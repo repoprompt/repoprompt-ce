@@ -276,6 +276,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     XCTContext.runActivity(named: "Unrelated VM publications: \(sidebarPublications); container: \(presentationBodiesBefore) → \(presentationBodiesAfter); chrome: \(chromeBodiesBefore) → \(chromeBodiesAfter); composer bodies: \(composerBodiesBefore) → \(composerBodiesAfter)") { _ in
                         XCTAssertEqual(composerBodiesAfter, composerBodiesBefore, "The observed presentation wrapper must preserve the equatable composer boundary.")
                     }
+                    if !additionalWindow { await captureComposerLayoutsIfRequested(fixture: fixture, regular: makeInput) }
                     XCTAssertNil(window.attachedSheet)
                     var previewEvents: [String] = []
                     var previewWasInstalled = false
@@ -441,6 +442,114 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 if let result = findPickerView(in: child.value, as: type, depth: depth + 1) { return result }
             }
             return nil
+        }
+
+        /// Opt-in local evidence only: no capture API or alternate composer in production.
+        /// Remove REQUEST after the coordinated run; ordinary CI never writes these images.
+        private func captureComposerLayoutsIfRequested(fixture: Fixture, regular: @escaping (Binding<Bool>) -> AgentInputBar) async {
+            let directory = URL(fileURLWithPath: "/private/tmp/cc-composer-visual-20261113", isDirectory: true)
+            guard FileManager.default.fileExists(atPath: directory.appendingPathComponent("REQUEST").path) else { return }
+            let vm = fixture.viewModel
+            let session = fixture.sourceSession
+            let heldSessions = Set(vm.sessions.keys)
+            let api = fixture.window.apiSettingsViewModel
+            let previousConnected = api.isClaudeCodeConnected
+            let previousStatus = api.claudeCodeCLIStatus
+            let previousDraft = vm.draftRuntime.text(for: session.tabID)
+            let sampleText = "Visual layout fixture"
+            defer {
+                api.isClaudeCodeConnected = previousConnected
+                api.test_setClaudeCodeCLIStatus(previousStatus)
+                vm.storeDraftText(for: session.tabID, previousDraft)
+                vm.syncComposerUIState()
+            }
+            let settings = GlobalSettingsStore.shared
+            let previousGate = settings.experimentalCommandCenter()
+            settings.setExperimentalCommandCenter(true, commit: false)
+            defer { settings.setExperimentalCommandCenter(previousGate, commit: false) }
+            let draft = CommandCenterComposerModel()
+            defer { draft.stop() }
+            do {
+                // Use the same canonical fake availability as the native Send fixture, not
+                // a disconnected-provider projection that hides the real footer controls.
+                api.isClaudeCodeConnected = true
+                api.test_setClaudeCodeCLIStatus(.binaryPresent)
+                try await AsyncTestWait.waitUntil("visual fixture provider available", timeout: 2) {
+                    vm.agentAvailabilityContext.claudeCodeAvailable && vm.hasAvailableAgentProviders
+                }
+                vm.storeDraftText(for: session.tabID, sampleText)
+                vm.syncComposerUIState()
+                let subject = AgentComposerSubject.tab(session.tabID)
+                let ui = AgentComposerUIStore(props: AgentComposerProjection.props(vm: vm, subject: subject))
+                let pills = AgentStatusPillsUIStore()
+                pills.update(vm.makeStatusPillsSnapshot(subject: subject))
+                let hosted: (Binding<Bool>) -> AgentInputBar = { reset in
+                    AgentInputBar(
+                        agentModeVM: vm, composerUI: ui, statusPillsUI: pills,
+                        openContextDrawerFiles: {}, oracleViewModel: fixture.window.oracleViewModel,
+                        promptManager: fixture.window.promptManager, workspaceSearchService: fixture.window.workspaceSearchService,
+                        selectionCoordinator: fixture.window.selectionCoordinator, runtimeVM: vm.ui.runtimeMetrics.runtimeVM,
+                        windowID: fixture.window.windowID, currentTabID: session.tabID, subject: subject,
+                        actionsOverride: AgentComposerActions.make(vm: vm, subject: subject, composerUI: ui, windowID: fixture.window.windowID),
+                        projectChip: AnyView(AgentWorkspaceContextPill(title: "Fixture project", systemImage: "folder", action: {})),
+                        resetTextFieldTrigger: reset, composerBottomInset: .constant(0), transcriptBottomClearance: .constant(0)
+                    )
+                }
+                draft.start()
+                draft.newDraft(projectID: nil, selection: .init(role: .pair, agentRaw: session.selectedAgent.rawValue, modelRaw: session.selectedModelRaw, reasoningEffortRaw: session.selectedReasoningEffortRaw, modelParameterSelections: session.acpModelParameterSelections))
+                draft.storeLocalDraftText(sampleText)
+                let unbound: (Binding<Bool>) -> AgentInputBar = { reset in
+                    AgentInputBar(
+                        agentModeVM: vm, composerUI: draft.composerUI, statusPillsUI: draft.statusPillsUI,
+                        openContextDrawerFiles: {}, oracleViewModel: nil, promptManager: nil,
+                        workspaceSearchService: nil, selectionCoordinator: nil, runtimeVM: nil,
+                        windowID: fixture.window.windowID, currentTabID: draft.presentationID,
+                        subject: draft.subject, actionsOverride: draft.actions(),
+                        projectChip: AnyView(CommandCenterProjectPicker(projects: [], selectedID: nil, selectedName: nil, recentID: nil, isDisabled: { _ in false }, choose: draft.chooseProject, openFolder: {})),
+                        selectWorkflowOverride: draft.selectWorkflow,
+                        resetTextFieldTrigger: reset, composerBottomInset: .constant(0), transcriptBottomClearance: .constant(0)
+                    )
+                }
+                for width in [CGFloat(900), CGFloat(1710)] {
+                    let suffix = "-\(Int(width))"
+                    try await writeComposerBitmap(name: "regular" + suffix, width: width, content: PickerResetBacking(content: regular), directory: directory)
+                    try await writeComposerBitmap(name: "cc-hosted" + suffix, width: width, content: PickerResetBacking(content: hosted), directory: directory)
+                    try await writeComposerBitmap(name: "cc-unbound" + suffix, width: width, content: PickerResetBacking(content: unbound), directory: directory)
+                }
+                XCTAssertEqual(Set(vm.sessions.keys), heldSessions, "Capturing presentation must never materialize a session or another writer")
+            } catch {
+                print("CC_VISUAL_SNAPSHOT_UNAVAILABLE: \(error.localizedDescription)")
+            }
+        }
+
+        private func writeComposerBitmap(name: String, width: CGFloat, content: some View, directory: URL) async throws {
+            let frame = NSRect(x: -10000, y: -10000, width: width, height: 320)
+            let window = NSWindow(contentRect: frame, styleMask: [.titled], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            window.animationBehavior = .none
+            let host = NSHostingView(rootView: content.frame(width: width, height: 320, alignment: .bottom))
+            host.appearance = NSAppearance(named: .darkAqua)
+            window.contentView = host
+            window.orderFront(nil)
+            defer { window.orderOut(nil)
+                window.close()
+            }
+            host.layoutSubtreeIfNeeded()
+            host.displayIfNeeded()
+            try await AsyncTestWait.waitUntil("visual composer editor mounted", timeout: 2) { self.findPickerEditor(in: host)?.window === window }
+            let settled = expectation(description: "Visual layout settles")
+            RunLoop.main.perform { MainActor.assumeIsolated { host.layoutSubtreeIfNeeded()
+                host.displayIfNeeded()
+                settled.fulfill()
+            } }
+            await fulfillment(of: [settled], timeout: 2)
+            guard let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { throw NSError(domain: "CCVisualFixture", code: 1) }
+            host.cacheDisplay(in: host.bounds, to: bitmap)
+            guard let png = bitmap.representation(using: .png, properties: [:]) else { throw NSError(domain: "CCVisualFixture", code: 2) }
+            try png.write(to: directory.appendingPathComponent(name + ".png"), options: .atomic)
+            let metadata: [String: Any] = ["width": bitmap.pixelsWide, "height": bitmap.pixelsHigh, "logicalWidth": width, "theme": "darkAqua", "sharedComposer": true, "connectedClaudeFixture": true, "matchingDraftText": true]
+            try JSONSerialization.data(withJSONObject: metadata, options: [.sortedKeys]).write(to: directory.appendingPathComponent(name + ".json"), options: .atomic)
+            print("CC_VISUAL_SNAPSHOT: \(name) \(bitmap.pixelsWide)x\(bitmap.pixelsHigh)")
         }
 
         @MainActor

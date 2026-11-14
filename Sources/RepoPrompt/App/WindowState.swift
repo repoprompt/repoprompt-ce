@@ -1009,13 +1009,38 @@ class WindowState: ObservableObject {
         }
         .store(in: &cancellables)
 
-        NotificationCenter.default.publisher(for: .agentSessionBindingDidChange)
-            .receive(on: RunLoop.main)
-            .sink { [weak self] notification in
-                guard let self, notificationTargetsActiveComposeTab(notification) else { return }
+        Self.sessionBindingTitleTargets()
+            .sink { [weak self] target in
+                guard let self, target.matches(windowID: windowID, activeTabID: promptManager.activeComposeTabID) else { return }
                 refreshAgentChatTitleCluster()
             }
             .store(in: &cancellables)
+    }
+
+    struct SessionBindingTitleTarget: Equatable {
+        let windowID: Int
+        let tabID: UUID
+
+        init?(_ notification: Notification) {
+            guard let windowID = notification.userInfo?["windowID"] as? Int,
+                  let tabID = notification.userInfo?["tabID"] as? UUID else { return nil }
+            self.windowID = windowID
+            self.tabID = tabID
+        }
+
+        func matches(windowID: Int, activeTabID: UUID?) -> Bool {
+            self.windowID == windowID && tabID == activeTabID
+        }
+    }
+
+    /// The notification's object is the presenter. Drop it synchronously before queueing
+    /// title work, including for unrelated windows; only value identities cross the hop.
+    /// Active-tab matching remains at delivery time, after any intervening selection change.
+    static func sessionBindingTitleTargets(center: NotificationCenter = .default) -> AnyPublisher<SessionBindingTitleTarget, Never> {
+        center.publisher(for: .agentSessionBindingDidChange)
+            .compactMap { SessionBindingTitleTarget($0) }
+            .receive(on: RunLoop.main)
+            .eraseToAnyPublisher()
     }
 
     private func notificationTargetsActiveComposeTab(_ notification: Notification) -> Bool {

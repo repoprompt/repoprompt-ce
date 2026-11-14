@@ -19,6 +19,11 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct AgentComposerActions {
+    /// Only unbound human drafts use this. Existing sessions always use canonical claim/execute.
+    var submitDraft: ((String) async -> AgentModeViewModel.UserTurnSubmissionResult)?
+    var sendTitle: String?
+    /// Retained closures must refresh when an unbound draft changes destination without changing ID.
+    var presentationIdentity: AnyHashable?
     var prepareReprompt: (AgentComposerSubmitTarget, String) -> Bool = { _, _ in false }
     var toggleComputerUse: (UUID, ObjectIdentifier) async -> Void = { _, _ in }
     let storeDraft: (_ tabID: UUID, _ text: String, _ acknowledgedSequence: UInt64) -> Void
@@ -54,23 +59,29 @@ struct AgentComposerActions {
 
 struct AgentInputBar: View {
     @Environment(\.agentModePerfRecorder) private var perfRecorder
-    let agentModeVM: AgentModeViewModel
+    let agentModeVM: AgentModeViewModel?
     @ObservedObject var composerUI: AgentComposerUIStore
     @ObservedObject var statusPillsUI: AgentStatusPillsUIStore
     let openContextDrawerFiles: () -> Void
-    let oracleViewModel: OracleViewModel
-    let promptManager: PromptViewModel
-    let workspaceSearchService: WorkspaceSearchService
-    let selectionCoordinator: WorkspaceSelectionCoordinator
-    let runtimeVM: AgentRuntimeSidebarViewModel
+    let oracleViewModel: OracleViewModel?
+    let promptManager: PromptViewModel?
+    let workspaceSearchService: WorkspaceSearchService?
+    let selectionCoordinator: WorkspaceSelectionCoordinator?
+    let runtimeVM: AgentRuntimeSidebarViewModel?
     let windowID: Int
     let currentTabID: UUID?
+    var subject = AgentComposerSubject.currentTab
+    var actionsOverride: AgentComposerActions?
+    var ownerIsCurrent: @MainActor () -> Bool = { true }
+    var projectChip: AnyView?
+    var selectWorkflowOverride: ((AgentWorkflowDefinition?) -> Void)?
 
     @Binding var resetTextFieldTrigger: Bool
     @Binding var composerBottomInset: CGFloat
     @Binding var transcriptBottomClearance: CGFloat
 
     @FocusState var isFocused: Bool
+    @StateObject private var detachedRepromptStore = AgentRepromptUIStore()
     @State private var providerSwitchBannerHeight: CGFloat = 0
     @State private var composerOnlyBottomInset: CGFloat = 0
     @State private var composerOnlyBottomClearance: CGFloat = 0
@@ -104,7 +115,8 @@ struct AgentInputBar: View {
         #if DEBUG
             let _ = perfRecorder.increment("ui.body.inputBar")
         #endif
-        AgentProviderSwitchPresentation(viewModel: agentModeVM, tabID: currentTabID, content: composer, bannerHeight: $providerSwitchBannerHeight)
+        AgentProviderSwitchPresentation(viewModel: subject.isDraft ? nil : agentModeVM, tabID: currentTabID, content: composer, bannerHeight: $providerSwitchBannerHeight)
+            .disabled(composerUI.isConfiguring)
             .onChange(of: providerSwitchBannerHeight) { _, _ in syncProviderSwitchGeometry() }
             .onChange(of: composerOnlyBottomInset) { _, _ in syncProviderSwitchGeometry() }
             .onChange(of: composerOnlyBottomClearance) { _, _ in syncProviderSwitchGeometry() }
@@ -129,8 +141,9 @@ struct AgentInputBar: View {
             selectionCoordinator: selectionCoordinator,
             windowID: windowID,
             currentTabID: currentTabID,
-            repromptViewModel: agentModeVM,
-            repromptStore: agentModeVM.repromptUIStore,
+            repromptViewModel: subject.isDraft ? nil : agentModeVM,
+            subject: subject,
+            repromptStore: agentModeVM?.repromptUIStore ?? detachedRepromptStore,
             pendingSubmissionStore: composerUI,
             resetTextFieldTrigger: $resetTextFieldTrigger,
             composerBottomInset: $composerOnlyBottomInset,
@@ -141,97 +154,7 @@ struct AgentInputBar: View {
     }
 
     private var composerActions: AgentComposerActions {
-        // Composer props carry the source session identity in submitTarget, so replacing
-        // an idle session also invalidates the equatable view's retained actions.
-        let cursorSession = agentModeVM.activeSession
-        let attachmentAdmission: @MainActor (UUID) -> Bool = { [weak agentModeVM, weak composerUI] tabID in
-            guard let agentModeVM, let composerUI else { return false }
-            return !composerUI.hasPendingSubmission(tabID: tabID)
-                && agentModeVM.repromptUIStore.allowsAttachmentMutation(tabID: tabID, currentTabID: agentModeVM.currentTabID)
-        }
-        return AgentComposerActions(
-            prepareReprompt: { target, text in agentModeVM.prepareRepromptForComposerSend(target: target, text: text) },
-            toggleComputerUse: { tabID, identity in await agentModeVM.toggleComputerUse(tabID: tabID, expectedSessionIdentity: identity) },
-            storeDraft: { tabID, text, sequence in
-                agentModeVM.storeDraftText(for: tabID, text, acknowledgingThrough: sequence)
-            },
-            loadDraft: { tabID in agentModeVM.draftRuntime.loadSnapshot(tabID: tabID) },
-            claimSubmit: { attempt in agentModeVM.claimComposerSubmitForImmediatePresentation(attempt) },
-            executeSubmit: { claim, text in
-                await agentModeVM.executePresentedComposerSubmitAttempt(text: text, claim: claim)
-            },
-            cancelRun: { target in _ = await agentModeVM.cancelAgentRun(target: target) },
-            cancelBackground: { target in _ = await agentModeVM.cancelOracleBackground(target: target) },
-            cancelRouting: { tabID in await agentModeVM.cancelFreshTaskRouting(tabID: tabID) },
-            attachFiles: { tabID, urls in
-                guard attachmentAdmission(tabID) else { return }
-                if let reason = agentModeVM.imageAttachmentBlockReason(tabID: tabID) {
-                    agentModeVM.reportImageAttachmentBlocked(reason, tabID: tabID)
-                    return
-                }
-                await agentModeVM.attachFiles(tabID: tabID, urls: urls, admission: {
-                    attachmentAdmission(tabID) && agentModeVM.imageAttachmentBlockReason(tabID: tabID) == nil
-                }).value
-            },
-            reportAttachmentFailures: { tabID, failures in
-                guard attachmentAdmission(tabID) else { return }
-                agentModeVM.reportAttachmentFailures(tabID: tabID, failures)
-            },
-            removePendingAttachment: { tabID, attachmentID in agentModeVM.removePendingFileAttachment(tabID: tabID, attachmentID: attachmentID) },
-            commitTaggedFile: { tabID, suggestion, displayName in
-                agentModeVM.commitPendingTaggedFile(
-                    tabID: tabID,
-                    relativePath: suggestion.relativePath,
-                    displayName: displayName
-                )
-            },
-            removeTaggedFile: { tabID, attachmentID in agentModeVM.removePendingTaggedFile(tabID: tabID, attachmentID: attachmentID) },
-            agentWorkspaceLookupContext: { tabID in
-                guard let tabID else { return .visibleWorkspace }
-                return await agentModeVM.agentWorkspaceLookupContext(tabID: tabID)
-            },
-            slashSkillSuggestions: { query in await agentModeVM.slashSkillSuggestions(for: query) },
-            modelOptions: { agent, includeClaudeEffortVariants in
-                agentModeVM.modelOptions(for: agent, includeClaudeEffortVariants: includeClaudeEffortVariants)
-            },
-            canSelectAgentInCurrentChat: { agent in agentModeVM.canSelectAgentInCurrentChat(agent) },
-            selectAgentModel: { agent, rawModel in
-                if agentModeVM.requestProviderSwitchSelection(agent: agent, model: rawModel, tabID: currentTabID) { return }
-                guard !composerUI.props.areModelControlsDisabled,
-                      agentModeVM.canSelectAgentInCurrentChat(agent) else { return }
-                AgentModelCatalog.updateLastUsedEffortIfEncoded(agentKind: agent, rawModel: rawModel)
-                agentModeVM.selectedAgent = agent
-                agentModeVM.selectModel(rawModel: rawModel)
-            },
-            reviewAgentModel: { agent, model, intent in
-                agentModeVM.requestProviderSwitchSelection(agent: agent, model: model, tabID: currentTabID, cursorParameterIntent: intent)
-            },
-            reasoningEffortOptionsForCurrentSelection: { agentModeVM.reasoningEffortOptionsForCurrentSelection() },
-            selectReasoningEffort: { effort in agentModeVM.selectReasoningEffort(effort) },
-            selectACPModelParameter: { target, openCodeDiscoveryKey in
-                agentModeVM.selectACPModelParameter(target, openCodeDiscoveryKey: openCodeDiscoveryKey)
-            },
-            clearCursorModelParameter: { agentModeVM.clearCursorModelParameter($0) },
-            canMutateCursorModel: { tabID in
-                agentModeVM.canMutateCursorComposerModel(expectedSession: cursorSession, expectedTabID: tabID)
-            },
-            setAutoEditEnabled: { enabled in agentModeVM.setAutoEditEnabled(enabled) },
-            setProviderPermissionLevel: { id in agentModeVM.setProviderPermissionLevel(id) },
-            applyCodexToolSettingMutation: { mutation in
-                agentModeVM.applyCodexToolSettingMutation(mutation)
-            },
-            applyClaudeToolSettingMutation: { mutation in
-                agentModeVM.applyClaudeToolSettingMutation(mutation)
-            },
-            setClaudeEffortLevel: { level in agentModeVM.setClaudeEffortLevel(level) },
-            openCLIProvidersSettings: {
-                NotificationCenter.default.post(
-                    name: .showCLIProvidersTab,
-                    object: nil,
-                    userInfo: ["windowID": windowID]
-                )
-            }
-        )
+        actionsOverride ?? AgentComposerActions.make(vm: agentModeVM!, subject: subject, composerUI: composerUI, windowID: windowID, isCurrent: ownerIsCurrent, openInWorkspace: openContextDrawerFiles)
     }
 
     @ViewBuilder
@@ -250,7 +173,14 @@ struct AgentInputBar: View {
             promptManager: promptManager,
             selectionCoordinator: selectionCoordinator,
             runtimeVM: runtimeVM,
-            windowID: windowID
+            windowID: windowID,
+            subject: subject, projectChip: projectChip,
+            setAutoEdit: composerActions.setAutoEditEnabled,
+            selectWorkflow: { workflow in
+                if let selectWorkflowOverride { selectWorkflowOverride(workflow) }
+                else if subject.isCurrent { agentModeVM?.selectWorkflow(workflow) }
+                else { agentModeVM?.selectWorkflow(workflow, tabID: currentTabID) }
+            }
         )
         .padding(.horizontal, 28)
         .disabled(composerUI.hasPendingSubmission(tabID: currentTabID))
@@ -309,12 +239,13 @@ struct AgentComposerView: View, Equatable {
     let props: AgentComposerProps
     let placeholderText: String
     let actions: AgentComposerActions
-    let promptManager: PromptViewModel
-    let workspaceSearchService: WorkspaceSearchService
-    let selectionCoordinator: WorkspaceSelectionCoordinator
+    let promptManager: PromptViewModel?
+    let workspaceSearchService: WorkspaceSearchService?
+    let selectionCoordinator: WorkspaceSelectionCoordinator?
     let windowID: Int
     let currentTabID: UUID?
     var repromptViewModel: AgentModeViewModel?
+    var subject = AgentComposerSubject.currentTab
     @ObservedObject var repromptStore = AgentRepromptUIStore()
     @ObservedObject var pendingSubmissionStore = AgentComposerUIStore()
 
@@ -332,7 +263,7 @@ struct AgentComposerView: View, Equatable {
         pendingInteractionHandoffTask?.cancel()
         guard let tabID else { return }
         let overridable = overridesLiveText ? nativeComposerEditor.currentTextEntry : nil
-        guard let repromptViewModel else {
+        guard subject.isCurrent, let repromptViewModel else {
             composerFocusActivationRequest = .init(overridableTextEntry: overridable)
             return
         }
@@ -384,7 +315,7 @@ struct AgentComposerView: View, Equatable {
     }
 
     private var pendingInteractionSnapshots: AnyPublisher<AgentRunInteractionUISnapshot, Never> {
-        repromptViewModel?.ui.runInteraction.$snapshot.eraseToAnyPublisher() ?? Empty().eraseToAnyPublisher()
+        subject.isCurrent ? (repromptViewModel?.ui.runInteraction.$snapshot.eraseToAnyPublisher() ?? Empty().eraseToAnyPublisher()) : Empty().eraseToAnyPublisher()
     }
 
     private func flushDraftOnDeparture(tabID: UUID) {
@@ -396,6 +327,9 @@ struct AgentComposerView: View, Equatable {
     }
 
     @State private var localInputText: String = ""
+    @State private var draftSubmissionPending = false
+    @State private var draftSubmittedText: String?
+    @State private var draftSubmittedRevision: UInt64 = 0
     @State private var nativeComposerEditor = TextFieldNativeEditor()
     @State private var externalTextUpdateTick: Int = 0
     @State private var submissionLatch = AgentComposerSubmissionLatch()
@@ -443,15 +377,22 @@ struct AgentComposerView: View, Equatable {
             lhsCurrentTabID == rhsCurrentTabID
     }
 
+    static func hasEquivalentActionIdentity(_ lhs: AgentComposerActions, _ rhs: AgentComposerActions) -> Bool {
+        lhs.presentationIdentity == rhs.presentationIdentity && lhs.sendTitle == rhs.sendTitle
+            && (lhs.submitDraft == nil) == (rhs.submitDraft == nil)
+    }
+
     static func == (lhs: AgentComposerView, rhs: AgentComposerView) -> Bool {
-        hasEquivalentRenderIdentity(
-            lhsProps: lhs.props,
-            lhsPlaceholderText: lhs.placeholderText,
-            lhsCurrentTabID: lhs.currentTabID,
-            rhsProps: rhs.props,
-            rhsPlaceholderText: rhs.placeholderText,
-            rhsCurrentTabID: rhs.currentTabID
-        )
+        lhs.subject == rhs.subject
+            && hasEquivalentActionIdentity(lhs.actions, rhs.actions)
+            && hasEquivalentRenderIdentity(
+                lhsProps: lhs.props,
+                lhsPlaceholderText: lhs.placeholderText,
+                lhsCurrentTabID: lhs.currentTabID,
+                rhsProps: rhs.props,
+                rhsPlaceholderText: rhs.placeholderText,
+                rhsCurrentTabID: rhs.currentTabID
+            )
     }
 
     private var hasPendingFileAttachments: Bool {
@@ -485,20 +426,20 @@ struct AgentComposerView: View, Equatable {
               target.tabID == currentTabID
         else { return nil }
         if let viewModel = repromptViewModel {
-            guard viewModel.currentTabID == target.tabID, let session = viewModel.sessions[target.tabID],
+            guard subject.isCurrent ? viewModel.currentTabID == target.tabID : subject == .tab(target.tabID), let session = viewModel.sessions[target.tabID],
                   viewModel.makeComposerSubmitTarget(tabID: target.tabID, session: session) == target else { return nil }
         }
         return target
     }
 
     private var repromptPresentation: AgentRepromptUIStore.Presentation? {
-        currentTabID.flatMap { repromptStore.presentations[$0] }
+        subject.isCurrent ? currentTabID.flatMap { repromptStore.presentations[$0] } : nil
     }
 
     /// A rewrite that finished in a session not on screen waits here until its composer is back,
     /// has loaded that text and can dispatch it.
     private var repromptAutoSendReadyID: UUID? {
-        repromptStore.autoSendReadyID(tabID: currentTabID, visibleDraft: localInputText, canSubmit: canSubmitToRenderedTarget)
+        subject.isCurrent ? repromptStore.autoSendReadyID(tabID: currentTabID, visibleDraft: localInputText, canSubmit: canSubmitToRenderedTarget) : nil
     }
 
     private var repromptUndoRecovery: AgentRepromptUIStore.Recovery? {
@@ -516,6 +457,7 @@ struct AgentComposerView: View, Equatable {
     }
 
     private var isSubmissionPending: Bool {
+        if draftSubmissionPending { return true }
         if let viewModel = repromptViewModel, let tabID = currentTabID {
             // Cancel releases admission immediately, even if the old backend call is settling.
             return pendingSubmissionStore.hasPendingSubmission(tabID: tabID)
@@ -534,7 +476,7 @@ struct AgentComposerView: View, Equatable {
 
     private var canSubmitToRenderedTarget: Bool {
         props.canSendWithCurrentProvider
-            && renderedSubmitTarget != nil
+            && (actions.submitDraft != nil || renderedSubmitTarget != nil)
             && !isSubmissionPending
     }
 
@@ -543,7 +485,7 @@ struct AgentComposerView: View, Equatable {
             get: { localInputText },
             set: { text in
                 guard let tabID = currentTabID,
-                      repromptViewModel == nil || repromptViewModel?.currentTabID == tabID else { return }
+                      repromptViewModel == nil || subject.ownsEditor(tabID: tabID, ownerCurrentTabID: repromptViewModel?.currentTabID) else { return }
                 setLocalInputText(text)
                 actions.storeDraft(tabID, text, acknowledgedDraftRestorationSequenceByTab[tabID] ?? 0)
             }
@@ -709,6 +651,7 @@ struct AgentComposerView: View, Equatable {
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .composerActivationRequested)) { notification in
+            guard subject.isCurrent else { return }
             // Delivered synchronously with the tab write, ahead of the tab-change handler above.
             guard notification.userInfo?["windowID"] as? Int == windowID,
                   let tabID = notification.userInfo?["tabID"] as? UUID else { return }
@@ -717,11 +660,17 @@ struct AgentComposerView: View, Equatable {
         .onReceive(pendingInteractionSnapshots) { handlePendingInteractionChange($0) }
         .onChange(of: localInputText) { _, newValue in
             isInputEmpty = newValue.isEmpty
+            if draftSubmissionPending, newValue == draftSubmittedText,
+               submissionLatch.inputRevision == draftSubmittedRevision { return }
             guard let tabID = currentTabID, !isSyncingDraftFromSession else { return }
             actions.storeDraft(tabID, newValue, acknowledgedDraftRestorationSequenceByTab[tabID] ?? 0)
         }
+        .onChange(of: props.draftText) { _, text in
+            guard !subject.isCurrent, let text, text != localInputText, let tabID = currentTabID else { return }
+            loadDraftFromSession(for: tabID)
+        }
         .onChange(of: repromptStore.composerFocusRestoreRequest) { _, request in
-            guard let request, request.tabID == currentTabID,
+            guard subject.isCurrent, let request, request.tabID == currentTabID,
                   repromptViewModel?.currentTabID == request.tabID else { return }
             composerFocusRestoreRequest = request.id
         }
@@ -748,6 +697,13 @@ struct AgentComposerView: View, Equatable {
         }
         .onChange(of: props.draftRestorationEvent) { _, event in
             guard let event, event.tabID == currentTabID else { return }
+            if !subject.isCurrent {
+                // The canonical snapshot already includes all rejection fragments and any
+                // newer typing. Never replay a throttled window-global event over that truth.
+                loadDraftFromSession(for: event.tabID)
+                if !event.message.isEmpty { showSteeringUnsupportedNotice(event.message) }
+                return
+            }
             isSyncingDraftFromSession = true
             let restoredText: String
             switch event.strategy {
@@ -830,7 +786,7 @@ struct AgentComposerView: View, Equatable {
 
     private var mainContent: some View {
         VStack(alignment: .leading, spacing: AgentAttachmentStripLayout.composerVerticalSpacingWhenPresent) {
-            if let repromptViewModel {
+            if subject.isCurrent, let repromptViewModel {
                 VStack(alignment: .leading, spacing: 6) {
                     AgentRepromptQuestionsView(viewModel: repromptViewModel, store: repromptStore, tabID: currentTabID, onReturnToComposer: { [tabID = currentTabID] in
                         guard repromptViewModel.currentTabID == tabID else { return }
@@ -878,20 +834,7 @@ struct AgentComposerView: View, Equatable {
                         attachmentDropController?.setTextViewAttachmentDragActive(false)
                     }
                 },
-                features: .agentInputBar(
-                    fileTagStore: promptManager.fileManager.workspaceFileContextStore,
-                    fileTagSearchService: workspaceSearchService,
-                    fileTagSelectionCoordinator: selectionCoordinator,
-                    fileTagLookupContextIdentity: AnyHashable(props.fileTagLookupContextIdentity),
-                    fileTagLookupContextProvider: { [tabID = props.currentTabID] in
-                        await actions.agentWorkspaceLookupContext(tabID)
-                    },
-                    fileMentionPickerConfiguration: globalSettings.fileMentionPickerConfiguration(),
-                    onFileTagCommitted: handleFileTagCommitted(_:),
-                    slashSkillSuggestionsProvider: { query in
-                        await actions.slashSkillSuggestions(query)
-                    }
-                ),
+                features: editorFeatures,
                 externalUpdateTick: externalTextUpdateTick,
                 externalEditTransaction: repromptEditTransaction,
                 onUndoExternalEdit: { [id = repromptPresentation?.id, recoveryID = repromptUndoRecovery?.id, tabID = currentTabID] in
@@ -1010,11 +953,12 @@ struct AgentComposerView: View, Equatable {
                     }
                     .accessibilityLabel("Stop background Oracle requests")
                 } else {
+                    if actions.sendTitle == "Open & Send" { Text("Open & Send").font(.caption).foregroundStyle(.secondary) }
                     SendOrResendButton(
                         inputText: localInputText,
                         hasMessages: false, // Disable resend in agent mode - just show greyed send button
                         sendWhenEmpty: hasPendingAttachments,
-                        sendTooltip: repromptPresentation == nil ? "Send Message (Return)" : "Send Current Text (Return)",
+                        sendTooltip: actions.sendTitle ?? (repromptPresentation == nil ? "Send Message (Return)" : "Send Current Text (Return)"),
                         foregroundColor: .accentColor,
                         sendAction: sendMessage,
                         resendAction: {}
@@ -1029,6 +973,21 @@ struct AgentComposerView: View, Equatable {
         }
         .frame(maxWidth: .infinity)
         .frame(height: composerControlStripHeight)
+    }
+
+    private var editorFeatures: ResizableTextFieldFeatures {
+        guard let promptManager, let workspaceSearchService, let selectionCoordinator,
+              actions.submitDraft == nil else { return .plain }
+        return .agentInputBar(
+            fileTagStore: promptManager.fileManager.workspaceFileContextStore,
+            fileTagSearchService: workspaceSearchService,
+            fileTagSelectionCoordinator: selectionCoordinator,
+            fileTagLookupContextIdentity: AnyHashable(props.fileTagLookupContextIdentity),
+            fileTagLookupContextProvider: { [tabID = props.currentTabID] in await actions.agentWorkspaceLookupContext(tabID) },
+            fileMentionPickerConfiguration: globalSettings.fileMentionPickerConfiguration(),
+            onFileTagCommitted: handleFileTagCommitted(_:),
+            slashSkillSuggestionsProvider: { await actions.slashSkillSuggestions($0) }
+        )
     }
 
     // MARK: - MCP Control Chip
@@ -1236,13 +1195,16 @@ struct AgentComposerView: View, Equatable {
     }
 
     private func inputBarModelMenuItems(for agent: AgentProviderKind) -> [StableMenuItem] {
+        if actions.submitDraft != nil, props.canUseLinkedAgentSession, agent != props.selectedAgent {
+            return [.message("Change provider in workspace")]
+        }
         let options = inputBarModelOptions(for: agent)
         if options.isEmpty {
             return [.action("Use \(agent.displayName)", isEnabled: true, imageSystemName: agent.iconName) {
                 actions.selectAgentModel(agent, "")
             }]
         }
-        if agent == .cursor {
+        if agent == .cursor, actions.submitDraft == nil {
             return AgentModelStableMenuItems.cursorModelItems(
                 options: options,
                 selectedModelRaw: props.selectedAgent == .cursor ? ((try? CursorAIModelCatalog.ModelSpecifier(raw: props.selectedModelRaw).baseModelRaw) ?? props.selectedModelRaw) : "",
@@ -1925,6 +1887,29 @@ struct AgentComposerView: View, Equatable {
         }
         let trimmed = rawDraftSnapshot.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || hasPendingAttachments else { return }
+        if let submitDraft = actions.submitDraft, let tabID = currentTabID {
+            draftSubmissionPending = true
+            setLocalInputText(rawDraftSnapshot)
+            draftSubmittedText = rawDraftSnapshot
+            draftSubmittedRevision = submissionLatch.inputRevision
+            actions.storeDraft(tabID, rawDraftSnapshot, acknowledgedDraftRestorationSequenceByTab[tabID] ?? 0)
+            Task { @MainActor in
+                let result = await submitDraft(rawDraftSnapshot)
+                draftSubmissionPending = false
+                guard currentTabID == tabID else { return }
+                switch result {
+                case .submitted:
+                    // Never clear typing that happened while admission or provider dispatch awaited.
+                    if localInputText == rawDraftSnapshot {
+                        // The independent model owns clearing/restoration and allocation-time
+                        // transfer. Its published canonical draft may already contain newer typing.
+                        loadDraftFromSession(for: tabID)
+                    }
+                case let .blocked(message): showSteeringUnsupportedNotice(message)
+                }
+            }
+            return
+        }
         guard let submitTarget = renderedSubmitTarget else {
             logViewSubmitRejection(reason: "view_nil_target", target: props.submitTarget)
             showSteeringUnsupportedNotice(Self.staleSubmitTargetMessage)
@@ -2034,7 +2019,7 @@ struct AgentComposerView: View, Equatable {
     }
 
     private func canMutateAttachments(tabID: UUID) -> Bool {
-        let liveTabID: UUID? = if let repromptViewModel { repromptViewModel.currentTabID }
+        let liveTabID: UUID? = if let repromptViewModel, subject.isCurrent { repromptViewModel.currentTabID }
         else { currentTabID }
         return !pendingSubmissionStore.hasPendingSubmission(tabID: tabID)
             && repromptStore.allowsAttachmentMutation(tabID: tabID, currentTabID: liveTabID)
@@ -2043,7 +2028,7 @@ struct AgentComposerView: View, Equatable {
     private func pickFiles() {
         guard canAttachFiles, let tabID = currentTabID else { return }
         Task { @MainActor in
-            let targetWindow = WindowStatesManager.shared.allWindows.first { $0.windowID == windowID }?.nsWindow
+            let targetWindow = !subject.isCurrent ? NSApp.keyWindow : WindowStatesManager.shared.allWindows.first { $0.windowID == windowID }?.nsWindow
             let urls = await OpenPanelService.shared.pickFiles(
                 title: "Choose Files",
                 message: "Attach one or more files for the next turn.",

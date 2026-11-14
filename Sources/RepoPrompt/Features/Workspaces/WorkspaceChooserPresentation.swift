@@ -1,9 +1,46 @@
 import Combine
 import Foundation
+import RepoPromptDomainRuntime
+
+/// Library membership is a persisted choice, never inferred from a display name.
+protocol WorkspaceMenuItem {
+    var id: UUID { get }
+    var name: String { get }
+    var lastUsed: Date { get }
+    var isSystemWorkspace: Bool { get }
+    var isHiddenInMenus: Bool { get }
+    var isTemporaryWorkspace: Bool { get }
+}
+
+extension WorkspaceModel: WorkspaceMenuItem {}
+extension DomainWorkspaceMetadata: WorkspaceMenuItem {
+    var id: UUID {
+        workspaceID
+    }
+
+    var isTemporaryWorkspace: Bool {
+        WorkspaceLibraryClassification.isTemporary(isEphemeral: isEphemeral, isSavedWorkspace: isSavedWorkspace, repoPaths: repoPaths)
+    }
+}
+
+enum WorkspaceLibraryClassification {
+    static func isTemporary(isEphemeral: Bool, isSavedWorkspace: Bool?, repoPaths: [String]) -> Bool {
+        if isEphemeral { return true }
+        if let isSavedWorkspace { return !isSavedWorkspace }
+        return !repoPaths.isEmpty && repoPaths.allSatisfy { rawPath in
+            let path = URL(fileURLWithPath: (rawPath as NSString).expandingTildeInPath).standardizedFileURL.path
+            let components = URL(fileURLWithPath: path).pathComponents
+            return path.hasPrefix("/tmp/") || path.hasPrefix("/private/tmp/")
+                || path.hasPrefix(FileManager.default.temporaryDirectory.standardizedFileURL.path + "/")
+                || components.contains(".repoprompt-worktrees")
+                || zip(components, components.dropFirst()).contains { $0 == ".codex" && $1 == "worktrees" }
+        }
+    }
+}
 
 /// Shared by existing menu callers and the authority-backed chooser; ranking is unchanged.
 enum WorkspaceMenuPolicy {
-    static func items(in workspaces: [WorkspaceModel], query: WorkspaceMenuQuery = .init()) -> [WorkspaceModel] {
+    static func items<Item: WorkspaceMenuItem>(in workspaces: [Item], query: WorkspaceMenuQuery = .init()) -> [Item] {
         var items = workspaces
         if !query.includeSystem { items = items.filter { !$0.isSystemWorkspace } }
         if !query.includeHidden { items = items.filter { !$0.isHiddenInMenus } }

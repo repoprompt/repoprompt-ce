@@ -2435,3 +2435,236 @@ private actor WorkflowTestBackend: DecisionService {
         gate = nil
     }
 }
+
+/// Frozen current-main projection, retained only as the equivalence oracle for this refactor.
+@MainActor
+private extension AgentModeViewModel {
+    func referenceCurrentComposerProps(tabID explicitTabID: UUID? = nil) -> AgentComposerProps {
+        let tabID = explicitTabID ?? currentTabID
+        let session = tabID.flatMap { sessions[$0] }
+        let isMCPControlled = isMCPControlled(tabID: tabID)
+        let isCodexRunActive: Bool = {
+            guard selectedAgent == .codexExec, let tabID else { return false }
+            return isTabRunning(tabID)
+        }()
+        let cancelTarget = composerRunCancelTarget(tabID: tabID)
+        let submitTarget = makeComposerSubmitTarget(tabID: tabID, session: session)
+        let acpControls = acpModelParameterControls(session: session)
+        // Cursor's catalog can refresh while a run is active. Metadata disappearing must
+        // not unlock a model/configuration already captured by that run.
+        let acpRunLocksModelControls = session?.runState.isActive == true
+            && (selectedAgent == .cursor || !acpControls.isEmpty)
+        let routerControlsFreshTask = session.map(isGlobalModelRouterControllingFreshTask) ?? false
+        let selectedRouterServiceID = routerControlsFreshTask
+            ? modelRouterSettingsStore.modelRouterConfiguration().selectedBackendID : nil
+        let automaticRouterServiceName = selectedRouterServiceID.flatMap { modelRouterRuntime?.serviceDisplayNamesByID[$0] }
+        let autoEffortConfiguration = modelRouterSettingsStore.autoEffortConfiguration()
+        let autoEffortServiceName = autoEffortConfiguration.enabled
+            ? autoEffortConfiguration.selectedBackendID.flatMap { modelRouterRuntime?.serviceDisplayNamesByID[$0] } ?? "Unavailable service"
+            : nil
+        return AgentComposerProps(
+            computerUse: computerUseComposerProps(session: session),
+            imageAttachmentNotice: imageAttachmentNotice,
+            currentTabID: tabID,
+            submitTarget: submitTarget,
+            attachments: AgentAttachmentStripSnapshot(
+                scopeTabID: tabID,
+                attachments: pendingFileAttachments,
+                taggedFileAttachments: pendingTaggedFileAttachments
+            ),
+            runState: runState,
+            cancelTarget: cancelTarget,
+            backgroundCancelTarget: composerOracleBackgroundCancelTarget(tabID: tabID),
+            isAgentBusy: isAgentBusy,
+            isWaitingForInstruction: isWaitingForInstruction,
+            canUseLinkedAgentSession: hasLinkedAgentSession(for: tabID),
+            isCurrentTabMCPControlled: isMCPControlled,
+            areModelControlsDisabled: isMCPControlled || acpRunLocksModelControls || routerControlsFreshTask,
+            providerControls: activeProviderControlsBinding,
+            isCodexRunActive: isCodexRunActive,
+            hasAvailableAgentProviders: hasAvailableAgentProviders,
+            canSendWithCurrentProvider: canSendWithCurrentProvider,
+            isRoutingFreshTask: tabID.map { freshTaskRoutingByTabID[$0] != nil } ?? false,
+            isGlobalModelRouterControllingFreshTask: routerControlsFreshTask,
+            automaticRouterServiceName: automaticRouterServiceName,
+            autoEffortServiceName: autoEffortServiceName,
+            unavailableSelectedAgentMessage: unavailableSelectedAgentMessage,
+            selectedAgent: selectedAgent,
+            selectedModelRaw: selectedModelRaw,
+            selectedModelDisplayName: selectedModelDisplayName,
+            selectedReasoningEffortRaw: selectedReasoningEffortRaw,
+            selectedReasoningEffortDisplayName: selectedReasoningEffortDisplayName,
+            acpModelParameterControls: acpControls,
+            availableAgents: availableAgents,
+            isProviderPickerLockedForCurrentTab: isProviderPickerLocked(tabID: tabID),
+            lockedAgentSelectionMessage: lockedAgentSelectionMessage(tabID: tabID),
+            autoEditEnabled: autoEditEnabled,
+            stagedSlashCommand: stagedSlashCommandProps(tabID: tabID),
+            draftRestorationEvent: draftRestorationEvent.map(AgentDraftRestorationProps.init),
+            fileTagLookupContextIdentity: agentWorkspaceLookupContextIdentity(tabID: tabID, session: session)
+        )
+    }
+}
+
+@MainActor
+final class AgentComposerProjectionEquivalenceTests: XCTestCase {
+    func testCurrentWorkspaceProjectionMatchesFrozenMainAcrossProviderRunAndAutomationMatrix() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "CC-equivalence-\(UUID().uuidString)"))
+        let settings = GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: root.appendingPathComponent("settings.json")))
+        let vm = AgentModeViewModel(
+            testWorkspacePath: nil,
+            codexControllerFactory: { _, _, _, _, _, _ in fatalError("Projection must not launch a provider") },
+            headlessProviderFactory: { _, _ in UnsupportedHeadlessAgentProvider(reason: "projection only") }
+        )
+        vm.test_setSuppressesAgentSessionPersistence(true)
+        vm.modelRouterSettingsStore = settings
+        XCTAssertEqual(vm.makeComposerProps(), vm.referenceCurrentComposerProps())
+        let freshID = UUID()
+        vm.test_setCurrentTabIDOverride(freshID)
+        XCTAssertEqual(vm.makeComposerProps(), vm.referenceCurrentComposerProps())
+        let tabID = UUID()
+        vm.test_setCurrentTabIDOverride(tabID)
+        let session = vm.session(for: tabID)
+        defer { session.saveDebounceTask?.cancel()
+            session.persistedLoadTask?.cancel()
+        }
+        for agent in [AgentProviderKind.claudeCode, .codexExec, .cursor] {
+            for state in [AgentSessionRunState.idle, .running, .waitingForUser] {
+                for managed in [false, true] {
+                    session.selectedAgent = agent
+                    session.selectedModelRaw = AgentModelCatalog.defaultModelRaw(for: agent)
+                    session.runState = state
+                    session.isMCPOriginated = managed
+                    session.pendingFileAttachments = [.init(source: .localFile(path: "/tmp/explicit.txt"), title: "explicit.txt", fileName: "explicit.txt")]
+                    vm.updateBindingsFromSession(session)
+                    settings.setAutoEffortEnabled(managed, commit: false)
+                    settings.setModelRouterEnabled(managed, commit: false)
+                    XCTAssertEqual(vm.makeComposerProps(), vm.referenceCurrentComposerProps(), "\(agent) / \(state) / managed \(managed)")
+                    XCTAssertEqual(vm.makeStatusPillsSnapshot(), vm.referenceCurrentStatusSnapshot(), "Status \(agent) / \(state) / managed \(managed)")
+                }
+            }
+        }
+    }
+
+    func testExplicitEditorSubjectAndCanonicalRestorationDoNotFollowForegroundTab() {
+        let vm = AgentModeViewModel(
+            testWorkspacePath: nil,
+            codexControllerFactory: { _, _, _, _, _, _ in fatalError("Editor must not launch a provider") },
+            headlessProviderFactory: { _, _ in UnsupportedHeadlessAgentProvider(reason: "editor only") }
+        )
+        vm.test_setSuppressesAgentSessionPersistence(true)
+        let foregroundID = UUID(), targetID = UUID()
+        vm.test_setCurrentTabIDOverride(foregroundID)
+        let foreground = vm.session(for: foregroundID), target = vm.session(for: targetID)
+        defer { for session in [foreground, target] {
+            session.saveDebounceTask?.cancel()
+            session.persistedLoadTask?.cancel()
+        } }
+        let subject = AgentComposerSubject.tab(targetID)
+        XCTAssertTrue(subject.ownsEditor(tabID: targetID, ownerCurrentTabID: foregroundID))
+        XCTAssertFalse(subject.ownsEditor(tabID: foregroundID, ownerCurrentTabID: foregroundID))
+        XCTAssertFalse(AgentComposerSubject.currentTab.ownsEditor(tabID: targetID, ownerCurrentTabID: foregroundID))
+        XCTAssertTrue(AgentComposerSubject.currentTab.ownsEditor(tabID: foregroundID, ownerCurrentTabID: foregroundID))
+        let actions = AgentComposerActions.make(vm: vm, subject: subject, composerUI: AgentComposerUIStore(), windowID: 0)
+        vm.storeDraftText(for: foregroundID, "foreground untouched")
+        actions.storeDraft(targetID, "newer typing", 0)
+        vm.restoreComposerDraft(tabID: targetID, text: "rejected message\nnewer typing", message: "attachment refused", strategy: .replaceAlways)
+        vm.reportImageAttachmentBlocked(.agentBusy, tabID: targetID)
+        let props = AgentComposerProjection.props(vm: vm, subject: subject)
+        XCTAssertEqual(props.imageAttachmentNotice?.tabID, targetID)
+        XCTAssertNil(AgentComposerProjection.props(vm: vm, subject: .tab(foregroundID)).imageAttachmentNotice)
+        XCTAssertEqual(props.draftRestorationEvent?.tabID, targetID)
+        XCTAssertEqual(props.draftRestorationEvent?.text, "rejected message\nnewer typing")
+        XCTAssertEqual(vm.draftRuntime.text(for: foregroundID), "foreground untouched")
+        XCTAssertEqual(vm.currentTabID, foregroundID)
+        XCTAssertNil(AgentComposerProjection.props(vm: vm, subject: .tab(foregroundID)).draftRestorationEvent)
+        actions.storeDraft(targetID, "rejected message\nnewer typing\nmore typing", 0)
+        vm.restoreComposerDraft(tabID: foregroundID, text: "foreground rejection", message: "other tab", strategy: .replaceAlways)
+        let coalesced = AgentComposerProjection.props(vm: vm, subject: subject)
+        XCTAssertNil(coalesced.draftRestorationEvent, "Another tab may supersede the window-global signal")
+        XCTAssertEqual(coalesced.draftText, "rejected message\nnewer typing\nmore typing", "Exact editor must still observe all canonical restoration and newer text")
+    }
+
+    func testFreshComposerDefaultsReadSavedPreferenceRatherThanHistoricalTab() throws {
+        let name = "CC-fresh-defaults-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
+        defaults.set(AgentProviderKind.cursor.rawValue, forKey: "agentMode.lastUsedAgent")
+        defaults.set([AgentProviderKind.cursor.rawValue: AgentModel.cursorAuto.rawValue], forKey: "agentMode.lastUsedModelsByAgent")
+        let fresh = AgentModeViewModel.freshComposerSelection(defaults: defaults)
+        XCTAssertEqual(fresh.agent, .cursor)
+        XCTAssertEqual(fresh.modelRaw, AgentModel.cursorAuto.rawValue)
+    }
+
+    func testExplicitSlashSuggestionsUseSubjectProviderWithoutActivatingIt() async {
+        let vm = AgentModeViewModel(
+            testWorkspacePath: nil,
+            codexControllerFactory: { _, _, _, _, _, _ in fatalError("Suggestions must not launch a provider") },
+            headlessProviderFactory: { _, _ in UnsupportedHeadlessAgentProvider(reason: "suggestions only") }
+        )
+        vm.test_setSuppressesAgentSessionPersistence(true)
+        let foregroundID = UUID(), targetID = UUID()
+        vm.test_setCurrentTabIDOverride(foregroundID)
+        let foreground = vm.session(for: foregroundID), target = vm.session(for: targetID)
+        defer { for session in [foreground, target] {
+            session.saveDebounceTask?.cancel()
+            session.persistedLoadTask?.cancel()
+        } }
+        foreground.selectedAgent = .claudeCode
+        target.selectedAgent = .codexExec
+        target.codexConversationID = "fixture-thread"
+        let expected = vm.codexCoordinator.nativeSlashCommandSuggestions(for: target, query: "compact", limit: 1)
+        let actual = await vm.slashSkillSuggestions(for: "compact", tabID: targetID)
+        XCTAssertFalse(expected.isEmpty)
+        for suggestion in expected {
+            XCTAssertTrue(actual.contains { $0.relativePath == suggestion.relativePath })
+        }
+        XCTAssertEqual(vm.currentTabID, foregroundID)
+        let before = Set(vm.sessions.keys)
+        let missing = await vm.slashSkillSuggestions(for: "", tabID: UUID())
+        XCTAssertTrue(missing.isEmpty)
+        XCTAssertEqual(Set(vm.sessions.keys), before)
+    }
+
+    func testUnhostedDraftUsesSameProjectionWithLiveLocalOptionsAndNoSubmitTarget() {
+        let draft = AgentComposerDraftState(text: "message", agent: .codexExec, model: AgentModelCatalog.defaultModelRaw(for: .codexExec), effort: "low")
+        let props = AgentComposerProjection.props(vm: nil, subject: .draft(draft.id), draft: draft)
+        XCTAssertEqual(props.currentTabID, draft.id)
+        XCTAssertEqual(props.draftText, "message")
+        XCTAssertEqual(props.selectedModelRaw, draft.model)
+        XCTAssertEqual(props.selectedReasoningEffortRaw, "low")
+        XCTAssertNil(props.submitTarget, "Typing must never allocate a session/writer")
+        XCTAssertFalse(props.areModelControlsDisabled)
+        XCTAssertNotNil(props.providerControls)
+        XCTAssertFalse(props.availableAgents.isEmpty)
+        XCTAssertEqual(props.autoEditEnabled, draft.autoEdit)
+    }
+}
+
+@MainActor
+private extension AgentModeViewModel {
+    func referenceCurrentStatusSnapshot() -> AgentStatusPillsSnapshot {
+        #if DEBUG
+            test_statusPillsSnapshotBuildCount += 1
+        #endif
+        return AgentStatusPillsSnapshot(
+            currentTabID: currentTabID,
+            selectedWorkflow: selectedWorkflow,
+            stagedSlashCommand: stagedSlashCommandProps(tabID: currentTabID),
+            selectedAgent: selectedAgent,
+            autoEditPermissionGuidance: autoEditPermissionGuidance,
+            runState: runState,
+            autoEditEnabled: autoEditEnabled,
+            interviewFirst: interviewFirst,
+            modelRouter: modelRouterPillProps(),
+            autoEffort: autoEffortPillProps(),
+            executionLocation: executionLocationProps(tabID: currentTabID),
+            activeAgentSessionID: activeSession?.activeAgentSessionID,
+            activeRunID: activeSession?.runID,
+            monitor: currentMonitorPillProps(),
+            reprompt: repromptPillProps()
+        )
+    }
+}

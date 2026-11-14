@@ -2021,6 +2021,21 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return dict?[agentRaw]
     }
 
+    /// Read the defaults used by a fresh window without borrowing a historical foreground tab.
+    /// Catalog inputs may come from a donor, but this function never changes its selection.
+    static func freshComposerSelection(
+        defaults: UserDefaults = .standard,
+        availability: AgentModelCatalog.AvailabilityContext = .current,
+        codexDynamicModels: [CodexAppServerClient.RemoteModel]? = nil
+    ) -> AgentModelCatalog.NormalizedAgentSelection {
+        let agent = defaults.string(forKey: lastUsedAgentKey) ?? AgentProviderKind.claudeCode.rawValue
+        let models = defaults.dictionary(forKey: lastUsedModelsByAgentKey) as? [String: String]
+        return AgentModelCatalog.normalizeSelection(
+            agentRaw: agent, modelRaw: models?[agent], availability: availability,
+            codexDynamicModels: codexDynamicModels, preserveUnavailableAgent: true
+        )
+    }
+
     private func restoreLastUsedAgentSelectionIfNeeded() {
         guard let savedAgentRaw = UserDefaults.standard.string(forKey: Self.lastUsedAgentKey) else { return }
         let savedModelRaw = Self.lastUsedModelRaw(forAgentRaw: savedAgentRaw)
@@ -3141,15 +3156,24 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return runtime
     }
 
-    func slashSkillSuggestions(for query: String) async -> [MentionSuggestion] {
-        let sourceTabID = currentTabID
-        let sourceSession = activeSession
+    func slashSkillSuggestions(for query: String, tabID explicitTabID: UUID? = nil) async -> [MentionSuggestion] {
+        let sourceTabID = explicitTabID ?? currentTabID
+        let sourceSession = explicitTabID.flatMap { sessions[$0] } ?? (explicitTabID == nil ? activeSession : nil)
+        // Workspace search/catalog resources cannot serve a stashed project's tab. Never
+        // borrow the foreground project's skills, or materialize a missing session to suggest.
+        if explicitTabID != nil {
+            guard let sourceSession else { return [] }
+            if let bound = sourceSession.persistentSessionBindingIdentity,
+               workspaceManager?.activeWorkspaceID != bound.workspaceID { return [] }
+        }
+        let sourceBinding = sourceSession?.persistentSessionBindingIdentity
+        let sourceGeneration = sourceSession?.bindingTransitionGeneration
         let sourceControllerID = sourceSession?.claudeController.map(ObjectIdentifier.init)
         let slashSession: TabSession? = {
-            if let activeSession {
-                return activeSession
+            if let sourceSession {
+                return sourceSession
             }
-            guard selectedAgent == .codexExec,
+            guard explicitTabID == nil, selectedAgent == .codexExec,
                   let tabID = currentTabID
             else {
                 return nil
@@ -3166,9 +3190,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             : query
         let agentKind = slashSession?.selectedAgent ?? selectedAgent
         func requestIsCurrent() -> Bool {
-            currentTabID == sourceTabID
-                && activeSession === sourceSession
-                && (activeSession?.selectedAgent ?? selectedAgent) == agentKind
+            let ownsPresentation = explicitTabID == nil
+                ? currentTabID == sourceTabID && activeSession === sourceSession
+                : sourceTabID.flatMap { sessions[$0] } === sourceSession
+                && sourceSession?.persistentSessionBindingIdentity == sourceBinding
+                && sourceSession?.bindingTransitionGeneration == sourceGeneration
+                && (sourceBinding == nil || workspaceManager?.activeWorkspaceID == sourceBinding?.workspaceID)
+            return ownsPresentation
+                && (sourceSession?.selectedAgent ?? selectedAgent) == agentKind
                 && sourceSession?.claudeController.map(ObjectIdentifier.init) == sourceControllerID
         }
         var nativeSuggestions = isExplicitSkillNamespaceQuery ? [] : (slashSession.map {
@@ -3198,7 +3227,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         guard requestIsCurrent() else { return [] }
         let nativeCommandOwner = agentKind == .claudeCode ? "Claude Code" : "Codex"
-        await refreshSkillCatalog(force: false, agentKind: agentKind)
+        if explicitTabID == nil {
+            await refreshSkillCatalog(force: false, agentKind: agentKind)
+        } else {
+            await refreshSkillCatalog(force: false, agentKind: agentKind, shouldPublish: requestIsCurrent)
+        }
         guard requestIsCurrent() else { return [] }
         // Preserve local-skill precedence for non-compact collisions, even an advertised
         // built-in such as /context. The local row describes what expansion will execute.
@@ -8534,7 +8567,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             createIfNeeded: createIfNeeded,
             expectedWorkspaceID: expectedWorkspaceID
         )
-        if case .oversightLane = creationKind {
+        if creationKind.retainsPublishedSession {
             guard parentSessionID == nil, !inheritWorktreeBindings, case .fresh = selector else {
                 throw MCPError.invalidParams("An oversight lane must be a new top-level session.")
             }
@@ -8572,7 +8605,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 expectedWorkspaceID: expectedWorkspaceID,
                 creationKind: creationKind
             )
-            if case .oversightLane = creationKind {
+            if creationKind.retainsPublishedSession {
                 publishedLaneTarget = target
             }
             guard let resolvedSessionID = target.sessionID else { return target }
@@ -8605,7 +8638,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return provisionalTarget
         } catch {
             let propagatedError: Error
-            if case .oversightLane = creationKind,
+            if creationKind.retainsPublishedSession,
                let publishedLaneTarget,
                let sessionID = publishedLaneTarget.sessionID
                ?? publishedLaneTarget.recoveryClaim?.identity.sessionID
@@ -9065,7 +9098,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 return provisionalTarget
             } catch {
                 failSessionCreation(provisionalTarget.creationHandle, message: "Session creation did not finish: \(error.localizedDescription)")
-                if case .oversightLane = creationKind {
+                if creationKind.retainsPublishedSession {
                     // A published lane remains an ordinary session even when hydration loses its
                     // exact binding; never route it through MCP's destructive discard recovery.
                     mcpAcceptSessionTarget(provisionalTarget)
@@ -9339,7 +9372,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 workspaceSaveResult: receipt.outcome.diagnosticCategory,
                 reason: reason.rawValue
             ))
-            if case .oversightLane = creationKind {
+            if creationKind.retainsPublishedSession {
                 throw AgentSessionLaneAdmissionFailure(
                     reason: reason.rawValue,
                     saveResult: receipt.outcome.diagnosticCategory,
@@ -12416,14 +12449,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
-    func selectWorkflow(_ workflow: AgentWorkflowDefinition?) {
-        guard let tabID = currentTabID else { return }
+    func selectWorkflow(_ workflow: AgentWorkflowDefinition?, tabID requested: UUID? = nil) {
+        guard let tabID = requested ?? currentTabID else { return }
+        if tabID != currentTabID {
+            guard let session = sessions[tabID], let id = session.activeAgentSessionID,
+                  let command = try? runtimeCommand(sessionID: id), command.writer.session === session else { return }
+        }
         let session = session(for: tabID)
         session.userWorkflowSelectionMutationGeneration &+= 1
         session.selectedWorkflow = workflow
-        selectedWorkflow = workflow
-        syncComposerUIState(tabID: tabID)
-        ui.statusPills.update(makeStatusPillsSnapshot())
+        if tabID == currentTabID {
+            selectedWorkflow = workflow
+            syncComposerUIState(tabID: tabID)
+            ui.statusPills.update(makeStatusPillsSnapshot())
+        }
         providerSwitchPreviewDidChange(session)
     }
 
@@ -17359,6 +17398,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         _ attempt: AgentComposerSubmitAttempt,
         requireActiveTabOwnership: Bool,
         awaitsExecutor: Bool = false,
+        adoptsLocalReprompt: Bool = false,
         allowsPendingStartWithdrawal: Bool = true
     ) -> AgentComposerSubmitClaimResult {
         let target = attempt.target
@@ -17387,7 +17427,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
         switch result {
         case let .claimed(claim):
-            if requireActiveTabOwnership { adoptRepromptPreparation(into: claim) }
+            if requireActiveTabOwnership || adoptsLocalReprompt { adoptRepromptPreparation(into: claim) }
             // Transfer local preparation before publishing the rotated submission token. An
             // earlier UI refresh would invalidate and discard that still-unadopted preparation.
             runtimeSessionStore.presentation.composerClaimChanged(claim.sourceSession)

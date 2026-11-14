@@ -103,6 +103,17 @@ struct AgentModeGeneralSettingsView: View {
                 headerSection
 
                 configurationSummarySection
+
+                Divider()
+
+                SettingToggle(
+                    title: "Command Center (experimental)",
+                    description: "Enable the cross-workspace session browser for tip experimentation. Off by default; disabling it stops its observations without closing windows or stopping agents.",
+                    isOn: Binding(
+                        get: { globalSettings.experimentalCommandCenter() },
+                        set: { globalSettings.setExperimentalCommandCenter($0) }
+                    )
+                )
             }
             .padding(fontPreset.scaledClamped(20, max: 28))
             .frame(maxWidth: .infinity, alignment: .topLeading)

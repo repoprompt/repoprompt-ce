@@ -714,7 +714,7 @@ final class AgentRepromptSubmissionTests: XCTestCase {
     }
 
     func testInvalidationRestoresOriginalOrRequiresExplicitEditedDraftChoice() async throws {
-        for change in ["run-review", "stop-stream", "managed-review", "edited-review"] {
+        for change in ["claim-review", "stop-stream", "managed-review", "edited-review"] {
             let fixture = try await AgentRepromptTestFixture()
             defer { fixture.cleanUp() }
             try fixture.installPersistentWriter()
@@ -739,7 +739,7 @@ final class AgentRepromptSubmissionTests: XCTestCase {
             }
             if change == "stop-stream" { await fixture.viewModel.cancelAgentRun(tabID: fixture.session.tabID) }
             else if change == "managed-review" { fixture.session.installRunID(UUID()) }
-            else { fixture.session.runState = .completed }
+            else { fixture.session.composerSubmissionToken = UUID() }
             fixture.viewModel.invalidateRepromptIfNeeded()
             XCTAssertNil(fixture.viewModel.repromptOperation, change)
             XCTAssertNil(fixture.session.activeComposerSubmitAttempt)
@@ -812,6 +812,41 @@ final class AgentRepromptSubmissionTests: XCTestCase {
         XCTAssertEqual(vm.repromptDispatchOriginals[claim.attempt.id], "Original")
     }
 
+    func testBusyRunTransitionsDoNotInvalidateStreamingOrCompletedPreparation() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        try fixture.installPersistentWriter()
+        fixture.session.installRunID(UUID())
+        fixture.session.runState = .running
+        fixture.session.hasLoadedPersistedState = true
+        fixture.session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        fixture.enableReprompt()
+        let gate = AgentRepromptStartGate()
+        defer { Task { await gate.release() } }
+        fixture.viewModel.repromptService = .init(transport: { _, _, publish in
+            try await publish("Partial")
+            _ = await gate.wait()
+            try await publish(" done")
+        })
+        XCTAssertTrue(try fixture.begin(text: "Original"))
+        try await AsyncTestWait.waitUntil("partial", timeout: 5) { fixture.session.draftText == "Partial" }
+        let operation = try XCTUnwrap(fixture.viewModel.repromptOperation)
+        fixture.session.runState = .completed
+        fixture.viewModel.invalidateRepromptIfNeeded()
+        XCTAssertTrue(operation.validate(), "Busy-to-idle is not a composer mutation")
+        await gate.release()
+        try await ready(fixture)
+        fixture.session.runState = .running
+        fixture.viewModel.invalidateRepromptIfNeeded()
+        XCTAssertTrue(operation.validate(), "Run-state diagnostics must not invalidate the same run target")
+        XCTAssertEqual(fixture.session.draftText, "Partial done")
+        XCTAssertNil(fixture.viewModel.repromptUIStore.recoveries[fixture.session.tabID])
+        let claim = try fixture.claim(text: "Partial done", local: true)
+        defer { fixture.viewModel.releaseComposerSubmitClaim(claim) }
+        XCTAssertEqual(fixture.viewModel.repromptDispatchTexts[claim.attempt.id], "Partial done")
+        XCTAssertEqual(fixture.viewModel.repromptDispatchOriginals[claim.attempt.id], "Original")
+    }
+
     func testSessionsPrepareRewritesIndependently() async throws {
         let fixture = try await AgentRepromptTestFixture()
         defer { fixture.cleanUp() }
@@ -855,13 +890,19 @@ final class AgentRepromptSubmissionTests: XCTestCase {
         XCTAssertEqual(second.draftText, "Partial B done")
     }
 
-    func testAutomaticModeWaitsForItsSessionBeforeSending() async throws {
+    func testAutomaticModeSendsInBackgroundWithoutReturningToItsSession() async throws {
         let fixture = try await AgentRepromptTestFixture()
         defer { fixture.cleanUp() }
         fixture.enableReprompt()
         fixture.viewModel.setRepromptMode(.sendAutomatically)
         let vm = fixture.viewModel
         let tabID = fixture.session.tabID
+        try fixture.installPersistentWriter()
+        fixture.session.installRunID(UUID())
+        fixture.session.runState = .running
+        fixture.session.isMCPInstructionDispatchInProgress = true
+        fixture.session.hasLoadedPersistedState = true
+        fixture.session.recordRestorationAuthoritative(.persistedPayloadApplied)
         let gate = AgentRepromptStartGate()
         defer { Task { await gate.release() } }
         vm.repromptService = .init(transport: { _, _, publish in
@@ -873,15 +914,15 @@ final class AgentRepromptSubmissionTests: XCTestCase {
         _ = vm.session(for: other)
         vm.test_setCurrentTabIDOverride(other)
         await gate.release()
-        try await AsyncTestWait.waitUntil("parked send", timeout: 5) { vm.repromptUIStore.autoSendRequests[tabID] != nil }
-        let request = try XCTUnwrap(vm.repromptUIStore.autoSendRequests[tabID])
-        XCTAssertFalse(vm.consumeRepromptAutoSend(request, tabID: other, visibleDraft: request.text, hasMarkedText: false), "Another session's composer must not send it")
-        XCTAssertTrue(fixture.session.items.isEmpty)
-
-        vm.test_setCurrentTabIDOverride(tabID)
-        XCTAssertFalse(vm.consumeRepromptAutoSend(request, tabID: tabID, visibleDraft: "Still loading", hasMarkedText: false), "Waits for the composer to show the text")
-        XCTAssertTrue(vm.consumeRepromptAutoSend(request, tabID: tabID, visibleDraft: request.text, hasMarkedText: false), "Returning to the session sends it")
-        XCTAssertFalse(vm.consumeRepromptAutoSend(request, tabID: tabID, visibleDraft: request.text, hasMarkedText: false), "Exactly once")
+        try await AsyncTestWait.waitUntil("background queued turn", timeout: 5) { !fixture.session.pendingClaudeSteeringInstructions.isEmpty }
+        XCTAssertEqual(vm.currentTabID, other, "Sending must not steal focus")
+        XCTAssertEqual(fixture.session.pendingClaudeSteeringInstructions.count, 1)
+        XCTAssertEqual(fixture.session.pendingClaudeSteeringInstructions.first?.providerText, "Finished brief")
+        XCTAssertNil(vm.repromptOperations[tabID])
+        XCTAssertNil(vm.repromptUIStore.autoSendRequests[tabID])
+        XCTAssertEqual(fixture.session.draftText, "")
+        vm.invalidateRepromptIfNeeded()
+        XCTAssertEqual(fixture.session.pendingClaudeSteeringInstructions.count, 1, "Exactly once")
     }
 
     func testAutoSendIsNotSpentUntilItCanDispatch() async throws {
@@ -968,7 +1009,7 @@ final class AgentRepromptSubmissionTests: XCTestCase {
         }
     }
 
-    func testRunOrSettingsChangeInvalidatesWithoutDispatch() async throws {
+    func testClaimOrSettingsChangeInvalidatesWithoutDispatch() async throws {
         for changeSettings in [false, true] {
             let fixture = try await AgentRepromptTestFixture()
             defer { fixture.cleanUp() }
@@ -979,7 +1020,7 @@ final class AgentRepromptSubmissionTests: XCTestCase {
                 var profile = fixture.store.globalAgentModelsProfile()
                 profile.agentRepromptGuidance = "New guidance"
                 fixture.store.setGlobalAgentModelsProfile(profile, contextBuilderWriteIntent: .preserveExistingOwnership)
-            } else { fixture.session.runState = .completed }
+            } else { fixture.session.composerSubmissionToken = UUID() }
             fixture.viewModel.invalidateRepromptIfNeeded()
             XCTAssertNil(fixture.viewModel.repromptOperation)
             XCTAssertTrue(fixture.session.items.isEmpty)
