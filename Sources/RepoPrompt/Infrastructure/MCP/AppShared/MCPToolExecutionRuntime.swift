@@ -47,6 +47,7 @@ final class MCPToolExecutionRuntime {
         let executionID: UUID
         let runID: UUID?
         let connectionID: UUID?
+        let runRoutingRegistrationID: UUID?
         let toolName: String
         let lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?
         let startedAt: Date
@@ -117,6 +118,20 @@ final class MCPToolExecutionRuntime {
         return cancelledCount
     }
 
+    /// Retiring a policy may cancel only executions dispatched by that original registration.
+    /// Preserve successor executions and do not reset the shared run-wide completion counters.
+    @discardableResult
+    func cancelActiveTools(ownedBy receipt: MCPRunRoutingCleanupReceipt, reason: String?) -> Int {
+        guard receipt.routeOwner?.toolExecutionRuntime === self else { return 0 }
+        let executionIDs = activeToolExecutionsByID.values.compactMap { execution in
+            execution.runID == receipt.runID && execution.runRoutingRegistrationID == receipt.policyID
+                ? execution.executionID : nil
+        }
+        return executionIDs.reduce(into: 0) { count, executionID in
+            if cancelToolExecution(executionID: executionID, reason: reason) { count += 1 }
+        }
+    }
+
     @MainActor
     func registerToolExecution(
         executionID: UUID,
@@ -124,12 +139,14 @@ final class MCPToolExecutionRuntime {
         connectionID: UUID?,
         toolName: String,
         lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation? = nil,
+        runRoutingRegistrationID: UUID? = nil,
         cancel: @escaping () -> Void
     ) {
         let execution = ActiveToolExecution(
             executionID: executionID,
             runID: runID,
             connectionID: connectionID,
+            runRoutingRegistrationID: runRoutingRegistrationID,
             toolName: toolName,
             lifecycleCorrelation: lifecycleCorrelation,
             startedAt: Date(),

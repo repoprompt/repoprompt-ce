@@ -1178,6 +1178,74 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
         session.saveDebounceTask?.cancel()
     }
 
+    func testACPControllerShutdownConsumesOnlyItsOriginalRoutingRegistration() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let script = try AgentSessionLinkACPServerScript.write(to: directory)
+        let provider = AgentSessionLinkCapturingACPProvider(providerID: .antigravity, commandPath: script.path, environment: [:])
+        let request = ACPRunRequest(agentKind: .antigravity, modelString: nil, workspacePath: directory.path, resumeSessionID: nil, attachments: [], taskLabelKind: nil)
+        let original = try ACPAgentSessionController(provider: provider, runRequest: request)
+        let successor = try ACPAgentSessionController(provider: provider, runRequest: request)
+        let route = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: nil)
+        let runID = UUID(), client = "acp-controller-cleanup-\(UUID().uuidString)"
+        let manager = ServerNetworkManager.shared
+        await original.setExpectedMCPRunID(runID)
+        await successor.setExpectedMCPRunID(runID)
+        addTeardownBlock {
+            await original.shutdown()
+            await successor.shutdown()
+            await route.close()
+        }
+        let installed = await manager.installClientConnectionPolicy(
+            for: client, windowID: route.identity.routeID, restrictedTools: [], runID: runID,
+            purpose: .agentModeRun, routingOwner: route
+        )
+        let originalReceipt = try XCTUnwrap(installed)
+        let retained = await original.retainRoutingCleanup(originalReceipt)
+        XCTAssertTrue(retained)
+        let repeated = await original.retainRoutingCleanup(originalReceipt)
+        XCTAssertTrue(repeated)
+        let originalHostValue = await original.hostForRoutingHandoff(expectedRunID: runID)
+        let originalHost = try XCTUnwrap(originalHostValue)
+        await originalHost.registerExpectedAgentPID(12345, clientName: client, runID: runID)
+        let originalPIDs = await manager.debugExpectedAgentPIDs(for: client, runID: runID)
+        XCTAssertEqual(originalPIDs, [12345])
+        await route.close()
+        let reopened = MCPHostRouteResources(identity: route.identity, coordinator: nil)
+        addTeardownBlock { await reopened.close() }
+        let replacement = await manager.installClientConnectionPolicy(
+            for: client, windowID: route.identity.routeID, restrictedTools: ["edit_file"], runID: runID,
+            purpose: .agentModeRun, routingOwner: reopened
+        )
+        let successorReceipt = try XCTUnwrap(replacement)
+        let wrongOwner = await original.retainRoutingCleanup(successorReceipt)
+        XCTAssertFalse(wrongOwner)
+        let successorRetained = await successor.retainRoutingCleanup(successorReceipt)
+        XCTAssertTrue(successorRetained)
+        let successorHostValue = await successor.hostForRoutingHandoff(expectedRunID: runID)
+        let successorHost = try XCTUnwrap(successorHostValue)
+        await successorHost.registerExpectedAgentPID(12345, clientName: client, runID: runID)
+        await originalHost.clearExpectedAgentPID(12345, clientName: client, runID: runID)
+        await originalHost.registerExpectedAgentPID(12346, clientName: client, runID: runID)
+        let successorPIDs = await manager.debugExpectedAgentPIDs(for: client, runID: runID)
+        XCTAssertEqual(successorPIDs, [12345], "Old process cleanup and late registration cannot affect the successor, even after PID reuse")
+        await original.shutdown()
+        await original.shutdown()
+        XCTAssertTrue(originalReceipt.isConsumed)
+        XCTAssertFalse(successorReceipt.isConsumed)
+        let surviving = await manager.debugRunPolicyState(for: runID)
+        XCTAssertEqual(surviving?.restrictedTools, ["edit_file"])
+        let late = await original.retainRoutingCleanup(successorReceipt)
+        XCTAssertFalse(late)
+        await successor.shutdown()
+        XCTAssertTrue(successorReceipt.isConsumed)
+        let removed = await manager.debugRunPolicyState(for: runID)
+        XCTAssertNil(removed)
+        let removedPIDs = await manager.debugExpectedAgentPIDs(for: client)
+        XCTAssertTrue(removedPIDs.isEmpty)
+    }
+
     func testACPTaskEntryAndLeaseCompletionKeepTheirOriginalWriter() async throws {
         typealias Boundary = ACPIntegratedAgentModeRunner.StartupBoundary
         @MainActor final class Counters {

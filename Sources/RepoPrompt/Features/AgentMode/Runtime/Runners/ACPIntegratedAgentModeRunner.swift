@@ -1018,6 +1018,21 @@ final class ACPIntegratedAgentModeRunner {
         }
     }
 
+    private func retainRoutingCleanup(from lease: MCPBootstrapLease, on controller: ACPAgentSessionController) async -> Bool {
+        guard let receipts = await lease.originatingRoutingCleanupReceipts() else { return true }
+        guard !receipts.isEmpty else {
+            await lease.cancelAndCleanup()
+            return false
+        }
+        for receipt in receipts {
+            guard await controller.retainRoutingCleanup(receipt) else {
+                await lease.cancelAndCleanup()
+                return false
+            }
+        }
+        return true
+    }
+
     private func startFreshRun(
         tabID: UUID,
         session: AgentTabSession,
@@ -1037,7 +1052,8 @@ final class ACPIntegratedAgentModeRunner {
         let resumeDescription = runRequest.resumeSessionID ?? "nil"
         let workspaceDescription = runRequest.workspacePath ?? "nil"
         log("fresh start begin model=\(modelDescription) resume=\(resumeDescription) workspace=\(workspaceDescription)", runID: runID)
-        let acquired = await lease.acquire()
+        var acquired = await lease.acquire()
+        if acquired { acquired = await retainRoutingCleanup(from: lease, on: controller) }
         guard acquired else {
             log("lease acquire failed", runID: runID)
             await handleAcquireFailure(
@@ -1294,7 +1310,8 @@ final class ACPIntegratedAgentModeRunner {
                 }
 
                 if let deferredLease {
-                    let acquired = await deferredLease.acquire()
+                    var acquired = await deferredLease.acquire()
+                    if acquired { acquired = await retainRoutingCleanup(from: deferredLease, on: controller) }
                     guard await admitReused(.deferredLeaseAcquired) else { return .superseded }
                     guard acquired else {
                         let errorText = "RepoPrompt MCP routing policy could not be prepared before \(runRequest.agentKind.displayName) ACP prompt submission."

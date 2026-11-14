@@ -205,6 +205,8 @@ protocol CodexSessionControlling: AnyObject {
     func cancelCurrentTurn() async
     func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome
     func shutdown() async
+    /// Retain originating MCP cleanup through actual controller shutdown, not merely one turn.
+    func retainRoutingCleanup(_ receipt: MCPRunRoutingCleanupReceipt) -> Bool
     func revokeComputerUseAutoApproval()
     @discardableResult
     func respondToServerRequest(receipt: CodexServerRequestReceipt, result: [String: Any]) async -> CodexServerResponseDelivery
@@ -218,6 +220,11 @@ enum CodexServerResponseDelivery: Equatable {
 }
 
 extension CodexSessionControlling {
+    /// Legacy/test controllers cannot silently accept an independently owned routing resource.
+    func retainRoutingCleanup(_: MCPRunRoutingCleanupReceipt) -> Bool {
+        false
+    }
+
     func revokeComputerUseAutoApproval() {}
 
     var currentSessionReference: CodexNativeSessionController.SessionRef? {
@@ -995,6 +1002,9 @@ final class CodexNativeSessionController {
     private var lifecycleState: LifecycleState = .fresh
     /// Protected by `eventsContinuationLock`. All retirement callers join this one teardown.
     private var shutdownTask: Task<Void, Never>?
+    /// Protected by the same lock. Replacement cleanup is exact-origin and joined by shutdown.
+    private var routingCleanupReceipt: MCPRunRoutingCleanupReceipt?
+    private var routingCleanupTail: Task<Void, Never>?
 
     #if DEBUG
         enum ShutdownPhase: Equatable {
@@ -1980,6 +1990,15 @@ final class CodexNativeSessionController {
             return threadID
         }
         try prepareForStartOrResume()
+        // Snapshot before provisioning or transport awaits. A delayed PID registration and its
+        // eventual clear must stay with this policy even if this controller receives a successor.
+        let routingOrigin = withEventsStateLock { routingCleanupReceipt }
+        let pidRegistrar = routingOrigin.map { CodexAppServerClient.ExpectedAgentPIDRegistrar.serverNetworkManager(registration: $0) }
+        func routingOriginIsCurrent() -> Bool {
+            withEventsStateLock {
+                shutdownTask == nil && routingCleanupReceipt == routingOrigin && routingOrigin?.isConsumed != true
+            }
+        }
         do {
             ensureEventsStreamReady()
             try await eventHandlingMutex.withLock {
@@ -2047,14 +2066,17 @@ final class CodexNativeSessionController {
                     #endif
                     throw error
                 }
+                guard routingOriginIsCurrent() else { throw CancellationError() }
                 await client.setExpectedAgentPIDRegistration(
-                    .init(clientName: expectedMCPClientName, runID: runID)
+                    .init(clientName: expectedMCPClientName, runID: runID, registrar: pidRegistrar)
                 )
+                guard routingOriginIsCurrent() else { throw CancellationError() }
             }
             await client.updateProcessLaunchDirectory(workspacePaths.processLaunchDirectory)
             try await updateClientProcessLaunchPolicy()
             // Re-check: the pre-launch setup above has suspension points after the first check.
             try Task.checkCancellation()
+            guard routingOriginIsCurrent() else { throw CancellationError() }
             #if DEBUG
                 let spawnInitializeStartMS = perfRecorder.timestampMSIfEnabled()
             #endif
@@ -2873,6 +2895,51 @@ final class CodexNativeSessionController {
         withEventsStateLock { computerUseAutoApprovalRevoked = true }
     }
 
+    func routingProcessRegistration() async -> MCPRunRoutingProcessRegistration? {
+        let origin = withEventsStateLock {
+            shutdownTask == nil && lifecycleState != .shuttingDown && lifecycleState != .terminated ? routingCleanupReceipt : nil
+        }
+        guard let origin, !origin.isConsumed,
+              let generation = await client.healthyTransportGeneration(),
+              let pid = await client.activeExpectedAgentPID(for: origin.runID),
+              await client.healthyTransportGeneration() == generation,
+              withEventsStateLock({ shutdownTask == nil && lifecycleState != .shuttingDown && lifecycleState != .terminated && routingCleanupReceipt == origin && !origin.isConsumed })
+        else { return nil }
+        return .init(receipt: origin, pid: pid)
+    }
+
+    #if DEBUG
+        func test_waitForRoutingCleanup() async {
+            let tail = withEventsStateLock { routingCleanupTail }
+            await tail?.value
+        }
+    #endif
+
+    func retainRoutingCleanup(_ receipt: MCPRunRoutingCleanupReceipt) -> Bool {
+        withEventsStateLock {
+            guard shutdownTask == nil, lifecycleState != .shuttingDown, lifecycleState != .terminated,
+                  receipt.runID == runID, receipt.routeID == windowID,
+                  receipt.routeOwner != nil, !receipt.isConsumed,
+                  receipt.managerIdentity == ObjectIdentifier(ServerNetworkManager.shared) else { return false }
+            if let origin = routingCleanupReceipt {
+                guard origin.routeOwner === receipt.routeOwner else { return false }
+                if origin == receipt { return true }
+            }
+            let previous = routingCleanupReceipt
+            let predecessor = routingCleanupTail
+            routingCleanupReceipt = receipt
+            if let previous {
+                // Keep only the current registration on a reused controller. Older registrations
+                // are consumed by an exact-origin task, never by querying today's run policy.
+                routingCleanupTail = Task {
+                    await predecessor?.value
+                    await ServerNetworkManager.shared.cleanupRunRoutingState(ownedBy: previous)
+                }
+            }
+            return true
+        }
+    }
+
     func shutdown() async {
         let claim = withEventsStateLock { () -> (task: Task<Void, Never>, isOwner: Bool) in
             if let shutdownTask { return (shutdownTask, false) }
@@ -2938,6 +3005,16 @@ final class CodexNativeSessionController {
                     includeTransportGeneration: true
                 )
             #endif
+        }
+        let routingCleanup = withEventsStateLock { () -> (Task<Void, Never>?, MCPRunRoutingCleanupReceipt?) in
+            let captured = (routingCleanupTail, routingCleanupReceipt)
+            routingCleanupTail = nil
+            routingCleanupReceipt = nil
+            return captured
+        }
+        await routingCleanup.0?.value
+        if let receipt = routingCleanup.1 {
+            await ServerNetworkManager.shared.cleanupRunRoutingState(ownedBy: receipt)
         }
         #if DEBUG
             test_shutdownObserver?(.finished)

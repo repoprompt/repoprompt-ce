@@ -153,6 +153,7 @@ final class HeadlessAgentModeRunner {
                     break
                 }
                 await provider.dispose()
+                await lease.finishOwnedProviderRouting()
             }
         }
 

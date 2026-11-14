@@ -46,6 +46,8 @@ package protocol ACPAgentSessionHost: Sendable {
     func mergingCurrentCarrier(into environment: [String: String]) -> [String: String]
     func registerExpectedAgentPID(_ pid: pid_t, clientName: String, runID: UUID?) async
     func clearExpectedAgentPID(_ pid: pid_t, clientName: String, runID: UUID?) async
+    /// Joins resources retained by this controller's host after its process has shut down.
+    func finishControllerResources() async
     func permissionIsAutoSelectable(optionID: String?, providerID: ACPProviderID) -> Bool
     func permissionOneTimeAllow(options: [(optionID: String, kind: String)], providerID: ACPProviderID) -> String?
     func permissionOneTimeReject(options: [(optionID: String, kind: String)]) -> String?
@@ -53,4 +55,8 @@ package protocol ACPAgentSessionHost: Sendable {
         func diagnosticErrorKind(_ error: Error) -> String
         func recordRunRoutingEvent(runID: UUID, event: String, fields: [String: String]) async
     #endif
+}
+
+package extension ACPAgentSessionHost {
+    func finishControllerResources() async {}
 }
