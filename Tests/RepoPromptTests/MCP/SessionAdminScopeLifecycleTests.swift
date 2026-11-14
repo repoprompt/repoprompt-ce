@@ -6,6 +6,7 @@ import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 @testable import RepoPromptMCPServer
 import RepoPromptPersistence
+import RepoPromptSettingsCore
 import RepoPromptVCS
 import XCTest
 
@@ -9190,6 +9191,279 @@ final class SessionAdminInventoryReadTests: XCTestCase {
         try await assertExactTargetFlow(placement: "inactive")
     }
 
+    func testCommandCenterHumanCreationAndExistingSendLeaveRegularPresentationUnchanged() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            var starts = 0
+            let controller = MonitorFakeNativeController()
+            let factory: WindowStateCompositionFactory.AgentModeViewModelFactory = { windowID, prompt, manager, server in
+                let vm = AgentModeViewModel(
+                    testWindowID: windowID, testWorkspacePath: FileManager.default.temporaryDirectory.path,
+                    codexControllerFactory: { _, _, _, _, _, _ in fatalError("No Codex") },
+                    claudeControllerFactory: { _, _, _, _ in starts += 1
+                        return controller
+                    },
+                    mcpServerEnabler: { true }, testMCPServer: server,
+                    testWorkspaceFileContextStore: prompt.workspaceFileContextStore
+                )
+                vm.promptManager = prompt
+                vm.workspaceManager = manager
+                return vm
+            }
+            let fixture = try await LoadedWindowFixture.make(activeID: UUID(), parentID: nil, agentFactory: factory)
+            addTeardownBlock { @MainActor in await fixture.cleanup() }
+            _ = try await fixture.persistActiveCarriers()
+            let window = fixture.window, vm = window.agentModeViewModel
+            let priorConnected = window.apiSettingsViewModel.isClaudeCodeConnected
+            let priorCLIStatus = window.apiSettingsViewModel.claudeCodeCLIStatus
+            // The controller is fake; its provider availability must be fake too, rather than
+            // depending on the developer's installed CLI/login or bypassing production admission.
+            window.apiSettingsViewModel.isClaudeCodeConnected = true
+            window.apiSettingsViewModel.test_setClaudeCodeCLIStatus(.binaryPresent)
+            defer {
+                window.apiSettingsViewModel.isClaudeCodeConnected = priorConnected
+                window.apiSettingsViewModel.test_setClaudeCodeCLIStatus(priorCLIStatus)
+            }
+            let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            let tab = try XCTUnwrap(window.promptManager.activeComposeTabID)
+            vm.storeDraftText(for: tab, "regular foreground draft")
+            let initialAgent = vm.selectedAgent, initialModel = vm.selectedModelRaw
+            let focused = window.isCurrentlyFocused
+            let selection = AgentSessionLanePolicy.RoleSelection(
+                role: .pair,
+                agentRaw: "claudeCode",
+                modelRaw: "claude-fable-5-2",
+                reasoningEffortRaw: nil,
+                modelParameterSelections: []
+            )
+            let created = try await vm.createHumanSessionWithoutActivation(sessionName: "CC human", selection: selection, expectedWorkspaceID: workspace.id)
+            guard case let .created(sessionID, tabID, binding) = created else { return XCTFail("Expected a proven first save, got \(created)") }
+            let session = try XCTUnwrap(vm.sessions[tabID])
+            XCTAssertEqual(session.selectedAgent.rawValue, selection.agentRaw)
+            XCTAssertFalse(session.isMCPOriginated)
+            XCTAssertNil(session.mcpControlContext)
+            XCTAssertNil(session.parentSessionID)
+            XCTAssertNil(session.createdByOverseerSessionID)
+            XCTAssertNil(session.organizationalParentID)
+            XCTAssertNil(session.delegationScopeID)
+            XCTAssertEqual(session.currentRestorationBindingToken, binding)
+            XCTAssertEqual(session.restorationReadiness, .authoritative(binding, .freshBindingDurablyCreated))
+            XCTAssertEqual(starts, 0, "Creation must not start a provider")
+            XCTAssertEqual(window.promptManager.activeComposeTabID, tab)
+            XCTAssertEqual(window.workspaceManager.activeWorkspace?.activeComposeTabID, tab)
+            XCTAssertEqual(vm.currentTabID, tab)
+            XCTAssertEqual(vm.draftRuntime.text(for: tab), "regular foreground draft")
+            let props = AgentComposerProjection.props(vm: vm, subject: .tab(tabID))
+            XCTAssertEqual(props.currentTabID, tabID)
+            XCTAssertEqual(props.selectedAgent, session.selectedAgent)
+            XCTAssertEqual(props.attachments.attachments, session.pendingFileAttachments)
+            XCTAssertEqual(props.autoEffortServiceName, vm.makeComposerProps().autoEffortServiceName)
+            XCTAssertNil(props.stagedSlashCommand)
+            let endpoint = try XCTUnwrap(vm.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: tabID))
+            let row = CommandCenterSessionRow(
+                sessionID: sessionID, workspaceID: workspace.id, tabID: tabID, name: "CC human",
+                provider: nil, attention: .idle, detail: nil, provenance: .live(endpoint, sequence: 0, observedAt: Date())
+            )
+            let settings = GlobalSettingsStore.shared
+            let priorGate = settings.experimentalCommandCenter()
+            defer { settings.setExperimentalCommandCenter(priorGate, commit: false) }
+            settings.setExperimentalCommandCenter(false, commit: false)
+            XCTAssertFalse(CommandCenterSubmissionHost.edit(row, .togglePin))
+            settings.setExperimentalCommandCenter(true, commit: false)
+            XCTAssertTrue(CommandCenterSubmissionHost.edit(row, .togglePin))
+            XCTAssertTrue(window.promptManager.currentComposeTabs.first { $0.id == tabID }?.isPinned == true)
+            XCTAssertTrue(CommandCenterSubmissionHost.edit(row, .rename("CC renamed")))
+            XCTAssertEqual(window.promptManager.currentComposeTabs.first { $0.id == tabID }?.name, "CC renamed")
+            let staleRow = CommandCenterSessionRow(sessionID: sessionID, workspaceID: UUID(), tabID: tabID, name: "Wrong project", provider: nil, attention: .idle, detail: nil, provenance: row.provenance)
+            XCTAssertFalse(CommandCenterSubmissionHost.edit(staleRow, .rename("Must not rename")))
+            XCTAssertEqual(starts, 0)
+            XCTAssertEqual(vm.currentTabID, tab)
+            let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: tabID, session: session))
+            XCTAssertEqual(target.expectedSourceAgentSessionID, sessionID)
+            XCTAssertEqual(target.route, .existingAgentSession)
+            vm.storeDraftText(for: tabID, "CC actual human turn")
+            let sent = await vm.submitUserTurnCreatingSessionIfNeeded(text: "CC actual human turn", target: target, createAndActivateSessionTab: {
+                XCTFail("CC must never activate/create through Send")
+                return nil
+            })
+            guard sent == .submitted else { return XCTFail("The production submit refused the fake connected provider: \(sent)") }
+            try await AsyncTestWait.waitUntil("one native message dispatch", timeout: 15) { await controller.sentCount == 1 }
+            let messages = await controller.sentMessages
+            XCTAssertEqual(messages.count, 1)
+            XCTAssertTrue(messages[0].contains("CC actual human turn"))
+            XCTAssertEqual(starts, 1)
+            XCTAssertEqual(window.promptManager.activeComposeTabID, tab)
+            XCTAssertEqual(window.workspaceManager.activeWorkspaceID, workspace.id)
+            XCTAssertEqual(vm.draftRuntime.text(for: tab), "regular foreground draft")
+            XCTAssertEqual(vm.selectedAgent, initialAgent)
+            XCTAssertEqual(vm.selectedModelRaw, initialModel)
+            XCTAssertEqual(window.isCurrentlyFocused, focused)
+            _ = await vm.cancelAgentRun(target: vm.makeRunCancelTarget(tabID: tabID, session: session))
+            // Exercise the real shared CC actions, not the compatibility model.send branch.
+            let ccStore = AgentComposerUIStore(props: AgentComposerProjection.props(vm: vm, subject: .tab(tabID)))
+            let actions = AgentComposerActions.make(vm: vm, subject: .tab(tabID), composerUI: ccStore, windowID: window.windowID)
+            actions.storeDraft(tabID, "rejected from CC", 0)
+            let blockedTarget = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: tabID, session: session))
+            let attempt = AgentComposerSubmitAttempt(id: UUID(), target: blockedTarget, inputRevision: 1, noticeRevision: 0, rawDraftSnapshot: "rejected from CC")
+            guard case let .claimed(claim) = actions.claimSubmit(attempt) else { return XCTFail("Exact inactive claim refused") }
+            XCTAssertTrue(ccStore.hasPendingSubmission(tabID: tabID))
+            XCTAssertFalse(vm.ui.composer.hasPendingSubmission(tabID: tab))
+            actions.storeDraft(tabID, "newer typing", 0)
+            window.apiSettingsViewModel.isClaudeCodeConnected = false
+            let blocked = await actions.executeSubmit(claim, "rejected from CC")
+            guard case .blocked = blocked else { return XCTFail("Disconnected provider must reject before dispatch") }
+            XCTAssertEqual(vm.draftRuntime.text(for: tabID), "rejected from CC\nnewer typing")
+            XCTAssertFalse(ccStore.hasPendingSubmission(tabID: tabID))
+            XCTAssertFalse(vm.ui.composer.hasPendingSubmission(tabID: tabID))
+            XCTAssertFalse(session.isComposerSubmissionInFlight)
+            XCTAssertEqual(vm.draftRuntime.text(for: tab), "regular foreground draft")
+            XCTAssertEqual(vm.currentTabID, tab)
+            XCTAssertEqual(starts, 1)
+            window.apiSettingsViewModel.isClaudeCodeConnected = true
+            let priorAutoEdit = ApplyEditsApprovalStore.globalDefaultAutoEditEnabled()
+            defer { ApplyEditsApprovalStore.setGlobalDefaultAutoEditEnabled(priorAutoEdit) }
+            var humanDraft = AgentComposerDraftState(text: "production host turn", agent: .claudeCode, model: selection.modelRaw)
+            humanDraft.autoEdit = true
+            let receipt = await CommandCenterSubmissionHost.coordinator().send(
+                target: .draft(projectID: workspace.id, draftID: humanDraft.id),
+                text: humanDraft.text,
+                windowID: window.windowID,
+                selection: selection,
+                draftConfiguration: humanDraft
+            )
+            XCTAssertEqual(receipt.outcome, .sent, receipt.message ?? "production host receipt")
+            let hostedID = try XCTUnwrap(receipt.sessionID)
+            let hosted = try XCTUnwrap(CommandCenterSubmissionHost.owner(hostedID))
+            XCTAssertTrue(hosted.session.autoEditEnabled)
+            XCTAssertFalse(hosted.session.isMCPOriginated)
+            XCTAssertEqual(hosted.session.restorationReadiness, .authoritative(hosted.binding, .freshBindingDurablyCreated))
+            try await AsyncTestWait.waitUntil("production host native dispatch", timeout: 15) { await controller.sentCount == 2 }
+            XCTAssertEqual(vm.currentTabID, tab)
+            XCTAssertEqual(window.promptManager.activeComposeTabID, tab)
+            _ = await vm.cancelAgentRun(target: vm.makeRunCancelTarget(tabID: hosted.session.tabID, session: hosted.session))
+        }
+    }
+
+    func testCommandCenterConversationLoadsExactInactiveTabWithoutChangingRegularPresentation() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let foregroundID = UUID(), targetID = UUID()
+            var providerStarts = 0
+            let factory: WindowStateCompositionFactory.AgentModeViewModelFactory = { windowID, prompt, manager, server in
+                let vm = AgentModeViewModel(
+                    testWindowID: windowID, testWorkspacePath: FileManager.default.temporaryDirectory.path,
+                    codexControllerFactory: { _, _, _, _, _, _ in fatalError("Conversation loading must not start Codex") },
+                    headlessProviderFactory: { _, _ in
+                        providerStarts += 1
+                        return AgentSessionLinkCapturingHeadlessProvider()
+                    }, mcpServerEnabler: { false }, testMCPServer: server,
+                    testWorkspaceFileContextStore: prompt.workspaceFileContextStore
+                )
+                vm.promptManager = prompt
+                vm.workspaceManager = manager
+                return vm
+            }
+            let fixture = try await LoadedWindowFixture.make(activeID: foregroundID, parentID: nil, agentFactory: factory)
+            addTeardownBlock { @MainActor in await fixture.cleanup() }
+            let window = fixture.window, vm = window.agentModeViewModel
+            let initial = try XCTUnwrap(fixture.carriers)
+            let foregroundTab = try XCTUnwrap(initial.activeComposeTabID)
+            if let prior = vm.sessions[foregroundTab] {
+                prior.saveDebounceTask?.cancel()
+                prior.persistedLoadTask?.cancel()
+                await prior.persistedLoadTask?.value
+            }
+            _ = try await AgentSessionDataService.shared.saveAgentSession(AgentSession(
+                id: foregroundID, workspaceID: initial.id, composeTabID: foregroundTab, name: "Foreground",
+                transcript: AgentTranscriptIO.buildTranscript(from: [.user("foreground conversation", sequenceIndex: 0)], terminalState: .idle),
+                agentKind: "claudeCode", agentModel: "", isMCPOriginated: false
+            ), for: initial)
+            vm.test_removeSession(tabID: foregroundTab)
+            try fixture.installCarriers()
+            _ = await vm.ensureSessionReady(tabID: foregroundTab, reconnectActiveProviders: false)
+            // Use the existing non-activating tab owner instead of manufacturing a document
+            // replacement. Stashed carriers deliberately have no canonical runtime-owner route.
+            let created = await window.promptManager.createBackgroundComposeTab(
+                strategy: .blank, name: "Selected", freshAgentSessionID: targetID
+            )
+            let targetTab = try XCTUnwrap(created)
+            await window.workspaceManager.awaitOwnSavesForWindowClose()
+            let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            XCTAssertEqual(workspace.activeComposeTabID, foregroundTab)
+            XCTAssertTrue(workspace.composeTabs.contains { $0.id == targetTab.id && $0.activeAgentSessionID == targetID })
+            let rows = [AgentChatItem.user("selected conversation", sequenceIndex: 0), AgentChatItem.assistant("saved reply", sequenceIndex: 1)]
+            let savedFile = try await AgentSessionDataService.shared.saveAgentSession(AgentSession(
+                id: targetID, workspaceID: workspace.id, composeTabID: targetTab.id, name: targetTab.name,
+                transcript: AgentTranscriptIO.buildTranscript(from: rows, terminalState: .idle),
+                agentKind: "claudeCode", agentModel: "", isMCPOriginated: false
+            ), for: workspace)
+            fixture.carriers = workspace
+            fixture.indexEntries[targetID] = AgentSessionIndexEntry(
+                id: targetID, tabID: targetTab.id, name: targetTab.name, savedAt: Date(), itemCount: 2,
+                autoEditEnabled: false, hasUnknownConversationContent: false, isMCPOriginated: false,
+                worktreeBindingSummaries: [], activeWorktreeMergeSummaries: []
+            )
+            try fixture.installCarriers()
+            vm.test_removeSession(tabID: targetTab.id)
+            vm.storeDraftText(for: foregroundTab, "regular draft")
+            let foregroundSnapshot = vm.ui.transcript.snapshot
+            let selectedAgent = vm.selectedAgent
+            let selectedModel = vm.selectedModelRaw
+            let focus = window.isCurrentlyFocused
+            let windows = WindowStatesManager.shared.allWindows.map(\.windowID)
+            let selectedRow = CommandCenterSessionRow(
+                sessionID: targetID, workspaceID: workspace.id, tabID: targetTab.id, name: "Selected",
+                provider: nil, attention: .saved, detail: nil, provenance: .saved(recordedAt: Date())
+            )
+            let savedBytes = try Data(contentsOf: savedFile)
+            XCTAssertNil(SessionAdminWindows.runtimeOwner(for: targetID))
+            let conversation = CommandCenterConversationModel(isEnabled: { true }, load: {
+                await CommandCenterConversationHost.load($0, isEnabled: { true }, workspaceStore: fixture.runtime.workspaceStore)
+            })
+            defer { conversation.stop() }
+            conversation.select(selectedRow)
+            try await AsyncTestWait.waitUntil("selected inactive conversation loaded", timeout: 10) {
+                !conversation.isLoading
+            }
+            XCTAssertNil(conversation.message)
+            XCTAssertTrue(try XCTUnwrap(conversation.snapshot).rows.contains { $0.text == "selected conversation" })
+            XCTAssertEqual(conversation.selectedID, selectedRow.id)
+            XCTAssertEqual(window.promptManager.activeComposeTabID, foregroundTab)
+            XCTAssertEqual(window.workspaceManager.activeWorkspaceID, workspace.id)
+            XCTAssertEqual(window.workspaceManager.activeWorkspace?.stashedTabs.count, 0)
+            XCTAssertEqual(vm.ui.transcript.snapshot, foregroundSnapshot)
+            XCTAssertEqual(vm.draftRuntime.text(for: foregroundTab), "regular draft")
+            XCTAssertEqual(vm.selectedAgent, selectedAgent)
+            XCTAssertEqual(vm.selectedModelRaw, selectedModel)
+            XCTAssertEqual(window.isCurrentlyFocused, focus)
+            XCTAssertEqual(WindowStatesManager.shared.allWindows.map(\.windowID), windows)
+            XCTAssertEqual(providerStarts, 0)
+            XCTAssertNil(conversation.snapshot?.windowID, "Saved history has no runtime action route")
+            XCTAssertNil(vm.sessions[targetTab.id], "Browsing must not materialize the inactive session")
+            XCTAssertNil(SessionAdminWindows.runtimeOwner(for: targetID))
+            XCTAssertEqual(try Data(contentsOf: savedFile), savedBytes)
+            // A separate explicit owner activation may later make this session live. The
+            // conversation must then adopt that exact owner, never manufacture another.
+            _ = await vm.ensureSessionReady(tabID: targetTab.id, reconnectActiveProviders: false)
+            let canonical = try XCTUnwrap(SessionAdminWindows.runtimeOwner(for: targetID))
+            conversation.refresh()
+            try await AsyncTestWait.waitUntil("saved conversation follows explicit live owner", timeout: 10) {
+                conversation.snapshot?.windowID == window.windowID
+            }
+            XCTAssertTrue(SessionAdminWindows.runtimeOwner(for: targetID)?.session === canonical.session)
+            XCTAssertTrue(canonical.location.window === window)
+            XCTAssertTrue(vm.sessions[targetTab.id] === canonical.session)
+            canonical.session.appendItem(.assistant("background update", sequenceIndex: 10))
+            conversation.refresh()
+            XCTAssertTrue(try XCTUnwrap(conversation.snapshot).rows.contains { $0.text == "background update" })
+            XCTAssertEqual(vm.ui.transcript.snapshot, foregroundSnapshot)
+            XCTAssertEqual(window.promptManager.activeComposeTabID, foregroundTab)
+            XCTAssertEqual(providerStarts, 0)
+        }
+    }
+
+    func testCommandCenterCensusWitnessesPreparedOwnerWithoutPresentationOrAuthority() async throws {
+        try await assertExactTargetFlow(placement: "historical", checksLookout: true)
+    }
+
     func testPreparedSavedOwnerIsReleasedAfterLinkRetirement() async throws {
         try await assertExactTargetFlow(placement: "historical", retirement: "retire")
     }
@@ -9278,7 +9552,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
         try await assertExactTargetFlow(placement: "historical", duringRun: "shutdown-active", longWatch: true)
     }
 
-    private func assertExactTargetFlow(placement: String, retirement: String = "revoke", checksConnectionChanges: Bool = false, duringRun: String? = nil, longWatch: Bool = false, terminalStatus: NativeAgentRuntimeTurnStatus = .completed, reconnectBeforeActivation: Bool = false, deferredFixturePublication: Bool = false) async throws {
+    private func assertExactTargetFlow(placement: String, retirement: String = "revoke", checksConnectionChanges: Bool = false, duringRun: String? = nil, longWatch: Bool = false, terminalStatus: NativeAgentRuntimeTurnStatus = .completed, reconnectBeforeActivation: Bool = false, deferredFixturePublication: Bool = false, checksLookout: Bool = false) async throws {
         // This is the full-access OFF approval-card flow. Never inherit the machine's real setting.
         let previousFullAccess = OverseerGlobalAutoApprove.isEnabled
         OverseerGlobalAutoApprove.isEnabled = { false }
@@ -9666,6 +9940,22 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             } catch {
                 return XCTFail("Provider dispatch did not settle: starts=\(providerStarts), state=\(String(describing: targetVM.sessions[targetTab.id]?.runState)), items=\(String(describing: targetVM.sessions[targetTab.id]?.items.map(\.text))), decisions=\(decisions)")
             }
+            var lookoutRows: [AgentSessionStatusCensus.Row] = []
+            let lookout = checksLookout ? AgentSessionStatusCensus.appCensus(isEnabled: { true }) : nil
+            defer { lookout?.stop() }
+            if let lookout {
+                let startsBefore = providerStarts
+                lookout.start { lookoutRows = $0 }
+                lookout.refresh()
+                let witnessed = try XCTUnwrap(lookoutRows.first { $0.sample.candidate.sessionID == targetID })
+                XCTAssertEqual(witnessed.sample.status?.status, .running)
+                XCTAssertEqual(witnessed.sample.outcome, .running)
+                XCTAssertTrue(manager.preparedOversightWindows[targetID]?.windowID == witnessed.sample.candidate.windowID)
+                XCTAssertEqual(providerStarts, startsBefore, "Looking never dispatches a provider")
+                XCTAssertEqual(manager.allWindows.map(\.windowID), windowIDsBefore)
+                XCTAssertEqual(targetFixture.window.promptManager.activeComposeTabID, selectedBefore)
+                XCTAssertEqual(targetFixture.window.isCurrentlyFocused, focusedBefore)
+            }
             // Retry while the app-owned continuation is watching: point at it, never steer twice.
             if realCatalog {
                 try await AsyncTestWait.waitUntil("resumed requester has a real catalog connection", timeout: 15) { observer.runID.flatMap { connections[$0] } != nil || !connectionErrors.isEmpty }
@@ -9910,6 +10200,13 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 bridge.test_activeOverseeWatches == 0 && bridge.delegationScopes.test_activeOverseeContinuationCount == 0
             }
             XCTAssertEqual(decisions.count(where: { $0.contains(terminalNotice) }), 1)
+            if checksLookout {
+                try await AsyncTestWait.waitUntil("Lookout receives prepared-owner terminal status through settled signals", timeout: 5) {
+                    lookoutRows.contains { $0.sample.candidate.sessionID == targetID && $0.sample.outcome == .completed }
+                }
+                XCTAssertEqual(providerStarts, 1)
+                XCTAssertEqual(manager.allWindows.map(\.windowID), windowIDsBefore)
+            }
             if duringRun == "visit" {
                 try await AsyncTestWait.waitUntil("queued UI visit hydrates the completed session without a second click", timeout: 15) {
                     manager.preparedOversightWindows[targetID] == nil

@@ -561,7 +561,7 @@ private enum PersistentWorkspaceCreationError: LocalizedError {
     }
 }
 
-private enum PersistentFolderOpenError: LocalizedError {
+enum PersistentFolderOpenError: LocalizedError {
     case invalidFolder
     case authoritySnapshotUnavailable
     case authorityConflictUnresolved
@@ -18524,73 +18524,31 @@ class WorkspaceManagerViewModel: ObservableObject {
             )
         }
 
-        let authoritySnapshot = await domainWorkspaceAuthorityClient.snapshot()
-        #if DEBUG
-            await persistentFolderOpenDidSnapshotHandlerForTesting?()
-        #endif
-
-        try Task.checkCancellation()
-        let candidates = try persistentFolderOpenCandidates(from: authoritySnapshot)
-        let workspace = WorkspaceModel(
-            name: uniqueWorkspaceName(
-                baseName: folderURL.lastPathComponent,
-                in: candidates
-            ),
-            repoPaths: [folderURL.path],
-            isSavedWorkspace: true
-        )
-        let fileURL = workspaceFileURL(for: workspace)
-        guard let canonicalRootPath = WorkspaceRootSetKey(paths: [folderURL.path])
-            .normalizedPaths.first?.lowercased()
-        else {
-            throw PersistentFolderOpenError.invalidFolder
-        }
-        let outcome: DomainCommandOutcome
+        let resolved: PersistentFolderWorkspaceResolver.Resolution
         do {
-            outcome = try await domainWorkspaceAuthorityClient.resolveOrCreatePersistentWorkspace(
-                workspace,
-                fileURL: fileURL,
-                canonicalRootPath: canonicalRootPath,
-                operationID: operationID
+            resolved = try await PersistentFolderWorkspaceResolver.resolve(
+                folderURL: folderURL, client: domainWorkspaceAuthorityClient,
+                fileURL: { self.workspaceFileURL(for: $0) },
+                afterSnapshot: {
+                    #if DEBUG
+                        await self.persistentFolderOpenDidSnapshotHandlerForTesting?()
+                    #endif
+                }, operationID: operationID
             )
-        } catch {
-            reportDomainAuthorityFailure(
-                error,
-                workspaceID: workspace.id,
-                operation: "open_folder_resolve_or_create"
-            )
-            throw error
+        } catch let failure as PersistentFolderWorkspaceResolver.Failure {
+            switch failure {
+            case let .snapshot(error), let .projection(error): reportDomainProjectionFailure(error)
+            case let .command(id, error): reportDomainAuthorityFailure(error, workspaceID: id, operation: "open_folder_resolve_or_create")
+            case let .outcome(id, outcome):
+                if !Self.isSuccessfulDomainOutcome(outcome) || outcome.workspace == nil { applyDomainAuthorityOutcome(outcome, workspaceID: id) }
+                reportDomainAuthorityIssue(outcome, operation: "open_folder_resolve_or_create")
+            }
+            throw failure.underlying
         }
-
-        guard Self.isSuccessfulDomainOutcome(outcome),
-              let outcomeWorkspace = outcome.workspace
-        else {
-            applyDomainAuthorityOutcome(outcome, workspaceID: workspace.id)
-            reportDomainAuthorityIssue(outcome, operation: "open_folder_resolve_or_create")
-            throw DomainWorkspaceAuthorityOperationError(outcome: outcome)
-        }
-
-        let provenance: PersistentFolderOpenProvenance
-        switch outcome.exactRootResolution {
-        case .created:
-            provenance = .created
-        case .reused:
-            provenance = .reused
-        case .recoveryBlocked, nil:
-            reportDomainAuthorityIssue(outcome, operation: "open_folder_resolve_or_create")
-            throw DomainWorkspaceAuthorityOperationError(outcome: outcome)
-        }
-
-        let canonical: WorkspaceModel
-        do {
-            canonical = try Self.decodeDomainWorkspaceProjection(
-                documentBytes: outcomeWorkspace.document.documentBytes,
-                fileURL: outcomeWorkspace.document.fileURL
-            )
-        } catch {
-            reportDomainProjectionFailure(error)
-            throw error
-        }
+        let outcome = resolved.outcome
+        let outcomeWorkspace = resolved.snapshot
+        let canonical = resolved.workspace
+        let provenance = resolved.provenance
         applyDomainAuthorityOutcome(outcome, workspaceID: canonical.id)
         domainWorkspaceFileURLsByID[canonical.id] = outcomeWorkspace.document.fileURL
         if let index = workspaceIndex(for: canonical.id) {
