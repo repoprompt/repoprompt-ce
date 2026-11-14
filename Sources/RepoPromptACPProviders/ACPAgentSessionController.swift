@@ -329,6 +329,7 @@ package actor ACPAgentSessionController {
     private var stdoutConsumerTask: Task<Void, Never>?
     private var stderrConsumerTask: Task<Void, Never>?
     private var processWaitTask: Task<Void, Never>?
+    private var shutdownTask: Task<Void, Never>?
     private var stdoutFramer = LineFramer()
     private var stderrFramer = LineFramer()
     private var launchDescription: String?
@@ -540,6 +541,15 @@ package actor ACPAgentSessionController {
 
     package func setExpectedMCPRunID(_ runID: UUID?) {
         expectedMCPRunID = runID
+    }
+
+    /// The app may attach routing resources only to this still-live original process host.
+    /// This is not session command admission or evidence of shutdown completion.
+    package func hostForRoutingHandoff(expectedRunID: UUID) -> (any ACPAgentSessionHost)? {
+        guard expectedMCPRunID == expectedRunID, shutdownTask == nil,
+              state != .closing, state != .closed
+        else { return nil }
+        return host
     }
 
     package func setAutoApproveAllToolPermissions(_ enabled: Bool) {
@@ -1811,8 +1821,21 @@ package actor ACPAgentSessionController {
         #if DEBUG
             debugResumeConfigurationMutationPostcheck()
         #endif
-        guard state != .closed, state != .closing else { return }
+        if let shutdownTask {
+            log("Joining ACP controller shutdown")
+            await shutdownTask.value
+            return
+        }
+        guard state != .closed else { return }
         state = .closing
+        // The original producer is retained before the first suspension. Cancellation of a
+        // caller must not turn `.closing` into a false completion acknowledgement.
+        let task = Task { await self.performShutdown() }
+        shutdownTask = task
+        await task.value
+    }
+
+    private func performShutdown() async {
         recentDevinToolCalls.removeAll()
         recentDevinToolCallIDs.removeAll()
         promptImagesSupported = false
@@ -1837,6 +1860,7 @@ package actor ACPAgentSessionController {
 
         await clearExpectedAgentPIDIfNeeded()
         await cleanupLaunchArtifacts()
+        await host.finishControllerResources()
 
         stdoutChannel = nil
         stderrChannel = nil

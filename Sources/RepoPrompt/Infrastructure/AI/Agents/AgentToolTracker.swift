@@ -112,9 +112,9 @@ actor AgentToolTracker {
 
         if let token {
             await manager.unregisterToolEventObserver(for: runID, token: token)
-        } else {
-            await manager.unregisterToolObservers(for: runID)
         }
+        // Registration publishes trackedRunID and token together. No token means no owned
+        // observer, never permission to unregister another tracker's run-scoped observers.
     }
 
     /// Detaches the observer if one was registered.

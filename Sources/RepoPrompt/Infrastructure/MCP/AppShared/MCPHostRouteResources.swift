@@ -10,6 +10,34 @@ import RepoPromptMCPServer
 final class MCPHostRouteResources {
     enum RegistrationFailure: Error { case closing, wrongRoute, differentCatalog }
 
+    struct ConnectionKey: Hashable {
+        let owner: ObjectIdentifier
+        let connectionID: UUID
+    }
+
+    func connectionKey(_ connectionID: UUID) -> ConnectionKey {
+        .init(owner: ObjectIdentifier(self), connectionID: connectionID)
+    }
+
+    struct PolicyContextInstallation {
+        let token: MCPRunRouteBindings.PendingPolicyToken
+        let workspaceID: UUID?
+        let tabID: UUID?
+    }
+
+    /// The catalog's actual context owner supplies these operations. No window lookup is part of
+    /// registration or teardown; the original route and token are passed to every operation.
+    struct RunRouting {
+        let install: @MainActor (MCPHostRouteResources, MCPRunRoutingCleanupReceipt, UUID, String?, UUID?) -> PolicyContextInstallation?
+        let rollback: @MainActor (MCPHostRouteResources, MCPRunRouteBindings.PendingPolicyToken, String?, UUID?) -> MCPServerViewModel.PendingPolicyRunIDMappingRollbackResult
+        let removeContext: @MainActor (MCPHostRouteResources, MCPRunRoutingCleanupReceipt, UUID) -> Void
+    }
+
+    private struct RetainedConnection {
+        let registration: DomainConnectionRegistration
+        let policyID: UUID?
+    }
+
     let identity: MCPHostRouteIdentity
     let coordinator: DomainRoutingCoordinator?
     private let domainRuntime: MCPDomainRuntime
@@ -20,12 +48,13 @@ final class MCPHostRouteResources {
     private var ownerLifetime: MCPRunRouteBindings.OwnerLifetime?
     private(set) var isClosing = false
     var descriptor: DomainWindowDescriptor?
-    private var connections: [UUID: DomainConnectionRegistration] = [:]
+    private var connections: [UUID: RetainedConnection] = [:]
     private var registrationTask: Task<DomainWindowDescriptor?, Never>?
     private var closeTask: Task<Void, Never>?
     private var catalogTransitionTail: Task<Void, Never>?
     private(set) var catalogHandle: MCPDomainToolRegistrationHandle?
     private var catalog: MCPAppToolCatalogRegistration?
+    private var runRouting: RunRouting?
     private var presentationRevision: UInt64 = 0
     private var routingPublicationTail: Task<Void, Never>?
 
@@ -67,13 +96,15 @@ final class MCPHostRouteResources {
         guard !isClosing else { return nil }
         registrationTask = nil
         descriptor = registered
+        AppDomainRuntimeComposition.shared.recordRouteResources(self, in: domainRuntime)
         return registered
     }
 
     /// Publish against this route's descriptor, never a successor presentation's route.
     /// The tail serializes binding and release effects and is joined by route teardown.
-    func publishBinding(connectionID: UUID, context: MCPTabContextSnapshot) {
-        guard let coordinator, !isClosing else { return }
+    func publishBinding(connectionID: UUID, context: MCPTabContextSnapshot, cleanupReceipt: MCPRunRoutingCleanupReceipt? = nil) {
+        let ownership = cleanupReceipt?.mappingOwnership ?? runRouteBindings.cleanupOwnership(for: connectionID)
+        guard let coordinator, !isClosing, ownership?.isConsumed != true else { return }
         if presentationRevision < .max { presentationRevision += 1 }
         let revision = presentationRevision
         let binding: DomainBinding = if let workspaceID = context.workspaceID {
@@ -88,7 +119,7 @@ final class MCPHostRouteResources {
         let predecessor = routingPublicationTail
         routingPublicationTail = Task { @MainActor [weak self] in
             await predecessor?.value
-            guard let self, !isClosing else { return }
+            guard let self, !isClosing, ownership?.isConsumed != true else { return }
             guard let descriptor = await ensureRegistered(
                 workspaceID: context.workspaceID, contextID: context.tabID, revision: revision
             ), !isClosing else { return }
@@ -100,9 +131,19 @@ final class MCPHostRouteResources {
             let updated = await coordinator.registerWindow(updatedDescriptor, operationID: UUID())
             guard !isClosing, updated.disposition != .staleGeneration else { return }
             self.descriptor = updated.snapshot.windows.first { $0.windowID == self.identity.routeID }
-            var registration = updated.snapshot.connections.first {
-                $0.registration.connectionID == connectionID
-            }?.registration
+            guard ownership?.isConsumed != true else { return }
+            // A new owned policy gets a new domain connection generation, even when the numeric
+            // connection/run IDs are reused. Old route cleanup then cannot retract its successor.
+            var registration: DomainConnectionRegistration?
+            if let ownership {
+                if connections[connectionID]?.policyID == ownership.policyID {
+                    registration = connections[connectionID]?.registration
+                }
+            } else {
+                registration = updated.snapshot.connections.first {
+                    $0.registration.connectionID == connectionID
+                }?.registration
+            }
             if registration == nil {
                 let registered = await coordinator.registerConnection(connectionID: connectionID, operationID: UUID())
                 registration = registered.snapshot.connections.first {
@@ -110,8 +151,8 @@ final class MCPHostRouteResources {
                 }?.registration
             }
             guard let registration else { return }
-            retainConnection(registration)
-            guard !isClosing else { return }
+            connections[connectionID] = RetainedConnection(registration: registration, policyID: ownership?.policyID)
+            guard !isClosing, ownership?.isConsumed != true else { return }
             let bound = await coordinator.bind(connection: registration, binding: binding, operationID: UUID())
             if bound.disposition != .applied, bound.disposition != .unchanged {
                 logger.warning("Domain routing bind rejected: \(bound.diagnostic ?? String(describing: bound.disposition))")
@@ -120,11 +161,40 @@ final class MCPHostRouteResources {
     }
 
     func publishRelease(connectionID: UUID) {
+        let ownership = runRouteBindings.cleanupOwnership(for: connectionID)
         let predecessor = routingPublicationTail
         routingPublicationTail = Task { @MainActor in
             await predecessor?.value
-            await self.releaseDisconnectedConnection(connectionID)
+            if let ownership {
+                guard let retained = self.connections[connectionID], retained.policyID == ownership.policyID else { return }
+                self.connections.removeValue(forKey: connectionID)
+                await self.releaseConnection(retained.registration)
+            } else {
+                await self.releaseDisconnectedConnection(connectionID)
+            }
         }
+    }
+
+    func installPendingPolicy(_ receipt: MCPRunRoutingCleanupReceipt, connectionID: UUID, clientName: String?, tabID: UUID?) -> PolicyContextInstallation? {
+        guard !isClosing, !receipt.isConsumed, receipt.routeOwner === self else { return nil }
+        return runRouting?.install(self, receipt, connectionID, clientName, tabID)
+    }
+
+    func rollbackPendingPolicy(_ receipt: MCPRunRoutingCleanupReceipt, token: MCPRunRouteBindings.PendingPolicyToken, clientName: String?) -> MCPServerViewModel.PendingPolicyRunIDMappingRollbackResult? {
+        guard receipt.routeOwner === self else { return nil }
+        return runRouting?.rollback(self, token, clientName, receipt.routingWaitGeneration)
+    }
+
+    func consumeCleanup(_ receipt: MCPRunRoutingCleanupReceipt) async {
+        guard receipt.routeOwner === self else { return }
+        runRouteBindings.consumeCleanup(receipt) { connectionID in
+            runRouting?.removeContext(self, receipt, connectionID)
+            // The mutable snapshot may already have been consumed by a committed child; its
+            // original domain registration still needs release. Repeated release is exact/idempotent.
+            publishRelease(connectionID: connectionID)
+        }
+        await settleRoutingPublications()
+        releaseContextOwnerIfUnregisteredAndDrained()
     }
 
     func settleRoutingPublications() async {
@@ -154,6 +224,7 @@ final class MCPHostRouteResources {
             throw RegistrationFailure.closing
         }
         self.catalog = catalog
+        runRouting = catalog.runRouting
         catalogHandle = registration.handle
         return registration.handle
     }
@@ -170,7 +241,7 @@ final class MCPHostRouteResources {
             await AppDomainRuntimeComposition.shared.unregister(handle, in: self.domainRuntime)
             if self.catalogHandle == handle {
                 self.catalogHandle = nil
-                self.catalog = nil
+                self.releaseContextOwnerIfUnregisteredAndDrained()
             }
         }
         catalogTransitionTail = task
@@ -185,12 +256,22 @@ final class MCPHostRouteResources {
         await catalogTransitionTail?.value
         if let handle = catalogHandle { await unregisterCatalog(handle) }
         await closeDomainRoute()
+        // A prematurely closed route must retain its original context cleanup operations until
+        // their mappings have been consumed; never resolve a reopened catalog for that obligation.
+        releaseContextOwnerIfUnregisteredAndDrained()
+    }
+
+    private func releaseContextOwnerIfUnregisteredAndDrained() {
+        guard catalogHandle == nil, runRouteBindings.connectionIDToRunID.isEmpty,
+              !runRouteBindings.hasRetainedCleanupOwnership else { return }
+        catalog = nil
+        runRouting = nil
     }
 
     /// Retain the observed registration even if close has just begun: teardown must retract an
     /// in-flight producer's exact effect. This receipt is cleanup ownership, not fresh admission.
     func retainConnection(_ registration: DomainConnectionRegistration) {
-        connections[registration.connectionID] = registration
+        connections[registration.connectionID] = RetainedConnection(registration: registration, policyID: nil)
     }
 
     /// Transport disconnect may arrive through a different legacy server than the provider that
@@ -199,7 +280,7 @@ final class MCPHostRouteResources {
         guard let coordinator else { return }
         let snapshot = await coordinator.snapshot()
         guard let registration = snapshot.connections.first(where: { $0.registration.connectionID == connectionID })?.registration else { return }
-        if connections[connectionID] == registration { connections.removeValue(forKey: connectionID) }
+        if connections[connectionID]?.registration == registration { connections.removeValue(forKey: connectionID) }
         await releaseConnection(registration)
     }
 
@@ -236,10 +317,11 @@ final class MCPHostRouteResources {
                 self.descriptor = await registration.value
             }
             self.registrationTask = nil
+            defer { AppDomainRuntimeComposition.shared.forgetRouteResources(self, in: self.domainRuntime) }
             guard let coordinator = self.coordinator else { return }
             for connectionID in Array(self.connections.keys) {
                 guard let registration = self.connections.removeValue(forKey: connectionID) else { continue }
-                await self.releaseConnection(registration)
+                await self.releaseConnection(registration.registration)
             }
             guard let descriptor = self.descriptor else { return }
             _ = await coordinator.unregisterWindow(

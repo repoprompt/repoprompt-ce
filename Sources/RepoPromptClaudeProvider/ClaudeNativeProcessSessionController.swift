@@ -50,7 +50,31 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
     private var hasWrittenRawEventLogHeader = false
 
     private var process: SpawnedProcess?
-    private var registeredExpectedAgentPID: pid_t?
+    /// Captured for one process launch; cleanup never asks for a run's latest registrar.
+    package struct ExpectedAgentPIDRegistrar {
+        package let register: @Sendable (pid_t, String, UUID) async -> Void
+        package let clear: @Sendable (pid_t, String, UUID) async -> Void
+
+        package init(
+            register: @escaping @Sendable (pid_t, String, UUID) async -> Void,
+            clear: @escaping @Sendable (pid_t, String, UUID) async -> Void
+        ) {
+            self.register = register
+            self.clear = clear
+        }
+    }
+
+    private struct ExpectedAgentPIDRegistration {
+        let id = UUID()
+        let pid: pid_t
+        let clientName: String
+        let registrar: ExpectedAgentPIDRegistrar
+        let registration: Task<Void, Never>
+        var cleanup: Task<Void, Never>?
+    }
+
+    private var registeredExpectedAgentPID: ExpectedAgentPIDRegistration?
+    private var shutdownTask: Task<Void, Never>?
     private var stdoutFramer = LineFramer()
     private var stderrTail = Data()
     private var stdoutChunkChannel: FileHandleChunkChannel?
@@ -230,17 +254,15 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
 
     /// Clears MCP expected-agent PID registration when async `shutdown()` did not run.
     private func scheduleExpectedAgentPIDDeinitClearIfNeeded() {
-        guard config.toolContext == .agentRun,
-              let registeredExpectedAgentPID,
-              let clientName = host.expectedAgentClientName(for: config.runtimeVariant)
-        else {
-            return
-        }
-        let pid = registeredExpectedAgentPID
+        guard let origin = registeredExpectedAgentPID else { return }
         let runID = runID
-        let host = host
         Task {
-            await host.clearExpectedAgentPID(pid, clientName: clientName, runID: runID)
+            if let cleanup = origin.cleanup {
+                await cleanup.value
+            } else {
+                await origin.registration.value
+                await origin.registrar.clear(origin.pid, origin.clientName, runID)
+            }
         }
     }
 
@@ -323,6 +345,24 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
         effortLevel: ClaudeCodeEffortLevel? = nil,
         systemPromptOverride: String? = nil
     ) async throws -> SessionRef {
+        try await startOrResume(
+            existingSessionID: existingSessionID, model: model, effortLevel: effortLevel,
+            systemPromptOverride: systemPromptOverride, expectedAgentPIDRegistrar: nil
+        )
+    }
+
+    package func startOrResume(
+        existingSessionID: String?,
+        model: String?,
+        effortLevel: ClaudeCodeEffortLevel?,
+        systemPromptOverride: String?,
+        expectedAgentPIDRegistrar: ExpectedAgentPIDRegistrar?
+    ) async throws -> SessionRef {
+        if let shutdownTask {
+            await shutdownTask.value
+            try Task.checkCancellation()
+            self.shutdownTask = nil
+        }
         if hasActiveSession, isInitialized {
             return SessionRef(sessionID: sessionID)
         }
@@ -357,7 +397,9 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
         )
         do {
             try await prepareRuntimeIfNeeded()
-            try await startProcessIfNeeded(existingSessionID: existingSessionID, model: model, effortLevel: effortLevel)
+            guard !isShuttingDown else { throw ControllerError.processNotRunning }
+            try await startProcessIfNeeded(existingSessionID: existingSessionID, model: model, effortLevel: effortLevel, expectedAgentPIDRegistrar: expectedAgentPIDRegistrar)
+            guard !isShuttingDown else { throw ControllerError.processNotRunning }
             try await initializeIfNeeded(systemPromptOverride: systemPromptOverride)
             return SessionRef(sessionID: sessionID)
         } catch {
@@ -615,7 +657,10 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
     }
 
     package func shutdown() async {
-        guard !isShuttingDown else { return }
+        if let shutdownTask {
+            await shutdownTask.value
+            return
+        }
         isShuttingDown = true
         configurationLifetime = UUID()
         appliedConfigurationProof = nil
@@ -634,6 +679,13 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
 
         closeOutputChannelsAndInput()
 
+        let process = process
+        let task = Task { await self.finishShutdown(process: process) }
+        shutdownTask = task
+        await task.value
+    }
+
+    private func finishShutdown(process: SpawnedProcess?) async {
         if let process {
             let pid = process.pid
             _ = await ProcessTermination.terminateAndReap(
@@ -645,7 +697,7 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
         await clearExpectedAgentPIDIfNeeded()
         pendingPermissionRequests.removeAll()
         permissionReceiptByNativeID.removeAll()
-        process = nil
+        self.process = nil
         activeLaunchEnvironmentSignature = nil
         isInitialized = false
         hasCompletedInitialFlagSettings = false
@@ -666,17 +718,25 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
             return
         }
 
+        let origin = configurationLifetime
         let isRunning = await host.isMCPServerRunning()
+        guard !isShuttingDown, configurationLifetime == origin, !Task.isCancelled else { throw CancellationError() }
         guard isRunning else {
             throw AIProviderError.invalidConfiguration(detail: "Could not start MCP server. Check MCP settings and try again.")
         }
-        configLease = try await host.prepareMCPLaunchConfig()
+        let lease = try await host.prepareMCPLaunchConfig()
+        guard !isShuttingDown, configurationLifetime == origin, !Task.isCancelled else {
+            lease.release()
+            throw CancellationError()
+        }
+        configLease = lease
     }
 
     private func startProcessIfNeeded(
         existingSessionID: String?,
         model: String?,
-        effortLevel: ClaudeCodeEffortLevel?
+        effortLevel: ClaudeCodeEffortLevel?,
+        expectedAgentPIDRegistrar: ExpectedAgentPIDRegistrar?
     ) async throws {
         guard process == nil else { return }
         try ProviderProcessLaunchPolicy.check()
@@ -689,7 +749,9 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
         flagSettingsRequestGeneration = 0
         hasCompletedInitialFlagSettings = false
 
+        let origin = configurationLifetime
         let resolvedFlags = try await resolveLaunchFlagSettings(model: model, effortLevel: effortLevel)
+        guard !isShuttingDown, configurationLifetime == origin, !Task.isCancelled else { throw CancellationError() }
         let launchEnvironment = resolvedFlags.launchEnvironment
         let environment = await resolvedLaunchEnvironment(
             resolverOverrides: launchEnvironment.environmentOverrides,
@@ -720,6 +782,8 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
             )
         #endif
 
+        try Task.checkCancellation()
+        guard !isShuttingDown, configurationLifetime == origin else { throw ControllerError.processNotRunning }
         let workingDirectory = resolvedWorkingDirectory()
         let spawned = try ProcessLauncher.spawn(
             command: resolvedCommand,
@@ -765,7 +829,7 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
             )
             throw ControllerError.initializationFailed("Failed to start Claude process readers: \(error.localizedDescription)")
         }
-        await registerExpectedAgentPIDIfNeeded(spawned.pid)
+        await registerExpectedAgentPIDIfNeeded(spawned.pid, registrar: expectedAgentPIDRegistrar)
     }
 
     private func initializeIfNeeded(systemPromptOverride: String?) async throws {
@@ -1963,7 +2027,11 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
             initialized: Bool = true,
             controlRequest: (@Sendable ([String: Any]) async throws -> [String: Any])? = { _ in [:] },
             write: @escaping @Sendable (Data) throws -> Void
-        ) {
+        ) async {
+            if let shutdownTask {
+                await shutdownTask.value
+                self.shutdownTask = nil
+            }
             precondition(process == nil)
             configurationLifetime = UUID()
             latestFlagSettingsIntentGeneration = 0
@@ -2522,36 +2590,51 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
         return FileManager.default.homeDirectoryForCurrentUser.path
     }
 
-    private func registerExpectedAgentPIDIfNeeded(_ pid: pid_t) async {
+    private func registerExpectedAgentPIDIfNeeded(_ pid: pid_t, registrar suppliedRegistrar: ExpectedAgentPIDRegistrar?) async {
         guard config.toolContext == .agentRun,
               let clientName = host.expectedAgentClientName(for: config.runtimeVariant)
         else {
             return
         }
-        registeredExpectedAgentPID = pid
-        await host.registerExpectedAgentPID(pid, clientName: clientName, runID: runID)
-        if isShuttingDown {
-            await host.clearExpectedAgentPID(pid, clientName: clientName, runID: runID)
-            if registeredExpectedAgentPID == pid {
-                registeredExpectedAgentPID = nil
-            }
-            return
-        }
+        let host = host
+        let runID = runID
+        let registrar = suppliedRegistrar ?? ExpectedAgentPIDRegistrar(
+            register: { pid, name, run in await host.registerExpectedAgentPID(pid, clientName: name, runID: run) },
+            clear: { pid, name, run in await host.clearExpectedAgentPID(pid, clientName: name, runID: run) }
+        )
+        let task = Task { await registrar.register(pid, clientName, runID) }
+        let origin = ExpectedAgentPIDRegistration(pid: pid, clientName: clientName, registrar: registrar, registration: task)
+        registeredExpectedAgentPID = origin
+        await task.value
+        // Shutdown owns clearance after the original process is reaped. It joins
+        // this producer; awaiting shutdown here would make that join cyclic.
+        if isShuttingDown { return }
         if config.enableDebugLogging {
             print("[ClaudeNativeSession] Registered expected MCP parent PID \(pid) for \(clientName) runID=\(runID.uuidString)")
         }
     }
 
     private func clearExpectedAgentPIDIfNeeded() async {
-        guard let registeredExpectedAgentPID,
-              let clientName = host.expectedAgentClientName(for: config.runtimeVariant)
-        else {
-            return
+        guard let origin = registeredExpectedAgentPID else { return }
+        let runID = runID
+        let cleanup: Task<Void, Never>
+        if let existing = origin.cleanup {
+            cleanup = existing
+        } else {
+            cleanup = Task {
+                await origin.registration.value
+                await origin.registrar.clear(origin.pid, origin.clientName, runID)
+            }
+            if registeredExpectedAgentPID?.id == origin.id {
+                registeredExpectedAgentPID?.cleanup = cleanup
+            }
         }
-        await host.clearExpectedAgentPID(registeredExpectedAgentPID, clientName: clientName, runID: runID)
-        self.registeredExpectedAgentPID = nil
+        await cleanup.value
+        if registeredExpectedAgentPID?.id == origin.id {
+            registeredExpectedAgentPID = nil
+        }
         if config.enableDebugLogging {
-            print("[ClaudeNativeSession] Cleared expected MCP parent PID for \(clientName) runID=\(runID.uuidString)")
+            print("[ClaudeNativeSession] Cleared expected MCP parent PID for \(origin.clientName) runID=\(runID.uuidString)")
         }
     }
 

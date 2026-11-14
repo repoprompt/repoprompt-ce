@@ -997,8 +997,12 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
 
     @MainActor
     func testProductionFactoryAdapterAndControlResponseGateConfigurationProof() async throws {
+        let route = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: nil)
+        let runID = UUID(), tabID = UUID()
+        let client = "claude-controller-cleanup-\(UUID().uuidString)"
+        let manager = ServerNetworkManager.shared
         let runtime = ClaudeAgentModeCoordinator.test_makeDefaultController(
-            runID: UUID(), tabID: UUID(), windowID: 1,
+            runID: runID, tabID: tabID, windowID: route.identity.routeID,
             launchSettings: .init(
                 runtimeVariant: .standard, workspacePath: nil, permissionMode: nil,
                 allowNativeBashTool: nil, mcpStrictMode: nil
@@ -1007,7 +1011,19 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         let adapter = try XCTUnwrap(runtime as? ClaudeCompatibleNativeSessionAdapter)
         let underlying = await adapter.test_processController()
         let controller = try XCTUnwrap(underlying, "The production factory must wrap the proof-capable process controller")
-        addTeardownBlock { await runtime.shutdown() }
+        addTeardownBlock {
+            await runtime.shutdown()
+            await route.close()
+        }
+        let installed = await manager.installClientConnectionPolicy(
+            for: client, windowID: route.identity.routeID, restrictedTools: [], runID: runID,
+            purpose: .agentModeRun, routingOwner: route
+        )
+        let originalCleanup = try XCTUnwrap(installed)
+        let retained = await adapter.retainRoutingCleanup(originalCleanup)
+        XCTAssertTrue(retained)
+        let originalPIDRegistrar = ClaudeNativeProcessSessionController.ExpectedAgentPIDRegistrar.serverNetworkManager(registration: originalCleanup)
+        await originalPIDRegistrar.register(12345, client, runID)
         let writes = WrittenLines()
         await controller.test_installConfigurationTransport(initialized: true, controlRequest: nil, write: { writes.append($0) })
         for (index, reject) in [true, false].enumerated() {
@@ -1053,6 +1069,52 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
                 XCTAssertEqual(writes.count, 3, "Two settings requests followed by one user write")
             }
         }
+        await route.close()
+        let successorRoute = MCPHostRouteResources(identity: route.identity, coordinator: nil)
+        let successorRuntime = ClaudeAgentModeCoordinator.test_makeDefaultController(
+            runID: runID, tabID: tabID, windowID: route.identity.routeID,
+            launchSettings: .init(
+                runtimeVariant: .standard,
+                workspacePath: nil,
+                permissionMode: nil,
+                allowNativeBashTool: nil,
+                mcpStrictMode: nil
+            )
+        )
+        addTeardownBlock {
+            await successorRuntime.shutdown()
+            await successorRoute.close()
+        }
+        let successor = try XCTUnwrap(successorRuntime as? ClaudeCompatibleNativeSessionAdapter)
+        let replacement = await manager.installClientConnectionPolicy(
+            for: client, windowID: route.identity.routeID, restrictedTools: ["edit_file"], runID: runID,
+            purpose: .agentModeRun, routingOwner: successorRoute
+        )
+        let successorCleanup = try XCTUnwrap(replacement)
+        let successorPIDRegistrar = ClaudeNativeProcessSessionController.ExpectedAgentPIDRegistrar.serverNetworkManager(registration: successorCleanup)
+        await successorPIDRegistrar.register(12345, client, runID)
+        await originalPIDRegistrar.clear(12345, client, runID)
+        await originalPIDRegistrar.register(12346, client, runID)
+        let successorPIDs = await manager.debugExpectedAgentPIDs(for: client, runID: runID)
+        XCTAssertEqual(successorPIDs, [12345], "Delayed original registration/clear cannot change a successor's reused PID")
+        let successorRetained = await successor.retainRoutingCleanup(successorCleanup)
+        XCTAssertTrue(successorRetained)
+        let wrongIncarnationHandoff = await adapter.retainRoutingCleanup(successorCleanup)
+        XCTAssertFalse(wrongIncarnationHandoff, "Matching numeric IDs cannot transfer cleanup from a reopened route")
+        await runtime.shutdown()
+        await runtime.shutdown()
+        XCTAssertTrue(originalCleanup.isConsumed)
+        XCTAssertFalse(successorCleanup.isConsumed)
+        let survivingPolicy = await manager.debugRunPolicyState(for: runID)
+        XCTAssertEqual(survivingPolicy?.restrictedTools, ["edit_file"])
+        let lateHandoff = await adapter.retainRoutingCleanup(successorCleanup)
+        XCTAssertFalse(lateHandoff)
+        await successorRuntime.shutdown()
+        XCTAssertTrue(successorCleanup.isConsumed)
+        let finalPolicy = await manager.debugRunPolicyState(for: runID)
+        XCTAssertNil(finalPolicy)
+        let finalPIDs = await manager.debugExpectedAgentPIDs(for: client, runID: runID)
+        XCTAssertTrue(finalPIDs.isEmpty)
     }
 
     func testRepoPromptPermissionAutoApprovalAndAllowPayloadPreserveToolUseID() throws {
@@ -2276,18 +2338,17 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
 
     private func spyFixture(replacement: MonitorFakeNativeController? = nil, mcp: Bool = false) async throws -> (AgentSessionLinkRunnerHarness, AgentTabSession, MonitorFakeNativeController, ClaudeControllerEventListener) {
         let controller = MonitorFakeNativeController()
+        let tabID = UUID()
         var creations = 0
         let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() }, claudeControllerFactory: { _, _, _, _ in
             creations += 1
             return creations > 1 ? replacement ?? controller : controller
-        })
-        let session = harness.host.session(for: UUID())
-        // A live provider conversation already has a persistent runtime writer, whether or
-        // not its turn is MCP-controlled. Unbound local creation is covered separately.
-        let persistentSessionID = UUID()
-        XCTAssertNil(harness.host.runtimeSessionStore.bindingRejection(persistentSessionID, on: session))
-        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: persistentSessionID, workspaceID: UUID()))
-        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        }, initialWorkspaceTabID: tabID)
+        // Local composer startup needs the real workspace carrier as well as a restored writer.
+        // Reuse the existing positive runner fixture instead of inventing a detached workspace ID.
+        let session = try harness.makeBoundSession(agent: .claudeCode, tabID: tabID)
+        let persistentSessionID = try XCTUnwrap(session.activeAgentSessionID)
+        XCTAssertEqual(session.persistentSessionBindingIdentity?.workspaceID, harness.host.workspaceManager?.activeWorkspaceID)
         XCTAssertNotNil(try harness.host.runtimeCommand(sessionID: persistentSessionID))
         let controlledSessionID = mcp ? persistentSessionID : nil
         session.selectedAgent = .claudeCode
@@ -2401,7 +2462,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         XCTAssertEqual(session.lastTerminalCommitRevision?.ownership, owner)
         let messages = await controller.sentMessages
         XCTAssertEqual(messages.count, 1)
-        XCTAssertTrue(messages[0].contains(row.text))
+        XCTAssertTrue(messages.first?.contains(row.text) == true)
         await h.host.claudeCoordinator.shutdownClaudeSession(session)
     }
 
@@ -3319,6 +3380,58 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
             }
             await cleanup()
         }
+    }
+
+    func testAdoptedTurnCleanupRetainsRegistrationBeforeListenerReplacement() async throws {
+        let f = try await fixture()
+        var receipts: [MCPRunRoutingCleanupReceipt] = []
+        do {
+            let manager = ServerNetworkManager.shared
+            let route = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: nil)
+            addTeardownBlock { await route.close() }
+            let runID = try XCTUnwrap(f.session.runID)
+            let client = "adopted-cleanup-\(UUID().uuidString)"
+            let installed = await manager.installClientConnectionPolicy(
+                for: client, windowID: route.identity.routeID, restrictedTools: [], runID: runID,
+                purpose: .agentModeRun, routingOwner: route
+            )
+            let original = try XCTUnwrap(installed)
+            receipts.append(original)
+            f.listener.routingCleanup = .registered([original])
+            try await feed(assistant("original provider turn"), f.controller)
+            await until("registered provider turn adopts") { f.session.runState == .running }
+            let ownership = try XCTUnwrap(f.session.activeRunOwnership)
+            let teardown = try XCTUnwrap(f.session.claimRunAttemptTerminalTeardown(ownership: ownership, terminalState: .cancelled))
+            let replaced = await manager.installClientConnectionPolicy(
+                for: client, windowID: route.identity.routeID, restrictedTools: ["edit_file"], runID: runID,
+                purpose: .agentModeRun, routingOwner: route
+            )
+            let successor = try XCTUnwrap(replaced)
+            receipts.append(successor)
+            f.listener.routingCleanup = .registered([successor])
+            // Model the existing synchronous controller-detach boundary. Teardown already captured
+            // the original terminal resources, so it must not consult the listener again after this.
+            f.session.claudeController = nil
+            await teardown()
+            await teardown()
+            f.session.claudeController = f.controller
+            XCTAssertTrue(original.isConsumed)
+            XCTAssertFalse(successor.isConsumed)
+            let policy = await manager.debugRunPolicyState(for: runID)
+            XCTAssertEqual(policy?.restrictedTools, ["edit_file"])
+            try await feed(result("original-final"), f.controller)
+            await until("original provider turn publishes") { f.session.runState == .completed && !f.session.runLifecycle.terminalCommitInProgress }
+            await AgentSessionRuntimeHost.cleanRunRouting(.registered([successor]), routeID: route.identity.routeID, reason: "fixture_complete")
+            let finalPolicy = await manager.debugRunPolicyState(for: runID)
+            XCTAssertNil(finalPolicy)
+        } catch {
+            for receipt in receipts {
+                await ServerNetworkManager.shared.cleanupRunRoutingState(ownedBy: receipt)
+            }
+            await cleanup(f)
+            throw error
+        }
+        await cleanup(f)
     }
 
     func testNextProviderAttemptWaitsForPriorTerminalPublication() async throws {

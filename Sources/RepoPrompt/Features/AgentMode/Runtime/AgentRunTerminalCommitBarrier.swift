@@ -511,6 +511,26 @@ final class AgentRunTerminalCommitBarrier {
             && !terminalTeardownTasks.keys.contains { $0.binding.tabID == tabID }
     }
 
+    /// A snapshot of this owner's actual producers, not a tab lookup performed after an await.
+    /// Capturing is allowed only after terminal publication leaves the active commit phase.
+    /// Joining cannot cancel a producer or adopt a later same-tab teardown.
+    struct TeardownReceipt {
+        let ownerships: [AgentRunOwnership]
+        fileprivate let tasks: [Task<Void, Never>]
+
+        func waitForCompletion() async {
+            for task in tasks {
+                await task.value
+            }
+        }
+    }
+
+    func captureTerminalTeardown(tabID: UUID, lifecycle: AgentRunAttemptLifecycle) -> TeardownReceipt? {
+        guard !lifecycle.terminalCommitInProgress, lifecycle.activeOwnership == nil else { return nil }
+        let captured = terminalTeardownTasks.filter { $0.key.binding.tabID == tabID }
+        return TeardownReceipt(ownerships: Array(captured.keys), tasks: Array(captured.values))
+    }
+
     func awaitTerminalPublication(
         for ownership: AgentRunOwnership,
         lifecycle: AgentRunAttemptLifecycle

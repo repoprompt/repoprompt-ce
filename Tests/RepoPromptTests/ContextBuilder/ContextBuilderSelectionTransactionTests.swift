@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import os
 import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
@@ -19,6 +20,325 @@ final class MCPHostRouteResourceTests: XCTestCase {
         XCTAssertLessThan(window, first.routeID)
         XCTAssertLessThan(first.routeID, second.routeID)
         XCTAssertGreaterThan(MCPRouteIdentityAllocator.allocateWindowID(), second.routeID)
+    }
+
+    func testPendingMappingRollbackDoesNotResurrectConsumedOrigin() async throws {
+        let manager = ServerNetworkManager.shared
+        for reuseConnection in [false, true] {
+            for retireOrigin in [false, true] {
+                let route = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: nil)
+                let runID = UUID(), originalConnection = UUID()
+                let replacementConnection = reuseConnection ? originalConnection : UUID()
+                let client = "rollback-cleanup-\(UUID().uuidString)"
+                let first = await manager.installClientConnectionPolicy(
+                    for: client, windowID: route.identity.routeID, restrictedTools: [], runID: runID,
+                    purpose: .agentModeRun, routingOwner: route
+                )
+                let original = try XCTUnwrap(first)
+                XCTAssertEqual(route.runRouteBindings.register(
+                    connectionID: originalConnection, runID: runID, windowID: route.identity.routeID, cleanupReceipt: original
+                ), .registered(displacedConnectionID: nil))
+                let second = await manager.installClientConnectionPolicy(
+                    for: client, windowID: route.identity.routeID, restrictedTools: [], runID: runID,
+                    purpose: .agentModeRun, routingOwner: route
+                )
+                let replacement = try XCTUnwrap(second)
+                let pending = try XCTUnwrap(route.runRouteBindings.beginPendingPolicy(
+                    connectionID: replacementConnection, runID: runID, windowID: route.identity.routeID,
+                    cleanupReceipt: replacement
+                ))
+                if retireOrigin { await manager.cleanupRunRoutingState(ownedBy: original) }
+                XCTAssertTrue(route.runRouteBindings.rollback(pending, removingContext: {}))
+                XCTAssertEqual(route.runRouteBindings.connectionID(forRunID: runID), retireOrigin ? nil : originalConnection)
+                await manager.cleanupRunRoutingState(ownedBy: original)
+                await manager.cleanupRunRoutingState(ownedBy: replacement)
+                XCTAssertNil(route.runRouteBindings.connectionID(forRunID: runID))
+                XCTAssertEqual(route.runRouteBindings.register(
+                    connectionID: originalConnection, runID: runID, windowID: route.identity.routeID, cleanupReceipt: original
+                ), .refusedOwnerUnavailable, "A consumed receipt cannot reinstall its mapping")
+                await route.close()
+            }
+        }
+    }
+
+    func testOwnedBootstrapCleanupDoesNotNeedFreshCommandAuthorityOrFollowSuccessor() async throws {
+        let manager = ServerNetworkManager.shared
+        let route = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: nil)
+        let runID = UUID(), tabID = UUID()
+        let spec = MCPBootstrapLeaseSpec.agentMode(
+            tabID: tabID, runID: runID, gateID: UUID(), windowID: route.identity.routeID, agent: .codexExec
+        )
+        let originalCommandIsCurrent = OSAllocatedUnfairLock(initialState: true)
+        let original = MCPBootstrapLease(spec: spec, routingStateOwner: { originalCommandIsCurrent.withLock { $0 } }, routingOwner: route)
+        let originalAcquired = await original.acquire()
+        XCTAssertTrue(originalAcquired)
+        let firstGeneration = await MCPRoutingWaiter.generation(runID: runID)
+        let firstReceipts = await original.originatingRoutingCleanupReceipts()
+        let firstReceipt = try XCTUnwrap(firstReceipts?.last)
+        // A failed process can finish its exact shutdown before this still-acquired lease
+        // launches a replacement. Its retired waiter is not reusable by the new process.
+        await manager.cleanupRunRoutingState(ownedBy: firstReceipt)
+        let reinstalled = await original.reinstallPolicyForReplacementProcess()
+        XCTAssertTrue(reinstalled)
+        let originalGeneration = await MCPRoutingWaiter.generation(runID: runID)
+        XCTAssertNotNil(originalGeneration)
+        XCTAssertNotEqual(firstGeneration, originalGeneration)
+        let renewedReceipts = await original.originatingRoutingCleanupReceipts()
+        XCTAssertEqual(renewedReceipts?.count, 1)
+        XCTAssertNotEqual(renewedReceipts?.last?.policyID, firstReceipt.policyID)
+        let oldExecution = UUID(), newExecution = UUID(), localExecution = UUID()
+        var oldCancellationCount = 0
+        var newCancellationCount = 0
+        var localCancellationCount = 0
+        try route.toolExecutionRuntime.registerToolExecution(
+            executionID: oldExecution, runID: runID, connectionID: nil, toolName: "old-policy",
+            runRoutingRegistrationID: XCTUnwrap(renewedReceipts?.last).policyID,
+            cancel: { oldCancellationCount += 1 }
+        )
+        route.toolExecutionRuntime.registerToolExecution(
+            executionID: localExecution, runID: runID, connectionID: nil, toolName: "trusted-local",
+            cancel: { localCancellationCount += 1 }
+        )
+        await manager.cleanupRunRoutingState(ownedBy: firstReceipt)
+        let waiterAfterRepeatedProcessCleanup = await MCPRoutingWaiter.generation(runID: runID)
+        XCTAssertEqual(waiterAfterRepeatedProcessCleanup, originalGeneration)
+        let replacementSpec = MCPBootstrapLeaseSpec.agentMode(
+            tabID: tabID, runID: runID, gateID: UUID(), windowID: route.identity.routeID, agent: .codexExec
+        )
+        let replacement = MCPBootstrapLease(spec: replacementSpec, routingOwner: route)
+        let replacementAcquired = await replacement.acquire()
+        XCTAssertTrue(replacementAcquired)
+        let replacementGeneration = await MCPRoutingWaiter.generation(runID: runID)
+        XCTAssertNotEqual(originalGeneration, replacementGeneration)
+        let replacementReceipts = await replacement.originatingRoutingCleanupReceipts()
+        try route.toolExecutionRuntime.registerToolExecution(
+            executionID: newExecution, runID: runID, connectionID: nil, toolName: "successor-policy",
+            runRoutingRegistrationID: XCTUnwrap(replacementReceipts?.last).policyID,
+            cancel: { newCancellationCount += 1 }
+        )
+        originalCommandIsCurrent.withLock { $0 = false }
+        let cancelledWaiter = Task { await original.cancelAndCleanup() }
+        cancelledWaiter.cancel()
+        await cancelledWaiter.value
+        await original.cancelAndCleanup()
+        let policyAfterOldCleanup = await manager.debugRunPolicyState(for: runID)
+        let waiterAfterOldCleanup = await MCPRoutingWaiter.generation(runID: runID)
+        XCTAssertNotNil(policyAfterOldCleanup)
+        XCTAssertEqual(waiterAfterOldCleanup, replacementGeneration)
+        XCTAssertEqual(oldCancellationCount, 1)
+        XCTAssertEqual(newCancellationCount, 0)
+        XCTAssertEqual(localCancellationCount, 0)
+        XCTAssertFalse(route.toolExecutionRuntime.containsExecution(oldExecution))
+        XCTAssertTrue(route.toolExecutionRuntime.containsExecution(newExecution))
+        let oldOutcome = await original.currentRoutingTerminalOutcome()
+        XCTAssertEqual(oldOutcome, .failed(.cleanedUp))
+        await replacement.cancelAndCleanup()
+        let finalPolicy = await manager.debugRunPolicyState(for: runID)
+        let finalWaiter = await MCPRoutingWaiter.generation(runID: runID)
+        XCTAssertNil(finalPolicy)
+        XCTAssertNil(finalWaiter)
+        XCTAssertEqual(newCancellationCount, 1)
+        XCTAssertEqual(localCancellationCount, 0, "An unqualified invocation is not owned by a provider registration")
+        route.toolExecutionRuntime.unregisterToolExecution(executionID: localExecution)
+        await route.close()
+    }
+
+    func testOwnedProviderLifetimeCleanupJoinsBootstrapProducerWithoutFollowingSuccessor() async {
+        let manager = ServerNetworkManager.shared
+        let route = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: nil)
+        let runID = UUID(), tabID = UUID()
+        let gate = TestReleaseFence(name: "originating bootstrap enabler")
+        defer { gate.release() }
+        let enabler = Task {
+            await gate.enterAndWait()
+            return true
+        }
+        let cancellationObserved = expectation(description: "lifetime cleanup stopped originating acquisition")
+        let original = MCPBootstrapLease(
+            spec: .agentMode(tabID: tabID, runID: runID, gateID: UUID(), windowID: route.identity.routeID, agent: .codexExec),
+            mcpServerEnabler: {
+                await withTaskCancellationHandler {
+                    await enabler.value
+                } onCancel: {
+                    cancellationObserved.fulfill()
+                }
+            },
+            routingOwner: route
+        )
+        let acquisition = Task { await original.acquire() }
+        await gate.waitUntilEntered()
+        let successor = MCPBootstrapLease(
+            spec: .agentMode(tabID: tabID, runID: runID, gateID: UUID(), windowID: route.identity.routeID, agent: .codexExec),
+            routingOwner: route
+        )
+        let acquired = await successor.acquire()
+        XCTAssertTrue(acquired)
+        let successorGeneration = await MCPRoutingWaiter.generation(runID: runID)
+        let completed = OSAllocatedUnfairLock(initialState: false)
+        let cleanup = Task {
+            await original.finishOwnedProviderRouting()
+            completed.withLock { $0 = true }
+        }
+        await fulfillment(of: [cancellationObserved], timeout: 10)
+        cleanup.cancel()
+        XCTAssertFalse(completed.withLock { $0 }, "Cancellation is not completion of the original acquisition")
+        gate.release()
+        await cleanup.value
+        let originalAcquired = await acquisition.value
+        XCTAssertFalse(originalAcquired)
+        await original.finishOwnedProviderRouting()
+        let survivingPolicy = await manager.debugRunPolicyState(for: runID)
+        let survivingGeneration = await MCPRoutingWaiter.generation(runID: runID)
+        XCTAssertNotNil(survivingPolicy)
+        XCTAssertEqual(survivingGeneration, successorGeneration)
+        // A successful attempt may already have released its waiter. Provider lifetime cleanup
+        // must still consume that provider's policy rather than treating hasReleased as complete.
+        await successor.releaseWithoutRoutingWait()
+        await successor.finishOwnedProviderRouting()
+        await successor.finishOwnedProviderRouting()
+        let finalPolicy = await manager.debugRunPolicyState(for: runID)
+        let finalGeneration = await MCPRoutingWaiter.generation(runID: runID)
+        XCTAssertNil(finalPolicy)
+        XCTAssertNil(finalGeneration)
+        await route.close()
+    }
+
+    func testLegacyCleanupSuspendedBeforeReplacementCannotConsumeSuccessor() async throws {
+        let manager = ServerNetworkManager.shared
+        for independentSuccessor in [false, true] {
+            let route = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: nil)
+            let runID = UUID(), connectionID = UUID()
+            let client = "legacy-cleanup-race-\(UUID().uuidString)"
+            _ = await MCPRoutingWaiter.registerOwned(runID: runID)
+            _ = await manager.installClientConnectionPolicy(
+                for: client, windowID: route.identity.routeID, restrictedTools: [], runID: runID,
+                purpose: .agentModeRun
+            )
+            let oldTracker = AgentToolTracker()
+            _ = await oldTracker.registerEnhancedObserver(runID: runID, onCalled: { _, _, _ in }, onCompleted: { _, _, _, _, _ in })
+            let gate = TestReleaseFence(name: "legacy cleanup before replacement")
+            defer { gate.release() }
+            await manager.debugSetAfterLegacyCleanupWaiterCapture { candidate in
+                if candidate == runID { await gate.enterAndWait() }
+            }
+            let oldCleanup = Task {
+                await AgentSessionRuntimeHost.cleanRunRouting(.legacyWindow(runID: runID), routeID: route.identity.routeID, reason: "legacy_cleanup_fixture")
+            }
+            await gate.waitUntilEntered()
+            let successorWait = await MCPRoutingWaiter.registerOwned(runID: runID)
+            let newTracker = AgentToolTracker()
+            _ = await newTracker.registerEnhancedObserver(runID: runID, onCalled: { _, _, _ in }, onCompleted: { _, _, _, _, _ in })
+            let installed = await manager.installClientConnectionPolicy(
+                for: client, windowID: route.identity.routeID, restrictedTools: ["edit_file"], runID: runID,
+                purpose: .agentModeRun, routingOwner: independentSuccessor ? route : nil,
+                routingWaitGeneration: successorWait
+            )
+            let successor = try XCTUnwrap(installed)
+            await manager.debugSeedConnectionRunRouting(
+                connectionID: connectionID, runID: runID, windowID: route.identity.routeID, registration: successor
+            )
+            XCTAssertEqual(route.runRouteBindings.register(
+                connectionID: connectionID, runID: runID, windowID: route.identity.routeID,
+                cleanupReceipt: independentSuccessor ? successor : nil
+            ), .registered(displacedConnectionID: nil))
+            XCTAssertEqual(route.runRouteBindings.allowsLegacyCleanup(runID: runID, connectionID: connectionID), !independentSuccessor)
+            gate.release()
+            await oldCleanup.value
+            await manager.debugSetAfterLegacyCleanupWaiterCapture(nil)
+            let policy = await manager.debugRunPolicyState(for: runID)
+            let cachedRun = await manager.debugCachedRunID(for: connectionID)
+            let pending = await manager.debugPendingPolicySnapshot(for: client)
+            let waiter = await MCPRoutingWaiter.generation(runID: runID)
+            XCTAssertEqual(policy?.restrictedTools, ["edit_file"])
+            XCTAssertEqual(cachedRun, runID)
+            XCTAssertEqual(pending.count, 1)
+            XCTAssertEqual(waiter, successorWait)
+            await oldTracker.stop()
+            let observerCount = await manager.toolEventObserverCount(for: runID)
+            XCTAssertEqual(observerCount, 1, "Legacy cleanup cannot retract the successor's observer after suspension")
+            XCTAssertEqual(route.runRouteBindings.connectionID(forRunID: runID), connectionID)
+            await newTracker.stop()
+            if independentSuccessor {
+                await manager.cleanupRunRoutingState(ownedBy: successor)
+            } else {
+                await manager.cleanupRunRoutingState(for: runID, windowID: route.identity.routeID)
+                await MCPRoutingWaiter.cleanup(runID: runID, generation: successorWait)
+            }
+            await route.close()
+        }
+    }
+
+    func testPolicyCleanupRetainsOriginalRegistrationAcrossReplacementAndRouteClose() async throws {
+        let manager = ServerNetworkManager.shared
+        let identity = MCPRouteIdentityAllocator.allocateHost()
+        let original = MCPHostRouteResources(identity: identity, coordinator: nil)
+        let runID = UUID(), connectionID = UUID()
+        let client = "host-cleanup-\(UUID().uuidString)"
+        let oldWait = await MCPRoutingWaiter.registerOwned(runID: runID)
+        let installed = await manager.installClientConnectionPolicy(
+            for: client, windowID: identity.routeID, restrictedTools: [], runID: runID,
+            purpose: .agentModeRun, routingOwner: original, routingWaitGeneration: oldWait
+        )
+        let oldReceipt = try XCTUnwrap(installed)
+        XCTAssertEqual(original.runRouteBindings.register(
+            connectionID: connectionID, runID: runID, windowID: identity.routeID, cleanupReceipt: oldReceipt
+        ), .registered(displacedConnectionID: nil))
+        await manager.debugSeedConnectionRunRouting(connectionID: connectionID, runID: runID, windowID: identity.routeID, registration: oldReceipt)
+        let oldTracker = AgentToolTracker()
+        _ = await oldTracker.registerEnhancedObserver(runID: runID, onCalled: { _, _, _ in }, onCompleted: { _, _, _, _, _ in })
+
+        // Reuse both IDs on a different resource incarnation, while the original provider still
+        // retains its policy receipt and observer token. There is no presentation window fixture.
+        await original.close()
+        let successor = MCPHostRouteResources(identity: identity, coordinator: nil)
+        let newWait = await MCPRoutingWaiter.registerOwned(runID: runID)
+        let replacement = await manager.installClientConnectionPolicy(
+            for: client, windowID: identity.routeID, restrictedTools: ["edit_file"], runID: runID,
+            purpose: .agentModeRun, routingOwner: successor, routingWaitGeneration: newWait
+        )
+        let newReceipt = try XCTUnwrap(replacement)
+        XCTAssertNotEqual(oldReceipt.policyID, newReceipt.policyID)
+        XCTAssertNotEqual(oldWait, newWait)
+        XCTAssertEqual(successor.runRouteBindings.register(
+            connectionID: connectionID, runID: runID, windowID: identity.routeID, cleanupReceipt: newReceipt
+        ), .registered(displacedConnectionID: nil))
+        await manager.debugSeedConnectionRunRouting(connectionID: connectionID, runID: runID, windowID: identity.routeID, registration: newReceipt)
+        let newTracker = AgentToolTracker()
+        _ = await newTracker.registerEnhancedObserver(runID: runID, onCalled: { _, _, _ in }, onCompleted: { _, _, _, _, _ in })
+        await oldTracker.stop()
+        await manager.cleanupRunRoutingState(for: runID, windowID: identity.routeID)
+        await manager.revokeClientConnectionPolicy(for: client, windowID: identity.routeID, runID: runID)
+        await manager.clearClientConnectionPolicy(for: client, windowID: identity.routeID, runID: runID)
+        await manager.cleanupRunRoutingState(ownedBy: oldReceipt)
+        await manager.cleanupRunRoutingState(ownedBy: oldReceipt)
+        XCTAssertNil(original.runRouteBindings.connectionID(forRunID: runID))
+        XCTAssertEqual(successor.runRouteBindings.connectionID(forRunID: runID), connectionID)
+        let cachedRun = await manager.debugCachedRunID(for: connectionID)
+        let policy = await manager.debugRunPolicyState(for: runID)
+        let pending = await manager.debugPendingPolicySnapshot(for: client)
+        let observers = await manager.toolEventObserverCount(for: runID)
+        let remainingWait = await MCPRoutingWaiter.generation(runID: runID)
+        XCTAssertEqual(cachedRun, runID)
+        XCTAssertEqual(policy?.restrictedTools, ["edit_file"])
+        XCTAssertEqual(pending.count, 1)
+        XCTAssertEqual(observers, 1, "Delayed old-provider teardown must preserve the successor observer")
+        XCTAssertEqual(remainingWait, newWait)
+
+        await newTracker.stop()
+        await manager.cleanupRunRoutingState(ownedBy: newReceipt)
+        await manager.cleanupRunRoutingState(ownedBy: newReceipt)
+        XCTAssertNil(successor.runRouteBindings.connectionID(forRunID: runID))
+        let finalRun = await manager.debugCachedRunID(for: connectionID)
+        let finalPolicy = await manager.debugRunPolicyState(for: runID)
+        let finalPending = await manager.debugPendingPolicySnapshot(for: client)
+        let finalObservers = await manager.toolEventObserverCount(for: runID)
+        let finalWait = await MCPRoutingWaiter.generation(runID: runID)
+        XCTAssertNil(finalRun)
+        XCTAssertNil(finalPolicy)
+        XCTAssertTrue(finalPending.isEmpty)
+        XCTAssertEqual(finalObservers, 0)
+        XCTAssertNil(finalWait)
+        await successor.close()
     }
 
     func testWithdrawalRefusesNewMappingsButDoesNotCancelTrackedTools() async throws {
@@ -74,6 +394,108 @@ final class MCPHostRouteResourceTests: XCTestCase {
         XCTAssertTrue(final.connections.contains { $0.registration == successor }, "Old owner must never retract a replacement registration")
         let refused = await owner.ensureRegistered(workspaceID: nil, contextID: nil, revision: 0)
         XCTAssertNil(refused)
+    }
+
+    func testWindowFreeRouteLookupPinsDispatchAcrossReplacementAndLateClose() async throws {
+        let runtime = try await makeRuntime()
+        try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
+            let app = AppDomainRuntimeComposition.shared
+            let network = ServerNetworkManager.shared
+            let before = WindowState.windowCounter
+            let owner = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: runtime.routingCoordinator, runtime: runtime)
+            let routeID = owner.identity.routeID
+            let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: "read_file"))
+            @MainActor func catalog() -> MCPAppToolCatalogRegistration {
+                let binder = MCPAppToolBinder(windowID: routeID) { name, _, arguments, implementation in
+                    try await implementation(.init(toolName: name, windowID: routeID, context: .trustedLocal(
+                        toolName: name, metadata: .init(connectionID: nil, clientName: nil, windowID: routeID)
+                    )), arguments)
+                }
+                return MCPAppToolCatalogRegistration(
+                    windowID: routeID, providers: [],
+                    sharedBindings: [MCPDomainToolBinding(definition: definition) { _ in .bool(true) }],
+                    runtime: binder, requiredToolNames: ["read_file"]
+                )
+            }
+            let successor = MCPHostRouteResources(
+                identity: .init(id: UUID(), routeID: routeID, kind: .independent), coordinator: runtime.routingCoordinator, runtime: runtime
+            )
+            do {
+                _ = await owner.ensureRegistered(workspaceID: nil, contextID: nil, revision: 0)
+                let handle = try await owner.registerCatalog(catalog())
+                guard case let .available(found) = await app.independentRouteResources(routeID: routeID) else {
+                    XCTFail("Independent owner was not registered")
+                    await owner.close()
+                    await successor.close()
+                    return
+                }
+                XCTAssertTrue(found === owner)
+                XCTAssertNil(WindowStatesManager.shared.window(withID: routeID))
+                let captured = await network.captureWindowToolDispatchIdentity(windowID: routeID, catalogRegistrationHandle: handle)
+                let dispatch = try XCTUnwrap(captured)
+                let valid = await network.isCurrentWindowToolDispatchIdentity(dispatch, expectedServerViewModelIdentity: ObjectIdentifier(owner))
+                XCTAssertTrue(valid)
+                let runID = UUID(), connectionID = UUID()
+                // Independent mapping remains disabled until its originating cleanup is migrated.
+                let mapped = await network.mapConnectionToRunID(connectionID, runID: runID, windowID: routeID, signalRouting: false)
+                XCTAssertFalse(mapped)
+                XCTAssertNil(owner.runRouteBindings.connectionID(forRunID: runID))
+                let context = MCPTabContextSnapshot(
+                    tabID: UUID(), windowID: routeID, workspaceID: nil, promptText: "", selection: .init(),
+                    selectedMetaPromptIDs: [], tabName: "Host", runID: runID, explicitlyBound: true
+                )
+                owner.publishBinding(connectionID: connectionID, context: context)
+                await owner.settleRoutingPublications()
+                let originalConnection = try await runtime.routingCoordinator.currentRegistration(connectionID: connectionID)
+
+                // Replace domain and catalog generations without running the old owner's cleanup.
+                // Its delayed teardown must not remove the new lookup, catalog or route descriptor.
+                _ = await runtime.toolRegistry.unregister(handle)
+                _ = await successor.ensureRegistered(workspaceID: nil, contextID: nil, revision: 0)
+                let successorHandle = try await successor.registerCatalog(catalog())
+                _ = await runtime.routingCoordinator.unregisterConnection(originalConnection, operationID: UUID())
+                successor.publishBinding(connectionID: connectionID, context: context)
+                await successor.settleRoutingPublications()
+                let replacementConnection = try await runtime.routingCoordinator.currentRegistration(connectionID: connectionID)
+                XCTAssertNotEqual(originalConnection, replacementConnection)
+                app.recordRouteResources(owner, in: runtime) // A late old registration cannot replace the newer generation.
+                let stale = await network.isCurrentWindowToolDispatchIdentity(dispatch)
+                XCTAssertFalse(stale)
+                let successorDispatch = await network.captureWindowToolDispatchIdentity(windowID: routeID, catalogRegistrationHandle: successorHandle)
+                XCTAssertNotNil(successorDispatch)
+                let wrongHandle = await network.captureWindowToolDispatchIdentity(windowID: routeID, catalogRegistrationHandle: handle)
+                XCTAssertNil(wrongHandle)
+                await owner.close()
+                guard case let .available(stillFound) = await app.independentRouteResources(routeID: routeID) else {
+                    XCTFail("Late close removed the successor owner")
+                    await successor.close()
+                    return
+                }
+                XCTAssertTrue(stillFound === successor)
+                let retainedConnection = try await runtime.routingCoordinator.currentRegistration(connectionID: connectionID)
+                XCTAssertEqual(retainedConnection, replacementConnection)
+                let stillActive = await successor.hasActiveCatalog()
+                XCTAssertTrue(stillActive)
+                let stillValid = try await network.isCurrentWindowToolDispatchIdentity(XCTUnwrap(successorDispatch))
+                XCTAssertTrue(stillValid)
+                XCTAssertEqual(WindowState.windowCounter, before)
+                successor.closeDomainAdmission()
+                let closedDispatch = await network.captureWindowToolDispatchIdentity(windowID: routeID, catalogRegistrationHandle: successorHandle)
+                XCTAssertNil(closedDispatch)
+                if case .unavailable = await app.independentRouteResources(routeID: routeID) {} else {
+                    XCTFail("Closing independent route must refuse instead of falling back to presentation")
+                }
+            } catch {
+                await owner.close()
+                await successor.close()
+                throw error
+            }
+            await owner.close()
+            await successor.close()
+            if case .unregistered = await app.independentRouteResources(routeID: routeID) {} else {
+                XCTFail("Closed owner remained registered")
+            }
+        }
     }
 
     func testDisconnectThroughAnotherOwnerReleasesTheCanonicalConnection() async throws {
@@ -220,19 +642,38 @@ final class MCPHostRouteResourceTests: XCTestCase {
         let lease = try await resources.acquire(context: .init(workspaceID: workspace.id, contextID: tab.id), rootIDs: [root.id])
         let current = await lease.isCurrent()
         XCTAssertTrue(current)
+        XCTAssertTrue(lease.rootsAreCurrent)
         XCTAssertEqual(WindowState.windowCounter, before)
-        await files.unloadRoot(id: root.id)
-        let retained = await files.rootRefs()
-        XCTAssertTrue(retained.contains { $0.id == root.id })
         workspace.name = "Changed canonical context"
         let replacement = try DomainWorkspaceDocument.decode(documentBytes: JSONEncoder().encode(workspace), fileURL: documentURL)
         _ = await runtime.workspaceStore.registerReadDocument(replacement)
         let stale = await lease.isCurrent()
         XCTAssertFalse(stale)
+        let fresh = try await lease.capture(context: .init(workspaceID: workspace.id, contextID: tab.id))
+        let freshIsCurrent = await fresh.isCurrent()
+        XCTAssertTrue(freshIsCurrent, "A new request reads fresh bytes without refreshing an old request's receipt")
+        let discarded = try await lease.capture(context: .init(workspaceID: workspace.id, contextID: tab.id))
+        await discarded.release()
+        XCTAssertTrue(lease.rootsAreCurrent, "Releasing a borrowed request must not release the activation's roots")
+        await files.unloadRoot(id: root.id)
+        let retained = await files.rootRefs()
+        XCTAssertTrue(retained.contains { $0.id == root.id })
         await lease.release()
         await lease.release()
         let released = await files.rootRefs()
         XCTAssertFalse(released.contains { $0.id == root.id })
+        XCTAssertFalse(lease.rootsAreCurrent)
+        XCTAssertFalse(fresh.rootsAreCurrent, "Root owner release invalidates every borrowed request even if it is still retained")
+
+        let reloaded = try await files.loadRoot(path: directory.path)
+        addTeardownBlock { await files.unloadRoot(id: reloaded.id) }
+        let original = try await resources.acquire(context: .init(workspaceID: workspace.id, contextID: tab.id), rootIDs: [reloaded.id])
+        XCTAssertTrue(original.rootsAreCurrent)
+        try await files.replaceRootLifetimeForTesting(rootID: reloaded.id)
+        XCTAssertFalse(original.rootsAreCurrent, "Final dispatch checks must observe exact root revocation without another actor hop")
+        await original.release()
+        let successorRoots = await files.rootRefs()
+        XCTAssertTrue(successorRoots.contains { $0.id == reloaded.id }, "Releasing the old receipt cannot unload a replacement lifetime")
     }
 
     private func makeRuntime() async throws -> MCPDomainRuntime {
@@ -470,6 +911,105 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
         XCTAssertEqual(fixture.window.promptManager.promptText, activePrompt)
     }
 
+    func testOwnedPolicyContextUsesPinnedCatalogAndLateCleanupPreservesReopenedRoute() async throws {
+        let storageRoot = try makeTestDirectory(name: "OwnedPolicyContext")
+        let runtime = MCPDomainRuntime(configuration: .init(
+            mode: .app, profileIdentifier: "owned-context-\(UUID().uuidString)",
+            storageDirectory: storageRoot.appendingPathComponent("runtime-state"), workspaceStorageDirectory: storageRoot,
+            eventDirectory: storageRoot.appendingPathComponent("events"), temporaryDirectory: storageRoot.appendingPathComponent("tmp"),
+            externalReloadInterval: nil
+        ))
+        try await runtime.start()
+        addTeardownBlock { _ = await runtime.shutdown() }
+        let fixture = try await makeFixture(name: "owned-context", domainRuntime: runtime)
+        defer { fixture.cleanup() }
+        let server = fixture.window.mcpServer
+        // The ephemeral UI fixture has not persisted its new background tab. Publish that
+        // concrete read document before asking the domain router to bind its exact context.
+        let workspace = try XCTUnwrap(fixture.window.workspaceManager.workspaces.first { $0.id == fixture.workspaceID })
+        let authority = try XCTUnwrap(server.domainWorkspaceAuthorityClient)
+        _ = try await authority.registerForRead(
+            workspace, fileURL: fixture.window.workspaceManager.workspaceFileURL(for: workspace)
+        )
+        let manager = ServerNetworkManager.shared
+        let identity = MCPRouteIdentityAllocator.allocateHost()
+        let original = MCPHostRouteResources(identity: identity, coordinator: runtime.routingCoordinator, runtime: runtime)
+        let successor = MCPHostRouteResources(identity: identity, coordinator: runtime.routingCoordinator, runtime: runtime)
+        let count = WindowState.windowCounter
+        let client = "owned-context-\(UUID().uuidString)"
+        XCTAssertNil(WindowStatesManager.shared.window(withID: identity.routeID))
+        let originalCatalog = try await original.registerCatalog(server.makeToolCatalog(route: original))
+        let installed = await manager.installClientConnectionPolicy(
+            for: client, windowID: identity.routeID, restrictedTools: [], tabID: fixture.tabID,
+            runID: fixture.runID, purpose: .agentModeRun, routingOwner: original
+        )
+        let originalReceipt = try XCTUnwrap(installed)
+        let applied = await manager.debugApplyPendingPolicy(clientName: client, connectionID: fixture.connectionID)
+        XCTAssertEqual(applied.outcome, "applied")
+        await original.settleRoutingPublications()
+        XCTAssertEqual(original.runRouteBindings.tabContextByConnectionID[fixture.connectionID]?.tabID, fixture.tabID)
+        XCTAssertNotNil(server.tabContextCancellablesByConnectionID[original.connectionKey(fixture.connectionID)])
+        XCTAssertNil(fixture.boundContext)
+        let originalToken = try XCTUnwrap(original.runRouteBindings.beginPendingPolicy(
+            connectionID: fixture.connectionID, runID: fixture.runID, windowID: identity.routeID, cleanupReceipt: originalReceipt
+        ))
+        let initialRouting = await runtime.routingCoordinator.snapshot()
+        let oldDomainConnection = try XCTUnwrap(initialRouting.connections.first { $0.registration.connectionID == fixture.connectionID }?.registration)
+        XCTAssertEqual(
+            initialRouting.connections.first { $0.registration == oldDomainConnection }?.binding,
+            .runScoped(runID: fixture.runID, context: DomainContextIdentity(workspaceID: fixture.workspaceID, contextID: fixture.tabID))
+        )
+
+        await original.unregisterCatalog(originalCatalog)
+        do {
+            _ = try await original.registerCatalog(server.makeToolCatalog(route: original))
+            XCTFail("A retained mapping cannot exchange its original context cleanup owner")
+        } catch MCPHostRouteResources.RegistrationFailure.differentCatalog {
+            // The old catalog's exact operations remain retained until mapping cleanup completes.
+        }
+
+        // Retire the route before its provider's delayed cleanup, then reuse every wire ID. The
+        // catalog still leases the original context operations, not the reopened route's owner.
+        await original.close()
+        _ = try await successor.registerCatalog(server.makeToolCatalog(route: successor))
+        let replaced = await manager.installClientConnectionPolicy(
+            for: client, windowID: identity.routeID, restrictedTools: ["edit_file"], tabID: fixture.tabID,
+            runID: fixture.runID, purpose: .agentModeRun, routingOwner: successor
+        )
+        let successorReceipt = try XCTUnwrap(replaced)
+        let reapplied = await manager.debugApplyPendingPolicy(clientName: client, connectionID: fixture.connectionID)
+        XCTAssertEqual(reapplied.outcome, "applied")
+        await successor.settleRoutingPublications()
+        let replacementRouting = await runtime.routingCoordinator.snapshot()
+        let newDomainConnection = try XCTUnwrap(replacementRouting.connections.first { $0.registration.connectionID == fixture.connectionID }?.registration)
+        XCTAssertNotEqual(oldDomainConnection, newDomainConnection)
+        XCTAssertNotEqual(
+            original.runRouteBindings.tabContextByConnectionID[fixture.connectionID]?.routeOwnerIdentity,
+            successor.runRouteBindings.tabContextByConnectionID[fixture.connectionID]?.routeOwnerIdentity
+        )
+        XCTAssertNotNil(server.tabContextCancellablesByConnectionID[successor.connectionKey(fixture.connectionID)])
+        XCTAssertEqual(original.rollbackPendingPolicy(originalReceipt, token: originalToken, clientName: client), .restored)
+        await original.settleRoutingPublications()
+        XCTAssertNotNil(server.tabContextCancellablesByConnectionID[successor.connectionKey(fixture.connectionID)], "Original rollback cannot cancel the reopened route's mirror")
+        await manager.cleanupRunRoutingState(ownedBy: originalReceipt)
+        await manager.cleanupRunRoutingState(ownedBy: originalReceipt)
+        XCTAssertNil(original.runRouteBindings.tabContextByConnectionID[fixture.connectionID])
+        XCTAssertNil(server.tabContextCancellablesByConnectionID[original.connectionKey(fixture.connectionID)])
+        XCTAssertEqual(successor.runRouteBindings.tabContextByConnectionID[fixture.connectionID]?.tabID, fixture.tabID)
+        XCTAssertNotNil(server.tabContextCancellablesByConnectionID[successor.connectionKey(fixture.connectionID)])
+        let afterOldCleanup = await runtime.routingCoordinator.snapshot()
+        XCTAssertTrue(afterOldCleanup.connections.contains { $0.registration == newDomainConnection })
+        let mappingCurrent = await manager.mapConnectionToRunID(fixture.connectionID, runID: fixture.runID, windowID: identity.routeID)
+        XCTAssertTrue(mappingCurrent)
+        XCTAssertEqual(WindowState.windowCounter, count, "Owned route application must not manufacture a window")
+        await manager.cleanupRunRoutingState(ownedBy: successorReceipt)
+        XCTAssertNil(successor.runRouteBindings.tabContextByConnectionID[fixture.connectionID])
+        XCTAssertNil(server.tabContextCancellablesByConnectionID[successor.connectionKey(fixture.connectionID)])
+        let finalRouting = await runtime.routingCoordinator.snapshot()
+        XCTAssertFalse(finalRouting.connections.contains { $0.registration == newDomainConnection })
+        await successor.close()
+    }
+
     func testCursorInitializeNamePromotesQueuedDiscoveryContext() async throws {
         let fixture = try await makeFixture(name: "cursor-initialize-name")
         defer { fixture.cleanup() }
@@ -701,7 +1241,7 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
         ))
 
         await server.routeResources.settleRoutingPublications()
-        XCTAssertNotNil(server.tabContextCancellablesByConnectionID[successorID])
+        XCTAssertNotNil(server.tabContextCancellablesByConnectionID[server.routeResources.connectionKey(successorID)])
         let coordinator = try XCTUnwrap(server.domainRoutingCoordinator)
         let beforeRollback = await coordinator.snapshot()
         XCTAssertTrue(beforeRollback.connections.contains { $0.registration.connectionID == successorID })
@@ -722,7 +1262,7 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
         let afterRollback = await coordinator.snapshot()
         XCTAssertFalse(afterRollback.connections.contains { $0.registration.connectionID == successorID })
         XCTAssertTrue(afterRollback.connections.contains { $0.registration.connectionID == fixture.connectionID })
-        XCTAssertNil(server.tabContextCancellablesByConnectionID[successorID])
+        XCTAssertNil(server.tabContextCancellablesByConnectionID[server.routeResources.connectionKey(successorID)])
         XCTAssertNil(server.runRouteBindings.tabContextByConnectionID[successorID])
         XCTAssertEqual(fixture.boundContext?.runID, fixture.runID)
         XCTAssertEqual(fixture.boundContext?.selection, selection)

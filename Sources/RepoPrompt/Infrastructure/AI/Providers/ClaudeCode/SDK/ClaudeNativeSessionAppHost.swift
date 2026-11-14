@@ -7,6 +7,19 @@ import RepoPromptMCPServer
 
 extension MCPConfigLease: ClaudeNativeConfigLease {}
 
+extension ClaudeNativeProcessSessionController.ExpectedAgentPIDRegistrar {
+    static func serverNetworkManager(registration: MCPRunRoutingCleanupReceipt) -> Self {
+        .init(
+            register: { pid, name, runID in
+                await ServerNetworkManager.shared.registerExpectedAgentPID(pid, for: name, runID: runID, registration: registration)
+            },
+            clear: { pid, name, runID in
+                await ServerNetworkManager.shared.clearExpectedAgentPID(pid, for: name, runID: runID, registration: registration)
+            }
+        )
+    }
+}
+
 struct ClaudeNativeSessionAppHost: ClaudeNativeSessionHosting {
     func repoPromptPermissionMatch(toolName: String, requestPayload: [String: Any]) -> ClaudeNativePermissionMatch? {
         guard let match = MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(

@@ -356,8 +356,8 @@ final class MCPServerViewModel: ObservableObject {
     let gitArtifactAdvertisementRegistry = MCPGitArtifactAdvertisementRegistry()
     var agentWorktreeBindingStateProvider: (@MainActor (UUID, UUID?) -> AgentSessionWorktreeBindingState)?
     var agentWorktreeBindingStateResolver: (@MainActor (UUID, UUID?) async -> AgentSessionWorktreeBindingState)?
-    var fileToolLookupContextCacheByConnectionID: [UUID: FileToolLookupContextCacheEntry] = [:]
-    var pendingFileToolLookupContextResolutionByConnectionID: [UUID: PendingFileToolLookupContextResolution] = [:]
+    var fileToolLookupContextCacheByConnectionID: [MCPHostRouteResources.ConnectionKey: FileToolLookupContextCacheEntry] = [:]
+    var pendingFileToolLookupContextResolutionByConnectionID: [MCPHostRouteResources.ConnectionKey: PendingFileToolLookupContextResolution] = [:]
     #if DEBUG
         var fileToolLookupContextCacheHitCount = 0
         var fileToolLookupContextCacheMissCount = 0
@@ -2259,7 +2259,8 @@ final class MCPServerViewModel: ObservableObject {
             resolveObserverEndpoint: { [weak self] metadata, targetWindow in
                 guard let self else { return nil }
                 return await resolveAgentSessionLinkObserverEndpoint(route: routeResources, metadata: metadata, targetWindow: targetWindow)
-            }
+            },
+            runRouting: routeResources.identity.kind == .independent ? makeRunRouting(route: routeResources) : nil
         )
     }
 
@@ -2359,7 +2360,7 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     @MainActor
-    var tabContextCancellablesByConnectionID: [UUID: Set<AnyCancellable>] = [:]
+    var tabContextCancellablesByConnectionID: [MCPHostRouteResources.ConnectionKey: Set<AnyCancellable>] = [:]
     var isMultiWindowModeEffectivelyActive: Bool {
         WindowStatesManager.shared.isMultiWindowModeEffectivelyActive
     }
@@ -3637,7 +3638,8 @@ final class MCPServerViewModel: ObservableObject {
         EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.runToolSetup, runToolSetupState)
         return try await routeResources.toolExecutionRuntime.execute(
             .init(toolName: name, windowID: routeResources.identity.routeID, context: invocationContext),
-            ownerIdentity: ObjectIdentifier(self), indexedRunID: indexedRunID,
+            ownerIdentity: routeResources.identity.kind == .independent ? ObjectIdentifier(routeResources) : ObjectIdentifier(self),
+            indexedRunID: indexedRunID,
             waitCallOrigin: waitCallOrigin, selfCallOrigin: selfCallOrigin,
             lifecycleCorrelation: lifecycleCorrelation, validateInvocation: validateInvocation,
             presentation: .init(
@@ -4826,7 +4828,8 @@ final class MCPServerViewModel: ObservableObject {
             workspaceID: resolvedContext.snapshot.workspaceID,
             tabID: resolvedContext.snapshot.tabID,
             route: route,
-            bindingGeneration: resolvedContext.snapshot.readFileAutoSelectionGeneration
+            bindingGeneration: resolvedContext.snapshot.readFileAutoSelectionGeneration,
+            routeOwnerIdentity: resolvedContext.snapshot.routeOwnerIdentity
         )
     }
 
@@ -4840,6 +4843,7 @@ final class MCPServerViewModel: ObservableObject {
             && context.tabID == key.tabID
             && context.runID == runID
             && context.readFileAutoSelectionGeneration == key.bindingGeneration
+            && context.routeOwnerIdentity == key.routeOwnerIdentity
     }
 
     @MainActor

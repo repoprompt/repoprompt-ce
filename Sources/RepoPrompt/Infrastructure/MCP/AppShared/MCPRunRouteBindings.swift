@@ -30,6 +30,8 @@ final class MCPRunRouteBindings {
         let previousRunPrimaryConnectionID: UUID?
         let previousPendingPolicyTokenID: UUID?
         let previousWindowID: Int?
+        let previousCleanupOwnership: MCPRunRoutingCleanupReceipt.MappingOwnership?
+        let displacedCleanupOwnership: MCPRunRoutingCleanupReceipt.MappingOwnership?
         var promotedContext: MCPTabContextSnapshot?
         var promotedContextClientName: String?
         var promotedContextWindowID: Int?
@@ -62,6 +64,8 @@ final class MCPRunRouteBindings {
     var connectionIDByRunID: [UUID: UUID] = [:]
     var connectionIDToRunID: [UUID: UUID] = [:]
     var pendingPolicyTokenIDByRunID: [UUID: UUID] = [:]
+    /// Registration metadata in this existing mapping owner, not a session/run lifecycle table.
+    private var cleanupOwnershipByConnectionID: [UUID: MCPRunRoutingCleanupReceipt.MappingOwnership] = [:]
     var presentationWindowByConnection: [UUID: Int] = [:]
 
     func connectionID(forRunID runID: UUID) -> UUID? {
@@ -88,8 +92,16 @@ final class MCPRunRouteBindings {
         return Array(Set(runIDs)).sorted { $0.uuidString < $1.uuidString }
     }
 
+    /// Legacy callers have no originating policy receipt and cannot remove owned mappings,
+    /// even if a replacement appears during their cross-actor cleanup hop.
+    func allowsLegacyCleanup(runID: UUID, connectionID: UUID) -> Bool {
+        cleanupOwnershipByConnectionID[connectionID] == nil
+            && connectionIDByRunID[runID].flatMap { cleanupOwnershipByConnectionID[$0] } == nil
+    }
+
     func hasCurrentMapping(runID: UUID, connectionID: UUID, expectedTabID: UUID? = nil) -> Bool {
         guard ownerLifetime != nil,
+              cleanupOwnershipByConnectionID[connectionID]?.isConsumed != true,
               connectionIDByRunID[runID] == connectionID,
               connectionIDToRunID[connectionID] == runID
         else { return false }
@@ -107,13 +119,27 @@ final class MCPRunRouteBindings {
             && ServerNetworkManager.shared.hasLiveProviderInputConnection(token)
     }
 
-    func register(connectionID: UUID, runID: UUID, windowID: Int) -> RegistrationResult {
+    func register(
+        connectionID: UUID, runID: UUID, windowID: Int,
+        cleanupReceipt: MCPRunRoutingCleanupReceipt? = nil
+    ) -> RegistrationResult {
         guard ownerLifetime != nil else { return .refusedOwnerUnavailable }
+        if let cleanupReceipt {
+            guard !cleanupReceipt.isConsumed, cleanupReceipt.runID == runID, cleanupReceipt.routeID == windowID,
+                  cleanupReceipt.routeOwner?.runRouteBindings === self
+            else { return .refusedOwnerUnavailable }
+        } else if cleanupOwnershipByConnectionID[connectionID] != nil
+            || connectionIDByRunID[runID].flatMap({ cleanupOwnershipByConnectionID[$0] }) != nil
+        {
+            // An unqualified legacy registration cannot supersede an independently owned route.
+            return .refusedOwnerUnavailable
+        }
         if connectionIDByRunID[runID] == connectionID,
            connectionIDToRunID[connectionID] == runID
         {
             pendingPolicyTokenIDByRunID.removeValue(forKey: runID)
             presentationWindowByConnection[connectionID] = windowID
+            cleanupOwnershipByConnectionID[connectionID] = cleanupReceipt?.mappingOwnership
             return .registered(displacedConnectionID: nil)
         }
         if let boundRun = tabContextByConnectionID[connectionID]?.runID, boundRun != runID {
@@ -133,11 +159,49 @@ final class MCPRunRouteBindings {
         connectionIDByRunID[runID] = connectionID
         connectionIDToRunID[connectionID] = runID
         pendingPolicyTokenIDByRunID.removeValue(forKey: runID)
+        cleanupOwnershipByConnectionID[connectionID] = cleanupReceipt?.mappingOwnership
         return .registered(displacedConnectionID: displaced)
     }
 
-    func beginPendingPolicy(connectionID: UUID, runID: UUID, windowID: Int) -> PendingPolicyToken? {
+    var hasRetainedCleanupOwnership: Bool {
+        !cleanupOwnershipByConnectionID.isEmpty
+    }
+
+    func cleanupOwnership(for connectionID: UUID) -> MCPRunRoutingCleanupReceipt.MappingOwnership? {
+        cleanupOwnershipByConnectionID[connectionID]
+    }
+
+    /// Retract only entries installed by this exact policy on this exact resource owner. Closing
+    /// admission does not revoke the original cleanup obligation; a reopened owner is different.
+    func consumeCleanup(_ receipt: MCPRunRoutingCleanupReceipt, removingContext: (UUID) -> Void = { _ in }) {
+        guard receipt.routeOwner?.runRouteBindings === self else { return }
+        receipt.markConsumed()
+        let connections = cleanupOwnershipByConnectionID.compactMap { $0.value.policyID == receipt.policyID ? $0.key : nil }
+        for connectionID in connections {
+            removingContext(connectionID)
+            cleanupOwnershipByConnectionID.removeValue(forKey: connectionID)
+            readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
+            if connectionIDByRunID[receipt.runID] == connectionID {
+                connectionIDByRunID.removeValue(forKey: receipt.runID)
+                pendingPolicyTokenIDByRunID.removeValue(forKey: receipt.runID)
+            }
+            if connectionIDToRunID[connectionID] == receipt.runID {
+                connectionIDToRunID.removeValue(forKey: connectionID)
+            }
+        }
+    }
+
+    func beginPendingPolicy(
+        connectionID: UUID, runID: UUID, windowID: Int,
+        cleanupReceipt: MCPRunRoutingCleanupReceipt? = nil
+    ) -> PendingPolicyToken? {
         guard ownerLifetime != nil else { return nil }
+        if let cleanupReceipt {
+            guard !cleanupReceipt.isConsumed, cleanupReceipt.runID == runID, cleanupReceipt.routeID == windowID,
+                  cleanupReceipt.routeOwner?.runRouteBindings === self else { return nil }
+        } else if cleanupOwnershipByConnectionID[connectionID] != nil
+            || connectionIDByRunID[runID].flatMap({ cleanupOwnershipByConnectionID[$0] }) != nil
+        { return nil }
         if let boundRun = tabContextByConnectionID[connectionID]?.runID, boundRun != runID { return nil }
         let displacedConnectionID = connectionIDByRunID[runID]
         if let displacedConnectionID, displacedConnectionID != connectionID,
@@ -152,7 +216,9 @@ final class MCPRunRouteBindings {
             previousRunID: previousRunID,
             previousRunPrimaryConnectionID: previousRunID.flatMap { connectionIDByRunID[$0] },
             previousPendingPolicyTokenID: previousRunID.flatMap { pendingPolicyTokenIDByRunID[$0] },
-            previousWindowID: presentationWindowByConnection[connectionID]
+            previousWindowID: presentationWindowByConnection[connectionID],
+            previousCleanupOwnership: cleanupOwnershipByConnectionID[connectionID],
+            displacedCleanupOwnership: displacedConnectionID.flatMap { cleanupOwnershipByConnectionID[$0] }
         )
         if let displacedConnectionID = token.displacedConnectionID,
            connectionIDToRunID[displacedConnectionID] == runID
@@ -165,11 +231,13 @@ final class MCPRunRouteBindings {
         connectionIDByRunID[runID] = connectionID
         connectionIDToRunID[connectionID] = runID
         pendingPolicyTokenIDByRunID[runID] = token.id
+        cleanupOwnershipByConnectionID[connectionID] = cleanupReceipt?.mappingOwnership
         return token
     }
 
     func isCurrent(_ token: PendingPolicyToken) -> Bool {
         pendingPolicyTokenIDByRunID[token.runID] == token.id
+            && cleanupOwnershipByConnectionID[token.connectionID]?.isConsumed != true
             && connectionIDByRunID[token.runID] == token.connectionID
             && connectionIDToRunID[token.connectionID] == token.runID
     }
@@ -191,20 +259,26 @@ final class MCPRunRouteBindings {
         if let displacedConnectionID = token.displacedConnectionID,
            token.displacedPendingPolicyTokenID == nil,
            token.displacedConnectionRunID == token.runID,
+           token.displacedCleanupOwnership?.isConsumed != true,
            connectionIDByRunID[token.runID] == nil,
            connectionIDToRunID[displacedConnectionID] == nil
         {
             connectionIDByRunID[token.runID] = displacedConnectionID
             connectionIDToRunID[displacedConnectionID] = token.runID
+            cleanupOwnershipByConnectionID[displacedConnectionID] = token.displacedCleanupOwnership
         } else if token.displacedConnectionID == nil {
             connectionIDByRunID.removeValue(forKey: token.runID)
         }
-        if let previousRunID = token.previousRunID, token.previousPendingPolicyTokenID == nil {
+        cleanupOwnershipByConnectionID.removeValue(forKey: token.connectionID)
+        if let previousRunID = token.previousRunID, token.previousPendingPolicyTokenID == nil,
+           token.previousCleanupOwnership?.isConsumed != true
+        {
             let currentPrimary = connectionIDByRunID[previousRunID]
             let unchanged = currentPrimary == token.previousRunPrimaryConnectionID
             let canRestore = token.previousRunPrimaryConnectionID == token.connectionID && currentPrimary == nil
             if unchanged || canRestore {
                 connectionIDToRunID[token.connectionID] = previousRunID
+                cleanupOwnershipByConnectionID[token.connectionID] = token.previousCleanupOwnership
                 if canRestore { connectionIDByRunID[previousRunID] = token.connectionID }
             }
         } else {

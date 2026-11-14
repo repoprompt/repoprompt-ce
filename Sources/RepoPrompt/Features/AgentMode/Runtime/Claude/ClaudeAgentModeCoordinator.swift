@@ -85,7 +85,8 @@ final class ClaudeAgentModeCoordinator {
         let isSessionCurrent: @MainActor (_ session: AgentTabSession) -> Bool
         let requestUIRefresh: @MainActor (_ session: AgentTabSession, _ urgent: Bool) -> Void
         let scheduleSave: @MainActor (_ session: AgentTabSession) -> Void
-        var cleanupProviderRun: @MainActor (AgentTabSession, UUID) async -> Void = { _, _ in }
+        var cleanupProviderRun: @MainActor (AgentSessionRuntimeHost.RunRoutingCleanup) async -> Void = { _ in }
+        var legacyRunRoutingCleanup: @MainActor (UUID) -> AgentSessionRuntimeHost.RunRoutingCleanup? = { .legacyWindow(runID: $0) }
         weak var sessionRuntime: AgentSessionRuntimeStore.Scope?
         let stageClaudeResumeRecoveryHandoff: @MainActor (_ session: AgentTabSession) async -> Bool
         let prependPendingHandoff: @MainActor (_ text: String, _ session: AgentTabSession) -> String
@@ -306,7 +307,7 @@ final class ClaudeAgentModeCoordinator {
             mcpStrictMode: launchSettings.mcpStrictMode
         )
         let runtimeConfig = ClaudeCompatiblePluginBridge.runtimeConfig(from: coreConfig, mode: .agentMode)
-        return ClaudeCompatibleNativeSessionAdapter(runtimeConfig: runtimeConfig) {
+        return ClaudeCompatibleNativeSessionAdapter(runtimeConfig: runtimeConfig, routingIdentity: (runID, windowID)) {
             ClaudeNativeProcessSessionController(
                 host: ClaudeNativeSessionAppHost(),
                 runID: runID,
@@ -409,9 +410,9 @@ final class ClaudeAgentModeCoordinator {
         reserveEventsForHostPreparation(for: session)
     }
 
-    func cleanupAdoptedRun(session: AgentTabSession, runID: UUID) async {
+    func cleanupAdoptedRun(session: AgentTabSession, runID: UUID, cleanup: AgentSessionRuntimeHost.RunRoutingCleanup) async {
         guard !ClaudeIntegratedAgentModeRunner.cancellationPreservesRunRoute(session: session, runID: runID) else { return }
-        await hostCapabilities.cleanupProviderRun(session, runID)
+        await hostCapabilities.cleanupProviderRun(cleanup)
     }
 
     func hasPendingProviderAdoption(for session: AgentTabSession) -> Bool {
@@ -430,11 +431,12 @@ final class ClaudeAgentModeCoordinator {
                 if !session.runLifecycle.terminalCommitInProgress { session.runState = .cancelled }
             }
             let runID = session.runID
+            let cleanup = controllerListeners[session.tabID]?.routingCleanup
             let detached = prepareClaudeCancelSync(session)
             if let retirement = beginClaudeResumeTransferIfNeeded(for: session, oldController: detached) {
                 retainWithdrawnProviderRetirement(retirement, tabID: session.tabID)
             }
-            if let runID { Task { await self.cleanupAdoptedRun(session: session, runID: runID) } }
+            if let runID, let cleanup { Task { await self.cleanupAdoptedRun(session: session, runID: runID, cleanup: cleanup) } }
         }
         let retirements = withdrawnProviderRetirementsByTabID[session.tabID] ?? []
         guard !retirements.isEmpty else { return nil }
@@ -476,6 +478,7 @@ final class ClaudeAgentModeCoordinator {
                 && session.runID == runID && session.bindingTransitionGeneration == bindingGeneration
                 && !session.bindingTransitionInProgress
         }
+        listener.routingCleanup = runID.flatMap(hostCapabilities.legacyRunRoutingCleanup)
         controllerListeners[session.tabID] = listener
         listener.onBusyChanged = { [weak self, weak session, weak listener] in
             guard let self, let session, let listener else { return }
@@ -593,9 +596,10 @@ final class ClaudeAgentModeCoordinator {
         session.runState = .failed
         hostCapabilities.scheduleSave(session)
         let runID = session.runID
+        let cleanup = listener.routingCleanup
         let detached = prepareClaudeCancelSync(session)
         beginClaudeResumeTransferIfNeeded(for: session, oldController: detached)
-        if let runID { Task { await self.cleanupAdoptedRun(session: session, runID: runID) } }
+        if let runID, let cleanup { Task { await self.cleanupAdoptedRun(session: session, runID: runID, cleanup: cleanup) } }
         hostCapabilities.requestUIRefresh(session, true)
     }
 
@@ -727,7 +731,8 @@ final class ClaudeAgentModeCoordinator {
 
     func ensureClaudeNativeSession(
         session: AgentTabSession,
-        intent: NativeSessionIntent
+        intent: NativeSessionIntent,
+        routingLease: MCPBootstrapLease? = nil
     ) async -> EnsureSessionOutcome {
         if let message = session.operationAdmissionFailureMessage {
             return intent.allowsFreshStartRecovery ? .superseded : .failed(message: message)
@@ -855,7 +860,8 @@ final class ClaudeAgentModeCoordinator {
                 runtimeVariant: runtimeVariant,
                 effectivePermissionMode: effectivePermissionMode,
                 effectiveAllowNativeBashTool: effectiveAllowNativeBashTool,
-                effectiveMCPStrictMode: effectiveMCPStrictMode
+                effectiveMCPStrictMode: effectiveMCPStrictMode,
+                routingLease: routingLease
             )
             guard intentIsCurrent(intent, for: session) else { return .superseded }
             updateProviderSessionIDIfNeeded(sessionRef.sessionID, for: session)
@@ -1063,6 +1069,24 @@ final class ClaudeAgentModeCoordinator {
         return ObjectIdentifier(currentController as AnyObject) == ObjectIdentifier(controller as AnyObject)
     }
 
+    /// Transfer only originating resource ownership; callers repeat their full admission after
+    /// this actor hop before any provider operation. An unsupported owned adapter fails closed.
+    private func retainRoutingCleanup(
+        from lease: MCPBootstrapLease?, on controller: any NativeAgentRuntimeControlling, for session: AgentTabSession
+    ) async -> Bool {
+        let listener = controllerListeners[session.tabID]
+        guard let lease, let receipts = await lease.originatingRoutingCleanupReceipts() else { return true }
+        guard !receipts.isEmpty, let owner = controller as? any MCPRunRoutingCleanupRetaining else { return false }
+        for receipt in receipts {
+            guard await owner.retainRoutingCleanup(receipt) else { return false }
+        }
+        guard let listener, controllerListeners[session.tabID] === listener, listener.isCurrent(),
+              sessionOwnsClaudeController(controller, for: session), receipts.allSatisfy({ !$0.isConsumed })
+        else { return false }
+        listener.routingCleanup = .registered(receipts)
+        return true
+    }
+
     private func startOrResumeWithFallback(
         controller: any NativeAgentRuntimeControlling,
         session: AgentTabSession,
@@ -1071,12 +1095,17 @@ final class ClaudeAgentModeCoordinator {
         runtimeVariant: ClaudeCodeRuntimeVariant,
         effectivePermissionMode: String,
         effectiveAllowNativeBashTool: Bool?,
-        effectiveMCPStrictMode: Bool?
+        effectiveMCPStrictMode: Bool?,
+        routingLease: MCPBootstrapLease?
     ) async throws -> NativeAgentRuntimeSessionRef {
         let isPeriodic = session.oversight.pendingAutoWake?.isPeriodic == true
         let existingSessionID = session.providerSessionID
         let systemPromptOverride = agentModeSystemPromptOverride(for: session)
         let effortLevel = currentClaudeEffortLevel(for: session)
+        guard await retainRoutingCleanup(from: routingLease, on: controller, for: session),
+              intentIsCurrent(intent, for: session),
+              sessionOwnsClaudeController(controller, for: session)
+        else { throw ControllerLifecycleError.superseded }
         do {
             let sessionRef = try await controller.startOrResume(
                 existingSessionID: existingSessionID,
@@ -1128,11 +1157,32 @@ final class ClaudeAgentModeCoordinator {
             else {
                 throw ControllerLifecycleError.superseded
             }
+            let retirementGeneration = UUID()
+            controllerRetirementGenerationByTabID[session.tabID] = retirementGeneration
+            defer {
+                if controllerRetirementGenerationByTabID[session.tabID] == retirementGeneration {
+                    controllerRetirementGenerationByTabID.removeValue(forKey: session.tabID)
+                }
+            }
             await detached.controller.shutdown()
             await stopToolTracking(detached, for: session)
-            guard intentIsCurrent(intent, for: session) else {
+            guard controllerRetirementGenerationByTabID[session.tabID] == retirementGeneration,
+                  intentIsCurrent(intent, for: session)
+            else {
                 throw ControllerLifecycleError.superseded
             }
+            if let routingLease, await routingLease.originatingRoutingCleanupReceipts() != nil {
+                guard controllerRetirementGenerationByTabID[session.tabID] == retirementGeneration,
+                      intentIsCurrent(intent, for: session),
+                      await routingLease.reinstallPolicyForReplacementProcess(),
+                      controllerRetirementGenerationByTabID[session.tabID] == retirementGeneration,
+                      intentIsCurrent(intent, for: session)
+                else { throw ControllerLifecycleError.superseded }
+            }
+
+            guard controllerRetirementGenerationByTabID[session.tabID] == retirementGeneration,
+                  intentIsCurrent(intent, for: session)
+            else { throw ControllerLifecycleError.superseded }
 
             // A resume fallback is still the same canonical run attempt. Reuse
             // its process identity and retain the previous provider identity
@@ -1155,6 +1205,13 @@ final class ClaudeAgentModeCoordinator {
             session.claudeController = freshController
             controllerLaunchSettingsByTabID[session.tabID] = launchSettings
             await reconcileEventListener(for: session, controller: freshController)
+            guard intentIsCurrent(intent, for: session),
+                  sessionOwnsClaudeController(freshController, for: session)
+            else { throw ControllerLifecycleError.superseded }
+            guard await retainRoutingCleanup(from: routingLease, on: freshController, for: session),
+                  intentIsCurrent(intent, for: session),
+                  sessionOwnsClaudeController(freshController, for: session)
+            else { throw ControllerLifecycleError.superseded }
             let sessionRef = try await freshController.startOrResume(
                 existingSessionID: nil,
                 model: model,
@@ -1340,6 +1397,7 @@ final class ClaudeAgentModeCoordinator {
         selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
         reinstallRunRoutingPolicy: (@MainActor () async -> Bool)? = nil,
         inputAttemptChanged: (@MainActor (Bool) -> Void)? = nil,
+        routingLease: MCPBootstrapLease? = nil,
         inputResourcesAreCurrent: @escaping @MainActor () -> Bool = { true }
     ) async -> NativeSendOutcome {
         guard inputResourcesAreCurrent() else { return .failed(message: "The input resource generation changed before Claude dispatch.") }
@@ -1492,7 +1550,7 @@ final class ClaudeAgentModeCoordinator {
                       session.selfCompactState.active?.owner?.matchesLocalBinding(session) == true
                 else { return .superseded }
             }
-            switch isSelfNote ? .ready : await ensureClaudeNativeSession(session: session, intent: intent) {
+            switch isSelfNote ? .ready : await ensureClaudeNativeSession(session: session, intent: intent, routingLease: routingLease) {
             case .ready:
                 break
             case let .failed(message):
@@ -1505,6 +1563,10 @@ final class ClaudeAgentModeCoordinator {
             else {
                 return .superseded
             }
+            guard await retainRoutingCleanup(from: routingLease, on: controller, for: session),
+                  inputResourcesAreCurrent(), intentIsCurrent(intent, for: session),
+                  sessionOwnsClaudeController(controller, for: session)
+            else { return .superseded }
             let ensuredControllerID = ObjectIdentifier(controller as AnyObject)
             if ensuredControllerID != controllerBeforeEnsure {
                 controllersLaunchedBySend.insert(ensuredControllerID)

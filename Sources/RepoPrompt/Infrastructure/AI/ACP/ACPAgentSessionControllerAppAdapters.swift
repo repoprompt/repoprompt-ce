@@ -6,7 +6,57 @@ import RepoPromptDomainRuntime
 import RepoPromptProcess
 import RepoPromptSettingsCore
 
-struct ACPAgentSessionAppHost: ACPAgentSessionHost {
+final class ACPAgentSessionAppHost: ACPAgentSessionHost, @unchecked Sendable {
+    private let routingLock = NSLock()
+    private var routingCleanupReceipt: MCPRunRoutingCleanupReceipt?
+    private var routingCleanupTail: Task<Void, Never>?
+    private var resourceShutdownTask: Task<Void, Never>?
+
+    fileprivate func retainRoutingCleanup(_ receipt: MCPRunRoutingCleanupReceipt) -> Bool {
+        routingLock.withLock {
+            guard resourceShutdownTask == nil, receipt.routeOwner != nil, !receipt.isConsumed,
+                  receipt.managerIdentity == ObjectIdentifier(ServerNetworkManager.shared)
+            else { return false }
+            if let origin = routingCleanupReceipt {
+                guard origin.runID == receipt.runID, origin.routeOwner === receipt.routeOwner else { return false }
+                if origin == receipt { return true }
+            }
+            let previous = routingCleanupReceipt
+            let predecessor = routingCleanupTail
+            routingCleanupReceipt = receipt
+            if let previous {
+                routingCleanupTail = Task {
+                    await predecessor?.value
+                    await ServerNetworkManager.shared.cleanupRunRoutingState(ownedBy: previous)
+                }
+            }
+            return true
+        }
+    }
+
+    #if DEBUG
+        func test_originatingRoutingCleanupReceipt() -> MCPRunRoutingCleanupReceipt? {
+            routingLock.withLock { routingCleanupReceipt }
+        }
+    #endif
+
+    func finishControllerResources() async {
+        let task = routingLock.withLock { () -> Task<Void, Never> in
+            if let resourceShutdownTask { return resourceShutdownTask }
+            let receipt = routingCleanupReceipt
+            let predecessor = routingCleanupTail
+            routingCleanupReceipt = nil
+            routingCleanupTail = nil
+            let task = Task {
+                await predecessor?.value
+                if let receipt { await ServerNetworkManager.shared.cleanupRunRoutingState(ownedBy: receipt) }
+            }
+            resourceShutdownTask = task
+            return task
+        }
+        await task.value
+    }
+
     var applicationVersion: String {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
     }
@@ -117,11 +167,15 @@ struct ACPAgentSessionAppHost: ACPAgentSessionHost {
     }
 
     func registerExpectedAgentPID(_ pid: pid_t, clientName: String, runID: UUID?) async {
-        await ServerNetworkManager.shared.registerExpectedAgentPID(pid, for: clientName, runID: runID)
+        let origin = routingLock.withLock { (closed: resourceShutdownTask != nil, receipt: routingCleanupReceipt) }
+        guard !origin.closed else { return }
+        await ServerNetworkManager.shared.registerExpectedAgentPID(pid, for: clientName, runID: runID, registration: origin.receipt)
     }
 
     func clearExpectedAgentPID(_ pid: pid_t, clientName: String, runID: UUID?) async {
-        await ServerNetworkManager.shared.clearExpectedAgentPID(pid, for: clientName, runID: runID)
+        let origin = routingLock.withLock { (closed: resourceShutdownTask != nil, receipt: routingCleanupReceipt) }
+        guard !origin.closed else { return }
+        await ServerNetworkManager.shared.clearExpectedAgentPID(pid, for: clientName, runID: runID, registration: origin.receipt)
     }
 
     func permissionIsAutoSelectable(optionID: String?, providerID: ACPProviderID) -> Bool {
@@ -151,7 +205,12 @@ struct ACPAgentSessionAppHost: ACPAgentSessionHost {
     #endif
 }
 
-extension ACPAgentSessionController {
+extension ACPAgentSessionController: MCPRunRoutingCleanupRetaining {
+    func retainRoutingCleanup(_ receipt: MCPRunRoutingCleanupReceipt) -> Bool {
+        guard let host = hostForRoutingHandoff(expectedRunID: receipt.runID) as? ACPAgentSessionAppHost else { return false }
+        return host.retainRoutingCleanup(receipt)
+    }
+
     /// Cursor persists bracket overrides in existing model strings; ACP requires separate exact model/config calls.
     func applyCursorModelSelection(
         _ raw: String,

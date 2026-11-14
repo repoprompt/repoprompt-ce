@@ -43,6 +43,8 @@ final class AgentModeRunService {
         let activeAgentRunWaitQuery: (_ runID: UUID) -> Bool
         /// Bounded wait for child `agent_run.wait` scopes to drain before Claude native interrupt.
         let childAgentRunWaitDrainTimeoutSeconds: TimeInterval
+        /// Pinned by executable-host composition, never resolved from the selected window.
+        var routingOwner: MCPHostRouteResources?
     }
 
     /// Neutral command/cancellation contracts shared with the direct/headless
@@ -408,7 +410,8 @@ final class AgentModeRunService {
                 perfRecorder: self.perfRecorder,
                 mcpServerEnabler: mcpServerEnabler,
                 policyInstaller: MCPBootstrapLease.agentModePolicyInstaller(connectionPolicyInstaller),
-                expectedPIDPolicyArmer: expectedPIDPolicyArmer
+                expectedPIDPolicyArmer: expectedPIDPolicyArmer,
+                routingOwner: self.dependencies.routingOwner
             )
         }
         if selectedAgent.usesClaudeNativeRuntime {
