@@ -330,11 +330,11 @@ enum AgentSessionLinkRoutineWakeInterval {
     }
 }
 
-/// Approved periodic-idle durations. Unsupported values round up to the next option, capped at six hours.
+/// Approved periodic-idle durations. Unsupported values round up to the next option, capped at 24 hours.
 enum AgentSessionLinkPeriodicWakeInterval {
-    static let optionsSeconds = [600, 1800, 3600, 7200, 21600]
+    static let optionsSeconds = [600, 1800, 3600, 7200, 10800, 21600, 43200, 86400]
     static let defaultSeconds = 1800
-    static let maximumSeconds = 21600
+    static let maximumSeconds = 86400
 
     static func normalized(_ seconds: Int) -> Int {
         for option in optionsSeconds where option >= seconds {

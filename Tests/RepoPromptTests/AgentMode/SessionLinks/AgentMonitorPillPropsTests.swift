@@ -7,6 +7,22 @@ import XCTest
 /// Monitor pill rendering contract: directional row labels, accessibility text, status mapping, and
 /// endpoint-relative revocation notices.
 final class AgentMonitorPillPropsTests: XCTestCase {
+    func testPeriodicWakeOptionsPreserveMinuteChoicesAndLabelHours() {
+        let seconds = [600, 1800, 3600, 7200, 10800, 21600, 43200, 86400]
+        XCTAssertEqual(AgentSessionLinkPeriodicWakeInterval.optionsSeconds, seconds)
+        XCTAssertEqual(AgentSessionLinkPeriodicWakeInterval.defaultSeconds, 1800)
+        XCTAssertEqual(AgentSessionLinkPeriodicWakeInterval.maximumSeconds, 86400)
+        XCTAssertEqual(seconds.map { AgentSessionLinkPeriodicWakeInterval.normalized($0) }, seconds)
+        XCTAssertEqual(
+            seconds.map { AgentMonitorPeriodicWakeCopy.optionLabel(seconds: $0) },
+            ["10 min", "30 min", "1h", "2h", "3h", "6h", "12h", "24h"]
+        )
+        XCTAssertEqual(
+            [3600, 7200, 21600].map { AgentMonitorPeriodicWakeCopy.optionLabel(seconds: $0) },
+            ["1h", "2h", "6h"]
+        )
+    }
+
     private let targetID = UUID(uuidString: "8B910000-0000-0000-0000-00000000E572")!
     private let observerID = UUID(uuidString: "04CF0000-0000-0000-0000-000000771A00")!
 
