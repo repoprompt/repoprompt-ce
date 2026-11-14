@@ -48,6 +48,36 @@ struct AgentToolCardRenderStatePreferenceKey: PreferenceKey {
     }
 }
 
+extension ToolCardContainer where Content == ToolMarkdownExpandedContent {
+    init(
+        iconName: String,
+        iconColor: Color,
+        title: String,
+        detailText: String? = nil,
+        subtitle: String?,
+        status: ToolCardStatus,
+        item: AgentChatItem,
+        headerTrailingView: AnyView? = nil,
+        isExpandable: Bool? = nil,
+        isExpanded: Binding<Bool>
+    ) {
+        self.init(
+            iconName: iconName,
+            iconColor: iconColor,
+            title: title,
+            detailText: detailText,
+            subtitle: subtitle,
+            status: status,
+            timestamp: item.timestamp,
+            headerTrailingView: headerTrailingView,
+            isExpandable: isExpandable ?? toolResultHasPayload(item),
+            isExpanded: isExpanded
+        ) {
+            ToolMarkdownExpandedContent(item: item)
+        }
+    }
+}
+
 /// Shared container providing consistent UI chrome for all tool cards
 /// Supports collapsed (1-line summary) and expanded states via isExpanded binding
 struct ToolCardContainer<Content: View>: View {
@@ -84,46 +114,7 @@ struct ToolCardContainer<Content: View>: View {
         showsTimestamp: Bool = true,
         headerTrailingView: AnyView? = nil,
         isExpandable: Bool = true,
-        debugItemID: UUID? = nil,
-        debugToolName: String? = nil,
-        debugBashPhase: AgentToolCardRenderedBashPhase? = nil,
-        debugRenderMode: AgentToolCardRenderMode? = nil,
-        isExpanded: Binding<Bool>,
-        @ViewBuilder content: @escaping () -> Content
-    ) {
-        self.iconName = iconName
-        self.iconColor = iconColor
-        self.title = title
-        self.headerStatusText = headerStatusText
-        self.detailText = detailText
-        self.subtitle = subtitle
-        self.status = status
-        self.timestamp = timestamp
-        self.showsTimestamp = showsTimestamp
-        self.headerTrailingView = headerTrailingView
-        self.isExpandable = isExpandable
-        managesOwnExpansion = false
-        self.debugItemID = debugItemID
-        self.debugToolName = debugToolName
-        self.debugBashPhase = debugBashPhase
-        self.debugRenderMode = debugRenderMode
-        _isExpanded = isExpanded
-        self.content = content
-    }
-
-    init(
-        iconName: String,
-        iconColor: Color = .orange,
-        title: String,
-        headerStatusText: String? = nil,
-        detailText: String? = nil,
-        subtitle: String? = nil,
-        status: ToolCardStatus = .neutral,
-        timestamp: Date? = nil,
-        showsTimestamp: Bool = true,
-        headerTrailingView: AnyView? = nil,
-        isExpandable: Bool = true,
-        managesOwnExpansion: Bool,
+        managesOwnExpansion: Bool = false,
         debugItemID: UUID? = nil,
         debugToolName: String? = nil,
         debugBashPhase: AgentToolCardRenderedBashPhase? = nil,
@@ -182,7 +173,7 @@ struct ToolCardContainer<Content: View>: View {
             }
         }
         .padding(10)
-        .background(backgroundColor)
+        .background(status.cardBackgroundColor(colorScheme: colorScheme))
         .cornerRadius(12)
         .contentShape(Rectangle())
     }
@@ -202,13 +193,7 @@ struct ToolCardContainer<Content: View>: View {
                 }
                 .buttonStyle(.plain)
 
-                if let headerTrailingView {
-                    headerTrailingView
-                } else if showsTimestamp, let timestamp {
-                    MessageTimestampText(date: timestamp)
-                        .font(.system(size: 10))
-                        .foregroundColor(.secondary.opacity(0.7))
-                }
+                toolCardHeaderTrailing(headerTrailingView, showsTimestamp: showsTimestamp, timestamp: timestamp)
             }
 
             if let detailText {
@@ -227,13 +212,7 @@ struct ToolCardContainer<Content: View>: View {
                 headerLeadingContent
                 Spacer()
 
-                if let headerTrailingView {
-                    headerTrailingView
-                } else if showsTimestamp, let timestamp {
-                    MessageTimestampText(date: timestamp)
-                        .font(.system(size: 10))
-                        .foregroundColor(.secondary.opacity(0.7))
-                }
+                toolCardHeaderTrailing(headerTrailingView, showsTimestamp: showsTimestamp, timestamp: timestamp)
             }
 
             if let detailText {
@@ -243,28 +222,11 @@ struct ToolCardContainer<Content: View>: View {
     }
 
     private var headerLeadingContent: some View {
-        HStack(spacing: 6) {
-            Image(systemName: iconName)
-                .font(.system(size: 11))
-                .foregroundColor(iconColor)
-
-            Text(title)
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundColor(.primary)
-                .lineLimit(1)
-
+        toolCardHeaderLeading(iconName: iconName, iconColor: iconColor, title: title, subtitle: subtitle) {
             if let headerStatusText, !headerStatusText.isEmpty {
                 StatusBadge(text: headerStatusText, status: status)
             } else {
                 StatusDot(status: status, size: 6)
-            }
-
-            if let subtitle {
-                Text(subtitle)
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
             }
         }
     }
@@ -276,17 +238,6 @@ struct ToolCardContainer<Content: View>: View {
             .lineLimit(1)
             .truncationMode(.tail)
             .padding(.leading, 17)
-    }
-
-    private var backgroundColor: Color {
-        switch status {
-        case .running:
-            BubbleColors.toolCallBackground(colorScheme: colorScheme)
-        case .failure:
-            BubbleColors.errorBackground(colorScheme: colorScheme)
-        default:
-            BubbleColors.toolResultBackground(colorScheme: colorScheme)
-        }
     }
 
     private var debugRenderStatePreference: [UUID: AgentToolCardRenderState] {
@@ -388,7 +339,7 @@ struct StaticToolCardContainer<Content: View>: View {
             content()
         }
         .padding(10)
-        .background(backgroundColor)
+        .background(status.cardBackgroundColor(colorScheme: colorScheme))
         .cornerRadius(12)
         .contentShape(Rectangle())
     }
@@ -411,41 +362,60 @@ struct StaticToolCardContainer<Content: View>: View {
                 Spacer()
             }
 
-            if let headerTrailingView {
-                headerTrailingView
-            } else if showsTimestamp, let timestamp {
-                MessageTimestampText(date: timestamp)
-                    .font(.system(size: 10))
-                    .foregroundColor(.secondary.opacity(0.7))
-            }
+            toolCardHeaderTrailing(headerTrailingView, showsTimestamp: showsTimestamp, timestamp: timestamp)
         }
     }
 
     private var headerLeadingContent: some View {
-        HStack(spacing: 6) {
-            Image(systemName: iconName)
-                .font(.system(size: 11))
-                .foregroundColor(iconColor)
-
-            Text(title)
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundColor(.primary)
-                .lineLimit(1)
-
+        toolCardHeaderLeading(iconName: iconName, iconColor: iconColor, title: title, subtitle: subtitle) {
             StatusDot(status: status, size: 6)
-
-            if let subtitle {
-                Text(subtitle)
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
         }
     }
+}
 
-    private var backgroundColor: Color {
-        switch status {
+@MainActor
+@ViewBuilder
+private func toolCardHeaderTrailing(_ custom: AnyView?, showsTimestamp: Bool, timestamp: Date?) -> some View {
+    if let custom {
+        custom
+    } else if showsTimestamp, let timestamp {
+        MessageTimestampText(date: timestamp)
+            .font(.system(size: 10))
+            .foregroundColor(.secondary.opacity(0.7))
+    }
+}
+
+@MainActor
+private func toolCardHeaderLeading(
+    iconName: String,
+    iconColor: Color,
+    title: String,
+    subtitle: String?,
+    @ViewBuilder status: () -> some View
+) -> some View {
+    HStack(spacing: 6) {
+        Image(systemName: iconName)
+            .font(.system(size: 11))
+            .foregroundColor(iconColor)
+        Text(title)
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundColor(.primary)
+            .lineLimit(1)
+        status()
+        if let subtitle {
+            Text(subtitle)
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+    }
+}
+
+private extension ToolCardStatus {
+    @MainActor
+    func cardBackgroundColor(colorScheme: ColorScheme) -> Color {
+        switch self {
         case .running:
             BubbleColors.toolCallBackground(colorScheme: colorScheme)
         case .failure:

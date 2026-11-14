@@ -117,6 +117,8 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
                 let session = fixture.viewModel.session(for: tab.id)
                 session.selectedAgent = .claudeCode
                 session.hasLoadedPersistedState = true
+                _ = try XCTUnwrap(fixture.viewModel.test_installPersistentSessionBinding(sessionID: tab.activeAgentSessionID, on: session))
+                session.recordRestorationAuthoritative(.persistedPayloadApplied)
             }
             let modelBefore = manager.workspaces
             manager.test_lifecycleBindingTabValidationCount = 0
@@ -138,12 +140,13 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
             XCTAssertNil(fixture.viewModel.agentSidebarOversightMenuProps(
                 tabID: last.tabID, expectedSessionID: last.sessionID
             ))
-            XCTAssertEqual(manager.test_lifecycleBindingTabValidationCount, 3)
+            XCTAssertEqual(manager.test_lifecycleBindingTabValidationCount, 0, "Runtime identity reads must not rescan UI metadata")
+            XCTAssertNotNil(last.domainEndpoint)
             XCTAssertEqual(manager.workspaces, modelBefore, "Reads must neither rebuild nor mutate bindings")
         }
     }
 
-    func testLifecycleIndexPreservesFirstExactMatchAcrossDuplicatesAndNestedEdits() throws {
+    func testLifecycleIndexPreservesFirstExactMatchWithoutElectingTheRuntimeWriter() throws {
         let fixture = try makeFixture()
         let manager = try XCTUnwrap(retainedWorkspaces.last)
         let original = try XCTUnwrap(manager.activeWorkspace)
@@ -166,20 +169,20 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
             )?.workspaceID, expected, file: file, line: line)
         }
         assertMatchesScan()
-        XCTAssertEqual(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID)?.workspaceID, first.id)
+        XCTAssertEqual(fixture.viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: fixture.tabID)?.workspaceID, original.id, "Presentation order cannot elect a different writer workspace")
         manager.workspaces.swapAt(1, 2)
         assertMatchesScan()
-        XCTAssertEqual(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID)?.workspaceID, original.id)
+        XCTAssertEqual(fixture.viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: fixture.tabID)?.workspaceID, original.id)
         manager.workspaces[1].composeTabs.removeAll()
         assertMatchesScan()
         manager.workspaces[2].composeTabs.remove(at: 1)
         assertMatchesScan()
         manager.workspaces[2].composeTabs[1].activeAgentSessionID = UUID()
         assertMatchesScan()
-        XCTAssertNil(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+        XCTAssertEqual(fixture.viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: fixture.tabID), fixture.endpoint, "Removing presentation witnesses does not release the runtime claim")
         manager.workspaces = [original]
         assertMatchesScan()
-        XCTAssertEqual(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID), fixture.endpoint)
+        XCTAssertEqual(fixture.viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: fixture.tabID), fixture.endpoint)
     }
 
     func testIndexedIdentityReadsLiveGenerationsAndDoesNotHydrateRemovedBindings() async throws {
@@ -194,16 +197,18 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
         XCTAssertNil(fixture.session.persistedLoadTask)
 
         // A synchronous model index must never cache session generations across an authority hop.
-        let beforeHop = fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID)
+        let beforeHop = fixture.viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: fixture.tabID)
         await Task.yield()
-        fixture.session.beginPersistentBindingTransition()
+        let generation = fixture.session.beginPersistentBindingTransition()
+        XCTAssertNil(fixture.viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: fixture.tabID), "In-flight binding preparation is unavailable")
+        fixture.session.finishPersistentBindingTransition(generation: generation)
         let transitioned = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
         XCTAssertNotEqual(transitioned, beforeHop)
         XCTAssertEqual(transitioned.bindingTransitionGeneration, fixture.session.bindingTransitionGeneration)
         _ = fixture.viewModel.test_installPersistentSessionBinding(
             sessionID: nil, on: fixture.session, updateWorkspaceMetadata: false
         )
-        XCTAssertNil(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+        XCTAssertNil(fixture.viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
         _ = fixture.viewModel.test_installPersistentSessionBinding(
             sessionID: fixture.endpoint.sessionID, on: fixture.session, updateWorkspaceMetadata: false
         )
@@ -211,12 +216,12 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
         XCTAssertEqual(rebound.persistentBindingGeneration, fixture.session.persistentSessionBindingIdentity?.generation)
         XCTAssertNotEqual(rebound.persistentBindingGeneration, fixture.endpoint.persistentBindingGeneration)
         manager.workspaces[0].composeTabs[0].activeAgentSessionID = UUID()
-        XCTAssertNil(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+        XCTAssertEqual(fixture.viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: fixture.tabID), rebound, "Metadata mismatch is not a runtime rebind")
         manager.workspaces = original
-        XCTAssertEqual(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID), rebound)
+        XCTAssertEqual(fixture.viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: fixture.tabID), rebound)
         fixture.viewModel.test_removeSession(tabID: fixture.tabID)
         XCTAssertTrue(fixture.viewModel.agentSessionLinkCandidates(isWindowClosing: false).isEmpty)
-        XCTAssertNil(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+        XCTAssertNil(fixture.viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
     }
 
     func testActivationRetirementSettersPublishOnceWithoutLinkOrWakeEvents() async throws {
@@ -253,13 +258,13 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
             case "creator": fixture.session.createdByOverseerSessionID = UUID()
             case "mcp-control":
                 let registration = await AgentRunSessionStore.register(sessionID: fixture.endpoint.sessionID)
-                fixture.session.mcpControlContext = AgentModeViewModel.AgentMCPControlContext(
-                    sessionID: fixture.endpoint.sessionID, activationID: UUID(), registration: registration,
+                fixture.session.mcpControlContext = try AgentModeViewModel.AgentMCPControlContext(
+                    sessionID: fixture.endpoint.sessionID, activationID: UUID(), writerIdentity: controlWriterIdentity(for: fixture.session), registration: registration,
                     currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil,
                     originatingConnectionID: nil,
                     interactionTransport: .mcp(sessionID: fixture.endpoint.sessionID, originatingConnectionID: nil),
                     suppressUserNotifications: true, forceAutoEditEnabled: false,
-                    autoEditEnabledBeforeOverride: fixture.session.autoEditEnabled, taskLabelKind: .explore
+                    autoEditEnabledBeforeOverride: fixture.session.autoEditEnabled, taskLabelKind: .explore, autoEditOverride: nil
                 )
             case "transition":
                 let generation = fixture.session.beginPersistentBindingTransition()
@@ -309,7 +314,7 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
         successor.recordRestorationAuthoritative(.persistedPayloadApplied)
         XCTAssertTrue(successor.permitsBoundOperationAndSave)
         fixture.viewModel.test_installLiveSession(successor)
-        fixture.viewModel.syncStatusPillsUIState()
+        fixture.viewModel.ui.statusPills.update(fixture.viewModel.makeStatusPillsSnapshot())
         let snapshot = fixture.viewModel.ui.statusPills.snapshot
         let revision = fixture.viewModel.ui.statusPills.revision
         let previousSink = AgentSessionLinkInvalidationSink.overseerActivationRetired
@@ -385,8 +390,9 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
             to: fixture.endpoint
         )
         XCTAssertEqual(fixture.viewModel.currentTabID, fixture.tabID)
-        XCTAssertFalse(fixture.viewModel.ui.statusPills.snapshot.monitor.routineWakeIntervalEnabled)
-        for (enabled, seconds) in [(true, 3600), (false, 10800)] {
+        XCTAssertTrue(fixture.viewModel.ui.statusPills.snapshot.monitor.routineWakeIntervalEnabled)
+        XCTAssertEqual(fixture.viewModel.ui.statusPills.snapshot.monitor.routineWakeIntervalSeconds, 300)
+        for (enabled, seconds) in [(false, 3600), (true, 10800)] {
             XCTAssertTrue(fixture.viewModel.agentSessionLinkSetRoutineWakeInterval(
                 enabled: enabled,
                 seconds: seconds,
@@ -413,7 +419,7 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
             let displayed = fixture.viewModel.ui.statusPills.snapshot.monitor
             XCTAssertEqual(displayed.periodicIdleWakeEnabled, enabled)
             XCTAssertEqual(displayed.periodicIdleWakeIntervalSeconds, seconds)
-            XCTAssertFalse(displayed.routineWakeIntervalEnabled)
+            XCTAssertTrue(displayed.routineWakeIntervalEnabled)
             XCTAssertEqual(displayed.routineWakeIntervalSeconds, 300)
         }
     }
@@ -484,7 +490,9 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
             props(endpoint: fixture.endpoint),
             to: fixture.endpoint
         )
-        fixture.session.beginPersistentBindingTransition()
+        let generation = fixture.session.beginPersistentBindingTransition()
+        XCTAssertNil(fixture.viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+        fixture.session.finishPersistentBindingTransition(generation: generation)
         let replacement = try AgentSessionLinkEndpointTestSupport.endpoint(
             fixture.viewModel,
             tabID: fixture.tabID
@@ -985,7 +993,7 @@ final class AgentSessionLinkStatusPillSyncScopeTests: XCTestCase {
         viewModel.test_flushPendingUIRefresh()
         let pendingBefore = viewModel.ui.statusPills.snapshot.monitor.pendingUpdates
 
-        viewModel.agentSessionLinkPublishPassiveStatusNotices(
+        viewModel.linkExecutionRuntime.agentSessionLinkPublishPassiveStatusNotices(
             passiveSnapshot(observer: fixture.endpoint, row: row),
             to: fixture.endpoint
         )
@@ -1007,7 +1015,7 @@ final class AgentSessionLinkStatusPillSyncScopeTests: XCTestCase {
         let row = try XCTUnwrap(published.outbound.first)
         viewModel.agentSessionLinkPublishProjection(published, to: fixture.endpoint)
 
-        viewModel.agentSessionLinkPublishPassiveStatusNotices(
+        viewModel.linkExecutionRuntime.agentSessionLinkPublishPassiveStatusNotices(
             passiveSnapshot(observer: fixture.endpoint, row: row),
             to: fixture.endpoint
         )
@@ -1031,7 +1039,7 @@ final class AgentSessionLinkStatusPillSyncScopeTests: XCTestCase {
         let row = try XCTUnwrap(published.outbound.first)
         viewModel.agentSessionLinkPublishProjection(published, to: fixture.endpoint)
         viewModel.test_flushPendingUIRefresh()
-        viewModel.agentSessionLinkPublishPassiveStatusNotices(
+        viewModel.linkExecutionRuntime.agentSessionLinkPublishPassiveStatusNotices(
             passiveSnapshot(observer: fixture.endpoint, row: row),
             to: fixture.endpoint
         )
@@ -1057,7 +1065,9 @@ final class AgentSessionLinkStatusPillSyncScopeTests: XCTestCase {
         let viewModel = fixture.viewModel
         viewModel.agentSessionLinkPublishProjection(props(endpoint: fixture.endpoint), to: fixture.endpoint)
         viewModel.test_flushPendingUIRefresh()
-        fixture.session.beginPersistentBindingTransition()
+        let generation = fixture.session.beginPersistentBindingTransition()
+        XCTAssertNil(fixture.viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+        fixture.session.finishPersistentBindingTransition(generation: generation)
         let replacement = try AgentSessionLinkEndpointTestSupport.endpoint(viewModel, tabID: fixture.tabID)
         XCTAssertNotEqual(replacement, fixture.endpoint)
         var observed: (published: AgentMonitorPillProps, live: AgentMonitorPillProps)?

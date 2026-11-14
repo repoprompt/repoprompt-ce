@@ -204,6 +204,7 @@ final class AgentRunTerminalCommitBarrier {
             {
                 notifyProviderSuccessor(
                     providerSuccessor,
+                    binding: binding,
                     revision: existingRevision,
                     publicationResult: publicationResult
                 )
@@ -392,6 +393,7 @@ final class AgentRunTerminalCommitBarrier {
         {
             notifyProviderSuccessor(
                 providerSuccessor,
+                binding: binding,
                 revision: revision,
                 publicationResult: publicationResult
             )
@@ -450,10 +452,12 @@ final class AgentRunTerminalCommitBarrier {
 
     private func notifyProviderSuccessor(
         _ providerSuccessor: ProviderSuccessor,
+        binding: AgentRunTerminalSessionBinding,
         revision: AgentRunTerminalCommitRevision,
         publicationResult: AgentRunTerminalPublicationResult
     ) {
         if case .accepted = publicationResult {
+            guard binding.hooks.permitsTerminalSuccessor(revision, publicationResult) else { return }
             guard !consumedProviderSuccessorIDs.contains(providerSuccessor.id) else {
                 return
             }
@@ -482,6 +486,7 @@ final class AgentRunTerminalCommitBarrier {
         else { return nil }
         switch publicationResult {
         case let .accepted(successorEpoch):
+            guard binding.hooks.permitsTerminalSuccessor(revision, publicationResult) else { return nil }
             if revision.mcpPublicationEnvelope != nil, successorEpoch == nil {
                 return nil
             }
@@ -504,6 +509,26 @@ final class AgentRunTerminalCommitBarrier {
     func isSettled(tabID: UUID, lifecycle: AgentRunAttemptLifecycle, hasAcceptedWork: Bool) -> Bool {
         !lifecycle.terminalCommitInProgress && lifecycle.activeOwnership == nil && !hasAcceptedWork
             && !terminalTeardownTasks.keys.contains { $0.binding.tabID == tabID }
+    }
+
+    /// A snapshot of this owner's actual producers, not a tab lookup performed after an await.
+    /// Capturing is allowed only after terminal publication leaves the active commit phase.
+    /// Joining cannot cancel a producer or adopt a later same-tab teardown.
+    struct TeardownReceipt {
+        let ownerships: [AgentRunOwnership]
+        fileprivate let tasks: [Task<Void, Never>]
+
+        func waitForCompletion() async {
+            for task in tasks {
+                await task.value
+            }
+        }
+    }
+
+    func captureTerminalTeardown(tabID: UUID, lifecycle: AgentRunAttemptLifecycle) -> TeardownReceipt? {
+        guard !lifecycle.terminalCommitInProgress, lifecycle.activeOwnership == nil else { return nil }
+        let captured = terminalTeardownTasks.filter { $0.key.binding.tabID == tabID }
+        return TeardownReceipt(ownerships: Array(captured.keys), tasks: Array(captured.values))
     }
 
     func awaitTerminalPublication(

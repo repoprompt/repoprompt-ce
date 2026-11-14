@@ -1,17 +1,6 @@
 import Foundation
-
-extension CodexIntegrationConfiguration.ServerEntry: Equatable {
-    static func == (
-        lhs: CodexIntegrationConfiguration.ServerEntry,
-        rhs: CodexIntegrationConfiguration.ServerEntry
-    ) -> Bool {
-        lhs.rawName == rhs.rawName
-            && lhs.normalizedName == rhs.normalizedName
-            && lhs.cliPathComponent == rhs.cliPathComponent
-    }
-}
-
-extension CodexIntegrationConfiguration.ServerEntry: @unchecked Sendable {}
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
 
 enum AgentProviderPermissionLevelID: Hashable {
     case codex(CodexAgentToolPreferences.PermissionLevel)

@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 
 /// A fresh lane has already published its durable tab binding. The idempotency key must be spent
@@ -80,6 +81,43 @@ extension AgentModeViewModel {
             throw AgentSessionLaneSpawnAdmissionFailure(detail: detail ?? "Scoped spawn admission was refused. Call session_admin scope_status to inspect authority and placement.")
         }
         defer { DelegationSpawnAdmission.finish(spawnAdmission) }
+        return try await createTopLevelSessionWithoutActivation(
+            creatorSessionID: creatorSessionID, sessionName: sessionName, selection: selection,
+            expectedWorkspaceID: expectedWorkspaceID, creationKind: .oversightLane(creatorSessionID: creatorSessionID),
+            spawnAdmission: spawnAdmission
+        )
+    }
+
+    /// Human creation shares durable admission and first-save fencing, but receives no MCP control,
+    /// delegation admission, creator stamp, or auto-join. It never activates the new tab.
+    func createHumanSessionWithoutActivation(
+        sessionName: String?, selection: AgentSessionLanePolicy.RoleSelection, expectedWorkspaceID: UUID, humanDraft: AgentComposerDraftState? = nil
+    ) async throws -> MCPOversightLaneCreationOutcome {
+        guard workspaceManager?.activeWorkspaceID == expectedWorkspaceID,
+              workspaceManager?.activeWorkspace?.id == expectedWorkspaceID
+        else {
+            throw AgentSessionLaneDestinationFailure.destinationChanged
+        }
+        do {
+            return try await createTopLevelSessionWithoutActivation(
+                creatorSessionID: nil, sessionName: sessionName, selection: selection,
+                expectedWorkspaceID: expectedWorkspaceID, creationKind: .human, spawnAdmission: nil, humanDraft: humanDraft
+            )
+        } catch let AgentSessionLaneDestinationFailure.admissionRejected(failure) {
+            // A partial binding save may already have spent this identity even when no usable
+            // target returned. Preserve it rather than making a second allocation on retry.
+            if let retained = failure.retainedAdmission {
+                return .creationIncomplete(sessionID: retained.identity.sessionID, tabID: retained.identity.tabID)
+            }
+            throw AgentSessionLaneDestinationFailure.admissionRejected(failure)
+        }
+    }
+
+    private func createTopLevelSessionWithoutActivation(
+        creatorSessionID: UUID?, sessionName: String?, selection: AgentSessionLanePolicy.RoleSelection,
+        expectedWorkspaceID: UUID, creationKind: MCPSessionCreationKind,
+        spawnAdmission: DelegationSpawnAdmission.Admission?, humanDraft: AgentComposerDraftState? = nil
+    ) async throws -> MCPOversightLaneCreationOutcome {
         let target: MCPSessionTarget
         do {
             target = try await mcpResolveOrCreateSessionTarget(
@@ -90,7 +128,7 @@ extension AgentModeViewModel {
                 parentSessionID: nil,
                 inheritWorktreeBindings: false,
                 expectedWorkspaceID: expectedWorkspaceID,
-                creationKind: .oversightLane(creatorSessionID: creatorSessionID)
+                creationKind: creationKind
             )
         } catch let published as AgentSessionLanePublishedFailure {
             return .creationIncomplete(sessionID: published.sessionID, tabID: published.tabID)
@@ -142,7 +180,7 @@ extension AgentModeViewModel {
             failSessionCreation(target.creationHandle, message: "This lane changed before its initial configuration completed.")
             return incomplete
         }
-        if let scopeID = spawnAdmission?.stampScopeID, let lease = spawnAdmission?.stampLease,
+        if let creatorSessionID, let scopeID = spawnAdmission?.stampScopeID, let lease = spawnAdmission?.stampLease,
            AgentSessionLinkRuntimeBridge.shared.delegationScopes.isCurrent(lease),
            DelegationSpawnTargetPlacement(
                organizationalParentID: session.organizationalParentID,
@@ -155,6 +193,10 @@ extension AgentModeViewModel {
             // stamp, it never overwrites an existing placement or scope.
             session.organizationalParentID = creatorSessionID
             session.delegationScopeID = scopeID
+        }
+        if case .human = creationKind, let humanDraft {
+            session.autoEditEnabled = humanDraft.autoEdit
+            session.selectedWorkflow = humanDraft.workflow
         }
         // Provenance was installed by the fresh-session seam before this first dirty marking.
         session.isDirty = true
@@ -241,7 +283,7 @@ extension AgentModeViewModel {
     func agentSessionLinkLaneProvenance(
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> UUID? {
-        guard agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+        guard linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
               let session = session(for: endpoint.tabID, createIfNeeded: false),
               session.activeAgentSessionID == endpoint.sessionID
         else { return nil }
@@ -304,7 +346,7 @@ extension AgentModeViewModel {
         let canRetire: @MainActor () -> Bool = { [weak self] in
             guard let self,
                   isStillRetirable(),
-                  agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+                  linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
                   let session = session(for: endpoint.tabID, createIfNeeded: false),
                   session.activeAgentSessionID == endpoint.sessionID,
                   agentSessionLinkLaneSessionIsQuiescent(session),
@@ -351,7 +393,7 @@ extension AgentModeViewModel {
     /// The synchronous slice of the retire CAS run immediately before unlinking: endpoint
     /// currentness, target quiescence, live subtree settlement, and the save-admission probe.
     func agentSessionLinkRetirementReadiness(endpoint: DomainAgentSessionLinkEndpointIdentity) -> Bool {
-        guard agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+        guard linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
               let session = session(for: endpoint.tabID, createIfNeeded: false),
               session.activeAgentSessionID == endpoint.sessionID,
               agentSessionLinkLaneSessionIsQuiescent(session),

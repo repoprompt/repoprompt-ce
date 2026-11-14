@@ -1,4 +1,7 @@
 import Foundation
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
+import RepoPromptCodexProvider
 
 @MainActor
 final class AgentModeProviderBindingService {

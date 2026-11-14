@@ -31,7 +31,7 @@ extension AgentModeViewModel {
             throw MCPError.invalidParams(session.restorationAdmissionFailureMessage ?? Self.mcpResidentTargetError)
         }
         if requiringLoadedState, !session.permitsBoundOperationAndSave { return nil }
-        guard let endpoint = agentSessionLinkObserverEndpoint(tabID: session.tabID),
+        guard let endpoint = linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: session.tabID),
               endpoint.sessionID == sessionID, !session.bindingTransitionInProgress,
               !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: sessionID),
               !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: sessionID),
@@ -49,20 +49,7 @@ extension AgentModeViewModel {
         target.window != nil && mcpActivationTargetIsCurrent(target)
     }
 
-    enum MCPActivationOwnership {
-        case resident
-        case installed(context: AgentMCPControlContext, generation: UInt64)
-
-        @MainActor
-        func matches(_ session: TabSession) -> Bool {
-            switch self {
-            case .resident:
-                AgentModeViewModel.isMCPResidentAppOwned(session)
-            case let .installed(context, generation):
-                session.mcpControlContext == context && session.mcpControlActivationGeneration == generation
-            }
-        }
-    }
+    typealias MCPActivationOwnership = AgentSessionMCPRuntime.ControlActivationOwnership
 
     private func mcpActivationTargetIsCurrent(
         _ target: MCPResidentTarget, ownership: MCPActivationOwnership = .resident
@@ -83,7 +70,7 @@ extension AgentModeViewModel {
             && current.permitsBoundOperationAndSave
             && !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: target.endpoint.sessionID)
             && !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: target.endpoint.sessionID)
-            && agentSessionLinkObserverEndpoint(tabID: current.tabID) == target.endpoint
+            && linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: current.tabID) == target.endpoint
             && workspaceManager?.activeWorkspaceID == target.endpoint.workspaceID
     }
 
@@ -97,10 +84,13 @@ extension AgentModeViewModel {
     func mcpPreflightResidentActivation(sessionID: UUID, admittedWindow: WindowState?) async throws -> MCPResidentTarget? {
         // An unloaded runtime has not established persisted origin yet. Explicit adoption may
         // hydrate it; the shared preparation/activation fences requalify before any control action.
-        guard let resolved = try mcpResidentTarget(sessionID: sessionID),
-              resolved.session.permitsBoundOperationAndSave else { return nil }
+        guard let resolved = try mcpResidentTarget(sessionID: sessionID) else { return nil }
+        guard !resolved.session.isAwaitingWorkspaceAdoption else {
+            throw MCPError.invalidParams(TabSession.loadingAdmissionFailureMessage)
+        }
+        guard resolved.session.permitsBoundOperationAndSave else { return nil }
         let target = MCPResidentTarget(session: resolved.session, endpoint: resolved.endpoint, window: admittedWindow)
-        let hasLinks = await agentSessionLinkHasActiveOutboundLink(target.endpoint)
+        let hasLinks = await linkExecutionRuntime.agentSessionLinkHasActiveOutboundLink(target.endpoint)
         try mcpRequireResidentActivationFence(target, authoritativeHasLinks: hasLinks)
         return target
     }
@@ -166,15 +156,7 @@ extension AgentModeViewModel {
             sessionName: workspaceManager?.composeTabName(with: session.tabID) ?? "Agent Session",
             agentRaw: session.selectedAgent.rawValue, agentDisplayName: session.selectedAgent.displayName,
             modelRaw: session.selectedModelRaw, reasoningEffortRaw: session.selectedReasoningEffortRaw,
-            modelParameterSelections: AgentMCPModelParameterSupport.effectiveSelections(
-                session.acpModelParameterSelections,
-                agentRaw: session.selectedAgent.rawValue, modelRaw: session.selectedModelRaw
-            ).map {
-                AgentRunMCPSnapshot.ModelParameterSelection(
-                    providerID: $0.providerID.rawValue, baseModelRaw: $0.baseModelRaw,
-                    kind: $0.kind.rawValue, configID: $0.configID, valueRaw: $0.valueRaw
-                )
-            },
+            modelParameterSelections: AgentSessionMCPRuntime.snapshotModelParameterSelections(for: session),
             status: status, statusText: session.runningStatusText,
             latestAssistantPreview: nil, interaction: nil,
             hookGate: session.codexHookGateAudit.map { AgentRunMCPSnapshot.HookGate(audit: $0) },
@@ -215,6 +197,9 @@ extension AgentModeViewModel {
         windowIsAvailable: @escaping @MainActor () -> Bool
     ) async throws -> MCPInstructionDispatch {
         try Task.checkCancellation()
+        guard !target.session.isAwaitingWorkspaceAdoption else {
+            throw MCPError.invalidParams(Self.mcpResidentBusyError)
+        }
         if let failure = target.session.restorationAdmissionFailureMessage {
             throw MCPError.invalidParams(failure)
         }
@@ -223,10 +208,10 @@ extension AgentModeViewModel {
         }
         let session = target.session
         let protectedPrompt = session.pendingApplyEditsReview != nil || session.pendingWorktreeMergeReview != nil
-            || mcpPendingInteraction(for: session).map { $0.kind != .instruction } == true
+            || mcpRuntime.mcpPendingInteraction(for: session).map { $0.kind != .instruction } == true
         guard !protectedPrompt else { throw MCPError.invalidParams(Self.mcpResidentProtectedError) }
         let admission = AgentSessionLinkSteerAdmission.evaluate(
-            readiness: Self.agentSessionLinkDeliveryReadinessSnapshot(
+            readiness: AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
                 session: session, endpointMatchesGrant: true, isClosing: false
             ),
             runStateIsActive: session.runState.isActive, pendingPromptExists: protectedPrompt,
@@ -278,14 +263,14 @@ extension AgentModeViewModel {
                 envelope: frame, workflow: workflow,
                 includeBuiltInSessionCleanupGuidance: GlobalSettingsStore.shared.showBuiltInWorkflowCleanupGuidance()
             )
-            let outcome = await persistAndStartNoncomposerTurn(
+            let outcome = await linkExecutionRuntime.persistAndStartNoncomposerTurn(
                 session: session, tabID: session.tabID, workspaceID: target.endpoint.workspaceID,
                 claim: claim, displayText: frame, providerMessage: payload, workflow: workflow,
                 attribution: nil, stopFence: stopFence
             ) {
                 windowIsAvailable() && self.mcpResidentTargetIsCurrent(target)
-                    && self.composerSubmitClaimIsCurrent(claim) && stopFence.permitsStart(of: session)
-                    && AgentSessionLinkDeliveryReadiness.failure(snapshot: Self.agentSessionLinkDeliveryReadinessSnapshot(
+                    && self.composerSubmitRuntime.isCurrent(claim) && stopFence.permitsStart(of: session)
+                    && AgentSessionLinkDeliveryReadiness.failure(snapshot: AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
                         session: session, endpointMatchesGrant: true, isClosing: false,
                         ignoresComposerSubmissionInFlight: true,
                         ignoresProviderSwitchStalenessAfterAcceptance: true

@@ -73,22 +73,6 @@ extension AgentModeViewModel {
         return .success(session)
     }
 
-    /// Builds the canonical user-visible projection for one exact live endpoint.
-    ///
-    /// Synchronous and `@MainActor`, so it is the projection seam tests and diagnostics use. The
-    /// `read` path deliberately does **not** call it: it snapshots the transcript and materializes
-    /// off the actor instead — see `agentSessionLinkTranscriptPage(for:anchor:...)`.
-    func agentSessionLinkCanonicalTranscript(
-        for candidate: AgentSessionLinkEndpointCandidate
-    ) -> Result<AgentSessionLinkCanonicalTranscript, AgentSessionLinkReadUnavailableReason> {
-        agentSessionLinkReadableSession(for: candidate).map { session in
-            Self.canonicalTranscript(
-                from: session.transcript,
-                sourceItemsRevision: UInt64(max(0, session.sourceItemsRevision))
-            )
-        }
-    }
-
     /// Pure canonical projection: runtime tool-result policy, then the canonical archived + working
     /// projection builder.
     ///

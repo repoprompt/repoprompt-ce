@@ -132,10 +132,7 @@ struct AgentOversightSessionIDSheet: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
                 }
-                .padding(8)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.accentColor.opacity(0.08))
-                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .agentOversightPreviewSurface()
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel(resolvedPeer.accessibilityLabel)
             }

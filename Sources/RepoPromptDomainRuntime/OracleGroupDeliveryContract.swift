@@ -43,7 +43,7 @@ package enum OracleGroupDeliveryContract {
     }
 
     /// Reconciliation guidance plus a lane manifest, placed before the lane bodies.
-    package static func preamble(lanes: [Lane], reconciliationGuidance: String? = nil) -> String? {
+    package static func preamble(lanes: [Lane], reconciliationGuidance: String? = nil, backgroundTurnID: String? = nil) -> String? {
         guard lanes.count > 1 else { return nil }
         let ordered = lanes.sorted { $0.laneIndex < $1.laneIndex }
         var lines = [
@@ -54,6 +54,11 @@ package enum OracleGroupDeliveryContract {
             "",
             "Lanes (\(ordered.count)):"
         ]
+        if backgroundTurnID != nil {
+            lines[1] = lines[1].replacingOccurrences(of: "and `oracle_chat_log` reads", with: "and legacy `oracle_chat_log` reads")
+            lines.insert(OracleBackgroundContract.promptQualification, at: 3)
+            lines.insert(OracleBackgroundContract.recoveryGuidance, at: 4)
+        }
         lines += ordered.map { lane in
             let model = lane.modelID.map { "`\($0)`" } ?? "model unspecified"
             let partial = lane.isPartial ? " (partial)" : ""

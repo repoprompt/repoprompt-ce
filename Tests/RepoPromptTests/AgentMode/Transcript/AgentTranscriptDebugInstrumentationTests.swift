@@ -12,7 +12,7 @@
         func testRequestedProjectionIdentityMetricsPreserveDigestsAndDrift() throws {
             let rows = [AgentChatItem.user("request", sequenceIndex: 0), .assistant("answer", sequenceIndex: 1)]
             let transcript = AgentTranscriptIO.buildTranscript(from: rows, terminalState: .completed)
-            let first = AgentModeViewModel.buildTranscriptPresentation(
+            let first = AgentSessionTranscriptBuilder.buildTranscriptPresentation(
                 from: transcript, sourceItems: rows, selectedAgent: .claudeCode, previousPerformanceSnapshot: .empty
             )
             var previous = first.baseProjection
@@ -27,7 +27,7 @@
             )
             var received: [AgentTranscriptProjectionIdentityMetrics] = []
             AgentTranscriptDebugInstrumentation.configure(.init(projectionIdentityHandler: { received.append($0) }))
-            let next = AgentModeViewModel.buildTranscriptPresentation(
+            let next = AgentSessionTranscriptBuilder.buildTranscriptPresentation(
                 from: transcript, sourceItems: rows, selectedAgent: .claudeCode, previousPerformanceSnapshot: .empty,
                 previousBaseProjection: previous
             )

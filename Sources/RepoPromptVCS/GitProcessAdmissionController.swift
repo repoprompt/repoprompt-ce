@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 package enum GitProcessAdmissionPriority: Int, CaseIterable, Hashable {
     case rootBootstrap = 0
@@ -74,8 +75,10 @@ package enum GitProcessAdmissionError: LocalizedError, Equatable {
 /// traffic. Active subprocesses remain non-preemptive, so an already saturated
 /// pool can cause a deadline to fail rather than weakening the ordering contract.
 package actor GitProcessAdmissionController {
-    package nonisolated static let defaultGlobalLimit = 8
-    package nonisolated static let defaultPerRepositoryLimit = 2
+    package nonisolated static let defaultGlobalLimit = max(1, HostResourceCapacity.baseline.subprocess)
+    // Fair-share fan-out, not a Git index lock. MCP's repository snapshot exclusion
+    // and the mutation authority remain separate and unchanged.
+    package nonisolated static let defaultPerRepositoryLimit = max(1, defaultGlobalLimit / 2)
     package nonisolated static let defaultMaximumWaiterCount = 1024
     package nonisolated static let defaultMaximumWaitersPerRepository = 256
     package nonisolated static let defaultMaximumDeadlineWaiterCount = 128

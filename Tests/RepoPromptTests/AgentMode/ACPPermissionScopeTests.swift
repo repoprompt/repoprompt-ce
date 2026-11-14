@@ -1,5 +1,8 @@
 import Foundation
 import MCP
+import RepoPromptACPProviders
+import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptSettingsCore
 import XCTest
@@ -775,12 +778,13 @@ final class ACPApprovalAvailabilityTests: XCTestCase {
         )
         addTeardownBlock { @MainActor in await context.cleanup() }
         let viewModel = context.window.agentModeViewModel
+        let command = try XCTUnwrap(viewModel.runtimeCommand(sessionID: XCTUnwrap(context.session.activeAgentSessionID)))
         for available in [false, true] {
             let request = approval(available: available)
             context.session.pendingApproval = request
             context.session.runState = .waitingForApproval
             XCTAssertEqual(request.supportsPlainApprove, available)
-            let interaction = try XCTUnwrap(viewModel.mcpPendingInteraction(for: context.session))
+            let interaction = try XCTUnwrap(viewModel.mcpRuntime.mcpPendingInteraction(for: context.session))
             XCTAssertEqual(interaction.options.map(\.label).contains("accept"), available)
             XCTAssertTrue(interaction.options.map(\.label).contains("accept_for_session"))
             let descriptor = try XCTUnwrap(AgentPendingInteractionDescriptor.make(from: context.session))
@@ -793,27 +797,27 @@ final class ACPApprovalAvailabilityTests: XCTestCase {
                     text: nil, skip: false, responseArgument: .scalar(response), amendment: nil, answersByQuestionID: [:]
                 )
                 if available {
-                    _ = try viewModel.mcpPendingInteractionResolution(
+                    _ = try viewModel.interactionRuntime.mcpPendingInteractionResolution(
                         for: context.session, kind: .approval, interactionID: request.id, payload: payload
                     )
                 } else {
-                    XCTAssertThrowsError(try viewModel.mcpPendingInteractionResolution(
+                    XCTAssertThrowsError(try viewModel.interactionRuntime.mcpPendingInteractionResolution(
                         for: context.session, kind: .approval, interactionID: request.id, payload: payload
                     ))
                     XCTAssertEqual(context.session.pendingApproval, request)
                 }
             }
-            let submitted = viewModel.submitApprovalDecision(tabID: context.session.tabID, requestID: request.id, decision: .accept)
+            let submitted = viewModel.interactionRuntime.submitApprovalDecision(command: command, requestID: request.id, decision: .accept)
             XCTAssertEqual(submitted, available)
             if !available {
                 XCTAssertEqual(context.session.pendingApproval, request)
                 XCTAssertEqual(context.session.runState, .waitingForApproval)
-                viewModel.submitApprovalDecision(tabID: context.session.tabID, decision: .accept)
-                XCTAssertEqual(context.session.pendingApproval, request, "Unchecked/batch callers must not consume the prompt")
+                XCTAssertFalse(viewModel.interactionRuntime.submitApprovalDecision(command: command, requestID: request.id, decision: .accept))
+                XCTAssertEqual(context.session.pendingApproval, request, "Repeated rejected responses must not consume the prompt")
             }
             for decision: AgentApprovalDecision in [.acceptForSession, .acceptWithExecpolicyAmendment("remember"), .decline] {
                 context.session.pendingApproval = request
-                XCTAssertTrue(viewModel.submitApprovalDecision(tabID: context.session.tabID, requestID: request.id, decision: decision))
+                XCTAssertTrue(viewModel.interactionRuntime.submitApprovalDecision(command: command, requestID: request.id, decision: decision))
             }
         }
     }
@@ -836,7 +840,7 @@ final class ACPApprovalAvailabilityTests: XCTestCase {
                 let payload = AgentModeViewModel.MCPInteractionResponsePayload(
                     text: nil, skip: false, responseArgument: .scalar(response), amendment: amendment, answersByQuestionID: [:]
                 )
-                XCTAssertThrowsError(try viewModel.mcpPendingInteractionResolution(
+                XCTAssertThrowsError(try viewModel.interactionRuntime.mcpPendingInteractionResolution(
                     for: context.session, kind: .approval, interactionID: request.id, payload: payload
                 ), "\(response), plain approval: \(available)") { error in
                     guard let mcpError = error as? MCPError, case .invalidParams = mcpError else {
@@ -907,7 +911,7 @@ final class ACPApprovalAvailabilityTests: XCTestCase {
             }
             context.session.pendingApproval = request
             context.session.runState = .waitingForApproval
-            let interaction = try XCTUnwrap(context.window.agentModeViewModel.mcpPendingInteraction(for: context.session))
+            let interaction = try XCTUnwrap(context.window.agentModeViewModel.mcpRuntime.mcpPendingInteraction(for: context.session))
             XCTAssertEqual(
                 interaction.options.map(\.label), testCase.options,
                 "\(String(describing: testCase.scope)): \(testCase.kind), plain approval: \(testCase.available)"
@@ -925,7 +929,7 @@ final class ACPApprovalAvailabilityTests: XCTestCase {
 
     func testOtherProvidersKeepPlainApproveAndUnknownACPAvailabilityFailsClosed() {
         let request = AgentApprovalRequest(
-            requestID: .codex(.int(1)), method: "requestApproval", kind: .commandExecution,
+            requestID: .codex(.fixture(.int(1))), method: "requestApproval", kind: .commandExecution,
             threadID: "thread", turnID: "turn", itemID: "item"
         )
         XCTAssertTrue(request.supportsPlainApprove)
@@ -953,7 +957,7 @@ final class CodexApprovalChoiceTests: XCTestCase {
             (Self.amendmentCommand, ["accept", "accept_with_amendment", "cancel"])
         ] {
             try install(parsedRequest(json), in: context)
-            let interaction = try XCTUnwrap(context.window.agentModeViewModel.mcpPendingInteraction(for: context.session))
+            let interaction = try XCTUnwrap(context.window.agentModeViewModel.mcpRuntime.mcpPendingInteraction(for: context.session))
             XCTAssertEqual(interaction.options.map(\.label), expected, "MCP options must equal availableDecisions: \(json)")
         }
     }
@@ -968,12 +972,12 @@ final class CodexApprovalChoiceTests: XCTestCase {
             let request = try parsedRequest(json)
             install(request, in: context)
             for (response, amendment) in accepted {
-                XCTAssertNoThrow(try viewModel.mcpPendingInteractionResolution(
+                XCTAssertNoThrow(try viewModel.interactionRuntime.mcpPendingInteractionResolution(
                     for: context.session, kind: .approval, interactionID: request.id, payload: payload(response, amendment)
                 ), "Advertised \(response) \(amendment ?? "") must still resolve: \(json)")
             }
             for (response, amendment) in rejected {
-                XCTAssertThrowsError(try viewModel.mcpPendingInteractionResolution(
+                XCTAssertThrowsError(try viewModel.interactionRuntime.mcpPendingInteractionResolution(
                     for: context.session, kind: .approval, interactionID: request.id, payload: payload(response, amendment)
                 ), "Unadvertised \(response) \(amendment ?? "") must be rejected: \(json)") { error in
                     guard let mcpError = error as? MCPError, case .invalidParams = mcpError else {
@@ -1004,7 +1008,7 @@ final class CodexApprovalChoiceTests: XCTestCase {
                 params["availableDecisions"] = try JSONSerialization.jsonObject(with: Data(encoded.utf8), options: .fragmentsAllowed)
             }
             let request = try XCTUnwrap(CodexNativeSessionController.parseApprovalRequest(
-                requestID: .int(1), method: "item/commandExecution/requestApproval", params: params,
+                receipt: .fixture(.int(1)), method: "item/commandExecution/requestApproval", params: params,
                 activeThreadID: "thread", currentTurnID: "turn"
             ))
             XCTAssertEqual(request.availableDecisions == nil, encoded == nil || encoded == "null", label)
@@ -1043,10 +1047,10 @@ final class CodexApprovalChoiceTests: XCTestCase {
             install(request, in: context)
             let denied = AgentApprovalDecision.acceptWithExecpolicyAmendment(example.denied)
             XCTAssertFalse(request.allows(denied))
-            XCTAssertThrowsError(try viewModel.mcpPendingInteractionResolution(
+            XCTAssertThrowsError(try viewModel.interactionRuntime.mcpPendingInteractionResolution(
                 for: session, kind: .approval, interactionID: request.id, payload: payload("accept_with_amendment", example.denied)
             ))
-            XCTAssertThrowsError(try viewModel.applyPendingInteractionResolution(.approval(request: request, decision: denied), to: session))
+            XCTAssertThrowsError(try viewModel.interactionRuntime.applyPendingInteractionResolution(.approval(request: request, decision: denied), command: runtimeCommand(in: context)))
             XCTAssertEqual(session.pendingApproval?.id, request.id)
             XCTAssertEqual(session.runState, .waitingForApproval)
         }
@@ -1061,10 +1065,10 @@ final class CodexApprovalChoiceTests: XCTestCase {
             install(request, in: context)
             let decision = AgentApprovalDecision.acceptWithExecpolicyAmendment(example.equivalent)
             XCTAssertTrue(request.allows(decision), "JSON escapes and whitespace must not change token identity")
-            let resolution = try viewModel.mcpPendingInteractionResolution(
+            let resolution = try viewModel.interactionRuntime.mcpPendingInteractionResolution(
                 for: session, kind: .approval, interactionID: request.id, payload: payload("accept_with_amendment", example.equivalent)
             )
-            try viewModel.applyPendingInteractionResolution(resolution, to: session)
+            try viewModel.interactionRuntime.applyPendingInteractionResolution(resolution, command: runtimeCommand(in: context))
             XCTAssertNil(session.pendingApproval)
         }
         await fulfillment(of: [sent], timeout: 3)
@@ -1085,7 +1089,7 @@ final class CodexApprovalChoiceTests: XCTestCase {
             "availableDecisions": [["acceptWithExecpolicyAmendment": ["execpolicy_amendment": ["git", "status"]]]]
         ]
         let request = try XCTUnwrap(CodexNativeSessionController.parseApprovalRequest(
-            requestID: .int(1), method: "item/commandExecution/requestApproval", params: params,
+            receipt: .fixture(.int(1)), method: "item/commandExecution/requestApproval", params: params,
             activeThreadID: "thread", currentTurnID: "turn"
         ))
         let equal = AgentApprovalDecision.acceptWithExecpolicyAmendment(" [ \"git\", \"status\" ] ")
@@ -1095,7 +1099,7 @@ final class CodexApprovalChoiceTests: XCTestCase {
         var withoutProposal = params
         withoutProposal.removeValue(forKey: "proposedExecpolicyAmendment")
         let advertisedOnly = try XCTUnwrap(CodexNativeSessionController.parseApprovalRequest(
-            requestID: .int(1), method: "item/commandExecution/requestApproval", params: withoutProposal,
+            receipt: .fixture(.int(1)), method: "item/commandExecution/requestApproval", params: withoutProposal,
             activeThreadID: "thread", currentTurnID: "turn"
         ))
         XCTAssertEqual(advertisedOnly.rememberedDecision, request.rememberedDecision)
@@ -1116,7 +1120,7 @@ final class CodexApprovalChoiceTests: XCTestCase {
         for (label, target, expected) in presentations {
             install(target, in: context)
             let cardDetails = target.details.filter { $0.label == "Execpolicy Amendment" }
-            let interaction = try XCTUnwrap(context.window.agentModeViewModel.mcpPendingInteraction(for: context.session))
+            let interaction = try XCTUnwrap(context.window.agentModeViewModel.mcpRuntime.mcpPendingInteraction(for: context.session))
             let mcpDetails = interaction.details.filter { ["Suggested Amendment", "Execpolicy Amendment"].contains($0.label) }
             XCTAssertEqual(cardDetails.count, expected == nil ? 0 : 1, label)
             XCTAssertEqual(mcpDetails.count, expected == nil ? 0 : 2, label)
@@ -1135,7 +1139,7 @@ final class CodexApprovalChoiceTests: XCTestCase {
 
         let legacy = try parsedRequest(#"{"threadId":"thread","command":"git status"}"#)
         let fileChange = AgentApprovalRequest(
-            requestID: .codex(.int(1)), method: "item/fileChange/requestApproval", kind: .fileChange,
+            requestID: .codex(.fixture(.int(1))), method: "item/fileChange/requestApproval", kind: .fileChange,
             threadID: "thread", turnID: "turn", itemID: "file"
         )
         XCTAssertTrue(legacy.allows(equal))
@@ -1165,7 +1169,7 @@ final class CodexApprovalChoiceTests: XCTestCase {
             ("accept_for_session", nil), ("always_allow", nil), ("approve_for_session", nil),
             ("decline", nil), ("reject", nil), ("amend", #"["git"]"#), ("accept_with_amendment", "not-json")
         ] as [(String, String?)] {
-            XCTAssertThrowsError(try viewModel.mcpPendingInteractionResolution(
+            XCTAssertThrowsError(try viewModel.interactionRuntime.mcpPendingInteractionResolution(
                 for: session, kind: .approval, interactionID: plain.id, payload: payload(response, value)
             )) { error in
                 guard case let MCPError.invalidParams(message) = error, let message else { return XCTFail("\(error)") }
@@ -1176,31 +1180,31 @@ final class CodexApprovalChoiceTests: XCTestCase {
             XCTAssertEqual(session.runState, .waitingForApproval)
         }
         for decision: AgentApprovalDecision in [.acceptForSession, .decline, .acceptWithExecpolicyAmendment(#"["git"]"#)] {
-            XCTAssertFalse(viewModel.submitApprovalDecision(tabID: session.tabID, requestID: plain.id, decision: decision))
-            XCTAssertThrowsError(try viewModel.applyPendingInteractionResolution(.approval(request: plain, decision: decision), to: session))
+            XCTAssertFalse(try viewModel.interactionRuntime.submitApprovalDecision(command: runtimeCommand(in: context), requestID: plain.id, decision: decision))
+            XCTAssertThrowsError(try viewModel.interactionRuntime.applyPendingInteractionResolution(.approval(request: plain, decision: decision), command: runtimeCommand(in: context)))
             XCTAssertEqual(session.pendingApproval, plain)
             XCTAssertEqual(session.runState, .waitingForApproval)
         }
-        let stale = try viewModel.mcpPendingInteractionResolution(
+        let stale = try viewModel.interactionRuntime.mcpPendingInteractionResolution(
             for: session, kind: .approval, interactionID: plain.id, payload: payload("accept", nil)
         )
         install(amendment, in: context)
-        XCTAssertThrowsError(try viewModel.applyPendingInteractionResolution(stale, to: session))
-        XCTAssertFalse(viewModel.submitApprovalDecision(tabID: session.tabID, requestID: plain.id, decision: .accept))
+        XCTAssertThrowsError(try viewModel.interactionRuntime.applyPendingInteractionResolution(stale, command: runtimeCommand(in: context)))
+        XCTAssertFalse(try viewModel.interactionRuntime.submitApprovalDecision(command: runtimeCommand(in: context), requestID: plain.id, decision: .accept))
         XCTAssertEqual(session.pendingApproval, amendment)
         XCTAssertEqual(session.runState, .waitingForApproval)
 
         let legacy = try parsedRequest(#"{"threadId":"thread","command":"git status"}"#)
         install(legacy, in: context)
-        let beforeCU = try viewModel.mcpPendingInteractionResolution(
+        let beforeCU = try viewModel.interactionRuntime.mcpPendingInteractionResolution(
             for: session, kind: .approval, interactionID: legacy.id, payload: payload("accept_for_session", nil)
         )
         session.codexControllerFeatureState = .init(computerUseEnabled: true, goalSupportEnabled: false, reasoningSummariesEnabled: false, memoriesEnabled: false)
-        XCTAssertEqual(try XCTUnwrap(viewModel.mcpPendingInteraction(for: session)).options.map(\.label), ["accept", "decline", "cancel"])
-        XCTAssertThrowsError(try viewModel.mcpPendingInteractionResolution(
+        XCTAssertEqual(try XCTUnwrap(viewModel.mcpRuntime.mcpPendingInteraction(for: session)).options.map(\.label), ["accept", "decline", "cancel"])
+        XCTAssertThrowsError(try viewModel.interactionRuntime.mcpPendingInteractionResolution(
             for: session, kind: .approval, interactionID: legacy.id, payload: payload("accept_for_session", nil)
         ))
-        XCTAssertThrowsError(try viewModel.applyPendingInteractionResolution(beforeCU, to: session))
+        XCTAssertThrowsError(try viewModel.interactionRuntime.applyPendingInteractionResolution(beforeCU, command: runtimeCommand(in: context)))
         XCTAssertEqual(session.pendingApproval, legacy)
         XCTAssertEqual(session.runState, .waitingForApproval)
         XCTAssertTrue(controller.recorder.events.isEmpty)
@@ -1209,7 +1213,7 @@ final class CodexApprovalChoiceTests: XCTestCase {
         let cancelOnly = try parsedRequest(#"{"threadId":"thread","command":"git status","availableDecisions":["cancel"]}"#)
         let network = try parsedRequest(#"{"threadId":"thread","command":"git status","availableDecisions":["accept","acceptForSession","cancel"]}"#)
         let fileChange = AgentApprovalRequest(
-            requestID: .codex(.int(1)), method: "item/fileChange/requestApproval", kind: .fileChange,
+            requestID: .codex(.fixture(.int(1))), method: "item/fileChange/requestApproval", kind: .fileChange,
             threadID: "thread", turnID: "turn", itemID: "file"
         )
         let cases: [(AgentApprovalRequest, String, String?, [AgentNotificationAction], String)] = [
@@ -1228,14 +1232,14 @@ final class CodexApprovalChoiceTests: XCTestCase {
             XCTAssertEqual(actions, expectedActions)
             let category = try XCTUnwrap(AgentNotificationAction.category(for: actions, interactionID: nil))
             XCTAssertTrue(AgentNotificationAction.staticCategories.contains(category), "Non-choice approval actions must remain registered")
-            let resolution = try viewModel.mcpPendingInteractionResolution(
+            let resolution = try viewModel.interactionRuntime.mcpPendingInteractionResolution(
                 for: session, kind: .approval, interactionID: request.id, payload: payload(response, value)
             )
-            try viewModel.applyPendingInteractionResolution(resolution, to: session)
+            try viewModel.interactionRuntime.applyPendingInteractionResolution(resolution, command: runtimeCommand(in: context))
             XCTAssertNil(session.pendingApproval)
             XCTAssertNotEqual(session.runState, .waitingForApproval)
-            XCTAssertFalse(viewModel.submitApprovalDecision(tabID: session.tabID, requestID: request.id, decision: .cancel))
-            XCTAssertThrowsError(try viewModel.applyPendingInteractionResolution(resolution, to: session))
+            XCTAssertFalse(try viewModel.interactionRuntime.submitApprovalDecision(command: runtimeCommand(in: context), requestID: request.id, decision: .cancel))
+            XCTAssertThrowsError(try viewModel.interactionRuntime.applyPendingInteractionResolution(resolution, command: runtimeCommand(in: context)))
         }
         await fulfillment(of: [sent], timeout: 3)
         XCTAssertEqual(controller.recorder.events.sorted(), cases.map { "1:\($0.4)" }.sorted())
@@ -1253,13 +1257,18 @@ final class CodexApprovalChoiceTests: XCTestCase {
         }
 
         func shutdown() async {}
-        func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async {
+        func respondToServerRequest(receipt: CodexServerRequestReceipt, result: [String: Any]) async -> CodexServerResponseDelivery {
             do {
                 let data = try JSONSerialization.data(withJSONObject: result, options: .sortedKeys)
-                recorder.record("\(id.displayValue):\(String(decoding: data, as: UTF8.self))")
+                recorder.record("\(receipt.requestID.displayValue):\(String(decoding: data, as: UTF8.self))")
             } catch { XCTFail("Invalid wire result: \(error)") }
             sent.fulfill()
+            return .written
         }
+    }
+
+    private func runtimeCommand(in context: AgentRunMCPControlledSessionContext) throws -> AgentSessionRuntimeStore.Command {
+        try XCTUnwrap(context.window.agentModeViewModel.runtimeCommand(sessionID: XCTUnwrap(context.session.activeAgentSessionID)))
     }
 
     private func makeContext() async throws -> AgentRunMCPControlledSessionContext {
@@ -1276,7 +1285,7 @@ final class CodexApprovalChoiceTests: XCTestCase {
             JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any], "Fixture must be a JSON object"
         )
         return try XCTUnwrap(CodexNativeSessionController.parseApprovalRequest(
-            requestID: .int(1), method: "item/commandExecution/requestApproval", params: params,
+            receipt: .fixture(.int(1)), method: "item/commandExecution/requestApproval", params: params,
             activeThreadID: "thread", currentTurnID: "turn"
         ), "Codex fixture must parse: \(json)")
     }

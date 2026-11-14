@@ -1,5 +1,15 @@
 import SwiftUI
 
+private extension View {
+    func renameSheetControlBackground() -> some View {
+        background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .strokeBorder(Color(NSColor.separatorColor).opacity(0.5), lineWidth: 0.5)
+            )
+    }
+}
+
 struct AgentSessionRenameSheet: View {
     @Binding var renameText: String
     let onConfirm: (String) -> Void
@@ -9,6 +19,12 @@ struct AgentSessionRenameSheet: View {
 
     private var trimmedText: String {
         renameText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func confirmRename() {
+        if !trimmedText.isEmpty {
+            onConfirm(trimmedText)
+        }
     }
 
     var body: some View {
@@ -29,11 +45,7 @@ struct AgentSessionRenameSheet: View {
                     .textFieldStyle(.plain)
                     .font(.system(size: 13))
                     .focused($isFieldFocused)
-                    .onSubmit {
-                        if !trimmedText.isEmpty {
-                            onConfirm(trimmedText)
-                        }
-                    }
+                    .onSubmit(confirmRename)
 
                 if !renameText.isEmpty {
                     Button {
@@ -50,11 +62,7 @@ struct AgentSessionRenameSheet: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .strokeBorder(Color(NSColor.separatorColor).opacity(0.5), lineWidth: 0.5)
-            )
+            .renameSheetControlBackground()
 
             // Buttons
             HStack(spacing: 10) {
@@ -65,18 +73,10 @@ struct AgentSessionRenameSheet: View {
                         .padding(.vertical, 6)
                 }
                 .buttonStyle(.plain)
-                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .strokeBorder(Color(NSColor.separatorColor).opacity(0.5), lineWidth: 0.5)
-                )
+                .renameSheetControlBackground()
                 .keyboardShortcut(.cancelAction)
 
-                Button {
-                    if !trimmedText.isEmpty {
-                        onConfirm(trimmedText)
-                    }
-                } label: {
+                Button(action: confirmRename) {
                     Text("Rename")
                         .font(.system(size: 12, weight: .medium))
                         .frame(maxWidth: .infinity)

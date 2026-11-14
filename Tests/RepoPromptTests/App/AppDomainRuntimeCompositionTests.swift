@@ -6,6 +6,7 @@ import RepoPromptFoundation
 import RepoPromptPersistence
 import RepoPromptSettingsCore
 import RepoPromptShared
+@testable import RepoPromptWorkspaceContext
 import SQLite3
 import XCTest
 

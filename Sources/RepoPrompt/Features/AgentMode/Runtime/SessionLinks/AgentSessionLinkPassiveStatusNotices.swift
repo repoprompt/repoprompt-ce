@@ -79,6 +79,13 @@ struct AgentSessionLinkPassiveStatusNotices {
         /// Proof from this exact publication only; nil never means zero.
         var runFacts: AgentRunQuietFacts?
         let managedMetadata: ManagedMetadata?
+        /// Wait evidence is separate from status identity and counters-only receipt proof.
+        var hasPendingInteraction: Bool
+        var supplementalNeedsUser: Bool?
+
+        var needsUser: Bool {
+            hasPendingInteraction || supplementalNeedsUser == true
+        }
 
         /// Supplemental values refresh presentation separately, never observation identity.
         static func == (lhs: Self, rhs: Self) -> Bool {
@@ -114,10 +121,15 @@ struct AgentSessionLinkPassiveStatusNotices {
             waitingOn: DomainAgentSessionWaitingOn? = nil,
             latestVisibleAssistantPreview: String? = nil,
             runFacts: AgentRunQuietFacts? = nil,
-            managedMetadata: ManagedMetadata? = nil
+            managedMetadata: ManagedMetadata? = nil,
+            hasPendingInteraction: Bool = false
         ) {
             self.managedMetadata = managedMetadata
-            self.runFacts = runFacts
+            self.hasPendingInteraction = hasPendingInteraction
+            supplementalNeedsUser = runFacts?.supplementalNeedsUser
+            self.runFacts = runFacts.flatMap {
+                AgentRunQuietFacts(settledThrough: $0.settledThrough, ordinaryThrough: $0.ordinaryThrough)
+            }
             self.reference = reference
             self.targetEndpoint = targetEndpoint
             self.targetSessionID = targetSessionID
@@ -276,12 +288,18 @@ struct AgentSessionLinkPassiveStatusNotices {
         let attentionSequence: UInt64
     }
 
-    /// One first-wins request for the observer to notice this exact oversight lane.
+    /// One first-wins attention occurrence for this exact oversight lane.
     ///
-    /// `occurrence` and `requestedAt` never change. Everything else is current presentation context
+    /// `occurrence`, `reason` and `requestedAt` never change. Everything else is current presentation context
     /// refreshed by authoritative status reconciliation, so a standalone request can become richer
     /// without becoming a new request or changing failure-suppression identity.
     struct PendingAttentionRequest: Hashable {
+        enum Reason: Hashable {
+            case requestedAttention
+            case needsUser
+        }
+
+        let reason: Reason
         let occurrence: AttentionOccurrenceIdentity
         let targetEndpoint: DomainAgentSessionLinkEndpointIdentity
         let targetSessionID: UUID
@@ -311,8 +329,10 @@ struct AgentSessionLinkPassiveStatusNotices {
             idleSince: Date? = nil,
             waitingOn: DomainAgentSessionWaitingOn? = nil,
             latestVisibleAssistantPreview: String? = nil,
-            managedMetadata: ManagedMetadata? = nil
+            managedMetadata: ManagedMetadata? = nil,
+            reason: Reason = .requestedAttention
         ) {
+            self.reason = reason
             self.managedMetadata = managedMetadata
             self.occurrence = occurrence
             self.targetEndpoint = targetEndpoint
@@ -340,7 +360,8 @@ struct AgentSessionLinkPassiveStatusNotices {
                 idleSince: sample.idleSince,
                 waitingOn: sample.waitingOn,
                 latestVisibleAssistantPreview: sample.latestVisibleAssistantPreview,
-                managedMetadata: sample.managedMetadata
+                managedMetadata: sample.managedMetadata,
+                reason: reason
             )
         }
 
@@ -816,6 +837,7 @@ struct AgentSessionLinkPassiveStatusNotices {
         self.linkSetRevision = linkSetRevision
 
         let currentByReference = samplesByReference(samples)
+        changed = retireInactiveAttention(samples: currentByReference) || changed
         let currentReferences = Set(currentByReference.keys)
         let removedReferences = Set(deliveredRunThrough.keys).subtracting(currentReferences)
             .union(Set(lastObservedStatus.keys).subtracting(currentReferences))
@@ -843,6 +865,8 @@ struct AgentSessionLinkPassiveStatusNotices {
                 changed = true
             }
             if sample.status == .unavailable {
+                sample.hasPendingInteraction = false
+                sample.supplementalNeedsUser = nil
                 // Remove public detail/attention, not the same-endpoint monotonic cache. An
                 // unavailable placeholder has NO fresh pair and cannot baseline, close, or pay;
                 // its existing Observation cache rejects a regressing first return without a resume
@@ -861,6 +885,7 @@ struct AgentSessionLinkPassiveStatusNotices {
             }
 
             let preceding = lastObservedStatus[reference]
+            changed = noteNeedsUserEntry(sample: sample, preceding: preceding, observedAt: observedAt) || changed
             if let incoming = sample.runFacts, let known = preceding?.lastKnownRunFacts,
                incoming.settledThrough < known.settledThrough || incoming.ordinaryThrough < known.ordinaryThrough
             {
@@ -1019,15 +1044,27 @@ struct AgentSessionLinkPassiveStatusNotices {
         else {
             return .unavailable
         }
-        guard pendingAttentionByReference[reference] == nil else {
-            // First wins until receipt or lifecycle invalidation. No timestamp, ordering, revision,
-            // or fingerprint movement: the wire response intentionally reveals no coalescing state.
+        switch insertAttention(observation: observation, reason: .requestedAttention, requestedAt: requestedAt) {
+        case .inserted:
+            advanceQueueRevision()
             return .accepted
+        case .alreadyPending: return .accepted
+        case .atCapacity: return .atCapacity
         }
-        guard pendingAttentionByReference.count < Self.maximumPendingAttentionRequestCount else {
-            return .atCapacity
-        }
+    }
 
+    private enum AttentionInsertion: Equatable {
+        case inserted, alreadyPending, atCapacity
+    }
+
+    private mutating func insertAttention(
+        observation: Observation,
+        reason: PendingAttentionRequest.Reason,
+        requestedAt: Date
+    ) -> AttentionInsertion {
+        let reference = observation.sample.reference
+        guard pendingAttentionByReference[reference] == nil else { return .alreadyPending }
+        guard pendingAttentionByReference.count < Self.maximumPendingAttentionRequestCount else { return .atCapacity }
         nextAttentionSequence &+= 1
         let occurrence = AttentionOccurrenceIdentity(
             queueEpoch: queueEpoch,
@@ -1036,8 +1073,8 @@ struct AgentSessionLinkPassiveStatusNotices {
         )
         pendingAttentionByReference[reference] = PendingAttentionRequest(
             occurrence: occurrence,
-            targetEndpoint: targetEndpoint,
-            targetSessionID: targetSessionID,
+            targetEndpoint: observation.targetEndpoint,
+            targetSessionID: observation.targetSessionID,
             requestedAt: requestedAt,
             displayName: observation.sample.displayName,
             status: observation.status,
@@ -1046,10 +1083,38 @@ struct AgentSessionLinkPassiveStatusNotices {
             idleSince: observation.sample.idleSince,
             waitingOn: observation.sample.waitingOn,
             latestVisibleAssistantPreview: observation.sample.latestVisibleAssistantPreview,
-            managedMetadata: observation.sample.managedMetadata
+            managedMetadata: observation.sample.managedMetadata,
+            reason: reason
         )
-        advanceQueueRevision()
-        return .accepted
+        return .inserted
+    }
+
+    /// Retire invalid lanes and ended waits before offering entries, regardless of target ordering.
+    private mutating func retireInactiveAttention(samples: [DomainAgentSessionLinkReference: Sample]) -> Bool {
+        let retired = pendingAttentionByReference.values.filter { attention in
+            guard let sample = samples[attention.reference], sample.status != .unavailable,
+                  sample.targetEndpoint == attention.targetEndpoint,
+                  sample.targetSessionID == attention.targetSessionID else { return true }
+            return attention.reason == .needsUser && !sample.needsUser
+        }
+        for attention in retired {
+            pendingAttentionByReference.removeValue(forKey: attention.reference)
+        }
+        return !retired.isEmpty
+    }
+
+    private mutating func noteNeedsUserEntry(sample: Sample, preceding: Observation?, observedAt: Date) -> Bool {
+        guard let preceding, preceding.status != .unavailable,
+              preceding.targetEndpoint == sample.targetEndpoint,
+              preceding.targetSessionID == sample.targetSessionID,
+              !preceding.sample.needsUser, sample.needsUser,
+              (!preceding.sample.hasPendingInteraction && sample.hasPendingInteraction)
+              || (preceding.sample.supplementalNeedsUser == false && sample.supplementalNeedsUser == true)
+        else { return false }
+        return insertAttention(
+            observation: Observation(sample: sample, observedAt: observedAt),
+            reason: .needsUser, requestedAt: observedAt
+        ) == .inserted
     }
 
     /// Applies an accepted provider receipt monotonically within this reducer's queue epoch.

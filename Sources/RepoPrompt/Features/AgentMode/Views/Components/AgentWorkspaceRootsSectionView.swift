@@ -718,7 +718,7 @@ struct AgentWorkspaceRootsSectionView: View {
                     iconSize: rootIconButtonIconSize,
                     cornerRadius: rootIconButtonCornerRadius
                 ) {
-                    rootsStore.moveRootUp(rowID: row.id)
+                    rootsStore.moveRoot(rowID: row.id, direction: .up)
                 }
                 .focused($focusedRootAction, equals: RootActionFocus(rowID: row.id, action: .moveUp))
                 .disabled(!row.canMoveUp)
@@ -731,7 +731,7 @@ struct AgentWorkspaceRootsSectionView: View {
                     iconSize: rootIconButtonIconSize,
                     cornerRadius: rootIconButtonCornerRadius
                 ) {
-                    rootsStore.moveRootDown(rowID: row.id)
+                    rootsStore.moveRoot(rowID: row.id, direction: .down)
                 }
                 .focused($focusedRootAction, equals: RootActionFocus(rowID: row.id, action: .moveDown))
                 .disabled(!row.canMoveDown)
@@ -826,12 +826,12 @@ struct AgentWorkspaceRootsSectionView: View {
 
         if hasMultipleRoots {
             Button("Move Root Up") {
-                rootsStore.moveRootUp(rowID: row.id)
+                rootsStore.moveRoot(rowID: row.id, direction: .up)
             }
             .disabled(!row.canMoveUp)
 
             Button("Move Root Down") {
-                rootsStore.moveRootDown(rowID: row.id)
+                rootsStore.moveRoot(rowID: row.id, direction: .down)
             }
             .disabled(!row.canMoveDown)
         }
@@ -923,18 +923,9 @@ struct AgentWorkspaceRootsSectionView: View {
     /// in an active worktree merge for the active Agent session. It has the
     /// lowest row priority so it truncates before WT/branch at narrow widths.
     private func mergeAttentionCapsule(_ attention: AgentWorktreeMergeAttention) -> some View {
-        let tint: Color = switch attention.kind {
-        case .conflicted: .orange
-        case .awaitingApproval: .purple
-        case .awaitingCommit: .yellow
-        }
-        let glyph = switch attention.kind {
-        case .conflicted: "exclamationmark.triangle.fill"
-        case .awaitingApproval: "arrow.triangle.merge"
-        case .awaitingCommit: "checkmark.circle"
-        }
+        let tint = attention.kind.presentationColor
         return HStack(spacing: fontPreset.scaledClamped(3, max: 4)) {
-            Image(systemName: glyph)
+            Image(systemName: attention.kind.presentationGlyph)
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .semibold))
             Text("MERGE")
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .medium))

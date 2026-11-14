@@ -216,3 +216,80 @@ final class EnhancedMarkdownBareURLTests: XCTestCase {
         return compiler.attributedString(from: Document(parsing: markdown, options: options))
     }
 }
+
+@MainActor
+final class MarkdownPresentationUpdateTests: XCTestCase {
+    func testHiddenUpdatesKeepSelectionAndRevealOnlyLatestLargeMarkdown() {
+        let source = String(repeating: "## Section\n\nA **bold** paragraph with a [link](https://example.com).\n\n```swift\nlet value = 42\n```\n\n", count: 1200)
+        var compiler = EnhancedMarkdownCompiler()
+        let initial = compiler.attributedString(from: Document(parsing: source))
+        let textView = CodeBlockTextView()
+        let coordinator = MarkdownTextViewCoordinator()
+        func render(_ text: NSAttributedString, visible: Bool) {
+            AttributedTextView(attributedString: text, isEditable: false, allowsTextSelection: true)
+                .updateTextView(textView, coordinator: coordinator, presentationVisible: visible)
+        }
+        render(initial, visible: true)
+        let selection = NSRange(location: 100, length: 500)
+        textView.setSelectedRange(selection)
+        // AppKit normalizes text-storage attributes; preserve its installed representation.
+        let installed = NSAttributedString(attributedString: textView.attributedString())
+        let initialVersion = textView.contentVersion
+        for index in 0 ..< 20 {
+            render(NSAttributedString(string: source + "Intermediate \(index)"), visible: false)
+        }
+        XCTAssertTrue(textView.attributedString().isEqual(to: installed))
+        XCTAssertEqual(textView.selectedRange(), selection)
+        XCTAssertEqual(textView.contentVersion, initialVersion)
+
+        let latest = NSMutableAttributedString(attributedString: initial)
+        latest.append(NSAttributedString(string: "Latest state"))
+        render(latest, visible: true)
+        XCTAssertEqual(textView.string, latest.string)
+        XCTAssertEqual(textView.contentVersion, initialVersion + 1)
+        XCTAssertEqual(textView.selectedRange(), selection)
+        let installedLatest = NSAttributedString(attributedString: textView.attributedString())
+        render(installedLatest, visible: true)
+        XCTAssertEqual(textView.contentVersion, initialVersion + 1, "An unchanged reveal must not replace text storage again")
+    }
+
+    func testHiddenEditableContentStillUpdates() {
+        let textView = CodeBlockTextView()
+        let coordinator = MarkdownTextViewCoordinator()
+        let text = NSAttributedString(string: "Latest editable draft")
+        AttributedTextView(attributedString: text, isEditable: true, allowsTextSelection: true)
+            .updateTextView(textView, coordinator: coordinator, presentationVisible: false)
+        XCTAssertEqual(textView.string, text.string)
+        XCTAssertTrue(textView.isEditable)
+        XCTAssertEqual(textView.contentVersion, 1)
+    }
+
+    func testInteractionFlagsAreRepairedAndDelegateRefreshDoesNotReplaceEqualContent() {
+        let textView = CodeBlockTextView()
+        let text = NSAttributedString(string: "Selectable markdown")
+        let view = AttributedTextView(attributedString: text, isEditable: false, allowsTextSelection: true)
+        let first = MarkdownTextViewCoordinator()
+        view.updateTextView(textView, coordinator: first, presentationVisible: true)
+        let version = textView.contentVersion
+        textView.isEditable = true
+        textView.isSelectable = false
+        textView.isContinuousSpellCheckingEnabled = true
+        textView.isGrammarCheckingEnabled = true
+        textView.isAutomaticSpellingCorrectionEnabled = true
+        textView.isAutomaticQuoteSubstitutionEnabled = true
+        textView.isAutomaticTextReplacementEnabled = true
+        let next = MarkdownTextViewCoordinator()
+        let installed = NSAttributedString(attributedString: textView.attributedString())
+        AttributedTextView(attributedString: installed, isEditable: false, allowsTextSelection: true)
+            .updateTextView(textView, coordinator: next, presentationVisible: true)
+        XCTAssertFalse(textView.isEditable)
+        XCTAssertTrue(textView.isSelectable)
+        XCTAssertFalse(textView.isContinuousSpellCheckingEnabled)
+        XCTAssertFalse(textView.isGrammarCheckingEnabled)
+        XCTAssertFalse(textView.isAutomaticSpellingCorrectionEnabled)
+        XCTAssertFalse(textView.isAutomaticQuoteSubstitutionEnabled)
+        XCTAssertFalse(textView.isAutomaticTextReplacementEnabled)
+        XCTAssertTrue(textView.delegate === next)
+        XCTAssertEqual(textView.contentVersion, version)
+    }
+}

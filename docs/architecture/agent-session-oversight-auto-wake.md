@@ -138,7 +138,15 @@ defect in this subsystem.
 | Link authority | Grants, capabilities (including default management), generations, cursors, revocation. Process-memory. | `DomainAgentSessionLinkAuthority` |
 | Passive reducer | The canonical observer-local queue: first-to-final coalescing of target status edges plus separate, non-lossy attention occurrences. Owns no authority and performs no delivery. | `AgentSessionLinkPassiveStatusNotices` |
 | Claim / receipt | The immutable rendered batch a provider was actually sent, including exact attention occurrence identities, and what that provider's acceptance therefore acknowledges. | `AgentSessionLinkPromptContext` |
-| Wake coordinator | Temporary admission policy: may this lane start an automatic turn *right now*? | `AgentModeViewModel+SessionLinkAutoWake` |
+| Wake coordinator | Temporary admission policy: may this lane start an automatic turn *right now*? | `AgentSessionLinkExecutionRuntime+Wake` |
+
+`AgentSessionRuntimeStore.Scope` retains the link executor and its actual inventory/hold/claim storage.
+The VM forwarding methods and `_modify` accessors refer to that same owner; they do not copy its maps.
+Auto-wake and periodic scheduling execute there too, preserving the four authorities above.
+Presentation labels and refreshes are optional. Canonical endpoint admission, run start, provider-switch
+commands, self-compaction settlement and composer claims remain required composition inputs. The
+legacy app adapter still supplies those inputs; this relocation alone does not make the saved-session
+execution host independent of windows.
 
 The lane board is derived data in the existing passive observation pipeline, not a fifth owner. The target view model combines its own run outcome, stamped failure reason, send-readiness blockers, and a current child-session census into the observation snapshot; the runtime bridge publishes that snapshot through link authority, and `poll`/`wait` render it. A board change can advance the existing `wait(until: "change")` cursor, but it creates no new status or attention edge for the passive reducer, changes no Auto-wake admission rule, and persists no board state.
 
@@ -533,7 +541,7 @@ configuration committed synchronously. A concurrent composer claim wins. Revocat
 that hop cannot substitute a new grant; later revocation does not undo an already admitted commit.
 Busy/loading/settling refusals are retryable, never queued. Even identical selections pass every gate.
 
-`AgentAdvertisedModelCatalog` indexes full compound IDs when ordinary catalogue producers run.
+`AgentModelCatalogRuntime` indexes full compound IDs when ordinary catalogue producers run.
 Admission performs bounded memory lookups only: no persistence warming, full catalogue flattening,
 provider discovery, or legacy resolver fallback. Registry/backend changes invalidate the index;
 a cold index tells the caller to refresh `agent_manage.list_agents` in the destination window.
@@ -1090,6 +1098,32 @@ stale or out-of-order receipt cannot clear a successor occurrence, an unaccepted
 occurrence pending, and a target may request attention again after the previous occurrence is
 receipted.
 
+### Observed user waits use the same attention owner
+
+The reducer also offers an attention occurrence when an established lane enters a deterministic user
+wait. Its immutable reason is `needsUser`; explicit requests retain `requestedAttention`. Public
+`pendingInteractionKind` supplies pending approval, permission, review, question and input evidence,
+including on links without Manage. Hook review and a live instruction wait require one supplementary
+bit in the existing private `runFacts` publication. The instruction predicate requires the waiting run
+state, continuation and wait ID together. A waiting status or prompt string alone is insufficient.
+The reducer extracts that bit before processing counters-only quiet proof, so ordinary status
+coalescing, fingerprints and receipts keep their existing behavior. Unknown proof stays unknown.
+
+First observations, restored lanes and recovery of unknown supplementary evidence baseline silently.
+A public pending edge works even without private facts. Replacing one wait with another without a
+sampled gap does not create another occurrence. Each observer has its own occurrence under its exact
+link, admission gates and receipt. Each reason uses the existing exception to routine selection,
+exact-lane snooze and interval admission. These settings retain their saved values. Inspection and
+prompt responses require their existing capabilities and user instructions.
+
+The same first-wins slot and sixteen-occurrence capacity apply. A later explicit request coalesced
+behind `needsUser` does not convert its reason. Acceptance or an observed wait exit removes that item;
+a pending explicit request survives wait exit. Capacity misses are not retried when space opens, and
+unobserved exit/re-entry is not reconstructed. The renderer uses `<needs_user>` without `requested_at`
+and explains the wait at `observed_at`, rather than claiming the lane requested attention. A frozen
+claim may lag resolution until retirement is published. Physical acquisition checks the exact
+rendered occurrence against the published queue. Provider acceptance uses the existing receipt rules.
+
 `set_waiting_on` is related context, not part of the attention transaction. It is optional,
 self-scoped and session-global, shared with every linked observer, mutable, and published non-atomically
 through a separate state path. It is never a prerequisite for `request_attention`, is never auto-set or
@@ -1210,10 +1244,12 @@ target, so opening an observer cannot overlap or masquerade as revocation.
 ## The routine wake interval is admission spacing, not a schedule
 
 An observer may require a minimum interval between *routine* automatic wakes. It is durable
-observer-session configuration (`routineWakeIntervalEnabled`, `routineWakeIntervalSeconds`), default
-off, retained while off, and normalized to one of 60/300/600/900/1800/3600/10800 seconds by
+observer-session configuration (`routineWakeIntervalEnabled`, `routineWakeIntervalSeconds`), enabled
+at 300 seconds for new sessions, retained while off, and normalized to one of
+60/180/300/600/900/1800/3600/10800 seconds by
 `AgentSessionLinkRoutineWakeInterval.normalized` — the one helper every decode, restore, and write
-path shares.
+path shares. Saved choices are preserved; legacy payloads without these fields retain their disabled
+default. The picker uses `No delay` to disable spacing while retaining the saved duration.
 
 Timing is measured from the **transport boundary**, not from a clock: the first successful transition
 to `.dispatching` in `agentSessionLinkAcquirePhysicalDispatch` records an endpoint-qualified monotonic
@@ -1271,8 +1307,8 @@ omitted rather than shown as zero once elapsed. `agent_session_link` is unchange
 
 Periodic waking is a separate, default-off observer-session preference, not notification admission
 spacing. It applies only while the session has at least one live outbound oversight relationship.
-The compact `Wake periodically when idle` checkbox and adjacent picker offer 10/30/60/120/360 minutes
-(default 30). The existing routine-limit checkbox likewise keeps its picker on the same row. The entire
+The `Wake after being idle for:` checkbox and adjacent picker offer 10/30/60/120/360 minutes
+(default 30). The separate routine-interval picker includes `No delay`. The entire
 wake-controls block is visible only with outbound oversight; inbound-only sessions do not show it.
 Hiding these controls does not clear the session's saved preferences.
 
@@ -1302,8 +1338,8 @@ clear the attempt. It converts it to `.cancelledBeforeDispatch` and leaves it in
 
 That tombstone looks like dead state and is not. Providers do not mint the wake's dispatch ID — they
 use their own (`codexNativeSend`, `claudeNativeSend`, `codexFallback`, and so on), and
-`agentSessionLinkEffectiveDispatchID` plus `AgentModeViewModel.dispatchRequiresLaneBatch` (both in
-`AgentModeViewModel+SessionLinkPrompt.swift`) rewrite that ID to the wake's **only while an attempt
+`agentSessionLinkEffectiveDispatchID` plus `AgentSessionLinkExecutionRuntime.dispatchRequiresLaneBatch` (both in
+`AgentSessionLinkExecutionRuntime+Prompt.swift`) rewrite that ID to the wake's **only while an attempt
 exists in `.preparingDispatch`, `.cancelledBeforeDispatch`, or `.dispatching`**.
 
 Clear the tombstone while a provider path is still preparing and the rewrite stops happening: the
@@ -1418,10 +1454,10 @@ parts that already existed:
 | --- | --- |
 | Mismatch and close predicates, cycle value | `AgentSessionLinkCodexCatalogRepair` (`isStuckProjection`, `projectionResolvesCycle`, `Cycle`) |
 | Cycle record | `AgentTabSession.codexSessionLinkCatalogRepairCycle` |
-| Opens/closes the cycle | `agentSessionLinkReconcileCodexCatalogRepair` in `AgentModeViewModel+SessionLinkPrompt` |
+| Opens/closes the cycle | `agentSessionLinkReconcileCodexCatalogRepair` in `AgentSessionLinkExecutionRuntime+Prompt` |
 | Spends the cycle | `codexRepairSessionLinkCatalogIfQuiescent` in `CodexAgentModeCoordinator` |
 | Quiescence gate | `isQuiescentForControllerReplacement` in `CodexAgentModeCoordinator`, reading `oversight.pendingAutoWakeOwnsTransportBoundary` |
-| Re-admits the queue | `agentSessionLinkRedriveCurrentPassiveSnapshot` in `AgentModeViewModel+SessionLinkAutoWake` |
+| Re-admits the queue | `agentSessionLinkRedriveCurrentPassiveSnapshot` in `AgentSessionLinkExecutionRuntime+Wake` |
 
 **The cycle records a controller generation, not a Boolean.** `nil` on the session is no cycle;
 `Cycle.state(currentControllerGeneration:)` answers `.pending` while the recorded generation still

@@ -118,19 +118,27 @@ enum AgentSidebarOverseerSectionBuilder {
             let containsCurrent = currentTabID.map { current in children.contains { $0.tabID == current } } ?? false
             let isCollapsed = !children.isEmpty && matchesSearch == nil
                 && collapsedKeys.contains(key) && !containsCurrent
-            append(presentationCopy(
-                root,
+            append(root.withThreadPresentation(
                 depth: 0,
                 threadKey: key,
                 hasThreadChildren: !children.isEmpty,
                 isThreadCollapsed: isCollapsed,
-                hiddenCount: isCollapsed ? children.count : 0,
-                hiddenAttentionCount: isCollapsed ? children.count(where: { attentionTabIDs.contains($0.tabID) }) : 0
+                hiddenThreadDescendantCount: isCollapsed ? children.count : 0,
+                hiddenThreadDescendantAttentionCount: isCollapsed ? children.count(where: { attentionTabIDs.contains($0.tabID) }) : 0,
+                threadActivityDate: root.lastUserMessageAt ?? root.activityDate
             ), id: .overseerRoot(root.tabID))
             guard !isCollapsed else { continue }
             for child in children {
                 append(
-                    presentationCopy(child, depth: 1, threadKey: nil, hasThreadChildren: false, isThreadCollapsed: false, hiddenCount: 0, hiddenAttentionCount: 0),
+                    child.withThreadPresentation(
+                        depth: 1,
+                        threadKey: nil,
+                        hasThreadChildren: false,
+                        isThreadCollapsed: false,
+                        hiddenThreadDescendantCount: 0,
+                        hiddenThreadDescendantAttentionCount: 0,
+                        threadActivityDate: child.lastUserMessageAt ?? child.activityDate
+                    ),
                     id: .overseen(overseerTabID: root.tabID, tabID: child.tabID)
                 )
             }
@@ -148,7 +156,15 @@ enum AgentSidebarOverseerSectionBuilder {
         pendingHeader = elsewhereTitle
         for row in elsewhere {
             append(
-                presentationCopy(row, depth: 0, threadKey: nil, hasThreadChildren: false, isThreadCollapsed: false, hiddenCount: 0, hiddenAttentionCount: 0),
+                row.withThreadPresentation(
+                    depth: 0,
+                    threadKey: nil,
+                    hasThreadChildren: false,
+                    isThreadCollapsed: false,
+                    hiddenThreadDescendantCount: 0,
+                    hiddenThreadDescendantAttentionCount: 0,
+                    threadActivityDate: row.lastUserMessageAt ?? row.activityDate
+                ),
                 id: .elsewhere(row.tabID)
             )
         }
@@ -156,42 +172,5 @@ enum AgentSidebarOverseerSectionBuilder {
         var seen = Set<UUID>()
         let unique = rendered.map(\.session).filter { seen.insert($0.tabID).inserted }
         return AgentSidebarOverseerPresentation(renderedRows: rendered, orderedUniqueSessions: unique)
-    }
-
-    /// The row as displayed in this tab. Session data, delegation metadata and search sources are
-    /// unchanged; only depth and disclosure state are presentation-specific.
-    private static func presentationCopy(
-        _ row: AgentModeViewModel.SidebarSession,
-        depth: Int,
-        threadKey: AgentSidebarThreadKey?,
-        hasThreadChildren: Bool,
-        isThreadCollapsed: Bool,
-        hiddenCount: Int,
-        hiddenAttentionCount: Int
-    ) -> AgentModeViewModel.SidebarSession {
-        AgentModeViewModel.SidebarSession(
-            id: row.id,
-            tabID: row.tabID,
-            title: row.title,
-            lastUserMessageAt: row.lastUserMessageAt,
-            activityDate: row.activityDate,
-            isPinned: row.isPinned,
-            sessionID: row.sessionID,
-            canStash: row.canStash,
-            parentSessionID: row.parentSessionID,
-            createdByOverseerSessionID: row.createdByOverseerSessionID,
-            depth: depth,
-            isMCPControlled: row.isMCPControlled,
-            worktree: row.worktree,
-            worktreeMergeAttention: row.worktreeMergeAttention,
-            threadKey: threadKey,
-            hasThreadChildren: hasThreadChildren,
-            isThreadCollapsed: isThreadCollapsed,
-            hiddenThreadDescendantCount: hiddenCount,
-            hiddenThreadDescendantAttentionCount: hiddenAttentionCount,
-            threadActivityDate: row.lastUserMessageAt ?? row.activityDate,
-            restorationDateBucket: row.restorationDateBucket,
-            searchFieldSource: row.searchFieldSource
-        )
     }
 }

@@ -4,6 +4,7 @@ import MCP
 import Ontology
 import RepoPromptFileSystem
 import RepoPromptShared
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 enum MCPApplyEditsMissingTargetPolicy {

@@ -1229,8 +1229,7 @@ final class AgentSessionOversightLaunchCoordinator {
               settled.state == entry.state, settled.closedReferences == entry.closedReferences,
               settled.parkedReference == nil
         else { return }
-        switch receipt.outcome {
-        case .applied, .unchanged, .absent:
+        @MainActor func recordTerminalSettlement() {
             settled.state = .terminal(reason)
             settled.token = nil
             settled.reference = nil
@@ -1240,20 +1239,16 @@ final class AgentSessionOversightLaunchCoordinator {
             #if DEBUG
                 logReconcile(pair: pair, outcome: "terminal", reason: reason.rawValue)
             #endif
+        }
+        switch receipt.outcome {
+        case .applied, .unchanged, .absent:
+            recordTerminalSettlement()
             reportTerminalSummaryIfNeeded(reason: reason)
         case .tokenMismatch:
             // A generation mismatch is the store proving this retirement is stale. The explicit Add
             // will hand the entry to the interactive path; do not pre-emptively terminalize it.
             guard receipt.assertionGeneration == assertion else { return }
-            settled.state = .terminal(reason)
-            settled.token = nil
-            settled.reference = nil
-            settled.parkedReference = nil
-            settled.closedReferences.removeAll()
-            entries[pair] = settled
-            #if DEBUG
-                logReconcile(pair: pair, outcome: "terminal", reason: reason.rawValue)
-            #endif
+            recordTerminalSettlement()
         // Token mismatch proves no removal. Do not report that the saved row was removed.
         case .writeFailed, .blocked:
             // Suppressed for this launch and recorded token-qualified, so no topology event retries

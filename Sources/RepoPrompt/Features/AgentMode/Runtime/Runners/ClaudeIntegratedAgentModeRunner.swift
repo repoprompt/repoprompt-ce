@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentProviderContracts
 import RepoPromptDomainRuntime
 import RepoPromptProcess
 import RepoPromptProviderQuota
@@ -35,15 +36,6 @@ final class ClaudeIntegratedAgentModeRunner {
         private func reasoningDebug(_ message: @autoclosure () -> String) {}
     #endif
 
-    private func reasoningDebugSnippet(_ text: String, limit: Int = 160) -> String {
-        text
-            .replacingOccurrences(of: "\n", with: "\\n")
-            .replacingOccurrences(of: "\r", with: "\\r")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .prefix(limit)
-            .description
-    }
-
     init(
         claudeCoordinator: ClaudeAgentModeCoordinator,
         hooks: AgentModeRunService.Hooks,
@@ -79,6 +71,7 @@ final class ClaudeIntegratedAgentModeRunner {
         guard let runID = AgentModeProcessRunIdentity.existingProcessRunID(for: session),
               session.claudeController != nil, listener.pendingProviderTurnID == turnID,
               listener.subscription == nil, listener.isCurrent(),
+              let cleanup = listener.routingCleanup,
               let subscription = listener.reserve()
         else { return false }
         let owner = session.beginRunAttempt(source: "claudeNative.providerInitiated")
@@ -97,7 +90,7 @@ final class ClaudeIntegratedAgentModeRunner {
         session.installRunAttemptTerminalResources(ownership: owner) { [weak session, claudeCoordinator] state in
             {
                 guard let session, state == .cancelled || state == .failed else { return }
-                await claudeCoordinator.cleanupAdoptedRun(session: session, runID: runID)
+                await claudeCoordinator.cleanupAdoptedRun(session: session, runID: runID, cleanup: cleanup)
             }
         }
         hooks.presentation.setAgentRunActive(session, true)
@@ -138,9 +131,15 @@ final class ClaudeIntegratedAgentModeRunner {
         return true
     }
 
+    #if DEBUG
+        enum StartupBoundary: Equatable { case taskEntry, toolTrackingCompleted, providerInitializationStarted }
+        var testAtClaudeStartupBoundary: ((StartupBoundary) -> Void)?
+    #endif
+
     func startRun(
         tabID: UUID,
         session: AgentTabSession,
+        origin: AgentSessionRuntimeStore.Command,
         initialUserMessage: String,
         initialMessageForRun: String,
         attachments: [AgentFileAttachment],
@@ -154,18 +153,32 @@ final class ClaudeIntegratedAgentModeRunner {
         preparedEvents: ClaudeAttemptEventReservation? = nil,
         startOutcome: AgentRunStartOutcomeRecorder? = nil
     ) async {
+        // The service transfers only admitted work, without an intervening await. A refused direct
+        // caller has no authority to repair a note prepared under a different admission.
+        guard case .restored = origin.requirement, origin.writer.session === session, origin.isCurrent,
+              let receipt = AgentSessionRuntimeStore.WriterReceipt(origin)
+        else {
+            if let preparedEvents {
+                preparedEvents.listener.close(preparedEvents.subscription, returningTail: false)
+                preparedEvents.listener.terminalPublished(for: preparedEvents.subscription)
+            }
+            startOutcome?.recordStartFailure(message: nil)
+            return
+        }
         let dedicatedNoteID = selfCompactDispatchID.flatMap { $0.stage == .note ? $0 : nil }
         var handedToRunTask = false
         var reservedEvents = preparedEvents
         defer {
             if !handedToRunTask {
-                session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained)
+                if receipt.disposition(for: session) != .claimLost {
+                    session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained)
+                }
                 if let reservedEvents {
-                    reservedEvents.listener.close(reservedEvents.subscription, returningTail: true)
+                    reservedEvents.listener.close(reservedEvents.subscription, returningTail: receipt.disposition(for: session) != .claimLost)
                     reservedEvents.listener.terminalPublished(for: reservedEvents.subscription)
                 }
             }
-            if let dedicatedNoteID, !handedToRunTask {
+            if let dedicatedNoteID, !handedToRunTask, receipt.disposition(for: session) != .claimLost {
                 AgentSelfCompactParkedPrefix.reparkUnattemptedDedicatedNote(dedicatedNoteID, session: session) {
                     hooks.persistence.scheduleSave(session)
                 }
@@ -194,14 +207,10 @@ final class ClaudeIntegratedAgentModeRunner {
             }
             return
         }
-        let attachmentReservationID = hooks.attachments.reserveAttachmentsForTurn(attachments, session)
-
-        if initialMessageForRun != initialUserMessage,
-           !session.pendingNonCodexUserInputTokenQueue.isEmpty
-        {
-            session.pendingNonCodexUserInputTokenQueue[0] = hooks.usage.estimateRuntimeTokens(initialMessageForRun)
-        }
-        hooks.usage.startNonCodexTurnAccountingIfNeeded(session, initialMessageForRun)
+        let attachmentReservationID = hooks.prepareNonCodexTurnInputs(
+            session: session, attachments: attachments,
+            initialUserMessage: initialUserMessage, initialMessageForRun: initialMessageForRun
+        )
         session.activeReasoningItemID = nil
         session.reasoningItemIDsByGroupID.removeAll()
         session.codexReasoningSegmentsByKey.removeAll()
@@ -257,6 +266,7 @@ final class ClaudeIntegratedAgentModeRunner {
         hooks.bindingObservation.updateBindings(session)
 
         let isPeriodic = session.oversight.pendingAutoWake?.isPeriodic == true
+        let recordsHandoff = !isPeriodic && providerControlCommand == nil && selfCompactDispatchID == nil
         // Only the producer can identify its newly appended row. An Auto-wake can follow an
         // unanswered historical user row, so even a trailing-row check cannot establish ownership.
         let rollbackUserItemID = providerControlCommand == nil && selfCompactDispatchID == nil && !isPeriodic
@@ -265,8 +275,10 @@ final class ClaudeIntegratedAgentModeRunner {
         session.agentTask = Task { [weak self, weak session, hooks] in
             guard let session else { return }
             defer {
-                session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained)
-                if let dedicatedNoteID {
+                if receipt.disposition(for: session) != .claimLost {
+                    session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained)
+                }
+                if let dedicatedNoteID, Self.ownsStartupTail(session, receipt: receipt, ownership: ownership, runID: runID) {
                     AgentSelfCompactParkedPrefix.reparkUnattemptedDedicatedNote(dedicatedNoteID, session: session) {
                         hooks.persistence.scheduleSave(session)
                     }
@@ -276,12 +288,33 @@ final class ClaudeIntegratedAgentModeRunner {
                 return
             }
             defer {
-                listener.close(subscription, returningTail: true)
+                listener.close(subscription, returningTail: Self.ownsStartupTail(session, receipt: receipt, ownership: ownership, runID: runID))
                 listener.terminalPublished(for: subscription)
             }
+            #if DEBUG
+                testAtClaudeStartupBoundary?(.taskEntry)
+            #endif
+            guard await admitStartupLease(
+                session: session, receipt: receipt, ownership: ownership, runID: runID,
+                listener: listener, subscription: subscription, lease: lease, acquired: false,
+                attachmentReservationID: attachmentReservationID,
+                recordsHandoff: recordsHandoff
+            ) else { return }
             await withTaskCancellationHandler {
                 let acquired = await lease.acquire()
+                if acquired {
+                    guard await self.admitStartupLease(
+                        session: session, receipt: receipt, ownership: ownership, runID: runID,
+                        listener: listener, subscription: subscription, lease: lease, acquired: true,
+                        attachmentReservationID: attachmentReservationID,
+                        recordsHandoff: recordsHandoff
+                    ) else { return }
+                }
                 guard acquired else {
+                    guard Self.ownsStartupAttempt(session, receipt: receipt, ownership: ownership, runID: runID) else {
+                        listener.close(subscription, returningTail: false)
+                        return
+                    }
                     listener.close(subscription, returningTail: true)
                     await self.handleAcquireFailure(
                         tabID: tabID,
@@ -289,6 +322,7 @@ final class ClaudeIntegratedAgentModeRunner {
                         lease: lease,
                         runID: runID,
                         ownership: ownership,
+                        receipt: receipt,
                         attachmentReservationID: attachmentReservationID
                     )
                     return
@@ -299,7 +333,18 @@ final class ClaudeIntegratedAgentModeRunner {
                     runID: runID
                 )
 
+                #if DEBUG
+                    self.testAtClaudeStartupBoundary?(.toolTrackingCompleted)
+                #endif
+                guard await self.admitStartupLease(
+                    session: session, receipt: receipt, ownership: ownership, runID: runID,
+                    listener: listener, subscription: subscription, lease: lease, acquired: true,
+                    attachmentReservationID: attachmentReservationID,
+                    recordsHandoff: recordsHandoff
+                ) else { return }
+
                 let providerName = session.selectedAgent.rawValue
+                var startupRefused = false
                 var didSendToProvider = false
                 var routeRefusalMessage: String?
                 var nativeFailureMetadata: (errorText: String?, shouldShutdownSession: Bool)?
@@ -307,6 +352,19 @@ final class ClaudeIntegratedAgentModeRunner {
                     failureText: { _ in nativeFailureMetadata?.errorText ?? "" }
                 ) {
                     await lease.providerInitializationStarted(provider: providerName)
+                    #if DEBUG
+                        self.testAtClaudeStartupBoundary?(.providerInitializationStarted)
+                    #endif
+                    guard await self.admitStartupLease(
+                        session: session, receipt: receipt, ownership: ownership, runID: runID,
+                        listener: listener, subscription: subscription, lease: lease, acquired: true,
+                        attachmentReservationID: attachmentReservationID,
+                        recordsHandoff: recordsHandoff
+                    ) else {
+                        startupRefused = true
+                        await lease.providerInitializationCompleted(provider: providerName, outcome: "superseded")
+                        return .superseded
+                    }
                     let sendOutcome = await self.claudeCoordinator.sendClaudeNativeMessage(
                         session: session,
                         text: initialMessageForRun,
@@ -320,7 +378,8 @@ final class ClaudeIntegratedAgentModeRunner {
                         selfCompactDispatchID: selfCompactDispatchID,
                         // A replacement process's MCP child needs this run's one-shot admission
                         // policy re-armed; the lease that installed it still owns it here.
-                        reinstallRunRoutingPolicy: { await lease.reinstallPolicyForReplacementProcess() }
+                        reinstallRunRoutingPolicy: { await lease.reinstallPolicyForReplacementProcess() },
+                        routingLease: lease
                     )
                     if sendOutcome == .sent { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) }
                     if let dedicatedNoteID, sendOutcome != .sent {
@@ -377,6 +436,9 @@ final class ClaudeIntegratedAgentModeRunner {
                     }
                 }
 
+                // The startup gate already settled its original attempt or released captured-only
+                // resources. Never feed its refusal into post-coordinator shared-state cleanup.
+                guard !startupRefused else { return }
                 listener.close(subscription, returningTail: true)
                 switch report.result {
                 case .superseded:
@@ -476,7 +538,7 @@ final class ClaudeIntegratedAgentModeRunner {
             return false
         }
 
-        func testConsumeTurnStatus(_ events: [NativeAgentRuntimeEvent], session: AgentTabSession, runID: UUID, owner: AgentRunOwnership) async -> ClaudeNativeProcessSessionController.TurnStatus {
+        func testConsumeTurnStatus(_ events: [NativeAgentRuntimeEvent], session: AgentTabSession, runID: UUID, owner: AgentRunOwnership) async -> NativeAgentRuntimeTurnStatus {
             let stream = AsyncStream<NativeAgentRuntimeEvent> { continuation in
                 for event in events {
                     continuation.yield(event)
@@ -512,7 +574,7 @@ final class ClaudeIntegratedAgentModeRunner {
         var exitedDueToAttemptMismatch = false
         // Keyed answers may settle several unprotected inputs across separate events.
         // Keep their strongest outcome until the existing settlement boundary is terminal.
-        var unprotectedTurnStatus: ClaudeNativeProcessSessionController.TurnStatus = .completed
+        var unprotectedTurnStatus: NativeAgentRuntimeTurnStatus = .completed
         var answeredUnprotected = false
         var hostIDsAtFirstSuccessor: Set<UUID>?
         // Only first-party Claude owns this subscription telemetry. No extra request or
@@ -538,14 +600,14 @@ final class ClaudeIntegratedAgentModeRunner {
             }
         }
 
-        func strongest(_ current: ClaudeNativeProcessSessionController.TurnStatus, _ next: ClaudeNativeProcessSessionController.TurnStatus) -> ClaudeNativeProcessSessionController.TurnStatus {
+        func strongest(_ current: NativeAgentRuntimeTurnStatus, _ next: NativeAgentRuntimeTurnStatus) -> NativeAgentRuntimeTurnStatus {
             switch (current, next) {
             case (.failed, _), (_, .failed): .failed
             case (.cancelled, _), (_, .cancelled): .cancelled
             default: .completed
             }
         }
-        var completedProtectedStatuses: [UUID: ClaudeNativeProcessSessionController.TurnStatus] = [:]
+        var completedProtectedStatuses: [UUID: NativeAgentRuntimeTurnStatus] = [:]
         var abandonedProtectedIDs: Set<UUID> = []
         eventLoop: while let item = await next() {
             guard session.runID == runID,
@@ -619,13 +681,13 @@ final class ClaudeIntegratedAgentModeRunner {
                 #if DEBUG
                     if ClaudeReasoningExtractionFeature.isEnabled, result.type == "reasoning" {
                         let text = result.reasoning ?? result.text ?? ""
-                        reasoningDebug("stream reasoning run=\(runID.uuidString) attempt=\(runAttemptID.uuidString) tab=\(session.tabID.uuidString) len=\(text.count) snippet=\(reasoningDebugSnippet(text))")
+                        reasoningDebug("stream reasoning run=\(runID.uuidString) attempt=\(runAttemptID.uuidString) tab=\(session.tabID.uuidString) len=\(text.count) snippet=\(AgentSessionStreamRuntime.claudeReasoningDebugSnippet(text))")
                     }
                 #endif
                 await hooks.transcript.handleHeadlessStreamResult(result, session, runID, runAttemptID)
             case let .rateLimit(info):
                 if session.selectedAgent == .claudeCode, let quotaLease {
-                    await quotaService.observe(ClaudeCompatibleProviderRuntimeBridge.quotaObservation(from: info), lease: quotaLease, observedAt: Date())
+                    await quotaService.observe(info, lease: quotaLease, observedAt: Date())
                 }
             case let .runtimeInit(status):
                 // Only the window is recomputed, so usage provenance and vouches are left as they are.
@@ -659,7 +721,7 @@ final class ClaudeIntegratedAgentModeRunner {
                 }
             case .turnCompleted, .turnsCompleted:
                 let ids: [UUID]
-                let turnStatus: ClaudeNativeProcessSessionController.TurnStatus
+                let turnStatus: NativeAgentRuntimeTurnStatus
                 let keyed: Bool
                 switch event {
                 case let .turnCompleted(id, status): (ids, turnStatus, keyed) = ([id], status, false)
@@ -774,29 +836,83 @@ final class ClaudeIntegratedAgentModeRunner {
         return (true, answeredUnprotected)
     }
 
+    private static func ownsStartupAttempt(
+        _ session: AgentTabSession,
+        receipt: AgentSessionRuntimeStore.WriterReceipt,
+        ownership: AgentRunOwnership,
+        runID: UUID
+    ) -> Bool {
+        receipt.disposition(for: session) != .claimLost
+            && session.isCurrentRunAttemptForCurrentBinding(ownership, expectedRunID: runID)
+    }
+
+    private static func ownsStartupTail(
+        _ session: AgentTabSession,
+        receipt: AgentSessionRuntimeStore.WriterReceipt,
+        ownership: AgentRunOwnership,
+        runID: UUID
+    ) -> Bool {
+        guard receipt.disposition(for: session) != .claimLost else { return false }
+        return session.isCurrentRunAttemptForCurrentBinding(ownership, expectedRunID: runID)
+            || (session.activeRunOwnership == nil && session.lastTerminalCommitRevision?.ownership == ownership)
+    }
+
+    /// A captured inbox and gate may be released after claim loss; shared state and routing policy
+    /// remain the current owner's responsibility. Binding-transition attempts cannot use the
+    /// terminal barrier either, so they never acquire settlement authority from this receipt.
+    private func admitStartupLease(
+        session: AgentTabSession,
+        receipt: AgentSessionRuntimeStore.WriterReceipt,
+        ownership: AgentRunOwnership,
+        runID: UUID,
+        listener: ClaudeControllerEventListener,
+        subscription: ClaudeAttemptEventSubscription,
+        lease: MCPBootstrapLease,
+        acquired: Bool,
+        attachmentReservationID: UUID?,
+        recordsHandoff: Bool
+    ) async -> Bool {
+        guard Self.ownsStartupAttempt(session, receipt: receipt, ownership: ownership, runID: runID) else {
+            listener.close(subscription, returningTail: false)
+            if acquired { await lease.releaseGateForDeferredRouting() }
+            return false
+        }
+        guard receipt.disposition(for: session) != .current else { return true }
+        listener.close(subscription, returningTail: true)
+        if Self.ownsStartupAttempt(session, receipt: receipt, ownership: ownership, runID: runID) {
+            if recordsHandoff { hooks.providerInput.recordPendingHandoffSendOutcome(session, false) }
+            if Self.ownsStartupAttempt(session, receipt: receipt, ownership: ownership, runID: runID) {
+                await finalize(
+                    session: session, runID: runID, ownership: ownership,
+                    attachmentReservationID: attachmentReservationID, terminalState: .cancelled,
+                    errorText: nil, notifyTurnComplete: false
+                )
+            }
+        }
+        // Never re-resolve the controller or revoke its policy after an awaited terminal commit.
+        if acquired { await lease.releaseGateForDeferredRouting() }
+        return false
+    }
+
     private func handleAcquireFailure(
         tabID _: UUID,
         session: AgentTabSession,
         lease: MCPBootstrapLease,
         runID: UUID,
         ownership: AgentRunOwnership,
+        receipt: AgentSessionRuntimeStore.WriterReceipt,
         attachmentReservationID: UUID?
     ) async {
         let outcome = await lease.acquireFailureOutcome
+        guard Self.ownsStartupAttempt(session, receipt: receipt, ownership: ownership, runID: runID) else { return }
         hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
-        await terminalCommitBarrier.commit(.init(
-            binding: hooks.bindTerminalSession(session),
-            ownership: ownership,
-            expectedRunID: runID,
-            terminalState: outcome.terminalState,
-            source: "claudeNative.acquireFailure",
-            errorText: outcome.errorText,
+        guard Self.ownsStartupAttempt(session, receipt: receipt, ownership: ownership, runID: runID) else { return }
+        await hooks.commitAcquireFailure(
+            session: session, outcome: outcome, runID: runID, ownership: ownership,
             attachmentReservationID: attachmentReservationID,
-            attachmentDisposition: .deleteFiles,
-            finalizeNonCodexUsage: true,
-            supportsFollowUp: true,
-            notifyTurnComplete: false
-        ))
+            source: "claudeNative.acquireFailure", supportsFollowUp: true,
+            barrier: terminalCommitBarrier
+        )
     }
 
     @discardableResult

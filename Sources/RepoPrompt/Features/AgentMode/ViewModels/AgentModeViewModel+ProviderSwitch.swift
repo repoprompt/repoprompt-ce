@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 
@@ -7,7 +8,7 @@ extension AgentModeViewModel {
     /// Summary provenance excludes host-owned one-shot delivery content, not stable instructions
     /// or monitor authority. Full actual instructions still own every preview currency/fit check.
     private func providerSwitchInstructionProvenance(_ session: TabSession, destination: AgentProviderKind) -> [String] {
-        providerSwitchInstructionStrings(session, destination: destination, includeOwedContent: false)
+        linkExecutionRuntime.providerSwitchInstructionStrings(session, destination: destination, includeOwedContent: false)
     }
 
     /// Switch admission separates hard blockers (integrity or a real pending handover) from
@@ -70,7 +71,7 @@ extension AgentModeViewModel {
         if session.pendingSelfWorktreeRelocation != nil {
             return .hard(SendBlocker.changingExecutionLocation.rawValue)
         }
-        var snapshot = Self.agentSessionLinkDeliveryReadinessSnapshot(
+        var snapshot = AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
             session: session, endpointMatchesGrant: sessions[session.tabID] === session, isClosing: false,
             ignoresComposerSubmissionInFlight: ownsComposerClaim
         )
@@ -123,7 +124,7 @@ extension AgentModeViewModel {
             if snapshot.runStateIsActive { return .forceable(.running) }
             return .forceable(.workInFlight)
         }
-        if !providerSwitchTerminalIsSettled(session) { return .forceable(.finishingTurn) }
+        if !runService.providerSwitchTerminalIsSettled(session) { return .forceable(.finishingTurn) }
         return .clear
     }
 
@@ -160,14 +161,15 @@ extension AgentModeViewModel {
     /// the source has not settled afterwards — a carrier rendered from it would repeat the stale
     /// in-flight-turn defect this path exists to prevent. A settled terminal state (.cancelled
     /// with publication finished, teardown still running detached) is safe to project.
-    private func providerSwitchQuiesceSourceForForcedSwitch(_ session: TabSession) async -> Bool {
-        providerSwitchDeclinePendingInteractions(for: session)
+    private func providerSwitchQuiesceSourceForForcedSwitch(_ claim: AgentComposerSubmitClaim) async -> Bool {
+        guard interactionRuntime.declinePendingInteractionsForProviderSwitch(claim: claim) else { return false }
+        let session = claim.sourceSession
         agentSelfCompactCancelForAcceptedLocalInput(session)
         guard providerSwitchSourceRunIsLive(session) else {
             // Queued work with no live run gets the same claim-time withdrawal an explicit Stop
             // runs — without manufacturing a cancelled attempt the way cancelRun would on idle.
             prepareAgentRunCancellation(session: session, intent: .userStop, origin: .explicitStop)
-            withdrawQueuedWorkForManagedStop(session: session)
+            linkExecutionRuntime.withdrawQueuedWorkForManagedStop(session: session)
             retireTimedOutManagedStopIfEligible(session)
             return providerSwitchSourceIsSettled(session)
         }
@@ -259,7 +261,7 @@ extension AgentModeViewModel {
                         return nil as String?
                     }
                 #endif
-                try await self.requireIdleProviderForWorktreeBindingTransition(session)
+                try await AgentSessionWorktreeRuntime.requireIdleProvider(session)
                 return nil as String?
             } catch { return error.localizedDescription }
         }
@@ -429,7 +431,7 @@ extension AgentModeViewModel {
         if !owned.allowsSave, owned.session.saveRequestGeneration != owned.saveGenerationAtEntry,
            owned.session.isDirty, providerSwitchPreviewIdentityIsCurrent(owned.preview)
         {
-            scheduleSave(for: owned.session)
+            persistenceRuntime.scheduleSave(for: owned.session)
         }
     }
 
@@ -561,7 +563,7 @@ extension AgentModeViewModel {
             sourceParameters: session.acpModelParameterSelections,
             composition: providerSwitchComposition(session, destination: agent), sourceRevision: session.sourceItemsRevision,
             draftRevision: session.draftMutationGeneration,
-            instructions: providerSwitchInstructionStrings(session, destination: agent),
+            instructions: linkExecutionRuntime.providerSwitchInstructionStrings(session, destination: agent),
             instructionProvenance: providerSwitchInstructionProvenance(session, destination: agent),
             generatedSummary: retainingSummary, updated: updated
         )
@@ -590,7 +592,7 @@ extension AgentModeViewModel {
                 session.sourceItemsRevision == preview.sourceRevision
                     && session.draftMutationGeneration == preview.draftRevision
                     && providerSwitchComposition(session, destination: preview.destination) == preview.composition
-                    && providerSwitchInstructionStrings(session, destination: preview.destination) == preview.instructions
+                    && linkExecutionRuntime.providerSwitchInstructionStrings(session, destination: preview.destination) == preview.instructions
             ))
     }
 
@@ -676,7 +678,7 @@ extension AgentModeViewModel {
         let nextSequence = session.nextSequenceIndex
         let state = session.runState
         let originalSlot = preview.originalHandoff
-        let stale = Self.providerSwitchNeedsReview(session)
+        let stale = AgentSessionLinkExecutionRuntime.providerSwitchNeedsReview(session)
         let composition = preview.composition
         let wrapped = composeProviderSwitchPreviewDraft(composition, destination: preview.destination, session: session)
         let live: @MainActor () -> Bool = { [weak self] in
@@ -703,7 +705,7 @@ extension AgentModeViewModel {
             return
         }
         let budget = AgentProviderHandover.Budget(
-            catalogWindow: providerSwitchCatalogWindow(agent: preview.destination, model: preview.model),
+            catalogWindow: linkExecutionRuntime.providerSwitchCatalogWindow(agent: preview.destination, model: preview.model),
             instructions: preview.instructions, composedInput: "\n\n" + composed, isPreview: true
         )
         let server = preview.destination == .grokBuild ? RepoPromptMCPServerConfiguration.grokBuildRuntimeServerName : MCPIntegrationHelper.repoPromptMCPServerName
@@ -711,7 +713,7 @@ extension AgentModeViewModel {
             try AgentProviderHandover.HistoryReference(
                 server: server,
                 sessionID: $0,
-                historyAllowed: providerSwitchHistoryToolAllowed(session, destination: preview.destination),
+                historyAllowed: linkExecutionRuntime.providerSwitchHistoryToolAllowed(session, destination: preview.destination),
                 indicesMatch: true
             )
         }
@@ -745,7 +747,7 @@ extension AgentModeViewModel {
                 .init(mode: .summary, unavailable: preview.isReview ? AgentSessionLinkSendFailure.providerHandoverNeedsReview.message : (result.wordLimit == nil ? "no room for a summary" : nil), hidden: !preview.isReview)
             ]
             if !stale, let payload = originalSlot.payload, let descriptor = preview.originalDescriptor,
-               providerSwitchReadReferenceIsCurrent(descriptor, session: session, destination: preview.destination),
+               linkExecutionRuntime.providerSwitchReadReferenceIsCurrent(descriptor, session: session, destination: preview.destination),
                let mode = AgentProviderHandover.Mode(rawValue: descriptor.mode),
                AgentProviderHandover.estimate(payload) <= budget.remainingCarrierTokens,
                payload.utf8.count <= AgentProviderHandover.maximumBytes,
@@ -942,7 +944,7 @@ extension AgentModeViewModel {
                 transcript: session.transcript, items: session.items,
                 nextSequence: session.nextSequenceIndex, state: session.runState,
                 originalSlot: preview.originalHandoff,
-                stale: Self.providerSwitchNeedsReview(session), source: source,
+                stale: AgentSessionLinkExecutionRuntime.providerSwitchNeedsReview(session), source: source,
                 reference: preview.historyReference, budget: budget
             )
             let carrier: AgentProviderHandover.Carrier? = switch preview.selected ?? .history {
@@ -965,7 +967,7 @@ extension AgentModeViewModel {
         providerSwitchExactOwnerProbe?(session) ?? false
     }
 
-    private func providerSwitchClaim(_ preview: ProviderSwitchPreview, discard: Bool = false) -> AgentComposerSubmitClaim? {
+    private func providerSwitchClaim(_ preview: ProviderSwitchPreview, discard: Bool = false, allowsPendingStartWithdrawal: Bool = true) -> AgentComposerSubmitClaim? {
         guard providerSwitchPreviewIsCurrent(preview, content: !discard), providerSwitchHasExactOwner(preview.session),
               let target = makeComposerSubmitTarget(tabID: preview.session.tabID, session: preview.session) else { return nil }
         let attempt = AgentComposerSubmitAttempt(
@@ -975,7 +977,7 @@ extension AgentModeViewModel {
             noticeRevision: 0,
             rawDraftSnapshot: preview.session.draftText
         )
-        guard case let .claimed(claim) = claimComposerSubmitAttempt(attempt, requireActiveTabOwnership: false) else { return nil }
+        guard case let .claimed(claim) = claimComposerSubmitAttempt(attempt, requireActiveTabOwnership: false, allowsPendingStartWithdrawal: allowsPendingStartWithdrawal) else { return nil }
         return claim
     }
 
@@ -993,7 +995,7 @@ extension AgentModeViewModel {
             }
             return
         }
-        guard providerSwitchPreview?.id == id, providerSwitchPreviewIsCurrent(preview), composerSubmitClaimIsCurrent(claim),
+        guard providerSwitchPreview?.id == id, providerSwitchPreviewIsCurrent(preview), composerSubmitRuntime.isCurrent(claim),
               providerSwitchTransitionBlocker(session, ownsComposerClaim: true) == nil,
               let workspaceID = workspaceManager?.activeWorkspaceID else { return }
         // Publish the exact row identity before dispatch, including synchronous fake completions.
@@ -1002,9 +1004,9 @@ extension AgentModeViewModel {
         providerSwitchPreview?.generationItemID = row.id
         providerSwitchPreview?.selected = .summary
         session.isDirty = true
-        guard case .success = await flushSaveRequired(for: session.tabID, workspaceID: workspaceID),
+        guard case .success = await persistenceRuntime.flushSaveRequired(for: session.tabID, workspaceID: workspaceID),
               providerSwitchPreview?.id == id, providerSwitchPreview?.generationItemID == row.id,
-              composerSubmitClaimIsCurrent(claim), preview.stopFence.permitsStart(of: session),
+              composerSubmitRuntime.isCurrent(claim), preview.stopFence.permitsStart(of: session),
               sessions[session.tabID] === session, session.currentRestorationBindingToken == preview.binding
         else {
             if providerSwitchPreview?.id == id {
@@ -1038,7 +1040,7 @@ extension AgentModeViewModel {
             if let index = providerSwitchPreview?.choices.firstIndex(where: { $0.mode == .summary }) {
                 providerSwitchPreview?.choices[index].unavailable = AgentSessionLinkSendFailure.targetNotIdle.message
             }
-        } else { agentSessionLinkClearWaitingOnAfterAcceptedTurn(session) }
+        } else { session.clearAgentSessionLinkWaitingOnAfterAcceptedTurn() }
     }
 
     func providerSwitchGenerationSettled(_ session: TabSession) {
@@ -1133,7 +1135,9 @@ extension AgentModeViewModel {
               ? providerSwitchDiscardBlocker(preview) == nil
               : providerSwitchPreviewAdmission(preview).isAdmissible(forcing: forcing),
               discard ? preview.isReview : (preview.chosen != nil && preview.chosen?.unavailable == nil),
-              let claim = providerSwitchClaim(preview, discard: discard), let workspaceID = workspaceManager?.activeWorkspaceID else { return false }
+              // This claim owns a lifecycle mutation, not an input waiting to start. Forced
+              // quiescence withdraws queued input through Stop without cancelling its own claim.
+              let claim = providerSwitchClaim(preview, discard: discard, allowsPendingStartWithdrawal: false), let workspaceID = workspaceManager?.activeWorkspaceID else { return false }
         defer { releaseComposerSubmitClaim(claim) }
         let session = preview.session
         var rollback = ProviderSwitchRollback(session)
@@ -1148,7 +1152,7 @@ extension AgentModeViewModel {
             let previewCurrent = forcing
                 ? providerSwitchPreviewIdentityIsCurrent(preview)
                 : providerSwitchPreviewIsCurrent(preview, content: !discard)
-            return composerSubmitClaimIsCurrent(claim) && providerSwitchMutation?.id == mutation.id
+            return composerSubmitRuntime.isCurrent(claim) && providerSwitchMutation?.id == mutation.id
                 && (!requiresPresentedPreview || providerSwitchPreview?.id == id) && previewCurrent
                 && workspaceManager?.activeWorkspaceID == workspaceID && providerSwitchHasExactOwner(session)
                 && (
@@ -1163,9 +1167,9 @@ extension AgentModeViewModel {
                 : (
                     providerSwitchPreviewIsCurrent(preview, content: false)
                         && session.sourceItemsRevision == preview.sourceRevision
-                        && providerSwitchInstructionStrings(session, destination: preview.destination) == preview.instructions
+                        && linkExecutionRuntime.providerSwitchInstructionStrings(session, destination: preview.destination) == preview.instructions
                 )
-            return composerSubmitClaimIsCurrent(claim) && providerSwitchMutation?.id == mutation.id
+            return composerSubmitRuntime.isCurrent(claim) && providerSwitchMutation?.id == mutation.id
                 && sourceCurrent && workspaceManager?.activeWorkspaceID == workspaceID
                 && providerSwitchHasExactOwner(session)
                 && providerSwitchTransitionAdmission(session, ownsComposerClaim: true, resolvingHandoff: preview.originalHandoff).isAdmissible(forcing: forcing)
@@ -1180,7 +1184,7 @@ extension AgentModeViewModel {
                     providerSwitchBackgroundOutcome = .init(session: session, binding: preview.binding)
                 }
             } else if providerSwitchPreviewIdentityIsCurrent(preview),
-                      composerSubmitClaimIsCurrent(claim), providerSwitchMutation?.id == mutation.id,
+                      composerSubmitRuntime.isCurrent(claim), providerSwitchMutation?.id == mutation.id,
                       session.pendingHandoff == handoff
             {
                 session.appendItem(.error(message, sequenceIndex: session.nextSequenceIndex))
@@ -1200,7 +1204,7 @@ extension AgentModeViewModel {
             if !discard {
                 var stagedRevision: Int?
                 if forcing {
-                    guard await providerSwitchQuiesceSourceForForcedSwitch(session), current() else {
+                    guard await providerSwitchQuiesceSourceForForcedSwitch(claim), current() else {
                         // The quiesce already ran; a late refusal must surface, not fail silently.
                         surfaceReviewFailure()
                         return false
@@ -1282,7 +1286,7 @@ extension AgentModeViewModel {
                     sourceItemID: cutoff,
                     providerSwitchDelivery: .ready
                 )
-                agentSessionLinkReoweSupplementForRebuiltProviderContext(for: session)
+                linkExecutionRuntime.agentSessionLinkReoweSupplementForRebuiltProviderContext(for: session)
             } else { session.pendingHandoff.clearAfterSend() }
             let text: String
             if discard { text = "Pending handover discarded; chat history unchanged." }
@@ -1304,10 +1308,10 @@ extension AgentModeViewModel {
             #if DEBUG
                 test_providerSwitchBeforeSave?(session)
             #endif
-            let result = await flushSaveRequired(for: session.tabID, workspaceID: workspaceID, observingSavePhase: { phase = $0 })
+            let result = await persistenceRuntime.flushSaveRequired(for: session.tabID, workspaceID: workspaceID, observingSavePhase: { phase = $0 })
             guard case .success = result else {
                 if phase == .beforeWrite, sessions[session.tabID] === session,
-                   session.currentRestorationBindingToken == preview.binding, composerSubmitClaimIsCurrent(claim),
+                   session.currentRestorationBindingToken == preview.binding, composerSubmitRuntime.isCurrent(claim),
                    session.pendingHandoff == staged
                 {
                     rollback.restore(session)
@@ -1327,7 +1331,7 @@ extension AgentModeViewModel {
                 return false
             }
             guard sessions[session.tabID] === session, session.currentRestorationBindingToken == preview.binding,
-                  composerSubmitClaimIsCurrent(claim), session.pendingHandoff == staged else { return false }
+                  composerSubmitRuntime.isCurrent(claim), session.pendingHandoff == staged else { return false }
             if providerSwitchPreview?.session === session, providerSwitchPreview?.binding == preview.binding { providerSwitchPreview = nil }
             updateBindingsFromSession(session)
             return true

@@ -224,6 +224,7 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
         XCTAssertEqual(claude.options.map(\.rawValue), [
             "default",
             "fable",
+            "claude-fable-5-2",
             "claude-fable-5-1",
             "claude-fable-5",
             "claude-mythos-5-1",
@@ -245,6 +246,9 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
         ])
         XCTAssertTrue(claude.options.contains { $0.rawValue == "claude-fable-5" && $0.supportedEffortLevels.contains("xhigh") })
         XCTAssertTrue(claude.options.contains { $0.rawValue == "opus[1m]" && $0.supportedEffortLevels.contains("xhigh") })
+        let fable52 = try XCTUnwrap(claude.options.first { $0.rawValue == "claude-fable-5-2" })
+        XCTAssertEqual(fable52.displayName, "Fable 5.2")
+        XCTAssertEqual(fable52.supportedEffortLevels, ["low", "medium", "high", "xhigh", "max"])
         let opus55 = try XCTUnwrap(claude.options.first { $0.rawValue == "claude-opus-5-5" })
         XCTAssertEqual(opus55.displayName, "Opus 5.5")
         XCTAssertEqual(opus55.supportedEffortLevels, ["low", "medium", "high", "xhigh", "max"])
@@ -348,6 +352,7 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
         XCTAssertEqual(ClaudeCompatibleModelNormalizer.normalizedSlotModel("sonnet:xhigh", config: ClaudeCompatibleBackendID.glmZAI.defaultPreset), "sonnet")
         XCTAssertEqual(ClaudeCompatibleModelNormalizer.normalizedSlotModel("glm-5.2[1m]:xhigh", config: ClaudeCompatibleBackendID.glmZAI.defaultPreset), "sonnet")
         XCTAssertEqual(ClaudeCompatibleHeadlessRuntime.runtimeModelParam("opus:xhigh"), "opus")
+        XCTAssertEqual(ClaudeCompatibleHeadlessRuntime.runtimeModelParam("claude-fable-5-2:xhigh"), "claude-fable-5-2")
         XCTAssertEqual(ClaudeCompatibleHeadlessRuntime.runtimeModelParam("claude-opus-5-5:max"), "claude-opus-5-5")
         XCTAssertEqual(ClaudeCompatibleHeadlessRuntime.runtimeModelParam("claude-opus-5-5:xhigh"), "claude-opus-5-5")
         XCTAssertEqual(ClaudeCompatibleHeadlessRuntime.runtimeModelParam("claude-opus-5:max"), "claude-opus-5")

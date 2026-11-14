@@ -2,6 +2,7 @@ import Combine
 @testable import RepoPromptApp
 import RepoPromptFileSystem
 import RepoPromptShared
+@testable import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 import XCTest
 

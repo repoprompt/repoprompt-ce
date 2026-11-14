@@ -2107,7 +2107,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         persisted.selectedAgent = .devin
         persisted.selectedModelRaw = AgentModelCatalog.defaultModelRaw(for: .devin)
         persisted.providerSessionID = "hosted-persisted-acp-session"
-        await fixture.vm.flushSave(for: tabID)
+        await fixture.vm.persistenceRuntime.flushSave(for: tabID)
         fixture.vm.test_setCurrentTabIDOverride(fixture.tabs[1].id)
         fixture.vm.test_removeSession(tabID: tabID)
         await settleHostedPublication(in: fixture)
@@ -2289,7 +2289,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         persisted.selectedAgent = .devin
         persisted.selectedModelRaw = AgentModelCatalog.defaultModelRaw(for: .devin)
         persisted.providerSessionID = "hosted-existing-acp-session"
-        await fixture.vm.flushSave(for: tabID)
+        await fixture.vm.persistenceRuntime.flushSave(for: tabID)
         // Keep ordinary active-chat ownership away from this cold menu target.
         fixture.vm.test_setCurrentTabIDOverride(fixture.tabs[1].id)
         fixture.vm.test_removeSession(tabID: tabID)
@@ -2314,7 +2314,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         session.selectedModelRaw = AgentModelCatalog.defaultModelRaw(for: .devin)
         session.providerSessionID = "hosted-existing-acp-session"
         XCTAssertFalse(fixture.vm.test_isCursorModelPollingActive)
-        await fixture.vm.flushSave(for: tabID)
+        await fixture.vm.persistenceRuntime.flushSave(for: tabID)
         let retired = try menuProps(in: fixture).targetEndpoint
         let items = session.items
         let revision = session.sourceItemsRevision
@@ -2864,7 +2864,8 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         }
         let host = NSHostingView(rootView: sidebar(for: state, tabID: tabs[0].id))
         window.contentView = host
-        window.makeKeyAndOrderFront(nil)
+        // Data/provider tests use this hosted fixture without displaying a window.
+        // Only the explicitly opted-in native opening helper may order it front.
         host.layoutSubtreeIfNeeded()
         await Task.yield()
         return Fixture(state: state, tabs: tabs, host: host, window: window, providerAttempts: providerAttempts, hydrationAttempts: hydrationAttempts)
@@ -2902,6 +2903,12 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         cancelAfterOpening: Bool = true, timeout: TimeInterval = 3,
         whileTracking: ((NSMenu) -> Void)? = nil
     ) async throws -> NSMenu {
+        // Real AppKit tracking displays menus and consumes desktop input. Never do
+        // this in routine suite runs; keep offscreen data/provider coverage active.
+        guard ProcessInfo.processInfo.environment["REPOPROMPT_RUN_INTERACTIVE_MENU_TESTS"] == "1" else {
+            throw XCTSkip("Interactive menu tests steal desktop focus; opt in with REPOPROMPT_RUN_INTERACTIVE_MENU_TESTS=1")
+        }
+        fixture.window.makeKeyAndOrderFront(nil)
         let region = try mountedRegion(in: fixture)
         let finished = expectation(description: "Native tracking observed and intentionally ended")
         var tracked: NSMenu?

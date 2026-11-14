@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 /// Conservative command-shape allowlist, not a shell parser. Quoting, expansion, pipelines,
 /// redirects, wrappers, environment assignments and unknown options always stay manual.

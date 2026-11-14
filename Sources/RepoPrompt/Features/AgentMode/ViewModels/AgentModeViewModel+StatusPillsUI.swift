@@ -1,31 +1,30 @@
 import Foundation
 
 extension AgentModeViewModel {
-    func makeStatusPillsSnapshot() -> AgentStatusPillsSnapshot {
+    func makeStatusPillsSnapshot(subject: AgentComposerSubject = .currentTab) -> AgentStatusPillsSnapshot {
+        let currentTabID: UUID? = if case let .tab(id) = subject { id } else { self.currentTabID }
+        let session = currentTabID.flatMap { sessions[$0] }
+        let current = subject.isCurrent
         #if DEBUG
             test_statusPillsSnapshotBuildCount += 1
         #endif
         return AgentStatusPillsSnapshot(
             currentTabID: currentTabID,
-            selectedWorkflow: selectedWorkflow,
+            selectedWorkflow: current ? selectedWorkflow : (session?.selectedWorkflow),
             stagedSlashCommand: stagedSlashCommandProps(tabID: currentTabID),
-            selectedAgent: selectedAgent,
-            autoEditPermissionGuidance: autoEditPermissionGuidance,
-            runState: runState,
-            autoEditEnabled: autoEditEnabled,
-            interviewFirst: interviewFirst,
-            modelRouter: modelRouterPillProps(),
-            autoEffort: autoEffortPillProps(),
+            selectedAgent: current ? selectedAgent : (session?.selectedAgent ?? .claudeCode),
+            autoEditPermissionGuidance: current ? autoEditPermissionGuidance : nil,
+            runState: current ? runState : (session?.runState ?? .idle),
+            autoEditEnabled: current ? autoEditEnabled : (session?.autoEditEnabled ?? false),
+            interviewFirst: current ? interviewFirst : false,
+            modelRouter: modelRouterPillProps(tabID: currentTabID),
+            autoEffort: autoEffortPillProps(tabID: currentTabID),
             executionLocation: executionLocationProps(tabID: currentTabID),
-            activeAgentSessionID: activeSession?.activeAgentSessionID,
-            activeRunID: activeSession?.runID,
-            monitor: currentMonitorPillProps(),
-            reprompt: repromptPillProps()
+            activeAgentSessionID: session?.activeAgentSessionID,
+            activeRunID: session?.runID,
+            monitor: currentMonitorPillProps(tabID: currentTabID),
+            reprompt: current ? repromptPillProps() : .init(unavailableReason: "Open this session in its workspace to configure reprompt.")
         )
-    }
-
-    func syncStatusPillsUIState() {
-        ui.statusPills.update(makeStatusPillsSnapshot())
     }
 
     /// Preserve notify-time monitor freshness without rebuilding for unrelated endpoint updates.
@@ -34,7 +33,7 @@ extension AgentModeViewModel {
     func syncStatusPillsUIStateIfMonitorStale() {
         let published = ui.statusPills.snapshot
         if published.currentTabID != currentTabID || published.monitor != currentMonitorPillProps() {
-            syncStatusPillsUIState()
+            ui.statusPills.update(makeStatusPillsSnapshot())
         }
     }
 
@@ -118,15 +117,7 @@ extension AgentModeViewModel {
             && !session.isMCPOriginated
             && session.parentSessionID == nil
             && !session.pendingHandoff.hasPayload
-            && !session.hasSentFirstMessage
-            && session.runState == .idle
-            && session.runID == nil
-            && session.activeRunAttemptID == nil
-            && session.providerSessionID == nil
-            && session.codexConversationID == nil
-            && session.worktreeBindings.isEmpty
-            && session.items.isEmpty
-            && session.transcript.turns.isEmpty
+            && session.hasEmptyIdleExecutionLocation
     }
 
     private func executionLocationMutationDisabledReason(for session: TabSession) -> String? {
@@ -159,13 +150,13 @@ extension AgentModeViewModel {
         }
         session.pendingInitialStartLocation = selection
         syncComposerUIState(tabID: tabID)
-        syncStatusPillsUIState()
+        ui.statusPills.update(makeStatusPillsSnapshot())
     }
 
     func setInterviewFirst(_ enabled: Bool) {
         guard interviewFirst != enabled else { return }
         interviewFirst = enabled
-        syncStatusPillsUIState()
+        ui.statusPills.update(makeStatusPillsSnapshot())
     }
 
     func toggleInterviewFirst() {

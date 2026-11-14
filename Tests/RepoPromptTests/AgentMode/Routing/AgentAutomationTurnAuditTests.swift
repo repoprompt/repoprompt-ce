@@ -1,5 +1,7 @@
 import Foundation
+import RepoPromptAIContracts
 @testable import RepoPromptApp
+import RepoPromptCodexProvider
 import XCTest
 
 final class AgentAutomationTurnAuditTests: XCTestCase {
@@ -377,7 +379,7 @@ final class RoutingExecutionMetadataTests: XCTestCase {
         XCTAssertTrue(mapped.allSatisfy {
             $0.supportedReasoningEffortRawValues == ["high", "future-depth", "future-depth"]
         })
-        let projected = AgentCodexModelRegistry().resolvedOptions(
+        let projected = AgentCodexModelRegistry(invalidate: { AgentModelCatalogRuntime.shared.invalidate(.codexExec) }).resolvedOptions(
             staticOptions: [], preferredLiveModels: [remote]
         )
         XCTAssertTrue(projected.contains {
@@ -418,7 +420,7 @@ final class RoutingExecutionMetadataTests: XCTestCase {
             supportedReasoningEfforts: [.init(reasoningEffort: "high", description: "")],
             defaultReasoningEffort: "high"
         )
-        let options = AgentCodexModelRegistry().resolvedOptions(
+        let options = AgentCodexModelRegistry(invalidate: { AgentModelCatalogRuntime.shared.invalidate(.codexExec) }).resolvedOptions(
             staticOptions: [], preferredLiveModels: [remote]
         )
         let fast = try XCTUnwrap(options.first { $0.rawValue == "gpt-6-sol-fast-high" })

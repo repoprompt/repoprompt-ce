@@ -1,4 +1,5 @@
 import AppKit
+import RepoPromptAIContracts
 import SwiftUI
 
 /// Popover content for agent handoff configuration.

@@ -1,10 +1,368 @@
 import Combine
 import Foundation
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
 @testable import RepoPromptApp
+import RepoPromptClaudeProvider
+import RepoPromptDomainRuntime
 import RepoPromptProviderQuota
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
+import RepoPromptShared
 import XCTest
+
+@MainActor
+final class AgentSessionComposerSubmitRuntimeTests: XCTestCase {
+    private func boundFixture() -> (AgentSessionRuntimeStore.Scope, AgentTabSession, AgentSessionRuntimeStore.Command) {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let session = AgentTabSession(tabID: UUID())
+        scope.replaceSessions([session.tabID: session])
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: UUID(), workspaceID: UUID()))
+        session.hasLoadedPersistedState = true
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        guard case let .unique(writer) = scope.resolveWriter(sessionID: session.activeAgentSessionID!),
+              case let .success(command) = writer.admitCommand() else { fatalError("Invalid test writer") }
+        return (scope, session, command)
+    }
+
+    private func attempt(_ target: AgentComposerSubmitTarget) -> AgentComposerSubmitAttempt {
+        .init(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: "")
+    }
+
+    func testPendingCapabilityPrecedesPublicationAndNeverManufacturesAnAttempt() throws {
+        let (scope, session, command) = boundFixture()
+        let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        var published = false
+        let attachment = scope.presentation.attach(session, sink: .init(
+            activityChanged: { _, _ in }, refresh: { _, _, _ in }, turnComplete: { _ in }, turnFailed: { _, _ in },
+            composerClaim: { candidate in
+                guard candidate.activeComposerSubmitAttempt != nil else { return }
+                published = true
+                XCTAssertNotNil(candidate.composerStartCancellation)
+                XCTAssertEqual(AgentSessionLinkStopAdmission.classify(AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
+                    session: candidate, endpointMatchesGrant: true, isClosing: false
+                )), .pendingStart)
+            }
+        ))
+        defer { scope.presentation.detach(attachment) }
+        guard case let .claimed(claim) = scope.submissions.claim(attempt(target), command: command, awaitsExecutor: true) else { return XCTFail("Expected claim") }
+        XCTAssertTrue(published)
+        let fence = try XCTUnwrap(claim.cancellation.pendingStartFence(for: session))
+        XCTAssertTrue(claim.cancellation.withdraw(on: session))
+        XCTAssertFalse(fence.permitsStart(of: session))
+        XCTAssertFalse(claim.cancellation.beginExecution(), "A late executor cannot acquire cancelled work")
+        XCTAssertNil(session.activeRunOwnership)
+        XCTAssertNil(session.activeRunAttemptID)
+        XCTAssertNil(session.lastTerminalCommitRevision)
+        XCTAssertNil(session.activeComposerSubmitAttempt)
+        XCTAssertNil(session.composerStartCancellation)
+    }
+
+    func testLifecycleMutationClaimIsNotAnAdvertisedPendingInput() throws {
+        let (scope, session, command) = boundFixture()
+        let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        guard case let .claimed(claim) = scope.submissions.claim(attempt(target), command: command, allowsPendingStartWithdrawal: false) else { return XCTFail("Expected mutation claim") }
+        XCTAssertEqual(AgentSessionLinkStopAdmission.classify(AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
+            session: session, endpointMatchesGrant: true, isClosing: false
+        )), .blocked(.targetBusy))
+        XCTAssertFalse(claim.cancellation.withdraw(on: session), "Quiescing queued work must not withdraw the owning lifecycle mutation")
+        session.stopState.invalidateScheduledStarts()
+        XCTAssertTrue(scope.submissions.isCurrent(claim))
+        XCTAssertTrue(scope.submissions.release(claim))
+        XCTAssertTrue(claim.cancellation.isFinalized)
+        XCTAssertNil(session.composerStartCancellation)
+    }
+
+    func testWithdrawRestoresOnceAboveNewTypingButJoinsTheRealProducer() async throws {
+        let (scope, session, command) = boundFixture()
+        let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        let submission = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: "original")
+        guard case let .claimed(claim) = scope.submissions.claim(submission, command: command) else { return XCTFail("Expected claim") }
+        claim.cancellation.oweDraftRestoration("original")
+        session.draftText = "newer typing"
+        let gate = AgentSessionLinkStopSignal<Void>()
+        let fence = try XCTUnwrap(claim.cancellation.pendingStartFence(for: session))
+        var reachedPrologue = false
+        claim.cancellation.retainProducer()
+        let producer = Task {
+            await gate.value()
+            if fence.permitsStart(of: session) { reachedPrologue = true }
+            claim.cancellation.releaseProducer()
+        }
+        XCTAssertTrue(scope.submissions.release(claim))
+        XCTAssertTrue(claim.cancellation.withdraw(on: session))
+        XCTAssertFalse(claim.cancellation.withdraw(on: session))
+        claim.cancellation.restoreOwedDraftIfNeeded()
+        XCTAssertEqual(session.draftText, "original\nnewer typing")
+        XCTAssertNil(session.activeComposerSubmitAttempt)
+        XCTAssertFalse(claim.cancellation.isFinalized)
+        XCTAssertTrue(session.isComposerSubmissionInFlight, "Hiding a claim is not a producer-drain receipt")
+        XCTAssertTrue(scope.settlement(for: session).blockers.contains(.pendingStart))
+        gate.finish(())
+        await producer.value
+        await claim.cancellation.finalized.value()
+        XCTAssertFalse(reachedPrologue)
+        XCTAssertTrue(claim.cancellation.isFinalized)
+        XCTAssertFalse(session.isComposerSubmissionInFlight)
+        XCTAssertNil(session.activeRunAttemptID)
+    }
+
+    func testInitialPreparationCapabilityDoesNotAuthorizeGenericLocationChanges() throws {
+        let (scope, session, command) = boundFixture()
+        let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        guard case let .claimed(claim) = scope.submissions.claim(attempt(target), command: command) else { return XCTFail("Expected claim") }
+        defer { scope.submissions.release(claim) }
+        session.isPreparingInitialWorktree = true
+        XCTAssertFalse(claim.cancellation.canWithdraw(on: session))
+        claim.cancellation.ownsInitialPreparation(on: session)
+        XCTAssertTrue(claim.cancellation.canWithdraw(on: session))
+        session.isChangingExecutionLocation = true
+        XCTAssertFalse(claim.cancellation.canWithdraw(on: session))
+        XCTAssertEqual(AgentSessionLinkStopAdmission.classify(AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
+            session: session, endpointMatchesGrant: true, isClosing: false
+        )), .blocked(.targetBusy))
+        session.isChangingExecutionLocation = false
+        session.isPreparingInitialWorktree = false
+    }
+
+    func testRunPrologueUpgradesComposerStopWithoutRestoringSentInput() throws {
+        let (scope, session, command) = boundFixture()
+        let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        guard case let .claimed(claim) = scope.submissions.claim(attempt(target), command: command) else { return XCTFail("Expected claim") }
+        defer { scope.submissions.release(claim) }
+        claim.cancellation.oweDraftRestoration("sent")
+        claim.cancellation.retainProducer()
+        XCTAssertTrue(scope.submissions.release(claim))
+        _ = session.beginRunAttempt(source: "pending-start-test")
+        session.installRunID(UUID())
+        session.runState = .running
+        XCTAssertTrue(claim.cancellation.didLaunch)
+        XCTAssertFalse(claim.cancellation.withdraw(on: session))
+        XCTAssertEqual(AgentSessionLinkStopAdmission.classify(AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
+            session: session, endpointMatchesGrant: true, isClosing: false
+        )), .activeRun)
+        XCTAssertFalse(session.isComposerSubmissionInFlight)
+        let nextTarget = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        guard case let .claimed(next) = scope.submissions.claim(attempt(nextTarget), command: command) else { return XCTFail("Launched input retained the composer") }
+        XCTAssertTrue(scope.submissions.release(next))
+        claim.cancellation.releaseProducer()
+        XCTAssertEqual(session.draftText, "")
+        session.runState = .cancelled
+    }
+
+    func testDestinationAliasWithdrawsSourceAndRebindingFailsClosed() throws {
+        let (scope, source, command) = boundFixture()
+        let destination = AgentTabSession(tabID: UUID())
+        scope.replaceSessions([source.tabID: source, destination.tabID: destination])
+        destination.installPersistentSessionBinding(.init(tabID: destination.tabID, sessionID: UUID(), workspaceID: UUID()))
+        destination.hasLoadedPersistedState = true
+        destination.recordRestorationAuthoritative(.persistedPayloadApplied)
+        let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        guard case let .claimed(claim) = scope.submissions.claim(attempt(target), command: command) else { return XCTFail("Expected claim") }
+        defer { scope.submissions.release(claim) }
+        XCTAssertTrue(scope.submissions.alias(claim, to: destination))
+        claim.cancellation.oweDraftRestoration("source draft")
+        destination.draftText = "destination draft"
+        let fence = try XCTUnwrap(claim.cancellation.pendingStartFence(for: destination))
+        XCTAssertTrue(claim.cancellation.withdraw(on: destination))
+        XCTAssertFalse(fence.permitsStart(of: destination))
+        XCTAssertEqual(source.draftText, "source draft")
+        XCTAssertEqual(destination.draftText, "destination draft")
+        XCTAssertFalse(scope.submissions.isCurrent(claim))
+        XCTAssertTrue(scope.submissions.release(claim))
+        XCTAssertNil(destination.composerStartCancellation)
+
+        let nextTarget = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        guard case let .claimed(next) = scope.submissions.claim(attempt(nextTarget), command: command) else { return XCTFail("Expected successor") }
+        defer { scope.submissions.release(next) }
+        source.installPersistentSessionBinding(.init(tabID: source.tabID, sessionID: UUID(), workspaceID: UUID()))
+        XCTAssertFalse(next.cancellation.canWithdraw(on: source))
+        XCTAssertFalse(next.cancellation.withdraw(on: source))
+    }
+
+    func testOldPendingAdmissionCannotWithdrawSuccessorClaim() throws {
+        let (scope, session, command) = boundFixture()
+        let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        guard case let .claimed(first) = scope.submissions.claim(attempt(target), command: command) else { return XCTFail("Expected claim") }
+        let admission = AgentRunCancellationAdmission(
+            scope: .pendingStart, session: session, binding: command.writer.binding,
+            expectedOwnership: nil, expectedRunID: nil, cancellationGeneration: session.stopState.cancellationGeneration,
+            pendingStartFence: nil, expectedComposerAttemptID: first.attempt.id, validateAndClaim: { command.isCurrent }
+        )
+        XCTAssertTrue(scope.submissions.release(first))
+        let nextTarget = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        guard case let .claimed(next) = scope.submissions.claim(attempt(nextTarget), command: command) else { return XCTFail("Expected successor") }
+        defer { scope.submissions.release(next) }
+        XCTAssertFalse(admission.claim(for: session))
+        XCTAssertFalse(first.cancellation.withdraw(on: session))
+        XCTAssertTrue(scope.submissions.isCurrent(next))
+    }
+
+    func testBlockedSteerRecoveryIsNotGatedByStopAdmissionOrWriterRetirement() throws {
+        let (scope, session, command) = boundFixture()
+        _ = session.beginRunAttempt(source: "existing-run")
+        session.installRunID(UUID())
+        session.runState = .running
+        let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        guard case let .claimed(claim) = scope.submissions.claim(attempt(target), command: command) else { return XCTFail("Expected steer claim") }
+        defer { scope.submissions.release(claim) }
+        claim.cancellation.oweDraftRestoration("blocked steer")
+        session.draftText = "new text"
+        scope.beginRetirement()
+        XCTAssertFalse(claim.cancellation.withdraw(on: session))
+        claim.cancellation.restoreOwedDraftIfNeeded(message: "Steer was refused.")
+        claim.cancellation.restoreOwedDraftIfNeeded(message: "Late duplicate")
+        XCTAssertEqual(session.draftText, "blocked steer\nnew text")
+        session.runState = .cancelled
+    }
+
+    func testUnrelatedPrologueCannotDiscardBlockedComposerRecovery() throws {
+        let (scope, session, command) = boundFixture()
+        let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        guard case let .claimed(claim) = scope.submissions.claim(attempt(target), command: command) else { return XCTFail("Expected claim") }
+        defer { scope.submissions.release(claim) }
+        claim.cancellation.oweDraftRestoration("not sent")
+        _ = session.beginRunAttempt(source: "unrelated-follow-up")
+        claim.cancellation.restoreOwedDraftIfNeeded(message: "The composer target changed.")
+        XCTAssertEqual(session.draftText, "not sent")
+    }
+
+    func testTerminalOnlyBookkeepingCannotUpgradeOrReleaseAPendingProducer() throws {
+        let (scope, session, command) = boundFixture()
+        let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        guard case let .claimed(claim) = scope.submissions.claim(attempt(target), command: command) else { return XCTFail("Expected claim") }
+        claim.cancellation.retainProducer()
+        XCTAssertTrue(scope.submissions.release(claim))
+        _ = session.beginRunAttempt(source: "terminal-only-test", beginsProviderRun: false)
+        XCTAssertFalse(claim.cancellation.didLaunch)
+        XCTAssertFalse(claim.cancellation.isFinalized)
+        XCTAssertTrue(session.isComposerSubmissionInFlight)
+        claim.cancellation.releaseProducer()
+        XCTAssertTrue(claim.cancellation.isFinalized)
+    }
+
+    func testInternalPreparationCancellationDoesNotPoisonTheFinalStartFence() throws {
+        let (scope, session, command) = boundFixture()
+        let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        guard case let .claimed(claim) = scope.submissions.claim(attempt(target), command: command) else { return XCTFail("Expected claim") }
+        defer { scope.submissions.release(claim) }
+        let advertised = try XCTUnwrap(claim.cancellation.pendingStartFence(for: session))
+        session.stopState.invalidateScheduledStarts() // Internal location/start preparation, not Stop.
+        XCTAssertFalse(advertised.permitsStart(of: session))
+        XCTAssertTrue(scope.submissions.isCurrent(claim))
+        let handedOff = try XCTUnwrap(claim.cancellation.pendingStartFence(for: session))
+        XCTAssertTrue(handedOff.permitsStart(of: session))
+        XCTAssertTrue(claim.cancellation.withdraw(on: session))
+        XCTAssertFalse(handedOff.permitsStart(of: session))
+        XCTAssertNil(claim.cancellation.pendingStartFence(for: session), "Stop may not refresh a deferred producer's fence")
+    }
+
+    func testDestinationCapabilitySurvivesSourceRemovalThenCleansUpIndependently() throws {
+        func prepare() throws -> (AgentSessionRuntimeStore.Scope, AgentTabSession, AgentComposerStartCancellation) {
+            let (scope, source, command) = boundFixture()
+            let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+            guard case let .claimed(claim) = scope.submissions.claim(attempt(target), command: command) else { throw NSError(domain: "pending", code: 1) }
+            let destination = AgentTabSession(tabID: UUID())
+            scope.replaceSessions([source.tabID: source, destination.tabID: destination])
+            destination.installPersistentSessionBinding(.init(tabID: destination.tabID, sessionID: UUID(), workspaceID: UUID()))
+            destination.hasLoadedPersistedState = true
+            destination.recordRestorationAuthoritative(.persistedPayloadApplied)
+            XCTAssertTrue(scope.submissions.alias(claim, to: destination))
+            claim.cancellation.retainProducer()
+            scope.submissions.release(claim)
+            scope.replaceSessions([destination.tabID: destination])
+            return (scope, destination, claim.cancellation)
+        }
+        let (scope, destination, start) = try prepare()
+        XCTAssertNil(start.source)
+        XCTAssertTrue(start.canWithdraw(on: destination), "The exact admitted destination remains stoppable")
+        XCTAssertTrue(start.withdraw(on: destination))
+        XCTAssertFalse(start.isFinalized)
+        start.releaseProducer()
+        XCTAssertTrue(start.isFinalized)
+        XCTAssertNil(destination.composerStartCancellation)
+        XCTAssertFalse(destination.isComposerSubmissionInFlight)
+        withExtendedLifetime(scope) {}
+    }
+
+    func testProgrammaticClaimWithoutPresentationRotatesTokenAndNeverTouchesDraft() throws {
+        let (scope, session, command) = boundFixture()
+        session.draftText = "local draft"
+        let generation = session.draftMutationGeneration
+        let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        XCTAssertNil(target.expectedInitialStartLocation)
+        XCTAssertEqual(target.expectedWriterIdentity, command.identity)
+        let submission = attempt(target)
+        guard case let .claimed(claim) = scope.submissions.claim(submission, command: command) else { return XCTFail("Expected claim") }
+        XCTAssertTrue(scope.submissions.isCurrent(claim))
+        XCTAssertNotEqual(session.composerSubmissionToken, target.expectedSubmissionToken)
+        XCTAssertEqual(session.draftText, "local draft")
+        XCTAssertEqual(session.draftMutationGeneration, generation)
+        XCTAssertTrue(scope.submissions.release(claim))
+        guard case let .rejected(reason) = scope.submissions.claim(submission, command: command) else { return XCTFail("Stale token accepted") }
+        XCTAssertEqual(reason, .targetRejected(reason: "submission_token_mismatch"))
+    }
+
+    func testClaimPinsWriterButCleanupSurvivesRetirementAndCannotClearSuccessor() throws {
+        let (scope, session, command) = boundFixture()
+        let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        guard case let .claimed(claim) = scope.submissions.claim(attempt(target), command: command) else { return XCTFail("Expected claim") }
+        scope.beginRetirement()
+        XCTAssertFalse(scope.submissions.isCurrent(claim))
+        XCTAssertNil(scope.submissions.programmaticTarget(command))
+        XCTAssertTrue(command.writer.isCurrent)
+        XCTAssertTrue(scope.submissions.release(claim))
+        let successor = attempt(target)
+        session.activeComposerSubmitAttempt = successor
+        XCTAssertFalse(scope.submissions.release(claim))
+        XCTAssertEqual(session.activeComposerSubmitAttempt?.id, successor.id)
+        session.activeComposerSubmitAttempt = nil
+    }
+
+    func testReacquiredBindingRejectsOldTargetAndOldClaimCannotClearReplacementObject() throws {
+        let (scope, session, command) = boundFixture()
+        let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        scope.replaceSessions([:])
+        scope.replaceSessions([session.tabID: session])
+        XCTAssertFalse(command.isCurrent)
+        guard case let .rejected(reason) = scope.submissions.claim(attempt(target)) else { return XCTFail("Old incarnation accepted") }
+        XCTAssertEqual(reason, .targetRejected(reason: "writer_unavailable"))
+        XCTAssertNil(session.activeComposerSubmitAttempt)
+        guard case let .unique(writer) = scope.resolveWriter(sessionID: command.identity.sessionID),
+              case let .success(current) = writer.admitCommand(),
+              let newTarget = scope.submissions.programmaticTarget(current),
+              case let .claimed(claim) = scope.submissions.claim(attempt(newTarget), command: current)
+        else { return XCTFail("Expected reacquired writer") }
+        let replacement = AgentTabSession(tabID: session.tabID)
+        let replacementAttempt = attempt(newTarget)
+        replacement.activeComposerSubmitAttempt = replacementAttempt
+        scope.replaceSessions([replacement.tabID: replacement])
+        XCTAssertFalse(scope.submissions.isCurrent(claim))
+        XCTAssertTrue(scope.submissions.release(claim))
+        XCTAssertNil(session.activeComposerSubmitAttempt)
+        XCTAssertEqual(replacement.activeComposerSubmitAttempt?.id, replacementAttempt.id)
+        replacement.activeComposerSubmitAttempt = nil
+    }
+
+    func testLocalUnboundClaimSurvivesItsFirstBindingWithoutMintingRemoteAuthority() {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let session = AgentTabSession(tabID: UUID())
+        scope.replaceSessions([session.tabID: session])
+        session.hasLoadedPersistedState = true
+        let target = AgentComposerSubmitTarget(
+            tabID: session.tabID, route: .createAgentSessionFromSourceTab,
+            expectedSourceTabSessionIdentity: ObjectIdentifier(session), expectedSourceAgentSessionID: nil,
+            expectedPersistentBindingIdentity: nil, expectedBindingTransitionGeneration: session.bindingTransitionGeneration,
+            expectedRunState: .idle, expectedRunID: nil, expectedRunAttemptID: nil,
+            expectedSubmissionToken: session.composerSubmissionToken, expectedInitialStartLocation: .local
+        )
+        guard case let .claimed(claim) = scope.submissions.claim(attempt(target)) else { return XCTFail("Expected local claim") }
+        XCTAssertNil(claim.command)
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: UUID(), workspaceID: UUID()))
+        XCTAssertTrue(scope.submissions.isCurrent(claim))
+        XCTAssertTrue(scope.submissions.release(claim))
+    }
+}
 
 @MainActor
 final class AgentComposerSubmissionAttemptTests: XCTestCase {
@@ -185,10 +543,7 @@ extension AgentComposerSubmissionAttemptTests {
         session.selectedAgent = .codexExec
         session.selectedModelRaw = "gpt-6.1-sol-high"
         let text = "Implement parser and tests"
-        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: session))
-        session.hasLoadedPersistedState = true
-        // An installed binding admits operations only after restoration is authoritative (#1363).
-        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        try installRestoredRoutingWriter(viewModel: viewModel, session: session)
         let claim = try routingClaim(viewModel: viewModel, session: session, text: text)
 
         let result = await viewModel.submitUserTurnAfterFreshTaskRouting(
@@ -442,7 +797,7 @@ extension AgentComposerSubmissionAttemptTests {
         // Claude keeps its manual effort separately from the Codex-oriented selection field.
         session.selectedReasoningEffortRaw = nil
         session.selectedClaudeEffortRaw = ClaudeCodeEffortLevel.high.rawValue
-        viewModel.syncStatusPillsUIState()
+        viewModel.ui.statusPills.update(viewModel.makeStatusPillsSnapshot())
         XCTAssertEqual(
             viewModel.ui.statusPills.snapshot.modelRouter.routedModelDisplayName,
             "\(viewModel.selectedModelDisplayName) High"
@@ -465,7 +820,7 @@ extension AgentComposerSubmissionAttemptTests {
             acceptedModelRaw: session.selectedModelRaw,
             acceptedEffortRaw: session.selectedReasoningEffortRaw
         ))
-        viewModel.syncStatusPillsUIState()
+        viewModel.ui.statusPills.update(viewModel.makeStatusPillsSnapshot())
         XCTAssertNil(viewModel.ui.statusPills.snapshot.modelRouter.routedModelDisplayName)
     }
 
@@ -490,7 +845,7 @@ extension AgentComposerSubmissionAttemptTests {
             acceptedModelRaw: session.selectedModelRaw,
             acceptedEffortRaw: "high"
         ))
-        viewModel.syncStatusPillsUIState()
+        viewModel.ui.statusPills.update(viewModel.makeStatusPillsSnapshot())
         XCTAssertEqual(
             viewModel.ui.statusPills.snapshot.modelRouter.routedModelDisplayName,
             "\(viewModel.selectedModelDisplayName) High"
@@ -725,30 +1080,33 @@ extension AgentComposerSubmissionAttemptTests {
     func testNewDestinationOwnsVisibleCancelAndRejectsSecondSubmit() async throws {
         let backend = SuspendedComposerRoutingBackend()
         let (viewModel, _) = try await makeRoutingViewModel(backend: backend)
+        addTeardownBlock { await backend.completeLateSelection() }
         let sourceTabID = UUID()
         let destinationTabID = UUID()
         viewModel.test_setCurrentTabIDOverride(sourceTabID)
         let sourceSession = viewModel.session(for: sourceTabID)
         let claim = try routingClaim(viewModel: viewModel, session: sourceSession, text: "Route this task")
+        // Production creation returns an already-bound destination. Keep this routing-only fake
+        // on that contract rather than waiting forever for a request its unbound writer refuses.
+        let destinationSession = viewModel.session(for: destinationTabID)
+        try installRestoredRoutingWriter(viewModel: viewModel, session: destinationSession)
+        let secondTarget = try XCTUnwrap(viewModel.makeComposerSubmitTarget(tabID: destinationTabID, session: destinationSession))
 
         let execution = Task { @MainActor in
             await viewModel.executeComposerSubmitAttempt(
                 text: "Route this task",
                 claim: claim,
                 createAndActivateSessionTab: {
-                    _ = viewModel.session(for: destinationTabID)
                     viewModel.test_setCurrentTabIDOverride(destinationTabID)
                     return destinationTabID
                 }
             )
         }
-        await backend.waitUntilStarted()
+        try await AsyncTestWait.waitUntil("bound destination routing started") { await backend.hasStarted }
 
         XCTAssertTrue(viewModel.makeComposerProps(tabID: destinationTabID).isRoutingFreshTask)
-        let destinationSession = viewModel.session(for: destinationTabID)
-        let secondTarget = try XCTUnwrap(
-            viewModel.makeComposerSubmitTarget(tabID: destinationTabID, session: destinationSession)
-        )
+        XCTAssertNil(viewModel.makeComposerSubmitTarget(tabID: destinationTabID, session: destinationSession))
+        // A render-time target captured before the alias must also fail at authoritative claim.
         let secondAttempt = AgentComposerSubmitAttempt(
             id: UUID(),
             target: secondTarget,
@@ -845,10 +1203,7 @@ extension AgentComposerSubmissionAttemptTests {
         let session = viewModel.session(for: tabID)
         session.selectedAgent = .codexExec
         session.selectedModelRaw = "gpt-6.1-sol-high"
-        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: session))
-        session.hasLoadedPersistedState = true
-        // An installed binding admits operations only after restoration is authoritative (#1363).
-        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        try installRestoredRoutingWriter(viewModel: viewModel, session: session)
         let baseline = viewModel.executableTarget(for: session)
         XCTAssertNil(viewModel.localUsageDecision(basedOn: baseline, scope: .primarySession, surface: .general))
         let child = try await viewModel.routeSubagentTargetIfEnabled(task: "Implement parser", surface: .headless, baseline: baseline)
@@ -908,9 +1263,7 @@ extension AgentComposerSubmissionAttemptTests {
         let tabID = UUID()
         viewModel.test_setCurrentTabIDOverride(tabID)
         let session = viewModel.session(for: tabID)
-        _ = viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: session)
-        session.hasLoadedPersistedState = true
-        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        try installRestoredRoutingWriter(viewModel: viewModel, session: session)
         session.installLocalInputSeed(.init())
         session.selectedAgent = .claudeCode
         session.installRunID(UUID())
@@ -940,9 +1293,7 @@ extension AgentComposerSubmissionAttemptTests {
         let tabID = UUID()
         viewModel.test_setCurrentTabIDOverride(tabID)
         let session = viewModel.session(for: tabID)
-        _ = viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: session)
-        session.hasLoadedPersistedState = true
-        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        try installRestoredRoutingWriter(viewModel: viewModel, session: session)
         session.installLocalInputSeed(.init())
         session.selectedAgent = .claudeCode
         session.installRunID(UUID())
@@ -963,7 +1314,7 @@ extension AgentComposerSubmissionAttemptTests {
         var reply = AgentChatItem.assistant("W1 sent", sequenceIndex: session.nextSequenceIndex)
         reply.isStreaming = true
         session.appendItem(reply)
-        viewModel.endActiveAssistantSegment(session)
+        viewModel.streamRuntime.endActiveAssistantSegment(session)
 
         XCTAssertEqual(
             session.localInputIndex.epoch,
@@ -1247,6 +1598,22 @@ extension AgentComposerSubmissionAttemptTests {
         return (viewModel, store)
     }
 
+    /// These isolated routing fixtures have no workspace manager. Give their restored payload
+    /// a real workspace-qualified runtime binding rather than admitting an unscoped presenter.
+    private func installRestoredRoutingWriter(
+        viewModel: AgentModeViewModel,
+        session: AgentModeViewModel.TabSession
+    ) throws {
+        let sessionID = UUID()
+        XCTAssertNil(viewModel.runtimeSessionStore.bindingRejection(sessionID, on: session))
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID, workspaceID: UUID()))
+        session.hasLoadedPersistedState = true
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        let command = try XCTUnwrap(viewModel.runtimeCommand(sessionID: sessionID))
+        XCTAssertTrue(command.writer.session === session)
+        XCTAssertTrue(command.isCurrent)
+    }
+
     private func routingClaim(
         viewModel: AgentModeViewModel,
         session: AgentModeViewModel.TabSession,
@@ -1408,6 +1775,9 @@ private actor SuspendedComposerRoutingBackend: DecisionService {
     private var request: FiniteChoiceDecisionRequest?
     private var startedWaiters: [CheckedContinuation<Void, Never>] = []
     private var completion: CheckedContinuation<DecisionOutcome, Never>?
+    var hasStarted: Bool {
+        request != nil
+    }
 
     func readinessSnapshot() -> DecisionReadiness {
         .ready(generation: 1, policyVersion: "fake-v1")
@@ -1491,7 +1861,7 @@ private extension DecisionServiceCapabilities {
 final class AgentSlashCommandSuggestionsTests: XCTestCase {
     func testClaudeCompactIsDiscoverableAndPrefixFiltered() async {
         let viewModel = makeViewModel()
-        addTeardownBlock { await viewModel.prepareForWindowClose() }
+        addTeardownBlock { await viewModel.test_retireAndCancelFixture() }
         viewModel.selectedAgent = .claudeCode
 
         let fresh = await viewModel.slashSkillSuggestions(for: "")
@@ -1516,7 +1886,7 @@ final class AgentSlashCommandSuggestionsTests: XCTestCase {
 
     func testClaudeBuiltinDoesNotLeakIntoOtherProviderMenus() async {
         let viewModel = makeViewModel()
-        addTeardownBlock { await viewModel.prepareForWindowClose() }
+        addTeardownBlock { await viewModel.test_retireAndCancelFixture() }
         for provider: AgentProviderKind in [.codexExec, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .cursor, .openCode, .grokBuild, .devin, .antigravity] {
             viewModel.selectedAgent = provider
             let suggestions = await viewModel.slashSkillSuggestions(for: "comp")
@@ -1526,7 +1896,7 @@ final class AgentSlashCommandSuggestionsTests: XCTestCase {
 
     func testActiveClaudeRuntimeCommandsReachMenuButNotOtherProviders() async {
         let viewModel = makeViewModel()
-        addTeardownBlock { await viewModel.prepareForWindowClose() }
+        addTeardownBlock { await viewModel.test_retireAndCancelFixture() }
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .claudeCode
         session.providerSessionID = "restored-conversation"
@@ -1543,7 +1913,7 @@ final class AgentSlashCommandSuggestionsTests: XCTestCase {
 
     func testSuspendedRuntimeLookupCannotPublishAfterProviderSwitch() async {
         let viewModel = makeViewModel()
-        addTeardownBlock { await viewModel.prepareForWindowClose() }
+        addTeardownBlock { await viewModel.test_retireAndCancelFixture() }
         let started = expectation(description: "runtime command lookup started")
         let runtime = SlashSuggestionRuntime(holdLookup: true, onLookup: { started.fulfill() })
         let session = AgentModeViewModel.TabSession(tabID: UUID())
@@ -1594,7 +1964,7 @@ final class AgentSlashCommandSuggestionsTests: XCTestCase {
         try "---\ndescription: Local context skill\n---\nLocal context instructions".write(to: commands.appendingPathComponent("context.md"), atomically: true, encoding: .utf8)
         let catalog = AgentSkillCatalog(homeDirectoryURL: root.appendingPathComponent("home"))
         let viewModel = makeViewModel(root: root, catalog: catalog)
-        addTeardownBlock { await viewModel.prepareForWindowClose() }
+        addTeardownBlock { await viewModel.test_retireAndCancelFixture() }
         viewModel.selectedAgent = .claudeCode
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .claudeCode
@@ -1605,21 +1975,21 @@ final class AgentSlashCommandSuggestionsTests: XCTestCase {
 
         let suggestions = await viewModel.slashSkillSuggestions(for: "compact")
         XCTAssertEqual(suggestions.map(\.relativePath), ["compact", "skill:compact"])
-        XCTAssertTrue(viewModel.resolvedSlashSkillInvocations(in: "/compact", agentKind: .claudeCode).isEmpty)
-        XCTAssertEqual(viewModel.resolvedSlashSkillInvocations(in: "/skill:compact", agentKind: .claudeCode).first?.definition.name, "compact")
+        XCTAssertTrue(viewModel.providerInputRuntime.resolvedSlashSkillInvocations(in: "/compact", agentKind: .claudeCode).isEmpty)
+        XCTAssertEqual(viewModel.providerInputRuntime.resolvedSlashSkillInvocations(in: "/skill:compact", agentKind: .claudeCode).first?.definition.name, "compact")
         let explicit = await viewModel.slashSkillSuggestions(for: "skill:compact")
         XCTAssertEqual(explicit.map(\.relativePath), ["skill:compact"])
-        XCTAssertEqual(viewModel.resolvedSlashSkillInvocations(in: "/compact", agentKind: .cursor).first?.definition.name, "compact")
+        XCTAssertEqual(viewModel.providerInputRuntime.resolvedSlashSkillInvocations(in: "/compact", agentKind: .cursor).first?.definition.name, "compact")
         // Deliberate compatibility policy: a local skill shadows even an advertised
         // non-compact built-in. The displayed local row must match actual expansion.
         let context = await viewModel.slashSkillSuggestions(for: "context")
         XCTAssertEqual(context.map(\.relativePath), ["context"])
         XCTAssertEqual(context.first?.subtitle, "Local context skill")
-        XCTAssertEqual(viewModel.resolvedSlashSkillInvocations(in: "/context", agentKind: .claudeCode).first?.definition.name, "context")
+        XCTAssertEqual(viewModel.providerInputRuntime.resolvedSlashSkillInvocations(in: "/context", agentKind: .claudeCode).first?.definition.name, "context")
         XCTAssertFalse(context.first?.submitsOnExactEnter ?? true)
         session.selectedAgent = .cursor
-        XCTAssertTrue(viewModel.resolvedSlashSkillInvocations(in: "/compact", agentKind: .claudeCode).isEmpty)
-        XCTAssertEqual(viewModel.resolvedSlashSkillInvocations(in: "/compact", agentKind: .cursor).first?.definition.name, "compact")
+        XCTAssertTrue(viewModel.providerInputRuntime.resolvedSlashSkillInvocations(in: "/compact", agentKind: .claudeCode).isEmpty)
+        XCTAssertEqual(viewModel.providerInputRuntime.resolvedSlashSkillInvocations(in: "/compact", agentKind: .cursor).first?.definition.name, "compact")
     }
 
     func testLargeRuntimeMenuRetainsLocalSkillAfterDeduplication() async throws {
@@ -1633,7 +2003,7 @@ final class AgentSlashCommandSuggestionsTests: XCTestCase {
         }
         runtimeCommands.append(.init(name: "review-local", description: "Runtime duplicate", argumentHint: ""))
         let viewModel = makeViewModel(root: root, catalog: AgentSkillCatalog(homeDirectoryURL: root.appendingPathComponent("home")))
-        addTeardownBlock { await viewModel.prepareForWindowClose() }
+        addTeardownBlock { await viewModel.test_retireAndCancelFixture() }
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .claudeCode
         session.providerSessionID = "existing-conversation"
@@ -1746,20 +2116,44 @@ private actor SlashSuggestionRuntime: NativeAgentRuntimeControlling {
 final class AutoWorkflowSubmissionTests: XCTestCase {
     func testRealComposerNewDestinationPathJudgesExactlyOnce() async throws {
         let fixture = try await makeFixture()
+        let vm = fixture.viewModel
+        // Use configured creation, not a restored empty transcript posing as a fresh destination.
+        let manager = AgentSessionLinkEndpointTestSupport.installWorkspace(on: vm, tabID: fixture.session.tabID, name: "Workflow creation")
+        await manager.awaitInitialized()
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("WorkflowFirstSend-\(UUID())")
+        let root = AppProfileLocations.current.customWorkspaceDirectory(selectedDirectory: directory)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        var workspace = try XCTUnwrap(manager.activeWorkspace)
+        workspace.ephemeralFlag = false
+        workspace.customStoragePath = root
+        manager.workspaces = [workspace]
+        manager.activeWorkspace = workspace
+        manager.promptViewModel.loadComposeTabsFromWorkspace(workspace)
+        vm.promptManager = manager.promptViewModel
+        let api = try XCTUnwrap(manager.promptViewModel.apiSettingsViewModel)
+        api.isClaudeCodeConnected = true
+        addTeardownBlock { @MainActor in
+            await vm.test_retireAndCancelFixture()
+            manager.prepareForWindowClose()
+            try? FileManager.default.removeItem(at: directory)
+        }
         var destination: AgentModeViewModel.TabSession?
-        let result = await fixture.viewModel.executeComposerSubmitAttempt(text: Self.text, claim: fixture.claim) {
-            let id = UUID()
-            let session = fixture.viewModel.session(for: id)
-            fixture.viewModel.test_setCurrentTabIDOverride(id)
-            destination = session
+        let result = await vm.executeComposerSubmitAttempt(text: Self.text, claim: fixture.claim) {
+            guard let id = await vm.createAndActivateSessionTab() else { return nil }
+            api.isClaudeCodeConnected = true
+            XCTAssertTrue(vm.agentAvailabilityContext.claudeCodeAvailable)
+            vm.test_setCurrentTabIDOverride(id)
+            destination = vm.sessions[id]
             return id
         }
         XCTAssertEqual(result, .submitted)
         let requests = await fixture.backend.requests
         XCTAssertEqual(requests.count(where: { $0.consumerID == .autoWorkflow }), 1)
-        let item = try XCTUnwrap(destination?.items.first { $0.kind == .user })
+        let created = try XCTUnwrap(destination)
+        XCTAssertNotNil(created.persistentSessionBindingIdentity)
+        let item = try XCTUnwrap(created.items.first { $0.kind == .user })
         XCTAssertEqual(item.workflow?.builtInWorkflow, .review)
-        XCTAssertNil(destination?.selectedWorkflow)
+        XCTAssertNil(created.selectedWorkflow)
     }
 
     func testChosenWorkflowReachesSubmissionWithoutChangingManualSelection() async throws {
@@ -1889,8 +2283,8 @@ final class AutoWorkflowSubmissionTests: XCTestCase {
         await fixture.viewModel.cancelPresentedComposerSubmission(id: fixture.claim.attempt.id)
         let selection = await choosing.value
         XCTAssertNil(selection)
-        XCTAssertFalse(fixture.viewModel.composerSubmitClaimIsCurrent(fixture.claim))
-        XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.session.tabID), Self.text)
+        XCTAssertFalse(fixture.viewModel.composerSubmitRuntime.isCurrent(fixture.claim))
+        XCTAssertEqual(fixture.viewModel.draftRuntime.text(for: fixture.session.tabID), Self.text)
         XCTAssertTrue(fixture.session.items.isEmpty)
         await fixture.backend.release()
         XCTAssertTrue(fixture.viewModel.autoWorkflowJudgments.isEmpty)
@@ -1992,7 +2386,7 @@ final class AutoWorkflowSubmissionTests: XCTestCase {
         addTeardownBlock { @MainActor in
             await backend.release()
             viewModel.releaseComposerSubmitClaim(claim)
-            await viewModel.prepareForWindowClose()
+            await viewModel.test_retireAndCancelFixture()
             await runtime.teardown()
             defaults.removePersistentDomain(forName: suite)
             try? FileManager.default.removeItem(at: root)
@@ -2039,5 +2433,238 @@ private actor WorkflowTestBackend: DecisionService {
         hold = false
         gate?.resume()
         gate = nil
+    }
+}
+
+/// Frozen current-main projection, retained only as the equivalence oracle for this refactor.
+@MainActor
+private extension AgentModeViewModel {
+    func referenceCurrentComposerProps(tabID explicitTabID: UUID? = nil) -> AgentComposerProps {
+        let tabID = explicitTabID ?? currentTabID
+        let session = tabID.flatMap { sessions[$0] }
+        let isMCPControlled = isMCPControlled(tabID: tabID)
+        let isCodexRunActive: Bool = {
+            guard selectedAgent == .codexExec, let tabID else { return false }
+            return isTabRunning(tabID)
+        }()
+        let cancelTarget = composerRunCancelTarget(tabID: tabID)
+        let submitTarget = makeComposerSubmitTarget(tabID: tabID, session: session)
+        let acpControls = acpModelParameterControls(session: session)
+        // Cursor's catalog can refresh while a run is active. Metadata disappearing must
+        // not unlock a model/configuration already captured by that run.
+        let acpRunLocksModelControls = session?.runState.isActive == true
+            && (selectedAgent == .cursor || !acpControls.isEmpty)
+        let routerControlsFreshTask = session.map(isGlobalModelRouterControllingFreshTask) ?? false
+        let selectedRouterServiceID = routerControlsFreshTask
+            ? modelRouterSettingsStore.modelRouterConfiguration().selectedBackendID : nil
+        let automaticRouterServiceName = selectedRouterServiceID.flatMap { modelRouterRuntime?.serviceDisplayNamesByID[$0] }
+        let autoEffortConfiguration = modelRouterSettingsStore.autoEffortConfiguration()
+        let autoEffortServiceName = autoEffortConfiguration.enabled
+            ? autoEffortConfiguration.selectedBackendID.flatMap { modelRouterRuntime?.serviceDisplayNamesByID[$0] } ?? "Unavailable service"
+            : nil
+        return AgentComposerProps(
+            computerUse: computerUseComposerProps(session: session),
+            imageAttachmentNotice: imageAttachmentNotice,
+            currentTabID: tabID,
+            submitTarget: submitTarget,
+            attachments: AgentAttachmentStripSnapshot(
+                scopeTabID: tabID,
+                attachments: pendingFileAttachments,
+                taggedFileAttachments: pendingTaggedFileAttachments
+            ),
+            runState: runState,
+            cancelTarget: cancelTarget,
+            backgroundCancelTarget: composerOracleBackgroundCancelTarget(tabID: tabID),
+            isAgentBusy: isAgentBusy,
+            isWaitingForInstruction: isWaitingForInstruction,
+            canUseLinkedAgentSession: hasLinkedAgentSession(for: tabID),
+            isCurrentTabMCPControlled: isMCPControlled,
+            areModelControlsDisabled: isMCPControlled || acpRunLocksModelControls || routerControlsFreshTask,
+            providerControls: activeProviderControlsBinding,
+            isCodexRunActive: isCodexRunActive,
+            hasAvailableAgentProviders: hasAvailableAgentProviders,
+            canSendWithCurrentProvider: canSendWithCurrentProvider,
+            isRoutingFreshTask: tabID.map { freshTaskRoutingByTabID[$0] != nil } ?? false,
+            isGlobalModelRouterControllingFreshTask: routerControlsFreshTask,
+            automaticRouterServiceName: automaticRouterServiceName,
+            autoEffortServiceName: autoEffortServiceName,
+            unavailableSelectedAgentMessage: unavailableSelectedAgentMessage,
+            selectedAgent: selectedAgent,
+            selectedModelRaw: selectedModelRaw,
+            selectedModelDisplayName: selectedModelDisplayName,
+            selectedReasoningEffortRaw: selectedReasoningEffortRaw,
+            selectedReasoningEffortDisplayName: selectedReasoningEffortDisplayName,
+            acpModelParameterControls: acpControls,
+            availableAgents: availableAgents,
+            isProviderPickerLockedForCurrentTab: isProviderPickerLocked(tabID: tabID),
+            lockedAgentSelectionMessage: lockedAgentSelectionMessage(tabID: tabID),
+            autoEditEnabled: autoEditEnabled,
+            stagedSlashCommand: stagedSlashCommandProps(tabID: tabID),
+            draftRestorationEvent: draftRestorationEvent.map(AgentDraftRestorationProps.init),
+            fileTagLookupContextIdentity: agentWorkspaceLookupContextIdentity(tabID: tabID, session: session)
+        )
+    }
+}
+
+@MainActor
+final class AgentComposerProjectionEquivalenceTests: XCTestCase {
+    func testCurrentWorkspaceProjectionMatchesFrozenMainAcrossProviderRunAndAutomationMatrix() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "CC-equivalence-\(UUID().uuidString)"))
+        let settings = GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: root.appendingPathComponent("settings.json")))
+        let vm = AgentModeViewModel(
+            testWorkspacePath: nil,
+            codexControllerFactory: { _, _, _, _, _, _ in fatalError("Projection must not launch a provider") },
+            headlessProviderFactory: { _, _ in UnsupportedHeadlessAgentProvider(reason: "projection only") }
+        )
+        vm.test_setSuppressesAgentSessionPersistence(true)
+        vm.modelRouterSettingsStore = settings
+        XCTAssertEqual(vm.makeComposerProps(), vm.referenceCurrentComposerProps())
+        let freshID = UUID()
+        vm.test_setCurrentTabIDOverride(freshID)
+        XCTAssertEqual(vm.makeComposerProps(), vm.referenceCurrentComposerProps())
+        let tabID = UUID()
+        vm.test_setCurrentTabIDOverride(tabID)
+        let session = vm.session(for: tabID)
+        defer { session.saveDebounceTask?.cancel()
+            session.persistedLoadTask?.cancel()
+        }
+        for agent in [AgentProviderKind.claudeCode, .codexExec, .cursor] {
+            for state in [AgentSessionRunState.idle, .running, .waitingForUser] {
+                for managed in [false, true] {
+                    session.selectedAgent = agent
+                    session.selectedModelRaw = AgentModelCatalog.defaultModelRaw(for: agent)
+                    session.runState = state
+                    session.isMCPOriginated = managed
+                    session.pendingFileAttachments = [.init(source: .localFile(path: "/tmp/explicit.txt"), title: "explicit.txt", fileName: "explicit.txt")]
+                    vm.updateBindingsFromSession(session)
+                    settings.setAutoEffortEnabled(managed, commit: false)
+                    settings.setModelRouterEnabled(managed, commit: false)
+                    XCTAssertEqual(vm.makeComposerProps(), vm.referenceCurrentComposerProps(), "\(agent) / \(state) / managed \(managed)")
+                    XCTAssertEqual(vm.makeStatusPillsSnapshot(), vm.referenceCurrentStatusSnapshot(), "Status \(agent) / \(state) / managed \(managed)")
+                }
+            }
+        }
+    }
+
+    func testExplicitEditorSubjectAndCanonicalRestorationDoNotFollowForegroundTab() {
+        let vm = AgentModeViewModel(
+            testWorkspacePath: nil,
+            codexControllerFactory: { _, _, _, _, _, _ in fatalError("Editor must not launch a provider") },
+            headlessProviderFactory: { _, _ in UnsupportedHeadlessAgentProvider(reason: "editor only") }
+        )
+        vm.test_setSuppressesAgentSessionPersistence(true)
+        let foregroundID = UUID(), targetID = UUID()
+        vm.test_setCurrentTabIDOverride(foregroundID)
+        let foreground = vm.session(for: foregroundID), target = vm.session(for: targetID)
+        defer { for session in [foreground, target] {
+            session.saveDebounceTask?.cancel()
+            session.persistedLoadTask?.cancel()
+        } }
+        let subject = AgentComposerSubject.tab(targetID)
+        XCTAssertTrue(subject.ownsEditor(tabID: targetID, ownerCurrentTabID: foregroundID))
+        XCTAssertFalse(subject.ownsEditor(tabID: foregroundID, ownerCurrentTabID: foregroundID))
+        XCTAssertFalse(AgentComposerSubject.currentTab.ownsEditor(tabID: targetID, ownerCurrentTabID: foregroundID))
+        XCTAssertTrue(AgentComposerSubject.currentTab.ownsEditor(tabID: foregroundID, ownerCurrentTabID: foregroundID))
+        let actions = AgentComposerActions.make(vm: vm, subject: subject, composerUI: AgentComposerUIStore(), windowID: 0)
+        vm.storeDraftText(for: foregroundID, "foreground untouched")
+        actions.storeDraft(targetID, "newer typing", 0)
+        vm.restoreComposerDraft(tabID: targetID, text: "rejected message\nnewer typing", message: "attachment refused", strategy: .replaceAlways)
+        vm.reportImageAttachmentBlocked(.agentBusy, tabID: targetID)
+        let props = AgentComposerProjection.props(vm: vm, subject: subject)
+        XCTAssertEqual(props.imageAttachmentNotice?.tabID, targetID)
+        XCTAssertNil(AgentComposerProjection.props(vm: vm, subject: .tab(foregroundID)).imageAttachmentNotice)
+        XCTAssertEqual(props.draftRestorationEvent?.tabID, targetID)
+        XCTAssertEqual(props.draftRestorationEvent?.text, "rejected message\nnewer typing")
+        XCTAssertEqual(vm.draftRuntime.text(for: foregroundID), "foreground untouched")
+        XCTAssertEqual(vm.currentTabID, foregroundID)
+        XCTAssertNil(AgentComposerProjection.props(vm: vm, subject: .tab(foregroundID)).draftRestorationEvent)
+        actions.storeDraft(targetID, "rejected message\nnewer typing\nmore typing", 0)
+        vm.restoreComposerDraft(tabID: foregroundID, text: "foreground rejection", message: "other tab", strategy: .replaceAlways)
+        let coalesced = AgentComposerProjection.props(vm: vm, subject: subject)
+        XCTAssertNil(coalesced.draftRestorationEvent, "Another tab may supersede the window-global signal")
+        XCTAssertEqual(coalesced.draftText, "rejected message\nnewer typing\nmore typing", "Exact editor must still observe all canonical restoration and newer text")
+    }
+
+    func testFreshComposerDefaultsReadSavedPreferenceRatherThanHistoricalTab() throws {
+        let name = "CC-fresh-defaults-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
+        defaults.set(AgentProviderKind.cursor.rawValue, forKey: "agentMode.lastUsedAgent")
+        defaults.set([AgentProviderKind.cursor.rawValue: AgentModel.cursorAuto.rawValue], forKey: "agentMode.lastUsedModelsByAgent")
+        let fresh = AgentModeViewModel.freshComposerSelection(defaults: defaults)
+        XCTAssertEqual(fresh.agent, .cursor)
+        XCTAssertEqual(fresh.modelRaw, AgentModel.cursorAuto.rawValue)
+    }
+
+    func testExplicitSlashSuggestionsUseSubjectProviderWithoutActivatingIt() async {
+        let vm = AgentModeViewModel(
+            testWorkspacePath: nil,
+            codexControllerFactory: { _, _, _, _, _, _ in fatalError("Suggestions must not launch a provider") },
+            headlessProviderFactory: { _, _ in UnsupportedHeadlessAgentProvider(reason: "suggestions only") }
+        )
+        vm.test_setSuppressesAgentSessionPersistence(true)
+        let foregroundID = UUID(), targetID = UUID()
+        vm.test_setCurrentTabIDOverride(foregroundID)
+        let foreground = vm.session(for: foregroundID), target = vm.session(for: targetID)
+        defer { for session in [foreground, target] {
+            session.saveDebounceTask?.cancel()
+            session.persistedLoadTask?.cancel()
+        } }
+        foreground.selectedAgent = .claudeCode
+        target.selectedAgent = .codexExec
+        target.codexConversationID = "fixture-thread"
+        let expected = vm.codexCoordinator.nativeSlashCommandSuggestions(for: target, query: "compact", limit: 1)
+        let actual = await vm.slashSkillSuggestions(for: "compact", tabID: targetID)
+        XCTAssertFalse(expected.isEmpty)
+        for suggestion in expected {
+            XCTAssertTrue(actual.contains { $0.relativePath == suggestion.relativePath })
+        }
+        XCTAssertEqual(vm.currentTabID, foregroundID)
+        let before = Set(vm.sessions.keys)
+        let missing = await vm.slashSkillSuggestions(for: "", tabID: UUID())
+        XCTAssertTrue(missing.isEmpty)
+        XCTAssertEqual(Set(vm.sessions.keys), before)
+    }
+
+    func testUnhostedDraftUsesSameProjectionWithLiveLocalOptionsAndNoSubmitTarget() {
+        let draft = AgentComposerDraftState(text: "message", agent: .codexExec, model: AgentModelCatalog.defaultModelRaw(for: .codexExec), effort: "low")
+        let props = AgentComposerProjection.props(vm: nil, subject: .draft(draft.id), draft: draft)
+        XCTAssertEqual(props.currentTabID, draft.id)
+        XCTAssertEqual(props.draftText, "message")
+        XCTAssertEqual(props.selectedModelRaw, draft.model)
+        XCTAssertEqual(props.selectedReasoningEffortRaw, "low")
+        XCTAssertNil(props.submitTarget, "Typing must never allocate a session/writer")
+        XCTAssertFalse(props.areModelControlsDisabled)
+        XCTAssertNotNil(props.providerControls)
+        XCTAssertFalse(props.availableAgents.isEmpty)
+        XCTAssertEqual(props.autoEditEnabled, draft.autoEdit)
+    }
+}
+
+@MainActor
+private extension AgentModeViewModel {
+    func referenceCurrentStatusSnapshot() -> AgentStatusPillsSnapshot {
+        #if DEBUG
+            test_statusPillsSnapshotBuildCount += 1
+        #endif
+        return AgentStatusPillsSnapshot(
+            currentTabID: currentTabID,
+            selectedWorkflow: selectedWorkflow,
+            stagedSlashCommand: stagedSlashCommandProps(tabID: currentTabID),
+            selectedAgent: selectedAgent,
+            autoEditPermissionGuidance: autoEditPermissionGuidance,
+            runState: runState,
+            autoEditEnabled: autoEditEnabled,
+            interviewFirst: interviewFirst,
+            modelRouter: modelRouterPillProps(),
+            autoEffort: autoEffortPillProps(),
+            executionLocation: executionLocationProps(tabID: currentTabID),
+            activeAgentSessionID: activeSession?.activeAgentSessionID,
+            activeRunID: activeSession?.runID,
+            monitor: currentMonitorPillProps(),
+            reprompt: repromptPillProps()
+        )
     }
 }

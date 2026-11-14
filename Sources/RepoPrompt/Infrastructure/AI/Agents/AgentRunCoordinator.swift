@@ -1,5 +1,7 @@
 import Foundation
 import OSLog
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
 import RepoPromptInstrumentation
 
 /// Identifies the type of headless agent run.
@@ -167,21 +169,24 @@ final class AgentRunCoordinator {
         gateID: UUID? = nil,
         timeoutMs: Int = defaultRoutingTimeoutMs,
         waitPolicy: MCPRoutingWaitPolicy? = nil,
-        progressLifecycle: MCPBootstrapRoutingProgressLifecycle? = nil
+        progressLifecycle: MCPBootstrapRoutingProgressLifecycle? = nil,
+        routingWaitGeneration: UUID? = nil
     ) async -> GateRoutingReleaseResult {
         let timeoutSeconds = TimeInterval(timeoutMs) / 1000.0
         let routingOutcome: MCPRoutingWaitOutcome = if let waitPolicy {
             await MCPRoutingWaiter.waitForRoutingOutcome(
                 runID: runID,
                 policy: waitPolicy,
-                progressLifecycle: progressLifecycle
+                progressLifecycle: progressLifecycle,
+                expectedGeneration: routingWaitGeneration
             )
         } else {
             // Compatibility path: one absolute deadline that ignores connection observation.
             await MCPRoutingWaiter.waitForRoutingOutcome(
                 runID: runID,
                 timeoutSeconds: timeoutSeconds,
-                progressLifecycle: progressLifecycle
+                progressLifecycle: progressLifecycle,
+                expectedGeneration: routingWaitGeneration
             )
         }
 

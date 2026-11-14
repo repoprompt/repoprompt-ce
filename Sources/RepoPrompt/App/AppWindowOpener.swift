@@ -21,6 +21,7 @@ import SwiftUI
 @MainActor
 final class AppWindowOpener: ObservableObject {
     static let shared = AppWindowOpener()
+    let commandCenter = CommandCenterWindowOpener()
 
     private var openMainWindowImpl: (() -> Void)?
     @Published private(set) var pendingDockWindowRequestCount = 0

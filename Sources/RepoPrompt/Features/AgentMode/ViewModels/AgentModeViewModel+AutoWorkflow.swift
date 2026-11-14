@@ -71,7 +71,7 @@ extension AgentModeViewModel {
     ) async -> AutoWorkflowTurnSelection? {
         let configuration = modelRouterSettingsStore.autoWorkflowConfiguration()
         guard !Task.isCancelled, configuration.enabled,
-              composerSubmitClaimIsCurrent(claim),
+              composerSubmitRuntime.isCurrent(claim),
               session.selectedWorkflow == nil,
               autoWorkflowIsEligible(session: session, text: text),
               let excerpt = AutoEffortTaskSummary.make(from: AgentTaskRoutingTaskExcerpt.make(from: text)),
@@ -81,9 +81,11 @@ extension AgentModeViewModel {
         else { return nil }
         let catalog = autoWorkflowCatalog()
         guard !catalog.isEmpty else { return nil }
+        claim.cancellation.retainProducer()
+        defer { claim.cancellation.releaseProducer() }
         let generation = session.userWorkflowSelectionMutationGeneration
         guard let registration = await runtime.registry.registration(for: backendID),
-              !Task.isCancelled, composerSubmitClaimIsCurrent(claim),
+              !Task.isCancelled, composerSubmitRuntime.isCurrent(claim),
               sessions[session.tabID] === session,
               session.selectedWorkflow == nil,
               session.userWorkflowSelectionMutationGeneration == generation,
@@ -112,7 +114,7 @@ extension AgentModeViewModel {
             task.cancel()
         }
         guard !Task.isCancelled,
-              composerSubmitClaimIsCurrent(claim),
+              composerSubmitRuntime.isCurrent(claim),
               sessions[session.tabID] === session,
               autoWorkflowIsEligible(session: session, text: text),
               case let .workflow(workflow)? = prepared.selection(for: outcome)

@@ -1,5 +1,5 @@
 {
-  "originHash" : "fd6d03b35845f23bcc7a241e790ce22e61f89129f73fa0c127816caa1c7921bf",
+  "originHash" : "accd1db04a2e8f28587156093c6a6f9f21c59b40e2164152578f3bf7cbd79d88",
   "pins" : [
     {
       "identity" : "async-http-client",
@@ -249,7 +249,7 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/repoprompt/swift-sdk.git",
       "state" : {
-        "revision" : "5716de85a976a8f70dedc9cb000e50aaa0d8cc5b"
+        "revision" : "1b8ca21c560e7678023e524d9a666220e7d7194c"
       }
     },
     {

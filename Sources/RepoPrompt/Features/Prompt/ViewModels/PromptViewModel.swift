@@ -1,10 +1,12 @@
 import Combine
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptCodeMapCore
 import RepoPromptFileSystem
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
 import RepoPromptVCS
+import RepoPromptWorkspaceContext
 import SwiftUI
 
 /// Errors that can occur when publishing git diff artifacts
@@ -4594,7 +4596,7 @@ class PromptViewModel: ObservableObject {
         guard let windowState = WindowStatesManager.shared.allWindows.first(where: { $0.windowID == windowID }) else { return }
 
         for tabID in tabIDs {
-            windowState.mcpServer.purgeClosedTabContext(tabID: tabID)
+            windowState.mcpServer.purgeClosedTabContext(route: windowState.mcpServer.routeResources, tabID: tabID)
             await ServerNetworkManager.shared.cleanupRunRoutingState(forTabID: tabID, windowID: windowID)
         }
     }

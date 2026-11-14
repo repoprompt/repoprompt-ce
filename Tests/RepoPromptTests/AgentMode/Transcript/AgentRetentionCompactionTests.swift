@@ -1,6 +1,7 @@
 #if DEBUG
     import Foundation
     import MCP
+    import RepoPromptDomainRuntime
     import RepoPromptSettingsCore
     @_spi(TestSupport) @testable import RepoPromptApp
     import XCTest
@@ -137,10 +138,10 @@
             let result = session.items[1]
             let payload = try XCTUnwrap(viewModel.rawToolResultPayloadForRendering(tabID: session.tabID, itemID: result.id))
             let revision = session.ephemeralToolResultPayloadRevisionByItemID[result.id]
-            XCTAssertTrue(viewModel.applyAssistantDelta("Synthetic next-tool preamble", session: session))
+            XCTAssertTrue(viewModel.streamRuntime.applyAssistantDelta("Synthetic next-tool preamble", session: session))
             XCTAssertEqual(session.items.last?.isStreaming, true)
 
-            viewModel.endActiveAssistantSegment(session)
+            viewModel.streamRuntime.endActiveAssistantSegment(session)
 
             XCTAssertEqual(session.items.last?.isStreaming, false)
             XCTAssertEqual(viewModel.rawToolResultPayloadForRendering(tabID: session.tabID, itemID: result.id), payload)
@@ -156,14 +157,14 @@
             let result = session.items[1]
             let payload = try XCTUnwrap(viewModel.rawToolResultPayloadForRendering(tabID: session.tabID, itemID: result.id))
             let revision = session.ephemeralToolResultPayloadRevisionByItemID[result.id]
-            XCTAssertTrue(viewModel.applyAssistantDelta("Synthetic final response", session: session))
+            XCTAssertTrue(viewModel.streamRuntime.applyAssistantDelta("Synthetic final response", session: session))
             session.appendItem(.toolCall(
                 name: "read_file", invocationID: id(700_001),
                 argsJSON: #"{"path":"synthetic.swift"}"#, sequenceIndex: session.nextSequenceIndex
             ))
             defer { session.saveDebounceTask?.cancel() }
 
-            await viewModel.test_publishNaturalCompletion(session)
+            await viewModel.runService.test_publishNaturalCompletion(session)
 
             let commit = try XCTUnwrap(session.lastTerminalCommitRevision)
             XCTAssertEqual(commit.ownership, ownership)
@@ -332,7 +333,7 @@
             let itemsBeforeSave = session.items
             session.isDirty = true
 
-            await viewModel.flushSave(for: tabID)
+            await viewModel.persistenceRuntime.flushSave(for: tabID)
 
             XCTAssertEqual(saves, 1, "The regression must exercise the real save boundary")
             XCTAssertNotEqual(session.items, itemsBeforeSave, "Save must repair or reconcile the fixture")

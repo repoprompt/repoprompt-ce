@@ -1,0 +1,29 @@
+import Foundation
+import RepoPromptDomainRuntime
+
+/// Core compatibility facade for Claude SDK NDJSON translation.
+///
+/// The protocol-specific translation rules live in the Claude-compatible
+/// provider package. Core keeps this small adapter so the process controller can
+/// continue to consume app-owned `AIStreamResult` values and keep RepoPrompt MCP
+/// tool-result status ownership in the host.
+package struct ClaudeSDKNDJSONTranslator {
+    private var providerTranslator: ClaudeCompatiblePluginNDJSONTranslator
+
+    package var cliSessionID: String? {
+        providerTranslator.cliSessionID
+    }
+
+    package init(enableDebugLogging: Bool = false, isRepoPromptToolName: @escaping @Sendable (String) -> Bool) {
+        providerTranslator = ClaudeCompatiblePluginNDJSONTranslator(
+            enableDebugLogging: enableDebugLogging,
+            treatsToolResultErrorsAsHostOwned: isRepoPromptToolName
+        )
+    }
+
+    package mutating func parseNDJSONLine(_ lineData: Data) -> [RepoPromptDomainRuntime.AIStreamResult] {
+        providerTranslator.parseNDJSONLine(lineData).map {
+            ClaudeCompatibleProviderRuntimeBridge.streamResult(from: $0)
+        }
+    }
+}

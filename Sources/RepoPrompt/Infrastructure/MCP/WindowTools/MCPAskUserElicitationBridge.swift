@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptMCPServer
 
 /// Maps the stable `ask_user` request/response envelope onto MCP form elicitation.
 /// The transport-facing provider remains connection scoped; this type only owns

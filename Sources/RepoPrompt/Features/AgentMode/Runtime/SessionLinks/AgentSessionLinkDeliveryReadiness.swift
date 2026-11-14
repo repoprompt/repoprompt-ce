@@ -46,6 +46,9 @@ enum AgentSessionLinkDeliveryReadiness {
         var isComposerSubmissionInFlight: Bool
         var isPreparingInitialWorktree: Bool
         var isChangingExecutionLocation: Bool
+        /// Exact stored receipts, never inferred from the visible busy flags.
+        var hasCancellableComposerStart: Bool = false
+        var composerStartHasLaunched: Bool = false
 
         // Target queues
         var pendingInstructionCount: Int
@@ -95,6 +98,8 @@ enum AgentSessionLinkDeliveryReadiness {
             isComposerSubmissionInFlight: Bool,
             isPreparingInitialWorktree: Bool,
             isChangingExecutionLocation: Bool,
+            hasCancellableComposerStart: Bool = false,
+            composerStartHasLaunched: Bool = false,
             pendingInstructionCount: Int,
             pendingACPSteeringCount: Int,
             pendingClaudeSteeringCount: Int,
@@ -125,6 +130,8 @@ enum AgentSessionLinkDeliveryReadiness {
             self.isComposerSubmissionInFlight = isComposerSubmissionInFlight
             self.isPreparingInitialWorktree = isPreparingInitialWorktree
             self.isChangingExecutionLocation = isChangingExecutionLocation
+            self.hasCancellableComposerStart = hasCancellableComposerStart
+            self.composerStartHasLaunched = composerStartHasLaunched
             self.pendingInstructionCount = pendingInstructionCount
             self.pendingACPSteeringCount = pendingACPSteeringCount
             self.pendingClaudeSteeringCount = pendingClaudeSteeringCount

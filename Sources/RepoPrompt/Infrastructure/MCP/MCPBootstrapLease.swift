@@ -164,10 +164,15 @@ extension MCPBootstrapReadinessError: LocalizedError {
 actor MCPBootstrapLease {
     private let log = Logger(subsystem: "com.repoprompt.mcp", category: "BootstrapLease")
 
+    nonisolated let runID: UUID
     private var spec: MCPBootstrapLeaseSpec
     private let perfRecorder: any AgentModePerfRecording
     private let mcpServerEnabler: (() async -> Bool)?
     private let policyInstaller: (MCPBootstrapLeaseSpec) async -> Void
+    private let routingOwner: MCPHostRouteResources?
+    private let processRegistrationProvider: (@MainActor @Sendable () async -> MCPRunRoutingProcessRegistration?)?
+    private var routingWaitGeneration: UUID?
+    private var cleanupReceipts: [MCPRunRoutingCleanupReceipt] = []
     private let expectedPIDPolicyArmer: (MCPBootstrapLeaseSpec) async -> Bool
     private let policyClearer: (MCPBootstrapLeaseSpec) async -> Void
     private let routingStateOwner: (@MainActor @Sendable () -> Bool)?
@@ -187,6 +192,7 @@ actor MCPBootstrapLease {
     /// cannot confer routing authority on a successor run.
     private var routingTerminalOutcome: MCPRoutingWaitOutcome?
     // Memoized in-flight cleanup operations backing the joinable clear/teardown (see clearPolicyOnce()).
+    private var ownedAcquisitionOperation: Task<Bool, Never>?
     private var policyClearOperation: Task<Void, Never>?
     private var policyReinstallOperation: Task<Void, Never>?
     private var routingCleanupOperation: Task<Void, Never>?
@@ -220,16 +226,75 @@ actor MCPBootstrapLease {
         expectedPIDPolicyArmer: ((MCPBootstrapLeaseSpec) async -> Bool)? = nil,
         policyClearer: ((MCPBootstrapLeaseSpec) async -> Void)? = nil,
         routingStateOwner: (@MainActor @Sendable () -> Bool)? = nil,
-        routeAuthorityResolver: ((MCPBootstrapLeaseSpec) async -> MCPRunRouteAuthorityDecision)? = nil
+        routeAuthorityResolver: ((MCPBootstrapLeaseSpec) async -> MCPRunRouteAuthorityDecision)? = nil,
+        routingOwner: MCPHostRouteResources? = nil,
+        processRegistrationProvider: (@MainActor @Sendable () async -> MCPRunRoutingProcessRegistration?)? = nil
     ) {
         self.spec = spec
+        runID = spec.runID
         self.perfRecorder = perfRecorder
         self.mcpServerEnabler = mcpServerEnabler
         self.policyInstaller = policyInstaller ?? Self.defaultPolicyInstaller
+        self.routingOwner = routingOwner
+        self.processRegistrationProvider = processRegistrationProvider
         self.expectedPIDPolicyArmer = expectedPIDPolicyArmer ?? Self.defaultExpectedPIDPolicyArmer
         self.policyClearer = policyClearer ?? Self.defaultPolicyClearer
         self.routingStateOwner = routingStateOwner
         self.routeAuthorityResolver = routeAuthorityResolver ?? Self.defaultRouteAuthorityResolver
+    }
+
+    /// Owned routes retain every policy installation (including a same-process retry) in this
+    /// existing lease. A stale command can lose admission without losing its cleanup obligations.
+    private func installPolicy(reusingProcess: Bool = true) async -> Bool {
+        guard let routingOwner else {
+            await policyInstaller(spec)
+            return true
+        }
+        let process = reusingProcess ? await processRegistrationProvider?() : nil
+        guard let generation = routingWaitGeneration,
+              let receipt = await Self.installPolicy(spec, routingOwner: routingOwner, routingWaitGeneration: generation, reusingProcess: process)
+        else { return false }
+        cleanupReceipts.append(receipt)
+        return true
+    }
+
+    private func armExpectedPIDPolicy() async -> Bool {
+        guard routingOwner != nil else { return await expectedPIDPolicyArmer(spec) }
+        guard let receipt = cleanupReceipts.last, let client = spec.clientName else { return false }
+        return await ServerNetworkManager.shared.requireExpectedAgentPIDForPendingPolicy(
+            for: client, runID: spec.runID, windowID: spec.windowID, registration: receipt
+        )
+    }
+
+    private func resolveRouteAuthority() async -> MCPRunRouteAuthorityDecision {
+        guard routingOwner != nil else { return await routeAuthorityResolver(spec) }
+        guard let receipt = cleanupReceipts.last else { return .revocationFenced }
+        return await ServerNetworkManager.shared.confirmCommittedRunRouteOrFenceRevocation(
+            runID: spec.runID, windowID: spec.windowID, tabID: spec.tabID, registration: receipt
+        )
+    }
+
+    private func notifyRoutingFailure() async {
+        if routingOwner != nil {
+            guard let generation = routingWaitGeneration else { return }
+            await MCPRoutingWaiter.notifyFailed(runID: spec.runID, generation: generation)
+        } else {
+            await MCPRoutingWaiter.notifyFailed(runID: spec.runID)
+        }
+    }
+
+    /// Snapshot of this lease's installed registrations for the originating provider resource.
+    /// Nil is the legacy adapter; an empty owned snapshot is not a successful handoff.
+    func originatingRoutingCleanupReceipts() -> [MCPRunRoutingCleanupReceipt]? {
+        guard routingOwner != nil else { return nil }
+        guard let current = cleanupReceipts.last, !current.isConsumed else { return [] }
+        return cleanupReceipts.filter { !$0.isConsumed }
+    }
+
+    private func clearOwnedPolicies() async {
+        for receipt in cleanupReceipts {
+            await ServerNetworkManager.shared.cleanupRunRoutingState(ownedBy: receipt)
+        }
     }
 
     /// Default callers own their run scope; cold resumes additionally fence replacement state.
@@ -244,6 +309,25 @@ actor MCPBootstrapLease {
     /// PID-owned policies release the gate after their unique pending policy is confirmed armed.
     /// Returns `false` if cancelled, the gate could not be acquired, or PID ownership could not be armed.
     func acquire() async -> Bool {
+        guard routingOwner != nil else { return await performAcquire() }
+        guard !hasReleased else { return false }
+        let operation: Task<Bool, Never>
+        if let existing = ownedAcquisitionOperation {
+            operation = existing
+        } else {
+            operation = Task { await self.performAcquire() }
+            ownedAcquisitionOperation = operation
+        }
+        return await withTaskCancellationHandler {
+            await operation.value
+        } onCancel: {
+            // Acquisition belongs to the original attempt. Cancellation requests its stop,
+            // while awaiting the task still joins any policy installation already in flight.
+            operation.cancel()
+        }
+    }
+
+    private func performAcquire() async -> Bool {
         if hasReleased {
             acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) acquire() ignored because lease already released")
             return false
@@ -274,7 +358,11 @@ actor MCPBootstrapLease {
 
         // Register routing state before gate acquisition
         acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) registering routing waiter")
-        await MCPRoutingWaiter.register(runID: spec.runID)
+        if routingOwner != nil {
+            routingWaitGeneration = await MCPRoutingWaiter.registerOwned(runID: spec.runID)
+        } else {
+            routingWaitGeneration = await MCPRoutingWaiter.register(runID: spec.runID)
+        }
         routingRegistered = true
         if shouldAbortAcquire {
             await cancelAndCleanup()
@@ -329,14 +417,17 @@ actor MCPBootstrapLease {
 
             // Install per-run connection policy
             acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) installing connection policy for client=\(spec.clientName ?? "<none>")")
-            await policyInstaller(spec)
+            guard await installPolicy() else {
+                await cancelAndCleanup()
+                return false
+            }
             policyInstalled = true
             if shouldAbortAcquire {
                 await cancelAndCleanup()
                 return false
             }
             if spec.requiresExpectedAgentPID {
-                let policyArmed = await expectedPIDPolicyArmer(spec)
+                let policyArmed = await armExpectedPIDPolicy()
                 await recordDiagnosticEvent(
                     "lease_expected_pid_policy_armed",
                     fields: ["armed": String(policyArmed)]
@@ -401,14 +492,24 @@ actor MCPBootstrapLease {
               policyReinstallOperation == nil, policyClearOperation == nil
         else { return false }
         acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) reinstalling connection policy for a replacement provider process")
-        let operation = Task { await self.policyInstaller(self.spec) }
+        let previousReceipt = cleanupReceipts.last
+        let operation = Task {
+            if self.routingOwner != nil {
+                // The old process retains its original registration, including its waiter.
+                // A replacement must never borrow that generation after old-process shutdown.
+                self.routingWaitGeneration = await MCPRoutingWaiter.registerOwned(runID: self.spec.runID)
+            }
+            guard !self.shouldAbortAcquire else { return }
+            _ = await self.installPolicy(reusingProcess: false)
+        }
         policyReinstallOperation = operation
         await operation.value
         policyReinstallOperation = nil
+        guard routingOwner == nil || cleanupReceipts.last != previousReceipt else { return false }
         policyInstalled = true
         guard !shouldAbortAcquire else { return false }
         if spec.requiresExpectedAgentPID {
-            let policyArmed = await expectedPIDPolicyArmer(spec)
+            let policyArmed = await armExpectedPIDPolicy()
             await recordDiagnosticEvent(
                 "lease_expected_pid_policy_rearmed",
                 fields: ["armed": String(policyArmed)]
@@ -416,6 +517,23 @@ actor MCPBootstrapLease {
             guard policyArmed, !shouldAbortAcquire else { return false }
         }
         return true
+    }
+
+    /// Provider lifetime cleanup, distinct from an attempt's successful routing wait. The
+    /// originating provider retains this lease before acquisition starts. Closing that lifetime
+    /// prevents new acquisition, joins the original producer (and any replacement installation),
+    /// then consumes only its retained registrations. A cancelled cleanup waiter does not cancel
+    /// these joins or transfer cleanup to a successor with the same run ID.
+    func finishOwnedProviderRouting() async {
+        guard routingOwner != nil else { return }
+        cleanupRequested = true
+        hasReleased = true
+        let acquisition = ownedAcquisitionOperation
+        acquisition?.cancel()
+        _ = await acquisition?.value
+        await clearPolicyOnce()
+        await cleanupRoutingOnce()
+        await releaseOwnedGate(reason: "provider_disposed")
     }
 
     // MARK: - Release Strategies
@@ -466,15 +584,21 @@ actor MCPBootstrapLease {
         if let routingTerminalOutcome {
             return routingTerminalOutcome
         }
-        return await MCPRoutingWaiter.currentTerminalOutcome(runID: spec.runID)
+        if routingOwner != nil, routingWaitGeneration == nil { return .failed(.notRegistered) }
+        return await MCPRoutingWaiter.currentTerminalOutcome(
+            runID: spec.runID, expectedGeneration: routingOwner == nil ? nil : routingWaitGeneration
+        )
     }
 
     /// Resolves a provider-boundary race through the same route authority used by bounded waits.
     /// Re-signaling a confirmed route prevents notification lag from parking the indefinite waiter.
     func resolveRouteAuthorityAtProviderCompletion() async -> MCPRunRouteAuthorityDecision {
-        let decision = await routeAuthorityResolver(spec)
+        let decision = await resolveRouteAuthority()
         if decision == .committed {
-            await MCPRoutingWaiter.notifyRouted(runID: spec.runID)
+            if routingOwner == nil { await MCPRoutingWaiter.notifyRouted(runID: spec.runID) }
+            else if let generation = routingWaitGeneration {
+                await MCPRoutingWaiter.notifyRouted(runID: spec.runID, generation: generation)
+            }
         }
         return decision
     }
@@ -493,6 +617,10 @@ actor MCPBootstrapLease {
             let outcome: MCPRoutingWaitOutcome = Task.isCancelled ? .cancelled : .failed(.signalled)
             routingTerminalOutcome = outcome
             await releaseOwnedGate(reason: "routing_superseded")
+            if routingOwner != nil {
+                if policyInstalled { await clearPolicyOnce() }
+                if routingRegistered { await cleanupRoutingOnce() }
+            }
             return outcome
         }
 
@@ -524,7 +652,8 @@ actor MCPBootstrapLease {
             gateID: spec.gateID,
             timeoutMs: timeoutMs,
             waitPolicy: waitPolicy,
-            progressLifecycle: progressLifecycle
+            progressLifecycle: progressLifecycle,
+            routingWaitGeneration: routingOwner == nil ? nil : routingWaitGeneration
         )
 
         #if DEBUG
@@ -554,7 +683,7 @@ actor MCPBootstrapLease {
         var routeAuthorityDecision: MCPRunRouteAuthorityDecision?
         switch outcome {
         case .timedOutBeforeConnection, .timedOutAfterConnection:
-            routeAuthorityDecision = await routeAuthorityResolver(spec)
+            routeAuthorityDecision = await resolveRouteAuthority()
             if routeAuthorityDecision == .committed {
                 outcome = .routed
             }
@@ -658,7 +787,7 @@ actor MCPBootstrapLease {
             await existing.value
             return
         }
-        let ownsState = await ownsRoutingState()
+        let ownsState = if routingOwner != nil { true } else { await ownsRoutingState() }
         // The ownership hop may have let another caller start the single-flight clear.
         if policyClearOperation != nil {
             await clearPolicyOnce()
@@ -668,7 +797,8 @@ actor MCPBootstrapLease {
         let reinstall = policyReinstallOperation
         let operation = Task {
             await reinstall?.value
-            await self.policyClearer(self.spec)
+            if self.routingOwner != nil { await self.clearOwnedPolicies() }
+            else { await self.policyClearer(self.spec) }
         }
         policyClearOperation = operation
         await operation.value
@@ -681,13 +811,21 @@ actor MCPBootstrapLease {
             await existing.value
             return
         }
-        let ownsState = await ownsRoutingState()
+        let ownsState = if routingOwner != nil { true } else { await ownsRoutingState() }
         if let existing = routingCleanupOperation {
             await existing.value
             return
         }
         guard ownsState else { return }
-        let operation = Task { await AgentRunCoordinator.shared.cleanupRouting(runID: self.spec.runID) }
+        let operation = Task {
+            if self.routingOwner != nil {
+                if let generation = self.routingWaitGeneration {
+                    await MCPRoutingWaiter.cleanup(runID: self.spec.runID, generation: generation)
+                }
+            } else {
+                await AgentRunCoordinator.shared.cleanupRouting(runID: self.spec.runID)
+            }
+        }
         routingCleanupOperation = operation
         await operation.value
     }
@@ -766,7 +904,7 @@ actor MCPBootstrapLease {
             return
         }
         acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) failAndRelease() signaling routing failure")
-        await MCPRoutingWaiter.notifyFailed(runID: spec.runID)
+        await notifyRoutingFailure()
         _ = await releaseWhenRouted()
     }
 
@@ -889,7 +1027,8 @@ actor MCPBootstrapLease {
                 ]
             )
         #endif
-        guard await ownsRoutingState() else {
+        let retainsCleanup = if routingOwner != nil { true } else { await ownsRoutingState() }
+        guard retainsCleanup else {
             await releaseOwnedGate(reason: reason)
             if let operation = policyClearOperation { await operation.value }
             if let operation = routingCleanupOperation { await operation.value }
@@ -897,7 +1036,7 @@ actor MCPBootstrapLease {
         }
         if routingRegistered, !didSignalRoutingFailure {
             didSignalRoutingFailure = true
-            await MCPRoutingWaiter.notifyFailed(runID: spec.runID)
+            await notifyRoutingFailure()
         }
         await releaseOwnedGate(reason: reason)
         if policyInstalled {
@@ -948,7 +1087,7 @@ actor MCPBootstrapLease {
         guard spec.purpose == .agentModeRun, policyClearOperation == nil,
               await ownsRoutingState()
         else { return false }
-        let decision = await routeAuthorityResolver(spec)
+        let decision = await resolveRouteAuthority()
         return decision == .committed && policyClearOperation == nil
     }
 
@@ -1002,8 +1141,15 @@ actor MCPBootstrapLease {
     }
 
     private static let defaultPolicyInstaller: (MCPBootstrapLeaseSpec) async -> Void = { spec in
-        guard let clientName = spec.clientName else { return }
-        await ServerNetworkManager.shared.installClientConnectionPolicy(
+        _ = await MCPBootstrapLease.installPolicy(spec, routingOwner: nil, routingWaitGeneration: nil)
+    }
+
+    private static func installPolicy(
+        _ spec: MCPBootstrapLeaseSpec, routingOwner: MCPHostRouteResources?, routingWaitGeneration: UUID?,
+        reusingProcess: MCPRunRoutingProcessRegistration? = nil
+    ) async -> MCPRunRoutingCleanupReceipt? {
+        guard let clientName = spec.clientName else { return nil }
+        return await ServerNetworkManager.shared.installClientConnectionPolicy(
             for: clientName,
             windowID: spec.windowID,
             restrictedTools: spec.restrictedTools,
@@ -1017,7 +1163,8 @@ actor MCPBootstrapLease {
             taskLabelKind: spec.taskLabelKind,
             allowsAgentExternalControlTools: spec.allowsAgentExternalControlTools,
             requiresExpectedAgentPID: spec.requiresExpectedAgentPID,
-            prunesOnlyAfterSettlement: spec.purpose == .discoverRun
+            prunesOnlyAfterSettlement: spec.purpose == .discoverRun,
+            routingOwner: routingOwner, routingWaitGeneration: routingWaitGeneration, reusingProcess: reusingProcess
         )
     }
 

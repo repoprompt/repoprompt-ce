@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentProviderContracts
 
 typealias ClaudeAttemptEventReservation = (listener: ClaudeControllerEventListener, subscription: ClaudeAttemptEventSubscription)
 
@@ -131,6 +132,8 @@ final class ClaudeAttemptEventSubscription {
 /// before terminal publication suspends; idle history is never retained.
 @MainActor
 final class ClaudeControllerEventListener {
+    /// Original controller registration, copied into a turn's terminal resources before suspension.
+    var routingCleanup: AgentSessionRuntimeHost.RunRoutingCleanup?
     var adoptionTask: Task<Void, Never>?
     private var task: Task<Void, Never>?
     private var installationID = UUID()

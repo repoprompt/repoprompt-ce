@@ -1,28 +1,10 @@
 import Foundation
+import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 
 @MainActor
 final class CodexContextUsageEstimator: ContextUsageEstimating {
     let agent: AgentProviderKind = .codexExec
-
-    @discardableResult
-    func enqueueUserTurnEstimate(
-        messageForProvider _: String,
-        session _: AgentTabSession
-    ) -> Int {
-        0
-    }
-
-    @discardableResult
-    func replaceNextQueuedUserTurnEstimate(
-        messageForProvider _: String,
-        session _: AgentTabSession
-    ) -> Int? {
-        nil
-    }
-
-    func dequeueQueuedUserTurnEstimate(session _: AgentTabSession) -> Int? {
-        nil
-    }
 
     func beginTurn(session _: AgentTabSession, initialMessage _: String) {
         // Codex uses native token usage events.

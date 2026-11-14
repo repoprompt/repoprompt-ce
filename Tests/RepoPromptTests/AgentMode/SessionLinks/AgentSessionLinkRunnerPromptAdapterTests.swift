@@ -1,5 +1,8 @@
 import Foundation
+import RepoPromptACPProviders
+import RepoPromptAIContracts
 @testable import RepoPromptApp
+@testable import RepoPromptWorkspaceContext
 import XCTest
 
 /// Headless runner adapter, driven through the real `HeadlessAgentModeRunner`.
@@ -30,7 +33,7 @@ final class AgentSessionLinkHeadlessRunnerPromptAdapterTests: XCTestCase {
 
     /// Drives the real `HeadlessAgentModeRunner` directly.
     ///
-    /// No shipping agent kind routes to this runner through `AgentModeRunService.startRun` (Codex,
+    /// No shipping agent kind routes to this runner through `AgentModeRunComposition.startRun` (Codex,
     /// Claude-compatible, and ACP kinds each go elsewhere), so constructing the runner is the only way
     /// to exercise its adapter and acceptance boundary.
     private func startRun(
@@ -40,16 +43,94 @@ final class AgentSessionLinkHeadlessRunnerPromptAdapterTests: XCTestCase {
         localComposerCandidate: UUID? = nil
     ) async {
         let runner = harness.makeHeadlessRunner()
-        await runner.startRun(
+        await harness.resources.fulfill(runner.prepareRun(
             tabID: session.tabID,
             session: session,
             initialUserMessage: message,
             initialMessageForRun: message,
             attachments: [],
             makeLease: { runID in harness.makeLease(runID: runID, tabID: session.tabID) },
+            stopFence: .init(session: session),
             localComposerCandidate: localComposerCandidate
-        )
+        ))
         await session.agentTask?.value
+    }
+
+    func testCompletedHeadlessProviderDisposalCleansOnlyItsOriginatingRegistration() async throws {
+        for replaceRegistration in [false, true] {
+            let route = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: nil)
+            let disposal = TestReleaseFence(name: "headless original provider disposal")
+            defer { disposal.release() }
+            let provider = AgentSessionLinkCapturingHeadlessProvider(
+                beforeStream: { runID in
+                    guard let runID, let generation = await MCPRoutingWaiter.generation(runID: runID) else {
+                        XCTFail("The actual runner must acquire its owned routing registration before dispatch")
+                        return
+                    }
+                    await MCPRoutingWaiter.notifyRouted(runID: runID, generation: generation)
+                },
+                onDispose: { await disposal.enterAndWait() }
+            )
+            let harness = makeHarness(provider: provider)
+            let session = harness.makeSession(agent: .openCode)
+            let barrier = AgentRunTerminalCommitBarrier()
+            let runner = HeadlessAgentModeRunner(hooks: harness.hooks, terminalCommitBarrier: barrier)
+            let request = await runner.prepareRun(
+                tabID: session.tabID, session: session,
+                initialUserMessage: "complete original run", initialMessageForRun: "complete original run",
+                attachments: [], makeLease: { runID in
+                    MCPBootstrapLease(
+                        spec: .agentMode(tabID: session.tabID, runID: runID, gateID: UUID(), windowID: route.identity.routeID, agent: .openCode),
+                        routingOwner: route
+                    )
+                }
+            )
+            let ownership = try XCTUnwrap(session.activeRunOwnership)
+            let runID = try XCTUnwrap(session.runID)
+            await harness.resources.fulfill(request)
+            await disposal.waitUntilEntered()
+            try await AsyncTestWait.waitUntil("headless terminal publication before teardown receipt") {
+                !session.terminalCommitInProgress && session.activeRunOwnership == nil
+            }
+            let terminalReceipt = try XCTUnwrap(barrier.captureTerminalTeardown(tabID: session.tabID, lifecycle: session.runLifecycle))
+            XCTAssertTrue(terminalReceipt.ownerships.contains(ownership))
+            var waiterEntered = false
+            var waiterCompleted = false
+            let waiter = Task { @MainActor in
+                waiterEntered = true
+                await terminalReceipt.waitForCompletion()
+                waiterCompleted = true
+            }
+            try await AsyncTestWait.waitUntil("original terminal receipt waiter") { waiterEntered }
+            waiter.cancel()
+            XCTAssertFalse(waiterCompleted, "Cancelling a waiter cannot acknowledge the held provider disposal")
+            let manager = ServerNetworkManager.shared
+            let originalPolicy = await manager.debugRunPolicyState(for: runID)
+            XCTAssertNotNil(originalPolicy, "Successful attempt settlement does not finish provider lifetime")
+            let successor: MCPBootstrapLease?
+            if replaceRegistration {
+                let lease = MCPBootstrapLease(
+                    spec: .agentMode(tabID: session.tabID, runID: runID, gateID: UUID(), windowID: route.identity.routeID, agent: .openCode),
+                    routingOwner: route
+                )
+                let acquired = await lease.acquire()
+                XCTAssertTrue(acquired)
+                successor = lease
+            } else {
+                successor = nil
+            }
+            disposal.release()
+            await session.agentTask?.value
+            await waiter.value
+            XCTAssertTrue(waiterCompleted)
+            XCTAssertEqual(session.runState, .completed)
+            let finalPolicy = await manager.debugRunPolicyState(for: runID)
+            XCTAssertEqual(finalPolicy != nil, replaceRegistration)
+            let messages = await provider.messages
+            XCTAssertEqual(messages.count, 1)
+            await successor?.finishOwnedProviderRouting()
+            await route.close()
+        }
     }
 
     func testLocalInputHeadlessAcceptanceAndRetainedTransportFailureSettleExactProducerOnce() async {
@@ -360,7 +441,7 @@ final class AgentSessionLinkACPRunnerPromptAdapterTests: XCTestCase {
         return url
     }
 
-    private func makeFixture(failPromptsContaining: String? = nil, bound: Bool = false) throws -> Fixture {
+    private func makeFixture(failPromptsContaining: String? = nil) throws -> Fixture {
         let workspace = try makeTemporaryDirectory()
         let scriptURL = try AgentSessionLinkACPServerScript.write(to: workspace)
         var environment: [String: String] = [:]
@@ -378,7 +459,7 @@ final class AgentSessionLinkACPRunnerPromptAdapterTests: XCTestCase {
             workspacePath: workspace.path
         )
         harnesses.append(harness)
-        let session = bound ? try harness.makeBoundSession(agent: .openCode) : harness.makeSession(agent: .openCode)
+        let session = try harness.makeBoundSession(agent: .openCode)
         let request = ACPRunRequest(
             agentKind: .openCode,
             modelString: nil,
@@ -397,9 +478,13 @@ final class AgentSessionLinkACPRunnerPromptAdapterTests: XCTestCase {
     }
 
     private func startRun(_ fixture: Fixture, message: String, localComposerCandidate: UUID? = nil) async {
-        _ = await fixture.harness.service.startRun(
+        guard let origin = try? fixture.harness.startCommand(for: fixture.session) else { XCTFail("Missing restored writer")
+            return
+        }
+        _ = await fixture.harness.composition.startRun(
             tabID: fixture.session.tabID,
             session: fixture.session,
+            origin: origin,
             initialUserMessage: message,
             initialMessageForRun: message,
             attachments: [],
@@ -431,7 +516,7 @@ final class AgentSessionLinkACPRunnerPromptAdapterTests: XCTestCase {
     }
 
     func testLocalInputRealAuthorityACPFreshReuseAndActiveSteeringPhysicalPrompts() async throws {
-        let fixture = try makeFixture(bound: true)
+        let fixture = try makeFixture()
         let input = try await AgentSessionLinkTransportLocalInputFixture.install(on: fixture.harness.host, session: fixture.session)
         fixture.harness.localInputFixture = input
         addTeardownBlock { @MainActor in await input.cleanup() }
@@ -539,15 +624,15 @@ final class AgentSessionLinkACPRunnerPromptAdapterTests: XCTestCase {
 
     // MARK: Composition point
 
-    func testMembershipChangeDuringPrepareForNextTurnIsReflectedAtDispatch() async throws {
+    func testMembershipChangeAfterMessageConstructionIsReflectedAtDispatch() async throws {
         let fixture = try makeFixture()
         fixture.harness.publishInventory(revision: 1, targetCount: 1)
         await startRun(fixture, message: "acp initial")
         XCTAssertEqual(fixture.harness.acceptedClaims.count, 1)
 
-        // Fires after the message is built and before `prepareForNextTurn()` suspends — exactly the
-        // window the old composition point sat in. Composing there would ship revision 1 (already
-        // acknowledged, so: nothing at all); composing after the suspension ships revision 2.
+        // Fires after message construction, now downstream of controller preparation. Composing
+        // next to the builder would ship revision 1 (already acknowledged, so: nothing at all);
+        // composition must still observe this later synchronous projection's revision 2.
         fixture.harness.onAttachmentsConsumed = { [weak harness = fixture.harness] in
             harness?.publishInventory(revision: 2, targetCount: 4)
             harness?.onAttachmentsConsumed = nil
@@ -563,7 +648,7 @@ final class AgentSessionLinkACPRunnerPromptAdapterTests: XCTestCase {
         )
         XCTAssertTrue(
             reused.userMessage.contains("count=\"4\""),
-            "membership added while the turn was suspended must reach the provider"
+            "membership added after message construction must reach the provider"
         )
         XCTAssertEqual(fixture.harness.acceptedClaims.count, 2)
     }
@@ -635,10 +720,10 @@ final class AgentSessionLinkACPRunnerPromptAdapterTests: XCTestCase {
         await startRun(fixture, message: "acp initial")
         let session = fixture.session
         let controller = try XCTUnwrap(session.acpController)
-        if session.persistentSessionBindingIdentity == nil {
-            session.testInstallPersistentSessionBinding(sessionID: UUID())
-        }
         let binding = try XCTUnwrap(session.persistentSessionBindingIdentity)
+        // Fresh startup now requires a real restored writer. Reinstall that scoped binding
+        // explicitly to retain this test's separate pre-restoration admission assertion.
+        session.installPersistentSessionBinding(binding)
         XCTAssertNotNil(session.operationAdmissionFailureMessage, "Installing the fixture binding does not restore it")
         // The interrupt race begins with an already restored session that can accept steering.
         session.recordRestorationAuthoritative(.persistedPayloadApplied)

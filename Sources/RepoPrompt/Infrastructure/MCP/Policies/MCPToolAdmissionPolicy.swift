@@ -8,25 +8,6 @@ typealias MCPToolOperationIdentity = RepoPromptDomainRuntime.MCPDomainToolOperat
 typealias MCPToolAdmissionDecision = RepoPromptDomainRuntime.MCPDomainPreAdmissionDecision
 typealias MCPToolSettlementResult = RepoPromptDomainRuntime.MCPToolExecutionSettlement
 
-extension MCPToolAdmissionClass {
-    var connectionLane: MCPConnectionCallLane {
-        switch self {
-        case .exclusive:
-            .ordinary
-        case .control:
-            .control
-        case .smallRead:
-            .smallRead
-        case .fileRead:
-            .fileRead
-        case .gitRead:
-            .gitRead
-        case .fileSearch:
-            .fileSearch
-        }
-    }
-}
-
 enum MCPToolAdmissionPolicy {
     static func clientPolicySnapshot(
         restricted: Set<String>,
@@ -54,23 +35,6 @@ enum MCPToolAdmissionPolicy {
             canBecomeOverseer: canBecomeOverseer,
             hasActivatedOverseer: hasActivatedOverseer
         )
-    }
-
-    /// Keep app-host admission aligned with the package-level domain limits.
-    static let exclusiveConnectionLimit = MCPDomainToolAdmissionLimits.exclusiveConnection
-    static let controlConnectionLimit = MCPDomainToolAdmissionLimits.controlConnection
-    static let smallReadConnectionLimit = MCPDomainToolAdmissionLimits.smallReadConnection
-    static let smallReadPerWindowLimit = MCPDomainToolAdmissionLimits.smallReadPerWindow
-    static let fileReadConnectionLimit = MCPDomainToolAdmissionLimits.fileReadConnection
-    static let fileReadPerWindowLimit = MCPDomainToolAdmissionLimits.fileReadPerWindow
-    static let gitReadConnectionLimit = MCPDomainToolAdmissionLimits.gitReadConnection
-    static let fileSearchConnectionLimit = MCPDomainToolAdmissionLimits.fileSearchConnection
-    static let gitReadPerRepositoryLimit = MCPDomainToolAdmissionLimits.gitReadPerRepository
-
-    static let classifications = MCPDomainToolCatalog.classifications
-
-    static func classification(forCanonicalToolName toolName: String) -> MCPToolAdmissionClass? {
-        MCPDomainToolCatalog.admissionClass(for: toolName)
     }
 
     static func operationIdentity(

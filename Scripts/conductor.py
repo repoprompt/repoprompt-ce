@@ -3580,6 +3580,7 @@ class OperationRegistry:
         "SWIFTFLAGS",
         "TMPDIR",
         "HOME",
+        "CFFIXED_USER_HOME",
         "USER",
         "LOGNAME",
         "SHELL",
@@ -3598,6 +3599,7 @@ class OperationRegistry:
         "HOMEBREW_CACHE",
     ]
     TEST_ENV_KEYS = [
+        "REPOPROMPT_RUN_INTERACTIVE_MENU_TESTS",
         "RPCE_RUN_CODEMAP_E2E",
         "RPCE_RUN_SCALE_TESTS",
         "REPOPROMPT_EXECUTION_LOCATION_UI_SMOKE_WAIT",

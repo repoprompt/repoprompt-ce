@@ -35,6 +35,7 @@ protocol SecItemClient {
     func add(_ query: CFDictionary, _ result: UnsafeMutablePointer<AnyObject?>?) -> OSStatus
     func update(_ query: CFDictionary, _ attributes: CFDictionary) -> OSStatus
     func delete(_ query: CFDictionary) -> OSStatus
+    func deleteClassicItem(_ item: AnyObject) -> OSStatus
 }
 
 struct SystemSecItemClient: SecItemClient {
@@ -52,6 +53,13 @@ struct SystemSecItemClient: SecItemClient {
 
     func delete(_ query: CFDictionary) -> OSStatus {
         SecItemDelete(query)
+    }
+
+    func deleteClassicItem(_ item: AnyObject) -> OSStatus {
+        guard CFGetTypeID(item as CFTypeRef) == SecKeychainItemGetTypeID() else {
+            return errSecParam
+        }
+        return SecKeychainItemDelete(unsafeBitCast(item, to: SecKeychainItem.self))
     }
 }
 
@@ -251,7 +259,9 @@ enum KeychainItemCreationAttributeError: Error, LocalizedError, Equatable {
 /// executable plus an embedded executable signed for the successor identity; no
 /// credential data or authorization prompt is involved in constructing this policy.
 struct TrustedApplicationCodeRequirement {
-    let trustedApplicationPath: String
+    // Documentation only, not signing authority. macOS's legacy SecItemDelete
+    // guard compares its basename with the caller's canonical application name.
+    let descriptionPath: String
     let codeURL: URL
     let requirementSource: String
 }
@@ -472,6 +482,27 @@ struct KeychainAccessAuthority {
     let creationAttributeProvider: TrustedApplicationsKeychainAttributeProvider
     let accessValidator: ClassicKeychainACLValidator
 
+    /// Both requirements represent the installed application, not the embedded
+    /// anchor's filename. Keep the anchor as the successor's code-validation URL,
+    /// while using the app bundle description expected by the legacy delete guard.
+    static func identityMigration(bundleURL: URL, anchorURL: URL) throws -> Self {
+        try Self(
+            descriptor: "RepoPrompt CE identity migration bridge",
+            applications: [
+                TrustedApplicationCodeRequirement(
+                    descriptionPath: bundleURL.path,
+                    codeURL: bundleURL,
+                    requirementSource: RuntimeCodeSigningPolicy.developerIDRequirement
+                ),
+                TrustedApplicationCodeRequirement(
+                    descriptionPath: bundleURL.path,
+                    codeURL: anchorURL,
+                    requirementSource: RuntimeCodeSigningPolicy.successorDeveloperIDRequirement
+                )
+            ]
+        )
+    }
+
     init(
         descriptor: String,
         applications: [TrustedApplicationCodeRequirement]
@@ -517,7 +548,7 @@ final class TrustedApplicationsKeychainAttributeProvider: KeychainItemCreationAt
                 requirementSource: application.requirementSource
             ) else {
                 throw KeychainItemCreationAttributeError.trustedApplicationValidationFailed(
-                    path: application.trustedApplicationPath
+                    path: application.codeURL.path
                 )
             }
             guard let requirement = RuntimeCodeSigningDetector.requirement(
@@ -526,7 +557,7 @@ final class TrustedApplicationsKeychainAttributeProvider: KeychainItemCreationAt
                 throw KeychainACLValidationError.invalidExpectedPrincipalPolicy
             }
             var trustedApplication: SecTrustedApplication?
-            let status = application.trustedApplicationPath.withCString { description in
+            let status = application.descriptionPath.withCString { description in
                 SecTrustedApplicationCreateFromRequirementSPI(
                     description,
                     requirement,
@@ -535,7 +566,7 @@ final class TrustedApplicationsKeychainAttributeProvider: KeychainItemCreationAt
             }
             guard status == errSecSuccess, let trustedApplication else {
                 throw KeychainItemCreationAttributeError.trustedApplicationCreationFailed(
-                    path: application.trustedApplicationPath,
+                    path: application.codeURL.path,
                     status: status
                 )
             }
@@ -544,7 +575,7 @@ final class TrustedApplicationsKeychainAttributeProvider: KeychainItemCreationAt
                 requirementSource: application.requirementSource
             ) else {
                 throw KeychainItemCreationAttributeError.trustedApplicationValidationFailed(
-                    path: application.trustedApplicationPath
+                    path: application.codeURL.path
                 )
             }
             trustedApplications.append(trustedApplication)
@@ -712,11 +743,22 @@ package final class KeychainService: SecureKeyValueStorageBackend, @unchecked Se
         return query
     }
 
+    @discardableResult
     private func validateExistingItem(
         for key: String,
         accessMode: KeychainAccessMode
-    ) throws {
-        guard let itemAccessValidator else { return }
+    ) throws -> AnyObject? {
+        guard let itemAccessValidator else { return nil }
+        let item = try lookupItemReference(for: key, accessMode: accessMode)
+        let access = try itemAccessProvider.copyAccess(from: item)
+        try itemAccessValidator.validate(access)
+        return item
+    }
+
+    private func lookupItemReference(
+        for key: String,
+        accessMode: KeychainAccessMode
+    ) throws -> AnyObject {
         let referenceQuery = query([
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: serviceName,
@@ -732,8 +774,7 @@ package final class KeychainService: SecureKeyValueStorageBackend, @unchecked Se
         guard let result else {
             throw KeychainItemAccessProviderError.invalidItemReference
         }
-        let access = try itemAccessProvider.copyAccess(from: result)
-        try itemAccessValidator.validate(access)
+        return result
     }
 
     private func keychainError(for status: OSStatus) -> KeychainError {
@@ -748,6 +789,8 @@ package final class KeychainService: SecureKeyValueStorageBackend, @unchecked Se
             .userInteractionCancelled
         case errSecAuthFailed:
             .authenticationFailed
+        case errSecInvalidOwnerEdit:
+            .invalidOwnerEdit
         default:
             .unexpectedStatus(status)
         }
@@ -760,6 +803,8 @@ package final class KeychainService: SecureKeyValueStorageBackend, @unchecked Se
         case interactionNotAllowed
         case userInteractionCancelled
         case authenticationFailed
+        case invalidOwnerEdit
+        case deletionNotConfirmed
         case unexpectedStatus(OSStatus)
 
         package var errorDescription: String? {
@@ -776,8 +821,21 @@ package final class KeychainService: SecureKeyValueStorageBackend, @unchecked Se
                 "Keychain interaction was cancelled"
             case .authenticationFailed:
                 "Keychain authentication failed"
+            case .invalidOwnerEdit:
+                "macOS rejected this Keychain item's ownership metadata (status -25244)."
+            case .deletionNotConfirmed:
+                "Credential removal could not be confirmed because a matching Keychain item still exists."
             case let .unexpectedStatus(status):
                 "Keychain error: \(status)"
+            }
+        }
+
+        package var recoverySuggestion: String? {
+            switch self {
+            case .invalidOwnerEdit, .deletionNotConfirmed:
+                "Retry the operation in the current official RepoPrompt CE app. If you intend to remove the credential and deletion still fails, use Keychain Access to verify its Account and Where fields before deleting only that credential. Do not delete migration journal or manifest items, reset the Keychain, or allow all applications. If the active item is unclear, contact support."
+            default:
+                nil
             }
         }
     }
@@ -916,12 +974,11 @@ package final class KeychainService: SecureKeyValueStorageBackend, @unchecked Se
     /// Delete an item from this service only.
     package func delete(for key: String, accessMode: KeychainAccessMode = .interactive) throws {
         try withLock {
-            if itemAccessValidator != nil {
-                do {
-                    try validateExistingItem(for: key, accessMode: accessMode)
-                } catch KeychainError.itemNotFound {
-                    return
-                }
+            let validatedItem: AnyObject?
+            do {
+                validatedItem = try validateExistingItem(for: key, accessMode: accessMode)
+            } catch KeychainError.itemNotFound {
+                return
             }
             let itemQuery = query([
                 kSecClass as String: kSecClassGenericPassword,
@@ -930,9 +987,40 @@ package final class KeychainService: SecureKeyValueStorageBackend, @unchecked Se
             ], accessMode: accessMode)
 
             let status = secItemClient.delete(itemQuery as CFDictionary)
-            guard status == errSecSuccess || status == errSecItemNotFound else {
+            if status == errSecSuccess || status == errSecItemNotFound { return }
+
+            // SecItemDelete's classic-password safety guard compares descriptive
+            // basenames, not code requirements. Older migration ACLs described the
+            // executable/anchor instead of the app bundle, producing -25244.
+            // Recover only for an interactive operation on an authenticated item.
+            // SecKeychainItemDelete still enforces Keychain authorization; it has
+            // no per-call UI-skip option, so never use it for background operations.
+            guard status == errSecInvalidOwnerEdit,
+                  !accessMode.isNonInteractive,
+                  let validatedItem,
+                  let itemAccessValidator
+            else {
                 throw keychainError(for: status)
             }
+            let access = try itemAccessProvider.copyAccess(from: validatedItem)
+            try itemAccessValidator.validate(access)
+            let recoveryStatus = secItemClient.deleteClassicItem(validatedItem)
+            guard recoveryStatus == errSecSuccess
+                || recoveryStatus == errSecItemNotFound
+                || recoveryStatus == errSecInvalidItemRef
+            else {
+                throw keychainError(for: recoveryStatus)
+            }
+
+            // Never follow a replacement item with another delete. The held
+            // reference may have become stale, or another matching item may remain.
+            // Confirm absence without reading any value before clearing UI state.
+            do {
+                _ = try lookupItemReference(for: key, accessMode: accessMode)
+            } catch KeychainError.itemNotFound {
+                return
+            }
+            throw KeychainError.deletionNotConfirmed
         }
     }
 }

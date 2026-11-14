@@ -5,6 +5,7 @@ import RepoPromptFileSystem
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
 import RepoPromptShared
+@testable import RepoPromptWorkspaceContext
 import XCTest
 
 #if DEBUG
@@ -13,6 +14,7 @@ import XCTest
         private var originalMCPAutoStart = false
         private var originalStoragePath: String?
         private var storageRoot: URL!
+        private var fixtureStorage: WorkspaceFixtureStorage!
         private var managers: [WorkspaceManagerViewModel] = []
 
         override func setUp() async throws {
@@ -25,6 +27,7 @@ import XCTest
             storageRoot = AppProfileLocations.current.customWorkspaceDirectory(selectedDirectory: storageRoot)
             try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
             UserDefaults.standard.set(storageRoot.path, forKey: "GlobalCustomStorageURL")
+            fixtureStorage = WorkspaceFixtureStorage(root: storageRoot)
             await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()
         }
 
@@ -32,6 +35,8 @@ import XCTest
             managers.forEach { $0.prepareForWindowClose() }
             managers.removeAll()
             await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()
+            await fixtureStorage.remove()
+            fixtureStorage = nil
             try? FileManager.default.removeItem(at: storageRoot)
             if let originalStoragePath {
                 UserDefaults.standard.set(originalStoragePath, forKey: "GlobalCustomStorageURL")
@@ -86,6 +91,196 @@ import XCTest
             manager.activeWorkspace = second
             XCTAssertEqual(manager.agentSessionLifecycleTabs(workspaceID: second.id, sessionID: sessionID), [laterTab, sharedTab])
             XCTAssertEqual(manager.workspaces.map(\.id), [first.id, second.id])
+        }
+
+        func testStoredOnlySelectionPublishesOnceWithoutCarrierMaintenanceAndPersists() async throws {
+            var tab = ComposeTabState(name: "Stored target", activeAgentSessionID: UUID())
+            tab.lastModified = .distantPast
+            let seed = WorkspaceModel(dateModified: .distantPast, name: "Stored owner", repoPaths: [], composeTabs: [tab], activeComposeTabID: tab.id)
+            try writeWorkspace(seed)
+            try writeLegacyIndex([seed])
+            let manager = makeManager(windowID: -17850)
+            await manager.awaitInitialized()
+            let before = try XCTUnwrap(manager.workspace(withID: seed.id))
+            let originalTab = try XCTUnwrap(before.composeTabs.first)
+            let dirty = manager.debugStateVersionForWorkspace(seed.id)
+            let revision = manager.selectionRevisionForMCP(workspaceID: seed.id, tabID: tab.id)
+            let rebuilds = manager.test_sessionCarrierIndexRebuildCount
+            manager.test_sessionCarrierIndexMaintenanceRowsVisited = 0
+            var publications = 0
+            let subscription = manager.$workspaces.dropFirst().sink { _ in publications += 1 }
+            var update = originalTab
+            update.selection = StoredSelection(selectedPaths: ["/stored/README.md"])
+            XCTAssertTrue(manager.updateComposeTabStoredOnly(update, inWorkspaceID: seed.id))
+            let stored = try XCTUnwrap(manager.workspace(withID: seed.id))
+            XCTAssertEqual(publications, 1)
+            XCTAssertEqual(manager.test_sessionCarrierIndexRebuildCount, rebuilds)
+            XCTAssertEqual(manager.test_sessionCarrierIndexMaintenanceRowsVisited, 0)
+            XCTAssertGreaterThan(stored.composeTabs[0].lastModified, originalTab.lastModified)
+            XCTAssertGreaterThan(stored.dateModified, before.dateModified)
+            XCTAssertGreaterThan(manager.debugStateVersionForWorkspace(seed.id), dirty)
+            let committedRevision = manager.selectionRevisionForMCP(workspaceID: seed.id, tabID: tab.id)
+            XCTAssertGreaterThan(committedRevision, revision)
+            XCTAssertEqual(try manager.sessionCarriers(sessionIDs: [XCTUnwrap(tab.activeAgentSessionID)]).map(\.tab), stored.composeTabs)
+            // An equal selection/tab is a true no-op, including timestamps, dirty state and revision.
+            let storedDirty = manager.debugStateVersionForWorkspace(seed.id)
+            XCTAssertTrue(manager.updateComposeTabStoredOnly(stored.composeTabs[0], inWorkspaceID: seed.id))
+            XCTAssertEqual(publications, 1)
+            XCTAssertEqual(manager.workspace(withID: seed.id), stored)
+            XCTAssertEqual(manager.debugStateVersionForWorkspace(seed.id), storedDirty)
+            XCTAssertEqual(manager.selectionRevisionForMCP(workspaceID: seed.id, tabID: tab.id), committedRevision)
+            subscription.cancel()
+            let url = try await manager.saveWorkspaceToFileAsync(stored, preserveDiskRepoPathsIfUnchangedSinceBaseline: false)
+            await manager.workspaceDiskWriter.flush(url: url)
+            let disk = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: url))
+            XCTAssertEqual(disk.composeTabs, stored.composeTabs)
+            XCTAssertEqual(disk.dateModified, stored.dateModified)
+            XCTAssertEqual(manager.selectionRevisionForMCP(workspaceID: seed.id, tabID: tab.id), committedRevision)
+            // A fresh manager restores the changed canonical selection, not a stale UI snapshot.
+            let restored = makeManager(windowID: -17851)
+            XCTAssertEqual(restored.workspace(withID: seed.id)?.composeTabs, stored.composeTabs)
+        }
+
+        func testStoredOnlyIdentityChangeWithEqualSelectionRebuildsAndContentChangeStillWrites() async throws {
+            let manager = makeManager(windowID: -17852)
+            await manager.awaitInitialized()
+            let tab = ComposeTabState(name: "Old identity", activeAgentSessionID: UUID())
+            let workspace = WorkspaceModel(name: "Identity owner", repoPaths: [], ephemeralFlag: true, composeTabs: [tab])
+            manager.workspaces = [workspace]
+            var publications = 0
+            let subscription = manager.$workspaces.dropFirst().sink { _ in publications += 1 }
+            let rebuilds = manager.test_sessionCarrierIndexRebuildCount
+            var update = tab
+            update.activeAgentSessionID = UUID()
+            XCTAssertTrue(manager.updateComposeTabStoredOnly(update, inWorkspaceID: workspace.id))
+            XCTAssertEqual(publications, 1)
+            XCTAssertEqual(manager.test_sessionCarrierIndexRebuildCount, rebuilds + 1)
+            XCTAssertTrue(try manager.sessionCarriers(sessionIDs: [XCTUnwrap(tab.activeAgentSessionID)]).isEmpty)
+            XCTAssertEqual(try manager.sessionCarriers(sessionIDs: [XCTUnwrap(update.activeAgentSessionID)]).map(\.tab.id), [tab.id])
+            XCTAssertNil(try manager.agentSessionLifecycleWorkspaceID(tabID: tab.id, sessionID: XCTUnwrap(tab.activeAgentSessionID)))
+            XCTAssertEqual(try manager.agentSessionLifecycleWorkspaceID(tabID: tab.id, sessionID: XCTUnwrap(update.activeAgentSessionID)), workspace.id)
+            XCTAssertEqual(manager.selectionRevisionForMCP(workspaceID: workspace.id, tabID: tab.id), 0)
+            update = try XCTUnwrap(manager.workspaces.first?.composeTabs.first)
+            update.promptText = "Content changes also survive an equal selection"
+            XCTAssertTrue(manager.updateComposeTabStoredOnly(update, inWorkspaceID: workspace.id))
+            XCTAssertEqual(publications, 2)
+            XCTAssertEqual(manager.test_sessionCarrierIndexRebuildCount, rebuilds + 1)
+            XCTAssertEqual(manager.workspaces[0].composeTabs[0].promptText, update.promptText)
+            subscription.cancel()
+        }
+
+        func testStoredOnlyDuplicateRoutesKeepFirstMatchAndGenericMaintenance() async {
+            let manager = makeManager(windowID: -17853)
+            await manager.awaitInitialized()
+            let tab = ComposeTabState(name: "First", activeAgentSessionID: UUID())
+            var duplicateTab = tab
+            duplicateTab.name = "Later tab"
+            let first = WorkspaceModel(name: "First workspace", repoPaths: [], ephemeralFlag: true, composeTabs: [tab, duplicateTab])
+            var duplicateWorkspace = first
+            duplicateWorkspace.name = "Later workspace"
+            let other = WorkspaceModel(name: "Other workspace", repoPaths: [], ephemeralFlag: true, composeTabs: [duplicateTab])
+            for models in [[first, other], [first, duplicateWorkspace]] {
+                manager.workspaces = models
+                let rebuilds = manager.test_sessionCarrierIndexRebuildCount
+                var publications = 0
+                let subscription = manager.$workspaces.dropFirst().sink { _ in publications += 1 }
+                var update = tab
+                update.selection = StoredSelection(selectedPaths: ["/first-match"])
+                manager.updateComposeTabStoredOnly(update)
+                XCTAssertEqual(publications, 1)
+                XCTAssertEqual(manager.test_sessionCarrierIndexRebuildCount, rebuilds + 1)
+                XCTAssertEqual(manager.workspaces[0].composeTabs[0].selection, update.selection)
+                XCTAssertEqual(manager.workspaces[0].composeTabs[1], duplicateTab)
+                XCTAssertEqual(manager.workspaces[1], models[1])
+                XCTAssertFalse(manager.updateComposeTabStoredOnly(update, inWorkspaceID: UUID()))
+                var missingTab = ComposeTabState(name: "Missing")
+                missingTab.selection = update.selection
+                XCTAssertFalse(manager.updateComposeTabStoredOnly(missingTab, inWorkspaceID: first.id))
+                XCTAssertEqual(publications, 1)
+                subscription.cancel()
+            }
+        }
+
+        func testStoredOnlyPeerStressKeepsEqualStaleClosedAndReplacedHostsWriteFree() async {
+            let source = makeManager(windowID: -17854)
+            await source.awaitInitialized()
+            let models = (0 ..< 4).map { workspace in
+                WorkspaceModel(
+                    name: "Stress \(workspace)", repoPaths: [], ephemeralFlag: true,
+                    composeTabs: (0 ..< 250).map { ComposeTabState(name: "Tab \(workspace)-\($0)", activeAgentSessionID: UUID()) }
+                )
+            }
+            let target = models[0].composeTabs[0]
+            let identity = WorkspaceSelectionIdentity(workspaceID: models[0].id, tabID: target.id)
+            source.workspaces = models
+            let windows = (0 ..< 7).map { _ in WindowState(automaticProviderModelDiscoveryEnabled: false) }
+            let previousWindows = WindowStatesManager.shared.allWindows
+            addTeardownBlock { @MainActor in
+                WindowStatesManager.shared.allWindows = previousWindows
+                for window in windows {
+                    await window.tearDown()
+                }
+            }
+            for window in windows {
+                await window.workspaceManager.awaitInitialized()
+                window.workspaceManager.workspaces = models
+                window.workspaceManager.activeWorkspace = nil
+            }
+            let peers = Array(windows.prefix(5))
+            let unrelated = windows[5]
+            unrelated.workspaceManager.workspaces = [WorkspaceModel(name: "Unrelated", repoPaths: [], ephemeralFlag: true)]
+            let unrelatedBaseline = unrelated.workspaceManager.workspaces
+            let replacement = windows[6]
+            WindowStatesManager.shared.allWindows = peers + [unrelated]
+            let observed = [source] + windows.map(\.workspaceManager)
+            let rebuilds = observed.map(\.test_sessionCarrierIndexRebuildCount)
+            var publications = Array(repeating: 0, count: observed.count)
+            let subscriptions = observed.enumerated().map { index, manager in
+                manager.test_sessionCarrierIndexMaintenanceRowsVisited = 0
+                return manager.$workspaces.dropFirst().sink { _ in publications[index] += 1 }
+            }
+            defer { subscriptions.forEach { $0.cancel() } }
+            let selection = StoredSelection(selectedPaths: (0 ..< 500).map { "/stress/File\($0).swift" })
+            func propagation(_ selection: StoredSelection) -> MCPSelectionPeerPropagation {
+                let registration = source.registerMCPSelectionSourceMutation(for: identity)
+                return MCPSelectionPeerPropagation(
+                    identity: identity, selection: selection, sourceRevision: registration.sourceRevision,
+                    peerHostIDs: registration.peerHostIDs, mirrorToUIIfActive: false
+                )
+            }
+            let first = propagation(selection)
+            var update = target
+            update.selection = selection
+            XCTAssertTrue(source.updateComposeTabStoredOnly(update, inWorkspaceID: identity.workspaceID))
+            await source.propagateMCPSelectionToPeerHosts(first)
+            XCTAssertEqual(publications, [1, 1, 1, 1, 1, 1, 0, 0])
+            for peer in peers {
+                XCTAssertEqual(peer.workspaceManager.composeTab(for: identity)?.selection, selection)
+                XCTAssertGreaterThan(peer.workspaceManager.committedSelectionRevision(for: identity), 0)
+                XCTAssertEqual(Array(peer.workspaceManager.workspaces.dropFirst()), Array(models.dropFirst()))
+            }
+            // Newer equal propagation still converges, without touching canonical storage.
+            await source.propagateMCPSelectionToPeerHosts(propagation(selection))
+            XCTAssertEqual(publications, [1, 1, 1, 1, 1, 1, 0, 0])
+            let nextSelection = StoredSelection(selectedPaths: selection.selectedPaths + ["/stress/New.swift"])
+            let next = propagation(nextSelection)
+            // Capture host generations first, then close one and replace another with the same document.
+            peers[3].beginClose()
+            WindowStatesManager.shared.allWindows = Array(peers.prefix(4)) + [replacement, unrelated]
+            let revisions = peers.map { $0.workspaceManager.committedSelectionRevision(for: identity) }
+            await source.propagateMCPSelectionToPeerHosts(next)
+            await source.propagateMCPSelectionToPeerHosts(first) // Delayed older work cannot roll back peers.
+            XCTAssertEqual(publications, [1, 2, 2, 2, 1, 1, 0, 0])
+            for (index, peer) in peers.enumerated() {
+                XCTAssertEqual(peer.workspaceManager.composeTab(for: identity)?.selection, index < 3 ? nextSelection : selection)
+                let revision = peer.workspaceManager.committedSelectionRevision(for: identity)
+                if index < 3 { XCTAssertGreaterThan(revision, revisions[index]) }
+                else { XCTAssertEqual(revision, revisions[index]) }
+            }
+            XCTAssertEqual(replacement.workspaceManager.composeTab(for: identity)?.selection, target.selection)
+            XCTAssertEqual(observed.map(\.test_sessionCarrierIndexRebuildCount), rebuilds)
+            XCTAssertEqual(observed.map(\.test_sessionCarrierIndexMaintenanceRowsVisited), Array(repeating: 0, count: observed.count))
+            XCTAssertEqual(unrelated.workspaceManager.workspaces, unrelatedBaseline)
         }
 
         func testDirectTabSwitchPreservesDraftAndPersistsSelectionWithoutUnrelatedCarrierRebuilds() async throws {
@@ -347,6 +542,107 @@ import XCTest
             XCTAssertFalse(saved.isTemporaryWorkspace)
         }
 
+        func testEphemeralActivationAndTeardownCreatesNoWorkspaceStorage() async throws {
+            let window = WindowState(automaticProviderModelDiscoveryEnabled: false)
+            addTeardownBlock { @MainActor in
+                if !window.isClosing { await window.tearDown() }
+            }
+            await window.workspaceManager.awaitInitialized()
+            await window.workspaceManager.awaitInitialWorkspaceActivationCompletion()
+            await window.workspaceManager.debugDrainScheduledSaves()
+            let before = try Set(FileManager.default.contentsOfDirectory(atPath: storageRoot.path))
+            let workspace = fixtureStorage.isolate(window.workspaceManager.createEphemeralWorkspace(
+                name: "Ephemeral storage regression", repoPaths: []
+            ), in: window.workspaceManager)
+            let scratch = window.workspaceManager.workspaceDirectory(for: workspace)
+            let result = await window.workspaceManager.switchWorkspace(to: workspace, saveState: false)
+            XCTAssertTrue(result.didSwitch)
+            let agentRows = try await AgentSessionDataService.shared.sidebarStreamMetadataRecords(for: workspace)
+            let chatRows = try await ChatDataService().listChatSessions(for: workspace)
+            XCTAssertTrue(agentRows.isEmpty)
+            XCTAssertTrue(chatRows.isEmpty)
+            window.beginClose()
+            await window.tearDown()
+            await window.workspaceManager.debugDrainScheduledSaves()
+            let after = try Set(FileManager.default.contentsOfDirectory(atPath: storageRoot.path))
+            XCTAssertEqual(after, before, "Activation/teardown must not add any profile workspace folder")
+            // Activation can legitimately capture git data in scratch. History reads must still
+            // be non-creating, and none of those transient artifacts may reach the profile root.
+            for component in ["AgentSessions", "Chats", "workspace.json"] {
+                XCTAssertFalse(FileManager.default.fileExists(atPath: scratch.appendingPathComponent(component).path))
+            }
+        }
+
+        func testEphemeralSessionSidecarsStayTemporaryAndReadableAcrossProjections() async throws {
+            let workspace = fixtureStorage.isolate(WorkspaceModel(
+                name: "Ephemeral with real history", repoPaths: [], ephemeralFlag: true
+            ))
+            let scratch = WorkspaceEphemeralStorage.directory(for: workspace.id)
+            let agent = AgentSession(workspaceID: workspace.id, name: "Agent scratch", autoEditEnabled: false)
+            let agents = AgentSessionDataService.shared
+            let chatService = ChatDataService()
+            let emptyAgents = try await agents.sidebarStreamMetadataRecords(for: workspace)
+            let emptyChats = try await chatService.listChatSessions(for: workspace)
+            XCTAssertTrue(emptyAgents.isEmpty)
+            XCTAssertTrue(emptyChats.isEmpty)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: scratch.path), "History reads alone must not create scratch")
+            let agentURL = try await agents.saveAgentSession(agent, for: workspace)
+            let chat = ChatSession(name: "Chat scratch", messages: [])
+            let chatURL = try await chatService.saveChatSession(chat, for: workspace)
+            XCTAssertEqual(agentURL.deletingLastPathComponent().deletingLastPathComponent(), scratch)
+            XCTAssertEqual(chatURL.deletingLastPathComponent().deletingLastPathComponent(), scratch)
+            XCTAssertFalse(try FileManager.default.fileExists(atPath: XCTUnwrap(workspace.customStoragePath).path))
+            XCTAssertTrue(scratch.resolvingSymlinksInPath().pathComponents.starts(
+                with: FileManager.default.temporaryDirectory.resolvingSymlinksInPath().pathComponents
+            ))
+
+            // A separately constructed same-ID projection and a rename must retain in-process history.
+            let projection = WorkspaceModel(id: workspace.id, name: "Renamed", repoPaths: [], ephemeralFlag: true)
+            let restored = try await agents.loadAgentSession(id: agent.id, for: projection)
+            let chats = try await chatService.listChatSessions(for: projection)
+            let restoredChat = try await chatService.loadChatSession(from: chatURL)
+            XCTAssertEqual(restored?.id, agent.id)
+            XCTAssertEqual(
+                chats.map { $0.resolvingSymlinksInPath().standardizedFileURL },
+                [chatURL.resolvingSymlinksInPath().standardizedFileURL]
+            )
+            XCTAssertEqual(restoredChat.id, chat.id)
+            await fixtureStorage.remove()
+            XCTAssertFalse(FileManager.default.fileExists(atPath: scratch.path))
+        }
+
+        func testEmptyDurableHistoryReadsAndDeletesDoNotCreateSidecars() async throws {
+            let workspace = fixtureStorage.isolate(WorkspaceModel(name: "No saved history", repoPaths: []))
+            let directory = try XCTUnwrap(workspace.customStoragePath)
+            let agents = AgentSessionDataService.shared
+            let files = try await agents.listAgentSessions(for: workspace)
+            let rows = try await agents.indexedAgentSessionMetadataRecords(for: workspace)
+            let sidebarRows = try await agents.sidebarStreamMetadataRecords(for: workspace)
+            let fastRows = try await agents.fastMetadataRecordsIfAvailable(for: workspace)
+            let missing = try await agents.loadAgentSession(id: UUID(), for: workspace)
+            let chats = try await ChatDataService().listChatSessions(for: workspace)
+            let missingSessionID = UUID()
+            try await agents.deleteAgentSession(id: missingSessionID, for: workspace)
+            let tombstones = await agents.deletedSessionFileURLs
+            XCTAssertTrue(
+                tombstones.contains(
+                    directory
+                        .appendingPathComponent("AgentSessions")
+                        .appendingPathComponent("AgentSession-\(missingSessionID.uuidString).json").standardizedFileURL
+                ),
+                "Absent-file deletion must still fence a concurrent first save"
+            )
+            let failures = await agents.deleteAgentSessions(forComposeTabIDs: [UUID()], for: workspace)
+            XCTAssertTrue(files.isEmpty)
+            XCTAssertTrue(rows.isEmpty)
+            XCTAssertTrue(sidebarRows.isEmpty)
+            XCTAssertNil(fastRows)
+            XCTAssertNil(missing)
+            XCTAssertTrue(chats.isEmpty)
+            XCTAssertTrue(failures.isEmpty)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+        }
+
         func testExplicitSaveAPIsRejectEphemeralWorkspaceWithoutSideEffects() async throws {
             let manager = makeManager(windowID: -772)
             await manager.awaitInitialized()
@@ -417,7 +713,9 @@ import XCTest
             )
 
             func materializeLocalArtifacts(for workspace: WorkspaceModel) throws -> URL {
-                let directory = manager.workspaceFileURL(for: workspace).deletingLastPathComponent()
+                // Git data is a sidecar, not a legacy workspace document. Keep this fixture
+                // on the production sidecar path even for an ephemeral document identity.
+                let directory = manager.workspaceDirectory(for: workspace)
                 let gitData = directory.appendingPathComponent("_git_data", isDirectory: true)
                 try FileManager.default.createDirectory(at: gitData, withIntermediateDirectories: true)
                 try Data("artifact".utf8).write(to: gitData.appendingPathComponent("marker"))
@@ -1219,23 +1517,54 @@ import XCTest
         }
 
         func testSaveCaptureIncludesBeforeSaveEditsBeforeDecidingItIsUnchanged() async throws {
+            let flushedText = "Pending editor text flushed by its owner"
+            let observed = expectation(description: "real deferred prompt observation completed")
+            let observationGate = WorkspaceDeleteSuspensionGate()
             try await withProjectionSaveFixture { fixture in
                 let manager = fixture.manager
                 let baseline = try await self.establishActiveCaptureBaseline(fixture)
+                let workspaceID = baseline.id
+                // Hold after the save captures its version, not before the capture. The real
+                // observation must finish before prepared bytes can authorize the write.
+                manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { id, _, _ in
+                    guard id == workspaceID else { return }
+                    await observationGate.wait()
+                }
+                var conflicts: [[String: String]] = []
+                manager.setWorkspaceSaveConflictHandlerForTesting { conflicts.append($0) }
+                manager.deferredPromptObservationDidFinishForTesting = { text in
+                    guard text == flushedText else { return }
+                    observed.fulfill()
+                    Task { await observationGate.open() }
+                }
                 var callbackCount = 0
                 let listener = manager.addBeforeSaveListener { workspace in
                     XCTAssertEqual(workspace.id, baseline.id)
                     callbackCount += 1
-                    manager.promptViewModel.promptText = "Pending editor text flushed by its owner"
+                    manager.promptViewModel.promptText = flushedText
                 }
-                defer { manager.removeBeforeSaveListener(listener) }
+                defer {
+                    manager.removeBeforeSaveListener(listener)
+                    manager.deferredPromptObservationDidFinishForTesting = nil
+                    manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil)
+                    manager.setWorkspaceSaveConflictHandlerForTesting(nil)
+                    Task { await observationGate.open() }
+                }
                 manager.markWorkspaceDirty(workspaceID: baseline.id)
                 manager.resetWorkspaceSaveDiagnosticsForTesting()
 
-                let result = await manager.pollAndSaveStateWithOutcomeAsync()
+                let saving = Task { await manager.pollAndSaveStateWithOutcomeAsync() }
+                do {
+                    try await self.awaitSaveCheckpoint(observed)
+                } catch {
+                    await observationGate.open()
+                    _ = await saving.value
+                    throw error
+                }
+                let result = await saving.value
 
                 XCTAssertTrue(result.acceptedForLifecycleAdmission, "\(result)")
-                XCTAssertEqual(callbackCount, 1)
+                XCTAssertEqual(callbackCount, 1, "Value-only save conflicts: \(conflicts)")
                 let afterValue = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(baseline.id)
                 let after = try XCTUnwrap(afterValue)
                 let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: after.document.documentBytes)
@@ -2341,7 +2670,7 @@ import XCTest
         }
 
         private func leakedFixtureWorkspace(id: UUID = UUID()) -> WorkspaceModel {
-            WorkspaceModel(
+            fixtureStorage.track(WorkspaceModel(
                 id: id,
                 name: "Agent Mode Chat Switch \(UUID().uuidString.prefix(8))",
                 repoPaths: [
@@ -2351,11 +2680,11 @@ import XCTest
                         .path
                 ],
                 ephemeralFlag: true
-            )
+            ))
         }
 
         private func persistentReadFixtureWorkspace(id: UUID = UUID()) -> WorkspaceModel {
-            WorkspaceModel(
+            fixtureStorage.track(WorkspaceModel(
                 id: id,
                 name: "Persistent Agent Mode MCP Read",
                 repoPaths: [
@@ -2365,7 +2694,7 @@ import XCTest
                         .path
                 ],
                 ephemeralFlag: true
-            )
+            ))
         }
 
         private func makeRuntime(profileIdentifier: String) async throws -> MCPDomainRuntime {
@@ -2526,14 +2855,38 @@ import XCTest
 
     /// The custom-storage preference read seam: the value a test process inherited from a killed run
     /// never pins this run's workspace store, while values the run's own fixtures set and every product
-    /// launch are unchanged. Test defaults use a volatile domain, so nothing is persisted.
+    /// launch are unchanged. Read-only test defaults never publish fixture paths process-wide.
     final class WorkspaceStoragePreferenceTests: XCTestCase {
+        private final class StorageDefaults: UserDefaults, @unchecked Sendable {
+            private let storedPath: String?
+
+            init(path: String?) {
+                storedPath = path
+                super.init(suiteName: "workspace-storage-preference-\(UUID().uuidString)")!
+            }
+
+            override func string(forKey defaultName: String) -> String? {
+                defaultName == WorkspaceStoragePreference.key ? storedPath : super.string(forKey: defaultName)
+            }
+        }
+
         private func defaults(storing path: String?) -> UserDefaults {
-            let defaults = UserDefaults(suiteName: "workspace-storage-preference-\(UUID().uuidString)")!
-            defaults.setVolatileDomain(
-                path.map { [WorkspaceStoragePreference.key: $0] } ?? [:], forName: UserDefaults.argumentDomain
-            )
-            return defaults
+            // NSArgumentDomain is shared even by named suites. Publishing synthetic storage paths
+            // there can redirect unrelated live workspace tasks while this fixture is alive.
+            StorageDefaults(path: path)
+        }
+
+        func testFixtureDefaultsDoNotChangeArgumentDomain() {
+            let original = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain) as NSDictionary
+            for path in [stale, nil] {
+                withExtendedLifetime(defaults(storing: path)) {
+                    XCTAssertEqual(
+                        UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain) as NSDictionary,
+                        original,
+                        "Fixture defaults must not replace or clear the process-wide argument domain"
+                    )
+                }
+            }
         }
 
         private let stale = "/var/folders/x/T/rpce-local-tests-gone/25bf8e1a2393f110/new-window-selection-1/Workspaces"

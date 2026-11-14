@@ -35,6 +35,7 @@ enum MCPAppToolCatalogMaterializationError: Error, Equatable, CustomStringConver
 final class MCPAppToolCatalogRegistration: WindowScopedService {
     let domainRegistrationID = MCPDomainToolRegistrationID()
     let windowID: Int
+    let runRouting: MCPHostRouteResources.RunRouting?
 
     private let providers: [any MCPAppToolProviding]
     private let sharedBindings: [MCPDomainToolBinding]
@@ -49,17 +50,59 @@ final class MCPAppToolCatalogRegistration: WindowScopedService {
         providers: [any MCPAppToolProviding],
         sharedBindings: [MCPDomainToolBinding] = [],
         runtime: MCPAppToolBinder,
-        requiredToolNames: Set<String> = Set(MCPAppToolGroup.orderedToolNames)
+        requiredToolNames: Set<String> = Set(MCPAppToolGroup.orderedToolNames),
+        runRouting: MCPHostRouteResources.RunRouting? = nil
     ) {
         #if DEBUG || EDIT_FLOW_PERF
             let constructionState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPWindowToolCatalog.construction)
             defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPWindowToolCatalog.construction, constructionState) }
         #endif
         self.windowID = windowID
+        self.runRouting = runRouting
         self.providers = providers
         self.sharedBindings = sharedBindings
         self.runtime = runtime
         self.requiredToolNames = requiredToolNames
+    }
+
+    /// One complete app catalog for either a physical presentation or an executable host route.
+    /// The binder and all capabilities are supplied by that route's composition owner.
+    convenience init(
+        windowID: Int,
+        runtime: MCPAppToolBinder,
+        context: MCPAppPhysicalCapabilityAdapters.Context,
+        selection: MCPAppPhysicalCapabilityAdapters.Selection,
+        files: MCPAppPhysicalCapabilityAdapters.Files,
+        execution: MCPAppPhysicalCapabilityAdapters.Execution,
+        fileProvider: MCPFileToolProvider,
+        oracleProvider: MCPOracleToolProvider,
+        sharedBindings: [MCPDomainToolBinding],
+        resolveSpawnParentSessionID: @escaping AgentSessionTargetOperationGuard.SpawnParentSessionResolver,
+        resolveObserverEndpoint: @escaping AgentSessionTargetOperationGuard.ObserverEndpointResolver,
+        runRouting: MCPHostRouteResources.RunRouting? = nil
+    ) {
+        self.init(
+            windowID: windowID,
+            providers: [
+                MCPSelectionToolProvider(runtime: runtime, context: context, selection: selection, files: files),
+                fileProvider,
+                MCPApplyEditsToolProvider(runtime: runtime, context: context, selection: selection),
+                oracleProvider,
+                MCPWorktreeToolProvider(
+                    runtime: runtime, execution: execution, context: context, selection: selection,
+                    resolveSpawnParentSessionID: resolveSpawnParentSessionID,
+                    resolveObserverEndpoint: resolveObserverEndpoint
+                ),
+                MCPContextBuilderToolProvider(runtime: runtime, execution: execution, context: context, files: files),
+                MCPAskUserToolProvider(runtime: runtime, execution: execution),
+                MCPAgentControlToolProvider(runtime: runtime, execution: execution),
+                MCPSessionAdminToolProvider(runtime: runtime, execution: execution),
+                MCPAgentSessionControlToolProvider(runtime: runtime, execution: execution)
+            ],
+            sharedBindings: sharedBindings,
+            runtime: runtime,
+            runRouting: runRouting
+        )
     }
 
     var longRunningInteractionAdapter: DomainLongRunningInteractionAdapter? {

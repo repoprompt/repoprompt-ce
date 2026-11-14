@@ -18,6 +18,9 @@ extension EnvironmentValues {
 /// - Uses the shared message timestamp formatter so timestamp labels stay consistent.
 /// - Observes FontScaleManager so footer text follows Agent Mode text size.
 private struct MessageFooterStrip: View {
+    #if DEBUG
+        @Environment(\.agentTranscriptProbeRowID) private var probeRowID
+    #endif
     @Environment(\.agentModePerfRecorder) private var perfRecorder
     let text: String
     let timestamp: Date
@@ -97,6 +100,9 @@ private struct MessageFooterStrip: View {
     }
 
     private func runtimeFooterText(_ runtimeFooter: AgentMessageRuntimeFooter, now: Date) -> some View {
+        #if DEBUG
+            AgentTranscriptTailRenderProbe.sink?(.footer(probeRowID, runtimeFooter.statusText))
+        #endif
         let elapsed = AgentRuntimeDurationFormatter.string(from: runtimeFooter.anchorDate, to: now)
         return Text("\(runtimeFooter.statusText) · \(elapsed)")
             .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
@@ -195,9 +201,173 @@ private struct LaneUpdateDeliveryAccessibilityValue: ViewModifier {
 
 // MARK: - Agent Message Bubble
 
-struct CodexManagedLoginAction {
+struct CodexManagedLoginAction: Equatable {
+    /// The caller must advance revision when the callbacks change for the same owner.
+    let ownerID: ObjectIdentifier
+    var revision: UInt64 = 0
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.ownerID == rhs.ownerID && lhs.revision == rhs.revision
+    }
+
     let browser: (@MainActor @escaping @Sendable (URL) -> Void) async throws -> Bool
     let deviceCode: (@MainActor @escaping @Sendable (CodexManagedChatgptDeviceCode, Bool) -> Void) async throws -> Bool
+}
+
+/// Value inputs at the transcript row boundary. Actions are constructed from these values and
+/// the compared owners below, rather than passing incomparable render-time closures through equality.
+struct AgentTranscriptRowInputs: Equatable {
+    let item: AgentChatItem
+    let isMostRecentEditBubble: Bool
+    let windowID: Int
+    let workspaceID: UUID?
+    let tabID: UUID?
+    let suppressAskUserTranscriptUI: Bool
+    let activeContextBuilderCallID: UUID?
+    let activeContextBuilderResultID: UUID?
+    let rawToolResultPayload: String?
+    let rawToolResultPayloadRenderRevision: Int
+    let cancelRunID: UUID?
+    let runInteraction: AgentRunInteractionUISnapshot
+    let runtimeFooter: AgentMessageRuntimeFooter?
+    let autoExpandEnabled: Bool
+    let liveBashExecution: AgentModeViewModel.BashLiveExecutionState?
+    let isRecentAssistant: Bool
+    let approvalVisible: Bool
+}
+
+@MainActor
+struct AgentTranscriptRow: View, @MainActor Equatable {
+    @Environment(\.handoffOmittedImageCount) private var omittedHandoffImageCount
+    let inputs: AgentTranscriptRowInputs
+    let agentModeVM: AgentModeViewModel
+    let promptManager: PromptViewModel
+    let contextBuilderAgentVM: ContextBuilderAgentViewModel
+    let codexManagedLoginAction: CodexManagedLoginAction?
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.inputs == rhs.inputs
+            && lhs.agentModeVM === rhs.agentModeVM
+            && lhs.promptManager === rhs.promptManager
+            && lhs.contextBuilderAgentVM === rhs.contextBuilderAgentVM
+            && lhs.codexManagedLoginAction == rhs.codexManagedLoginAction
+    }
+
+    var body: some View {
+        let cancelAction: (() -> Void)? = inputs.cancelRunID.map { runID in
+            { [weak agentModeVM] in agentModeVM?.cancelActiveToolsForRun(runID: runID, reason: "tool_card_header_cancel") }
+        }
+        AgentMessageBubble(
+            item: inputs.item,
+            isMostRecentEditBubble: inputs.isMostRecentEditBubble,
+            windowID: inputs.windowID,
+            currentWorkspaceID: inputs.workspaceID,
+            currentTabID: inputs.tabID,
+            suppressAskUserTranscriptUI: inputs.suppressAskUserTranscriptUI,
+            contextBuilderContext: .init(
+                tabID: inputs.tabID, contextBuilderAgentVM: contextBuilderAgentVM,
+                activeContextBuilderCallItemID: inputs.activeContextBuilderCallID,
+                activeContextBuilderResultItemID: inputs.activeContextBuilderResultID,
+                oracleOpenContext: .init(windowID: inputs.windowID, workspaceID: inputs.workspaceID, tabID: inputs.tabID),
+                showRunScopedToolCancel: inputs.cancelRunID != nil, cancelActiveToolsAction: cancelAction
+            ),
+            promptManager: promptManager,
+            handoffConfig: inputs.runInteraction.canForkCurrentSession ? handoffConfig : nil,
+            rawToolResultPayload: inputs.rawToolResultPayload,
+            rawToolResultPayloadRenderRevision: inputs.rawToolResultPayloadRenderRevision,
+            showRunScopedToolCancel: inputs.cancelRunID != nil,
+            cancelActiveToolsAction: cancelAction,
+            codexManagedLoginAction: codexManagedLoginAction,
+            recentAssistantItemIDs: inputs.isRecentAssistant ? [inputs.item.id] : [],
+            runtimeFooter: inputs.runtimeFooter
+        )
+        #if DEBUG
+        .environment(\.agentTranscriptProbeRowID, inputs.item.id)
+        #endif
+        .environment(\.markdownFileLinkOpener, MarkdownFileLinkOpener { target in
+            await promptManager.fileManager.openFileForMarkdownLink(target)
+        })
+        .environment(\.agentToolCardAutoExpandEnabled, inputs.autoExpandEnabled)
+        .environment(\.agentLiveBashExecutionByItemID, inputs.liveBashExecution.map { [inputs.item.id: $0] } ?? [:])
+        .environment(\.agentApprovalVisible, inputs.approvalVisible)
+    }
+
+    var handoffConfig: AgentHandoffConfig {
+        let itemID = inputs.item.id
+        return AgentHandoffConfig(
+            itemID: itemID,
+            defaultDestinationAgent: inputs.runInteraction.selectedAgent,
+            defaultModelRaw: inputs.runInteraction.selectedModelRaw,
+            defaultReasoningEffortRaw: inputs.runInteraction.selectedReasoningEffortRaw,
+            availableAgentsProvider: { [weak agentModeVM] in agentModeVM?.availableAgents ?? [] },
+            modelOptionsProvider: { [weak agentModeVM] agent in agentModeVM?.modelOptions(for: agent) ?? [] },
+            windowID: inputs.windowID,
+            buildPayloadForClipboard: { [weak agentModeVM] in await agentModeVM?.buildHandoffPayload(upToItemID: itemID) ?? "" },
+            performHandoff: { [weak agentModeVM] selection in
+                guard let vm = agentModeVM else { return }
+                try await vm.prepareHandoffToNewTab(
+                    upToItemID: itemID, destinationAgent: selection.agent,
+                    destinationModelRaw: selection.modelRaw, destinationReasoningEffortRaw: selection.reasoningEffortRaw,
+                    missingImagePolicy: .omitMissingImagesForHumanHandoff,
+                    onImagesOmitted: { omittedHandoffImageCount.wrappedValue = $0 }
+                )
+            }
+        )
+    }
+}
+
+/// Reads the navigation callback only for attributed rows. Keeping this dynamic environment
+/// dependency at its consumer lets unchanged transcript bubbles remain behind row equality.
+@MainActor
+private struct AgentCrossSessionAttributionBadge: View {
+    let attribution: AgentCrossSessionAttribution
+    let fontPreset: FontScalePreset
+    @Environment(\.navigateToLoadedAgentSession) private var navigateToLoadedAgentSession
+    @State private var isOpeningAttributionSource = false
+
+    /// Marks a user row that another Agent session delivered through a user-granted oversight link.
+    ///
+    /// The name is the sender's name captured at delivery time, never re-resolved, so the badge stays
+    /// truthful after that session is renamed or closed. The full source UUID lives in the tooltip and
+    /// accessibility text rather than the label, which would otherwise dominate the bubble.
+    var body: some View {
+        let name = attribution.sourceName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let displayName = (name?.isEmpty == false)
+            ? name!
+            : AgentMonitorSessionIDFormatter.short(attribution.sourceSessionID)
+        let label = "From \(displayName)"
+        let detail = "Sent by overseeing session \(attribution.sourceSessionID.uuidString) through an oversight link."
+
+        Button {
+            guard !isOpeningAttributionSource else { return }
+            isOpeningAttributionSource = true
+            Task {
+                defer { isOpeningAttributionSource = false }
+                await navigateToLoadedAgentSession(attribution.sourceSessionID)
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "eye.fill")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+                Text(label)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
+                    .lineLimit(1)
+            }
+            .foregroundColor(.purple)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(Color.purple.opacity(0.15))
+            .clipShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            (hovering ? NSCursor.pointingHand : NSCursor.arrow).set()
+        }
+        .onDisappear { NSCursor.arrow.set() }
+        .hoverTooltip(detail)
+        .accessibilityLabel(Text(label))
+        .accessibilityHint(Text(detail))
+    }
 }
 
 /// A bubble view for displaying agent chat items (user, assistant, tool calls, etc.)
@@ -217,12 +387,10 @@ struct AgentMessageBubble: View {
     let showRunScopedToolCancel: Bool
     let cancelActiveToolsAction: (() -> Void)?
     let codexManagedLoginAction: CodexManagedLoginAction?
-    @Environment(\.navigateToLoadedAgentSession) private var navigateToLoadedAgentSession
     @Environment(\.colorScheme) private var colorScheme
-    @Environment(\.agentRecentAssistantItemIDs) private var recentAssistantItemIDs
-    @Environment(\.agentMessageRuntimeFooterByItemID) private var runtimeFooterByItemID
+    private let recentAssistantItemIDs: Set<UUID>
+    private let runtimeFooter: AgentMessageRuntimeFooter?
     @ObservedObject private var fontScale = FontScaleManager.shared
-    @State private var isOpeningAttributionSource = false
     @State private var activeCodexManagedLoginFlow: CodexManagedLoginFlow?
     @State private var codexManagedLoginOperationID: UUID?
     @State private var codexManagedLoginFeedback: String?
@@ -247,7 +415,9 @@ struct AgentMessageBubble: View {
         rawToolResultPayloadRenderRevision: Int = 0,
         showRunScopedToolCancel: Bool = false,
         cancelActiveToolsAction: (() -> Void)? = nil,
-        codexManagedLoginAction: CodexManagedLoginAction? = nil
+        codexManagedLoginAction: CodexManagedLoginAction? = nil,
+        recentAssistantItemIDs: Set<UUID> = [],
+        runtimeFooter: AgentMessageRuntimeFooter? = nil
     ) {
         self.item = item
         self.isMostRecentEditBubble = isMostRecentEditBubble
@@ -263,10 +433,8 @@ struct AgentMessageBubble: View {
         self.showRunScopedToolCancel = showRunScopedToolCancel
         self.cancelActiveToolsAction = cancelActiveToolsAction
         self.codexManagedLoginAction = codexManagedLoginAction
-    }
-
-    private var runtimeFooter: AgentMessageRuntimeFooter? {
-        runtimeFooterByItemID[item.id]
+        self.recentAssistantItemIDs = recentAssistantItemIDs
+        self.runtimeFooter = runtimeFooter
     }
 
     private var normalizedToolName: String? {
@@ -287,6 +455,9 @@ struct AgentMessageBubble: View {
     }
 
     var body: some View {
+        #if DEBUG
+            let _ = AgentTranscriptTailRenderProbe.sink?(.body(item.id, item.text))
+        #endif
         let renderItem = renderingItem
         switch renderItem.kind {
         case .user:
@@ -294,7 +465,7 @@ struct AgentMessageBubble: View {
         case .assistant:
             assistantBubble
         case .assistantInline:
-            assistantInline
+            assistantBubble
         case .toolCall:
             if isHiddenAgentTool(item.toolName) {
                 EmptyView()
@@ -375,7 +546,7 @@ struct AgentMessageBubble: View {
                     if item.codexGoalMode != nil || item.workflow != nil || item.crossSessionAttribution != nil {
                         HStack(spacing: 6) {
                             if let attribution = item.crossSessionAttribution {
-                                crossSessionAttributionBadge(attribution)
+                                AgentCrossSessionAttributionBadge(attribution: attribution, fontPreset: fontPreset)
                             }
                             if let codexGoalMode = item.codexGoalMode {
                                 codexGoalModeBadge(codexGoalMode, hasWorkflow: item.workflow != nil)
@@ -443,50 +614,6 @@ struct AgentMessageBubble: View {
         .accessibilityHint(Text(tooltip))
     }
 
-    /// Marks a user row that another Agent session delivered through a user-granted oversight link.
-    ///
-    /// The name is the sender's name captured at delivery time, never re-resolved, so the badge stays
-    /// truthful after that session is renamed or closed. The full source UUID lives in the tooltip and
-    /// accessibility text rather than the label, which would otherwise dominate the bubble.
-    private func crossSessionAttributionBadge(_ attribution: AgentCrossSessionAttribution) -> some View {
-        let name = attribution.sourceName?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let displayName = (name?.isEmpty == false)
-            ? name!
-            : AgentMonitorSessionIDFormatter.short(attribution.sourceSessionID)
-        let label = "From \(displayName)"
-        let detail = "Sent by overseeing session \(attribution.sourceSessionID.uuidString) through an oversight link."
-
-        return Button {
-            guard !isOpeningAttributionSource else { return }
-            isOpeningAttributionSource = true
-            Task {
-                defer { isOpeningAttributionSource = false }
-                await navigateToLoadedAgentSession(attribution.sourceSessionID)
-            }
-        } label: {
-            HStack(spacing: 4) {
-                Image(systemName: "eye.fill")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
-                Text(label)
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
-                    .lineLimit(1)
-            }
-            .foregroundColor(.purple)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 3)
-            .background(Color.purple.opacity(0.15))
-            .clipShape(Capsule())
-        }
-        .buttonStyle(.plain)
-        .onHover { hovering in
-            (hovering ? NSCursor.pointingHand : NSCursor.arrow).set()
-        }
-        .onDisappear { NSCursor.arrow.set() }
-        .hoverTooltip(detail)
-        .accessibilityLabel(Text(label))
-        .accessibilityHint(Text(detail))
-    }
-
     private func workflowBadge(_ workflow: AgentWorkflowDefinition) -> some View {
         HStack(spacing: 4) {
             Image(systemName: workflow.iconName)
@@ -519,27 +646,6 @@ struct AgentMessageBubble: View {
                 )
             }
 
-            Spacer(minLength: 60)
-        }
-    }
-
-    // MARK: - Assistant Inline
-
-    private var assistantInline: some View {
-        HStack(alignment: .top) {
-            VStack(alignment: .leading, spacing: 4) {
-                assistantContent
-                    .frame(maxWidth: .infinity, alignment: .leading)
-
-                MessageFooterStrip(
-                    text: item.text,
-                    timestamp: item.timestamp,
-                    isTrailing: false,
-                    handoffConfig: handoffConfig,
-                    hasHandoffButton: handoffConfig != nil,
-                    runtimeFooter: runtimeFooter
-                )
-            }
             Spacer(minLength: 60)
         }
     }
@@ -703,95 +809,80 @@ struct AgentMessageBubble: View {
     /// Pending question (tool_call state) - shows structured questions while waiting for response
     private var askUserQuestionPendingView: some View {
         let summary = parseAskUserQuestionSummaryRobust(args: item.toolArgsJSON, result: nil)
-        return HStack {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(alignment: .top, spacing: 8) {
-                    Image(systemName: "questionmark.circle.fill")
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 14))
-                        .foregroundColor(.blue)
+        return askUserQuestionBubble {
+            VStack(alignment: .leading, spacing: 6) {
+                questionTitle(summary.displayTitle)
 
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(summary.displayTitle)
-                            .font(fontPreset.standardFont)
-                            .foregroundColor(.primary)
-                            .textSelection(.enabled)
-
-                        if let context = summary.contextLine {
-                            Text(context)
-                                .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                                .foregroundColor(.secondary)
-                                .lineLimit(2)
-                                .textSelection(.enabled)
-                        }
-
-                        askUserQuestionList(summary.questions)
-
-                        HStack(spacing: 4) {
-                            ProgressView()
-                                .scaleEffect(0.5)
-                                .frame(width: 12, height: 12)
-                            Text("Waiting for response...")
-                                .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                                .foregroundColor(.secondary)
-                        }
-                    }
+                if let context = summary.contextLine {
+                    questionContext(context)
                 }
 
-                timestampView
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-            .background(Color.blue.opacity(0.08))
-            .cornerRadius(12)
-            .overlay(
-                RoundedRectangle(cornerRadius: 12)
-                    .stroke(Color.blue.opacity(0.2), lineWidth: 1)
-            )
+                askUserQuestionList(summary.questions)
 
-            Spacer(minLength: 40)
+                HStack(spacing: 4) {
+                    ProgressView()
+                        .scaleEffect(0.5)
+                        .frame(width: 12, height: 12)
+                    Text("Waiting for response...")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                        .foregroundColor(.secondary)
+                }
+            }
         }
     }
 
     /// Completed question exchange (tool_result state) - shows Q&A grouped together
     private var askUserQuestionExchangeView: some View {
         let summary = parseAskUserQuestionSummaryRobust(args: item.toolArgsJSON, result: item.toolResultJSON)
-        return HStack {
+        return askUserQuestionBubble {
+            VStack(alignment: .leading, spacing: 10) {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        questionTitle(summary.displayTitle)
+                        if let status = summary.statusText {
+                            Text(status)
+                                .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .medium))
+                                .foregroundColor(.secondary)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.secondary.opacity(0.12))
+                                .cornerRadius(6)
+                        }
+                    }
+                    if let context = summary.contextLine {
+                        questionContext(context)
+                    }
+                }
+
+                AskUserQuestionResultView(summary: summary)
+            }
+        }
+    }
+
+    private func questionTitle(_ title: String) -> some View {
+        Text(title)
+            .font(fontPreset.standardFont)
+            .foregroundColor(.primary)
+            .textSelection(.enabled)
+    }
+
+    private func questionContext(_ context: String) -> some View {
+        Text(context)
+            .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+            .foregroundColor(.secondary)
+            .lineLimit(2)
+            .textSelection(.enabled)
+    }
+
+    private func askUserQuestionBubble(@ViewBuilder content: () -> some View) -> some View {
+        HStack {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(alignment: .top, spacing: 8) {
                     Image(systemName: "questionmark.circle.fill")
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 14))
                         .foregroundColor(.blue)
-
-                    VStack(alignment: .leading, spacing: 10) {
-                        VStack(alignment: .leading, spacing: 4) {
-                            HStack(spacing: 6) {
-                                Text(summary.displayTitle)
-                                    .font(fontPreset.standardFont)
-                                    .foregroundColor(.primary)
-                                    .textSelection(.enabled)
-                                if let status = summary.statusText {
-                                    Text(status)
-                                        .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .medium))
-                                        .foregroundColor(.secondary)
-                                        .padding(.horizontal, 6)
-                                        .padding(.vertical, 2)
-                                        .background(Color.secondary.opacity(0.12))
-                                        .cornerRadius(6)
-                                }
-                            }
-                            if let context = summary.contextLine {
-                                Text(context)
-                                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                                    .foregroundColor(.secondary)
-                                    .lineLimit(2)
-                                    .textSelection(.enabled)
-                            }
-                        }
-
-                        AskUserQuestionResultView(summary: summary)
-                    }
+                    content()
                 }
-
                 timestampView
             }
             .padding(.horizontal, 12)
@@ -802,7 +893,6 @@ struct AgentMessageBubble: View {
                 RoundedRectangle(cornerRadius: 12)
                     .stroke(Color.blue.opacity(0.2), lineWidth: 1)
             )
-
             Spacer(minLength: 40)
         }
     }
@@ -860,20 +950,14 @@ struct AgentMessageBubble: View {
                     maxHeight: AgentTranscriptCollapsedCardMetrics.collapsedHeight,
                     alignment: .leading
                 )
-                .background(
-                    RoundedRectangle(cornerRadius: 16)
-                        .fill(BubbleColors.toolResultBackground(colorScheme: colorScheme))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 16)
-                        .stroke(Color.secondary.opacity(0.15), lineWidth: 0.5)
-                )
+                .background(systemBubbleBackground)
+                .overlay(systemBubbleOutline)
             } else if let laneUpdate = laneUpdatePresentation {
                 laneUpdateRow(laneUpdate)
             } else {
                 HStack(spacing: 6) {
                     if let attribution = item.crossSessionAttribution {
-                        crossSessionAttributionBadge(attribution)
+                        AgentCrossSessionAttributionBadge(attribution: attribution, fontPreset: fontPreset)
                     }
                     Text(verbatim: item.text)
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
@@ -887,16 +971,20 @@ struct AgentMessageBubble: View {
                 }
                 .padding(.horizontal, 10)
                 .padding(.vertical, 7)
-                .background(
-                    RoundedRectangle(cornerRadius: 16)
-                        .fill(BubbleColors.toolResultBackground(colorScheme: colorScheme))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 16)
-                        .stroke(Color.secondary.opacity(0.15), lineWidth: 0.5)
-                )
+                .background(systemBubbleBackground)
+                .overlay(systemBubbleOutline)
             }
         }
+    }
+
+    private var systemBubbleBackground: some View {
+        RoundedRectangle(cornerRadius: 16)
+            .fill(BubbleColors.toolResultBackground(colorScheme: colorScheme))
+    }
+
+    private var systemBubbleOutline: some View {
+        RoundedRectangle(cornerRadius: 16)
+            .stroke(Color.secondary.opacity(0.15), lineWidth: 0.5)
     }
 
     // MARK: - Lane Update Row
@@ -1952,7 +2040,8 @@ struct ToolResultContentView: View {
             }
 
             if needsCollapse, !isDiffContent, !isJSONContent {
-                expandCollapseButton
+                messageExpansionButton(isExpanded: $isExpanded, remainingLineCount: remainingLineCount, fontPreset: fontPreset)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
     }
@@ -2010,26 +2099,30 @@ struct ToolResultContentView: View {
         return (trimmed.hasPrefix("{") && trimmed.hasSuffix("}")) ||
             (trimmed.hasPrefix("[") && trimmed.hasSuffix("]"))
     }
+}
 
-    private var expandCollapseButton: some View {
-        Button(action: {
-            withAnimation(.easeInOut(duration: 0.2)) {
-                isExpanded.toggle()
-            }
-        }) {
-            HStack(spacing: 4) {
-                Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .medium))
-                Text(isExpanded ? "Show less" : "Show \(remainingLineCount) more lines")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-            }
-            .foregroundColor(.secondary)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 6)
+@MainActor
+private func messageExpansionButton(
+    isExpanded: Binding<Bool>,
+    remainingLineCount: @autoclosure () -> Int,
+    fontPreset: FontScalePreset
+) -> some View {
+    Button(action: {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            isExpanded.wrappedValue.toggle()
         }
-        .buttonStyle(PlainButtonStyle())
-        .frame(maxWidth: .infinity, alignment: .leading)
+    }) {
+        HStack(spacing: 4) {
+            Image(systemName: isExpanded.wrappedValue ? "chevron.up" : "chevron.down")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .medium))
+            Text(isExpanded.wrappedValue ? "Show less" : "Show \(remainingLineCount()) more lines")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+        }
+        .foregroundColor(.secondary)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
     }
+    .buttonStyle(PlainButtonStyle())
 }
 
 // MARK: - Diff Content View
@@ -2099,22 +2192,7 @@ private struct DiffContentView: View {
             .cornerRadius(6)
 
             if needsCollapse {
-                Button(action: {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        isExpanded.toggle()
-                    }
-                }) {
-                    HStack(spacing: 4) {
-                        Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                            .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .medium))
-                        Text(isExpanded ? "Show less" : "Show \(remainingLineCount) more lines")
-                            .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                    }
-                    .foregroundColor(.secondary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 6)
-                }
-                .buttonStyle(PlainButtonStyle())
+                messageExpansionButton(isExpanded: $isExpanded, remainingLineCount: remainingLineCount, fontPreset: fontPreset)
             }
         }
     }

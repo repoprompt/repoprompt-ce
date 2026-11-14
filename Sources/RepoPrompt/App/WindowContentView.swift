@@ -66,6 +66,7 @@ struct WindowContentView: View {
                 AppWindowOpener.shared.install {
                     openWindow(id: "main")
                 }
+                AppWindowOpener.shared.commandCenter.install { openWindow(id: "command-center") }
             }
             // Cleanup if the window goes away
             .onDisappear {

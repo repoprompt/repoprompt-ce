@@ -1,5 +1,16 @@
 import SwiftUI
 
+@MainActor
+private func togglePillContent(isOn: Bool, cornerRadius: CGFloat, @ViewBuilder content: () -> some View) -> some View {
+    ZStack {
+        if isOn {
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .fill(Color.accentColor.opacity(0.12))
+        }
+        content()
+    }
+}
+
 // MARK: - Auto Edit Pill
 
 struct AgentAutoEditPill: View {
@@ -32,12 +43,7 @@ struct AgentAutoEditPill: View {
             }
             .padding(.horizontal, AgentPillMetrics.horizontalPadding())
             .frame(height: AgentPillMetrics.height())
-            .background(.ultraThinMaterial)
-            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .stroke(isOn ? Color.green.opacity(0.35) : Color.secondary.opacity(0.15), lineWidth: isOn ? 0.8 : 0.5)
-            )
+            .agentPillSurface(cornerRadius: cornerRadius, strokeColor: isOn ? Color.green.opacity(0.35) : Color.secondary.opacity(0.15), lineWidth: isOn ? 0.8 : 0.5)
         }
         .buttonStyle(.plain)
         .hoverTooltip(tooltipText, .top)
@@ -78,23 +84,13 @@ struct AgentInterviewPill: View {
         let cornerRadius = AgentPillMetrics.cornerRadius()
         let size = AgentPillMetrics.height()
         Button(action: onToggle) {
-            ZStack {
-                if isOn {
-                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                        .fill(Color.accentColor.opacity(0.12))
-                }
-
+            togglePillContent(isOn: isOn, cornerRadius: cornerRadius) {
                 Image(systemName: isOn ? "questionmark.bubble.fill" : "questionmark.bubble")
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
                     .foregroundStyle(isOn ? Color.accentColor : .secondary)
             }
             .frame(width: size, height: size)
-            .background(.ultraThinMaterial)
-            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .stroke(isOn ? Color.accentColor.opacity(0.4) : Color.secondary.opacity(0.15), lineWidth: isOn ? 0.8 : 0.5)
-            )
+            .agentPillSurface(cornerRadius: cornerRadius, strokeColor: isOn ? Color.accentColor.opacity(0.4) : Color.secondary.opacity(0.15), lineWidth: isOn ? 0.8 : 0.5)
         }
         .buttonStyle(.plain)
         .hoverTooltip(tooltipText, plainText: tooltipPlainText, .top)
@@ -133,11 +129,7 @@ struct AgentIconTogglePill: View {
         let cornerRadius = AgentPillMetrics.cornerRadius()
         let size = AgentPillMetrics.height()
         Button(action: onToggle) {
-            ZStack {
-                if isOn {
-                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                        .fill(Color.accentColor.opacity(0.12))
-                }
+            togglePillContent(isOn: isOn, cornerRadius: cornerRadius) {
                 if isBusy {
                     ProgressView().controlSize(.small)
                 } else {
@@ -147,12 +139,7 @@ struct AgentIconTogglePill: View {
                 }
             }
             .frame(width: size, height: size)
-            .background(.ultraThinMaterial)
-            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .stroke(isOutlineHighlighted ? Color.accentColor.opacity(0.4) : Color.secondary.opacity(0.15), lineWidth: isOutlineHighlighted ? 0.8 : 0.5)
-            )
+            .agentPillSurface(cornerRadius: cornerRadius, strokeColor: isOutlineHighlighted ? Color.accentColor.opacity(0.4) : Color.secondary.opacity(0.15), lineWidth: isOutlineHighlighted ? 0.8 : 0.5)
         }
         .buttonStyle(.plain)
     }
@@ -278,12 +265,7 @@ struct AgentModelRouterPill: View {
             )
             .foregroundStyle(props.isOn ? Color.accentColor : .secondary)
             .background(props.isOn ? Color.accentColor.opacity(0.12) : Color.clear)
-            .background(.ultraThinMaterial)
-            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .stroke((props.isOn || props.usageBalancing) ? Color.accentColor.opacity(0.4) : Color.secondary.opacity(0.15), lineWidth: (props.isOn || props.usageBalancing) ? 0.8 : 0.5)
-            )
+            .agentPillSurface(cornerRadius: cornerRadius, strokeColor: (props.isOn || props.usageBalancing) ? Color.accentColor.opacity(0.4) : Color.secondary.opacity(0.15), lineWidth: (props.isOn || props.usageBalancing) ? 0.8 : 0.5)
         }
         .buttonStyle(.plain)
         .disabled(props.isRouting)
@@ -350,12 +332,7 @@ struct AgentAutoEffortPill: View {
             )
             .foregroundStyle(props.isOn ? Color.accentColor : .secondary)
             .background(props.isOn ? Color.accentColor.opacity(0.12) : Color.clear)
-            .background(.ultraThinMaterial)
-            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .stroke(props.isOn ? Color.accentColor.opacity(0.4) : Color.secondary.opacity(0.15), lineWidth: props.isOn ? 0.8 : 0.5)
-            )
+            .agentPillSurface(cornerRadius: cornerRadius, strokeColor: props.isOn ? Color.accentColor.opacity(0.4) : Color.secondary.opacity(0.15), lineWidth: props.isOn ? 0.8 : 0.5)
         }
         .buttonStyle(.plain)
         .hoverTooltip(tooltip, .top)

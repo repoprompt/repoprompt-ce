@@ -5,6 +5,30 @@ import XCTest
 
 @MainActor
 final class GlobalSettingsOwnershipTests: XCTestCase {
+    func testExperimentalCommandCenterDefaultsOffAndPersistsExplicitOptInOnly() throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("globalSettings.json")
+        let suiteName = "LookoutDefaultOff.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let fileStore = GlobalSettingsFileStore(fileURL: url)
+        try fileStore.save(GlobalSettingsDocument())
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+        let beforeRead = try Data(contentsOf: url)
+        XCTAssertFalse(store.experimentalCommandCenter())
+        XCTAssertEqual(try Data(contentsOf: url), beforeRead, "Reading the absent flag never opts in or rewrites settings")
+        XCTAssertNil(try fileStore.load().scalarPreferences?.ui?.experimentalCommandCenter)
+        store.setExperimentalCommandCenter(true)
+        XCTAssertTrue(store.experimentalCommandCenter())
+        XCTAssertEqual(try fileStore.load().scalarPreferences?.ui?.experimentalCommandCenter, true)
+        let reloaded = GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: url))
+        XCTAssertTrue(reloaded.experimentalCommandCenter())
+        reloaded.setExperimentalCommandCenter(false)
+        XCTAssertFalse(reloaded.experimentalCommandCenter())
+        XCTAssertEqual(try GlobalSettingsFileStore(fileURL: url).load().scalarPreferences?.ui?.experimentalCommandCenter, false)
+    }
+
     func testTwoStoresRejectStaleSaveAndMigrationThenReloadAllowsFreshEdit() throws {
         let root = try makeRoot()
         defer { try? FileManager.default.removeItem(at: root) }

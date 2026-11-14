@@ -8,6 +8,7 @@ import RepoPromptFoundation
 import RepoPromptInstrumentation
 import RepoPromptShared
 import RepoPromptVCS
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 import SwiftUI
 
@@ -560,7 +561,7 @@ private enum PersistentWorkspaceCreationError: LocalizedError {
     }
 }
 
-private enum PersistentFolderOpenError: LocalizedError {
+enum PersistentFolderOpenError: LocalizedError {
     case invalidFolder
     case authoritySnapshotUnavailable
     case authorityConflictUnresolved
@@ -2045,6 +2046,8 @@ class WorkspaceManagerViewModel: ObservableObject {
             (@Sendable (UUID) async -> Void)?
         private var workspaceSaveAttemptCountByWorkspaceIDForTesting: [UUID: Int] = [:]
         private var workspaceSaveCapturePublicationCountByWorkspaceIDForTesting: [UUID: Int] = [:]
+        /// Passive completion of the real debounced prompt observation, including no-op observations.
+        var deferredPromptObservationDidFinishForTesting: ((String) -> Void)?
         private var cancelWorkingCommitAfterOutcomeWorkspaceIDsForTesting: Set<UUID> = []
         private var savePathComposeTabReloadCountForTesting = 0
         private var workspaceDeleteWillExecuteHandlerForTesting:
@@ -4777,13 +4780,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     nonisolated func workspaceDirectory(for workspace: WorkspaceModel, baseRoot: URL) -> URL {
-        // ➊ Honour per-workspace override first
-        if let customRoot = workspace.customStoragePath {
-            return customRoot
-        }
-
-        // ➋ Fall back to global custom storage set by the user or the default location
-        return baseRoot.appendingPathComponent(directoryName(for: workspace))
+        WorkspaceSessionSidecarMigration.workspaceDirectory(for: workspace, root: baseRoot)
     }
 
     func workspaceFileURL(for workspace: WorkspaceModel) -> URL {
@@ -4796,7 +4793,10 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     nonisolated func workspaceFileURL(for workspace: WorkspaceModel, baseRoot: URL) -> URL {
-        workspaceDirectory(for: workspace, baseRoot: baseRoot).appendingPathComponent("workspace.json")
+        // Keep document identity separate from transient sidecars, including read-only lookup
+        // of legacy ephemeral documents. Save admission still rejects ephemeral workspaces.
+        let directory = workspace.customStoragePath ?? baseRoot.appendingPathComponent(directoryName(for: workspace))
+        return directory.appendingPathComponent("workspace.json")
     }
 
     nonisolated func chatsFolder(for workspace: WorkspaceModel, baseRoot: URL) -> URL {
@@ -4918,9 +4918,20 @@ class WorkspaceManagerViewModel: ObservableObject {
             .debounce(for: .milliseconds(120), scheduler: DispatchQueue.main)
             .sink { [weak self] observation in
                 guard let self, acceptsDeferredWorkspaceObservation(observation) else { return }
-                bumpStateVersion(for: observation.workspaceID)
+                // A before-save capture can materialize this edit before its debounced
+                // notification arrives. Do not invalidate prepared bytes for that no-op.
+                let (_, storedTab) = activeComposeTabContext()
+                let alreadyCaptured = storedTab?.promptText == observation.value
+                    && activeWorkspace?.currentPromptText == observation.value
+                    && promptViewModel.promptText == observation.value
+                if !alreadyCaptured {
+                    bumpStateVersion(for: observation.workspaceID)
+                }
                 // No disk save here - publish in-memory snapshot for mirroring
                 publishActiveComposeTabSnapshot(commitToMemory: true)
+                #if DEBUG
+                    deferredPromptObservationDidFinishForTesting?(observation.value)
+                #endif
             }
             .store(in: &cancellables)
 
@@ -11100,8 +11111,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         _ = updateComposeTabStoredOnly(tab, inWorkspaceID: workspaceID)
     }
 
-    /// Exact-identity stored update. This avoids duplicate-tab ambiguity and dirties the
-    /// workspace that was actually mutated rather than whichever workspace is active.
+    /// Workspace-qualified stored update. Preserve first-match lookup for duplicate IDs;
+    /// dirty the workspace that was actually mutated rather than whichever workspace is active.
     @MainActor
     @discardableResult
     func updateComposeTabStoredOnly(_ tab: ComposeTabState, inWorkspaceID workspaceID: UUID) -> Bool {
@@ -11109,18 +11120,36 @@ class WorkspaceManagerViewModel: ObservableObject {
               let tabIndex = workspaces[workspaceIndex].composeTabs.firstIndex(where: { $0.id == tab.id })
         else { return false }
 
-        let oldSelection = workspaces[workspaceIndex].composeTabs[tabIndex].selection
+        let previous = workspaces[workspaceIndex].composeTabs[tabIndex]
+        // Selection equality alone must not discard session-identity or other content edits.
+        guard previous != tab else { return true }
         var updatedTab = tab
         updatedTab.lastModified = Date()
-        workspaces[workspaceIndex].composeTabs[tabIndex] = updatedTab
-        recordSelectionRevisionIfChanged(
-            workspaceIndex: workspaceIndex,
-            tabIndex: tabIndex,
-            oldSelection: oldSelection,
-            newSelection: updatedTab.selection,
-            reason: "updateComposeTabStoredOnly"
-        )
-        workspaces[workspaceIndex].dateModified = Date()
+        var replacement = workspaces[workspaceIndex]
+        replacement.composeTabs[tabIndex] = updatedTab
+        replacement.dateModified = Date()
+        // The snapshot path's indexed identity proof is an optimization, not lookup authority:
+        // ambiguous/unresolvable IDs still mutate the first match through generic maintenance.
+        if workspaceIndexMap[workspaceID] == workspaceIndex,
+           modelRoutingTabIndexes[workspaceID]?[tab.id] == tabIndex,
+           previous.activeAgentSessionID == updatedTab.activeAgentSessionID
+        {
+            composeTabPresentationPublication = (workspaceID, [tab.id])
+        }
+        workspaces[workspaceIndex] = replacement
+        // Synchronous publication subscribers can reorder or remove either owner.
+        // Reacquire both identities; a removed target must not revise its former neighbor.
+        if let storedWorkspaceIndex = workspaces.firstIndex(where: { $0.id == workspaceID }),
+           let storedTabIndex = workspaces[storedWorkspaceIndex].composeTabs.firstIndex(where: { $0.id == tab.id })
+        {
+            recordSelectionRevisionIfChanged(
+                workspaceIndex: storedWorkspaceIndex,
+                tabIndex: storedTabIndex,
+                oldSelection: previous.selection,
+                newSelection: updatedTab.selection,
+                reason: "updateComposeTabStoredOnly"
+            )
+        }
 
         // Important: do NOT call promptViewModel.loadComposeTabsFromWorkspace(...)
         // and do NOT publish snapshots here. We only persist the stored tab data.
@@ -18495,73 +18524,31 @@ class WorkspaceManagerViewModel: ObservableObject {
             )
         }
 
-        let authoritySnapshot = await domainWorkspaceAuthorityClient.snapshot()
-        #if DEBUG
-            await persistentFolderOpenDidSnapshotHandlerForTesting?()
-        #endif
-
-        try Task.checkCancellation()
-        let candidates = try persistentFolderOpenCandidates(from: authoritySnapshot)
-        let workspace = WorkspaceModel(
-            name: uniqueWorkspaceName(
-                baseName: folderURL.lastPathComponent,
-                in: candidates
-            ),
-            repoPaths: [folderURL.path],
-            isSavedWorkspace: true
-        )
-        let fileURL = workspaceFileURL(for: workspace)
-        guard let canonicalRootPath = WorkspaceRootSetKey(paths: [folderURL.path])
-            .normalizedPaths.first?.lowercased()
-        else {
-            throw PersistentFolderOpenError.invalidFolder
-        }
-        let outcome: DomainCommandOutcome
+        let resolved: PersistentFolderWorkspaceResolver.Resolution
         do {
-            outcome = try await domainWorkspaceAuthorityClient.resolveOrCreatePersistentWorkspace(
-                workspace,
-                fileURL: fileURL,
-                canonicalRootPath: canonicalRootPath,
-                operationID: operationID
+            resolved = try await PersistentFolderWorkspaceResolver.resolve(
+                folderURL: folderURL, client: domainWorkspaceAuthorityClient,
+                fileURL: { self.workspaceFileURL(for: $0) },
+                afterSnapshot: {
+                    #if DEBUG
+                        await self.persistentFolderOpenDidSnapshotHandlerForTesting?()
+                    #endif
+                }, operationID: operationID
             )
-        } catch {
-            reportDomainAuthorityFailure(
-                error,
-                workspaceID: workspace.id,
-                operation: "open_folder_resolve_or_create"
-            )
-            throw error
+        } catch let failure as PersistentFolderWorkspaceResolver.Failure {
+            switch failure {
+            case let .snapshot(error), let .projection(error): reportDomainProjectionFailure(error)
+            case let .command(id, error): reportDomainAuthorityFailure(error, workspaceID: id, operation: "open_folder_resolve_or_create")
+            case let .outcome(id, outcome):
+                if !Self.isSuccessfulDomainOutcome(outcome) || outcome.workspace == nil { applyDomainAuthorityOutcome(outcome, workspaceID: id) }
+                reportDomainAuthorityIssue(outcome, operation: "open_folder_resolve_or_create")
+            }
+            throw failure.underlying
         }
-
-        guard Self.isSuccessfulDomainOutcome(outcome),
-              let outcomeWorkspace = outcome.workspace
-        else {
-            applyDomainAuthorityOutcome(outcome, workspaceID: workspace.id)
-            reportDomainAuthorityIssue(outcome, operation: "open_folder_resolve_or_create")
-            throw DomainWorkspaceAuthorityOperationError(outcome: outcome)
-        }
-
-        let provenance: PersistentFolderOpenProvenance
-        switch outcome.exactRootResolution {
-        case .created:
-            provenance = .created
-        case .reused:
-            provenance = .reused
-        case .recoveryBlocked, nil:
-            reportDomainAuthorityIssue(outcome, operation: "open_folder_resolve_or_create")
-            throw DomainWorkspaceAuthorityOperationError(outcome: outcome)
-        }
-
-        let canonical: WorkspaceModel
-        do {
-            canonical = try Self.decodeDomainWorkspaceProjection(
-                documentBytes: outcomeWorkspace.document.documentBytes,
-                fileURL: outcomeWorkspace.document.fileURL
-            )
-        } catch {
-            reportDomainProjectionFailure(error)
-            throw error
-        }
+        let outcome = resolved.outcome
+        let outcomeWorkspace = resolved.snapshot
+        let canonical = resolved.workspace
+        let provenance = resolved.provenance
         applyDomainAuthorityOutcome(outcome, workspaceID: canonical.id)
         domainWorkspaceFileURLsByID[canonical.id] = outcomeWorkspace.document.fileURL
         if let index = workspaceIndex(for: canonical.id) {

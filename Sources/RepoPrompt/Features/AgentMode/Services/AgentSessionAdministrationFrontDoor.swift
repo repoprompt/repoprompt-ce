@@ -316,6 +316,25 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
             }
         }
 
+        // Discovery of ordering inputs must pass the same authority check as the completed
+        // request, including for previews, but cannot create a card for incomplete arguments.
+        if shaped.operation == .adminReorderGroups,
+           shaped.confirmationID == nil,
+           !shaped.arguments.keys.contains("order") || !shaped.arguments.keys.contains("expected_order"),
+           let handler = handlers[shaped.operation]
+        {
+            switch core.authorize(shaped) {
+            case let .authorized(batch), let .confirmationRequired(_, batch):
+                if let recovery = try handler.preflight(batch) {
+                    return .completed(selectionCoverage?.adding(to: recovery) ?? recovery)
+                }
+            case let .denied(denial, sessionID):
+                return .denied(denial, sessionID: sessionID)
+            case let .scopeSelectionRequired(scopeIDs):
+                return .scopeSelectionRequired(scopeIDs: scopeIDs)
+            }
+        }
+
         if shaped.preview, mutating {
             let outcome = try preview(shaped)
             if case let .completed(value) = outcome, let selectionCoverage {

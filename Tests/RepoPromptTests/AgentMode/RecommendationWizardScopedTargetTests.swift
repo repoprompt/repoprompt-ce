@@ -1,4 +1,5 @@
 import Combine
+import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore

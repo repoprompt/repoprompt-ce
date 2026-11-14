@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptFoundation
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 /// Window-scoped response-lane coordinator for Agent Mode `read_file` and eligible `file_search`
@@ -36,6 +37,7 @@ final class MCPReadFileAutoSelectionCoordinator {
         let tabID: UUID
         let route: Route
         let bindingGeneration: UInt64
+        var routeOwnerIdentity: ObjectIdentifier?
 
         var mirrorKey: TabMirrorKey {
             TabMirrorKey(windowID: windowID, workspaceID: workspaceID, tabID: tabID)

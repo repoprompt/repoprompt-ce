@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 /// A background response chosen from a notification, before it is validated against live state.
 struct AgentNotificationActionRequest: Equatable {

@@ -1,3 +1,4 @@
+import RepoPromptAIContracts
 import RepoPromptSecureStorage
 
 /// Preserve the provider-specific cache key while secure storage owns the cache.

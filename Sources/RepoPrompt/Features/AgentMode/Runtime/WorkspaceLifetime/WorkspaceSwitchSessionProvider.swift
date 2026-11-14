@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptACPProviders
+import RepoPromptAgentProviderContracts
 
 /// Bookkeeping snapshot captured by the first, prepare phase of workspace-switch
 /// discard, before the canonical cancellation awaits run. Provider/controller

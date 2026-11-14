@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
 
 extension AgentModeViewModel {
     enum GlobalModelRoutingError: LocalizedError {
@@ -23,7 +25,9 @@ extension AgentModeViewModel {
         let target: AgentRoutingExecutableTarget
     }
 
-    func modelRouterPillProps() -> AgentModelRouterPillProps {
+    func modelRouterPillProps(tabID: UUID? = nil) -> AgentModelRouterPillProps {
+        let currentTabID = tabID ?? currentTabID
+        let activeSession = currentTabID.flatMap { sessions[$0] }
         let configuration = modelRouterSettingsStore.modelRouterConfiguration()
         let available = modelRouterCanRoutePrimarySession(configuration)
         let isRouting = currentTabID.map { freshTaskRoutingByTabID[$0] != nil } ?? false
@@ -87,8 +91,8 @@ extension AgentModeViewModel {
         return effortName.map { "\(modelName) \($0)" } ?? modelName
     }
 
-    func autoEffortPillProps() -> AgentAutoEffortPillProps {
-        let session = activeSession
+    func autoEffortPillProps(tabID: UUID? = nil) -> AgentAutoEffortPillProps {
+        let session = (tabID ?? currentTabID).flatMap { sessions[$0] }
         let feedback = session?.autoEffortFeedback.flatMap { feedback in
             feedback.provider == session?.selectedAgent && feedback.selectedModelRaw == session?.selectedModelRaw
                 ? feedback : nil
@@ -108,7 +112,7 @@ extension AgentModeViewModel {
         let enabled = configuration.enabled
         guard enabled || configuration.selectedBackendID.map({ modelRouterRuntime?.isBackendReady($0) == true }) == true else { return }
         modelRouterSettingsStore.setAutoEffortEnabled(!enabled)
-        syncStatusPillsUIState()
+        ui.statusPills.update(makeStatusPillsSnapshot())
     }
 
     func handleModelRouterRuntimeChanged() {
@@ -138,7 +142,9 @@ extension AgentModeViewModel {
               modelRouterRuntime?.isBackendReady(backendID) == true
         else { return }
         guard (try? AgentTaskRoutingCandidateBuilder().build(
-            allowedProviders: providers(for: .primarySession, configuration: configuration),
+            allowedProviders: AgentTaskRoutingCandidateBuilder.providers(
+                for: .primarySession, configuration: configuration, availability: modelRouterAvailabilityContext, surface: .general
+            ),
             availability: modelRouterAvailabilityContext
         )) != nil else { return }
         modelRouterSettingsStore.setModelRouterEnabled(true)
@@ -163,6 +169,32 @@ extension AgentModeViewModel {
             && freshTaskRoutingEligibility(session: session, text: nil)
     }
 
+    /// Scheduled attachment admission must remain joined to the composer claim, just like
+    /// provider-switch admission; `.submitted` from the synchronous ingress is only scheduling.
+    private func submitClaimedOrdinaryUserTurn(
+        text: String, tabID: UUID, claim: AgentComposerSubmitClaim, rawDraftText: String,
+        composerOrigin: AgentUserInputOrigin,
+        autoEffortSelection: AutoEffortTurnSelection? = nil,
+        autoEffortAudit: AgentAutomationTurnAudit.Feature? = nil,
+        routerAudit: AgentAutomationTurnAudit.Feature? = nil,
+        autoWorkflow: AutoWorkflowTurnSelection? = nil,
+        repromptedText: String? = nil,
+        repromptAudit: AgentAutomationTurnAudit.Reprompt? = nil
+    ) async -> UserTurnSubmissionResult {
+        var pending: Task<UserTurnSubmissionResult, Never>?
+        let immediate = submitUserTurn(
+            text: text, tabID: tabID, rawDraftText: rawDraftText, composerOrigin: composerOrigin,
+            autoEffortSelection: autoEffortSelection, autoEffortAudit: autoEffortAudit,
+            routerAudit: routerAudit, autoWorkflow: autoWorkflow, repromptedText: repromptedText,
+            repromptAudit: repromptAudit, providerSwitchClaim: claim,
+            scheduledProviderSwitchSubmission: { pending = $0 }
+        )
+        if let pending {
+            return await withTaskCancellationHandler { await pending.value } onCancel: { pending.cancel() }
+        }
+        return immediate
+    }
+
     func submitUserTurnAfterFreshTaskRouting(
         text: String,
         claim: AgentComposerSubmitClaim,
@@ -172,7 +204,7 @@ extension AgentModeViewModel {
         repromptedText: String? = nil,
         precomputedRouting: RepromptSpeculation? = nil
     ) async -> UserTurnSubmissionResult {
-        guard composerSubmitClaimIsCurrent(claim), sessions[destinationTabID] === session else {
+        guard composerSubmitRuntime.isCurrent(claim), sessions[destinationTabID] === session else {
             return .blocked(message: Self.staleComposerSubmitTargetMessage)
         }
         let configuration = modelRouterSettingsStore.modelRouterConfiguration()
@@ -194,7 +226,9 @@ extension AgentModeViewModel {
             )
         }
 
-        let providers = providers(for: .primarySession, configuration: configuration)
+        let providers = AgentTaskRoutingCandidateBuilder.providers(
+            for: .primarySession, configuration: configuration, availability: modelRouterAvailabilityContext, surface: .general
+        )
         let reusable = reusableRepromptRouting(precomputedRouting, approved: repromptedText, configuration: configuration, backendID: backendID, runtime: runtime)
         let routeTask = reusable?.routingTask ?? Task {
             await routeModelThenEffort(
@@ -227,7 +261,7 @@ extension AgentModeViewModel {
             freshTaskRoutingByTabID[ownership.sourceTabID] = ownership
             freshTaskRoutingByTabID[ownership.destinationTabID] = ownership
             syncComposerUIState()
-            syncStatusPillsUIState()
+            ui.statusPills.update(makeStatusPillsSnapshot())
             stagedResult = await routeTask.value
             guard ownsFreshTaskRouting(ownership) else {
                 return .blocked(message: "Model routing was cancelled.")
@@ -256,7 +290,7 @@ extension AgentModeViewModel {
         )
 
         let currentConfiguration = modelRouterSettingsStore.modelRouterConfiguration()
-        guard composerSubmitClaimIsCurrent(claim),
+        guard composerSubmitRuntime.isCurrent(claim),
               sessions[destinationTabID] === session,
               currentConfiguration.revision == configuration.revision,
               currentConfiguration.selectedBackendID == backendID,
@@ -282,7 +316,7 @@ extension AgentModeViewModel {
             }
             routedAudit.chosenModelRaw = selected.target.modelRaw
             routedAudit.chosenEffortRaw = selected.target.reasoningEffortRaw
-            guard composerSubmitClaimIsCurrent(claim),
+            guard composerSubmitRuntime.isCurrent(claim),
                   sessions[destinationTabID] === session,
                   modelRouterSettingsStore.modelRouterConfiguration().revision == configuration.revision,
                   freshTaskRoutingEligibility(session: session, text: text)
@@ -290,9 +324,9 @@ extension AgentModeViewModel {
                 restoreRoutingSelection(baseline, on: session)
                 return .blocked(message: "The routing request became stale before submission.")
             }
-            let result = submitUserTurn(
+            let result = await submitClaimedOrdinaryUserTurn(
                 text: text,
-                tabID: destinationTabID,
+                tabID: destinationTabID, claim: claim,
                 rawDraftText: claim.attempt.rawDraftSnapshot,
                 composerOrigin: .localComposer,
                 routerAudit: routedAudit, autoWorkflow: autoWorkflow, repromptedText: repromptedText,
@@ -302,9 +336,9 @@ extension AgentModeViewModel {
                 restoreRoutingSelection(baseline, on: session)
             } else {
                 session.isDirty = true
-                scheduleSave(for: session.tabID)
+                persistenceRuntime.scheduleSave(for: session.tabID)
                 if currentTabID == session.tabID {
-                    syncStatusPillsUIState()
+                    ui.statusPills.update(makeStatusPillsSnapshot())
                 }
             }
             return result
@@ -329,13 +363,13 @@ extension AgentModeViewModel {
         autoWorkflow: AutoWorkflowTurnSelection? = nil,
         repromptedText: String? = nil
     ) async -> UserTurnSubmissionResult {
-        guard composerSubmitClaimIsCurrent(claim), sessions[destinationTabID] === session else {
+        guard composerSubmitRuntime.isCurrent(claim), sessions[destinationTabID] === session else {
             return .blocked(message: Self.staleComposerSubmitTargetMessage)
         }
         guard modelRouterSettingsStore.autoEffortEnabled() else {
-            return submitUserTurn(
+            return await submitClaimedOrdinaryUserTurn(
                 text: text,
-                tabID: destinationTabID,
+                tabID: destinationTabID, claim: claim,
                 rawDraftText: claim.attempt.rawDraftSnapshot,
                 composerOrigin: .localComposer,
                 routerAudit: routerAudit, autoWorkflow: autoWorkflow, repromptedText: repromptedText,
@@ -349,13 +383,17 @@ extension AgentModeViewModel {
            let task = speculation.effortTask
         {
             let staged = await task.value
-            if reusableRepromptEffort(claim: claim, approved: repromptedText, session: session, autoWorkflow: autoWorkflow) != nil {
+            if let staged, reusableRepromptEffort(claim: claim, approved: repromptedText, session: session, autoWorkflow: autoWorkflow) != nil {
                 choice = staged
             } else {
-                choice = await chooseAutoEffortForUserTurn(text: judgingText, session: session, workflow: judgedWorkflow, isRepromptReplacement: repromptedText != nil)
+                choice = await chooseAutoEffortForUserTurn(text: judgingText, session: session, workflow: judgedWorkflow, isRepromptReplacement: repromptedText != nil, isCurrent: {
+                    composerSubmitRuntime.isCurrent(claim) && sessions[destinationTabID] === session
+                })
             }
         } else {
-            choice = await chooseAutoEffortForUserTurn(text: judgingText, session: session, workflow: judgedWorkflow, isRepromptReplacement: repromptedText != nil)
+            choice = await chooseAutoEffortForUserTurn(text: judgingText, session: session, workflow: judgedWorkflow, isRepromptReplacement: repromptedText != nil, isCurrent: {
+                composerSubmitRuntime.isCurrent(claim) && sessions[destinationTabID] === session
+            })
         }
         var selection = choice.selection
         var effortAudit = choice.audit
@@ -366,7 +404,7 @@ extension AgentModeViewModel {
                 effortAudit.fallbackApplied = true
             }
         }
-        guard composerSubmitClaimIsCurrent(claim), sessions[destinationTabID] === session
+        guard composerSubmitRuntime.isCurrent(claim), sessions[destinationTabID] === session
         else { return .blocked(message: Self.staleComposerSubmitTargetMessage) }
         if let routerAudit, routerAudit.usageBalancingReason != nil {
             guard modelRouterSettingsStore.modelRouterConfiguration().usageBalancing.enabled,
@@ -377,9 +415,9 @@ extension AgentModeViewModel {
                 return .blocked(message: "The usage-balanced selection changed before submission. Send again with the current selection.")
             }
         }
-        let result = submitUserTurn(
+        let result = await submitClaimedOrdinaryUserTurn(
             text: text,
-            tabID: destinationTabID,
+            tabID: destinationTabID, claim: claim,
             rawDraftText: claim.attempt.rawDraftSnapshot,
             composerOrigin: .localComposer,
             autoEffortSelection: selection,
@@ -406,8 +444,15 @@ extension AgentModeViewModel {
         workflow: AgentWorkflowDefinition?,
         requestID: UUID = UUID(),
         isSpeculative: Bool = false,
-        isRepromptReplacement: Bool = false
+        isRepromptReplacement: Bool = false,
+        isCurrent: @MainActor () -> Bool
     ) async -> (selection: AutoEffortTurnSelection?, audit: AgentAutomationTurnAudit.Feature) {
+        var admitted = true
+        func admit() -> Bool {
+            admitted = admitted && isCurrent()
+            return admitted
+        }
+        guard admit() else { return ineligibleAutoEffortChoice() }
         let autoEffortConfiguration = modelRouterSettingsStore.autoEffortConfiguration()
         guard autoEffortConfiguration.enabled else {
             return (nil, .init(configured: false, eligible: false, judgmentRequested: false, decision: .disabled))
@@ -459,23 +504,26 @@ extension AgentModeViewModel {
         default:
             return ineligibleAutoEffortChoice()
         }
-        guard efforts.count >= 2 else { return ineligibleAutoEffortChoice() }
+        guard admit(), efforts.count >= 2 else { return ineligibleAutoEffortChoice() }
         let judgmentID = requestID
         if !isSpeculative {
             session.autoEffortJudgmentID = judgmentID
         }
         if !isSpeculative, currentTabID == session.tabID {
-            syncStatusPillsUIState()
+            ui.statusPills.update(makeStatusPillsSnapshot())
         }
         defer {
+            // Release only this operation's marker, even after claim loss. Leaving it would
+            // block successor MCP turns; a different judgment UUID is never cleared.
             if !isSpeculative, session.autoEffortJudgmentID == judgmentID {
                 session.autoEffortJudgmentID = nil
                 if currentTabID == session.tabID {
-                    syncStatusPillsUIState()
+                    ui.statusPills.update(makeStatusPillsSnapshot())
                 }
             }
         }
         guard let registration = await runtime.registry.registration(for: backendID),
+              admit(),
               let prepared = try? AutoEffortDecisionPolicy().build(
                   requestID: judgmentID,
                   maskedTaskExcerpt: maskedExcerpt,
@@ -492,7 +540,7 @@ extension AgentModeViewModel {
         )
         let chosen = prepared.effort(for: outcome)
         let currentAutoEffortConfiguration = modelRouterSettingsStore.autoEffortConfiguration()
-        guard currentAutoEffortConfiguration.enabled,
+        guard admit(), currentAutoEffortConfiguration.enabled,
               currentAutoEffortConfiguration.revision == autoEffortConfiguration.revision,
               currentAutoEffortConfiguration.selectedBackendRawValue == autoEffortConfiguration.selectedBackendRawValue,
               currentAutoEffortConfiguration.selectedBackendID == backendID,
@@ -512,7 +560,7 @@ extension AgentModeViewModel {
         case .claudeCode: claudeCoordinator.currentClaudeEffortLevel(for: session).rawValue
         default: nil
         }
-        guard currentManualEffortRaw == manualEffortRaw else {
+        guard admit(), currentManualEffortRaw == manualEffortRaw else {
             return (nil, .init(configured: true, eligible: true, judgmentRequested: true, decision: .fallback, fallbackApplied: true))
         }
         return (
@@ -544,7 +592,7 @@ extension AgentModeViewModel {
             previous: session.autoEffortFeedback
         )
         if currentTabID == session.tabID {
-            syncStatusPillsUIState()
+            ui.statusPills.update(makeStatusPillsSnapshot())
         }
     }
 
@@ -569,7 +617,9 @@ extension AgentModeViewModel {
             text: task,
             scope: .subagent,
             surface: surface,
-            providers: providers(for: .subagent, configuration: configuration),
+            providers: AgentTaskRoutingCandidateBuilder.providers(
+                for: .subagent, configuration: configuration, availability: modelRouterAvailabilityContext, surface: .headless
+            ),
             configuration: configuration,
             backendID: backendID,
             runtime: runtime,
@@ -756,15 +806,6 @@ extension AgentModeViewModel {
             && current.selectedBackendID == backendID
     }
 
-    func providers(for scope: AgentTaskRoutingScope, configuration: AgentTaskRouterConfiguration) -> Set<AgentProviderKind> {
-        AgentTaskRoutingCandidateBuilder.providers(
-            for: scope,
-            configuration: configuration,
-            availability: modelRouterAvailabilityContext,
-            surface: scope == .subagent ? .headless : .general
-        )
-    }
-
     func agentModelRoleDefaultReferences() -> [AgentTaskRoutingCandidateBuilder.RoleDefaultReference] {
         MCPAgentRoleDefaultsService.resolutions(
             availability: modelRouterAvailabilityContext,
@@ -780,7 +821,7 @@ extension AgentModeViewModel {
     }
 
     func freshTaskRoutingEligibility(session: TabSession, text: String?) -> Bool {
-        guard isModelRouterEligibleFirstSendDestination(session),
+        guard session.isEmptyFirstSendDestination,
               session.providerSessionID == nil,
               session.codexConversationID == nil,
               session.mcpControlContext == nil,
@@ -794,25 +835,14 @@ extension AgentModeViewModel {
     }
 
     /// Selected prompt workflows still create a brand-new provider session and therefore remain
-    /// Router-owned. The broader first-send helper excludes workflows because it also guards tab
-    /// creation and cleanup, where an empty destination must not yet carry copied pending state.
-    private func isModelRouterEligibleFirstSendDestination(_ session: TabSession) -> Bool {
-        !session.runState.isActive
-            && !session.hasSentFirstMessage
-            && session.runID == nil
-            && session.activeRunAttemptID == nil
-            && session.items.isEmpty
-            && session.transcript.turns.isEmpty
-            && session.pendingFileAttachments.isEmpty
-            && session.pendingTaggedFileAttachments.isEmpty
-    }
-
     private func modelRouterCanRoutePrimarySession(_ configuration: AgentTaskRouterConfiguration) -> Bool {
         guard let backendID = configuration.selectedBackendID,
               modelRouterRuntime?.isBackendReady(backendID) == true
         else { return false }
         return AgentTaskRoutingCandidateBuilder().hasAvailableTarget(
-            allowedProviders: providers(for: .primarySession, configuration: configuration),
+            allowedProviders: AgentTaskRoutingCandidateBuilder.providers(
+                for: .primarySession, configuration: configuration, availability: modelRouterAvailabilityContext, surface: .general
+            ),
             availability: modelRouterAvailabilityContext
         )
     }
@@ -882,7 +912,7 @@ extension AgentModeViewModel {
             freshTaskRoutingByTabID.removeValue(forKey: ownership.destinationTabID)
         }
         syncComposerUIState()
-        syncStatusPillsUIState()
+        ui.statusPills.update(makeStatusPillsSnapshot())
         requestUIRefresh(tabID: ownership.sourceTabID, urgent: true)
         if ownership.destinationTabID != ownership.sourceTabID {
             requestUIRefresh(tabID: ownership.destinationTabID, urgent: true)

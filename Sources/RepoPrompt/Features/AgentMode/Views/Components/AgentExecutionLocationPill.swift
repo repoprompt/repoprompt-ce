@@ -139,16 +139,10 @@ struct AgentExecutionLocationPill: View {
             .frame(height: AgentPillMetrics.height())
             // Stay content-sized for ordinary labels while the text frame still caps and truncates long worktree names.
             .fixedSize(horizontal: true, vertical: false)
-            .background(.ultraThinMaterial)
-            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .stroke(
-                        usesNeutralChrome
-                            ? Color.secondary.opacity(0.15)
-                            : accentColor.opacity(0.35),
-                        lineWidth: usesNeutralChrome ? 0.5 : 0.8
-                    )
+            .agentPillSurface(
+                cornerRadius: cornerRadius,
+                strokeColor: usesNeutralChrome ? Color.secondary.opacity(0.15) : accentColor.opacity(0.35),
+                lineWidth: usesNeutralChrome ? 0.5 : 0.8
             )
         }
         .buttonStyle(.plain)

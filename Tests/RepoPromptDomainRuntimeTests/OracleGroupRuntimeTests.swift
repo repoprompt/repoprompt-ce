@@ -111,6 +111,83 @@ final class OracleGroupRuntimeTests: XCTestCase {
         XCTAssertEqual(completion.terminalDocument.revision, 2)
     }
 
+    func testBackgroundProvenancePropagationAndImmutability() async throws {
+        for enabled in [false, true] {
+            let fixture = try makeRuntime()
+            defer { fixture.cleanup() }
+            let base = try makeStart(count: 2, seed: "background-provenance")
+            let owner = try OracleConversationOwner(kind: "app-tab", identifier: "workspace:fixture:tab:fixture")
+            let start = OracleGroupRuntime.Start(group: base.group, owner: owner, name: base.name, roster: base.roster, members: base.members)
+            let sessionID = UUID(), runID = UUID(), invocationID = UUID()
+            let metadata = OracleBackgroundExecution(agentSessionID: sessionID, agentRunID: runID, invocationID: invocationID)
+            let background = enabled ? metadata : nil
+            let store = fixture.store
+            let input = try OracleInput(mode: .chat, userMessage: "ask")
+            if enabled {
+                let invalid: [(UUID?, UUID, UUID, OracleGroupRuntime.Start)] = [
+                    (nil, runID, invocationID, start), (UUID(), runID, invocationID, start),
+                    (sessionID, UUID(), invocationID, start), (sessionID, runID, UUID(), start),
+                    (sessionID, runID, invocationID, base)
+                ]
+                for (session, run, invocation, target) in invalid {
+                    await XCTAssertOracleRuntimeThrowsErrorAsync {
+                        try await fixture.runtime.execute(
+                            Request(invocationID: invocation, runID: run, claimID: UUID(), input: input, intent: .start(target), agentSessionID: session, backgroundExecution: metadata),
+                            callbacks: .init(executeLane: { _ in XCTFail("Invalid provenance must not dispatch")
+                                return .init(response: "unused")
+                            })
+                        )
+                    } verify: { XCTAssertEqual($0 as? OracleGroupContractError, .invalidGroupResult) }
+                }
+                let absent = try await store.load(groupID: start.group.id, owner: owner)
+                XCTAssertNil(absent, "Provenance refusal must precede persistence")
+            }
+            let completion = try await fixture.runtime.execute(
+                Request(invocationID: invocationID, runID: runID, claimID: UUID(), input: input, intent: .start(start), agentSessionID: sessionID, backgroundExecution: background),
+                callbacks: .init(
+                    prepared: { document in
+                        XCTAssertEqual(document.turns.last?.backgroundExecution, background)
+                        let interrupted = try document.settlingInterrupted(status: .cancelled, code: "cancelled", message: "fixture")
+                        XCTAssertEqual(interrupted.turns.last?.backgroundExecution, background)
+                        let replacements: [OracleBackgroundExecution?] = enabled ? [nil, .init(agentSessionID: UUID(), agentRunID: runID, invocationID: invocationID)] : [metadata]
+                        for replacement in replacements {
+                            let changed = try rewriteBackground(interrupted, metadata: replacement)
+                            await XCTAssertOracleRuntimeThrowsErrorAsync {
+                                try await store.save(changed, expectedRevision: document.revision)
+                            } verify: { XCTAssertEqual($0 as? OraclePersistenceError, .invalidDocument("invalid_terminal_transition")) }
+                        }
+                    },
+                    executeLane: { _ in .init(response: "  exact answer  ") }
+                )
+            )
+            XCTAssertEqual(completion.terminalDocument.schemaVersion, 2)
+            XCTAssertEqual(completion.terminalDocument.turns.last?.backgroundExecution, background)
+            let loaded = try await store.load(groupID: start.group.id, owner: owner)
+            XCTAssertEqual(loaded, completion.terminalDocument)
+            let turnJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(completion.terminalDocument.turns[0])) as? [String: Any])
+            XCTAssertEqual(turnJSON["backgroundExecution"] == nil, !enabled, "Nil must preserve legacy encoding")
+            // Simulate an older schema2 reader rewriting only the fields it knows.
+            let downgraded = try rewriteBackground(completion.terminalDocument, metadata: nil)
+            XCTAssertNil(downgraded.turns.last?.backgroundExecution)
+            XCTAssertEqual(downgraded.turns.last?.results, completion.result.oracleResults)
+            let nextRun = UUID(), nextInvocation = UUID()
+            let nextMetadata = enabled ? OracleBackgroundExecution(agentSessionID: sessionID, agentRunID: nextRun, invocationID: nextInvocation) : nil
+            let continued = try await fixture.runtime.execute(
+                Request(
+                    invocationID: nextInvocation, runID: nextRun, claimID: UUID(), input: input,
+                    intent: .continuation(.init(group: start.group, owner: owner, observedRevision: completion.terminalDocument.revision, expectedRoster: start.roster)),
+                    agentSessionID: sessionID, backgroundExecution: nextMetadata
+                ),
+                callbacks: .init(executeLane: { invocation in
+                    XCTAssertEqual(invocation.priorTerminalTurns.first?.backgroundExecution, background)
+                    return .init(response: "next")
+                })
+            )
+            XCTAssertEqual(continued.terminalDocument.turns.first?.backgroundExecution, background)
+            XCTAssertEqual(continued.terminalDocument.turns.last?.backgroundExecution, nextMetadata)
+        }
+    }
+
     func testCancelledPrimaryPersistsStreamedPartialAfterAuxiliarySettles() async throws {
         let fixture = try makeRuntime()
         defer { fixture.cleanup() }
@@ -580,6 +657,14 @@ final class OracleGroupRuntimeTests: XCTestCase {
         let loaded = try await fixture.store.load(groupID: start.group.id, owner: start.owner)
         XCTAssertEqual(loaded?.revision, first.terminalDocument.revision)
     }
+}
+
+private func rewriteBackground(_ document: OracleGroupDocument, metadata: OracleBackgroundExecution?) throws -> OracleGroupDocument {
+    var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(document)) as? [String: Any])
+    var turns = try XCTUnwrap(object["turns"] as? [[String: Any]])
+    turns[turns.count - 1]["backgroundExecution"] = try metadata.map { try JSONSerialization.jsonObject(with: JSONEncoder().encode($0)) }
+    object["turns"] = turns
+    return try JSONDecoder().decode(OracleGroupDocument.self, from: JSONSerialization.data(withJSONObject: object))
 }
 
 private enum RuntimeFixtureError: Error, Equatable, CustomStringConvertible {

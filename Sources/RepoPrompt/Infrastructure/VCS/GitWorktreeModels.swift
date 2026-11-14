@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptInstrumentation
 import RepoPromptVCS
+import RepoPromptWorkspaceContext
 
 // MARK: - App-integrated Worktree Mutation Models
 

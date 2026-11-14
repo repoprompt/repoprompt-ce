@@ -1,4 +1,7 @@
 import Foundation
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
+import RepoPromptClaudeProvider
 
 enum ClaudeCodeAIModelCatalog {
     static let rawPrefix = "claude_code__"
@@ -24,6 +27,7 @@ enum ClaudeCodeAIModelCatalog {
 
     private static let modelDefinitions: [ModelDefinition] = [
         ModelDefinition(runtimeModelRaw: "fable", displayName: "Fable Latest", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
+        ModelDefinition(runtimeModelRaw: "claude-fable-5-2", displayName: "Fable 5.2", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
         ModelDefinition(runtimeModelRaw: "claude-fable-5-1", displayName: "Fable 5.1", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
         ModelDefinition(runtimeModelRaw: "claude-fable-5", displayName: "Fable 5", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
         // Restricted-access tier; listed for entitled accounts but never used as a default.
@@ -47,9 +51,7 @@ enum ClaudeCodeAIModelCatalog {
     ]
 
     static func normalizedSpecifier(_ specifier: String) -> String {
-        specifier
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
+        normalizedClaudeCodeModelIdentitySpecifier(specifier)
     }
 
     static func runtimeSpecifierRaw(for model: AIModel) -> String? {

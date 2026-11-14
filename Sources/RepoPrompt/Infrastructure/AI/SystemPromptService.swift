@@ -1,8 +1,11 @@
 import Foundation
+import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptFoundation
 import RepoPromptSettingsCore
 import RepoPromptShared
+import RepoPromptWorkspaceContext
 
 class SystemPromptService {
     /// Returns the Discover prompt with an optional token budget.
@@ -907,7 +910,7 @@ class SystemPromptService {
         - `prompt` - Get or modify the shared prompt; export context
         - `workspace_context` - Get a combined workspace snapshot (prompt + selection + tokens)
         - `ask_oracle` - Consult a second AI for planning, review, or questions. File reads are tracked so the Oracle knows what you see. Prefer one long-running chat (`new_chat:false`) within the current Agent run; chats are tied to the run that created them, which can change (for example after Stop, Clear chat, or an app relaunch).
-        - `oracle_chat_log` - Read recent Oracle conversation messages from the current Agent run's chats, for example to recover context after compaction
+        - `oracle_chat_log` - Legacy reads return recent Oracle conversation messages from the current Agent run's chats, for example to recover context after compaction. \(OracleBackgroundContract.promptQualification)
 
         \(agentDelegationSection)
 

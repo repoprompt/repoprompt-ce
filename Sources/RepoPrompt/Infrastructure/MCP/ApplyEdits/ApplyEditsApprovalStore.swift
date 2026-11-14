@@ -11,19 +11,23 @@ struct PendingApplyEditsReview: Identifiable, Hashable {
     let path: String
     let unifiedDiff: String
     let createdAt: Date
+    /// Process-local admission ordering, never wall-clock cancellation or persisted identity.
+    let admissionTime: ContinuousClock.Instant
 
     init(
         id: UUID = UUID(),
         scope: ApplyEditsApprovalScope,
         path: String,
         unifiedDiff: String,
-        createdAt: Date = Date()
+        createdAt: Date = Date(),
+        admissionTime: ContinuousClock.Instant = .now
     ) {
         self.id = id
         self.scope = scope
         self.path = path
         self.unifiedDiff = unifiedDiff
         self.createdAt = createdAt
+        self.admissionTime = admissionTime
     }
 }
 
@@ -51,6 +55,7 @@ struct ApplyEditsApprovalSnapshot: Equatable {
     let scope: ApplyEditsApprovalScope
     var autoEditEnabled: Bool
     var pendingReview: PendingApplyEditsReview?
+    var syncLease: UUID?
 }
 
 actor ApplyEditsApprovalStore: Sendable {
@@ -77,12 +82,120 @@ actor ApplyEditsApprovalStore: Sendable {
 
     private typealias SnapshotContinuation = AsyncStream<ApplyEditsApprovalSnapshot>.Continuation
 
-    private var autoEditOverridesByScope: [ApplyEditsApprovalScope: Bool] = [:]
+    /// One resource revision per existing scope entry. A nil value still follows the global
+    /// default; preparing a conditional override does not freeze that fallback.
+    private struct AutoEditEntry {
+        var value: Bool?
+        var revision = UUID()
+        var owner: UUID?
+        var restoreValue: Bool?
+        var syncSeedOwner: UUID?
+    }
+
+    struct AutoEditOverride: Equatable {
+        fileprivate let scope: ApplyEditsApprovalScope
+        fileprivate let revision: UUID
+        fileprivate let expectedValue: Bool
+        let restoreValue: Bool
+        fileprivate let id = UUID()
+    }
+
+    struct SyncPreparation {
+        fileprivate let scope: ApplyEditsApprovalScope
+        fileprivate let revision: UUID
+        fileprivate let autoEditRevision: UUID?
+    }
+
+    /// Resource ownership, not session-writer authority. Preparation does not replace a
+    /// lease or seed a value; admission is revalidated by the runtime before commit.
+    private var syncRevisions: [ApplyEditsApprovalScope: UUID] = [:]
+    private var syncLeases: [ApplyEditsApprovalScope: UUID] = [:]
+
+    func prepareSync(scope: ApplyEditsApprovalScope) -> SyncPreparation {
+        let revision = syncRevisions[scope] ?? UUID()
+        syncRevisions[scope] = revision
+        return .init(scope: scope, revision: revision, autoEditRevision: autoEditOverridesByScope[scope]?.revision)
+    }
+
+    func abandonSync(_ preparation: SyncPreparation) {
+        guard syncRevisions[preparation.scope] == preparation.revision,
+              syncLeases[preparation.scope] == nil else { return }
+        syncRevisions.removeValue(forKey: preparation.scope)
+    }
+
+    /// Compare and commit without suspension. A competing begin or cleanup invalidates
+    /// the preparation, including cleanup back to an absent entry (no nil/ nil ABA).
+    func commitSync(
+        _ preparation: SyncPreparation, initialValue: Bool,
+        replacePayload: Bool
+    ) -> (lease: UUID, id: UUID, stream: AsyncStream<ApplyEditsApprovalSnapshot>)? {
+        let scope = preparation.scope
+        guard syncRevisions[scope] == preparation.revision else { return nil }
+        let entry = autoEditOverridesByScope[scope]
+        // Ownership follows the actual store seed, not an intermediate runtime begin
+        // that may never have committed. Manual writes clear this marker.
+        let ownsSeed = entry?.syncSeedOwner != nil && entry?.syncSeedOwner == syncLeases[scope]
+        let lease = UUID()
+        syncRevisions[scope] = lease
+        syncLeases[scope] = lease
+        if entry == nil || (
+            (replacePayload || ownsSeed)
+                && entry?.owner == nil && entry?.revision == preparation.autoEditRevision
+        ) {
+            autoEditOverridesByScope[scope] = AutoEditEntry(value: initialValue, syncSeedOwner: lease)
+        } else if var entry, entry.syncSeedOwner != nil {
+            entry.syncSeedOwner = lease
+            autoEditOverridesByScope[scope] = entry
+        }
+        publishSnapshot(for: scope)
+        let subscription = subscribe(scope: scope)
+        return (lease, subscription.id, subscription.stream)
+    }
+
+    @discardableResult
+    func setAutoEditEnabled(_ enabled: Bool, for scope: ApplyEditsApprovalScope, lease: UUID, updateGlobalDefault: Bool) -> Bool {
+        guard syncLeases[scope] == lease else { return false }
+        setAutoEditEnabled(enabled, for: scope, updateGlobalDefault: updateGlobalDefault)
+        return true
+    }
+
+    func cleanupSync(scope: ApplyEditsApprovalScope, lease: UUID, admittedAtOrBefore cutoff: ContinuousClock.Instant) {
+        guard syncLeases[scope] == lease else { return }
+        cancelPendingReview(scope: scope, reason: "Approval scope cleaned up", admittedAtOrBefore: cutoff)
+        syncLeases.removeValue(forKey: scope)
+        syncRevisions.removeValue(forKey: scope)
+        // Work admitted after teardown remains independently settleable.
+        if pendingByScope[scope] != nil {
+            publishSnapshot(for: scope)
+            return
+        }
+        autoEditOverridesByScope.removeValue(forKey: scope)
+        finishAndRemoveAllSubscriptions(for: scope)
+    }
+
+    private var autoEditOverridesByScope: [ApplyEditsApprovalScope: AutoEditEntry] = [:]
     private var pendingByScope: [ApplyEditsApprovalScope: PendingRecord] = [:]
     private var subscriptions: [ApplyEditsApprovalScope: [UUID: SnapshotContinuation]] = [:]
 
+    #if DEBUG
+        private var test_beforeRequestCancellation: (@Sendable () async -> Void)?
+        private var test_afterRequestCancellation: (@Sendable () -> Void)?
+        private var test_onAutoEditOverridePrepared: (@Sendable (ApplyEditsApprovalScope) -> Void)?
+
+        func test_setAutoEditOverridePreparedHook(_ hook: (@Sendable (ApplyEditsApprovalScope) -> Void)?) {
+            test_onAutoEditOverridePrepared = hook
+        }
+
+        func test_setRequestCancellationHooks(
+            before: (@Sendable () async -> Void)?, after: (@Sendable () -> Void)?
+        ) {
+            test_beforeRequestCancellation = before
+            test_afterRequestCancellation = after
+        }
+    #endif
+
     func autoEditEnabled(for scope: ApplyEditsApprovalScope) -> Bool {
-        autoEditOverridesByScope[scope] ?? Self.globalDefaultAutoEditEnabled()
+        autoEditOverridesByScope[scope]?.value ?? Self.globalDefaultAutoEditEnabled()
     }
 
     func setAutoEditEnabled(
@@ -90,11 +203,61 @@ actor ApplyEditsApprovalStore: Sendable {
         for scope: ApplyEditsApprovalScope,
         updateGlobalDefault: Bool
     ) {
-        autoEditOverridesByScope[scope] = enabled
+        // Every ordinary write supersedes an outstanding override, including a same-value
+        // manual write. Old cleanup cannot restore over that choice.
+        autoEditOverridesByScope[scope] = AutoEditEntry(value: enabled)
         if updateGlobalDefault {
             Self.setGlobalDefaultAutoEditEnabled(enabled)
         }
         publishSnapshot(for: scope)
+    }
+
+    func prepareAutoEditOverride(for scope: ApplyEditsApprovalScope) -> AutoEditOverride {
+        let entry = autoEditOverridesByScope[scope] ?? AutoEditEntry()
+        autoEditOverridesByScope[scope] = entry
+        let receipt = AutoEditOverride(
+            scope: scope, revision: entry.revision,
+            expectedValue: autoEditEnabled(for: scope),
+            restoreValue: entry.restoreValue ?? autoEditEnabled(for: scope)
+        )
+        #if DEBUG
+            test_onAutoEditOverridePrepared?(scope)
+        #endif
+        return receipt
+    }
+
+    /// No suspension between comparison and mutation. A cancelled, cleaned-up, or superseded
+    /// request cannot arrive late and overwrite the next occupant of this resource address.
+    func applyAutoEditOverride(_ receipt: AutoEditOverride) -> Bool {
+        guard var entry = autoEditOverridesByScope[receipt.scope],
+              entry.revision == receipt.revision,
+              autoEditEnabled(for: receipt.scope) == receipt.expectedValue else { return false }
+        entry.value = true
+        entry.owner = receipt.id
+        entry.restoreValue = receipt.restoreValue
+        entry.revision = UUID()
+        autoEditOverridesByScope[receipt.scope] = entry
+        publishSnapshot(for: receipt.scope)
+        return true
+    }
+
+    func releaseAutoEditOverride(_ receipt: AutoEditOverride) {
+        guard var entry = autoEditOverridesByScope[receipt.scope] else { return }
+        // Even a superseded restore must project the resource's actual value, rather than
+        // leave the detached session's speculative restore visible in an attached presenter.
+        defer { publishSnapshot(for: receipt.scope) }
+        if entry.owner == receipt.id {
+            entry.value = receipt.restoreValue
+            entry.owner = nil
+            entry.restoreValue = nil
+            entry.revision = UUID()
+            autoEditOverridesByScope[receipt.scope] = entry
+        } else if entry.revision == receipt.revision {
+            // Release may beat apply to the actor. Invalidate that pending request without
+            // changing the effective value, retaining tombstones, or retrying on a successor.
+            entry.revision = UUID()
+            autoEditOverridesByScope[receipt.scope] = entry
+        }
     }
 
     func requestReview(
@@ -140,9 +303,9 @@ actor ApplyEditsApprovalStore: Sendable {
                 )
                 publishSnapshot(for: scope)
             }
-        }, onCancel: {
+        }, onCancel: { [reviewID = review.id] in
             Task {
-                await self.cancelPendingReview(scope: scope, reason: cancellationReason)
+                await self.cancelRequest(scope: scope, reviewID: reviewID, reason: cancellationReason)
             }
         })
         EditFlowPerf.end(
@@ -153,27 +316,47 @@ actor ApplyEditsApprovalStore: Sendable {
         return decision
     }
 
+    /// Caller cancellation may arrive after replacement, response, or timeout. Its public
+    /// address is not authority to cancel a later request in that same approval scope.
+    private func cancelRequest(scope: ApplyEditsApprovalScope, reviewID: UUID, reason: String) async {
+        #if DEBUG
+            await test_beforeRequestCancellation?()
+        #endif
+        resolvePendingReviewIfMatching(scope: scope, reviewID: reviewID, decision: .cancelled(reason: reason))
+        #if DEBUG
+            test_afterRequestCancellation?()
+        #endif
+    }
+
+    @discardableResult
     func resolveReview(
         scope: ApplyEditsApprovalScope,
         reviewID: UUID,
         decision: ApplyEditsReviewDecision
-    ) {
+    ) -> Bool {
         resolvePendingReviewIfMatching(scope: scope, reviewID: reviewID, decision: decision)
     }
 
-    func cancelPendingReview(scope: ApplyEditsApprovalScope, reason: String) {
-        guard let record = pendingByScope[scope] else { return }
+    func cancelPendingReview(
+        scope: ApplyEditsApprovalScope,
+        reason: String,
+        admittedAtOrBefore cutoff: ContinuousClock.Instant? = nil
+    ) {
+        guard let record = pendingByScope[scope],
+              cutoff.map({ record.review.admissionTime <= $0 }) != false else { return }
         finishPendingReview(scope: scope, record: record, decision: .cancelled(reason: reason))
     }
 
     func cleanupScope(_ scope: ApplyEditsApprovalScope) {
+        syncLeases.removeValue(forKey: scope)
+        syncRevisions.removeValue(forKey: scope)
         cancelPendingReview(scope: scope, reason: "Approval scope cleaned up")
         autoEditOverridesByScope.removeValue(forKey: scope)
         finishAndRemoveAllSubscriptions(for: scope)
     }
 
     func cleanupWindowScopes(windowID: Int, reason: String) {
-        var scopesToCleanup = Set<ApplyEditsApprovalScope>()
+        var scopesToCleanup = Set(syncRevisions.keys.filter { $0.windowID == windowID })
         for scope in autoEditOverridesByScope.keys where scope.windowID == windowID {
             scopesToCleanup.insert(scope)
         }
@@ -185,6 +368,8 @@ actor ApplyEditsApprovalStore: Sendable {
         }
         guard !scopesToCleanup.isEmpty else { return }
         for scope in scopesToCleanup {
+            syncLeases.removeValue(forKey: scope)
+            syncRevisions.removeValue(forKey: scope)
             cancelPendingReview(scope: scope, reason: reason)
             autoEditOverridesByScope.removeValue(forKey: scope)
             finishAndRemoveAllSubscriptions(for: scope)
@@ -218,13 +403,15 @@ actor ApplyEditsApprovalStore: Sendable {
         }
     #endif
 
+    @discardableResult
     private func resolvePendingReviewIfMatching(
         scope: ApplyEditsApprovalScope,
         reviewID: UUID,
         decision: ApplyEditsReviewDecision
-    ) {
-        guard let record = pendingByScope[scope], record.review.id == reviewID else { return }
+    ) -> Bool {
+        guard let record = pendingByScope[scope], record.review.id == reviewID else { return false }
         finishPendingReview(scope: scope, record: record, decision: decision)
+        return true
     }
 
     private func finishPendingReview(
@@ -242,7 +429,8 @@ actor ApplyEditsApprovalStore: Sendable {
         ApplyEditsApprovalSnapshot(
             scope: scope,
             autoEditEnabled: autoEditEnabled(for: scope),
-            pendingReview: pendingByScope[scope]?.review
+            pendingReview: pendingByScope[scope]?.review,
+            syncLease: syncLeases[scope]
         )
     }
 

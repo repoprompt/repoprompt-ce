@@ -3,6 +3,7 @@ import Foundation
 @testable import RepoPromptApp
 import RepoPromptFileSystem
 import RepoPromptVCS
+@testable import RepoPromptWorkspaceContext
 
 enum WorkspaceRootTargetSeedPlanTestSupport {
     struct Fixture {

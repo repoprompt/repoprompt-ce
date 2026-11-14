@@ -29,12 +29,12 @@ final class AgentSessionLinkAutoWakePersistenceTests: XCTestCase {
         )
         let live = viewModel.session(for: UUID())
         XCTAssertTrue(live.oversight.autoWakeOnUpdates, "fresh sessions default on")
-        XCTAssertFalse(live.oversight.routineWakeIntervalEnabled)
+        XCTAssertTrue(live.oversight.routineWakeIntervalEnabled)
         XCTAssertEqual(live.oversight.routineWakeIntervalSeconds, 300)
         XCTAssertFalse(live.oversight.periodicIdleWakeEnabled)
         XCTAssertEqual(live.oversight.periodicIdleWakeIntervalSeconds, 1800)
 
-        viewModel.restoreAgentSessionLinkState(from: decodedOff, to: live)
+        AgentSessionHydrationRuntime.restoreLinkState(from: decodedOff, to: live)
 
         XCTAssertFalse(live.oversight.autoWakeOnUpdates, "the durable saved choice wins")
         XCTAssertFalse(live.oversight.routineWakeIntervalEnabled)
@@ -57,7 +57,7 @@ final class AgentSessionLinkAutoWakePersistenceTests: XCTestCase {
             periodicIdleWakeIntervalSeconds: 3600
         )
         let decodedOn = try JSONDecoder().decode(AgentSession.self, from: JSONEncoder().encode(savedOn))
-        viewModel.restoreAgentSessionLinkState(from: decodedOn, to: live)
+        AgentSessionHydrationRuntime.restoreLinkState(from: decodedOn, to: live)
 
         XCTAssertTrue(live.oversight.autoWakeOnUpdates)
         XCTAssertTrue(live.oversight.routineWakeIntervalEnabled)
@@ -66,6 +66,17 @@ final class AgentSessionLinkAutoWakePersistenceTests: XCTestCase {
         XCTAssertEqual(live.oversight.periodicIdleWakeIntervalSeconds, 3600)
         XCTAssertEqual(live.oversight.autoWakeTargetSessionIDs, [selectedTargetID])
         XCTAssertNil(live.oversight.pendingAutoWake, "restoration must not reserve a provider turn")
+    }
+
+    func testNoDelayPickerMappingRetainsInterval() {
+        let noDelay = AgentSessionLinkRoutineWakeInterval.pickerSelection(0, retaining: 600)
+        XCTAssertFalse(noDelay.enabled)
+        XCTAssertEqual(noDelay.seconds, 600)
+        XCTAssertEqual(AgentSessionLinkRoutineWakeInterval.pickerSeconds(enabled: noDelay.enabled, seconds: noDelay.seconds), 0)
+        let limited = AgentSessionLinkRoutineWakeInterval.pickerSelection(300, retaining: noDelay.seconds)
+        XCTAssertTrue(limited.enabled)
+        XCTAssertEqual(limited.seconds, 300)
+        XCTAssertEqual(AgentSessionLinkRoutineWakeInterval.pickerSeconds(enabled: limited.enabled, seconds: limited.seconds), 300)
     }
 
     func testLegacyPayloadsDecodeAutoWakeFailClosed() throws {

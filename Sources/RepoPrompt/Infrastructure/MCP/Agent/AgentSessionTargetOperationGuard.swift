@@ -128,7 +128,11 @@ enum AgentSessionTargetOperationGuard {
         }
         if await hasAuthoritativeAgentRunPurpose(metadata: metadata) { return true }
         // No authoritative purpose survived; fall back to server-installed run routing.
-        return targetWindow?.mcpServer.hasExactRunScopedTabContext(metadata: metadata) ?? false
+        guard let targetWindow else { return false }
+        return targetWindow.mcpServer.hasExactRunScopedTabContext(
+            route: targetWindow.mcpServer.routeResources,
+            metadata: metadata
+        )
     }
 
     /// The captured/live/cached run-purpose triple, reconciled with a rehydration attempt.

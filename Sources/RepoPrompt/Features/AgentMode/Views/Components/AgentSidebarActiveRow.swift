@@ -292,7 +292,8 @@ struct AgentSidebarActiveRow: View, Equatable {
             guard let rowSessionID = session.sessionID, let agentModeVM = actions.agentModeVM else {
                 return .failure(AgentOversightResolutionMessage(message: AgentOversightUICopy.oversightUnavailableMessage))
             }
-            return await agentModeVM.resolveSidebarOverseerCandidate(rawSessionID: raw, excludingTargetSessionID: rowSessionID)
+            defer { withExtendedLifetime(agentModeVM) {} }
+            return await AgentSessionLinkRuntimeBridge.shared.resolveSidebarOverseerCandidate(rawSessionID: raw, excludingTargetSessionID: rowSessionID)
         }
         let resolveTargetCandidate: (@MainActor (String) async -> Result<AgentOversightSessionIDResolution, AgentOversightResolutionMessage>)? = {
             raw in

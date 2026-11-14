@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptMCPServer
 
 /// One self-only MCP surface. Caller authority comes exclusively from server-owned run routing and
 /// the immutable registration-time run attempt; tool arguments cannot name a target.

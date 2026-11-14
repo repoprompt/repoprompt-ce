@@ -1,3 +1,5 @@
+import RepoPromptACPProviders
+import RepoPromptAIContracts
 import RepoPromptSettingsCore
 import SwiftUI
 

@@ -114,7 +114,6 @@ extension AgentModeViewModel {
         let profile = modelRouterSettingsStore.effectiveAgentModelsProfile(workspaceID: workspaceID)
         let mode = workspaceID.map { modelRouterSettingsStore.workspaceAgentModelsSettings(for: $0).inheritanceMode }
         let capturedPending = Self.pendingUserTurnState(from: session)
-        let interactions = Self.repromptBlockingInteractions(session)
         let workflowGeneration = session.userWorkflowSelectionMutationGeneration
         let history = repromptIncludesRecentChat ? AgentRepromptHistory.make(
             items: session.items, compactedAt: session.contextCompactedAt, hasActiveTurn: session.runState.isActive,
@@ -152,15 +151,24 @@ extension AgentModeViewModel {
             // Which session is visible is deliberately not part of this: a rewrite outlives a switch.
             isCurrent: { [weak self, weak session] in
                 guard let self, let session, let operation = repromptOperations[target.tabID], operation.id == id else { return false }
+                if let writer = target.expectedWriterIdentity {
+                    guard let sessionID = target.expectedSourceAgentSessionID,
+                          (try? runtimeCommand(sessionID: sessionID))?.identity == writer else { return false }
+                }
                 let live = modelRouterSettingsStore.effectiveAgentModelsProfile(workspaceID: workspaceID)
                 let liveMode = workspaceID.map { self.modelRouterSettingsStore.workspaceAgentModelsSettings(for: $0).inheritanceMode }
                 return sessions[target.tabID] === session
                     && workspaceManager?.activeWorkspaceID == workspaceID
                     && (operation.mode != .sendAutomatically || repromptEnabled)
-                    && makeComposerSubmitTarget(tabID: target.tabID, session: session) == target
+                    && session.persistentSessionBindingIdentity == target.expectedPersistentBindingIdentity
+                    && session.bindingTransitionGeneration == target.expectedBindingTransitionGeneration
+                    && session.composerSubmissionToken == target.expectedSubmissionToken
+                    // Completion may clear a run; a different non-nil target is new inbound authority.
+                    && (session.runID == nil || session.runID == target.expectedRunID)
+                    && (session.activeRunAttemptID == nil || session.activeRunAttemptID == target.expectedRunAttemptID)
+                    && composerSourceAgentSessionID(tabID: target.tabID, session: session) == target.expectedSourceAgentSessionID
                     && (operation.isPublishing || (session.draftText == operation.expectedDraft && session.draftMutationGeneration == operation.expectedDraftGeneration))
                     && Self.pendingUserTurnState(from: session) == capturedPending
-                    && Self.repromptBlockingInteractions(session) == interactions
                     && session.userWorkflowSelectionMutationGeneration == workflowGeneration
                     && session.operationAdmissionFailureMessage == nil
                     && liveMode == mode && live.agentRepromptModelRaw == profile.agentRepromptModelRaw
@@ -171,19 +179,26 @@ extension AgentModeViewModel {
             }
         )
         repromptOperations[target.tabID] = operation
+        operation.onAutoSendReady = { [weak self, weak operation] in
+            guard let self, let operation else { return }
+            sendBackgroundRepromptIfReady(operation)
+        }
         operation.onComplete = { [weak self, weak operation, weak session] brief in
             guard let self, let operation, let session else { return }
             startRepromptSpeculation(session: session, operationID: operation.id, text: brief, originalText: operation.rawDraft)
         }
-        operation.onStateChange = { [weak self] in self?.syncStatusPillsUIState() }
-        operation.onEdit = { [weak self] in self?.cancelRepromptSpeculation(claimID: id) }
+        operation.onStateChange = { [weak self] in if let self { ui.statusPills.update(makeStatusPillsSnapshot()) } }
+        operation.onEdit = { [weak self] in
+            guard let self else { return }
+            repromptSpeculations.removeValue(forKey: id)?.cancel(runtime: modelRouterRuntime)
+        }
         operation.onClose = { [weak self] in
             guard let self else { return }
-            cancelRepromptSpeculation(claimID: id)
+            repromptSpeculations.removeValue(forKey: id)?.cancel(runtime: modelRouterRuntime)
             if repromptOperations[target.tabID]?.id == id {
                 repromptOperations[target.tabID] = nil
             }
-            syncStatusPillsUIState()
+            ui.statusPills.update(makeStatusPillsSnapshot())
         }
         let check: () -> Void = { [weak operation] in operation?.scheduleValidation() }
         session.objectWillChange.sink { _ in check() }.store(in: &operation.observations)
@@ -192,8 +207,31 @@ extension AgentModeViewModel {
         workspaceManager?.objectWillChange.sink { _ in check() }.store(in: &operation.observations)
         promptManager?.objectWillChange.sink { _ in check() }.store(in: &operation.observations)
         operation.start()
-        syncStatusPillsUIState()
+        ui.statusPills.update(makeStatusPillsSnapshot())
         return true
+    }
+
+    /// The visible editor retains its native-edit/IME fence. An offscreen operation has no
+    /// editor to drive auto-send, so it hands the same exact draft to the ordinary submit owner.
+    func sendBackgroundRepromptIfReady(_ operation: AgentRepromptOperation) {
+        let tabID = operation.sourceTabID
+        guard currentTabID != tabID, repromptEnabled,
+              repromptOperations[tabID] === operation, operation.validate(),
+              let session = sessions[tabID], !Self.repromptBlockingInteractions(session).contains(true),
+              let request = repromptUIStore.autoSendRequests[tabID],
+              let target = makeComposerSubmitTarget(tabID: tabID, session: session),
+              !ui.composer.hasPendingSubmission(tabID: tabID),
+              operation.consumeAutoSend(request) else { return }
+        let attempt = AgentComposerSubmitAttempt(
+            id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: request.text
+        )
+        guard case let .claimed(claim) = claimComposerSubmitForImmediatePresentation(attempt, requireActiveTabOwnership: false) else {
+            operation.invalidate(reason: "The prepared turn could not be admitted. Review the draft before sending.")
+            return
+        }
+        Task { @MainActor [self] in
+            _ = await executePresentedComposerSubmitAttempt(text: request.text, claim: claim)
+        }
     }
 
     /// Cmd-Return is local, explicit Review preparation even when the pill is off.
@@ -256,7 +294,7 @@ extension AgentModeViewModel {
 
     func invalidateRepromptIfNeeded() {
         for operation in Array(repromptOperations.values) {
-            _ = operation.validate()
+            if operation.validate() { operation.scheduleValidation() }
         }
     }
 

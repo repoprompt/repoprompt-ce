@@ -62,17 +62,9 @@ actor JevRouterCredentialService: DecisionServiceConfigurationController {
             }
             try secureKeys.saveAPIKey(trimmed, for: .jevRouterAPIKey, accessMode: .interactive)
             guard owns(operationID), !Task.isCancelled else { return .superseded }
-            advanceGeneration(validated: true)
-            startupValidatedGeneration = generation
-            return .saved(generation: generation, supportedModel: supportedModel)
-        } catch is CancellationError {
-            return .superseded
+            return completeValidation(supportedModel: supportedModel)
         } catch {
-            guard owns(operationID), !Task.isCancelled else { return .superseded }
-            if error as? JevRoutingClientError == .authentication {
-                advanceGeneration(validated: false)
-            }
-            return .failed(Self.redactedMessage(for: error))
+            return validationFailure(error, operationID: operationID)
         }
     }
 
@@ -95,18 +87,25 @@ actor JevRouterCredentialService: DecisionServiceConfigurationController {
                 advanceGeneration(validated: false)
                 return .failed("The account does not expose a supported Jev evaluator.")
             }
-            advanceGeneration(validated: true)
-            startupValidatedGeneration = generation
-            return .saved(generation: generation, supportedModel: supportedModel)
-        } catch is CancellationError {
-            return .superseded
+            return completeValidation(supportedModel: supportedModel)
         } catch {
-            guard owns(operationID), !Task.isCancelled else { return .superseded }
-            if error as? JevRoutingClientError == .authentication {
-                advanceGeneration(validated: false)
-            }
-            return .failed(Self.redactedMessage(for: error))
+            return validationFailure(error, operationID: operationID)
         }
+    }
+
+    private func completeValidation(supportedModel: String) -> ValidationResult {
+        advanceGeneration(validated: true)
+        startupValidatedGeneration = generation
+        return .saved(generation: generation, supportedModel: supportedModel)
+    }
+
+    private func validationFailure(_ error: Error, operationID: UUID) -> ValidationResult {
+        if error is CancellationError { return .superseded }
+        guard owns(operationID), !Task.isCancelled else { return .superseded }
+        if error as? JevRoutingClientError == .authentication {
+            advanceGeneration(validated: false)
+        }
+        return .failed(Self.redactedMessage(for: error))
     }
 
     func delete(operationID: UUID) throws {

@@ -2,8 +2,10 @@ import Combine
 import Darwin
 import Foundation
 import MCP
+import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+@testable import RepoPromptMCPServer
 import RepoPromptSettingsCore
 import RepoPromptShared
 import XCTest
@@ -190,7 +192,7 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
             )
             XCTAssertNotNil(token, "the live route survives a cancelled attempt")
             XCTAssertNotNil(
-                window(observer).agentSessionLinkPromptContext(for: observer.session),
+                window(observer).linkExecutionRuntime.agentSessionLinkPromptContext(for: observer.session),
                 "the observer's prompt gate stays open on the still-mapped connection"
             )
             _ = try await observer.manager.debugListToolNames(for: observer.connectionID)
@@ -247,13 +249,13 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
             session.runState = .idle
             session.oversight.periodicIdleWakeEnabled = true
             session.oversight.periodicIdleWakeIntervalSeconds = 21600
-            XCTAssertNotNil(viewModel.agentSessionLinkPromptContext(for: session), "prompt gate")
+            XCTAssertNotNil(viewModel.linkExecutionRuntime.agentSessionLinkPromptContext(for: session), "prompt gate")
             XCTAssertTrue(
-                AgentModeViewModel.agentSessionLinkPeriodicWakeSessionIsIdle(session),
-                "idle: \(AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(session: session, endpointMatchesGrant: true, isClosing: false))"
+                AgentSessionLinkExecutionRuntime.agentSessionLinkPeriodicWakeSessionIsIdle(session),
+                "idle: \(AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(session: session, endpointMatchesGrant: true, isClosing: false))"
             )
-            XCTAssertTrue(viewModel.agentSessionLinkPeriodicWakeIsEligible(session, endpoint: observer.endpoint), "periodic eligibility")
-            viewModel.agentSessionLinkReconcilePeriodicWake(for: observer.endpoint)
+            XCTAssertTrue(viewModel.linkExecutionRuntime.agentSessionLinkPeriodicWakeIsEligible(session, endpoint: observer.endpoint), "periodic eligibility")
+            viewModel.linkExecutionRuntime.agentSessionLinkReconcilePeriodicWake(for: observer.endpoint)
             XCTAssertNotNil(
                 session.oversight.periodicDeadline,
                 "the periodic idle wake must still arm after a cancelled reused-run attempt"
@@ -264,7 +266,7 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
             session.oversight.periodicIdleWakeEnabled = false
             session.oversight.autoWakeOnUpdates = true
             session.runState = .running
-            viewModel.agentSessionLinkPublishPassiveStatusNotices(
+            viewModel.linkExecutionRuntime.agentSessionLinkPublishPassiveStatusNotices(
                 laneSnapshot(observerEndpoint: observer.endpoint),
                 to: observer.endpoint
             )
@@ -274,7 +276,7 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
             XCTAssertNotEqual(reserved?.phase, .cancelledBeforeDispatch)
             XCTAssertEqual(reserved?.admissionBasis, .routineStatusOrOverflow)
             if let reserved {
-                viewModel.cancelAgentSessionLinkAutoWake(for: reserved.observerEndpoint, reason: .settingDisabled)
+                viewModel.linkExecutionRuntime.cancelAgentSessionLinkAutoWake(for: reserved.observerEndpoint, reason: .settingDisabled)
             }
         #else
             throw XCTSkip("Requires DEBUG MCP routing fixtures.")
@@ -794,9 +796,18 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
                 let session = window.agentModeViewModel.session(for: tabID)
                 session.selectedAgent = .claudeCode
                 session.hasLoadedPersistedState = true
-                _ = try XCTUnwrap(window.agentModeViewModel.test_installPersistentSessionBinding(
-                    sessionID: sessionID, on: session
-                ))
+                if window === first {
+                    _ = try XCTUnwrap(window.agentModeViewModel.test_installPersistentSessionBinding(
+                        sessionID: sessionID, on: session, updateWorkspaceMetadata: true
+                    ))
+                } else {
+                    XCTAssertEqual(window.agentModeViewModel.runtimeSessionStore.bindingRejection(sessionID, on: session), .conflictingWriter)
+                    XCTAssertNil(window.agentModeViewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session))
+                    XCTAssertNil(session.persistentSessionBindingIdentity)
+                    // Discovery still diagnoses legacy corruption, even though normal installation
+                    // now refuses a second writer. Inject only for this read-only census witness.
+                    session.testInstallPersistentSessionBinding(sessionID: sessionID)
+                }
             }
             manager.allWindows = [first, second]
             let firstCandidate = try XCTUnwrap(first.agentModeViewModel.agentSessionLinkCandidates(isWindowClosing: false).first)
@@ -825,6 +836,8 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
                 }
             }
 
+            XCTAssertNil(manager.agentSessionLinkModelCandidate(for: firstCandidate.domainEndpoint))
+            XCTAssertNil(manager.agentSessionLinkModelCandidate(for: secondCandidate.domainEndpoint), "No model command may elect one conflicting writer")
             try assertQueries("Both routable windows retain the shared UUID")
             XCTAssertEqual(manager.agentSessionLinkCandidates().count, 2)
             manager.allWindows = [first, first, second]
@@ -839,7 +852,10 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
             let duplicateTabID = UUID()
             workspace.workspaces[0].composeTabs.append(ComposeTabState(id: duplicateTabID, name: "Duplicate", activeAgentSessionID: sessionID))
             let duplicate = vm.session(for: duplicateTabID)
-            _ = vm.test_installPersistentSessionBinding(sessionID: sessionID, on: duplicate)
+            XCTAssertEqual(vm.runtimeSessionStore.bindingRejection(sessionID, on: duplicate), .conflictingWriter)
+            XCTAssertNil(vm.test_installPersistentSessionBinding(sessionID: sessionID, on: duplicate))
+            XCTAssertNil(duplicate.persistentSessionBindingIdentity)
+            duplicate.testInstallPersistentSessionBinding(sessionID: sessionID)
             duplicate.hasLoadedPersistedState = true
             try assertQueries("Duplicate UUID in distinct tabs and windows")
             XCTAssertEqual(manager.agentSessionLinkCandidates().count, 3)
@@ -887,30 +903,30 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
                 connectionID: fixture.connectionID, clientName: clientName,
                 windowID: fixture.window.windowID, runPurpose: .agentModeRun
             )
-            let original = try XCTUnwrap(server.tabContextByConnectionID[fixture.connectionID])
+            let original = try XCTUnwrap(server.runRouteBindings.tabContextByConnectionID[fixture.connectionID])
             let binding = fixture.session.persistentSessionBindingIdentity
             let sessionCount = fixture.window.agentModeViewModel.sessions.count
-            let pendingCount = server.pendingPolicyRunIDMappingTokenIDByRunID.count
+            let pendingCount = server.runRouteBindings.pendingPolicyTokenIDByRunID.count
             let contextGeneration = original.readFileAutoSelectionGeneration
-            let live = await server.resolveAgentSessionLinkModelObserverEndpoint(metadata: metadata, network: fixture.manager)
+            let live = await server.resolveAgentSessionLinkModelObserverEndpoint(route: server.routeResources, metadata: metadata, network: fixture.manager)
             XCTAssertEqual(live, fixture.endpoint)
 
-            server.tabContextByConnectionID.removeValue(forKey: fixture.connectionID)
-            let cold = await server.resolveAgentSessionLinkModelObserverEndpoint(metadata: metadata, network: fixture.manager)
+            server.runRouteBindings.tabContextByConnectionID.removeValue(forKey: fixture.connectionID)
+            let cold = await server.resolveAgentSessionLinkModelObserverEndpoint(route: server.routeResources, metadata: metadata, network: fixture.manager)
             XCTAssertNil(cold)
-            XCTAssertNil(server.tabContextByConnectionID[fixture.connectionID], "Must not rehydrate a missing context")
-            server.tabContextByConnectionID[fixture.connectionID] = original
-            server.connectionIDByRunID[fixture.runID] = UUID()
-            let stale = await server.resolveAgentSessionLinkModelObserverEndpoint(metadata: metadata, network: fixture.manager)
+            XCTAssertNil(server.runRouteBindings.tabContextByConnectionID[fixture.connectionID], "Must not rehydrate a missing context")
+            server.runRouteBindings.tabContextByConnectionID[fixture.connectionID] = original
+            server.runRouteBindings.connectionIDByRunID[fixture.runID] = UUID()
+            let stale = await server.resolveAgentSessionLinkModelObserverEndpoint(route: server.routeResources, metadata: metadata, network: fixture.manager)
             XCTAssertNil(stale, "A displaced connection must not claim the successor's route")
-            server.connectionIDByRunID[fixture.runID] = fixture.connectionID
+            server.runRouteBindings.connectionIDByRunID[fixture.runID] = fixture.connectionID
             XCTAssertEqual(fixture.session.persistentSessionBindingIdentity, binding)
             XCTAssertEqual(fixture.window.agentModeViewModel.sessions.count, sessionCount)
-            XCTAssertEqual(server.pendingPolicyRunIDMappingTokenIDByRunID.count, pendingCount)
-            XCTAssertEqual(server.tabContextByConnectionID[fixture.connectionID]?.readFileAutoSelectionGeneration, contextGeneration)
-            XCTAssertEqual(server.connectionIDToRunID[fixture.connectionID], fixture.runID)
+            XCTAssertEqual(server.runRouteBindings.pendingPolicyTokenIDByRunID.count, pendingCount)
+            XCTAssertEqual(server.runRouteBindings.tabContextByConnectionID[fixture.connectionID]?.readFileAutoSelectionGeneration, contextGeneration)
+            XCTAssertEqual(server.runRouteBindings.connectionIDToRunID[fixture.connectionID], fixture.runID)
             await fixture.manager.removeConnection(fixture.connectionID)
-            let terminal = await server.resolveAgentSessionLinkModelObserverEndpoint(metadata: metadata, network: fixture.manager)
+            let terminal = await server.resolveAgentSessionLinkModelObserverEndpoint(route: server.routeResources, metadata: metadata, network: fixture.manager)
             XCTAssertNil(terminal, "A retained presentation snapshot cannot revive a terminal connection")
         }
 
@@ -946,12 +962,12 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
             await fulfillment(of: [available], timeout: 2)
             subscription.cancel()
             let raw = "routing-test-model:high"
-            AgentAdvertisedModelCatalog.shared.record([
+            AgentModelCatalogRuntime.shared.record([
                 AgentModelOption(rawValue: raw, displayName: "Routing test", description: nil, isPlaceholderDefault: false, isProviderDefault: false)
-            ], for: .claudeCode, generation: AgentAdvertisedModelCatalog.shared.productionGeneration(for: .claudeCode))
+            ], for: .claudeCode, generation: AgentModelCatalogRuntime.shared.productionGeneration(for: .claudeCode))
             defer {
                 target.saveDebounceTask?.cancel()
-                AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode)
+                AgentModelCatalogRuntime.shared.invalidate(.claudeCode)
             }
             let service = AgentSessionLinkMCPToolService(
                 toolName: MCPWindowToolName.agentSessionLink,
@@ -964,7 +980,7 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
                 },
                 withHeartbeat: { _, _, _, _, operation in try await operation() },
                 resolveModelObserverEndpoint: { metadata in
-                    await window.mcpServer.resolveAgentSessionLinkModelObserverEndpoint(metadata: metadata, network: fixture.manager)
+                    await window.mcpServer.resolveAgentSessionLinkModelObserverEndpoint(route: window.mcpServer.routeResources, metadata: metadata, network: fixture.manager)
                 }, bridge: bridge
             )
             let args: [String: Value] = [
@@ -980,12 +996,12 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
             XCTAssertNil(target.runID)
             XCTAssertTrue(target.items.isEmpty)
             target.saveDebounceTask?.cancel()
-            window.mcpServer.tabContextByConnectionID.removeValue(forKey: fixture.connectionID)
+            window.mcpServer.runRouteBindings.tabContextByConnectionID.removeValue(forKey: fixture.connectionID)
             do {
                 _ = try await service.execute(args: args)
                 XCTFail("Cold caller must fail closed")
             } catch { XCTAssertTrue(String(describing: error).contains("already-installed")) }
-            XCTAssertNil(window.mcpServer.tabContextByConnectionID[fixture.connectionID])
+            XCTAssertNil(window.mcpServer.runRouteBindings.tabContextByConnectionID[fixture.connectionID])
             XCTAssertEqual(target.saveRequestGeneration, before + 1)
         }
 
@@ -1063,7 +1079,7 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
             session.installRunID(runID)
             let sessionID = try installRestoredBinding(on: session, in: window.agentModeViewModel)
             let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(window.agentModeViewModel, tabID: tabID)
-            window.agentModeViewModel.agentSessionLinkPublishPromptInventory(
+            window.agentModeViewModel.linkExecutionRuntime.agentSessionLinkPublishPromptInventory(
                 AgentSessionLinkPromptInventory(
                     observerSessionID: sessionID,
                     linkSetRevision: 1,
@@ -1239,7 +1255,7 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
                 line: line
             )
             XCTAssertNotNil(
-                host.agentSessionLinkPromptContext(for: observer.session),
+                host.linkExecutionRuntime.agentSessionLinkPromptContext(for: observer.session),
                 "\(label): observer prompt gate open",
                 file: file,
                 line: line

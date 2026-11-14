@@ -1,6 +1,8 @@
 #if DEBUG
     import Foundation
     import MCP
+    import RepoPromptACPProviders
+    import RepoPromptAIContracts
     import RepoPromptSettingsCore
     import XCTest
     @_spi(TestSupport) @testable import RepoPromptApp
@@ -139,7 +141,7 @@
 
         func testACPTrackerIdentityAndProviderFallbackDoNotExpandUnsupportedPolicy() {
             let (harness, session, owner) = fixture(.devin)
-            let runner = ACPIntegratedAgentModeRunner(hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(), toolTrackingHooks: .noOp, providerFactory: { _, _ in nil }, controllerFactory: { provider, request in try ACPAgentSessionController(provider: provider, runRequest: request) })
+            let runner = ACPIntegratedAgentModeRunner(hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(), toolTrackingHooks: .noOp)
             XCTAssertFalse(AgentSessionLinkPrompts.supportsQuietCheckIn(.devin))
             XCTAssertNil(session.quietLedger.candidateStartKey(owner: owner))
             session.quietLedger = AgentRunQuietLedger()

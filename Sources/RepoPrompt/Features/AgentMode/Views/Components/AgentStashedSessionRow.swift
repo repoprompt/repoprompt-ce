@@ -2,6 +2,44 @@ import AppKit
 import RepoPromptDomainRuntime
 import SwiftUI
 
+extension AgentSidebarSelectionGesture {
+    @MainActor
+    static var currentEvent: Self {
+        var modifiers: AgentSidebarSelectionModifiers = []
+        let flags = NSApp.currentEvent?.modifierFlags ?? []
+        if flags.contains(.command) { modifiers.insert(.command) }
+        if flags.contains(.shift) { modifiers.insert(.shift) }
+        return Self(modifiers: modifiers)
+    }
+}
+
+@MainActor
+func agentSidebarSelectionButton(isSelected: Bool, isInteractionEnabled: Bool, title: String, action: @escaping () -> Void) -> some View {
+    Button(action: action) {
+        Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+            .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+            .padding(6)
+            .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+    .padding(-6) // Keep the row layout unchanged around the larger hit target.
+    .disabled(!isInteractionEnabled)
+    .accessibilityLabel("\(isSelected ? "Deselect" : "Select") \(title)")
+    .accessibilityValue(isSelected ? "Selected" : "Not selected")
+}
+
+@MainActor
+func agentSidebarRowActionButton(systemImage: String, isHovered: Binding<Bool>, highlightColor: Color, tooltip: String, action: @escaping () -> Void) -> some View {
+    Button(action: action) {
+        Image(systemName: systemImage)
+            .font(.system(size: 11))
+            .foregroundColor(isHovered.wrappedValue ? highlightColor : .secondary)
+    }
+    .buttonStyle(.plain)
+    .onHover { isHovered.wrappedValue = $0 }
+    .hoverTooltip(tooltip)
+}
+
 // MARK: - Stashed Session Row
 
 struct AgentStashedSessionRow: View {
@@ -51,17 +89,9 @@ struct AgentStashedSessionRow: View {
         "Delete stashed tab"
     }
 
-    private var currentSelectionGesture: AgentSidebarSelectionGesture {
-        var modifiers: AgentSidebarSelectionModifiers = []
-        let flags = NSApp.currentEvent?.modifierFlags ?? []
-        if flags.contains(.command) { modifiers.insert(.command) }
-        if flags.contains(.shift) { modifiers.insert(.shift) }
-        return AgentSidebarSelectionGesture(modifiers: modifiers)
-    }
-
     private func handleRowTap() {
         guard isInteractionEnabled else { return }
-        if onSelectionGesture(currentSelectionGesture) == .activate {
+        if onSelectionGesture(.currentEvent) == .activate {
             onRestore()
         }
     }
@@ -74,17 +104,7 @@ struct AgentStashedSessionRow: View {
     var body: some View {
         HStack(spacing: metrics.rowSpacing) {
             if showsSelectionPresentation {
-                Button(action: toggleSelection) {
-                    Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                        .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
-                        .padding(6)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .padding(-6) // Keep the row layout unchanged around the larger hit target.
-                .disabled(!isInteractionEnabled)
-                .accessibilityLabel("\(isSelected ? "Deselect" : "Select") \(stashed.tab.name)")
-                .accessibilityValue(isSelected ? "Selected" : "Not selected")
+                agentSidebarSelectionButton(isSelected: isSelected, isInteractionEnabled: isInteractionEnabled, title: stashed.tab.name, action: toggleSelection)
             }
 
             Image(systemName: "tray.and.arrow.down")
@@ -133,23 +153,9 @@ struct AgentStashedSessionRow: View {
                     .allowsHitTesting(false)
                     .accessibilityLabel(commandProgressKind.rowProgressAccessibilityLabel)
             } else if isHovered, allowsDirectMutations {
-                Button(action: onRestore) {
-                    Image(systemName: "tray.and.arrow.up")
-                        .font(.system(size: 11))
-                        .foregroundColor(isRestoreHovered ? .accentColor : .secondary)
-                }
-                .buttonStyle(.plain)
-                .onHover { isRestoreHovered = $0 }
-                .hoverTooltip(restoreActionLabel)
+                agentSidebarRowActionButton(systemImage: "tray.and.arrow.up", isHovered: $isRestoreHovered, highlightColor: .accentColor, tooltip: restoreActionLabel, action: onRestore)
 
-                Button(action: onDelete) {
-                    Image(systemName: "trash")
-                        .font(.system(size: 11))
-                        .foregroundColor(isDeleteHovered ? .red : .secondary)
-                }
-                .buttonStyle(.plain)
-                .onHover { isDeleteHovered = $0 }
-                .hoverTooltip(deleteActionLabel)
+                agentSidebarRowActionButton(systemImage: "trash", isHovered: $isDeleteHovered, highlightColor: .red, tooltip: deleteActionLabel, action: onDelete)
             }
         }
         .padding(.horizontal, metrics.rowHorizontalPadding)

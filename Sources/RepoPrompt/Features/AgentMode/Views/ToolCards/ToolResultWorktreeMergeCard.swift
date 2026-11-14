@@ -135,11 +135,8 @@ struct ToolResultWorktreeMergeCard: View {
             detailText: presentation.detailText,
             subtitle: presentation.subtitle,
             status: presentation.status,
-            timestamp: item.timestamp,
-            isExpandable: toolResultHasPayload(item),
+            item: item,
             isExpanded: $isExpanded
-        ) {
-            ToolMarkdownExpandedContent(item: item)
-        }
+        )
     }
 }

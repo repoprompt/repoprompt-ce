@@ -101,6 +101,16 @@ final class AgentSessionReleaseOperationHandler: AgentSessionAdministrationOpera
             !retiring || backend.runState(of: id) == .idle || holdsControl(scope)
         }
 
+        func releasePhaseRefusal(_ target: UUID, detail: [String: Value]) -> AgentSessionAdminItemResult? {
+            guard isCurrent(target) else {
+                return .init(sessionID: target, status: .failed, reason: "scope_no_longer_current", detail: detail)
+            }
+            guard runStateAllows(target) else {
+                return .init(sessionID: target, status: .skipped, reason: "requires_control", detail: detail)
+            }
+            return nil
+        }
+
         for target in batch.admittedSessionIDs {
             var detail: [String: Value] = [:]
             var targetChanged = false
@@ -148,12 +158,8 @@ final class AgentSessionReleaseOperationHandler: AgentSessionAdministrationOpera
 
             // Fresh inventory per target: an earlier Stop may have retired shared links.
             let inventory = await links.oversightInventory()
-            guard isCurrent(target) else {
-                items.append(.init(sessionID: target, status: .failed, reason: "scope_no_longer_current", detail: detail))
-                continue
-            }
-            guard runStateAllows(target) else {
-                items.append(.init(sessionID: target, status: .skipped, reason: "requires_control", detail: detail))
+            if let refusal = releasePhaseRefusal(target, detail: detail) {
+                items.append(refusal)
                 continue
             }
             var unlinked = 0
@@ -216,12 +222,8 @@ final class AgentSessionReleaseOperationHandler: AgentSessionAdministrationOpera
             }
 
             if retiring {
-                guard isCurrent(target) else {
-                    items.append(.init(sessionID: target, status: .failed, reason: "scope_no_longer_current", detail: detail))
-                    continue
-                }
-                guard runStateAllows(target) else {
-                    items.append(.init(sessionID: target, status: .skipped, reason: "requires_control", detail: detail))
+                if let refusal = releasePhaseRefusal(target, detail: detail) {
+                    items.append(refusal)
                     continue
                 }
                 guard let beforeArchive = backend.state(of: target) else {

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 
@@ -10,7 +11,7 @@ enum AppOracleGroupRouting {
     static func executionProfile(for model: AIModel) -> OracleExecutionProfile? {
         let effort: String?
         if model.providerType == .grokBuild {
-            let snapshot = AgentACPModelRegistry.shared.resolvedSnapshotIncludingStandardStore(for: .grokBuild)
+            let snapshot = AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshotIncludingStandardStore(for: .grokBuild)
             effort = GrokBuildModelSpecifier.decompose(
                 raw: model.modelName,
                 options: snapshot?.options ?? []

@@ -1,13 +1,13 @@
 import RepoPromptWorkspaceCore
 
 enum WorkspaceRecentOrdering {
-    nonisolated static func sorted(_ workspaces: [WorkspaceModel]) -> [WorkspaceModel] {
+    nonisolated static func sorted<Item: WorkspaceMenuItem>(_ workspaces: [Item]) -> [Item] {
         workspaces.sorted {
             rank(for: $0) < rank(for: $1)
         }
     }
 
-    private nonisolated static func rank(for workspace: WorkspaceModel) -> WorkspaceExactRootCandidateRank {
+    private nonisolated static func rank(for workspace: some WorkspaceMenuItem) -> WorkspaceExactRootCandidateRank {
         WorkspaceExactRootCandidateRank(
             lastUsed: workspace.lastUsed,
             name: workspace.name,

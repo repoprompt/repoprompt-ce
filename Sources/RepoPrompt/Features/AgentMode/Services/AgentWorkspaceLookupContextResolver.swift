@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 enum AgentSessionWorktreeBindingState: Equatable {

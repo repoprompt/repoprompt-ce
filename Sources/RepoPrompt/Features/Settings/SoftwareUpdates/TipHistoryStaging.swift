@@ -212,11 +212,11 @@ final class TipHistoryOwnedStaging: Sendable {
         return destination
     }
 
-    static func requireCapacity(at destination: URL, download: TipHistoryDownload, allocationHeadroom: Int64 = 0) throws {
+    static func requireCapacity(at destination: URL, download: TipHistoryDownload, allocationHeadroom: Int64 = 0, availableCapacity: @Sendable (URL) throws -> Int64?) throws {
         guard download.size > 0, download.size <= 2_147_483_648, download.expandedSize > 0, download.expandedSize <= 8_589_934_592, allocationHeadroom >= 0, allocationHeadroom <= 1_638_400_000 else { throw TipHistoryDownloadError.archiveLimitExceeded }
-        let values = try destination.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        let available = try availableCapacity(destination)
         let required = download.size + download.expandedSize * 2 + allocationHeadroom + 64 * 1024 * 1024
-        guard let available = values.volumeAvailableCapacityForImportantUsage, available >= required else {
+        guard let available, available >= required else {
             throw TipHistoryDownloadError.insufficientDiskSpace
         }
     }

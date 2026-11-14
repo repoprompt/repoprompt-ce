@@ -748,7 +748,7 @@ final class OpenWindowsAgentSessionOrganizer: AgentSessionOrganizingBackend {
                     && current.runID == target.runID && current.cancellationGeneration == target.cancellationGeneration
             }
         )
-        _ = await target.window.agentModeViewModel.cancelAgentRunForSessionLink(
+        _ = await target.window.agentModeViewModel.linkExecutionRuntime.cancelAgentRunForSessionLink(
             session: target.session, admission: admission, outcomeRecorder: recorder,
             completion: .terminalPublished
         )

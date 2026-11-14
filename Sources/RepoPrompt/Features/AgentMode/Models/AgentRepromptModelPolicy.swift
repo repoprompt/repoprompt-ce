@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptSettingsCore
 
 /// Why Re-prompt does or does not have a model. Unavailable states are explicit so the UI can ask

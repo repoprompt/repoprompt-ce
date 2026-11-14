@@ -3,6 +3,14 @@ import Foundation
 import RepoPromptVCS
 
 enum GitWorktreeDefaultPathPlanner {
+    static func planAgentStart(repoRoot: String, worktrees: [GitWorktreeDescriptor], sessionID: UUID) throws -> Plan {
+        try plan(.init(
+            mainWorktreeRoot: URL(fileURLWithPath: worktrees.first(where: \.isMain)?.path ?? repoRoot),
+            existingWorktreeRoots: worktrees.map { URL(fileURLWithPath: $0.path) },
+            purpose: .agentStart(sessionID: sessionID.uuidString)
+        ))
+    }
+
     enum Purpose: Equatable {
         case standaloneCreate(now: Date)
         case agentStart(sessionID: String)

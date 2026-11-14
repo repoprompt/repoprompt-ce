@@ -2,9 +2,11 @@ import Darwin
 import Foundation
 import MCP
 @testable import RepoPromptApp
+@testable import RepoPromptMCPServer
 import RepoPromptProcess
 import RepoPromptSecureStorage
 import RepoPromptShared
+@testable import RepoPromptWorkspaceContext
 import XCTest
 
 /// Regression coverage for per-subscriber MCP state streams.

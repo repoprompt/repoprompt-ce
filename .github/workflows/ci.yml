@@ -443,7 +443,7 @@ jobs:
       - name: Run root test shard without compiling
         id: run-root-test-shard-without-compiling
         timeout-minutes: 32
-        run: ./conductor ci-shard --shard-count 4 --shard-index ${{ matrix.shard }} --timeout 1800 --full-log
+        run: ./conductor ci-shard --shard-count 4 --shard-index ${{ matrix.shard }} --timeout 1800
 
       - name: Retain execution receipts and full shard logs
         id: retain-execution-receipts-and-full-shard-logs

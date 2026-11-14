@@ -84,6 +84,66 @@ def validate_shard_args(shard_count: int, shard_index: int) -> None:
         raise ValueError("--shard-index must be between 1 and --shard-count")
 
 
+# Advisory selected-suite wall times, rounded UP to integer milliseconds, paired
+# with the method count from that same complete observation. Maxima >=30s from
+# verified root receipts in runs 43568173216 (2760) and 43582965646 (3f6),
+# macos-26 / Xcode_26.6 developer directory. Artifacts: old shards 14105284054, 14105511182,
+# 14105747618, 14105710910; new 14111910326, 14110674402, 14110074931,
+# 14111078504. Interrupted suites supply NO new timing observation.
+# These 20 owners cover ~65% of the observed per-owner worst body cost; a full
+# timing database is unnecessary. Refresh only from reviewed complete receipts.
+# Unknown/renamed owners use 250ms/method; stale or same-count changed suites can
+# still be underestimated. The conservative fallback may exceed a measured row.
+# Estimates NEVER select/skip tests or relax deadlines
+# or coverage. No clock, environment, cache, or network input may change the plan.
+SLOW_SUITE_ESTIMATES = (
+    ('RepoPromptTests.AgentQuietCheckInModelTests', 78959, 1),
+    ('RepoPromptTests.AgentRunStartBudgetTests', 55797, 8),
+    ('RepoPromptTests.AgentSessionHandoffWorktreeBindingTests', 35543, 20),
+    ('RepoPromptTests.AgentSessionLaneFirstSaveTests', 33775, 48),
+    ('RepoPromptTests.AgentSessionLinkHandoffInheritanceTests', 77736, 113),
+    ('RepoPromptTests.AgentSessionLinkLiveDiscoveryTests', 75888, 36),
+    ('RepoPromptTests.AgentSessionLinkRuntimeBridgeTests', 57199, 236),
+    ('RepoPromptTests.AgentSessionTargetOperationAuthorizationTests', 43651, 31),
+    ('RepoPromptTests.AgentSidebarRowInvalidationTests', 286943, 11),
+    ('RepoPromptTests.AgentWorktreeBindingAdmissionTests', 185874, 65),
+    ('RepoPromptTests.CodexAppServerFramingTests', 30126, 3),
+    ('RepoPromptTests.CodexResumeWedgeCommitTests', 49730, 80),
+    ('RepoPromptTests.ContextBuilderMultiRootDiscoveryTests', 64875, 36),
+    ('RepoPromptTests.MCPExportWatchdogIntegrationTests', 59961, 44),
+    ('RepoPromptTests.SessionAdminInventoryReadTests', 271613, 76),
+    ('RepoPromptTests.SessionAdminWorktreeRecoveryTests', 265402, 36),
+    ('RepoPromptTests.VCSServiceSharedWorktreeListingTests', 34639, 22),
+    ('RepoPromptTests.WorkspaceRootCatalogDeltaTests', 262369, 6),
+    ('RepoPromptTests.WorktreeBindingProviderRegressionTests', 132446, 33),
+    ('RepoPromptWorkspaceContextTests.WorkspaceCodemapGraphIncrementalIndexOwningTests', 32280, 8),
+)
+FALLBACK_METHOD_COST_MS = 250
+
+
+def _validated_suite_estimates() -> dict[str, tuple[int, int]]:
+    estimates: dict[str, tuple[int, int]] = {}
+    for row in SLOW_SUITE_ESTIMATES:
+        if not isinstance(row, tuple) or len(row) != 3:
+            raise ValueError('malformed suite cost estimate row')
+        suite, milliseconds, count = row
+        if (not isinstance(suite, str)
+                or not re.fullmatch(r'[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+', suite)
+                or suite in estimates
+                or type(milliseconds) is not int or milliseconds <= 0
+                or type(count) is not int or count <= 0):
+            raise ValueError(f'invalid or duplicate suite cost estimate: {row!r}')
+        estimates[suite] = (milliseconds, count)
+    return estimates
+
+
+def _suite_weight_ms(suite: str, count: int, estimates: Mapping[str, tuple[int, int]]) -> int:
+    milliseconds, observed_count = estimates.get(suite, (0, 1))
+    # Scale additions upward with integer ceil; removals never lower an estimate.
+    scaled = (milliseconds * max(count, observed_count) + observed_count - 1) // observed_count
+    return max(FALLBACK_METHOD_COST_MS * count, scaled)
+
+
 def assign_suites_to_shards(
     method_counts: Mapping[str, int],
     shard_count: int,
@@ -91,17 +151,23 @@ def assign_suites_to_shards(
     if shard_count <= 0:
         raise ValueError("shard_count must be greater than zero")
 
+    estimates = _validated_suite_estimates()
+    weights = {}
+    for suite, count in method_counts.items():
+        if type(count) is not int or count <= 0:
+            raise ValueError(f"invalid method count {count!r} for suite {suite}")
+        weights[suite] = _suite_weight_ms(suite, count, estimates)
     shards: list[list[str]] = [[] for _ in range(shard_count)]
     loads = [0 for _ in range(shard_count)]
+    weight_loads = [0 for _ in range(shard_count)]
     ordered_suites = sorted(
         method_counts.items(),
-        key=lambda item: (-item[1], item[0]),
+        key=lambda item: (-weights[item[0]], -item[1], item[0]),
     )
     for suite, method_count in ordered_suites:
-        if method_count <= 0:
-            raise ValueError(f"discovered suite {suite} has no test methods")
-        shard = min(range(shard_count), key=lambda index: (loads[index], index))
+        shard = min(range(shard_count), key=lambda index: (weight_loads[index], loads[index], index))
         shards[shard].append(suite)
+        weight_loads[shard] += weights[suite]
         loads[shard] += method_count
 
     return (

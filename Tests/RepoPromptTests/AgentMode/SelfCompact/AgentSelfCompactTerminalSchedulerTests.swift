@@ -36,6 +36,7 @@ final class AgentSelfCompactTerminalSchedulerTests: XCTestCase {
         var dispatched = 0
         var polls = 0
         var onPoll: (() -> Void)?
+        var onSupport: (() -> Void)?
         let runID = UUID()
         let attemptID = UUID()
         let endpoint = AgentSelfCompactOwner(
@@ -55,8 +56,11 @@ final class AgentSelfCompactTerminalSchedulerTests: XCTestCase {
                 store: { self.state = $0 },
                 isCurrentOwner: { _ in self.endpointIsCurrent },
                 hasActiveTools: { _ in !self.toolsAreDrained },
-                support: { self.support },
-                dispatch: { _, _, stillAdmissible in
+                support: {
+                    self.onSupport?()
+                    return self.support
+                },
+                dispatch: { _, _, stillAdmissible, _ in
                     guard stillAdmissible() else { return false }
                     self.dispatched += 1
                     return true
@@ -84,6 +88,128 @@ final class AgentSelfCompactTerminalSchedulerTests: XCTestCase {
             _ = state.reserve(note: "resume here", idempotencyKey: "key", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes, owner: owner)
             state.active?.admittedSupport = .claudeCode
         }
+    }
+
+    func testToolStartingDuringSupportUsesRemainingDrainBudget() async {
+        let fake = Fake()
+        fake.arm()
+        fake.onSupport = { fake.toolsAreDrained = false }
+        fake.onPoll = { if fake.polls == 3 { fake.toolsAreDrained = true } }
+        let worker = fake.scheduler().terminalSettled(
+            runID: fake.runID, runAttemptID: fake.attemptID,
+            terminalState: .completed, publication: .accepted(successorEpoch: nil),
+            successorClaimed: false, teardownSettled: { fake.teardownIsSettled }
+        )
+        await worker?.value
+        XCTAssertEqual(fake.polls, 3)
+        XCTAssertEqual(fake.dispatched, 1)
+    }
+
+    func testToolStartingDuringSupportTimesOutWithoutDispatch() async {
+        let fake = Fake()
+        fake.arm()
+        fake.onSupport = { fake.toolsAreDrained = false }
+        let worker = fake.scheduler().terminalSettled(
+            runID: fake.runID, runAttemptID: fake.attemptID,
+            terminalState: .completed, publication: .accepted(successorEpoch: nil),
+            successorClaimed: false, teardownSettled: { fake.teardownIsSettled }
+        )
+        await worker?.value
+        XCTAssertEqual(fake.polls, 50)
+        XCTAssertEqual(fake.dispatched, 0)
+        XCTAssertEqual(fake.state.latest?.outcome, .failed)
+    }
+
+    func testToolAfterSupportDoesNotGetASecondDrainBudget() async {
+        let fake = Fake()
+        fake.arm()
+        fake.toolsAreDrained = false
+        fake.onPoll = { if fake.polls == 48 { fake.toolsAreDrained = true } }
+        fake.onSupport = { fake.toolsAreDrained = false }
+        let worker = fake.scheduler().terminalSettled(
+            runID: fake.runID, runAttemptID: fake.attemptID,
+            terminalState: .completed, publication: .accepted(successorEpoch: nil),
+            successorClaimed: false, teardownSettled: { fake.teardownIsSettled }
+        )
+        await worker?.value
+        XCTAssertEqual(fake.polls, 50)
+        XCTAssertEqual(fake.dispatched, 0)
+        XCTAssertEqual(fake.state.latest?.outcome, .failed)
+    }
+
+    func testToolAppearingDuringDispatchPreparationRefusesNativeStart() async {
+        let fake = Fake()
+        fake.arm()
+        let scheduler = AgentSelfCompactTerminalScheduler(
+            load: { fake.state }, store: { fake.state = $0 },
+            isCurrentOwner: { _ in true }, hasActiveTools: { _ in !fake.toolsAreDrained },
+            support: { .claudeCode },
+            dispatch: { _, _, stillAdmissible, _ in
+                XCTAssertTrue(stillAdmissible())
+                fake.toolsAreDrained = false // e.g. while required save is suspended
+                XCTAssertFalse(stillAdmissible())
+                return false
+            }
+        )
+        let worker = scheduler.terminalSettled(
+            runID: fake.runID, runAttemptID: fake.attemptID,
+            terminalState: .completed, publication: .accepted(successorEpoch: nil),
+            successorClaimed: false, teardownSettled: { true }
+        )
+        await worker?.value
+        XCTAssertEqual(fake.state.latest?.outcome, .failed)
+        XCTAssertEqual(fake.dispatched, 0)
+    }
+
+    func testSupportReturningAfterOriginalDeadlineCannotStartCompact() async {
+        let fake = Fake()
+        fake.arm()
+        var instant = ContinuousClock.now
+        let scheduler = AgentSelfCompactTerminalScheduler(
+            load: { fake.state }, store: { fake.state = $0 }, isCurrentOwner: { _ in true },
+            hasActiveTools: { _ in false },
+            support: { instant = instant.advanced(by: .seconds(6))
+                return .claudeCode
+            },
+            dispatch: { _, _, _, _ in XCTFail("expired drain must not dispatch")
+                return true
+            },
+            maximumDrainPolls: 50, now: { instant }, sleep: { _ in }
+        )
+        let worker = scheduler.terminalSettled(
+            runID: fake.runID, runAttemptID: fake.attemptID,
+            terminalState: .completed, publication: .accepted(successorEpoch: nil),
+            successorClaimed: false, teardownSettled: { true }
+        )
+        await worker?.value
+        XCTAssertEqual(fake.state.latest?.outcome, .failed)
+    }
+
+    func testPhysicalStartFenceRejectsLateToolAndExpiredDeadline() async {
+        let fake = Fake()
+        fake.arm()
+        var instant = ContinuousClock.now
+        var captured: (@MainActor () -> Bool)?
+        let scheduler = AgentSelfCompactTerminalScheduler(
+            load: { fake.state }, store: { fake.state = $0 }, isCurrentOwner: { _ in true },
+            hasActiveTools: { _ in !fake.toolsAreDrained }, support: { .claudeCode },
+            dispatch: { _, _, _, physicalStartIsSafe in captured = physicalStartIsSafe
+                return true
+            },
+            maximumDrainPolls: 50, now: { instant }, sleep: { _ in }
+        )
+        let worker = scheduler.terminalSettled(
+            runID: fake.runID, runAttemptID: fake.attemptID,
+            terminalState: .completed, publication: .accepted(successorEpoch: nil),
+            successorClaimed: false, teardownSettled: { true }
+        )
+        await worker?.value
+        XCTAssertTrue(captured?() == true)
+        fake.toolsAreDrained = false
+        XCTAssertFalse(captured?() ?? true)
+        fake.toolsAreDrained = true
+        instant = instant.advanced(by: .seconds(6))
+        XCTAssertFalse(captured?() ?? true)
     }
 
     func testAcceptedCommitDispatchesOnlyFromWorkerAndDuplicateDoesNotDispatchTwice() async {

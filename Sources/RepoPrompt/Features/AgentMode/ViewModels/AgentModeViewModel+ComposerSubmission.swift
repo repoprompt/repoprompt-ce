@@ -4,13 +4,19 @@ import Foundation
 extension AgentModeViewModel {
     /// Local UI handoff, distinct from eventual provider dispatch. The existing claim remains
     /// the only admission authority; the pending row is merely its visible projection.
-    func claimComposerSubmitForImmediatePresentation(_ attempt: AgentComposerSubmitAttempt) -> AgentComposerSubmitClaimResult {
+    func claimComposerSubmitForImmediatePresentation(
+        _ attempt: AgentComposerSubmitAttempt, requireActiveTabOwnership: Bool = true,
+        presentationStore: AgentComposerUIStore? = nil
+    ) -> AgentComposerSubmitClaimResult {
         if let pending = ui.composer.pendingSubmissions.values.first(where: {
             $0.sourceTabID == attempt.sourceTabID || $0.destinationTabID == attempt.sourceTabID
         }) {
             return .rejected(.activeAttemptExists(activeAttemptID: pending.id))
         }
-        let result = claimComposerSubmitAttempt(attempt)
+        let result = claimComposerSubmitAttempt(
+            attempt, requireActiveTabOwnership: requireActiveTabOwnership, awaitsExecutor: true,
+            adoptsLocalReprompt: true
+        )
         guard case let .claimed(claim) = result else { return result }
         let submittedRepromptDraft = repromptUIStore.submittedDraftSnapshot(tabID: attempt.sourceTabID)
         ui.composer.pendingSubmissions[attempt.id] = .init(
@@ -21,10 +27,12 @@ extension AgentModeViewModel {
             repromptDraft: submittedRepromptDraft,
             originalDraft: repromptDispatchOriginals[attempt.id]
         )
+        if let presentationStore, presentationStore !== ui.composer { presentationStore.pendingSubmissions[attempt.id] = ui.composer.pendingSubmissions[attempt.id] }
         // Move recovery ownership into the pending send, rather than discarding it.
         repromptUIStore.clearSubmittedDraft(submittedRepromptDraft)
         // claim captured the exact original before this clear. Any later typing is a new draft.
-        if composerSubmitClaimIsCurrent(claim) {
+        if composerSubmitRuntime.isCurrent(claim) {
+            claim.cancellation.oweDraftRestoration(attempt.rawDraftSnapshot)
             storeDraftText(for: attempt.sourceTabID, "")
         }
         return result
@@ -40,11 +48,11 @@ extension AgentModeViewModel {
         guard let pending = ui.composer.pendingSubmissions[id],
               let session = sessions[pending.sourceTabID],
               let attempt = session.activeComposerSubmitAttempt, attempt.id == id else { return }
-        let claim = AgentComposerSubmitClaim(attempt: attempt, sourceSession: session, draftMutationGeneration: session.draftMutationGeneration)
-        // Fence dispatch and restore immediately; backend cancellation may itself suspend.
-        let workflowTask = autoWorkflowJudgments.removeValue(forKey: id)
-        workflowTask?.cancel()
-        finishPresentedComposerSubmitAttempt(claim, result: .blocked(message: "Send cancelled. Your draft was restored."))
+        guard let claim = composerSubmitRuntime.cleanupClaim(attempt: attempt, session: session) else { return }
+        // Withdrawal restores runtime-owned text immediately, but an entered producer retains
+        // its receipt until its finalizer. Never manufacture a run to cancel an unsent input.
+        guard claim.cancellation.withdraw(on: session) || claim.cancellation.cancelPresentedInput(on: session) else { return }
+        finishWithdrawnComposerSubmission(session: session, attemptID: id)
         await cancelFreshTaskRouting(tabID: pending.sourceTabID)
     }
 
@@ -59,10 +67,35 @@ extension AgentModeViewModel {
     /// Idempotent cleanup also covers cancellation before the asynchronous executor starts.
     func clearRepromptSubmissionState(claimID: UUID) {
         autoWorkflowJudgments.removeValue(forKey: claimID)?.cancel()
-        cancelRepromptSpeculation(claimID: claimID)
+        repromptSpeculations.removeValue(forKey: claimID)?.cancel(runtime: modelRouterRuntime)
         repromptAudits[claimID] = nil
         repromptDispatchTexts[claimID] = nil
         repromptDispatchOriginals[claimID] = nil
+    }
+
+    func finishWithdrawnComposerSubmission(session: AgentTabSession, attemptID: UUID) {
+        guard let pending = ui.composer.pendingSubmissions[attemptID],
+              pending.sourceTabID == session.tabID else { return }
+        ui.composer.pendingSubmissions[attemptID] = nil
+        restorePendingComposerRepromptMetadata(pending, message: "Send cancelled. Your draft was restored.")
+        clearRepromptSubmissionState(claimID: attemptID)
+    }
+
+    private func restorePendingComposerRepromptMetadata(_ pending: AgentComposerPendingSubmission, message: String) {
+        repromptUIStore.restoreCancelledDraft(
+            pending.repromptDraft.cancelledDraft, tabID: pending.sourceTabID,
+            currentDraft: draftRuntime.text(for: pending.sourceTabID)
+        )
+        if repromptUIStore.recoveries[pending.sourceTabID] == nil {
+            if let original = pending.originalDraft, pending.text != original {
+                repromptUIStore.recover(
+                    tabID: pending.sourceTabID, text: pending.text, originalDraft: original,
+                    reason: message, currentDraft: draftRuntime.text(for: pending.sourceTabID), requiresDecision: true
+                )
+            } else {
+                repromptUIStore.recoveries[pending.sourceTabID] = pending.repromptDraft.recovery
+            }
+        }
     }
 
     func finishPresentedComposerSubmitAttempt(_ claim: AgentComposerSubmitClaim, result: UserTurnSubmissionResult) {
@@ -70,33 +103,10 @@ extension AgentModeViewModel {
         if case let .blocked(message) = result,
            sessions[claim.attempt.sourceTabID] === claim.sourceSession
         {
-            restoreComposerDraft(
-                tabID: claim.attempt.sourceTabID,
-                text: claim.attempt.rawDraftSnapshot,
-                message: message,
-                strategy: .prependAlways
-            )
-            repromptUIStore.restoreCancelledDraft(
-                pending.repromptDraft.cancelledDraft,
-                tabID: pending.sourceTabID,
-                currentDraft: retrieveDraftText(for: pending.sourceTabID)
-            )
-            if repromptUIStore.recoveries[pending.sourceTabID] == nil {
-                if let original = pending.originalDraft, pending.text != original {
-                    // Bind only after restoration has composed against newer typing. Never let a
-                    // late executor re-stamp this authority or overwrite a newer preparation.
-                    repromptUIStore.recover(
-                        tabID: pending.sourceTabID, text: pending.text, originalDraft: original,
-                        reason: message, currentDraft: retrieveDraftText(for: pending.sourceTabID), requiresDecision: true
-                    )
-                } else {
-                    // An unrelated older recovery retains its original exact-draft boundary.
-                    repromptUIStore.recoveries[pending.sourceTabID] = pending.repromptDraft.recovery
-                }
-            }
+            claim.cancellation.restoreOwedDraftIfNeeded(message: message)
+            restorePendingComposerRepromptMetadata(pending, message: message)
         }
         if case .blocked = result { clearRepromptSubmissionState(claimID: claim.attempt.id) }
-        // executeComposerSubmitAttempt normally releases this. Also cover its early stale guard.
-        if composerSubmitClaimIsCurrent(claim) { releaseComposerSubmitClaim(claim) }
+        // The executor owns release. UI cleanup is not evidence of producer completion.
     }
 }

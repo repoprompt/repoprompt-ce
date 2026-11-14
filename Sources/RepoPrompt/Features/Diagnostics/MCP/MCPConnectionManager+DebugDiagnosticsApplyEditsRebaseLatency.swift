@@ -1,4 +1,5 @@
 import RepoPromptFileSystem
+import RepoPromptWorkspaceContext
 
 // MARK: - DEBUG MCP Apply-Edits Stable-Rebase Diagnostics
 
