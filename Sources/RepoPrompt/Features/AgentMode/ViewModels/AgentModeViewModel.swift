@@ -17140,7 +17140,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             initialThreadInput: { session in
                 self.captureInitialThreadInput(tabID: session.tabID, workspace: self.runtimeInputWorkspaceSource(session: session))
             },
-            composition: { self.runComposition }
+            composition: { self.runComposition },
+            workspaceCaptureOrder: .afterSkillExpansion
         )
         #if DEBUG
             environment.test_startOverride = { session, user, initial in

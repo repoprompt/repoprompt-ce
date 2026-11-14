@@ -21,6 +21,7 @@ final class AgentSessionRunStartRuntime {
         let initialThreadInput: (AgentTabSession) async throws -> AgentSessionProviderInputRuntime.InitialThreadInput?
         let composition: () -> AgentModeRunComposition
         var hostResources: AgentSessionHostStartupResources?
+        var workspaceCaptureOrder: AgentSessionProviderInputRuntime.WorkspaceCaptureOrder = .beforeSkillExpansion
         #if DEBUG
             var test_startOverride: ((AgentTabSession, String, String) async -> Bool)?
         #endif
@@ -327,7 +328,7 @@ final class AgentSessionRunStartRuntime {
                         let source = try await environment.inputWorkspace(session)
                         if let source { inputSources.append(source) }
                         return source
-                    }, workspaceCaptureOrder: environment.hostResources == nil ? .afterSkillExpansion : .beforeSkillExpansion,
+                    }, workspaceCaptureOrder: environment.workspaceCaptureOrder,
                     session: session, handoff: owner.handoff,
                     ignoresPendingHandoff: directStartOptions.ignoresPendingHandoff,
                     skipsSlashExpansion: directStartOptions.skipsSlashExpansion, isCurrent: inputIsCurrent,
