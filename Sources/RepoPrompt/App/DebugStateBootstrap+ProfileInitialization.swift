@@ -1,9 +1,8 @@
+import Darwin
 import Foundation
 import RepoPromptShared
 
 extension DebugStateBootstrap {
-    static let preferencesIDKey = "DebugStateBootstrapPreferencesID"
-
     enum PreparationAction: String {
         case reused, imported, reset, recoveredPreferences
     }
@@ -14,16 +13,16 @@ extension DebugStateBootstrap {
         let receipt: DebugStateSnapshot.Receipt?
     }
 
-    private enum ProfileState {
-        case empty, existing, pendingPreferences(DebugStateSnapshot.Receipt)
-    }
-
+    /// Testable pre-store boundary. Reuse does only fixed-path checks: no production
+    /// access, receipt/corpus scan, profile publication, or stale preference replay.
+    /// A first ordinary launch starts empty; only `.fresh` imports production.
     static func prepareProfile(
+        mode: Mode,
         locations: AppProfileLocations,
         defaults: UserDefaults,
         preferencesDomain: String,
-        cleanSlate: Bool = false,
         preferenceSourceURL: URL? = nil,
+        synchronize: (UserDefaults) -> Bool = { $0.synchronize() },
         cancellation: DebugStateSnapshot.Cancellation? = nil
     ) throws -> Preparation {
         guard locations.identity.buildFlavor == .debug else { throw DebugStateSnapshot.Failure.unsafeDestination }
@@ -38,87 +37,82 @@ extension DebugStateBootstrap {
             }
         }
 
-        if !cleanSlate, let reused = try reuseProfile(locations: locations, defaults: defaults, preferencesDomain: preferencesDomain) {
+        if mode == .reuse, let reused = try reuseProfile(locations: locations) {
             return reused
         }
 
         let lease = try DebugProfileAccessLease.acquire(locations: locations, exclusive: true)
-        let prior = defaults.persistentDomain(forName: preferencesDomain) ?? [:]
         try cancellation?.check()
-        if !cleanSlate {
-            switch try profileState(locations: locations, preferences: prior) {
-            case .existing:
-                try lease.allowWriters()
-                return Preparation(lease: lease, action: .reused, receipt: nil)
-            case let .pendingPreferences(receipt):
-                try applyPreferences(receipt: receipt, locations: locations, defaults: defaults, preferencesDomain: preferencesDomain)
-                try lease.allowWriters()
-                return Preparation(lease: lease, action: .recoveredPreferences, receipt: receipt)
-            case .empty:
-                break
-            }
+        if mode == .reuse {
+            let recovered = try installPendingPreferences(locations: locations, defaults: defaults, domain: preferencesDomain, synchronize: synchronize)
+            try lease.allowWriters()
+            return Preparation(lease: lease, action: recovered ? .recoveredPreferences : .reused, receipt: nil)
         }
 
+        let clean = mode == .clean
         let release = AppProfileLocations(identity: .repoPromptCE(.release), homeDirectory: locations.homeDirectory)
         let receipt = try seed(
             locations: locations,
-            cleanSlate: cleanSlate,
+            cleanSlate: clean,
             releasePreferences: nil,
-            previousPreferences: prior,
-            preferenceSourceURL: cleanSlate ? nil : (preferenceSourceURL ?? preferenceDirectory.appendingPathComponent(release.preferencesDomain + ".plist")),
+            previousPreferences: defaults.persistentDomain(forName: preferencesDomain) ?? [:],
+            preferenceSourceURL: clean ? nil : (preferenceSourceURL ?? preferenceDirectory.appendingPathComponent(release.preferencesDomain + ".plist")),
             previousPreferenceFileURL: previousPreferencesURL,
             profileLease: lease,
             cancellation: cancellation
         )
-        try applyPreferences(receipt: receipt, locations: locations, defaults: defaults, preferencesDomain: preferencesDomain)
+        try installPendingPreferences(locations: locations, defaults: defaults, domain: preferencesDomain, synchronize: synchronize)
         try lease.allowWriters()
-        return Preparation(lease: lease, action: cleanSlate ? .reset : .imported, receipt: receipt)
+        return Preparation(lease: lease, action: clean ? .reset : .imported, receipt: receipt)
     }
 
-    private static func reuseProfile(locations: AppProfileLocations, defaults: UserDefaults, preferencesDomain: String) throws -> Preparation? {
+    /// A shared lease lets a headless writer keep running. Pending preferences need the
+    /// exclusive path, so this declines and lets the caller install them.
+    private static func reuseProfile(locations: AppProfileLocations) throws -> Preparation? {
         let lease = try DebugProfileAccessLease.acquire(locations: locations, exclusive: false)
-        let preferences = defaults.persistentDomain(forName: preferencesDomain) ?? [:]
-        guard case .existing = try profileState(locations: locations, preferences: preferences) else { return nil }
+        let root = locations.applicationSupportRoot
+        try locations.validateWritableRoot(root)
+        if FileManager.default.fileExists(atPath: root.path) {
+            try DebugStateSnapshot.requireDirectory(root)
+        }
+        var info = stat()
+        let marker = root.appendingPathComponent(DebugStateSnapshot.pendingPreferencesMarkerName)
+        guard lstat(marker.path, &info) != 0, errno == ENOENT else { return nil }
         return Preparation(lease: lease, action: .reused, receipt: nil)
     }
 
-    private static func profileState(locations: AppProfileLocations, preferences: [String: Any]) throws -> ProfileState {
-        let root = locations.applicationSupportRoot
-        let fm = FileManager.default
-        try locations.validateWritableRoot(root)
-        if fm.fileExists(atPath: root.path) {
-            try DebugStateSnapshot.requireDirectory(root)
-            let receiptURL = root.appendingPathComponent("debugSeed.json")
-            try locations.validateMetadataFile(receiptURL)
-            if fm.fileExists(atPath: receiptURL.path) {
-                _ = try DebugStateSnapshot.stamp(receiptURL)
-                guard let receipt = try? JSONDecoder().decode(DebugStateSnapshot.Receipt.self, from: Data(contentsOf: receiptURL)),
-                      receipt.version == 1, receipt.profile == locations.preferencesDomain
-                else {
-                    throw DebugStateSnapshot.Failure.unsafeDestination
-                }
-                if let id = receipt.preferencesID, preferences[preferencesIDKey] as? String != id.uuidString {
-                    return .pendingPreferences(receipt)
-                }
-                return .existing
-            }
-            if try fm.contentsOfDirectory(atPath: root.path).contains(where: { $0 != ".DS_Store" }) {
-                return .existing
-            }
+    /// Publication stages this fence atomically with the files. A crash after the
+    /// swap is repaired once, before stores open; legacy seedPreferences without a
+    /// fence are never reapplied over the user's current debug preferences.
+    @discardableResult
+    private static func installPendingPreferences(
+        locations: AppProfileLocations, defaults: UserDefaults, domain: String,
+        synchronize: (UserDefaults) -> Bool
+    ) throws -> Bool {
+        let marker = locations.applicationSupportRoot.appendingPathComponent(DebugStateSnapshot.pendingPreferencesMarkerName)
+        var info = stat()
+        guard lstat(marker.path, &info) == 0 else {
+            if errno == ENOENT { return false }
+            throw PendingPreferencesFailure(underlyingDescription: "Could not inspect the pending-preferences marker.")
         }
-        return preferences.isEmpty ? .empty : .existing
-    }
-
-    private static func applyPreferences(receipt: DebugStateSnapshot.Receipt, locations: AppProfileLocations, defaults: UserDefaults, preferencesDomain: String) throws {
-        let url = locations.applicationSupportRoot.appendingPathComponent("seedPreferences.plist")
-        try locations.validateMetadataFile(url)
-        _ = try DebugStateSnapshot.stamp(url)
-        guard let id = receipt.preferencesID,
-              var preferences = try PropertyListSerialization.propertyList(from: Data(contentsOf: url), format: nil) as? [String: Any]
-        else {
-            throw DebugStateSnapshot.Failure.unsafeDestination
+        do {
+            _ = try DebugStateSnapshot.stamp(marker)
+            let url = locations.applicationSupportRoot.appendingPathComponent(DebugStateSnapshot.seedPreferencesFileName)
+            try locations.validateMetadataFile(url)
+            _ = try DebugStateSnapshot.stamp(url)
+            guard let preferences = try PropertyListSerialization.propertyList(from: Data(contentsOf: url), format: nil) as? [String: Any] else {
+                throw PendingPreferencesFailure(underlyingDescription: "The staged preferences are not a property-list dictionary.")
+            }
+            defaults.setPersistentDomain(preferences, forName: domain)
+            guard synchronize(defaults) else {
+                throw PendingPreferencesFailure(underlyingDescription: "Preference synchronization did not complete.")
+            }
+            try FileManager.default.removeItem(at: marker)
+            return true
+        } catch let error as PendingPreferencesFailure {
+            throw error
+        } catch {
+            throw PendingPreferencesFailure(underlyingDescription: error.localizedDescription)
         }
-        preferences[preferencesIDKey] = id.uuidString
-        defaults.setPersistentDomain(preferences, forName: preferencesDomain)
     }
 }
