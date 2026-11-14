@@ -125,6 +125,14 @@ actor ClaudeCompatibleNativeSessionAdapter: NativeAgentRuntimeControlling, MCPRu
         await controller.interruptTurn(reason: reason)
     }
 
+    func routingProcessRegistration() async -> MCPRunRoutingProcessRegistration? {
+        guard shutdownTask == nil, let origin = routingCleanupReceipt, !origin.isConsumed,
+              let process = controller as? ClaudeNativeProcessSessionController,
+              let active = await process.activeExpectedAgentPIDRegistration(), active.runID == origin.runID,
+              shutdownTask == nil, routingCleanupReceipt == origin, !origin.isConsumed else { return nil }
+        return .init(receipt: origin, pid: active.pid)
+    }
+
     func retainRoutingCleanup(_ receipt: MCPRunRoutingCleanupReceipt) -> Bool {
         guard shutdownTask == nil, let routingIdentity,
               receipt.runID == routingIdentity.runID, receipt.routeID == routingIdentity.routeID,

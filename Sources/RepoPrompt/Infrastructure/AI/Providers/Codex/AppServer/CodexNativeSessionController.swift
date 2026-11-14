@@ -2895,6 +2895,26 @@ final class CodexNativeSessionController {
         withEventsStateLock { computerUseAutoApprovalRevoked = true }
     }
 
+    func routingProcessRegistration() async -> MCPRunRoutingProcessRegistration? {
+        let origin = withEventsStateLock {
+            shutdownTask == nil && lifecycleState != .shuttingDown && lifecycleState != .terminated ? routingCleanupReceipt : nil
+        }
+        guard let origin, !origin.isConsumed,
+              let generation = await client.healthyTransportGeneration(),
+              let pid = await client.activeExpectedAgentPID(for: origin.runID),
+              await client.healthyTransportGeneration() == generation,
+              withEventsStateLock({ shutdownTask == nil && lifecycleState != .shuttingDown && lifecycleState != .terminated && routingCleanupReceipt == origin && !origin.isConsumed })
+        else { return nil }
+        return .init(receipt: origin, pid: pid)
+    }
+
+    #if DEBUG
+        func test_waitForRoutingCleanup() async {
+            let tail = withEventsStateLock { routingCleanupTail }
+            await tail?.value
+        }
+    #endif
+
     func retainRoutingCleanup(_ receipt: MCPRunRoutingCleanupReceipt) -> Bool {
         withEventsStateLock {
             guard shutdownTask == nil, lifecycleState != .shuttingDown, lifecycleState != .terminated,

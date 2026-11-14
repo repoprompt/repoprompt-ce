@@ -171,6 +171,19 @@ final class MCPRunRouteBindings {
         cleanupOwnershipByConnectionID[connectionID]
     }
 
+    /// The original live process keeps the exact connection/context; only its cleanup owner changes.
+    func transferProcessConnection(_ connectionID: UUID, from origin: MCPRunRoutingCleanupReceipt, to successor: MCPRunRoutingCleanupReceipt) -> Bool {
+        guard ownerLifetime != nil, !origin.isConsumed, !successor.isConsumed,
+              origin.routeOwner?.runRouteBindings === self, successor.routeOwner === origin.routeOwner,
+              origin.runID == successor.runID, origin.routeID == successor.routeID,
+              pendingPolicyTokenIDByRunID[origin.runID] == nil,
+              cleanupOwnershipByConnectionID[connectionID]?.policyID == origin.policyID,
+              hasCurrentMapping(runID: origin.runID, connectionID: connectionID)
+        else { return false }
+        cleanupOwnershipByConnectionID[connectionID] = successor.mappingOwnership
+        return true
+    }
+
     /// Retract only entries installed by this exact policy on this exact resource owner. Closing
     /// admission does not revoke the original cleanup obligation; a reopened owner is different.
     func consumeCleanup(_ receipt: MCPRunRoutingCleanupReceipt, removingContext: (UUID) -> Void = { _ in }) {

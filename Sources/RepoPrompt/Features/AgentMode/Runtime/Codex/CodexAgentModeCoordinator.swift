@@ -4197,7 +4197,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         runID: UUID,
         taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
         allowsAgentExternalControlTools: Bool = false,
-        routingStateOwner: (@MainActor @Sendable () -> Bool)? = nil
+        routingStateOwner: (@MainActor @Sendable () -> Bool)? = nil,
+        reusingController: (any CodexSessionControlling)? = nil
     ) -> MCPBootstrapLease? {
         guard shouldManageCodexTooling else { return nil }
         mcpRuntime?.mcpBindPendingAgentRunOracleReviewContext(tabID: tabID, runID: runID)
@@ -4216,7 +4217,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             mcpServerEnabler: mcpServerEnabler,
             policyInstaller: MCPBootstrapLease.agentModePolicyInstaller(connectionPolicyInstaller),
             routingStateOwner: routingStateOwner,
-            routingOwner: routingOwner
+            routingOwner: routingOwner,
+            processRegistrationProvider: { await (reusingController as? CodexNativeSessionController)?.routingProcessRegistration() }
         )
     }
 
@@ -6773,7 +6775,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 runID: runID,
                 taskLabelKind: session.mcpControlContext?.taskLabelKind,
                 allowsAgentExternalControlTools: allowsAgentExternalControlTools,
-                routingStateOwner: routingStateOwner
+                routingStateOwner: routingStateOwner,
+                reusingController: startupController
             ) else { return }
             let lease = initialLease
             func cleanupIdleCompactStartup() async {

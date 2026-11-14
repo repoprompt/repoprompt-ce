@@ -12,6 +12,14 @@ final class ACPAgentSessionAppHost: ACPAgentSessionHost, @unchecked Sendable {
     private var routingCleanupTail: Task<Void, Never>?
     private var resourceShutdownTask: Task<Void, Never>?
 
+    fileprivate func routingProcessRegistration(runID: UUID, pid: pid_t) -> MCPRunRoutingProcessRegistration? {
+        routingLock.withLock {
+            guard resourceShutdownTask == nil, let origin = routingCleanupReceipt,
+                  origin.runID == runID, !origin.isConsumed else { return nil }
+            return .init(receipt: origin, pid: pid)
+        }
+    }
+
     fileprivate func retainRoutingCleanup(_ receipt: MCPRunRoutingCleanupReceipt) -> Bool {
         routingLock.withLock {
             guard resourceShutdownTask == nil, receipt.routeOwner != nil, !receipt.isConsumed,
@@ -206,6 +214,12 @@ final class ACPAgentSessionAppHost: ACPAgentSessionHost, @unchecked Sendable {
 }
 
 extension ACPAgentSessionController: MCPRunRoutingCleanupRetaining {
+    func routingProcessRegistration() -> MCPRunRoutingProcessRegistration? {
+        guard let process = activeExpectedAgentPIDRegistration(),
+              let host = hostForRoutingHandoff(expectedRunID: process.runID) as? ACPAgentSessionAppHost else { return nil }
+        return host.routingProcessRegistration(runID: process.runID, pid: process.pid)
+    }
+
     func retainRoutingCleanup(_ receipt: MCPRunRoutingCleanupReceipt) -> Bool {
         guard let host = hostForRoutingHandoff(expectedRunID: receipt.runID) as? ACPAgentSessionAppHost else { return false }
         return host.retainRoutingCleanup(receipt)

@@ -543,6 +543,13 @@ package actor ACPAgentSessionController {
         expectedMCPRunID = runID
     }
 
+    package func activeExpectedAgentPIDRegistration() -> (runID: UUID, pid: pid_t)? {
+        guard shutdownTask == nil, state != .closing, state != .closed, state != .failed,
+              let runID = expectedMCPRunID, let pid = registeredExpectedAgentPID,
+              process?.pid == pid else { return nil }
+        return (runID, pid)
+    }
+
     /// The app may attach routing resources only to this still-live original process host.
     /// This is not session command admission or evidence of shutdown completion.
     package func hostForRoutingHandoff(expectedRunID: UUID) -> (any ACPAgentSessionHost)? {

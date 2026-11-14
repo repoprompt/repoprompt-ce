@@ -7,6 +7,13 @@ protocol MCPRunRoutingCleanupRetaining: Actor {
     func retainRoutingCleanup(_ receipt: MCPRunRoutingCleanupReceipt) -> Bool
 }
 
+/// Captured only from an actual controller's still-live registered process. Installation
+/// revalidates it against the current policy; a reused run ID is never process evidence.
+struct MCPRunRoutingProcessRegistration {
+    let receipt: MCPRunRoutingCleanupReceipt
+    let pid: pid_t
+}
+
 /// Originating cleanup only. This is not command admission, a current writer, or a durable save
 /// acknowledgement. The registration owner issues it in the same actor turn as policy installation.
 struct MCPRunRoutingCleanupReceipt: Equatable {

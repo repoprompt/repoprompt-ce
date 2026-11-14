@@ -1450,6 +1450,9 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         var cleanupReceipt: MCPRunRoutingCleanupReceipt?
         /// Independent-route PIDs belong to this exact registration, not a run-wide side table.
         var expectedAgentPIDsByClient: [String: Set<pid_t>] = [:]
+        /// Cleanup provenance only: a live process keeps its captured registrar across refresh.
+        /// Old registrars may clear only their transferred PID, never register another one.
+        var expectedAgentPIDOriginsByClient: [String: [pid_t: UUID]] = [:]
 
         func hasSameAdmissionPolicy(as other: Self) -> Bool {
             windowID == other.windowID && workspaceID == other.workspaceID && tabID == other.tabID
@@ -4830,6 +4833,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         var next = state
         if let current = runPolicyStateByRunID[runID], current.cleanupReceipt == state.cleanupReceipt {
             next.expectedAgentPIDsByClient = current.expectedAgentPIDsByClient
+            next.expectedAgentPIDOriginsByClient = current.expectedAgentPIDOriginsByClient
         }
         if let current = runPolicyStateByRunID[runID], current.hasSameAdmissionPolicy(as: state) {
             next.admissionRevision = current.admissionRevision
@@ -9012,6 +9016,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         if let registration {
             guard registration.runID == runID, ownsRunRegistration(registration) else { return }
             runPolicyStateByRunID[registration.runID]?.expectedAgentPIDsByClient[storageKey, default: []].insert(pid)
+            runPolicyStateByRunID[registration.runID]?.expectedAgentPIDOriginsByClient[storageKey, default: [:]][pid] = registration.policyID
             return
         }
         if let runID, runPolicyStateByRunID[runID]?.cleanupReceipt?.routeOwner != nil { return }
@@ -9043,11 +9048,18 @@ actor ServerNetworkManager: MCPServerConnectionHost {
 
     func clearExpectedAgentPID(_ pid: pid_t, for clientName: String, runID: UUID? = nil, registration: MCPRunRoutingCleanupReceipt? = nil) {
         if let registration {
-            guard registration.runID == runID, ownsRunRegistration(registration),
+            guard registration.runID == runID, registration.managerIdentity == ObjectIdentifier(self),
                   var state = runPolicyStateByRunID[registration.runID] else { return }
+            let ownsCurrent = ownsRunRegistration(registration)
+            guard ownsCurrent || (registration.routeOwner != nil && state.cleanupReceipt?.routeOwner === registration.routeOwner) else { return }
             for key in matchingClientKeys(for: clientName, in: Array(state.expectedAgentPIDsByClient.keys)) {
+                guard ownsCurrent || state.expectedAgentPIDOriginsByClient[key]?[pid] == registration.policyID else { continue }
                 state.expectedAgentPIDsByClient[key]?.remove(pid)
-                if state.expectedAgentPIDsByClient[key]?.isEmpty == true { state.expectedAgentPIDsByClient.removeValue(forKey: key) }
+                state.expectedAgentPIDOriginsByClient[key]?.removeValue(forKey: pid)
+                if state.expectedAgentPIDsByClient[key]?.isEmpty == true {
+                    state.expectedAgentPIDsByClient.removeValue(forKey: key)
+                    state.expectedAgentPIDOriginsByClient.removeValue(forKey: key)
+                }
             }
             runPolicyStateByRunID[registration.runID] = state
             return
@@ -9371,7 +9383,8 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         requiresExpectedAgentPID: Bool = false,
         prunesOnlyAfterSettlement: Bool = false,
         routingOwner: MCPHostRouteResources? = nil,
-        routingWaitGeneration: UUID? = nil
+        routingWaitGeneration: UUID? = nil,
+        reusingProcess: MCPRunRoutingProcessRegistration? = nil
     ) async -> MCPRunRoutingCleanupReceipt? {
         let storageKey = Self.clientStorageKey(clientName)
         pruneExpiredPolicies(for: clientName)
@@ -9406,20 +9419,46 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             let committedConnectionID = purpose == .agentModeRun
                 ? lateCommittedRunRouteCandidate(runID: runID, windowID: windowID, tabID: tabID) : nil
             let committedWorkspaceID = committedConnectionID.flatMap { cachedModelRunRoute(connectionID: $0)?.workspaceID }
-            runRoutingAuthorityGenerationByRunID[runID, default: 0] &+= 1
-            revocationFenceGenerationByRunID.removeValue(forKey: runID)
-            policy.cleanupReceipt = MCPRunRoutingCleanupReceipt(
+            let previousGeneration = runRoutingAuthorityGenerationByRunID[runID, default: 0]
+            let receipt = MCPRunRoutingCleanupReceipt(
                 managerIdentity: ObjectIdentifier(self), policyID: policy.id, runID: runID,
-                routeID: windowID, routingAuthorityGeneration: runRoutingAuthorityGenerationByRunID[runID, default: 0],
+                routeID: windowID, routingAuthorityGeneration: previousGeneration &+ 1,
                 routingWaitGeneration: routingWaitGeneration, routeOwner: routingOwner
             )
-            if let committedConnectionID {
-                runCleanupOwnershipByConnectionID[committedConnectionID] = policy.cleanupReceipt?.mappingOwnership
+            var transferredPIDOrigin: UUID?
+            if purpose == .agentModeRun, let process = reusingProcess, let routingOwner,
+               process.receipt.routeOwner === routingOwner, process.receipt.runID == runID,
+               process.receipt.routeID == windowID, ownsRunRegistration(process.receipt),
+               runPolicyStateByRunID[runID]?.tabID == tabID,
+               revocationFenceGenerationByRunID[runID] != previousGeneration,
+               runPolicyStateByRunID[runID]?.expectedAgentPIDsByClient[storageKey]?.contains(process.pid) == true
+            {
+                let origin = process.receipt
+                transferredPIDOrigin = runPolicyStateByRunID[runID]?.expectedAgentPIDOriginsByClient[storageKey]?[process.pid] ?? origin.policyID
+                if let connectionID = committedConnectionID {
+                    let originalConnection = authoritativeRunRouteActorSnapshot(runID: runID, connectionID: connectionID, windowID: windowID, tabID: tabID)
+                    guard runCleanupOwnershipByConnectionID[connectionID]?.policyID == origin.policyID,
+                          await routingOwner.transferProcessConnection(connectionID, from: origin, to: receipt)
+                    else { return nil }
+                    // The MainActor hop may admit a different policy, disconnect, or original shutdown.
+                    guard ownsRunRegistration(origin), runRoutingAuthorityGenerationByRunID[runID] == previousGeneration,
+                          authoritativeRunRouteActorSnapshot(runID: runID, connectionID: connectionID, windowID: windowID, tabID: tabID) == originalConnection
+                    else {
+                        await routingOwner.consumeCleanup(receipt)
+                        return nil
+                    }
+                }
+            }
+            runRoutingAuthorityGenerationByRunID[runID] = receipt.routingAuthorityGeneration
+            revocationFenceGenerationByRunID.removeValue(forKey: runID)
+            policy.cleanupReceipt = receipt
+            if let connectionID = committedConnectionID, routingOwner == nil || transferredPIDOrigin != nil {
+                runCleanupOwnershipByConnectionID[connectionID] = receipt.mappingOwnership
             }
             seedRunPolicyState(
                 runID: runID,
                 windowID: windowID,
-                workspaceID: committedWorkspaceID,
+                workspaceID: routingOwner == nil || transferredPIDOrigin != nil ? committedWorkspaceID : nil,
                 tabID: tabID,
                 restrictedTools: sanitizedRestricted,
                 additionalTools: additionalTools,
@@ -9430,6 +9469,10 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                 cleanupReceipt: policy.cleanupReceipt,
                 replacesRegistration: true
             )
+            if let originID = transferredPIDOrigin, let process = reusingProcess {
+                runPolicyStateByRunID[runID]?.expectedAgentPIDsByClient[storageKey, default: []].insert(process.pid)
+                runPolicyStateByRunID[runID]?.expectedAgentPIDOriginsByClient[storageKey, default: [:]][process.pid] = originID
+            }
         }
         var queue = pendingPoliciesByClient[storageKey] ?? []
         // Agent-mode runs can enqueue policies frequently (e.g. warmup/send/reconnect loops).
@@ -9895,6 +9938,16 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                 purpose: runPurposeByConnection[connectionID] ?? .unknown,
                 windowID: presentationWindowByConnection[connectionID]
             )
+        }
+
+        func debugValidateOwnedRouteDispatch(connectionID: UUID, routeID: Int, handle: MCPDomainToolRegistrationHandle, ownerIdentity: ObjectIdentifier) async -> Bool {
+            guard let resolution = connectionCallLimiterResolution(for: connectionID),
+                  let identity = await captureWindowToolDispatchIdentity(windowID: routeID, catalogRegistrationHandle: handle)
+            else { return false }
+            let authorization = toolDispatchAuthorization(connectionID: connectionID, resolution: resolution, windowIdentity: identity, policyAdmissionToken: nil)
+            return await Self.currentConnectionIDTaskLocal.withValue(connectionID) {
+                await validateToolDispatchAuthorization(authorization, expectedWindowID: routeID, expectedServerViewModelIdentity: ownerIdentity)
+            }
         }
 
         func debugCachedRunID(for connectionID: UUID) -> UUID? {

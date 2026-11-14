@@ -656,6 +656,14 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
         try sendLine(encoded, shutdownOnFailure: false)
     }
 
+    /// A process-local proof, not a provider-session ID or a configured future launch PID.
+    package func activeExpectedAgentPIDRegistration() -> (runID: UUID, pid: pid_t)? {
+        guard shutdownTask == nil, !isShuttingDown, hasActiveSession, isInitialized,
+              let origin = registeredExpectedAgentPID, origin.cleanup == nil,
+              process?.pid == origin.pid else { return nil }
+        return (runID, origin.pid)
+    }
+
     package func shutdown() async {
         if let shutdownTask {
             await shutdownTask.value

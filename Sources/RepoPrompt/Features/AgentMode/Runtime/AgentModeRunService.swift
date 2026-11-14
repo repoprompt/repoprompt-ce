@@ -394,6 +394,8 @@ final class AgentModeRunService {
         let expectedPIDPolicyArmer = dependencies.expectedPIDPolicyArmer
         let taskLabelKind = session.mcpControlContext?.taskLabelKind
         let allowsAgentExternalControlTools = session.mcpControlContext != nil && session.parentSessionID == nil
+        let claudeProcess = session.claudeController as? ClaudeCompatibleNativeSessionAdapter
+        let acpProcess = session.acpController
         let makeLease: (_ runID: UUID) -> MCPBootstrapLease = { runID in
             self.dependencies.bindPendingOracleReviewContext(tabID, runID)
             let leaseSpec = MCPBootstrapLeaseSpec.agentMode(
@@ -411,7 +413,12 @@ final class AgentModeRunService {
                 mcpServerEnabler: mcpServerEnabler,
                 policyInstaller: MCPBootstrapLease.agentModePolicyInstaller(connectionPolicyInstaller),
                 expectedPIDPolicyArmer: expectedPIDPolicyArmer,
-                routingOwner: self.dependencies.routingOwner
+                routingOwner: self.dependencies.routingOwner,
+                processRegistrationProvider: {
+                    if selectedAgent.usesClaudeNativeRuntime { return await claudeProcess?.routingProcessRegistration() }
+                    if selectedAgent.acpProviderID != nil { return await acpProcess?.routingProcessRegistration() }
+                    return nil
+                }
             )
         }
         if selectedAgent.usesClaudeNativeRuntime {

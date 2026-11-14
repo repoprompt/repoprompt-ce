@@ -170,6 +170,7 @@ actor MCPBootstrapLease {
     private let mcpServerEnabler: (() async -> Bool)?
     private let policyInstaller: (MCPBootstrapLeaseSpec) async -> Void
     private let routingOwner: MCPHostRouteResources?
+    private let processRegistrationProvider: (@MainActor @Sendable () async -> MCPRunRoutingProcessRegistration?)?
     private var routingWaitGeneration: UUID?
     private var cleanupReceipts: [MCPRunRoutingCleanupReceipt] = []
     private let expectedPIDPolicyArmer: (MCPBootstrapLeaseSpec) async -> Bool
@@ -226,7 +227,8 @@ actor MCPBootstrapLease {
         policyClearer: ((MCPBootstrapLeaseSpec) async -> Void)? = nil,
         routingStateOwner: (@MainActor @Sendable () -> Bool)? = nil,
         routeAuthorityResolver: ((MCPBootstrapLeaseSpec) async -> MCPRunRouteAuthorityDecision)? = nil,
-        routingOwner: MCPHostRouteResources? = nil
+        routingOwner: MCPHostRouteResources? = nil,
+        processRegistrationProvider: (@MainActor @Sendable () async -> MCPRunRoutingProcessRegistration?)? = nil
     ) {
         self.spec = spec
         runID = spec.runID
@@ -234,6 +236,7 @@ actor MCPBootstrapLease {
         self.mcpServerEnabler = mcpServerEnabler
         self.policyInstaller = policyInstaller ?? Self.defaultPolicyInstaller
         self.routingOwner = routingOwner
+        self.processRegistrationProvider = processRegistrationProvider
         self.expectedPIDPolicyArmer = expectedPIDPolicyArmer ?? Self.defaultExpectedPIDPolicyArmer
         self.policyClearer = policyClearer ?? Self.defaultPolicyClearer
         self.routingStateOwner = routingStateOwner
@@ -242,13 +245,14 @@ actor MCPBootstrapLease {
 
     /// Owned routes retain every policy installation (including a same-process retry) in this
     /// existing lease. A stale command can lose admission without losing its cleanup obligations.
-    private func installPolicy() async -> Bool {
+    private func installPolicy(reusingProcess: Bool = true) async -> Bool {
         guard let routingOwner else {
             await policyInstaller(spec)
             return true
         }
+        let process = reusingProcess ? await processRegistrationProvider?() : nil
         guard let generation = routingWaitGeneration,
-              let receipt = await Self.installPolicy(spec, routingOwner: routingOwner, routingWaitGeneration: generation)
+              let receipt = await Self.installPolicy(spec, routingOwner: routingOwner, routingWaitGeneration: generation, reusingProcess: process)
         else { return false }
         cleanupReceipts.append(receipt)
         return true
@@ -496,7 +500,7 @@ actor MCPBootstrapLease {
                 self.routingWaitGeneration = await MCPRoutingWaiter.registerOwned(runID: self.spec.runID)
             }
             guard !self.shouldAbortAcquire else { return }
-            _ = await self.installPolicy()
+            _ = await self.installPolicy(reusingProcess: false)
         }
         policyReinstallOperation = operation
         await operation.value
@@ -1141,7 +1145,8 @@ actor MCPBootstrapLease {
     }
 
     private static func installPolicy(
-        _ spec: MCPBootstrapLeaseSpec, routingOwner: MCPHostRouteResources?, routingWaitGeneration: UUID?
+        _ spec: MCPBootstrapLeaseSpec, routingOwner: MCPHostRouteResources?, routingWaitGeneration: UUID?,
+        reusingProcess: MCPRunRoutingProcessRegistration? = nil
     ) async -> MCPRunRoutingCleanupReceipt? {
         guard let clientName = spec.clientName else { return nil }
         return await ServerNetworkManager.shared.installClientConnectionPolicy(
@@ -1159,7 +1164,7 @@ actor MCPBootstrapLease {
             allowsAgentExternalControlTools: spec.allowsAgentExternalControlTools,
             requiresExpectedAgentPID: spec.requiresExpectedAgentPID,
             prunesOnlyAfterSettlement: spec.purpose == .discoverRun,
-            routingOwner: routingOwner, routingWaitGeneration: routingWaitGeneration
+            routingOwner: routingOwner, routingWaitGeneration: routingWaitGeneration, reusingProcess: reusingProcess
         )
     }
 

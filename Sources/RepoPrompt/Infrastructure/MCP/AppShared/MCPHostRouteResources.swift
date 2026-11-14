@@ -175,6 +175,20 @@ final class MCPHostRouteResources {
         }
     }
 
+    /// Join original publications before transferring the existing domain receipt and context.
+    /// No new connection generation or catalog lookup is manufactured for a process refresh.
+    func transferProcessConnection(_ connectionID: UUID, from origin: MCPRunRoutingCleanupReceipt, to successor: MCPRunRoutingCleanupReceipt) async -> Bool {
+        await settleRoutingPublications()
+        guard !isClosing, origin.routeOwner === self, successor.routeOwner === self,
+              coordinator == nil || connections[connectionID]?.policyID == origin.policyID,
+              runRouteBindings.transferProcessConnection(connectionID, from: origin, to: successor)
+        else { return false }
+        if let retained = connections[connectionID] {
+            connections[connectionID] = RetainedConnection(registration: retained.registration, policyID: successor.policyID)
+        }
+        return true
+    }
+
     func installPendingPolicy(_ receipt: MCPRunRoutingCleanupReceipt, connectionID: UUID, clientName: String?, tabID: UUID?) -> PolicyContextInstallation? {
         guard !isClosing, !receipt.isConsumed, receipt.routeOwner === self else { return nil }
         return runRouting?.install(self, receipt, connectionID, clientName, tabID)
