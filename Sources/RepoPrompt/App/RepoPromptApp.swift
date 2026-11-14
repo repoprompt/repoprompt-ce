@@ -204,6 +204,7 @@ struct RepoPromptSwiftUIApp: App {
                 .environment(\.font, fontScale.preset.font)
                 .handlesExternalEvents(preferring: [], allowing: [])
         }
+        .handlesExternalEvents(matching: [])
         .defaultSize(width: 1050, height: 700)
         // CommandCenterCommands supplies the remappable menu entry, not a second native command.
         .commandsRemoved()
