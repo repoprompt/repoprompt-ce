@@ -4,13 +4,18 @@ import Foundation
 extension AgentModeViewModel {
     /// Local UI handoff, distinct from eventual provider dispatch. The existing claim remains
     /// the only admission authority; the pending row is merely its visible projection.
-    func claimComposerSubmitForImmediatePresentation(_ attempt: AgentComposerSubmitAttempt) -> AgentComposerSubmitClaimResult {
+    func claimComposerSubmitForImmediatePresentation(
+        _ attempt: AgentComposerSubmitAttempt, requireActiveTabOwnership: Bool = true
+    ) -> AgentComposerSubmitClaimResult {
         if let pending = ui.composer.pendingSubmissions.values.first(where: {
             $0.sourceTabID == attempt.sourceTabID || $0.destinationTabID == attempt.sourceTabID
         }) {
             return .rejected(.activeAttemptExists(activeAttemptID: pending.id))
         }
-        let result = claimComposerSubmitAttempt(attempt, requireActiveTabOwnership: true, awaitsExecutor: true)
+        let result = claimComposerSubmitAttempt(
+            attempt, requireActiveTabOwnership: requireActiveTabOwnership, awaitsExecutor: true,
+            adoptsLocalReprompt: true
+        )
         guard case let .claimed(claim) = result else { return result }
         let submittedRepromptDraft = repromptUIStore.submittedDraftSnapshot(tabID: attempt.sourceTabID)
         ui.composer.pendingSubmissions[attempt.id] = .init(
