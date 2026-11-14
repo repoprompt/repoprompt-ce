@@ -895,6 +895,16 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
     }
 
     func testActualControllerSameProcessPolicyRefreshPreservesOwnedRouteAndPID() async throws {
+        try await assertActualControllerProcessPolicyRefresh()
+    }
+
+    func testActualControllerPIDMutationDuringTransferRefusesSuccessor() async throws {
+        for reregister in [false, true] {
+            try await assertActualControllerProcessPolicyRefresh(reregisterDuringTransfer: reregister)
+        }
+    }
+
+    private func assertActualControllerProcessPolicyRefresh(reregisterDuringTransfer: Bool? = nil) async throws {
         let storageRoot = try makeTestDirectory(name: "ProcessPolicyRefresh")
         let runtime = MCPDomainRuntime(configuration: .init(
             mode: .app, profileIdentifier: "process-refresh-\(UUID())",
@@ -906,7 +916,7 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
         addTeardownBlock { _ = await runtime.shutdown() }
         try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
             do {
-                for sameProcess in [true, false] {
+                for sameProcess in reregisterDuringTransfer == nil ? [true, false] : [true] {
                     let fixture = try await makeFixture(name: "process-refresh", domainRuntime: runtime)
                     defer { fixture.cleanup() }
                     let manager = ServerNetworkManager.shared
@@ -996,7 +1006,47 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
                         XCTAssertEqual(replacementPIDs, [pid], "Late old registration/clear cannot cross a different process, even after PID reuse")
                         XCTAssertFalse(b.isConsumed)
                     }
-                    if sameProcess {
+                    if let reregister = reregisterDuringTransfer {
+                        // B retained the actual process's registrar A. Clear it while the real
+                        // B->C MainActor transfer is suspended; optionally register via B to keep
+                        // the numeric PID but replace its provenance. Neither may resurrect A.
+                        let currentProcess = await controller.routingProcessRegistration()
+                        let registration = try XCTUnwrap(currentProcess)
+                        let currentRegistrar = CodexAppServerClient.ExpectedAgentPIDRegistrar.serverNetworkManager(registration: b)
+                        var didTransfer = false
+                        route.test_afterProcessConnectionTransfer = { tentative in
+                            didTransfer = true
+                            XCTAssertEqual(route.runRouteBindings.cleanupOwnership(for: fixture.connectionID)?.policyID, tentative.policyID)
+                            XCTAssertNotEqual(tentative.policyID, b.policyID)
+                            await originalPIDRegistrar.clear(pid, clientName, fixture.runID)
+                            if reregister { await currentRegistrar.register(pid, clientName, fixture.runID) }
+                            let duringTransfer = await manager.debugExpectedAgentPIDs(for: clientName, runID: fixture.runID)
+                            XCTAssertEqual(duringTransfer, reregister ? [pid] : [])
+                        }
+                        let rejected = await manager.installClientConnectionPolicy(
+                            for: clientName, windowID: route.identity.routeID, restrictedTools: [], tabID: fixture.tabID,
+                            runID: fixture.runID, purpose: .agentModeRun, requiresExpectedAgentPID: true,
+                            routingOwner: route, reusingProcess: registration
+                        )
+                        route.test_afterProcessConnectionTransfer = nil
+                        XCTAssertTrue(didTransfer, "Must exercise the actual cross-actor transfer, not an earlier refusal")
+                        XCTAssertNil(rejected, "PID membership and provenance must remain current across the transfer hop")
+                        let afterTransfer = await manager.debugExpectedAgentPIDs(for: clientName, runID: fixture.runID)
+                        XCTAssertEqual(afterTransfer, reregister ? [pid] : [], "A cleared PID must not be resurrected")
+                        XCTAssertNil(route.runRouteBindings.connectionID(forRunID: fixture.runID))
+                        XCTAssertNil(route.runRouteBindings.tabContextByConnectionID[fixture.connectionID])
+                        let routingAfterTransfer = await runtime.routingCoordinator.snapshot()
+                        XCTAssertFalse(routingAfterTransfer.connections.contains { $0.registration == domainA }, "Retract only the tentative successor's exact original domain receipt")
+                        let qualifiedAfterTransfer = await manager.isRunRouteAuthoritativelyCommitted(runID: fixture.runID, windowID: route.identity.routeID, tabID: fixture.tabID, expectedAgentPID: pid, registration: b)
+                        XCTAssertFalse(qualifiedAfterTransfer)
+                        if reregister {
+                            await originalPIDRegistrar.clear(pid, clientName, fixture.runID)
+                            let afterLateClear = await manager.debugExpectedAgentPIDs(for: clientName, runID: fixture.runID)
+                            XCTAssertEqual(afterLateClear, [pid], "A rejected transfer must not replace B's newer PID provenance with A")
+                        }
+                        if let rejected { await manager.cleanupRunRoutingState(ownedBy: rejected) }
+                    }
+                    if sameProcess, reregisterDuringTransfer == nil {
                         // The process retained registrar A. Its exact PID clear must work after refresh,
                         // before controller receipt B performs the broader routing teardown.
                         await client.clearExpectedAgentPIDRegistration()

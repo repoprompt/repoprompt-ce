@@ -175,6 +175,11 @@ final class MCPHostRouteResources {
         }
     }
 
+    #if DEBUG
+        /// Suspend the actual transfer after tentative publication to exercise actor reentrancy.
+        var test_afterProcessConnectionTransfer: (@MainActor @Sendable (MCPRunRoutingCleanupReceipt) async -> Void)?
+    #endif
+
     /// Join original publications before transferring the existing domain receipt and context.
     /// No new connection generation or catalog lookup is manufactured for a process refresh.
     func transferProcessConnection(_ connectionID: UUID, from origin: MCPRunRoutingCleanupReceipt, to successor: MCPRunRoutingCleanupReceipt) async -> Bool {
@@ -186,6 +191,9 @@ final class MCPHostRouteResources {
         if let retained = connections[connectionID] {
             connections[connectionID] = RetainedConnection(registration: retained.registration, policyID: successor.policyID)
         }
+        #if DEBUG
+            await test_afterProcessConnectionTransfer?(successor)
+        #endif
         return true
     }
 

@@ -9440,8 +9440,11 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                     guard runCleanupOwnershipByConnectionID[connectionID]?.policyID == origin.policyID,
                           await routingOwner.transferProcessConnection(connectionID, from: origin, to: receipt)
                     else { return nil }
-                    // The MainActor hop may admit a different policy, disconnect, or original shutdown.
+                    // The MainActor hop may admit a different policy, disconnect, or clear/replace
+                    // the process registration. Never resurrect a captured PID or its old provenance.
                     guard ownsRunRegistration(origin), runRoutingAuthorityGenerationByRunID[runID] == previousGeneration,
+                          runPolicyStateByRunID[runID]?.expectedAgentPIDsByClient[storageKey]?.contains(process.pid) == true,
+                          runPolicyStateByRunID[runID]?.expectedAgentPIDOriginsByClient[storageKey]?[process.pid] == transferredPIDOrigin,
                           authoritativeRunRouteActorSnapshot(runID: runID, connectionID: connectionID, windowID: windowID, tabID: tabID) == originalConnection
                     else {
                         await routingOwner.consumeCleanup(receipt)
