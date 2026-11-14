@@ -23,6 +23,8 @@ extension AgentSessionProviderInputRuntime {
         /// Runtime-composed input retains the exact command/resource proof through provider awaits.
         /// Legacy/local assembly has no additional resource receipt beyond its existing fences.
         var dispatchIsCurrent: @MainActor () -> Bool = { true }
+        var validateResources: (@MainActor () async -> Bool)?
+        var providerLaunchInput: AgentProviderLaunchInput?
     }
 
     struct ExplicitFileFailure: Equatable {

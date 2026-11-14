@@ -2500,7 +2500,7 @@ final class AgentRunStartBudgetTests: XCTestCase {
             XCTAssertEqual(vm.mcpRuntime.waitCursor(sessionID: fixture.sessionID)?.registration, context.registration)
             XCTAssertEqual(vm.mcpSnapshot(sessionID: fixture.sessionID)?.status, .running)
             XCTAssertNil(vm.mcpRuntime.mcpSnapshot(for: session), "Publication still needs the current exclusive writer")
-            XCTAssertNil(vm.mcpWaitPublication(sessionID: fixture.sessionID), "Waiter wakes must not publish a read-only snapshot")
+            XCTAssertNil(vm.mcpRuntime.waitPublication(sessionID: fixture.sessionID), "Waiter wakes must not publish a read-only snapshot")
             for op in ["poll", "wait"] {
                 let result = try await fixture.service.execute(args: [
                     "op": .string(op), "session_id": .string(fixture.sessionID.uuidString), "timeout": .double(0.01)

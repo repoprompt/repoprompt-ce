@@ -193,7 +193,7 @@ final class ACPIntegratedAgentModeRunner {
         case taskEntry, toolTrackingCompleted, leaseAcquired, acquireFailureOutcome
         case bootstrapStarting, bootstrapCompleted, resumeRecoveryStaged, configuration, routingReleased, prePromptFailure
         case reusabilityProbed, deferredLeaseAcquired, controlPromptAdmission, controlPromptPrepared
-        case promptPrepared, promptStreamAcquired, providerInputProved
+        case promptPrepared, promptStreamAcquired, providerInputPreparing, providerInputProved
     }
 
     #if DEBUG
@@ -207,6 +207,7 @@ final class ACPIntegratedAgentModeRunner {
         tabID: UUID,
         session: AgentTabSession,
         origin: AgentSessionRuntimeStore.Command,
+        providerLaunchInput: AgentProviderLaunchInput? = nil,
         workspace: AgentRunWorkspaceInput,
         initialUserMessage: String,
         initialMessageForRun: String,
@@ -224,7 +225,11 @@ final class ACPIntegratedAgentModeRunner {
               origin.writer.session === session, origin.isCurrent
         else { return nil }
         guard session.operationAdmissionFailureMessage == nil else { return nil }
-        guard stopFence?.permitsStart(of: session) ?? true else { return nil }
+        guard stopFence?.permitsStart(of: session) ?? true,
+              await providerLaunchInput?.validate(for: session) ?? true,
+              origin.isCurrent, providerLaunchInput?.isCurrent(for: session) != false,
+              session.operationAdmissionFailureMessage == nil,
+              stopFence?.permitsStart(of: session) ?? true else { return nil }
         let attachmentReservationID = hooks.prepareNonCodexTurnInputs(
             session: session, attachments: attachments,
             initialUserMessage: initialUserMessage, initialMessageForRun: initialMessageForRun
@@ -259,11 +264,13 @@ final class ACPIntegratedAgentModeRunner {
             #if DEBUG
                 testAfterExistingControllerProbe?(probe)
             #endif
+            let resourcesCurrent = await providerLaunchInput?.validate(for: session) ?? true
             guard isStartupStillCurrent(session: session, runAttemptID: runAttemptID) else {
                 startOutcome?.recordStartFailure(message: nil)
                 return false
             }
-            if origin.isCurrent, session.acpController === controller { return true }
+            if resourcesCurrent, origin.isCurrent, providerLaunchInput?.isCurrent(for: session) != false,
+               session.acpController === controller { return true }
             startOutcome?.recordStartFailure(message: nil)
             // A lost claim cannot retire a controller or settle attachments now shared with a
             // successor. The still-exclusive original claim can cancel this unsent attempt.
@@ -285,7 +292,7 @@ final class ACPIntegratedAgentModeRunner {
                 runRequest: runRequest,
                 attachmentReservationID: attachmentReservationID,
                 admitExistingController: admitExistingController,
-                receipt: receipt,
+                receipt: receipt, providerLaunchInput: providerLaunchInput,
                 makeLease: makeLease
             )
             return nil
@@ -332,7 +339,7 @@ final class ACPIntegratedAgentModeRunner {
                     runRequest: runRequest,
                     attachmentReservationID: attachmentReservationID,
                     providerControlCommand: nil,
-                    receipt: receipt,
+                    receipt: receipt, providerLaunchInput: providerLaunchInput,
                     makeLease: makeLease,
                     localComposerCandidate: localComposerCandidate
                 )
@@ -355,7 +362,8 @@ final class ACPIntegratedAgentModeRunner {
         guard isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID) else { return nil }
 
         let stillCurrent = { [self] in
-            origin.isCurrent && session.currentRestorationBindingToken == binding
+            origin.isCurrent && providerLaunchInput?.isCurrent(for: session) != false
+                && session.currentRestorationBindingToken == binding
                 && isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID)
                 && (stopFence?.permitsStart(of: session) ?? true)
         }
@@ -471,7 +479,7 @@ final class ACPIntegratedAgentModeRunner {
                                 }
                                 session.agentTask = makeTrackedRunTask(
                                     session: session, runID: runID, runAttemptID: runAttemptID,
-                                    controller: controller, receipt: receipt, attachmentReservationID: attachmentReservationID,
+                                    controller: controller, receipt: receipt, providerLaunchInput: providerLaunchInput, attachmentReservationID: attachmentReservationID,
                                     retainsController: false,
                                     clientNameHint: runRequest.agentKind.mcpClientNameHint, localComposerCandidate: localComposerCandidate
                                 ) { runner, session in
@@ -485,7 +493,7 @@ final class ACPIntegratedAgentModeRunner {
                                         controller: controller,
                                         runRequest: freshRunRequest,
                                         lease: lease,
-                                        receipt: receipt,
+                                        receipt: receipt, providerLaunchInput: providerLaunchInput,
                                         attachmentReservationID: attachmentReservationID,
                                         localComposerCandidate: localComposerCandidate
                                     )
@@ -507,6 +515,7 @@ final class ACPIntegratedAgentModeRunner {
         runAttemptID: UUID,
         controller: ACPAgentSessionController,
         receipt: AgentSessionRuntimeStore.WriterReceipt,
+        providerLaunchInput: AgentProviderLaunchInput?,
         attachmentReservationID: UUID?,
         retainsController: Bool,
         dedicatedNoteID: AgentSelfCompactionDispatchID? = nil,
@@ -524,7 +533,7 @@ final class ACPIntegratedAgentModeRunner {
             guard let self else { return }
             guard await admitStartupTask(
                 .taskEntry, session: session, runID: runID, runAttemptID: runAttemptID,
-                controller: controller, receipt: receipt, attachmentReservationID: attachmentReservationID,
+                controller: controller, receipt: receipt, providerLaunchInput: providerLaunchInput, attachmentReservationID: attachmentReservationID,
                 retainsController: retainsController, dedicatedNoteID: dedicatedNoteID
             ) else { return }
             if let clientNameHint {
@@ -532,7 +541,7 @@ final class ACPIntegratedAgentModeRunner {
             }
             guard await admitStartupTask(
                 .toolTrackingCompleted, session: session, runID: runID, runAttemptID: runAttemptID,
-                controller: controller, receipt: receipt, attachmentReservationID: attachmentReservationID,
+                controller: controller, receipt: receipt, providerLaunchInput: providerLaunchInput, attachmentReservationID: attachmentReservationID,
                 retainsController: retainsController, dedicatedNoteID: dedicatedNoteID
             ) else { return }
             await withTaskCancellationHandler {
@@ -555,6 +564,7 @@ final class ACPIntegratedAgentModeRunner {
         attachmentReservationID: UUID?,
         providerControlCommand: AgentProviderControlCommand?,
         receipt: AgentSessionRuntimeStore.WriterReceipt,
+        providerLaunchInput: AgentProviderLaunchInput?,
         makeLease: @escaping (_ runID: UUID) -> MCPBootstrapLease,
         localComposerCandidate: UUID? = nil
     ) {
@@ -583,7 +593,7 @@ final class ACPIntegratedAgentModeRunner {
         }
         session.agentTask = makeTrackedRunTask(
             session: session, runID: runID, runAttemptID: runAttemptID,
-            controller: controller, receipt: receipt, attachmentReservationID: attachmentReservationID,
+            controller: controller, receipt: receipt, providerLaunchInput: providerLaunchInput, attachmentReservationID: attachmentReservationID,
             retainsController: true, dedicatedNoteID: dedicatedNoteID,
             clientNameHint: runRequest.agentKind.mcpClientNameHint, localComposerCandidate: localComposerCandidate
         ) { runner, session in
@@ -598,7 +608,7 @@ final class ACPIntegratedAgentModeRunner {
                 controller: controller,
                 runRequest: runRequest,
                 deferredLease: deferredLease,
-                receipt: receipt,
+                receipt: receipt, providerLaunchInput: providerLaunchInput,
                 attachmentReservationID: attachmentReservationID,
                 providerControlCommand: providerControlCommand,
                 leaseDisposition: leaseDisposition,
@@ -618,6 +628,7 @@ final class ACPIntegratedAgentModeRunner {
         attachmentReservationID: UUID?,
         admitExistingController: (ExistingControllerProbe, ACPAgentSessionController?) async -> Bool,
         receipt: AgentSessionRuntimeStore.WriterReceipt,
+        providerLaunchInput: AgentProviderLaunchInput?,
         makeLease: @escaping (_ runID: UUID) -> MCPBootstrapLease
     ) async {
         let runAttemptID = ownership.attemptID
@@ -693,7 +704,7 @@ final class ACPIntegratedAgentModeRunner {
             runRequest: runRequest,
             attachmentReservationID: attachmentReservationID,
             providerControlCommand: command,
-            receipt: receipt,
+            receipt: receipt, providerLaunchInput: providerLaunchInput,
             makeLease: makeLease
         )
     }
@@ -746,7 +757,8 @@ final class ACPIntegratedAgentModeRunner {
         targetRunAttemptID: UUID?,
         targetController: ACPAgentSessionController,
         writeReceipt: ACPAgentSessionController.PromptWriteReceipt? = nil,
-        inputResourcesAreCurrent: @escaping @MainActor () -> Bool = { true }
+        inputResourcesAreCurrent: @escaping @MainActor () -> Bool = { true },
+        validateInputResources: (@MainActor () async -> Bool)? = nil
     ) async -> Bool {
         guard inputResourcesAreCurrent() else { return false }
         guard session.operationAdmissionFailureMessage == nil else { return false }
@@ -840,6 +852,14 @@ final class ACPIntegratedAgentModeRunner {
                 )
                 return false
             }
+            guard inputResourcesAreCurrent(), await validateInputResources?() ?? true, inputResourcesAreCurrent() else {
+                hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, oversightDispatch)
+                return false
+            }
+            guard retainPhysicalDispatchAfterProof(
+                session: session, runID: runID, runAttemptID: runAttemptID,
+                controller: controller, dispatch: oversightDispatch
+            ) else { return false }
             inputProof = await hooks.providerInput.proveAgentSessionLinkProviderInput(session, decorated.claim)
             guard inputResourcesAreCurrent(), retainPhysicalDispatchAfterProof(
                 session: session, runID: runID, runAttemptID: runAttemptID,
@@ -986,6 +1006,7 @@ final class ACPIntegratedAgentModeRunner {
         runAttemptID: UUID,
         controller: ACPAgentSessionController,
         receipt: AgentSessionRuntimeStore.WriterReceipt,
+        providerLaunchInput: AgentProviderLaunchInput?,
         attachmentReservationID: UUID?,
         retainsController: Bool,
         dedicatedNoteID: AgentSelfCompactionDispatchID? = nil
@@ -996,12 +1017,15 @@ final class ACPIntegratedAgentModeRunner {
         guard isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID),
               session.acpController === controller
         else { return false }
+        let resourcesCurrent = await providerLaunchInput?.validate(for: session) ?? true
+        guard isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID),
+              session.acpController === controller else { return false }
         switch receipt.disposition(for: session) {
-        case .current:
+        case .current where resourcesCurrent && providerLaunchInput?.isCurrent(for: session) != false:
             return true
         case .claimLost:
             return false
-        case .ownedSuspended:
+        case .current, .ownedSuspended:
             hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
             if let dedicatedNoteID {
                 AgentSelfCompactParkedPrefix.reparkUnattemptedDedicatedNote(
@@ -1044,6 +1068,7 @@ final class ACPIntegratedAgentModeRunner {
         runRequest: ACPRunRequest,
         lease: MCPBootstrapLease,
         receipt: AgentSessionRuntimeStore.WriterReceipt,
+        providerLaunchInput: AgentProviderLaunchInput?,
         attachmentReservationID: UUID?,
         localComposerCandidate: UUID? = nil
     ) async {
@@ -1063,14 +1088,14 @@ final class ACPIntegratedAgentModeRunner {
                 runAttemptID: runAttemptID,
                 controller: controller,
                 lease: lease,
-                receipt: receipt,
+                receipt: receipt, providerLaunchInput: providerLaunchInput,
                 attachmentReservationID: attachmentReservationID
             )
             return
         }
         guard await admitStartupTask(
             .leaseAcquired, session: session, runID: runID, runAttemptID: runAttemptID,
-            controller: controller, receipt: receipt, attachmentReservationID: attachmentReservationID,
+            controller: controller, receipt: receipt, providerLaunchInput: providerLaunchInput, attachmentReservationID: attachmentReservationID,
             retainsController: false
         ) else {
             // This lease's serialization gate is operation-local. Policy and controller cleanup
@@ -1082,7 +1107,7 @@ final class ACPIntegratedAgentModeRunner {
         let admitFresh: @MainActor (StartupBoundary) async -> Bool = { [self] boundary in
             await admitStartupTask(
                 boundary, session: session, runID: runID, runAttemptID: runAttemptID,
-                controller: controller, receipt: receipt, attachmentReservationID: attachmentReservationID,
+                controller: controller, receipt: receipt, providerLaunchInput: providerLaunchInput, attachmentReservationID: attachmentReservationID,
                 retainsController: false
             )
         }
@@ -1177,7 +1202,7 @@ final class ACPIntegratedAgentModeRunner {
                     controller: controller,
                     runRequest: runRequest,
                     attachmentReservationID: attachmentReservationID,
-                    events: events, receipt: receipt, retainsControllerOnRefusal: false, phase: &phase,
+                    events: events, receipt: receipt, providerLaunchInput: providerLaunchInput, retainsControllerOnRefusal: false, phase: &phase,
                     localComposerCandidate: localComposerCandidate
                 )
             } catch is CancellationError {
@@ -1239,6 +1264,7 @@ final class ACPIntegratedAgentModeRunner {
         runRequest: ACPRunRequest,
         deferredLease: MCPBootstrapLease?,
         receipt: AgentSessionRuntimeStore.WriterReceipt,
+        providerLaunchInput: AgentProviderLaunchInput?,
         attachmentReservationID: UUID?,
         providerControlCommand: AgentProviderControlCommand? = nil,
         leaseDisposition: ProviderControlLeaseDisposition? = nil,
@@ -1248,7 +1274,7 @@ final class ACPIntegratedAgentModeRunner {
         let admitReused: (StartupBoundary) async -> Bool = { [self] boundary in
             await admitStartupTask(
                 boundary, session: session, runID: runID, runAttemptID: runAttemptID,
-                controller: controller, receipt: receipt, attachmentReservationID: attachmentReservationID,
+                controller: controller, receipt: receipt, providerLaunchInput: providerLaunchInput, attachmentReservationID: attachmentReservationID,
                 retainsController: true, dedicatedNoteID: dedicatedNoteID
             )
         }
@@ -1329,7 +1355,7 @@ final class ACPIntegratedAgentModeRunner {
                     return await runProviderControlCommandTurn(
                         session: session, runID: runID, runAttemptID: runAttemptID,
                         command: providerControlCommand, controller: controller, runRequest: runRequest,
-                        receipt: receipt, attachmentReservationID: attachmentReservationID, phase: &phase
+                        receipt: receipt, providerLaunchInput: providerLaunchInput, attachmentReservationID: attachmentReservationID, phase: &phase
                     )
                 }
                 let prepared = await controller.prepareForNextTurn()
@@ -1337,7 +1363,7 @@ final class ACPIntegratedAgentModeRunner {
                 // repair belongs to a writer that replaced the caller during preparation.
                 guard await admitStartupTask(
                     .promptPrepared, session: session, runID: runID, runAttemptID: runAttemptID,
-                    controller: controller, receipt: receipt, attachmentReservationID: attachmentReservationID,
+                    controller: controller, receipt: receipt, providerLaunchInput: providerLaunchInput, attachmentReservationID: attachmentReservationID,
                     retainsController: prepared, dedicatedNoteID: dedicatedNoteID
                 ) else { return .superseded }
                 guard prepared else {
@@ -1356,7 +1382,7 @@ final class ACPIntegratedAgentModeRunner {
                     controller: controller,
                     runRequest: runRequest,
                     attachmentReservationID: attachmentReservationID,
-                    events: events, receipt: receipt, retainsControllerOnRefusal: true, phase: &phase,
+                    events: events, receipt: receipt, providerLaunchInput: providerLaunchInput, retainsControllerOnRefusal: true, phase: &phase,
                     dedicatedNoteID: dedicatedNoteID,
                     localComposerCandidate: localComposerCandidate
                 )
@@ -1404,11 +1430,20 @@ final class ACPIntegratedAgentModeRunner {
         attachmentReservationID: UUID?,
         events: AsyncStream<NormalizedAgentRuntimeEvent>,
         receipt: AgentSessionRuntimeStore.WriterReceipt,
+        providerLaunchInput: AgentProviderLaunchInput?,
         retainsControllerOnRefusal: Bool,
         phase: inout PromptPhase,
         dedicatedNoteID: AgentSelfCompactionDispatchID? = nil,
         localComposerCandidate: UUID? = nil
     ) async -> TransientOperationResult {
+        // Canonical resource IO precedes decoration/proof. The original writer, controller,
+        // and attempt are checked again after the await; no resource await follows proof.
+        guard await admitStartupTask(
+            .providerInputPreparing, session: session, runID: runID, runAttemptID: runAttemptID,
+            controller: controller, receipt: receipt, providerLaunchInput: providerLaunchInput,
+            attachmentReservationID: attachmentReservationID, retainsController: retainsControllerOnRefusal,
+            dedicatedNoteID: dedicatedNoteID
+        ) else { return .superseded }
         log("prompt turn begin", runID: runID)
         setRunningStatus("Thinking…", source: .transport, session: session, urgent: true)
         var carry = AgentSelfCompactParkedPrefix.prepare(initialMessageForRun, session: session) {
@@ -1483,7 +1518,7 @@ final class ACPIntegratedAgentModeRunner {
                 hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, oversightDispatch)
                 return .cancelled
             }
-            guard disposition == .current else {
+            guard disposition == .current, providerLaunchInput?.isCurrent(for: session) != false else {
                 hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, oversightDispatch)
                 return retainsControllerOnRefusal ? .cancelledBeforeSend : .cancelled
             }
@@ -1597,6 +1632,7 @@ final class ACPIntegratedAgentModeRunner {
         controller: ACPAgentSessionController,
         runRequest: ACPRunRequest,
         receipt: AgentSessionRuntimeStore.WriterReceipt,
+        providerLaunchInput: AgentProviderLaunchInput?,
         attachmentReservationID: UUID?,
         phase: inout PromptPhase
     ) async -> TransientOperationResult {
@@ -1611,7 +1647,7 @@ final class ACPIntegratedAgentModeRunner {
         let retired = prepared ? false : await controller.isRetired
         guard await admitStartupTask(
             .controlPromptPrepared, session: session, runID: runID, runAttemptID: runAttemptID,
-            controller: controller, receipt: receipt, attachmentReservationID: attachmentReservationID,
+            controller: controller, receipt: receipt, providerLaunchInput: providerLaunchInput, attachmentReservationID: attachmentReservationID,
             retainsController: !retired
         ) else {
             return await controlPromptAdmissionRefusal(session: session, runID: runID, runAttemptID: runAttemptID, controller: controller, receipt: receipt, displayName: displayName)
@@ -1622,7 +1658,7 @@ final class ACPIntegratedAgentModeRunner {
         let events = await controller.events
         guard await admitStartupTask(
             .controlPromptAdmission, session: session, runID: runID, runAttemptID: runAttemptID,
-            controller: controller, receipt: receipt, attachmentReservationID: attachmentReservationID,
+            controller: controller, receipt: receipt, providerLaunchInput: providerLaunchInput, attachmentReservationID: attachmentReservationID,
             retainsController: true
         ) else {
             return await controlPromptAdmissionRefusal(session: session, runID: runID, runAttemptID: runAttemptID, controller: controller, receipt: receipt, displayName: displayName)
@@ -2058,12 +2094,13 @@ final class ACPIntegratedAgentModeRunner {
         controller: ACPAgentSessionController,
         lease: MCPBootstrapLease,
         receipt: AgentSessionRuntimeStore.WriterReceipt,
+        providerLaunchInput: AgentProviderLaunchInput?,
         attachmentReservationID: UUID?
     ) async {
         let outcome = await lease.acquireFailureOutcome
         guard await admitStartupTask(
             .acquireFailureOutcome, session: session, runID: runID, runAttemptID: runAttemptID,
-            controller: controller, receipt: receipt, attachmentReservationID: attachmentReservationID,
+            controller: controller, receipt: receipt, providerLaunchInput: providerLaunchInput, attachmentReservationID: attachmentReservationID,
             retainsController: false
         ), let ownership = session.activeRunOwnership,
         ownership.attemptID == runAttemptID else { return }

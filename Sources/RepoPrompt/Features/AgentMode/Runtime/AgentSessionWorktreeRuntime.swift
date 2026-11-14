@@ -115,7 +115,9 @@ final class AgentSessionWorktreeRuntime {
         let recoveryChanged: @MainActor (AgentTabSession) -> Void
     }
 
-    private weak var scope: AgentSessionRuntimeStore.Scope?
+    private(set) weak var scope: AgentSessionRuntimeStore.Scope?
+    /// Host-composed launcher; the runtime worker never depends on a presenting VM.
+    var terminalContinuationLauncher: (@MainActor (AgentSessionRuntimeStore.Command, String, AgentDirectRunStartOptions, AgentRunStartOutcomeRecorder) async -> Void)?
     var captureResources: (@MainActor (AgentSessionRuntimeStore.Command) -> Resources?)?
     var effects: Effects?
     var presentation: Presentation?
@@ -129,6 +131,7 @@ final class AgentSessionWorktreeRuntime {
 
     func endPendingOperation() {
         pendingTransitions -= 1
+        scope?.noteSettlementChanged()
         if pendingTransitions == 0 {
             let waiters = drainWaiters
             drainWaiters.removeAll()
@@ -321,11 +324,20 @@ final class AgentSessionWorktreeRuntime {
                 if !changedDuringActiveRun {
                     try commitAuthority? {}
                     try requireCurrent()
-                    let previousHandoff = session.pendingHandoff
-                    switch await effects.stageRecovery(command) {
-                    case let .staged(staged): handoffRollback = (previousHandoff, staged)
-                    case .unchanged: break
-                    case .refused: throw TransitionError.stale
+                    // An unstarted initial-location change has no provider history to recover.
+                    // Staging a handoff here would itself invalidate initial-start eligibility.
+                    let needsRecovery = if case .initialSend = intent, session.hasEmptyIdleExecutionLocation {
+                        false
+                    } else {
+                        true
+                    }
+                    if needsRecovery {
+                        let previousHandoff = session.pendingHandoff
+                        switch await effects.stageRecovery(command) {
+                        case let .staged(staged): handoffRollback = (previousHandoff, staged)
+                        case .unchanged: break
+                        case .refused: throw TransitionError.stale
+                        }
                     }
                     try requireCurrent()
                     try await revalidateAuthority?()

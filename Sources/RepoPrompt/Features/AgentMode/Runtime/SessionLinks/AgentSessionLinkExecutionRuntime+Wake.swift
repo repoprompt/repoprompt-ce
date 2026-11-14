@@ -400,11 +400,16 @@ extension AgentSessionLinkExecutionRuntime {
             }
             switch route {
             case .idleFollowUp:
+                guard let command = admit(endpoint: endpoint), command.writer.session === session else {
+                    abandonAgentSessionLinkPromptClaim(reservedClaim)
+                    cancelAgentSessionLinkAutoWake(for: endpoint, reason: .requiredClaimUnavailable)
+                    return
+                }
                 let switchPreparation: ProviderSwitchSendPreparation?
                 switch await providerSwitchSendAdmission(
                     session: session, input: "", skipsAugmentation: true,
                     supplementalInput: reservedClaim.fragment, autoWakeID: wakeID,
-                    isCurrent: { self.agentSessionLinkAutoWakeSession(for: endpoint) === session
+                    isCurrent: { command.isCurrent && self.agentSessionLinkAutoWakeSession(for: endpoint) === session
                         && session.oversight.pendingAutoWake?.wakeID == wakeID
                         && self.agentSessionLinkAutoWakeRoute(session) == .idleFollowUp
                     }
@@ -423,7 +428,7 @@ extension AgentSessionLinkExecutionRuntime {
                     }
                 #endif
                 let startOutcome = await startAgentRun(
-                    tabID: endpoint.tabID,
+                    command: command,
                     initialMessage: "",
                     directStartOptions: startOptions,
                     providerSwitchPreparation: switchPreparation
@@ -600,7 +605,7 @@ extension AgentSessionLinkExecutionRuntime {
         if attempt.phase != .dispatching {
             // Keep the producer's identity fenced until its no-call finalizer runs. Automatic
             // queue content remains owed; a manual Wake now is a one-shot and is not requeued.
-            if commands.selfCompactHoldsWakeAcquisition(session) {
+            if agentSelfCompactHoldsWakeAcquisition(session) {
                 if let claim = agentSessionLinkPromptClaimStore.pendingClaim(
                     dispatchID: effectiveID,
                     observerSessionID: attempt.observerEndpoint.sessionID

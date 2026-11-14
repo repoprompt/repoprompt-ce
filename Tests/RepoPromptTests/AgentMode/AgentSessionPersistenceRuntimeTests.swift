@@ -328,7 +328,7 @@ final class AgentSessionPersistenceRuntimeTests: XCTestCase {
     }
 
     func testConfiguredCreationAndRequiredFlushUseSameRuntimeTransaction() async throws {
-        let f = try Fixture(fresh: true)
+        let f = try Fixture(fresh: true, canonicalOnly: true)
         defer { f.cleanUp() }
         let handle = try XCTUnwrap(f.creation)
         let prematureFlush = await f.scope.persistence.flushSaveRequired(for: f.session.tabID, workspaceID: f.placement.workspace.id)
@@ -341,6 +341,17 @@ final class AgentSessionPersistenceRuntimeTests: XCTestCase {
         XCTAssertTrue(f.session.qualifiedRestorationReadiness.isAuthoritative)
         XCTAssertFalse(f.session.isDirty)
         XCTAssertEqual(phases, [.writeMayHaveCommitted, .writeReturned, .durablySaved(binding)])
+        // Completion retains the actual acknowledgment after creationState is cleared; it
+        // must neither re-admit a pending creation nor replay the already committed write.
+        f.scope.persistence.saver = { _, _, _ in XCTFail("An acknowledged creation must not be written again")
+            return f.root
+        }
+        guard case .durablySaved(binding) = await f.scope.persistence.commitConfiguredCreation(handle) else {
+            return XCTFail("The exact durable creation receipt must remain available")
+        }
+        f.scope.persistence.saver = { payload, workspace, count in
+            try await AgentSessionDataService.shared.saveAgentSession(payload, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count)
+        }
         f.session.isDirty = true
         let flush = await f.scope.persistence.flushSaveRequired(for: f.session.tabID, workspaceID: f.placement.workspace.id)
         try flush.get()
@@ -519,10 +530,58 @@ final class AgentSessionPersistenceRuntimeTests: XCTestCase {
         XCTAssertEqual(writes, 0)
     }
 
+    func testCanonicalWorkspaceReadsRetainQueueAndOriginatingSaveAdmission() async throws {
+        enum Invalidation: CaseIterable { case writer, suppression, deletion }
+        for heldRead in [1, 2] {
+            for invalidation in Invalidation.allCases {
+                let f = try Fixture(canonicalOnly: true)
+                defer { f.cleanUp() }
+                let sessionID = try XCTUnwrap(f.session.activeAgentSessionID)
+                let entered = expectation(description: "Canonical workspace read \(heldRead)")
+                var release: CheckedContinuation<Void, Never>?
+                var reads = 0
+                var writes = 0
+                f.scope.persistence.composition?.canonicalStorage = .init(workspaceID: f.placement.workspace.id) { _ in
+                    reads += 1
+                    if reads == heldRead {
+                        await withCheckedContinuation { release = $0
+                            entered.fulfill()
+                        }
+                    }
+                    return f.placement.workspace
+                }
+                f.scope.persistence.saver = { _, _, _ in writes += 1
+                    return f.root
+                }
+                let task = Task { await f.scope.persistence.flushSaveRequired(for: f.session.tabID, workspaceID: f.placement.workspace.id) }
+                await fulfillment(of: [entered], timeout: 5)
+                XCTAssertTrue(f.scope.persistence.queue.inFlightSessionIDs.contains(sessionID), "Canonical reads must remain inside the save queue slot")
+                var deletion: AgentSessionDeletionRegistry.AttemptToken?
+                switch invalidation {
+                case .writer:
+                    f.scope.replaceSessions([:])
+                    f.scope.replaceSessions([f.session.tabID: f.session])
+                case .suppression:
+                    f.placement.suppressed = true
+                case .deletion:
+                    deletion = try AgentSessionDeletionRegistry.shared.beginDurableDeletion(sessionID: sessionID)
+                }
+                release?.resume()
+                let result = await task.value
+                if let deletion { AgentSessionDeletionRegistry.shared.didFailDurableDeletion(deletion) }
+                guard case .failure = result else { return XCTFail("A suspended read must retain the original save admission: \(invalidation)") }
+                XCTAssertEqual(writes, 0)
+                XCTAssertTrue(f.session.isDirty)
+                XCTAssertFalse(f.scope.persistence.queue.inFlightSessionIDs.contains(sessionID))
+            }
+        }
+    }
+
     func testHeldRequiredSaveDoesNotAcknowledgeMovedStorageOrReboundIncarnation() async throws {
         for rebind in [false, true] {
             let f = try Fixture()
             defer { f.cleanUp() }
+            f.scope.persistence.composition?.canonicalStorage = .init(workspaceID: f.placement.workspace.id) { _ in f.placement.workspace }
             let entered = expectation(description: "Disk write completed")
             var release: CheckedContinuation<Void, Never>?
             var savedURL: URL?
@@ -548,8 +607,61 @@ final class AgentSessionPersistenceRuntimeTests: XCTestCase {
         }
     }
 
-    func testAdmissionRefusalLeavesDirtyWithoutStartingIO() async throws {
+    func testHostDrainRetainsRealFailedSaveUntilExplicitRecovery() async throws {
         let f = try Fixture()
+        let membership = try XCTUnwrap(f.scope.membership(of: f.session)).identity
+        let cleanSibling = f.scope.makeSession(tabID: UUID())
+        f.scope.replaceSessions([f.session.tabID: f.session, cleanSibling.tabID: cleanSibling])
+        defer { f.cleanUp() }
+        var writes = 0
+        var savedURL: URL?
+        f.scope.persistence.saver = { payload, workspace, count in
+            writes += 1
+            let url = try await AgentSessionDataService.shared.saveAgentSession(
+                payload, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count
+            )
+            savedURL = url
+            return url
+        }
+        try await f.scope.persistence.flushSaveRequired(for: f.session.tabID, workspaceID: f.placement.workspace.id).get()
+        let url = try XCTUnwrap(savedURL)
+        // Replace the real payload's destination with a directory: real atomic IO must fail.
+        try FileManager.default.removeItem(at: url)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: url) }
+        f.session.isDirty = true
+        let drain = AgentSessionHostDrainRuntime.begin(scope: f.scope, owner: NSObject(), adapters: .init(
+            managedInput: AgentSessionHostDrainTestEffects.empty, selfCompact: AgentSessionHostDrainTestEffects.empty,
+            finishProvider: { _ in }, probe: { _, current in current() }
+        ))
+        drain.attemptRecovery()
+        guard case .retained = await drain.wait(until: .now.advanced(by: .seconds(5))) else { return XCTFail("Failed real save must retain recovery") }
+        XCTAssertEqual(writes, 2)
+        let status = try XCTUnwrap(drain.sessionOutcomes[f.session.tabID])
+        XCTAssertEqual(status.membership, membership)
+        XCTAssertEqual(status.sessionID, f.session.activeAgentSessionID)
+        guard case .retained = status.outcome else { return XCTFail("Inventory must expose the exact failed session's recovery obligation") }
+        XCTAssertTrue(f.session.isDirty)
+        XCTAssertTrue(f.scope.sessions[f.session.tabID] === f.session)
+        XCTAssertFalse(f.scope.hasReleasedWriterClaims)
+        XCTAssertEqual(f.store.retainedDrains.count, 1)
+        XCTAssertNil(f.scope.sessions[cleanSibling.tabID], "A failed sibling save does not withhold this exact clean release")
+        XCTAssertEqual(drain.sessionOutcomes[cleanSibling.tabID]?.outcome, .released)
+        f.scope.noteSettlementChanged()
+        XCTAssertEqual(writes, 2, "Observation cannot retry a failed save")
+        try FileManager.default.removeItem(at: url)
+        drain.attemptRecovery()
+        let result = await drain.wait(until: .now.advanced(by: .seconds(5)))
+        XCTAssertEqual(result, .released)
+        XCTAssertEqual(writes, 3)
+        XCTAssertFalse(f.session.isDirty)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+        XCTAssertTrue(f.store.retainedDrains.isEmpty)
+        XCTAssertEqual(drain.sessionOutcomes[cleanSibling.tabID]?.outcome, .released, "Recovery preserves the original exact sibling acknowledgement")
+    }
+
+    func testAdmissionRefusalLeavesDirtyWithoutStartingIO() async throws {
+        let f = try Fixture(canonicalOnly: true)
         defer { f.cleanUp() }
         var writes = 0
         f.scope.persistence.saver = { _, _, _ in writes += 1
@@ -588,7 +700,7 @@ final class AgentSessionPersistenceRuntimeTests: XCTestCase {
         let placement: Placement
         let creation: AgentSessionCreationHandle?
 
-        init(fresh: Bool = false) throws {
+        init(fresh: Bool = false, canonicalOnly: Bool = false) throws {
             let workspace = WorkspaceModel(name: "Headless persistence", repoPaths: [], customStoragePath: root)
             placement = Placement(workspace)
             scope = store.makeScope()
@@ -609,11 +721,14 @@ final class AgentSessionPersistenceRuntimeTests: XCTestCase {
             let placement = placement
             let storage = AgentSessionStorageInputs(
                 workspaceID: workspace.id,
-                workspaceWithID: { $0 == placement.workspace.id ? placement.workspace : nil },
+                workspaceWithID: { !canonicalOnly && $0 == placement.workspace.id ? placement.workspace : nil },
                 displayName: { _ in "Headless persistence" }, isSuppressed: { placement.suppressed },
                 attachmentWorkspaceDirectory: { FileManager.default.temporaryDirectory }
             )
-            scope.persistence.composition = storage.persistenceComposition(scope: scope, saveAdmission: { _ in placement.refusal })
+            scope.persistence.composition = storage.persistenceComposition(
+                scope: scope, saveAdmission: { _ in placement.refusal },
+                canonicalStorage: canonicalOnly ? .init(workspaceID: workspace.id, readWorkspace: { _ in placement.workspace }) : nil
+            )
         }
 
         func cleanUp() {

@@ -379,10 +379,61 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         XCTAssertEqual(receipt.teardownCompleted, false)
         XCTAssertFalse(claim.cancellation.isFinalized)
         XCTAssertFalse(vm.linkExecutionRuntime.pendingStopEffects.isEmpty)
+        let runtime = vm.linkExecutionRuntime
+        let sibling = AgentTabSession(tabID: UUID())
+        let siblingGate = TestReleaseFence(name: "sibling Stop effect")
+        let siblingEffectID = UUID()
+        let siblingEffect = Task { [sibling] in
+            await siblingGate.enterAndWait()
+            runtime.pendingStopEffects[siblingEffectID] = nil
+            withExtendedLifetime(sibling) {}
+        }
+        runtime.pendingStopEffects[siblingEffectID] = .init(sessionIdentity: ObjectIdentifier(sibling), task: siblingEffect)
+        addTeardownBlock { @MainActor in
+            siblingGate.release()
+            vm.releaseComposerSubmitClaim(claim)
+            await runtime.drainPendingStopEffects()
+        }
+        guard await siblingGate.waitUntilEntered() else { return }
+        let replacement = AgentTabSession(tabID: fixture.session.tabID)
+        try replacement.installPersistentSessionBinding(XCTUnwrap(fixture.session.persistentSessionBindingIdentity))
+        let replacementJoined = expectation(description: "replacement has no Stop producers")
+        var replacementFinished = false
+        let replacementWaiter = Task {
+            await runtime.drainPendingStopEffects(for: replacement)
+            replacementFinished = true
+            replacementJoined.fulfill()
+        }
+        await fulfillment(of: [replacementJoined], timeout: 3)
+        guard replacementFinished else {
+            siblingGate.release()
+            vm.releaseComposerSubmitClaim(claim)
+            await replacementWaiter.value
+            return
+        }
+        XCTAssertFalse(claim.cancellation.isFinalized, "A same-ID replacement must not join the original producer")
+        var drained = false
+        let entered = expectation(description: "exact Stop join entered")
+        let completed = expectation(description: "target Stop joined without sibling")
+        let waiter = Task {
+            entered.fulfill()
+            await runtime.drainPendingStopEffects(for: fixture.session)
+            drained = true
+            completed.fulfill()
+        }
+        waiter.cancel()
+        await fulfillment(of: [entered], timeout: 3)
+        XCTAssertFalse(drained, "Cancellation of the waiter cannot acknowledge producer drain")
         vm.releaseComposerSubmitClaim(claim)
-        await vm.linkExecutionRuntime.drainPendingStopEffects()
-        XCTAssertTrue(vm.linkExecutionRuntime.pendingStopEffects.isEmpty)
+        await fulfillment(of: [completed], timeout: 3)
+        if !drained { siblingGate.release() }
+        await waiter.value
+        XCTAssertTrue(drained)
+        XCTAssertEqual(Set(runtime.pendingStopEffects.keys), [siblingEffectID], "The target joins without waiting for its sibling")
         XCTAssertNil(fixture.session.activeRunAttemptID)
+        siblingGate.release()
+        await runtime.drainPendingStopEffects()
+        XCTAssertTrue(runtime.pendingStopEffects.isEmpty)
     }
 
     func testPendingStartWithdrawsWithoutSyntheticTerminalRun() async throws {

@@ -71,6 +71,63 @@ final class AgentFileTagWorktreeResolutionTests: XCTestCase {
     }
 
     @MainActor
+    func testRuntimeInputRechecksAdmissionAfterAsyncCanonicalCapture() async throws {
+        let fixture = try await makeBoundFixture(includeBranchOnly: false)
+        let source = AgentSessionProviderInputRuntime.WorkspaceSource(
+            store: fixture.store,
+            lookupSource: .init(activeAgentSessionID: fixture.sessionID, worktreeBindings: [fixture.binding])
+        )
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let input = scope.providerInput(
+            skillCatalog: AgentSkillCatalog(homeDirectoryURL: fixture.logicalRoot.appendingPathComponent("home")),
+            perfRecorder: NoopAgentModePerfRecorder()
+        )
+        let session = AgentTabSession(tabID: UUID())
+        for initialContext in [false, true] {
+            let gate = AgentFileTagTestAsyncGate()
+            var current = true
+            let task = Task { @MainActor in
+                if initialContext {
+                    return await input.buildInitialThreadMessageIfNeeded(
+                        session: session, initialMessage: "Inspect", input: {
+                            await gate.wait()
+                            return .init(workspace: source, selection: .init(selectedPaths: []), promptText: "Must not escape")
+                        }, isCurrent: { current }
+                    )
+                }
+                return await input.augmentUserMessage(
+                    "Inspect", attachments: [], taggedFileAttachments: [], agent: .claudeCode,
+                    workspacePaths: [fixture.logicalRoot.path], workspace: {
+                        await gate.wait()
+                        return source
+                    }, workspaceCaptureOrder: .beforeSkillExpansion,
+                    session: session, handoff: scope.handoff, ignoresPendingHandoff: true,
+                    skipsSlashExpansion: true, isCurrent: { current }
+                )
+            }
+            addTeardownBlock { task.cancel()
+                await gate.open()
+                _ = await task.value
+            }
+            try await AsyncTestWait.waitUntil("canonical input capture entered") { await gate.didEnter() }
+            current = false
+            await gate.open()
+            let result = await task.value
+            XCTAssertEqual(result, "Inspect", "Captured bytes cannot renew invalidated input admission")
+        }
+        do {
+            _ = try await input.buildInitialThreadMessageIfNeeded(
+                session: session, initialMessage: "Inspect", input: {
+                    throw AgentHostWorkspaceResources.Failure.contextUnavailable
+                }, isCurrent: { true }
+            )
+            XCTFail("Unavailable canonical input must not become a valid empty context")
+        } catch AgentHostWorkspaceResources.Failure.contextUnavailable {
+            // A genuinely empty legacy selection is still represented by a successful nil capture.
+        }
+    }
+
+    @MainActor
     func testRuntimeInputResolvesPresentationSourceAfterSkillsAndHonorsRefusal() async throws {
         let fixture = try await makeBoundFixture(includeBranchOnly: true)
         _ = await makeLookupContext(fixture: fixture)
@@ -96,6 +153,23 @@ final class AgentFileTagWorktreeResolutionTests: XCTestCase {
         XCTAssertTrue(result.contains("<selected_skill_context name=\"inspect\""), result)
         XCTAssertTrue(result.contains("let origin = \"base\""), result)
         XCTAssertFalse(result.contains("let origin = \"worktree\""), result)
+        let canonicalCatalog = AgentSkillCatalog(homeDirectoryURL: fixture.logicalRoot.appendingPathComponent("home"))
+        let canonicalInput = AgentSessionProviderInputRuntime(skillCatalog: canonicalCatalog, perfRecorder: NoopAgentModePerfRecorder())
+        var canonicalReads = 0
+        let canonical = await canonicalInput.augmentUserMessage(
+            "/skill:inspect @Sources/App.swift", attachments: [], taggedFileAttachments: [], agent: .claudeCode,
+            workspacePaths: [], workspace: {
+                canonicalReads += 1
+                XCTAssertNil(canonicalCatalog.resolve(name: "inspect"), "Canonical roots must be captured before skill discovery")
+                return .init(store: fixture.store, lookupSource: nil, workspacePaths: [fixture.logicalRoot.path])
+            }, workspaceCaptureOrder: .beforeSkillExpansion,
+            session: nil, handoff: scope.handoff, ignoresPendingHandoff: true,
+            skipsSlashExpansion: false, isCurrent: { true }
+        )
+        XCTAssertEqual(canonicalReads, 1, "Rendered input must retain the same capture, not read successor roots")
+        XCTAssertTrue(canonical.contains("<selected_skill_context name=\"inspect\""), canonical)
+        XCTAssertTrue(canonical.contains("let origin = \"base\""), canonical)
+        XCTAssertFalse(canonical.contains("let origin = \"worktree\""), canonical)
         let refused = await input.augmentUserMessage(
             "@Sources/App.swift", attachments: [], taggedFileAttachments: [], agent: .claudeCode,
             workspacePaths: [fixture.logicalRoot.path], workspace: {

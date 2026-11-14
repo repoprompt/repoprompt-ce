@@ -129,6 +129,16 @@ final class AgentSessionMCPRuntime {
         controlRead(sessionID: sessionID).session?.mcpControlContext?.registration
     }
 
+    func waitPublication(sessionID: UUID) -> (snapshot: AgentRunMCPSnapshot, cursor: AgentRunSessionStore.WaitCursor)? {
+        guard let cursor = waitCursor(sessionID: sessionID),
+              let session = controlledWriter(sessionID: sessionID)?.session,
+              session.mcpControlContext?.registration == cursor.registration,
+              session.mcpControlContext?.currentEpoch == cursor.epoch,
+              let snapshot = mcpSnapshot(for: session)
+        else { return nil }
+        return (snapshot, cursor)
+    }
+
     func waitCursor(sessionID: UUID) -> AgentRunSessionStore.WaitCursor? {
         guard let context = controlRead(sessionID: sessionID).session?.mcpControlContext else { return nil }
         return .init(registration: context.registration, epoch: context.currentEpoch)
@@ -1518,6 +1528,8 @@ final class AgentSessionMCPRuntime {
         )
         session.mcpControlActivationGeneration &+= 1
         let generation = session.mcpControlActivationGeneration
+        session.mcpStateObservationCancellable?.cancel()
+        session.mcpStateObservationCancellable = nil
         session.mcpControlCleanupTask?.cancel()
         session.mcpControlCleanupTask = nil
         session.mcpFollowUpRunPending = false

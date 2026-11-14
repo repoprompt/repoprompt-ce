@@ -43,57 +43,12 @@ extension AgentModeViewModel {
         selectedWorkflowMutationGeneration: UInt64?,
         message: String
     ) {
-        var sessionChanged = false
-        if !attachments.isEmpty {
-            let existingImageIDs = Set(session.pendingFileAttachments.map(\.id))
-            let restoredImages = attachments.filter { !existingImageIDs.contains($0.id) }
-            if !restoredImages.isEmpty {
-                session.pendingFileAttachments = restoredImages + session.pendingFileAttachments
-                sessionChanged = true
-            }
-        }
-        if !taggedFiles.isEmpty {
-            let existingTaggedPaths = Set(session.pendingTaggedFileAttachments.map(\.relativePath))
-            let restoredTaggedFiles = taggedFiles.filter { !existingTaggedPaths.contains($0.relativePath) }
-            if !restoredTaggedFiles.isEmpty {
-                session.pendingTaggedFileAttachments = restoredTaggedFiles + session.pendingTaggedFileAttachments
-                sessionChanged = true
-            }
-        }
-        if let workflow,
-           let selectedWorkflowMutationGeneration,
-           session.userWorkflowSelectionMutationGeneration == selectedWorkflowMutationGeneration,
-           session.selectedWorkflow == nil
-        {
-            session.selectedWorkflow = workflow
-            if tabID == currentTabID {
-                selectedWorkflow = workflow
-            }
-            sessionChanged = true
-        }
-        if sessionChanged {
-            session.isDirty = true
-            updateBindingsFromSession(session)
-            persistenceRuntime.scheduleSave(for: tabID)
-        }
-        let existingDraft = draftRuntime.text(for: tabID)
-        let composedDraft = AgentComposerDraftRestorationReducer.compose(
-            restoredText: draftText,
-            above: existingDraft
-        )
-        let operation = AgentComposerDraftRestorationOperation(
-            rejectedDraftText: draftText,
-            draftTextBeforeRestoration: existingDraft,
-            composedDraftText: composedDraft,
-            fragments: []
-        )
-        restoreComposerDraft(
-            tabID: tabID,
-            text: composedDraft,
-            message: message,
-            strategy: .replaceAlways,
-            operation: operation
-        )
+        guard tabID == session.tabID,
+              draftRuntime.restoreRejectedSubmission(
+                  session: session, draftText: draftText, attachments: attachments, taggedFiles: taggedFiles,
+                  workflow: workflow, workflowMutationGeneration: selectedWorkflowMutationGeneration, message: message
+              ) else { return }
+        if tabID == currentTabID { selectedWorkflow = session.selectedWorkflow }
         if let repromptedText {
             repromptUIStore.recoveries[tabID] = .init(
                 text: repromptedText, originalDraft: draftText, reason: message,

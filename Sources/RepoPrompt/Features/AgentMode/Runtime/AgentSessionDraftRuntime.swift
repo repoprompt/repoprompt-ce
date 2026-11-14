@@ -32,6 +32,62 @@ final class AgentSessionDraftRuntime {
         )
     }
 
+    /// Recovery belongs to the original runtime, even with no attached composer. A recycled tab
+    /// object must never receive the rejected input's draft, attachments, or workflow.
+    @discardableResult
+    func restoreRejectedSubmission(
+        session: AgentTabSession, draftText: String,
+        attachments: [AgentFileAttachment], taggedFiles: [AgentTaggedFileAttachment],
+        workflow: AgentWorkflowDefinition?, workflowMutationGeneration: UInt64?, message: String
+    ) -> Bool {
+        guard let scope, let membership = scope.membership(of: session) else { return false }
+        let originalWorkflowGeneration = session.userWorkflowSelectionMutationGeneration
+        var changed = false
+        let existingImages = Set(session.pendingFileAttachments.map(\.id))
+        let restoredImages = attachments.filter { !existingImages.contains($0.id) }
+        if !restoredImages.isEmpty {
+            session.pendingFileAttachments = restoredImages + session.pendingFileAttachments
+            changed = true
+        }
+        let existingPaths = Set(session.pendingTaggedFileAttachments.map(\.relativePath))
+        let restoredFiles = taggedFiles.filter { !existingPaths.contains($0.relativePath) }
+        if !restoredFiles.isEmpty {
+            session.pendingTaggedFileAttachments = restoredFiles + session.pendingTaggedFileAttachments
+            changed = true
+        }
+        if let workflow, let workflowMutationGeneration,
+           session.userWorkflowSelectionMutationGeneration == workflowMutationGeneration,
+           session.selectedWorkflow == nil
+        {
+            session.selectedWorkflow = workflow
+            changed = true
+        }
+        if changed {
+            session.isDirty = true
+            scope.presentation.bindingChanged(session)
+            scope.persistence.scheduleSave(for: session)
+        }
+        guard scope.membership(of: session)?.identity == membership.identity else { return false }
+        let existingDraft = text(for: session.tabID)
+        let composed = AgentComposerDraftRestorationReducer.compose(restoredText: draftText, above: existingDraft)
+        let restoredGeneration = session.draftMutationGeneration &+ (composed == existingDraft ? 0 : 1)
+        restore(
+            tabID: session.tabID,
+            text: composed,
+            message: message,
+            strategy: .replaceAlways,
+            operation: .init(
+                rejectedDraftText: draftText,
+                draftTextBeforeRestoration: existingDraft,
+                composedDraftText: composed,
+                fragments: []
+            )
+        )
+        return scope.membership(of: session)?.identity == membership.identity
+            && session.draftMutationGeneration == restoredGeneration && session.draftText == composed
+            && session.userWorkflowSelectionMutationGeneration == originalWorkflowGeneration
+    }
+
     func text(for tabID: UUID) -> String {
         scope?.sessions[tabID]?.draftText ?? pendingTabDrafts[tabID] ?? ""
     }

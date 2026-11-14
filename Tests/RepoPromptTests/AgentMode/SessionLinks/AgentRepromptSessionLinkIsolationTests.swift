@@ -64,7 +64,7 @@ final class AgentRepromptSessionLinkIsolationTests: XCTestCase {
         let turn = AgentNoncomposerTurn(endpoint: endpoint, providerText: "Managed envelope", sink: .init())
         XCTAssertTrue(fixture.viewModel.linkExecutionRuntime.submitNoncomposerSteer(
             tabID: fixture.session.tabID, session: fixture.session, displayText: "Managed instruction", turn: turn, route: .claudeInterrupt,
-            environment: .init(workspaceID: endpoint.workspaceID, resourcesAreCurrent: { true }, settings: fixture.viewModel.modelRouterSettingsStore, server: nil)
+            environment: .init(workspaceID: endpoint.workspaceID, resourcesAreCurrent: { true }, settings: fixture.viewModel.modelRouterSettingsStore, tools: fixture.viewModel.runtimeHost.route.toolExecutionRuntime)
         ))
         XCTAssertTrue(fixture.viewModel.repromptEnabled)
         XCTAssertTrue(fixture.viewModel.interviewFirst)
@@ -110,7 +110,7 @@ final class AgentRepromptSessionLinkIsolationTests: XCTestCase {
         let turn = AgentNoncomposerTurn(endpoint: endpoint, providerText: "Managed envelope", sink: .init())
         XCTAssertTrue(fixture.viewModel.linkExecutionRuntime.submitNoncomposerSteer(
             tabID: fixture.session.tabID, session: fixture.session, displayText: "Managed instruction", turn: turn, route: .claudeInterrupt,
-            environment: .init(workspaceID: endpoint.workspaceID, resourcesAreCurrent: { true }, settings: fixture.viewModel.modelRouterSettingsStore, server: nil)
+            environment: .init(workspaceID: endpoint.workspaceID, resourcesAreCurrent: { true }, settings: fixture.viewModel.modelRouterSettingsStore, tools: fixture.viewModel.runtimeHost.route.toolExecutionRuntime)
         ))
         // Provider admission of that inbound work replaces the native run target.
         fixture.session.installRunID(UUID())

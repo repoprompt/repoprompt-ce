@@ -103,6 +103,16 @@ struct AgentProviderSwitchSendPreparation {
     let stopFence: AgentRunStartStopFence
     var acceptedInputID: UUID?
     var taggedFileFailures: [AgentSessionProviderInputRuntime.ExplicitFileFailure] = []
+    var inputSources: [AgentSessionProviderInputRuntime.WorkspaceSource] = []
+
+    @MainActor
+    func validateInputSources() async -> Bool {
+        guard command.isCurrent, inputSources.allSatisfy({ $0.isCurrent() }) else { return false }
+        for source in inputSources {
+            guard await source.validate(), command.isCurrent, inputSources.allSatisfy({ $0.isCurrent() }) else { return false }
+        }
+        return true
+    }
 
     @MainActor
     func accepting(_ itemID: UUID, session: AgentTabSession) -> Self {

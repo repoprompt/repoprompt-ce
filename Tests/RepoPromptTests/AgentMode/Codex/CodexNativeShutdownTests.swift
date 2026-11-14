@@ -96,6 +96,89 @@ final class CodexNativeShutdownTests: XCTestCase {
         }
     }
 
+    func testRetainedDetachedHostJoinsManagedLogoutWithoutFollowingSameRunSuccessor() async throws {
+        let route = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: nil)
+        let coordinator = CodexAgentModeCoordinator(
+            windowID: route.identity.routeID, runtimeWorkspacePathsProvider: { _ in .uniform(nil) },
+            codexControllerFactory: { _, _, _, _, _, _, _, _, _ in preconditionFailure("Logout cannot launch a controller") },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            shouldManageCodexTooling: false, codexHookApprovalSettings: GlobalSettingsStore.shared
+        )
+        let host = AgentSessionRuntimeHost(
+            route: route, codexCoordinator: coordinator,
+            claudeCoordinator: .init(windowID: route.identity.routeID, workspacePathProvider: { _ in nil }),
+            providerResources: .live(), runRoutingCleaner: { _, _, _ in XCTFail("Logout must use the controller's exact receipt") },
+            runToolCanceller: { _, _ in 0 }
+        )
+        let session = host.scope.makeSession(tabID: UUID())
+        host.scope.replaceSessions([session.tabID: session])
+        session.selectedAgent = .codexExec
+        session.installRunID(UUID())
+        let runID = try XCTUnwrap(session.runID)
+        let original = makeController(tabID: session.tabID, runID: runID, windowID: route.identity.routeID)
+        let successor = makeController(tabID: session.tabID, runID: runID, windowID: route.identity.routeID)
+        try await original.test_beginBindingSession()
+        session.codexController = original
+        let gate = TestReleaseFence(name: "detached host original event handler")
+        let handler = Task { await original.test_withEventHandlingLock { await gate.enterAndWait() } }
+        let entered = await gate.waitUntilEntered(timeout: 2)
+        XCTAssertTrue(entered)
+        let draining = expectation(description: "logout reaches original controller drain")
+        original.test_shutdownObserver = { if $0 == .waitingForEventDrain { draining.fulfill() } }
+        host.scope.retainExecutableHost()
+        addTeardownBlock { @MainActor in
+            gate.release()
+            await handler.value
+            await original.shutdown()
+            await successor.shutdown()
+            host.scope.replaceSessions([:])
+            // This fixture installs no input worker or session after removal. Release its
+            // retained census entry via the normal acknowledged drain, not a test force-release.
+            let drain = host.beginRetirement(adapters: .init(
+                managedInput: AgentSessionHostDrainTestEffects.empty, selfCompact: AgentSessionHostDrainTestEffects.empty,
+                captureProvider: { _ in throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
+            ))
+            drain.attemptRecovery()
+            let outcome = await drain.wait(until: .now.advanced(by: .seconds(5)))
+            XCTAssertEqual(outcome, .released)
+        }
+        let participants = WindowStatesManager.managedCodexLogoutParticipants(
+            presenters: [], retainedHosts: AgentSessionRuntimeStore.shared.retainedExecutionHosts.filter { $0 === host }
+        )
+        XCTAssertEqual(participants.count, 1)
+        XCTAssertTrue(participants.first === host)
+        let fence = CodexManagedSessionFence()
+        let originalAuth = try XCTUnwrap(fence.beginAuthenticationAttempt())
+        let logoutCalls = OSAllocatedUnfairLock(initialState: 0)
+        let logout = CodexManagedLogoutCoordinator(fence: fence, logoutOperation: {
+            logoutCalls.withLock { $0 += 1 }
+            return .signedOut
+        })
+        let waiter = Task { await logout.stopSessionsAndSignOut(participants: participants) }
+        await fulfillment(of: [draining], timeout: 2)
+        XCTAssertEqual(logoutCalls.withLock { $0 }, 0)
+        XCTAssertFalse(fence.allowsAuthenticationPublication(originalAuth))
+        XCTAssertNil(fence.beginAuthenticationAttempt())
+        XCTAssertFalse(host.scope.isRetiring, "Provider logout is not whole-host retirement")
+        // Same tab/run IDs do not make the replacement part of the original cleanup receipt.
+        let replacement = host.scope.makeSession(tabID: session.tabID)
+        replacement.installRunID(runID)
+        replacement.selectedAgent = .claudeCode
+        replacement.codexController = successor
+        host.scope.replaceSessions([replacement.tabID: replacement])
+        waiter.cancel()
+        gate.release()
+        let result = await waiter.value
+        XCTAssertEqual(result, .signedOut)
+        XCTAssertEqual(logoutCalls.withLock { $0 }, 1)
+        XCTAssertTrue(replacement.codexController === successor)
+        XCTAssertEqual(replacement.runID, runID)
+        XCTAssertFalse(fence.finishAuthentication(token: originalAuth), "A pre-logout credential response cannot authorize a retained host")
+        let authenticated = try XCTUnwrap(fence.beginAuthenticationAttempt())
+        XCTAssertTrue(fence.finishAuthentication(token: authenticated))
+        XCTAssertTrue(fence.allowsCodexSessionInstallation(authenticated))
+    }
+
     func testCoordinatorRetirementReceiptJoinsOriginalControllerNotTabSuccessor() async throws {
         let route = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: nil)
         let runID = UUID()

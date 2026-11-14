@@ -8199,6 +8199,50 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
     }
 
+    /// Presentation preparation only: flush the editor into this manager before calling. This
+    /// joins the existing publisher and returns its exact canonical working bytes, not a saved
+    /// session receipt or permission to start a provider. The host must still capture its own
+    /// command/context/root resources afterward. Cancellation never cancels the shared publisher.
+    func publishCanonicalComposeInput(workspaceID: UUID, tabID: UUID) async throws -> DomainWorkspaceSnapshot {
+        try Task.checkCancellation()
+        guard canCommitComposeTabPresentation(workspaceID: workspaceID),
+              let authority = domainWorkspaceAuthorityClient,
+              let workspace = workspace(withID: workspaceID), !workspace.isEphemeral,
+              workspace.composeTabs.count(where: { $0.id == tabID }) == 1
+        else { throw WorkspacePersistenceFailure(category: .workspaceChanged) }
+        let stateVersion = stateVersionByWorkspaceID[workspaceID, default: 0]
+        let previousGeneration = domainWorkingCommitGeneration[workspaceID, default: 0]
+        publishWorkingDocumentToDomainAuthority(workspace)
+        guard let publisher = domainWorkingCommitTasks[workspaceID],
+              let generation = domainWorkingCommitGeneration[workspaceID], generation != previousGeneration,
+              let publicationGeneration = workingPublicationGenerationByWorkspaceID[workspaceID]
+        else { throw WorkspacePersistenceFailure(category: .workspaceChanged) }
+        await publisher.value
+        try Task.checkCancellation()
+        guard !isPreparingForWindowClose,
+              domainWorkingCommitGeneration[workspaceID] == generation,
+              stateVersionByWorkspaceID[workspaceID, default: 0] == stateVersion,
+              self.workspace(withID: workspaceID) == workspace,
+              let committed = ownWorkingCommitProvenanceByWorkspaceID[workspaceID],
+              committed.publicationGeneration == publicationGeneration
+        else { throw WorkspacePersistenceFailure(category: .workspaceChanged) }
+        guard let canonical = await authority.canonicalWorkspaceSnapshot(workspaceID) else {
+            throw WorkspacePersistenceFailure(category: .workspaceChanged)
+        }
+        try Task.checkCancellation()
+        guard !isPreparingForWindowClose,
+              domainWorkingCommitGeneration[workspaceID] == generation,
+              stateVersionByWorkspaceID[workspaceID, default: 0] == stateVersion,
+              self.workspace(withID: workspaceID) == workspace,
+              ownWorkingCommitProvenanceByWorkspaceID[workspaceID] == committed,
+              canonical.health != .removed,
+              canonical.revisions.workingRevision == committed.workingRevision,
+              canonical.document.contentDigest == committed.contentDigest,
+              canonical.contexts.contains(where: { $0.metadata.identity.contextID == tabID && $0.health != .removed })
+        else { throw WorkspacePersistenceFailure(category: .workspaceChanged) }
+        return canonical
+    }
+
     func runtimeOwnedDefaultWorkspaceCandidate() -> WorkspaceModel? {
         if let existing = workspaces.first(where: { $0.isSystemWorkspace }) {
             return existing

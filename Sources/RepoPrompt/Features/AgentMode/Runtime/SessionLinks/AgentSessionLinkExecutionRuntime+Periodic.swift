@@ -162,7 +162,8 @@ extension AgentSessionLinkExecutionRuntime {
     /// Uses the shared reservation, physical hooks and finalizer, but never a waiting continuation.
     func agentSessionLinkRunPeriodicAttempt(_ attempt: AgentSessionLinkAutoWakeAttempt, session: TabSession) async {
         let endpoint = attempt.observerEndpoint
-        guard !session.runState.isActive, session.runState != .waitingForUser,
+        guard let command = admit(endpoint: endpoint), command.writer.session === session,
+              !session.runState.isActive, session.runState != .waitingForUser,
               !session.mcpFollowUpRunPending, !session.hasActiveCodexHookGateOperation,
               agentSessionLinkPeriodicPreparationIsUnblocked(session),
               session.codexFallbackQueue.isEmpty, session.codexFallbackDispatchInFlight == nil,
@@ -183,7 +184,7 @@ extension AgentSessionLinkExecutionRuntime {
         let switchPreparation: ProviderSwitchSendPreparation?
         switch await providerSwitchSendAdmission(
             session: session, input: Self.periodicWakeMessage, skipsAugmentation: true,
-            isCurrent: { self.composerSubmitClaimIsCurrent(claim)
+            isCurrent: { command.isCurrent && self.composerSubmitClaimIsCurrent(claim)
                 && session.oversight.pendingAutoWake?.wakeID == attempt.wakeID
                 && (attempt.stopFence?.permitsStart(of: session) ?? true)
             }
@@ -194,7 +195,7 @@ extension AgentSessionLinkExecutionRuntime {
             cancelAgentSessionLinkAutoWake(for: endpoint, reason: .requiredClaimUnavailable)
             return
         }
-        guard var current = session.oversight.pendingAutoWake,
+        guard command.isCurrent, var current = session.oversight.pendingAutoWake,
               current.wakeID == attempt.wakeID, current.phase == .scheduled,
               agentSessionLinkPeriodicWakeIsEligible(session, endpoint: endpoint)
         else {
@@ -208,7 +209,7 @@ extension AgentSessionLinkExecutionRuntime {
         current.periodicComposerAttemptID = submission.id
         session.oversight.pendingAutoWake = current
         _ = await startAgentRun(
-            tabID: endpoint.tabID,
+            command: command,
             initialMessage: Self.periodicWakeMessage,
             directStartOptions: .periodicWake(wakeID: attempt.wakeID, stopFence: attempt.stopFence),
             providerSwitchPreparation: switchPreparation

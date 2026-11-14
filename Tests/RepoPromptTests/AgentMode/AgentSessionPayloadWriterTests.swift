@@ -95,6 +95,51 @@ final class AgentSessionPayloadWriterTests: XCTestCase {
         }
     }
 
+    func testAsyncStorageCheckCannotAdoptReacquiredWriterBeforeOrAfterIO() async throws {
+        for heldCheck in 1 ... 2 {
+            let fixture = try Fixture()
+            defer { fixture.cleanUp() }
+            let entered = expectation(description: "Storage authority check \(heldCheck)")
+            var release: CheckedContinuation<Void, Never>?
+            var checks = 0
+            var writes = 0
+            var phases: [AgentSessionRequiredSavePhase] = []
+            let task = Task { @MainActor in
+                try await fixture.write(storageIsCurrent: {
+                    checks += 1
+                    if checks == heldCheck {
+                        await withCheckedContinuation { release = $0
+                            entered.fulfill()
+                        }
+                    }
+                    return true
+                }, observingPhase: { phases.append($0) }) { payload, workspace, count in
+                    writes += 1
+                    return try await AgentSessionDataService.shared.saveAgentSession(
+                        payload, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count
+                    )
+                }
+            }
+            await fulfillment(of: [entered], timeout: 5)
+            fixture.scope.replaceSessions([:])
+            fixture.scope.replaceSessions([fixture.session.tabID: fixture.session])
+            release?.resume()
+            let outcome = try await task.value
+            if heldCheck == 1 {
+                guard case .rejectedBeforeWrite = outcome else { return XCTFail("Currency cannot adopt a new writer incarnation") }
+                XCTAssertEqual(writes, 0)
+                XCTAssertTrue(phases.isEmpty)
+            } else {
+                guard case let .supersededAfterWrite(url) = outcome else { return XCTFail("A completed write is not successor authority") }
+                let loaded = try await AgentSessionDataService.shared.loadAgentSession(from: url)
+                XCTAssertEqual(loaded.id, fixture.payload.id)
+                XCTAssertEqual(writes, 1, "Do not replay a completed write after an authority check")
+                XCTAssertEqual(phases, [.writeMayHaveCommitted, .writeReturned])
+            }
+            XCTAssertTrue(fixture.session.isDirty)
+        }
+    }
+
     func testSaverFailureAfterDurableEffectDoesNotClaimNoWrite() async throws {
         let fixture = try Fixture()
         defer { fixture.cleanUp() }
@@ -149,7 +194,7 @@ final class AgentSessionPayloadWriterTests: XCTestCase {
 
         func write(
             payload: AgentSession? = nil,
-            storageIsCurrent: () -> Bool = { true },
+            storageIsCurrent: () async -> Bool = { true },
             observingPhase: ((AgentSessionRequiredSavePhase) -> Void)? = nil,
             saver: AgentSessionPayloadWriter.Saver
         ) async throws -> AgentSessionPayloadWriter.Outcome {

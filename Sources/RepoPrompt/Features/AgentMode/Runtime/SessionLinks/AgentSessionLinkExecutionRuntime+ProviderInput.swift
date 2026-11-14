@@ -45,30 +45,55 @@ extension AgentSessionLinkExecutionRuntime {
         taggedFiles: [AgentTaggedFileAttachment], skipsSlashExpansion: Bool,
         environment: ManagedInputEnvironment, isCurrent: @escaping @MainActor () -> Bool
     ) async -> AgentSessionProviderInputRuntime.ProviderMessage {
-        guard let owner = scope, let command = try? owner.admit(session: session) else {
+        guard commands.isAvailable(), let owner = scope, let command = try? owner.admit(session: session) else {
             return .init(text: text, dispatchIsCurrent: { false })
         }
+        var capturedWorkspace: AgentSessionProviderInputRuntime.WorkspaceSource?
         let resources: @MainActor () -> Bool = {
-            command.isCurrent && environment.workspaceID == command.identity.workspaceID
-                && environment.resourcesAreCurrent() && !Task.isCancelled
+            self.commands.isAvailable() && command.isCurrent && environment.workspaceID == command.identity.workspaceID
+                && environment.resourcesAreCurrent() && (capturedWorkspace?.isCurrent() ?? true) && !Task.isCancelled
         }
         let admission: @MainActor () -> Bool = { resources() && isCurrent() }
         guard admission() else { return .init(text: text, dispatchIsCurrent: { false }) }
         var failures: [AgentSessionProviderInputRuntime.ExplicitFileFailure] = []
-        let prepared = await commands.input.augmentUserMessage(
-            text, attachments: attachments, taggedFileAttachments: taggedFiles, agent: session.selectedAgent,
-            workspacePaths: commands.workspacePaths(), workspace: { self.commands.inputWorkspace(session) },
-            session: session, handoff: owner.handoff, ignoresPendingHandoff: false,
-            skipsSlashExpansion: skipsSlashExpansion, isCurrent: admission, onTaggedFileFailures: { failures = $0 }
-        )
-        return .init(text: prepared, failures: admission() ? failures : [], dispatchIsCurrent: resources)
+        let prepared: String
+        let providerLaunchInput: AgentProviderLaunchInput?
+        do {
+            prepared = try await commands.input.augmentUserMessage(
+                text, attachments: attachments, taggedFileAttachments: taggedFiles, agent: session.selectedAgent,
+                workspacePaths: commands.workspacePaths(), workspace: {
+                    let source = try await self.commands.inputWorkspace(session, command)
+                    capturedWorkspace = source
+                    return source
+                },
+                workspaceCaptureOrder: commands.workspaceCaptureOrder,
+                session: session, handoff: owner.handoff, ignoresPendingHandoff: false,
+                skipsSlashExpansion: skipsSlashExpansion, isCurrent: admission, onTaggedFileFailures: { failures = $0 }
+            )
+            guard admission() else { return .init(text: text, dispatchIsCurrent: { false }) }
+            providerLaunchInput = if session.selectedAgent == .codexExec || session.selectedAgent.usesClaudeNativeRuntime {
+                try await environment.captureProviderLaunchInput(command)
+            } else { nil }
+        } catch {
+            return .init(text: text, dispatchIsCurrent: { false })
+        }
+        guard admission(), await environment.validateResources(command), admission(),
+              await capturedWorkspace?.validate() ?? true, admission()
+        else {
+            return .init(text: text, dispatchIsCurrent: { false })
+        }
+        return .init(text: prepared, failures: failures, dispatchIsCurrent: resources, validateResources: {
+            guard resources(), await environment.validateResources(command), resources(),
+                  await capturedWorkspace?.validate() ?? true else { return false }
+            return resources()
+        }, providerLaunchInput: providerLaunchInput)
     }
 
     func prepareResumeRecoveryHandoff(
         for session: AgentTabSession, sourceTitle: String, environment: ManagedInputEnvironment,
         command suppliedCommand: AgentSessionRuntimeStore.Command? = nil
     ) async -> AgentSessionHandoffRuntime.RecoveryResult {
-        guard let owner = scope, let membership = owner.membership(of: session),
+        guard commands.isAvailable(), let owner = scope, let membership = owner.membership(of: session),
               environment.resourcesAreCurrent() else { return .refused }
         // Initial worktree preparation already owns an explicit creation command. Preserve that
         // exact requirement instead of reconstructing restored admission before its first save.
@@ -100,15 +125,28 @@ extension AgentSessionLinkExecutionRuntime {
             for: session, sourceTabName: AgentSessionRestoreSupport.normalizedSessionTitle(sourceTitle),
             transcriptXML: AgentTranscriptIO.buildForkTranscriptXML(from: valid ? transcript : .empty, upToRowID: valid ? cutoff : nil)
         ) else { return .refused }
+        let recoveryIsCurrent: @MainActor () -> Bool = {
+            self.commands.isAvailable() && !Task.isCancelled && (command?.isCurrent ?? membership.permitsBindingPreparation)
+                && environment.resourcesAreCurrent()
+        }
+        guard recoveryIsCurrent() else { return .refused }
+        let input: AgentSessionProviderInputRuntime.InitialThreadInput?
+        do { input = try await commands.initialThreadInput(session, command) }
+        catch { return .refused }
+        guard recoveryIsCurrent() else { return .refused }
+        // Bound recovery may not turn an unavailable canonical context into a fresh empty thread.
+        guard input != nil || command == nil else { return .refused }
         let context: String?
-        if let input = commands.initialThreadInput(session) {
+        if let input {
             let values = await commands.input.initialThreadContext(input)
+            guard recoveryIsCurrent() else { return .refused }
             let block = AgentSessionProviderInputRuntime.composeInitialThreadMessage(
                 initialMessage: "", fileTree: values.fileTree, promptText: values.promptText
             ).trimmingCharacters(in: .whitespacesAndNewlines)
             context = block.isEmpty ? nil : block
         } else { context = nil }
-        guard command?.isCurrent ?? membership.permitsBindingPreparation, environment.resourcesAreCurrent(),
+        guard recoveryIsCurrent(), await environment.validateResources(command), recoveryIsCurrent(),
+              await input?.workspace.validate() ?? true, input?.workspace.isCurrent() ?? true, recoveryIsCurrent(),
               let staged = owner.handoff.stageRecovery(preparation, initialThreadContextBlock: context) else { return .refused }
         return .staged(staged)
     }

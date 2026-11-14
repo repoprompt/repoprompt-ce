@@ -59,7 +59,7 @@ enum AgentSessionPayloadWriter {
         writer: AgentSessionRuntimeStore.Writer,
         token: AgentSessionSaveCommitToken,
         creationHandle: AgentSessionCreationHandle? = nil,
-        storageIsCurrent: () -> Bool,
+        storageIsCurrent: () async -> Bool,
         observingPhase: ((AgentSessionRequiredSavePhase) -> Void)? = nil,
         saver: Saver
     ) async throws -> Outcome {
@@ -75,16 +75,20 @@ enum AgentSessionPayloadWriter {
               ).standardizedFileURL.path,
               token.binding == writer.binding,
               writer.isCurrent,
-              token.matches(writer.session, creationHandle: creationHandle),
-              storageIsCurrent()
+              token.matches(writer.session, creationHandle: creationHandle)
+        else { return .rejectedBeforeWrite }
+        guard await storageIsCurrent(), writer.isCurrent,
+              token.matches(writer.session, creationHandle: creationHandle)
         else { return .rejectedBeforeWrite }
 
         observingPhase?(.writeMayHaveCommitted)
         let fileURL = try await saver(payload, workspace, canonicalItemCount)
         observingPhase?(.writeReturned)
-        guard writer.isCurrent,
-              token.matches(writer.session, creationHandle: creationHandle),
-              storageIsCurrent()
+        guard writer.isCurrent, token.matches(writer.session, creationHandle: creationHandle) else {
+            return .supersededAfterWrite(fileURL)
+        }
+        guard await storageIsCurrent(), writer.isCurrent,
+              token.matches(writer.session, creationHandle: creationHandle)
         else { return .supersededAfterWrite(fileURL) }
         return .written(fileURL)
     }

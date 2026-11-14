@@ -80,6 +80,12 @@ final class AgentModeRunService {
     private let acpRunner: ACPIntegratedAgentModeRunner
     private let terminalCommitBarrier: AgentRunTerminalCommitBarrier
 
+    /// Capture before suspension. The barrier remains the producer owner; a host drain retains
+    /// this receipt rather than looking up a later run's teardown by tab ID.
+    func captureTerminalTeardown(for session: AgentTabSession) -> AgentRunTerminalCommitBarrier.TeardownReceipt? {
+        terminalCommitBarrier.captureTerminalTeardown(tabID: session.tabID, lifecycle: session.runLifecycle)
+    }
+
     /// Forward only; the barrier remains the owner of teardown/settlement evidence.
     func providerSwitchTerminalIsSettled(_ session: AgentTabSession) -> Bool {
         terminalCommitBarrier.isSettled(
@@ -282,6 +288,7 @@ final class AgentModeRunService {
         tabID: UUID,
         session: AgentTabSession,
         origin: AgentSessionRuntimeStore.Command,
+        providerLaunchInput: AgentProviderLaunchInput? = nil,
         workspace: AgentRunWorkspaceInput,
         initialUserMessage: String,
         initialMessageForRun: String,
@@ -312,7 +319,9 @@ final class AgentModeRunService {
                 session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained)
             }
         }
-        guard case .restored = origin.requirement, origin.writer.session === session, origin.isCurrent else {
+        guard case .restored = origin.requirement, origin.writer.session === session, origin.isCurrent,
+              providerLaunchInput?.isCurrent(for: session) != false
+        else {
             startOutcome?.recordStartFailure(message: nil)
             return .completed(nil)
         }
@@ -371,6 +380,7 @@ final class AgentModeRunService {
                 tabID: tabID,
                 session: session,
                 origin: origin,
+                providerLaunchInput: providerLaunchInput,
                 initialMessageForRun: initialMessageForRun,
                 attachments: attachments,
                 fallbackContext: codexFallbackContext,
@@ -428,6 +438,7 @@ final class AgentModeRunService {
                 tabID: tabID,
                 session: session,
                 origin: origin,
+                providerLaunchInput: providerLaunchInput,
                 initialUserMessage: initialUserMessage,
                 initialMessageForRun: initialMessageForRun,
                 attachments: attachments,
@@ -449,6 +460,7 @@ final class AgentModeRunService {
                 tabID: tabID,
                 session: session,
                 origin: origin,
+                providerLaunchInput: providerLaunchInput,
                 workspace: workspace,
                 initialUserMessage: initialUserMessage,
                 initialMessageForRun: initialMessageForRun,
@@ -474,6 +486,7 @@ final class AgentModeRunService {
         let resources = await headlessRunner.prepareRun(
             tabID: tabID,
             session: session,
+            providerLaunchInput: providerLaunchInput,
             initialUserMessage: initialUserMessage,
             initialMessageForRun: initialMessageForRun,
             attachments: attachments,
@@ -520,7 +533,8 @@ final class AgentModeRunService {
         targetRunAttemptID: UUID?,
         targetController: ACPAgentSessionController,
         writeReceipt: ACPAgentSessionController.PromptWriteReceipt? = nil,
-        inputResourcesAreCurrent: @escaping @MainActor () -> Bool = { true }
+        inputResourcesAreCurrent: @escaping @MainActor () -> Bool = { true },
+        validateInputResources: (@MainActor () async -> Bool)? = nil
     ) async -> Bool {
         guard inputResourcesAreCurrent() else { return false }
         guard session.operationAdmissionFailureMessage == nil else { return false }
@@ -564,7 +578,7 @@ final class AgentModeRunService {
             targetRunAttemptID: targetRunAttemptID,
             targetController: targetController,
             writeReceipt: writeReceipt,
-            inputResourcesAreCurrent: inputResourcesAreCurrent
+            inputResourcesAreCurrent: inputResourcesAreCurrent, validateInputResources: validateInputResources
         )
         steeringDebugLog("[AgentRunSteeringWake] ACP active submit runner returned sent=\(sent) agent=\(selectedAgent.rawValue) model=\(runRequest.modelString ?? "default") runID=\(String(describing: targetRunID)) attempt=\(String(describing: targetRunAttemptID))")
         return sent
@@ -793,7 +807,7 @@ final class AgentModeRunService {
                     inputResourcesAreCurrent: {
                         augmentedSteeringText.dispatchIsCurrent()
                             && steeringBatch.allSatisfy { $0.runtimeInputAdmission?.isCurrent() != false }
-                    }
+                    }, validateInputResources: augmentedSteeringText.validateResources
                 )
                 if !Task.isCancelled, session.acpSteeringFlushID == flushID,
                    session.acpController === controller,
@@ -1407,9 +1421,10 @@ final class AgentModeRunService {
                     // here would strand the runner, so steering must keep failing closed.
                     allowsCatalogRouteControllerRecovery: false,
                     inputAttemptChanged: { inputWasAttempted = $0 },
+                    providerLaunchInput: augmentedSteeringText.providerLaunchInput,
                     inputResourcesAreCurrent: {
                         augmentedSteeringText.dispatchIsCurrent() && steering.runtimeInputAdmission?.isCurrent() != false
-                    }
+                    }, validateInputResources: augmentedSteeringText.validateResources
                 )
                 steeringDebugLog("[AgentRunSteeringWake] Claude flush send completed id=\(steering.id) tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) outcome=\(String(describing: sendOutcome))")
                 switch sendOutcome {

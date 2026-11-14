@@ -2,9 +2,10 @@ import Foundation
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 
-/// Process-owned live-object authority. Scopes retain objects; the store keeps weak scope
-/// references so presentation disposal cannot leave phantom claims. A runtime host can retain
-/// the same scope independently of its presentation. Neither registration nor run lifecycle
+/// Process-owned live-object authority. Scopes retain objects; legacy scopes remain weak so
+/// presentation disposal cannot leave phantom claims. Explicit executable activations retain
+/// their actual host in that same census until full retirement acknowledgement, independently
+/// of presentation. Neither registration nor run lifecycle
 /// is duplicated here: those remain with the domain store and attempt/terminal owners.
 @MainActor
 final class AgentSessionRuntimeStore {
@@ -185,9 +186,49 @@ final class AgentSessionRuntimeStore {
 
     private struct WeakScope {
         weak var value: Scope?
+        /// Strong ownership is explicit for executable activations only. Legacy presentation
+        /// scopes remain weak; retaining an activation neither retires it nor fences commands.
+        var retainedHost: AgentSessionRuntimeHost?
     }
 
     private var scopes: [UUID: WeakScope] = [:]
+
+    /// Retain the executable owner, not merely the weak writer census, through recovery.
+    private var drainingHosts: [UUID: AgentSessionHostDrainRuntime] = [:]
+
+    func retainDrain(_ drain: AgentSessionHostDrainRuntime, for scope: Scope) {
+        precondition(drainingHosts[scope.id] == nil)
+        drainingHosts[scope.id] = drain
+    }
+
+    func retainedDrain(for scope: Scope) -> AgentSessionHostDrainRuntime? {
+        drainingHosts[scope.id]
+    }
+
+    func acknowledgeDrain(for scope: Scope) {
+        if drainingHosts[scope.id]?.outcome == .released {
+            // The drain publishes released only after its resource-release producer completes.
+            // A cancelled observer or failed/manual recovery acknowledgement cannot drop this.
+            scopes[scope.id]?.retainedHost = nil
+        }
+        drainingHosts[scope.id] = nil
+    }
+
+    private func retainExecutableHost(_ host: AgentSessionRuntimeHost, for scope: Scope) {
+        precondition(host.scope === scope && scopes[scope.id]?.value === scope)
+        precondition(scopes[scope.id]?.retainedHost == nil || scopes[scope.id]?.retainedHost === host)
+        scopes[scope.id]?.retainedHost = host
+    }
+
+    /// Shutdown/lifetime composition snapshots the same executable owners that ordinary
+    /// presentation detachment preserves. This census creates no writer or command authority.
+    var retainedExecutionHosts: [AgentSessionRuntimeHost] {
+        scopes.values.compactMap(\.retainedHost)
+    }
+
+    var retainedDrains: [AgentSessionHostDrainRuntime] {
+        Array(drainingHosts.values)
+    }
 
     func makeScope() -> Scope {
         scopes = scopes.filter { $0.value.value != nil }
@@ -297,6 +338,35 @@ final class AgentSessionRuntimeStore {
         fileprivate let id = UUID()
         fileprivate let store: AgentSessionRuntimeStore
 
+        /// Composition lookup only. Writer resolution/admission remains with this store; a saved
+        /// load returning another scope must reuse its actual host rather than wrap it again.
+        private(set) weak var executableHost: AgentSessionRuntimeHost?
+
+        func installExecutableHost(_ host: AgentSessionRuntimeHost) {
+            precondition(host.scope === self && executableHost == nil)
+            executableHost = host
+        }
+
+        /// Opt in only when canonical host composition is ready to own the activation. Losing
+        /// a presenter then leaves this exact scope admitted; no drain/Stop is implied.
+        func retainExecutableHost() {
+            guard let executableHost else { preconditionFailure("An executable scope requires its actual host") }
+            precondition(!hasReleasedWriterClaims && !isRetiring)
+            store.retainExecutableHost(executableHost, for: self)
+        }
+
+        var retainedDrain: AgentSessionHostDrainRuntime? {
+            store.retainedDrain(for: self)
+        }
+
+        func retainDrain(_ drain: AgentSessionHostDrainRuntime) {
+            store.retainDrain(drain, for: self)
+        }
+
+        func acknowledgeDrain() {
+            store.acknowledgeDrain(for: self)
+        }
+
         func resolveWriter(sessionID: UUID, expectedWorkspaceID: UUID? = nil) -> WriterResolution {
             store.resolveWriter(sessionID: sessionID, expectedWorkspaceID: expectedWorkspaceID)
         }
@@ -344,6 +414,8 @@ final class AgentSessionRuntimeStore {
                 && liveClaimByTabID[session.tabID]?.sessionID == identity.sessionID
                 && liveClaimByTabID[session.tabID]?.incarnationID == identity.incarnationID
         }
+
+        var settlementObservers: [UUID: AsyncStream<Void>.Continuation] = [:]
 
         let presentation = AgentSessionPresentationRuntime()
         var detachedNotificationCleanup: (@Sendable () -> Void)?
@@ -454,8 +526,8 @@ final class AgentSessionRuntimeStore {
             isRetiring = true
         }
 
-        /// The host has joined provider, interaction and attachment effects and acknowledged
-        /// its final save. Release claims explicitly; a retained presentation cannot keep them live.
+        /// Legacy prepared-owner compatibility. Its existing callers have not installed the
+        /// executable host drain/wakeup contract; do not tighten this policy before cutover.
         @discardableResult
         func releaseWriterClaimsAfterDrain() -> Bool {
             guard isRetiring, saveQueue.inFlightSessionIDs.isEmpty, !attachments.hasPendingRetention,
@@ -469,13 +541,22 @@ final class AgentSessionRuntimeStore {
             return true
         }
 
+        /// Host-only full policy, after exact producer/provider/domain joins and final saves.
+        /// Legacy prepared teardown continues to call the compatibility entry point above.
+        @discardableResult
+        func releaseWriterClaimsAfterHostDrain() -> Bool {
+            guard retainedDrain?.hasEffectCapabilities == true, retainedDrain?.hasPendingScopeEffects == false,
+                  sessions.isEmpty, installedInteractions?.hasPendingEffects != true else { return false }
+            return releaseWriterClaimsAfterDrain()
+        }
+
         /// Per-session release under the existing scope retirement fence. The host must first
         /// join provider/domain teardown and acknowledge the final save; timeout is not a receipt.
         /// A sibling's effects never release or block this exact object's claim. This primitive
         /// has no VM caller until host cutover; presentation removal/publication belongs to that host.
         @discardableResult
         func releaseWriterClaim(for session: AgentTabSession) -> Bool {
-            guard isRetiring, settlement(for: session).isSettled else { return false }
+            guard isRetiring, worktrees.pendingTransitions == 0, settlement(for: session).isSettled else { return false }
             var remaining = sessions
             remaining.removeValue(forKey: session.tabID)
             releasedSessionTabIDs.insert(session.tabID)
@@ -510,6 +591,7 @@ final class AgentSessionRuntimeStore {
                 updateLiveSessionBindingIndex(tabID: tabID)
             }
             presentation.refreshDetachedState()
+            noteSettlementChanged()
         }
 
         fileprivate func holdsSlot(session: AgentTabSession, incarnationID: UUID, binding: AgentPersistentSessionBindingIdentity?) -> Bool {
@@ -560,6 +642,7 @@ final class AgentSessionRuntimeStore {
                 // enter the reverse session-ID index or resolve as a persistent Writer.
                 let current = session.activeAgentSessionID
                 liveClaimByTabID[tabID] = LiveClaim(sessionID: current)
+                noteSettlementChanged()
                 if let current { liveTabIDsBySessionID[current, default: []].insert(tabID) }
             }
         }

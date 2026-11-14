@@ -64,6 +64,8 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
             fileManager: files, apiSettingsViewModel: api, windowID: -1,
             settingsManager: WindowSettingsManager(windowID: -1)
         )
+        await prompt.awaitInitialModelRefreshCompletion()
+        api.isOpenCodeConnected = true // The fixture's real ACP process has already bootstrapped.
         let manager = WorkspaceManagerViewModel(
             fileManager: files, promptViewModel: prompt,
             performInitialWorkspaceActivation: false
@@ -81,9 +83,10 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
                 LifecycleNoopCodexController(recorder: LifecycleRecorder())
             },
             connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
-            mcpServerEnabler: { true }
+            mcpServerEnabler: { true },
+            testPromptManager: prompt,
+            testWorkspaceManager: manager
         )
-        viewModel.workspaceManager = manager
         viewModel.test_setCurrentTabIDOverride(tabID)
         viewModel.test_setAgentSessionSaver { _, _, _ in
             directory.appendingPathComponent("\(UUID().uuidString).json")

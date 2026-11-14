@@ -6257,6 +6257,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         skipResumeWhenNoPriorCodexHistory: Bool = false,
         semanticRunState: AgentSessionRunState? = nil,
         startupClaimToken: UUID? = nil,
+        providerLaunchInput: AgentProviderLaunchInput? = nil,
         startupRouting: StartupRouting? = nil
     ) async {
         guard session.operationAdmissionFailureMessage == nil else { return }
@@ -6264,6 +6265,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         let sessionInstallationToken = managedSessionFence.capturePublicationToken()
         guard session.selectedAgent == .codexExec,
               managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken),
+              providerLaunchInput?.isCurrent(for: session) != false,
               startupRouting.map({ session.runID == $0.lease.runID && $0.stopFence.permitsStart(of: session) }) != false
         else { return }
         let sessionID = ObjectIdentifier(session)
@@ -6325,6 +6327,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                     skipResumeWhenNoPriorCodexHistory: false,
                     semanticRunState: semanticRunState,
                     startupClaimToken: claimToken,
+                    providerLaunchInput: providerLaunchInput,
                     startupRouting: startupRouting
                 )
                 return
@@ -6335,7 +6338,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         var controllerPermissionProfile = session.permissionProfile
         var runtimeWorkspacePaths: CodexRuntimeWorkspacePaths
         do {
-            runtimeWorkspacePaths = try runtimeWorkspacePathsProvider(session)
+            runtimeWorkspacePaths = try providerLaunchInput.map { try $0.codexWorkspacePaths(for: session) }
+                ?? runtimeWorkspacePathsProvider(session)
         } catch {
             let controllerToShutdown = session.codexController
             await failCodexStartupBeforeLaunch(session: session, error: error)
@@ -6357,14 +6361,16 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             wantsComputerUse = try await computerUseForNextTurn(session: session)
         } catch {
             guard session.activeRunAttemptID == runAttemptIDAtEntry,
-                  managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken) else { return }
+                  managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken),
+                  providerLaunchInput?.isCurrent(for: session) != false else { return }
             _ = invalidateCodexControllerForReconnect(session: session, expectedController: session.codexController, source: "computer-use-admission")
             await failCodexStartupBeforeLaunch(session: session, error: error, reason: "computer-use-admission")
             return
         }
         guard session.selectedAgent == .codexExec,
               session.activeRunAttemptID == runAttemptIDAtEntry,
-              managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken) else { return }
+              managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken),
+              providerLaunchInput?.isCurrent(for: session) != false else { return }
         var desiredFeatureState = AgentTabSession.CodexControllerFeatureState(
             computerUseEnabled: wantsComputerUse,
             goalSupportEnabled: wantsGoalSupport,
@@ -6427,23 +6433,25 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
 
         let computerUseStartupStopFence = AgentRunStartStopFence(session: session)
         func computerUseStartupIsCurrent(_ controller: any CodexSessionControlling) async -> Bool {
-            guard startupRouting.map({ $0.stopFence.permitsStart(of: session)
-                    && session.runID == $0.lease.runID && session.activeRunAttemptID == runAttemptIDAtEntry
-                    && session.codexController.map(ObjectIdentifier.init) == ObjectIdentifier(controller)
-                    && session.selectedAgent == .codexExec && !Task.isCancelled
-                    && managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken)
-            }) != false else { return false }
+            guard providerLaunchInput?.isCurrent(for: session) != false,
+                  startupRouting.map({ $0.stopFence.permitsStart(of: session)
+                          && session.runID == $0.lease.runID && session.activeRunAttemptID == runAttemptIDAtEntry
+                          && session.codexController.map(ObjectIdentifier.init) == ObjectIdentifier(controller)
+                          && session.selectedAgent == .codexExec && !Task.isCancelled
+                          && managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken)
+                  }) != false else { return false }
             if computerUseActivationID != nil {
                 guard computerUseStartupStopFence.permitsStart(of: session),
                       session.runID == runID, session.activeRunAttemptID == runAttemptIDAtEntry else { return false }
             }
             guard await validateCodexComputerUseScope(session: session, controller: controller, activationID: computerUseActivationID) else { return false }
-            return startupRouting.map { $0.stopFence.permitsStart(of: session)
-                && session.runID == $0.lease.runID && session.activeRunAttemptID == runAttemptIDAtEntry
-                && session.codexController.map(ObjectIdentifier.init) == ObjectIdentifier(controller)
-                && session.selectedAgent == .codexExec && !Task.isCancelled
-                && managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken)
-            } != false
+            return providerLaunchInput?.isCurrent(for: session) != false
+                && startupRouting.map { $0.stopFence.permitsStart(of: session)
+                    && session.runID == $0.lease.runID && session.activeRunAttemptID == runAttemptIDAtEntry
+                    && session.codexController.map(ObjectIdentifier.init) == ObjectIdentifier(controller)
+                    && session.selectedAgent == .codexExec && !Task.isCancelled
+                    && managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken)
+                } != false
                 && (
                     computerUseActivationID == nil
                         || (
@@ -6459,6 +6467,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                   session.runID == runID,
                   session.activeRunAttemptID == runAttemptIDAtEntry,
                   managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken),
+                  providerLaunchInput?.isCurrent(for: session) != false,
                   startupRouting?.stopFence.permitsStart(of: session) != false
             else {
                 logCodex("[AgentModeVM][CodexRetirement] replacement abandoned after state changed tab=\(session.tabID) run=\(runID)")
@@ -6467,7 +6476,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
 
             let refreshedWorkspacePaths: CodexRuntimeWorkspacePaths
             do {
-                refreshedWorkspacePaths = try runtimeWorkspacePathsProvider(session)
+                refreshedWorkspacePaths = try providerLaunchInput.map { try $0.codexWorkspacePaths(for: session) }
+                    ?? runtimeWorkspacePathsProvider(session)
             } catch {
                 let controllerToShutdown = session.codexController
                 await failCodexStartupBeforeLaunch(session: session, error: error)
@@ -6491,7 +6501,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 }
             } catch {
                 guard session.runID == runID, session.activeRunAttemptID == runAttemptIDAtEntry,
-                      managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken) else { return nil }
+                      managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken),
+                      providerLaunchInput?.isCurrent(for: session) != false else { return nil }
                 _ = invalidateCodexControllerForReconnect(session: session, expectedController: session.codexController, source: "computer-use-admission")
                 await failCodexStartupBeforeLaunch(session: session, error: error, reason: "computer-use-admission")
                 return nil
@@ -6499,6 +6510,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             guard session.selectedAgent == .codexExec, session.runID == runID,
                   session.activeRunAttemptID == runAttemptIDAtEntry,
                   managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken),
+                  providerLaunchInput?.isCurrent(for: session) != false,
                   startupRouting?.stopFence.permitsStart(of: session) != false else { return nil }
             let refreshedFeatureState = AgentTabSession.CodexControllerFeatureState(
                 computerUseEnabled: refreshedWantsComputerUse,
@@ -6544,7 +6556,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                     desiredFeatureState.capabilities,
                     contextWindowSelection
                 )
-                guard managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken)
+                guard managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken),
+                      providerLaunchInput?.isCurrent(for: session) != false
                 else {
                     logCodex("[AgentModeVM][CodexLogout] retiring controller created after managed sign-out invalidated its session token tab=\(session.tabID)")
                     await controller.shutdown()
@@ -6557,7 +6570,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 session.codexControllerFeatureState = desiredFeatureState
             }
             guard let controller = session.codexController,
-                  managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken)
+                  managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken),
+                  providerLaunchInput?.isCurrent(for: session) != false
             else { return nil }
             if let startupRouting {
                 let lease = startupRouting.lease
@@ -6568,7 +6582,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                       session.codexControllerGeneration == generation,
                       session.codexController.map(ObjectIdentifier.init) == ObjectIdentifier(controller),
                       startupRouting.stopFence.permitsStart(of: session), !Task.isCancelled,
-                      managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken)
+                      managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken),
+                      providerLaunchInput?.isCurrent(for: session) != false
                 else {
                     await lease.failAndCleanup()
                     return nil
@@ -6588,6 +6603,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                       session.codexController.map(ObjectIdentifier.init) == ObjectIdentifier(controller),
                       startupRouting.stopFence.permitsStart(of: session), !Task.isCancelled,
                       managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken),
+                      providerLaunchInput?.isCurrent(for: session) != false,
                       let receipts, !receipts.isEmpty,
                       receipts.allSatisfy({ controller.retainRoutingCleanup($0) })
                 else {
@@ -6665,6 +6681,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                             session: session,
                             policyAlreadyInstalled: true,
                             preserveExistingRunID: true,
+                            providerLaunchInput: providerLaunchInput,
                             startupRouting: startupRouting
                         )
                         return
@@ -6738,6 +6755,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 skipResumeWhenNoPriorCodexHistory: skipResumeWhenNoPriorCodexHistory,
                 semanticRunState: semanticRunState,
                 startupClaimToken: claimToken,
+                providerLaunchInput: providerLaunchInput,
                 startupRouting: startupRouting
             )
             return
@@ -6849,6 +6867,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 skipResumeWhenNoPriorCodexHistory: skipResumeWhenNoPriorCodexHistory,
                 semanticRunState: semanticRunState,
                 startupClaimToken: claimToken,
+                providerLaunchInput: providerLaunchInput,
                 startupRouting: originatingReceipts == nil ? nil : StartupRouting(lease: lease, stopFence: bootstrapStopFenceAtEntry)
             )
 
@@ -6905,7 +6924,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                                   session.activeRunAttemptID == runAttemptIDAtEntry,
                                   session.codexController.map(ObjectIdentifier.init) == expectedControllerID,
                                   session.codexControllerGeneration == pendingStart.controllerGeneration,
-                                  managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken)
+                                  managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken),
+                                  providerLaunchInput?.isCurrent(for: session) != false
                             else { return false }
                             guard let linkExecutionRuntime else { return false }
                             let readiness = await linkExecutionRuntime.qualifyProviderInputRoute(for: session)
@@ -6926,6 +6946,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                                 && session.codexController.map(ObjectIdentifier.init) == expectedControllerID
                                 && session.codexControllerGeneration == pendingStart.controllerGeneration
                                 && managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken)
+                                && providerLaunchInput?.isCurrent(for: session) != false
                         }
                     )
                     guard await computerUseStartupIsCurrent(expectedController) else {
@@ -6966,6 +6987,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                         }
                     }
                     guard managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken),
+                          providerLaunchInput?.isCurrent(for: session) != false,
                           commitPendingCodexStart(for: session, runID: runID)
                     else {
                         discardPendingCodexStart(for: session, controllerID: expectedControllerID)
@@ -7330,9 +7352,14 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         terminalizeRejectedSend: Bool = true,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
         selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
-        inputResourcesAreCurrent: @escaping @MainActor () -> Bool = { true },
+        providerLaunchInput: AgentProviderLaunchInput? = nil,
+        inputResourcesAreCurrent callerResourcesAreCurrent: @escaping @MainActor () -> Bool = { true },
+        validateInputResources: (@MainActor () async -> Bool)? = nil,
         inputAttemptChanged: (@MainActor (Bool) -> Void)? = nil
     ) async -> NativeSendOutcome {
+        let inputResourcesAreCurrent: @MainActor () -> Bool = {
+            callerResourcesAreCurrent() && providerLaunchInput?.isCurrent(for: session) != false
+        }
         guard inputResourcesAreCurrent() else { return .preDispatchRejected(message: "The input resource generation changed before Codex dispatch.") }
         if let refusal = codexEarlySendRefusal(
             session: session, writerReceipt: writerReceipt, ownership: ownership,
@@ -7523,7 +7550,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             policyAlreadyInstalled: policyAlreadyInstalled,
             allowMissingRolloutFallback: !isSelfNote,
             deferReconnectForCurrentActiveTurn: wasRunAlreadyActive,
-            skipResumeWhenNoPriorCodexHistory: !isSelfNote && !wasRunAlreadyActive && !hadResumeEligibleCodexHistoryBeforeSend
+            skipResumeWhenNoPriorCodexHistory: !isSelfNote && !wasRunAlreadyActive && !hadResumeEligibleCodexHistoryBeforeSend,
+            providerLaunchInput: providerLaunchInput
         )
         if Task.isCancelled {
             // The run was cancelled during startup — e.g. while the MCP routing wait was suspended. The
@@ -7976,6 +8004,12 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                         guard linkExecutionRuntime?.providerSwitchAcquirePhysicalDispatch(session: session, dispatchID: promptDispatchID)
                             ?? (session.pendingHandoff.providerSwitchDelivery == nil)
                         else { throw CancellationError() }
+                        if !isSelfNote {
+                            guard await providerLaunchInput?.validate(for: session) ?? true,
+                                  ownsPhysicalSendAfterProof(allowSelfNote: false),
+                                  await validateInputResources?() ?? true,
+                                  ownsPhysicalSendAfterProof(allowSelfNote: false) else { throw CancellationError() }
+                        }
                         let proof = await linkExecutionRuntime?.agentSessionLinkProveProviderInput(for: session, claim: monitoring?.claim)
                         guard ownsPhysicalSendAfterProof(allowSelfNote: isSelfNote)
                         else { throw CancellationError() }
@@ -8071,6 +8105,10 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 }
                 do {
                     preparedSteerAuthRetryTurn = session.codexPendingAuthRetryTurn
+                    guard await providerLaunchInput?.validate(for: session) ?? true,
+                          ownsPhysicalSendAfterProof(allowSelfNote: false),
+                          await validateInputResources?() ?? true,
+                          ownsPhysicalSendAfterProof(allowSelfNote: false) else { throw CancellationError() }
                     let proof = await linkExecutionRuntime?.agentSessionLinkProveProviderInput(for: session, claim: monitoring?.claim)
                     guard ownsPhysicalSendAfterProof(allowSelfNote: false)
                     else { throw CancellationError() }
@@ -12158,7 +12196,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
     /// only to the detached tracking controller's registration token.
     func detachForWorkspaceSwitchFinalizeSync(
         _ session: AgentTabSession,
-        runIDs: [UUID]
+        runIDs: [UUID],
+        preserveNonCodexRunState: Bool = false
     ) -> DetachedCodexController? {
         cancelCodexThreadNameSync(for: session.tabID)
         cancelCodexTabScopedControllerTasks(for: session.tabID)
@@ -12168,7 +12207,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         session.pendingCommandRunningFlushTask?.cancel()
         session.pendingCommandRunningFlushTask = nil
         session.pendingCommandRunningByKey.removeAll()
-        session.attachmentTurnState = .idle
+        if !preserveNonCodexRunState { session.attachmentTurnState = .idle }
         abandonCodexFallbackQueue(
             session: session,
             reason: "Codex queued follow-up was cancelled because the session shut down."

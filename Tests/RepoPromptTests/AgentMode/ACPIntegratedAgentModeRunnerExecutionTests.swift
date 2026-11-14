@@ -1246,6 +1246,79 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
         XCTAssertTrue(removedPIDs.isEmpty)
     }
 
+    func testACPCanonicalResourcesFenceFreshAndReusedPhysicalPrompts() async throws {
+        for reused in [false, true] {
+            for change in ["current", "resourceValidation", "writerValidation", "resourceProof", "stopProof"] {
+                let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                defer { try? FileManager.default.removeItem(at: directory) }
+                let script = try AgentSessionLinkACPServerScript.write(to: directory)
+                let provider = AgentSessionLinkCapturingACPProvider(providerID: .antigravity, commandPath: script.path)
+                let request = ACPRunRequest(agentKind: .antigravity, modelString: nil, workspacePath: directory.path, resumeSessionID: nil, attachments: [], taskLabelKind: nil)
+                let controller = try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
+                addTeardownBlock { await controller.shutdown() }
+                let harness = AgentSessionLinkRunnerHarness(
+                    headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() }, workspacePath: directory.path
+                )
+                let session = try harness.makeBoundSession(agent: .antigravity)
+                if reused {
+                    _ = try await controller.bootstrap()
+                    session.acpController = controller
+                    _ = AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
+                }
+                let origin = try harness.startCommand(for: session)
+                var resourcesCurrent = true
+                var preparingInput = false
+                let launch = try AgentProviderLaunchInput(
+                    origin: origin, workspace: harness.workspace, bindings: [], resourcesAreCurrent: { resourcesCurrent },
+                    validateResources: {
+                        if preparingInput, change == "resourceValidation" || change == "writerValidation" {
+                            await Task.yield()
+                            if change == "resourceValidation" { resourcesCurrent = false }
+                            else {
+                                let scope = origin.writer.scope
+                                var members = scope.sessions
+                                members.removeValue(forKey: session.tabID)
+                                scope.replaceSessions(members)
+                                members[session.tabID] = session
+                                scope.replaceSessions(members)
+                            }
+                        }
+                        return resourcesCurrent
+                    }
+                )
+                let runner = ACPIntegratedAgentModeRunner(hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(), toolTrackingHooks: .noOp)
+                runner.testAtStartupBoundary = { boundary in
+                    if boundary == .providerInputPreparing { preparingInput = true }
+                    if boundary == .providerInputProved {
+                        if change == "resourceProof" { resourcesCurrent = false }
+                        if change == "stopProof" { session.stopState.invalidateScheduledStarts() }
+                    }
+                }
+                let prepared = await runner.prepareRun(
+                    tabID: session.tabID, session: session, origin: origin, providerLaunchInput: launch, workspace: harness.workspace,
+                    initialUserMessage: "Exact host input", initialMessageForRun: "Exact host input", attachments: [], runRequest: request,
+                    makeLease: { harness.makeLease(runID: $0, tabID: session.tabID) }, stopFence: .init(session: session)
+                )
+                let resources = AgentRunProviderComposition(
+                    headless: { _, _ in AgentSessionLinkCapturingHeadlessProvider() }, acp: { _, _ in provider }, controller: { _, _ in controller }
+                )
+                await resources.fulfill(prepared)
+                await session.agentTask?.value
+                XCTAssertTrue(preparingInput, "reused=\(reused), \(change)")
+                XCTAssertEqual(provider.promptedMessages.count, change == "current" ? 1 : 0, "reused=\(reused), \(change)")
+                if change == "writerValidation" {
+                    XCTAssertFalse(origin.isCurrent)
+                    XCTAssertNil(session.lastTerminalCommitRevision, "A lost writer cannot settle its successor")
+                }
+                if session.runState.isActive {
+                    await harness.service.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted)
+                }
+                await controller.shutdown()
+            }
+        }
+    }
+
     func testACPTaskEntryAndLeaseCompletionKeepTheirOriginalWriter() async throws {
         typealias Boundary = ACPIntegratedAgentModeRunner.StartupBoundary
         @MainActor final class Counters {

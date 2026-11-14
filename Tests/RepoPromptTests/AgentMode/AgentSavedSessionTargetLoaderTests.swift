@@ -385,9 +385,11 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
         let session = try await f.load().get().writer.session
         let captured = try XCTUnwrap(configuration.location(session))
         XCTAssertNotNil(captured.retainedRoot)
-        XCTAssertTrue(configuration.locationIsCurrent(captured, session))
+        let originalLocationIsCurrent = await configuration.locationIsCurrent(captured, session)
+        XCTAssertTrue(originalLocationIsCurrent)
         f.placement.workspace.customStoragePath = f.root.appendingPathComponent("moved")
-        XCTAssertFalse(configuration.locationIsCurrent(captured, session))
+        let movedLocationIsCurrent = await configuration.locationIsCurrent(captured, session)
+        XCTAssertFalse(movedLocationIsCurrent)
         f.placement.suppressed = true
         XCTAssertNil(configuration.location(session)?.retainedRoot)
     }

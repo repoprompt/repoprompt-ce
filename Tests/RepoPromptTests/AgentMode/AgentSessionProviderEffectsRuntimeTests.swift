@@ -9,6 +9,99 @@ import XCTest
 
 @MainActor
 final class AgentSessionAttachmentRuntimeTests: XCTestCase {
+    func testExactRetentionJoinIgnoresSiblingAndReplacementButWaitsAfterCancellation() async throws {
+        let f = try Fixture()
+        let sibling = try Fixture()
+        sibling.scope.replaceSessions([:])
+        let runtime = f.scope.attachments
+        f.scope.replaceSessions([f.session.tabID: f.session, sibling.session.tabID: sibling.session])
+        runtime.configuration = .canonical { $0 === f.session ? f.location.value : sibling.location.value }
+        let targetGate = TestReleaseFence(name: "exact attachment target")
+        let siblingGate = TestReleaseFence(name: "exact attachment sibling")
+        let targetRoot = f.root.path
+        await AgentSessionDataService.shared.test_setBeforeAttachmentRetentionHook { url in
+            await (url.path.hasPrefix(targetRoot) ? targetGate : siblingGate).enterAndWait()
+        }
+        addTeardownBlock {
+            targetGate.release()
+            siblingGate.release()
+            await runtime.waitForRetention()
+            await AgentSessionDataService.shared.test_setBeforeAttachmentRetentionHook(nil)
+            try? FileManager.default.removeItem(at: f.root)
+            try? FileManager.default.removeItem(at: sibling.root)
+        }
+        for fixture in [f, sibling] {
+            let reservation = runtime.reserveAttachmentsForTurn([fixture.attachment], session: fixture.session)
+            runtime.finalizeAttachmentsForTurn(for: fixture.session, reservationID: reservation, disposition: .deleteFiles)
+        }
+        guard await targetGate.waitUntilEntered(), await siblingGate.waitUntilEntered() else { return }
+        let replacement = AgentTabSession(tabID: f.session.tabID)
+        try replacement.installPersistentSessionBinding(XCTUnwrap(f.session.persistentSessionBindingIdentity))
+        XCTAssertFalse(runtime.hasPendingRetention(for: replacement), "Persisted ID equality is not producer ownership")
+        let replacementJoined = expectation(description: "replacement has no attachment producers")
+        var replacementFinished = false
+        let replacementWaiter = Task {
+            await runtime.waitForRetention(for: replacement)
+            replacementFinished = true
+            replacementJoined.fulfill()
+        }
+        await fulfillment(of: [replacementJoined], timeout: 3)
+        guard replacementFinished else {
+            targetGate.release()
+            siblingGate.release()
+            await replacementWaiter.value
+            return
+        }
+        // A rebind must not hide an already admitted producer from its original object.
+        f.session.installPersistentSessionBinding(.init(tabID: f.session.tabID, sessionID: UUID(), workspaceID: f.workspaceID))
+        XCTAssertTrue(runtime.hasPendingRetention(for: f.session))
+        var joined = false
+        let entered = expectation(description: "exact attachment join entered")
+        let completed = expectation(description: "target attachment joined without sibling")
+        let waiter = Task {
+            entered.fulfill()
+            await runtime.waitForRetention(for: f.session)
+            joined = true
+            completed.fulfill()
+        }
+        waiter.cancel()
+        await fulfillment(of: [entered], timeout: 3)
+        XCTAssertFalse(joined)
+        targetGate.release()
+        await fulfillment(of: [completed], timeout: 3)
+        if !joined { siblingGate.release() }
+        await waiter.value
+        XCTAssertTrue(joined)
+        XCTAssertFalse(runtime.hasPendingRetention(for: f.session))
+        XCTAssertTrue(runtime.hasPendingRetention(for: sibling.session), "Sibling work cannot block the target join")
+        XCTAssertEqual(f.session.items.first?.attachments, [f.attachment], "Rebound publication remains fenced")
+    }
+
+    func testExactHydrationRepairJoinPublishesDirtyPathsBeforeFinalSave() async throws {
+        let f = try Fixture()
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        let runtime = f.scope.attachments
+        let sessionID = try XCTUnwrap(f.session.activeAgentSessionID)
+        let store = try AgentSessionAttachmentStore(rootURL: XCTUnwrap(f.location.value.retainedRoot))
+        let folder = store.sessionFolderURL(sessionID: sessionID)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let kept = folder.appendingPathComponent("\(f.attachment.id.uuidString).png")
+        try Data("retained".utf8).write(to: kept)
+        try FileManager.default.removeItem(atPath: XCTUnwrap(AgentImageAttachmentAvailabilityResolver.path(for: f.attachment)))
+        f.session.isDirty = false
+        runtime.repairRetainedAttachmentPathsAfterHydration(f.session, sessionID: sessionID)
+        XCTAssertTrue(runtime.hasPendingRetention(for: f.session))
+        let waiter = Task { await runtime.waitForRetention(for: f.session) }
+        waiter.cancel()
+        await waiter.value
+        XCTAssertEqual(f.session.items.first?.attachments.first?.source, .localFile(path: kept.path))
+        XCTAssertEqual(f.session.transcript.turns.first?.request?.attachments.first?.source, .localFile(path: kept.path))
+        XCTAssertTrue(f.session.isDirty, "Producer completion cannot acknowledge the repaired payload's durability")
+        XCTAssertFalse(runtime.hasPendingRetention(for: f.session))
+        f.scope.beginRetirement()
+        XCTAssertFalse(f.scope.releaseWriterClaimsAfterDrain(), "A subsequent acknowledged save is still required")
+    }
+
     func testProviderHooksRetainFilesAndScopeWithoutPresentationUntilDrain() async throws {
         var fixture: Fixture? = try Fixture()
         let f = try XCTUnwrap(fixture)
@@ -119,6 +212,73 @@ final class AgentSessionAttachmentRuntimeTests: XCTestCase {
             runtime.repairRetainedAttachmentPathsAfterHydration(f.session, sessionID: originalID)
             await runtime.waitForRetention()
             XCTAssertEqual(f.session.items.first?.attachments.first?.source, .localFile(path: retained.path))
+        }
+    }
+
+    func testCanonicalAttachmentReadsFenceOriginalMembershipAndStorageBeforeAndAfterIO() async throws {
+        enum Change: CaseIterable { case none, membership, storage, missing, resources }
+        for validationRead in [2, 3] {
+            for change in Change.allCases {
+                let f = try Fixture()
+                let runtime = f.scope.attachments
+                var workspace = WorkspaceModel(
+                    id: f.workspaceID, dateModified: Date(), name: "Canonical attachments",
+                    repoPaths: [], lastUsed: Date(), composeTabs: []
+                )
+                workspace.customStoragePath = f.root.appendingPathComponent("canonical")
+                var reads = 0
+                var missing = false
+                var resourcesCurrent = true
+                let gate = TestReleaseFence(name: "canonical attachment read \(validationRead) \(change)")
+                addTeardownBlock {
+                    gate.release()
+                    await runtime.waitForRetention()
+                    try? FileManager.default.removeItem(at: f.root)
+                }
+                let configuration = try await AgentSessionStorageInputs.canonicalAttachmentConfiguration(
+                    storage: .init(workspaceID: f.workspaceID, readWorkspace: { id in
+                        XCTAssertEqual(id, f.workspaceID)
+                        reads += 1
+                        if reads == validationRead { await gate.enterAndWait() }
+                        return missing ? nil : workspace
+                    }), workspaceDirectory: f.root, isSuppressed: false,
+                    resourcesAreCurrent: { resourcesCurrent }
+                )
+                runtime.configuration = configuration
+                let location = try XCTUnwrap(configuration.location(f.session))
+                let retained = try AgentSessionAttachmentStore(rootURL: XCTUnwrap(location.retainedRoot))
+                    .sessionFolderURL(sessionID: XCTUnwrap(f.session.activeAgentSessionID))
+                    .appendingPathComponent("\(f.attachment.id.uuidString).png")
+                let reservation = runtime.reserveAttachmentsForTurn([f.attachment], session: f.session)
+                runtime.finalizeAttachmentsForTurn(for: f.session, reservationID: reservation, disposition: .deleteFiles)
+                guard await gate.waitUntilEntered() else { return }
+                // Neither a later configuration nor reacquisition of the same object can vouch
+                // for the original disk operation's publication after its canonical read.
+                runtime.configuration = .canonical { _ in location }
+                switch change {
+                case .none: break
+                case .membership:
+                    f.scope.replaceSessions([:])
+                    f.scope.replaceSessions([f.session.tabID: f.session])
+                case .storage: workspace.customStoragePath = f.root.appendingPathComponent("successor")
+                case .missing: missing = true
+                case .resources: resourcesCurrent = false
+                }
+                let waiter = Task { await runtime.waitForRetention(for: f.session) }
+                waiter.cancel()
+                XCTAssertTrue(runtime.hasPendingRetention(for: f.session))
+                gate.release()
+                await waiter.value
+                let moved = validationRead == 3 || change == .none
+                XCTAssertEqual(FileManager.default.fileExists(atPath: retained.path), moved, "\(validationRead) \(change)")
+                let original = try XCTUnwrap(AgentImageAttachmentAvailabilityResolver.path(for: f.attachment))
+                XCTAssertEqual(FileManager.default.fileExists(atPath: original), !moved)
+                XCTAssertEqual(
+                    f.session.items.first?.attachments.first?.source,
+                    change == .none ? .localFile(path: retained.path) : f.attachment.source
+                )
+                XCTAssertFalse(runtime.hasPendingRetention(for: f.session))
+            }
         }
     }
 

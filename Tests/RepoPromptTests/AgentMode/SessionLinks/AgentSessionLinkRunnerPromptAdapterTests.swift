@@ -40,12 +40,14 @@ final class AgentSessionLinkHeadlessRunnerPromptAdapterTests: XCTestCase {
         _ harness: AgentSessionLinkRunnerHarness,
         session: AgentModeViewModel.TabSession,
         message: String,
-        localComposerCandidate: UUID? = nil
+        localComposerCandidate: UUID? = nil,
+        providerLaunchInput: AgentProviderLaunchInput? = nil
     ) async {
         let runner = harness.makeHeadlessRunner()
         await harness.resources.fulfill(runner.prepareRun(
             tabID: session.tabID,
             session: session,
+            providerLaunchInput: providerLaunchInput,
             initialUserMessage: message,
             initialMessageForRun: message,
             attachments: [],
@@ -54,6 +56,34 @@ final class AgentSessionLinkHeadlessRunnerPromptAdapterTests: XCTestCase {
             localComposerCandidate: localComposerCandidate
         ))
         await session.agentTask?.value
+    }
+
+    func testHeadlessCanonicalResourcesRemainCurrentThroughFinalProviderProof() async throws {
+        for change in ["current", "resourceAdmission", "resourceProof", "stopProof"] {
+            let provider = AgentSessionLinkCapturingHeadlessProvider()
+            let harness = makeHarness(provider: provider)
+            let session = try harness.makeBoundSession(agent: .claudeCode)
+            let command = try harness.startCommand(for: session)
+            var resourcesCurrent = true
+            var validations = 0
+            let input = try AgentProviderLaunchInput(
+                origin: command, workspace: harness.workspace, bindings: [],
+                resourcesAreCurrent: { resourcesCurrent }, validateResources: {
+                    validations += 1
+                    if change == "resourceAdmission", validations == 2 { resourcesCurrent = false }
+                    return resourcesCurrent
+                }
+            )
+            harness.beforeProviderInputProof = {
+                if change == "resourceProof" { resourcesCurrent = false }
+                if change == "stopProof" { session.stopState.invalidateScheduledStarts() }
+            }
+            await startRun(harness, session: session, message: "Exact host input", providerLaunchInput: input)
+            let messages = await provider.messages
+            XCTAssertEqual(messages.count, change == "current" ? 1 : 0, change)
+            XCTAssertGreaterThanOrEqual(validations, 2, change)
+            XCTAssertNil(session.agentTask, "Refused original input must settle its producer: \(change)")
+        }
     }
 
     func testCompletedHeadlessProviderDisposalCleansOnlyItsOriginatingRegistration() async throws {

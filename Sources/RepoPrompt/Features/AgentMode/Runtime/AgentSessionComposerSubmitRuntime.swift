@@ -147,6 +147,20 @@ final class AgentSessionComposerSubmitRuntime {
         return writer.isCurrent
     }
 
+    /// Record this claim's own draft consumption before publishing the empty composer. Later
+    /// rejection can distinguish that mutation from unrelated user typing without a new ledger.
+    @discardableResult
+    func clearSubmittedDraft(_ claim: AgentSessionComposerSubmitClaim) -> Bool {
+        guard let scope, isCurrent(claim), claim.scope === scope,
+              claim.sourceSession.draftMutationGeneration == claim.draftMutationGeneration,
+              claim.sourceSession.draftText == claim.attempt.rawDraftSnapshot else { return false }
+        claim.cancellation.oweDraftRestoration(claim.attempt.rawDraftSnapshot)
+        claim.cancellation.ownedDraftClearGeneration = claim.sourceSession.draftMutationGeneration
+            &+ (claim.sourceSession.draftText.isEmpty ? 0 : 1)
+        scope.drafts.write(tabID: claim.sourceSession.tabID, text: "")
+        return true
+    }
+
     /// Cleanup never requires new-command admission. It may release a retired or replaced
     /// originating object, but cannot clear a different object's or newer attempt's claim.
     @discardableResult
@@ -278,6 +292,7 @@ final class AgentComposerStartCancellation {
     private(set) var isWithdrawn = false
     private(set) var didLaunch: Bool
     private(set) var didRestoreDraft = false
+    fileprivate(set) var ownedDraftClearGeneration: UInt64?
     private(set) var isFinalized = false
     let finalized = AgentSessionLinkStopSignal<Void>()
 
@@ -344,6 +359,10 @@ final class AgentComposerStartCancellation {
 
     func restoreOwedDraftIfNeeded(message: String = "Send cancelled. Your draft was restored.") {
         runtime?.restoreDraft(self, message: message)
+    }
+
+    func takeOwedDraftForRecovery() -> String? {
+        takeOwedDraft()
     }
 
     fileprivate func takeOwedDraft() -> String? {
