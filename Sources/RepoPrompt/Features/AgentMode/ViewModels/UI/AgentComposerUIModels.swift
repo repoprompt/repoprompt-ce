@@ -401,6 +401,7 @@ struct AgentComposerProps: Equatable {
     let stagedSlashCommand: AgentStagedSlashCommandProps?
     let draftRestorationEvent: AgentDraftRestorationProps?
     let fileTagLookupContextIdentity: AgentWorkspaceLookupContextIdentity
+    var draftText: String?
 
     func backgroundStopTarget(inputText: String) -> OracleBackgroundCancelTarget? {
         guard cancelTarget == nil, !isRoutingFreshTask,

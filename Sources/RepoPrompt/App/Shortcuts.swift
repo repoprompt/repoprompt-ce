@@ -14,6 +14,7 @@ extension KeyboardShortcuts.Name {
 
     // Application commands: preserve the defaults formerly owned by native menus.
     static let newWorkspaceWindow = Self("newWorkspaceWindow", default: .init(.n, modifiers: [.command]))
+    static let showCommandCenter = Self("showCommandCenter")
     static let showAppSettings = Self("showAppSettings", default: .init(.comma, modifiers: [.command]))
     static let closeAppWindow = Self("closeAppWindow", default: .init(.w, modifiers: [.command, .shift]))
     static let checkForUpdates = Self("checkForUpdates", default: .init(.u, modifiers: [.command, .option]))

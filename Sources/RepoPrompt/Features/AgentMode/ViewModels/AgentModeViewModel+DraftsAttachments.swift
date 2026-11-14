@@ -220,14 +220,18 @@ extension AgentModeViewModel {
     func attachFiles(
         tabID: UUID,
         urls: [URL],
+        completion: (@MainActor (Bool) -> Void)? = nil,
         admission: @escaping @MainActor () -> Bool = { true }
     ) -> Task<Void, Never> {
-        guard !urls.isEmpty, admission() else { return Task {} }
+        guard !urls.isEmpty, admission() else { completion?(false)
+            return Task {}
+        }
         guard let workspaceDirectory = attachmentWorkspaceDirectoryURL() else {
             reportAttachmentFailures(
                 tabID: tabID,
                 messages: ["Attachments require an active workspace."]
             )
+            completion?(false)
             return Task {}
         }
 
@@ -237,6 +241,8 @@ extension AgentModeViewModel {
         let binding = session.persistentSessionBindingIdentity
         let bindingGeneration = session.bindingTransitionGeneration
         let intake = Task { @MainActor [weak self, weak session] in
+            var succeeded = false
+            defer { completion?(succeeded) }
             await previousIntake?.value
             guard let self, let session, admission(), sessions[tabID] === session,
                   session.persistentSessionBindingIdentity == binding,
@@ -258,6 +264,7 @@ extension AgentModeViewModel {
                 return
             }
             commitAttachmentIntake(outcome, to: session)
+            succeeded = outcome.failures.isEmpty
         }
         Self.attachmentIntakeTail = intake
         return intake

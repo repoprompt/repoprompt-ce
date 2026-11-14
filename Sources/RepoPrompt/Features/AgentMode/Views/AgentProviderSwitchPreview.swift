@@ -4,7 +4,7 @@ import SwiftUI
 /// resubmit the cached composer content, regardless of SwiftUI's equality path.
 struct AgentProviderSwitchPresentation<Content: View>: View {
     @Environment(\.agentModePerfRecorder) private var perfRecorder
-    let viewModel: AgentModeViewModel
+    let viewModel: AgentModeViewModel?
     let tabID: UUID?
     let content: Content
     @Binding var bannerHeight: CGFloat
@@ -14,11 +14,13 @@ struct AgentProviderSwitchPresentation<Content: View>: View {
             let _ = perfRecorder.increment("ui.body.providerSwitchPresentation")
         #endif
         VStack(spacing: 0) {
-            AgentProviderSwitchChrome(viewModel: viewModel, tabID: tabID)
-                .background(GeometryReader { geometry in
-                    Color.clear.onAppear { bannerHeight = geometry.size.height }
-                        .onChange(of: geometry.size.height) { _, height in bannerHeight = height }
-                })
+            if let viewModel {
+                AgentProviderSwitchChrome(viewModel: viewModel, tabID: tabID)
+                    .background(GeometryReader { geometry in
+                        Color.clear.onAppear { bannerHeight = geometry.size.height }
+                            .onChange(of: geometry.size.height) { _, height in bannerHeight = height }
+                    })
+            }
             content
         }
     }
