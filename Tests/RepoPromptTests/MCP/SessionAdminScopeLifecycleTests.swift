@@ -9390,7 +9390,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             XCTAssertEqual(workspace.activeComposeTabID, foregroundTab)
             XCTAssertTrue(workspace.composeTabs.contains { $0.id == targetTab.id && $0.activeAgentSessionID == targetID })
             let rows = [AgentChatItem.user("selected conversation", sequenceIndex: 0), AgentChatItem.assistant("saved reply", sequenceIndex: 1)]
-            _ = try await AgentSessionDataService.shared.saveAgentSession(AgentSession(
+            let savedFile = try await AgentSessionDataService.shared.saveAgentSession(AgentSession(
                 id: targetID, workspaceID: workspace.id, composeTabID: targetTab.id, name: targetTab.name,
                 transcript: AgentTranscriptIO.buildTranscript(from: rows, terminalState: .idle),
                 agentKind: "claudeCode", agentModel: "", isMCPOriginated: false
@@ -9413,8 +9413,10 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 sessionID: targetID, workspaceID: workspace.id, tabID: targetTab.id, name: "Selected",
                 provider: nil, attention: .saved, detail: nil, provenance: .saved(recordedAt: Date())
             )
+            let savedBytes = try Data(contentsOf: savedFile)
+            XCTAssertNil(SessionAdminWindows.runtimeOwner(for: targetID))
             let conversation = CommandCenterConversationModel(isEnabled: { true }, load: {
-                await CommandCenterConversationHost.load($0, isEnabled: { true })
+                await CommandCenterConversationHost.load($0, isEnabled: { true }, workspaceStore: fixture.runtime.workspaceStore)
             })
             defer { conversation.stop() }
             conversation.select(selectedRow)
@@ -9434,7 +9436,19 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             XCTAssertEqual(window.isCurrentlyFocused, focus)
             XCTAssertEqual(WindowStatesManager.shared.allWindows.map(\.windowID), windows)
             XCTAssertEqual(providerStarts, 0)
+            XCTAssertNil(conversation.snapshot?.windowID, "Saved history has no runtime action route")
+            XCTAssertNil(vm.sessions[targetTab.id], "Browsing must not materialize the inactive session")
+            XCTAssertNil(SessionAdminWindows.runtimeOwner(for: targetID))
+            XCTAssertEqual(try Data(contentsOf: savedFile), savedBytes)
+            // A separate explicit owner activation may later make this session live. The
+            // conversation must then adopt that exact owner, never manufacture another.
+            _ = await vm.ensureSessionReady(tabID: targetTab.id, reconnectActiveProviders: false)
             let canonical = try XCTUnwrap(SessionAdminWindows.runtimeOwner(for: targetID))
+            conversation.refresh()
+            try await AsyncTestWait.waitUntil("saved conversation follows explicit live owner", timeout: 10) {
+                conversation.snapshot?.windowID == window.windowID
+            }
+            XCTAssertTrue(SessionAdminWindows.runtimeOwner(for: targetID)?.session === canonical.session)
             XCTAssertTrue(canonical.location.window === window)
             XCTAssertTrue(vm.sessions[targetTab.id] === canonical.session)
             canonical.session.appendItem(.assistant("background update", sequenceIndex: 10))

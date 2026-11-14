@@ -1100,6 +1100,11 @@ final class CommandCenterSidebarProjectionTests: XCTestCase {
 
 @MainActor
 final class CommandCenterLibraryAndFolderTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+    }
+
     func testCanonicalClassificationAndMenuParityPreserveLegitimateUUIDNames() throws {
         var workspaces: [WorkspaceModel] = []
         for explicit in [nil, true, false] as [Bool?] {
@@ -1324,6 +1329,62 @@ final class CommandCenterSavedConversationTests: XCTestCase {
             XCTFail("Corrupt history must be refused")
         } catch {}
         XCTAssertEqual(try Data(contentsOf: file), corrupt)
+    }
+
+    func testProductionHostLoadsClosedProjectHistoryWithoutRuntimeOrWrites() async throws {
+        let root = try directory()
+        let folder = root.appendingPathComponent("Project")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let workspaceRoot = root.appendingPathComponent("Workspaces")
+        let runtime = MCPDomainRuntime(configuration: .init(
+            mode: .app, profileIdentifier: UUID().uuidString,
+            storageDirectory: root.appendingPathComponent("State"), workspaceStorageDirectory: workspaceRoot,
+            eventDirectory: root.appendingPathComponent("Events"), temporaryDirectory: root.appendingPathComponent("Tmp"),
+            externalReloadInterval: nil
+        ))
+        try await runtime.start()
+        addTeardownBlock { _ = await runtime.shutdown() }
+        let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: 0)
+        let resolution = try await PersistentFolderWorkspaceResolver.resolve(
+            folderURL: folder, client: client,
+            fileURL: { WorkspaceSessionSidecarMigration.workspaceDirectory(for: $0, root: workspaceRoot).appendingPathComponent("workspace.json") }
+        )
+        let workspace = resolution.workspace
+        let service = AgentSessionDataService()
+        await service.test_setWorkspaceRootOverride(workspaceRoot)
+        let saved = session(workspaceID: workspace.id)
+        let file = try await service.saveAgentSession(saved, for: workspace)
+        XCTAssertEqual(file.deletingLastPathComponent().deletingLastPathComponent(), resolution.snapshot.document.fileURL.deletingLastPathComponent())
+        let before = try Data(contentsOf: file)
+        let index = file.deletingLastPathComponent().appendingPathComponent("AgentSessionIndex.json")
+        let indexBefore = try Data(contentsOf: index)
+        let windows = WindowStatesManager.shared.sessionRuntimeWindows.map(\.windowID)
+        XCTAssertNil(SessionAdminWindows.runtimeOwner(for: saved.id))
+        let row = CommandCenterSessionRow(
+            sessionID: saved.id, workspaceID: workspace.id, tabID: saved.composeTabID,
+            name: saved.name, provider: nil, attention: .saved, detail: nil,
+            provenance: .saved(recordedAt: saved.savedAt)
+        )
+        let absentProjectRow = CommandCenterSessionRow(
+            sessionID: saved.id, workspaceID: UUID(), tabID: saved.composeTabID,
+            name: saved.name, provider: nil, attention: .saved, detail: nil,
+            provenance: .saved(recordedAt: saved.savedAt)
+        )
+        let refusal = await CommandCenterConversationHost.load(absentProjectRow, isEnabled: { true }, workspaceStore: runtime.workspaceStore)
+        guard case .unavailable = refusal else { return XCTFail("An absent catalog project must not be read or materialized") }
+        let model = CommandCenterConversationModel(isEnabled: { true }, load: {
+            await CommandCenterConversationHost.load($0, isEnabled: { true }, workspaceStore: runtime.workspaceStore)
+        })
+        defer { model.stop() }
+        model.select(row)
+        try await AsyncTestWait.waitUntil("closed project's real saved-history host", timeout: 3) { model.snapshot != nil || model.message != nil }
+        XCTAssertNil(model.message)
+        XCTAssertEqual(try XCTUnwrap(model.snapshot).rows.map(\.text), ["Saved question", "Saved answer"])
+        XCTAssertNil(model.snapshot?.windowID)
+        XCTAssertNil(SessionAdminWindows.runtimeOwner(for: saved.id))
+        XCTAssertEqual(WindowStatesManager.shared.sessionRuntimeWindows.map(\.windowID), windows)
+        XCTAssertEqual(try Data(contentsOf: file), before)
+        XCTAssertEqual(try Data(contentsOf: index), indexBefore)
     }
 
     func testSavedFrameReloadsWhenLiveOwnerAppearsAndKeepsDraft() async throws {

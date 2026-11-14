@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 import SwiftUI
 
@@ -59,8 +60,11 @@ enum CommandCenterConversationHost {
         await load(row, isEnabled: { GlobalSettingsStore.shared.experimentalCommandCenter() })
     }
 
+    /// Scene entry uses the process app catalog. A bounded runtime fixture can supply its
+    /// own catalog; this never substitutes for the canonical live-owner validation below.
     static func load(
-        _ row: CommandCenterSessionRow, isEnabled: @escaping @MainActor () -> Bool
+        _ row: CommandCenterSessionRow, isEnabled: @escaping @MainActor () -> Bool,
+        workspaceStore: DomainWorkspaceStore? = nil
     ) async -> CommandCenterConversationModel.LoadResult {
         let manager = WindowStatesManager.shared
         guard isEnabled(), !Task.isCancelled, !manager.isTerminating else {
@@ -79,13 +83,12 @@ enum CommandCenterConversationHost {
             return .unavailable("This session's runtime moved or is being prepared. Select it again after the transition completes.")
         }
         // Browsing history must not materialize a runtime, even when its workspace is open.
-        return await loadSaved(row, isEnabled: isEnabled)
+        return await loadSaved(row, isEnabled: isEnabled, store: workspaceStore ?? AppDomainRuntimeComposition.shared.runtime.workspaceStore)
     }
 
     private static func loadSaved(
-        _ row: CommandCenterSessionRow, isEnabled: @escaping @MainActor () -> Bool
+        _ row: CommandCenterSessionRow, isEnabled: @escaping @MainActor () -> Bool, store: DomainWorkspaceStore
     ) async -> CommandCenterConversationModel.LoadResult {
-        let store = AppDomainRuntimeComposition.shared.runtime.workspaceStore
         let catalog = await store.snapshot()
         guard isEnabled(), !Task.isCancelled, !WindowStatesManager.shared.isTerminating,
               !catalog.unavailableWorkspaceIDs.contains(row.workspaceID),
