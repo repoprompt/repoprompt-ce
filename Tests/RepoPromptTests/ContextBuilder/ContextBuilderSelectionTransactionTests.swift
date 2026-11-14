@@ -905,113 +905,121 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
         try await runtime.start()
         addTeardownBlock { _ = await runtime.shutdown() }
         try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
-            for sameProcess in [true, false] {
-                let fixture = try await makeFixture(name: "process-refresh", domainRuntime: runtime)
-                defer { fixture.cleanup() }
-                let manager = ServerNetworkManager.shared
-                let route = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: runtime.routingCoordinator, runtime: runtime)
-                let server = fixture.window.mcpServer
-                let workspace = try XCTUnwrap(fixture.window.workspaceManager.workspaces.first { $0.id == fixture.workspaceID })
-                let authority = try XCTUnwrap(server.domainWorkspaceAuthorityClient)
-                _ = try await authority.registerForRead(workspace, fileURL: fixture.window.workspaceManager.workspaceFileURL(for: workspace))
-                let handle = try await route.registerCatalog(server.makeToolCatalog(route: route))
-                let clientName = "same-process-\(UUID())"
-                let client = CodexAppServerClient(writeFrameHandler: { _, _ in }, livenessProbe: { _ in true })
-                await client.debugInstallTestTransport()
-                let controller = CodexNativeSessionController(
-                    client: client, runID: fixture.runID, tabID: fixture.tabID, windowID: route.identity.routeID,
-                    workspacePaths: .uniform(nil), clientShutdownBehavior: .stopOnShutdown, expectedMCPClientName: clientName
-                )
-                addTeardownBlock {
-                    await controller.shutdown()
-                    await manager.removeConnection(fixture.connectionID)
-                    await route.close()
-                }
-                try await controller.test_beginBindingSession()
-                let first = await manager.installClientConnectionPolicy(
-                    for: clientName, windowID: route.identity.routeID, restrictedTools: [], tabID: fixture.tabID,
-                    runID: fixture.runID, purpose: .agentModeRun, requiresExpectedAgentPID: true, routingOwner: route
-                )
-                let a = try XCTUnwrap(first)
-                XCTAssertTrue(controller.retainRoutingCleanup(a))
-                let originalPIDRegistrar = CodexAppServerClient.ExpectedAgentPIDRegistrar.serverNetworkManager(registration: a)
-                await client.setExpectedAgentPIDRegistration(.init(clientName: clientName, runID: fixture.runID, registrar: originalPIDRegistrar))
-                let activePID = await client.activeExpectedAgentPID(for: fixture.runID)
-                let pid = try XCTUnwrap(activePID)
-                await manager.debugRegisterConnectionForSocketFixture(connectionID: fixture.connectionID, connection: PolicyRefreshConnection(), clientName: clientName, sessionToken: UUID().uuidString, bootstrapPeerPID: Int(pid))
-                let applied = await manager.debugApplyPendingPolicy(clientName: clientName, connectionID: fixture.connectionID, clientPid: Int(pid))
-                XCTAssertEqual(applied.outcome, "applied")
-                await route.settleRoutingPublications()
-                let context = try XCTUnwrap(route.runRouteBindings.tabContextByConnectionID[fixture.connectionID])
-                let domainA = try await runtime.routingCoordinator.currentRegistration(connectionID: fixture.connectionID)
-                let before = await manager.isRunRouteAuthoritativelyCommitted(runID: fixture.runID, windowID: route.identity.routeID, tabID: fixture.tabID, expectedAgentPID: pid, registration: a)
-                XCTAssertTrue(before)
-                let replacementClient = CodexAppServerClient(writeFrameHandler: { _, _ in }, livenessProbe: { _ in true })
-                await replacementClient.debugInstallTestTransport()
-                let replacement = CodexNativeSessionController(
-                    client: replacementClient, runID: fixture.runID, tabID: fixture.tabID, windowID: route.identity.routeID,
-                    workspacePaths: .uniform(nil), clientShutdownBehavior: .stopOnShutdown, expectedMCPClientName: clientName
-                )
-                try await replacement.test_beginBindingSession()
-                addTeardownBlock { await replacement.shutdown() }
-                let target = sameProcess ? controller : replacement
-                let process = await target.routingProcessRegistration()
-                XCTAssertEqual(process != nil, sameProcess, "A different controller with reused wire IDs/PID has no original process registration")
-                let second = await manager.installClientConnectionPolicy(
-                    for: clientName, windowID: route.identity.routeID, restrictedTools: [], tabID: fixture.tabID,
-                    runID: fixture.runID, purpose: .agentModeRun, requiresExpectedAgentPID: true, routingOwner: route, reusingProcess: process
-                )
-                let b = try XCTUnwrap(second)
-                XCTAssertNotEqual(a.policyID, b.policyID)
-                XCTAssertTrue(target.retainRoutingCleanup(b))
-                await target.test_waitForRoutingCleanup()
-                if !sameProcess { await controller.shutdown() }
-                XCTAssertTrue(a.isConsumed)
-                XCTAssertFalse(b.isConsumed)
-                if sameProcess {
-                    XCTAssertTrue(route.runRouteBindings.hasCurrentMapping(runID: fixture.runID, connectionID: fixture.connectionID, expectedTabID: fixture.tabID))
-                    XCTAssertEqual(route.runRouteBindings.cleanupOwnership(for: fixture.connectionID)?.policyID, b.policyID)
-                    XCTAssertEqual(route.runRouteBindings.tabContextByConnectionID[fixture.connectionID]?.tabID, context.tabID)
-                    let domainB = try? await runtime.routingCoordinator.currentRegistration(connectionID: fixture.connectionID)
-                    XCTAssertEqual(domainB, domainA)
-                    let pids = await manager.debugExpectedAgentPIDs(for: clientName, runID: fixture.runID)
-                    XCTAssertEqual(pids, [pid])
-                    let qualified = await manager.isRunRouteAuthoritativelyCommitted(runID: fixture.runID, windowID: route.identity.routeID, tabID: fixture.tabID, expectedAgentPID: pid, registration: b)
-                    XCTAssertTrue(qualified)
-                    let dispatch = await manager.debugValidateOwnedRouteDispatch(connectionID: fixture.connectionID, routeID: route.identity.routeID, handle: handle, ownerIdentity: ObjectIdentifier(route))
-                    XCTAssertTrue(dispatch)
-                } else {
-                    let uncopiedPIDs = await manager.debugExpectedAgentPIDs(for: clientName, runID: fixture.runID)
-                    XCTAssertTrue(uncopiedPIDs.isEmpty, "A replacement process must register its own PID")
-                    let refused = await manager.isRunRouteAuthoritativelyCommitted(runID: fixture.runID, windowID: route.identity.routeID, tabID: fixture.tabID, expectedAgentPID: pid, registration: b)
-                    XCTAssertFalse(refused)
-                    await replacementClient.setExpectedAgentPIDRegistration(.init(clientName: clientName, runID: fixture.runID, registrar: .serverNetworkManager(registration: b)))
-                    await originalPIDRegistrar.clear(pid, clientName, fixture.runID)
-                    await originalPIDRegistrar.register(pid - 1, clientName, fixture.runID)
-                    await manager.cleanupRunRoutingState(ownedBy: a)
-                    let replacementPIDs = await manager.debugExpectedAgentPIDs(for: clientName, runID: fixture.runID)
-                    XCTAssertEqual(replacementPIDs, [pid], "Late old registration/clear cannot cross a different process, even after PID reuse")
+            do {
+                for sameProcess in [true, false] {
+                    let fixture = try await makeFixture(name: "process-refresh", domainRuntime: runtime)
+                    defer { fixture.cleanup() }
+                    let manager = ServerNetworkManager.shared
+                    let route = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: runtime.routingCoordinator, runtime: runtime)
+                    let server = fixture.window.mcpServer
+                    let workspace = try XCTUnwrap(fixture.window.workspaceManager.workspaces.first { $0.id == fixture.workspaceID })
+                    let authority = try XCTUnwrap(server.domainWorkspaceAuthorityClient)
+                    _ = try await authority.registerForRead(workspace, fileURL: fixture.window.workspaceManager.workspaceFileURL(for: workspace))
+                    let handle = try await route.registerCatalog(server.makeToolCatalog(route: route))
+                    let clientName = "same-process-\(UUID())"
+                    let client = CodexAppServerClient(writeFrameHandler: { _, _ in }, livenessProbe: { _ in true })
+                    await client.debugInstallTestTransport()
+                    let controller = CodexNativeSessionController(
+                        client: client, runID: fixture.runID, tabID: fixture.tabID, windowID: route.identity.routeID,
+                        workspacePaths: .uniform(nil), clientShutdownBehavior: .stopOnShutdown, expectedMCPClientName: clientName
+                    )
+                    addTeardownBlock {
+                        await controller.shutdown()
+                        await manager.removeConnection(fixture.connectionID)
+                        await route.close()
+                    }
+                    try await controller.test_beginBindingSession()
+                    let first = await manager.installClientConnectionPolicy(
+                        for: clientName, windowID: route.identity.routeID, restrictedTools: [], tabID: fixture.tabID,
+                        runID: fixture.runID, purpose: .agentModeRun, requiresExpectedAgentPID: true, routingOwner: route
+                    )
+                    let a = try XCTUnwrap(first)
+                    XCTAssertTrue(controller.retainRoutingCleanup(a))
+                    let originalPIDRegistrar = CodexAppServerClient.ExpectedAgentPIDRegistrar.serverNetworkManager(registration: a)
+                    await client.setExpectedAgentPIDRegistration(.init(clientName: clientName, runID: fixture.runID, registrar: originalPIDRegistrar))
+                    let activePID = await client.activeExpectedAgentPID(for: fixture.runID)
+                    let pid = try XCTUnwrap(activePID)
+                    await manager.debugRegisterConnectionForSocketFixture(connectionID: fixture.connectionID, connection: PolicyRefreshConnection(), clientName: clientName, sessionToken: UUID().uuidString, bootstrapPeerPID: Int(pid))
+                    let applied = await manager.debugApplyPendingPolicy(clientName: clientName, connectionID: fixture.connectionID, clientPid: Int(pid))
+                    XCTAssertEqual(applied.outcome, "applied")
+                    await route.settleRoutingPublications()
+                    let context = try XCTUnwrap(route.runRouteBindings.tabContextByConnectionID[fixture.connectionID])
+                    let domainA = try await runtime.routingCoordinator.currentRegistration(connectionID: fixture.connectionID)
+                    let before = await manager.isRunRouteAuthoritativelyCommitted(runID: fixture.runID, windowID: route.identity.routeID, tabID: fixture.tabID, expectedAgentPID: pid, registration: a)
+                    XCTAssertTrue(before)
+                    XCTAssertNotNil(route.runRouteBindings.pendingPolicyTokenIDByRunID[fixture.runID], "Committed mappings retain original rollback currency")
+                    let replacementClient = CodexAppServerClient(writeFrameHandler: { _, _ in }, livenessProbe: { _ in true })
+                    await replacementClient.debugInstallTestTransport()
+                    let replacement = CodexNativeSessionController(
+                        client: replacementClient, runID: fixture.runID, tabID: fixture.tabID, windowID: route.identity.routeID,
+                        workspacePaths: .uniform(nil), clientShutdownBehavior: .stopOnShutdown, expectedMCPClientName: clientName
+                    )
+                    try await replacement.test_beginBindingSession()
+                    addTeardownBlock { await replacement.shutdown() }
+                    let target = sameProcess ? controller : replacement
+                    let process = await target.routingProcessRegistration()
+                    XCTAssertEqual(process != nil, sameProcess, "A different controller with reused wire IDs/PID has no original process registration")
+                    let second = await manager.installClientConnectionPolicy(
+                        for: clientName, windowID: route.identity.routeID, restrictedTools: [], tabID: fixture.tabID,
+                        runID: fixture.runID, purpose: .agentModeRun, requiresExpectedAgentPID: true, routingOwner: route, reusingProcess: process
+                    )
+                    let b = try XCTUnwrap(second)
+                    XCTAssertNotEqual(a.policyID, b.policyID)
+                    XCTAssertTrue(target.retainRoutingCleanup(b))
+                    await target.test_waitForRoutingCleanup()
+                    if !sameProcess { await controller.shutdown() }
+                    XCTAssertTrue(a.isConsumed)
                     XCTAssertFalse(b.isConsumed)
+                    if sameProcess {
+                        XCTAssertTrue(route.runRouteBindings.hasCurrentMapping(runID: fixture.runID, connectionID: fixture.connectionID, expectedTabID: fixture.tabID))
+                        XCTAssertEqual(route.runRouteBindings.cleanupOwnership(for: fixture.connectionID)?.policyID, b.policyID)
+                        XCTAssertNil(route.runRouteBindings.pendingPolicyTokenIDByRunID[fixture.runID], "A's rollback token cannot retract transferred B")
+                        XCTAssertEqual(route.runRouteBindings.tabContextByConnectionID[fixture.connectionID]?.tabID, context.tabID)
+                        let domainB = try? await runtime.routingCoordinator.currentRegistration(connectionID: fixture.connectionID)
+                        XCTAssertEqual(domainB, domainA)
+                        let pids = await manager.debugExpectedAgentPIDs(for: clientName, runID: fixture.runID)
+                        XCTAssertEqual(pids, [pid])
+                        let qualified = await manager.isRunRouteAuthoritativelyCommitted(runID: fixture.runID, windowID: route.identity.routeID, tabID: fixture.tabID, expectedAgentPID: pid, registration: b)
+                        XCTAssertTrue(qualified)
+                        let dispatch = await manager.debugValidateOwnedRouteDispatch(connectionID: fixture.connectionID, routeID: route.identity.routeID, handle: handle, ownerIdentity: ObjectIdentifier(route))
+                        XCTAssertTrue(dispatch)
+                    } else {
+                        let uncopiedPIDs = await manager.debugExpectedAgentPIDs(for: clientName, runID: fixture.runID)
+                        XCTAssertTrue(uncopiedPIDs.isEmpty, "A replacement process must register its own PID")
+                        let refused = await manager.isRunRouteAuthoritativelyCommitted(runID: fixture.runID, windowID: route.identity.routeID, tabID: fixture.tabID, expectedAgentPID: pid, registration: b)
+                        XCTAssertFalse(refused)
+                        await replacementClient.setExpectedAgentPIDRegistration(.init(clientName: clientName, runID: fixture.runID, registrar: .serverNetworkManager(registration: b)))
+                        await originalPIDRegistrar.clear(pid, clientName, fixture.runID)
+                        await originalPIDRegistrar.register(pid - 1, clientName, fixture.runID)
+                        await manager.cleanupRunRoutingState(ownedBy: a)
+                        let replacementPIDs = await manager.debugExpectedAgentPIDs(for: clientName, runID: fixture.runID)
+                        XCTAssertEqual(replacementPIDs, [pid], "Late old registration/clear cannot cross a different process, even after PID reuse")
+                        XCTAssertFalse(b.isConsumed)
+                    }
+                    if sameProcess {
+                        // The process retained registrar A. Its exact PID clear must work after refresh,
+                        // before controller receipt B performs the broader routing teardown.
+                        await client.clearExpectedAgentPIDRegistration()
+                        let clearedByProcess = await manager.debugExpectedAgentPIDs(for: clientName, runID: fixture.runID)
+                        XCTAssertTrue(clearedByProcess.isEmpty)
+                        XCTAssertFalse(b.isConsumed)
+                    }
+                    await target.shutdown()
+                    XCTAssertTrue(b.isConsumed)
+                    XCTAssertNil(route.runRouteBindings.connectionID(forRunID: fixture.runID))
+                    XCTAssertNil(route.runRouteBindings.tabContextByConnectionID[fixture.connectionID])
+                    let finalPIDs = await manager.debugExpectedAgentPIDs(for: clientName, runID: fixture.runID)
+                    XCTAssertTrue(finalPIDs.isEmpty)
+                    let finalPolicy = await manager.debugRunPolicyState(for: fixture.runID)
+                    XCTAssertNil(finalPolicy)
+                    let finalRouting = await runtime.routingCoordinator.snapshot()
+                    XCTAssertFalse(finalRouting.connections.contains { $0.registration == domainA }, "Final shutdown releases the exact original domain connection")
                 }
-                if sameProcess {
-                    // The process retained registrar A. Its exact PID clear must work after refresh,
-                    // before controller receipt B performs the broader routing teardown.
-                    await client.clearExpectedAgentPIDRegistration()
-                    let clearedByProcess = await manager.debugExpectedAgentPIDs(for: clientName, runID: fixture.runID)
-                    XCTAssertTrue(clearedByProcess.isEmpty)
-                    XCTAssertFalse(b.isConsumed)
-                }
-                await target.shutdown()
-                XCTAssertTrue(b.isConsumed)
-                XCTAssertNil(route.runRouteBindings.connectionID(forRunID: fixture.runID))
-                XCTAssertNil(route.runRouteBindings.tabContextByConnectionID[fixture.connectionID])
-                let finalPIDs = await manager.debugExpectedAgentPIDs(for: clientName, runID: fixture.runID)
-                XCTAssertTrue(finalPIDs.isEmpty)
-                let finalPolicy = await manager.debugRunPolicyState(for: fixture.runID)
-                XCTAssertNil(finalPolicy)
-                let finalRouting = await runtime.routingCoordinator.snapshot()
-                XCTAssertFalse(finalRouting.connections.contains { $0.registration == domainA }, "Final shutdown releases the exact original domain connection")
+            } catch {
+                await ServerNetworkManager.shared.stop()
+                throw error
             }
+            await ServerNetworkManager.shared.stop()
         }
     }
 

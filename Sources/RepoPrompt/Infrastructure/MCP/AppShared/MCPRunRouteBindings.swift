@@ -176,10 +176,12 @@ final class MCPRunRouteBindings {
         guard ownerLifetime != nil, !origin.isConsumed, !successor.isConsumed,
               origin.routeOwner?.runRouteBindings === self, successor.routeOwner === origin.routeOwner,
               origin.runID == successor.runID, origin.routeID == successor.routeID,
-              pendingPolicyTokenIDByRunID[origin.runID] == nil,
               cleanupOwnershipByConnectionID[connectionID]?.policyID == origin.policyID,
               hasCurrentMapping(runID: origin.runID, connectionID: connectionID)
         else { return false }
+        // Committed policy mappings retain a rollback token. The network actor proved there
+        // is no pending admission; retire A's rollback currency atomically with ownership.
+        pendingPolicyTokenIDByRunID.removeValue(forKey: origin.runID)
         cleanupOwnershipByConnectionID[connectionID] = successor.mappingOwnership
         return true
     }
