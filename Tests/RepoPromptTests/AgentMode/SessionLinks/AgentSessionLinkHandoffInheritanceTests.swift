@@ -3134,6 +3134,9 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     let session = fixture.sourceSession
                     session.selectedAgent = .claudeCodeGLM
                     session.selectedModelRaw = "opus"
+                    // Complete the real provider-control normalization before admission. Otherwise
+                    // a delayed UI refresh initializes Claude effort during the required write.
+                    _ = vm.updatePermissionBindingState(from: session, syncUI: false)
                     try installSwitch(fixture)
                     let preparation = try await switchPreparation(fixture)
                     XCTAssertEqual(preparation.catalogWindow, 1_000_000)

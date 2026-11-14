@@ -629,10 +629,21 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
         for ownership in Ownership.allCases {
             for dirty in [false, true] {
                 try await withFixture { fixture in
-                    // Finish the surviving tab's activation before measuring removal writes.
+                    // Finish the surviving tab's activation and its provider-control save before
+                    // measuring removal writes; its delayed UI refresh is not a close of Alpha.
+                    await fixture.window.promptManager.awaitInitialModelRefreshCompletion()
                     fixture.viewModel.test_setCurrentTabIDOverride(nil)
                     await fixture.window.promptManager.switchComposeTab(fixture.tabBID)
                     XCTAssertEqual(fixture.window.promptManager.activeComposeTabID, fixture.tabBID)
+                    let survivingSession = try XCTUnwrap(fixture.viewModel.sessions[fixture.tabBID])
+                    _ = fixture.viewModel.updatePermissionBindingState(from: survivingSession, syncUI: false)
+                    fixture.viewModel.test_flushPendingUIRefresh()
+                    let activationSave = await fixture.viewModel.persistenceRuntime.flushSaveRequired(
+                        for: fixture.tabBID, workspaceID: fixture.workspaceID
+                    )
+                    if case let .failure(failure) = activationSave { XCTFail("\(failure)") }
+                    XCTAssertNil(survivingSession.saveDebounceTask)
+                    XCTAssertFalse(try fixture.viewModel.persistenceRuntime.queue.hasPendingSave(sessionID: XCTUnwrap(survivingSession.activeAgentSessionID)))
                     let session = fixture.sessionA
                     let peerScope = AgentSessionRuntimeStore.shared.makeScope()
                     defer { peerScope.replaceSessions([:]) }
