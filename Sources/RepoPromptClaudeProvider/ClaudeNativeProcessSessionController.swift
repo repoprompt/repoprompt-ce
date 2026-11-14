@@ -103,6 +103,7 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
         private var configurationTestInputClosed = false
         private var configurationTestBeforeApplicationErrorReturn: (@Sendable () async -> Void)?
         private var configurationTestBeforeProofSend: (@Sendable () async -> Void)?
+        private var configurationTestBeforeShutdownCompletion: (@Sendable () async -> Void)?
     #endif
     private var activeLaunchEnvironmentSignature: LaunchEnvironmentSignature?
     private var launchAutoCompactWindowTokens: Int?
@@ -702,6 +703,9 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
                 logger: config.enableDebugLogging ? { print("[ClaudeNativeSession] \($0)") } : { _ in }
             )
         }
+        #if DEBUG
+            await configurationTestBeforeShutdownCompletion?()
+        #endif
         await clearExpectedAgentPIDIfNeeded()
         pendingPermissionRequests.removeAll()
         permissionReceiptByNativeID.removeAll()
@@ -2057,6 +2061,11 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
             sessionID = "application-proof-session"
             configurationTestControlRequest = controlRequest
             configurationTestWrite = write
+        }
+
+        /// Hold the actual shutdown producer before its final PID/configuration/event cleanup.
+        package func test_setBeforeShutdownCompletion(_ action: @escaping @Sendable () async -> Void) {
+            configurationTestBeforeShutdownCompletion = action
         }
 
         package func test_setBeforeApplicationErrorReturn(_ action: @escaping @Sendable () async -> Void) {

@@ -512,11 +512,25 @@ final class ClaudeAgentModeCoordinator {
                     guard listener.subscription == nil, listener.pendingProviderTurnID == id,
                           session.activeRunOwnership == nil || session.claudeController.map(ObjectIdentifier.init) != controller.map(ObjectIdentifier.init)
                     else { return }
+                    var detached: DetachedClaudeController?
+                    if let controller, sessionOwnsClaudeController(controller, for: session) {
+                        // Shutdown is terminal for the production adapter. Detach the exact old
+                        // controller before suspending, but never detach a successor's listener.
+                        guard controllerListeners[session.tabID] === listener else { return }
+                        detached = detachClaudeController(controller, from: session, removeToolTracking: true, preservingAttemptEvents: false)
+                    }
                     if controllerListeners[session.tabID] === listener { controllerListeners.removeValue(forKey: session.tabID) }
                     listener.onBusyChanged = nil
                     listener.isCurrent = { false }
                     listener.retire()
-                    await controller?.shutdown()
+                    if let retirement = beginClaudeResumeTransferIfNeeded(for: session, oldController: detached, captureProviderSessionID: false) {
+                        // Reuse the existing start/Stop joins without handing an unadopted
+                        // producer's conversation identity to a reacquired writer.
+                        retainWithdrawnProviderRetirement(retirement, tabID: session.tabID)
+                        _ = await retirement.value
+                    } else {
+                        await controller?.shutdown()
+                    }
                     return
                 }
                 guard listener.isCurrent(), controllerListeners[session.tabID] === listener else { return }
@@ -2330,7 +2344,8 @@ final class ClaudeAgentModeCoordinator {
     @discardableResult
     func beginClaudeResumeTransferIfNeeded(
         for session: AgentTabSession,
-        oldController: DetachedClaudeController?
+        oldController: DetachedClaudeController?,
+        captureProviderSessionID: Bool = true
     ) -> Task<NativeAgentRuntimeSessionRef, Never>? {
         guard let oldController else { return nil }
         guard pendingResumeTransferTasksByTabID[session.tabID] == nil else {
@@ -2342,7 +2357,7 @@ final class ClaudeAgentModeCoordinator {
         }
         let generation = UUID()
         pendingResumeTransferGenerationByTabID[session.tabID] = generation
-        pendingResumeTransferEpochByTabID[session.tabID] = oldController.contextEpoch
+        pendingResumeTransferEpochByTabID[session.tabID] = captureProviderSessionID ? oldController.contextEpoch : nil
         let task = Task { @MainActor [self, session] in
             await cancelClaudeRunAndCaptureSessionRef(session, oldController: oldController)
         }
