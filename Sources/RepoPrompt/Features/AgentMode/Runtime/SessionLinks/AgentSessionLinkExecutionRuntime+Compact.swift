@@ -351,16 +351,16 @@ extension AgentSessionLinkExecutionRuntime {
                   let binding = session.persistentSessionBindingIdentity,
                   mayDispatch()
             else { return .notStarted }
-            let command = AgentProviderControlCommand.compact(
+            let providerCommand = AgentProviderControlCommand.compact(
                 expectedBinding: binding,
                 expectedProviderConversation: conversation,
                 selfCompactDispatchID: selfCompactDispatchID
             )
             let recorder = AgentRunStartOutcomeRecorder()
             _ = await startAgentRun(
-                tabID: tabID,
-                initialMessage: command.providerText,
-                directStartOptions: .providerControl(command),
+                command: command,
+                initialMessage: providerCommand.providerText,
+                directStartOptions: .providerControl(providerCommand),
                 startOutcome: recorder,
                 providerSwitchPreparation: nil
             )

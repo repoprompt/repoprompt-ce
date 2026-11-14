@@ -26,6 +26,9 @@ struct AgentResolvedSlashSkillInvocation: Equatable {
 final class AgentSessionProviderInputRuntime {
     let skillCatalog: AgentSkillCatalog
     private let perfRecorder: any AgentModePerfRecording
+    #if DEBUG
+        var test_afterProviderInputAugmentation: (@MainActor () async -> Void)?
+    #endif
 
     init(skillCatalog: AgentSkillCatalog, perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()) {
         self.skillCatalog = skillCatalog

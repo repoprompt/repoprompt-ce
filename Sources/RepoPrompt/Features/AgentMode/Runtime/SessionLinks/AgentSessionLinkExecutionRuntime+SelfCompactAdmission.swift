@@ -147,6 +147,7 @@ extension AgentSessionLinkExecutionRuntime {
         defer {
             if session.selfCompactAdmissionPendingID == attempt.id {
                 session.selfCompactAdmissionPendingID = nil
+                session.noteMonitorObservationInputsChanged()
             }
         }
         guard case .success = await owner.persistence.flushSaveRequired(

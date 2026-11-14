@@ -102,6 +102,7 @@ extension ClaudeAgentModeCoordinator {
         selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
         reinstallRunRoutingPolicy: (@MainActor () async -> Bool)? = nil,
         inputAttemptChanged: (@MainActor (Bool) -> Void)? = nil,
+        providerLaunchInput: AgentProviderLaunchInput? = nil,
         file: StaticString = #filePath,
         line: UInt = #line
     ) async -> NativeSendOutcome {
@@ -111,7 +112,8 @@ extension ClaudeAgentModeCoordinator {
             allowsCatalogRouteControllerRecovery: allowsCatalogRouteControllerRecovery,
             autoEffortSelection: autoEffortSelection, providerControlCommand: providerControlCommand,
             selfCompactDispatchID: selfCompactDispatchID, reinstallRunRoutingPolicy: reinstallRunRoutingPolicy,
-            inputAttemptChanged: inputAttemptChanged
+            inputAttemptChanged: inputAttemptChanged,
+            providerLaunchInput: providerLaunchInput
         )
     }
 }

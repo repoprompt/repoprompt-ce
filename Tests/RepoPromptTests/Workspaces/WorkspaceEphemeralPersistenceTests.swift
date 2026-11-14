@@ -1710,6 +1710,71 @@ import XCTest
             }
         }
 
+        func testCanonicalComposeInputJoinsItsPublisherWithoutAdoptingNewEditsOrCancellingCommit() async throws {
+            enum Change: CaseIterable { case none, localEdit, cancellation }
+            for change in Change.allCases {
+                let committed = expectation(description: "input publication committed \(change)")
+                let responseGate = WorkspaceDeleteSuspensionGate()
+                let counter = WorkspaceSavePreparationCounter()
+                try await withProjectionSaveFixture(configureClient: { client in
+                    let store = client.store
+                    client.commandWillExecuteForTesting = { envelope in
+                        guard case .replaceWorkingDocument = envelope.command,
+                              await counter.increment() == 1 else { return }
+                        let outcome = await store.execute(envelope)
+                        XCTAssertEqual(outcome.disposition, .applied)
+                        committed.fulfill()
+                        await responseGate.wait()
+                        XCTAssertFalse(Task.isCancelled, "Cancelling an input waiter must not cancel the originating publication")
+                    }
+                }) { fixture in
+                    let manager = fixture.manager
+                    await fixture.bridge.stopAndJoinForTesting()
+                    let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == fixture.workspace.id })
+                    let tabID = manager.workspaces[index].composeTabs[0].id
+                    manager.workspaces[index].composeTabs[0].promptText = "Canonical input before launch"
+                    manager.markWorkspaceDirty(workspaceID: fixture.workspace.id)
+                    let publication = Task {
+                        try await manager.publishCanonicalComposeInput(workspaceID: fixture.workspace.id, tabID: tabID)
+                    }
+                    do {
+                        try await self.awaitSaveCheckpoint(committed)
+                        switch change {
+                        case .none: break
+                        case .localEdit:
+                            manager.workspaces[index].composeTabs[0].promptText = "New local input belongs to a later request"
+                            manager.markWorkspaceDirty(workspaceID: fixture.workspace.id)
+                        case .cancellation: publication.cancel()
+                        }
+                        await responseGate.open()
+                        let result = await publication.result
+                        if case .none = change {
+                            let snapshot = try result.get()
+                            let decoded = try JSONDecoder().decode(WorkspaceModel.self, from: snapshot.document.documentBytes)
+                            XCTAssertEqual(decoded.composeTabs[0].promptText, "Canonical input before launch")
+                            XCTAssertNotNil(snapshot.revisions.dirtyRevision, "Working publication is not a saved-document or session durability ACK")
+                        } else {
+                            switch result {
+                            case .success: XCTFail("A stale or cancelled input request cannot capture successor input")
+                            case let .failure(error):
+                                if case .cancellation = change { XCTAssertTrue(error is CancellationError) }
+                            }
+                        }
+                        if case .localEdit = change {
+                            XCTAssertEqual(manager.workspaces[index].composeTabs[0].promptText, "New local input belongs to a later request")
+                        }
+                        let actualValue = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspace.id)
+                        let actual = try XCTUnwrap(actualValue)
+                        XCTAssertNotNil(actual.revisions.dirtyRevision, "A refused capture must not erase or replay an already committed working write")
+                    } catch {
+                        await responseGate.open()
+                        _ = await publication.result
+                        throw error
+                    }
+                }
+            }
+        }
+
         func testSaveJoinsCancelledOwnPublisherAndPersistsItsNewerLocalDescendant() async throws {
             let authorityCommitted = expectation(description: "predecessor committed before its response")
             let publisherCancelled = expectation(description: "ordinary save cancels and joins its predecessor")

@@ -90,7 +90,7 @@ enum AgentSessionSaveRuntime {
         canonicalItemCount: Int,
         writer: AgentSessionRuntimeStore.Writer,
         token: AgentSessionSaveCommitToken,
-        storageIsCurrent: () -> Bool,
+        storageIsCurrent: () async -> Bool,
         currentName: () -> String,
         observingPhase: ((AgentSessionRequiredSavePhase) -> Void)? = nil,
         saver: AgentSessionPayloadWriter.Saver

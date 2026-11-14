@@ -17,9 +17,10 @@ final class AgentSessionRunStartRuntime {
         let providerSwitchRefusal: (AgentTabSession) -> String
         let input: AgentSessionProviderInputRuntime
         let workspacePaths: () -> [String]
-        let inputWorkspace: (AgentTabSession) -> AgentSessionProviderInputRuntime.WorkspaceSource?
-        let initialThreadInput: (AgentTabSession) -> AgentSessionProviderInputRuntime.InitialThreadInput?
+        let inputWorkspace: (AgentTabSession) async throws -> AgentSessionProviderInputRuntime.WorkspaceSource?
+        let initialThreadInput: (AgentTabSession) async throws -> AgentSessionProviderInputRuntime.InitialThreadInput?
         let composition: () -> AgentModeRunComposition
+        var hostResources: AgentSessionHostStartupResources?
         #if DEBUG
             var test_startOverride: ((AgentTabSession, String, String) async -> Bool)?
         #endif
@@ -76,6 +77,9 @@ final class AgentSessionRunStartRuntime {
         let originalBindingToken = session.currentRestorationBindingToken
         let originalWorkspaceID = environment.currentWorkspaceID()
         func resourcesAreCurrent() -> Bool {
+            if let resources = environment.hostResources {
+                guard resources.origin.writer.session === session, resources.isCurrent else { return false }
+            }
             guard environment.currentWorkspaceID() == originalWorkspaceID else { return false }
             // An already-mismatched host is not a valid resource snapshot merely because it
             // stayed unchanged. Nil remains the explicit no-workspace resource composition.
@@ -118,6 +122,15 @@ final class AgentSessionRunStartRuntime {
         }
         guard periodicStartIsCurrent() else { return nil }
         let originalStopFence = directStartOptions.stopFence ?? AgentRunStartStopFence(session: session)
+        /// One async host-resource admission boundary. Resource currency does not authorize a
+        /// writer or scheduled turn: recheck all originating facts after the authority hop.
+        func admitHostResources(_ fence: AgentRunStartStopFence) async -> Bool {
+            guard let resources = environment.hostResources else { return true }
+            guard !Task.isCancelled, isCurrent(), periodicStartIsCurrent(), fence.permitsStart(of: session) else { return false }
+            guard await resources.validate() else { return false }
+            return !Task.isCancelled && isCurrent() && periodicStartIsCurrent() && fence.permitsStart(of: session)
+        }
+        guard await admitHostResources(originalStopFence) else { return nil }
         var preparedClaudeEvents: ClaudeAttemptEventReservation?
         var claudeEventsTransferred = false
         defer {
@@ -146,6 +159,13 @@ final class AgentSessionRunStartRuntime {
                     startOutcome?.recordStartFailure(message: nil)
                     return nil
                 }
+            }
+            guard await admitHostResources(originalStopFence) else { return nil }
+            // The resource authority hop can admit a new provider adoption. Do not reserve
+            // events or steer through that operation's preparation ownership.
+            guard claudeCoordinator.pendingProviderAdoption(for: session) == nil else {
+                recordClaudeStartRefusal()
+                return nil
             }
             if session.runState.isActive {
                 guard let writer, case .success = writer.admitCommand(), let execution = owner.execution,
@@ -266,12 +286,14 @@ final class AgentSessionRunStartRuntime {
                 return nil
             }
         }
+        var inputSources = providerSwitchPreparation?.inputSources ?? []
         func inputIsCurrent() -> Bool {
             command.isCurrent && resourcesAreCurrent() && stopFence.permitsStart(of: session) && periodicStartIsCurrent()
+                && inputSources.allSatisfy { $0.isCurrent() }
         }
         func runInputIsCurrent() -> Bool {
             periodicStartIsCurrent() && stopFence.permitsStart(of: session) && command.isCurrent && resourcesAreCurrent()
-                && session.operationAdmissionFailureMessage == nil
+                && session.operationAdmissionFailureMessage == nil && inputSources.allSatisfy { $0.isCurrent() }
         }
         guard await owner.mcp.prepareWaitTrackingForRunStart(session: session, stopFence: stopFence) else { return nil }
         guard runInputIsCurrent() else { return nil }
@@ -292,28 +314,43 @@ final class AgentSessionRunStartRuntime {
             switchMessages = nil
         }
         var taggedFileFailures = providerSwitchPreparation?.taggedFileFailures ?? []
-        let augmentedInitialMessage = if let switchMessages { switchMessages.user } else if directStartOptions.skipsUserAugmentation {
-            initialMessage
-        } else {
-            await environment.input.augmentUserMessage(
-                initialMessage, attachments: attachments, taggedFileAttachments: taggedFileAttachments,
-                agent: session.selectedAgent, workspacePaths: environment.workspacePaths(),
-                workspace: { environment.inputWorkspace(session) }, session: session, handoff: owner.handoff,
-                ignoresPendingHandoff: directStartOptions.ignoresPendingHandoff,
-                skipsSlashExpansion: directStartOptions.skipsSlashExpansion, isCurrent: inputIsCurrent,
-                onTaggedFileFailures: { taggedFileFailures = $0 }
-            )
-        }
-        guard inputIsCurrent() else { return nil }
-        // A provider control command is exactly its fixed native text: prepending initial-thread
-        // context would make it ordinary prose the provider no longer recognizes as a command.
-        let initialMessageForRun = if let switchMessages { switchMessages.initial } else { directStartOptions.providerControlCommand != nil
-            || directStartOptions.selfCompactDispatchID?.stage == .note
-            ? augmentedInitialMessage
-            : await environment.input.buildInitialThreadMessageIfNeeded(
-                session: session, initialMessage: augmentedInitialMessage,
-                input: { environment.initialThreadInput(session) }, isCurrent: inputIsCurrent
-            )
+        let augmentedInitialMessage: String
+        let initialMessageForRun: String
+        do {
+            augmentedInitialMessage = if let switchMessages { switchMessages.user } else if directStartOptions.skipsUserAugmentation {
+                initialMessage
+            } else {
+                try await environment.input.augmentUserMessage(
+                    initialMessage, attachments: attachments, taggedFileAttachments: taggedFileAttachments,
+                    agent: session.selectedAgent, workspacePaths: environment.workspacePaths(),
+                    workspace: {
+                        let source = try await environment.inputWorkspace(session)
+                        if let source { inputSources.append(source) }
+                        return source
+                    }, session: session, handoff: owner.handoff,
+                    ignoresPendingHandoff: directStartOptions.ignoresPendingHandoff,
+                    skipsSlashExpansion: directStartOptions.skipsSlashExpansion, isCurrent: inputIsCurrent,
+                    onTaggedFileFailures: { taggedFileFailures = $0 }
+                )
+            }
+            guard inputIsCurrent() else { return nil }
+            // A provider control command is exactly its fixed native text: prepending initial-thread
+            // context would make it ordinary prose the provider no longer recognizes as a command.
+            initialMessageForRun = if let switchMessages { switchMessages.initial } else { directStartOptions.providerControlCommand != nil
+                || directStartOptions.selfCompactDispatchID?.stage == .note
+                ? augmentedInitialMessage
+                : try await environment.input.buildInitialThreadMessageIfNeeded(
+                    session: session, initialMessage: augmentedInitialMessage,
+                    input: {
+                        let input = try await environment.initialThreadInput(session)
+                        if let input { inputSources.append(input.workspace) }
+                        return input
+                    }, isCurrent: inputIsCurrent
+                )
+            }
+        } catch {
+            startOutcome?.recordStartFailure(message: "The originating workspace context is no longer available.")
+            return nil
         }
         guard runInputIsCurrent() else { return nil }
         let preparedCodexFallbackContext = codexFallbackContext.map { context in
@@ -339,7 +376,18 @@ final class AgentSessionRunStartRuntime {
                 return nil
             }
         #endif
-        guard inputIsCurrent() else { return nil }
+        guard runInputIsCurrent() else { return nil }
+        let providerLaunchInput: AgentProviderLaunchInput?
+        do {
+            providerLaunchInput = try await environment.hostResources?.captureProviderLaunchInput(for: command).retainingInputSources(inputSources)
+        } catch {
+            startOutcome?.recordStartFailure(message: "The originating provider launch resources are no longer available.")
+            return nil
+        }
+        guard await admitHostResources(stopFence), runInputIsCurrent() else { return nil }
+        for source in inputSources {
+            guard await source.validate(), runInputIsCurrent() else { return nil }
+        }
         guard preparedClaudeEvents?.listener.isCurrent() != false else {
             recordClaudeStartRefusal()
             return nil
@@ -351,6 +399,7 @@ final class AgentSessionRunStartRuntime {
             tabID: tabID,
             session: session,
             origin: command,
+            providerLaunchInput: providerLaunchInput,
             initialUserMessage: augmentedInitialMessage,
             initialMessageForRun: initialMessageForRun,
             attachments: attachments,

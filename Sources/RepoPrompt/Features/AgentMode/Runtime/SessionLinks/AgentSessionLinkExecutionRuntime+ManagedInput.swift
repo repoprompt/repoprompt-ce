@@ -170,13 +170,15 @@ extension AgentSessionLinkExecutionRuntime {
         return text.isEmpty ? nil : text
     }
 
-    private func retainManagedInputEffect(
+    func retainManagedInputEffect(
         session: TabSession, owner: AgentSessionRuntimeStore.Scope, operation: @escaping @MainActor () async -> Void
     ) {
         let id = UUID()
-        let task = Task { @MainActor [self, owner] in
+        let task = Task { @MainActor [self, owner, session] in
             defer { pendingManagedInputEffects.removeValue(forKey: id)
-                withExtendedLifetime(owner) {}
+                owner.noteSettlementChanged()
+                // ObjectIdentifier filters are valid only while the exact originating object lives.
+                withExtendedLifetime((owner, session)) {}
             }
             await operation()
         }
@@ -232,19 +234,43 @@ extension AgentSessionLinkExecutionRuntime {
                 return
             }
             defer { session.codexDispatchSerialGate.finish(ticket) }
+            var capturedWorkspace: AgentSessionProviderInputRuntime.WorkspaceSource?
             @MainActor func isCurrent() -> Bool {
-                command.isCurrent && environment.resourcesAreCurrent() && stopFence.permitsStart(of: session)
+                command.isCurrent && environment.resourcesAreCurrent() && (capturedWorkspace?.isCurrent() ?? true)
+                    && stopFence.permitsStart(of: session)
                     && agentSessionLinkObserverEndpoint(tabID: session.tabID) == turn.endpoint
                     && session.runState.isActive && session.activeRunOwnership == ownership
                     && session.codexController.map(ObjectIdentifier.init) == controllerID
             }
             var failures: [AgentSessionProviderInputRuntime.ExplicitFileFailure] = []
-            let augmented = await commands.input.augmentUserMessage(
-                text, attachments: [], taggedFileAttachments: [], agent: session.selectedAgent,
-                workspacePaths: commands.workspacePaths(), workspace: { self.commands.inputWorkspace(session) },
-                session: session, handoff: owner.handoff, ignoresPendingHandoff: false,
-                skipsSlashExpansion: false, isCurrent: isCurrent, onTaggedFileFailures: { failures = $0 }
-            )
+            let augmented: String
+            let providerLaunchInput: AgentProviderLaunchInput?
+            do {
+                augmented = try await commands.input.augmentUserMessage(
+                    text, attachments: [], taggedFileAttachments: [], agent: session.selectedAgent,
+                    workspacePaths: commands.workspacePaths(), workspace: {
+                        let source = try await self.commands.inputWorkspace(session, command)
+                        capturedWorkspace = source
+                        return source
+                    },
+                    session: session, handoff: owner.handoff, ignoresPendingHandoff: false,
+                    skipsSlashExpansion: false, isCurrent: isCurrent, onTaggedFileFailures: { failures = $0 }
+                )
+                try command.requireCurrent()
+                guard isCurrent() else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
+                providerLaunchInput = try await environment.captureProviderLaunchInput(command)
+            } catch {
+                session.codexSteerAckTracker.resolve(attemptID: attemptID, state: .cancelled)
+                withdrawManagedInput(command: command, session: session, row: row, rollback: rollback, turn: turn)
+                return
+            }
+            guard isCurrent(), await environment.validateResources(command), isCurrent(),
+                  await capturedWorkspace?.validate() ?? true, isCurrent()
+            else {
+                session.codexSteerAckTracker.resolve(attemptID: attemptID, state: .cancelled)
+                withdrawManagedInput(command: command, session: session, row: row, rollback: rollback, turn: turn)
+                return
+            }
             let fallback = TabSession.CodexFallbackSubmissionContext(
                 queueID: UUID(), providerText: augmented, attachments: [], taggedFileAttachments: [], draftText: "",
                 optimisticUserItemID: row.id, origin: .mcp(attemptID: attemptID), dispatchTicket: ticket,
@@ -257,9 +283,14 @@ extension AgentSessionLinkExecutionRuntime {
                 outcome = await coordinator.sendCodexNativeMessage(
                     session: session, writerReceipt: receipt, ownership: ownership, text: augmented,
                     attachments: [], fallbackContext: fallback, stopFence: stopFence, terminalizeRejectedSend: false,
+                    providerLaunchInput: providerLaunchInput,
                     // Carry the admitted command through native route/read-proof awaits. Resource
                     // currency alone can survive same-object writer claim reacquisition.
                     inputResourcesAreCurrent: isCurrent,
+                    validateInputResources: {
+                        guard isCurrent(), await capturedWorkspace?.validate() ?? true else { return false }
+                        return isCurrent()
+                    },
                     inputAttemptChanged: { inputWasAttempted = $0 }
                 )
             } else { outcome = .preDispatchRejected(message: "The originating Codex writer or attempt changed before dispatch.") }
@@ -310,9 +341,10 @@ extension AgentSessionLinkExecutionRuntime {
                 return
             }
             defer { session.codexDispatchSerialGate.finish(ticket) }
+            var capturedWorkspace: AgentSessionProviderInputRuntime.WorkspaceSource?
             @MainActor func isCurrent() -> Bool {
                 guard let instruction, let waitID else { return false }
-                return command.isCurrent && environment.resourcesAreCurrent()
+                return command.isCurrent && environment.resourcesAreCurrent() && (capturedWorkspace?.isCurrent() ?? true)
                     && ownsInstructionWait(command: instruction, waitID: waitID)
                     && (
                         ownership.map { session.isCurrentRunAttemptForCurrentBinding($0) && session.quietLedger.isOpen(owner: $0) }
@@ -330,13 +362,25 @@ extension AgentSessionLinkExecutionRuntime {
                 return
             }
             var failures: [AgentSessionProviderInputRuntime.ExplicitFileFailure] = []
-            let augmented = await commands.input.augmentUserMessage(
-                text, attachments: [], taggedFileAttachments: [], agent: session.selectedAgent,
-                workspacePaths: commands.workspacePaths(), workspace: { self.commands.inputWorkspace(session) },
-                session: session, handoff: owner.handoff, ignoresPendingHandoff: false,
-                skipsSlashExpansion: false, isCurrent: isCurrent, onTaggedFileFailures: { failures = $0 }
-            )
-            guard isCurrent() else { reject()
+            let augmented: String
+            do {
+                augmented = try await commands.input.augmentUserMessage(
+                    text, attachments: [], taggedFileAttachments: [], agent: session.selectedAgent,
+                    workspacePaths: commands.workspacePaths(), workspace: {
+                        let source = try await self.commands.inputWorkspace(session, command)
+                        capturedWorkspace = source
+                        return source
+                    },
+                    session: session, handoff: owner.handoff, ignoresPendingHandoff: false,
+                    skipsSlashExpansion: false, isCurrent: isCurrent, onTaggedFileFailures: { failures = $0 }
+                )
+            } catch {
+                reject()
+                return
+            }
+            guard isCurrent(), await environment.validateResources(command), isCurrent(),
+                  await capturedWorkspace?.validate() ?? true, isCurrent()
+            else { reject()
                 return
             }
             let readiness = await qualifyProviderInputRoute(for: session)
@@ -348,6 +392,9 @@ extension AgentSessionLinkExecutionRuntime {
             let monitoring = agentSessionLinkDecoratedProviderText(augmented, session: session, dispatchID: dispatchID)
             ownsDispatchClaim = monitoring.claim != nil
             guard !monitoring.mustAbortDispatch else { reject()
+                return
+            }
+            guard await capturedWorkspace?.validate() ?? true, isCurrent() else { reject()
                 return
             }
             let proof = await agentSessionLinkProveProviderInput(for: session, claim: monitoring.claim)
@@ -381,11 +428,11 @@ extension AgentSessionLinkExecutionRuntime {
                   session.runState.isActive, session.runID == runID, session.activeRunAttemptID == attemptID else { return nil }
             return runID
         }
-        if let runID, let server = environment.server,
+        if let runID,
            session.selectedAgent != .codexExec || codexCoordinator?.isCodexCompactionInFlight(session: session) == true
         {
             retainManagedInputEffect(session: session, owner: owner) {
-                await server.wakeAgentRunWaitersOwnedByActiveRun(
+                await environment.tools.wakeAgentRunWaitersOwnedByActiveRun(
                     runID: runID, source: "managed-active-submit-parent-run", steeringMessage: message,
                     steeringOriginRunID: currentOrigin,
                     publicationForSessionID: { id in

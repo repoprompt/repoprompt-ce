@@ -170,6 +170,7 @@ extension AgentSessionLinkExecutionRuntime {
             }
             defer {
                 pendingStopEffects.removeValue(forKey: request.requestID)
+                command.writer.scope.noteSettlementChanged()
                 withExtendedLifetime(command) {}
             }
             beforeCleanupTask()
@@ -321,6 +322,7 @@ extension AgentSessionLinkExecutionRuntime {
             }
             defer {
                 pendingStopEffects.removeValue(forKey: effectID)
+                writer.scope.noteSettlementChanged()
                 withExtendedLifetime(writer) {}
             }
             guard writer.isCurrent, writer.session === session,
@@ -353,9 +355,13 @@ extension AgentSessionLinkExecutionRuntime {
 
     /// Teardown joins these effects separately from terminal publication: a Stop cleanup itself
     /// waits for terminal publication, so the terminal hook must never join this collection.
-    func drainPendingStopEffects() async {
-        while !pendingStopEffects.isEmpty {
-            let pending = Array(pendingStopEffects.values)
+    /// An exact-session join excludes sibling effects but still waits for the real cleanup and
+    /// audit producers after waiter cancellation. Completion alone is not a save acknowledgment.
+    func drainPendingStopEffects(for session: AgentTabSession? = nil) async {
+        let identity = session.map(ObjectIdentifier.init)
+        while true {
+            let pending = pendingStopEffects.values.filter { identity == nil || $0.sessionIdentity == identity }
+            guard !pending.isEmpty else { return }
             for effect in pending {
                 await effect.task.value
             }
@@ -394,6 +400,7 @@ extension AgentSessionLinkExecutionRuntime {
         let cleanup = Task { [self, command] in
             await start.finalized.value()
             pendingStopEffects.removeValue(forKey: requestID)
+            command.writer.scope.noteSettlementChanged()
             result.finish(true)
             withExtendedLifetime(command) {}
         }

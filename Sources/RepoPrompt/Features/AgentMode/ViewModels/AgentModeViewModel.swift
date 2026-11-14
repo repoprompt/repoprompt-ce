@@ -59,12 +59,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     typealias PersistedProviderConversationCleaner = ProviderConversationCleaner
     typealias CodexActiveToolQuery = (_ runID: UUID) -> Bool
     typealias CodexAgentRunWaitQuery = (_ runID: UUID) -> Bool
-    typealias CodexAgentRunWaitDrain = @MainActor (
-        _ runID: UUID,
-        _ runAttemptID: UUID?,
-        _ source: String,
-        _ steeringMessage: String?
-    ) async -> Bool
+    typealias CodexAgentRunWaitDrain = AgentSessionRuntimeHost.CodexAgentRunWaitDrain
 
     // MARK: - Published Session Proxies
 
@@ -704,7 +699,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         var test_afterClaudeAttachmentSelfCancel: (@MainActor () async -> Void)?
         var test_claudeAttachmentRestartFinished: (@MainActor () -> Void)?
-        var test_afterProviderInputAugmentation: (@MainActor () async -> Void)?
+        var test_afterProviderInputAugmentation: (@MainActor () async -> Void)? {
+            get { providerInputRuntime.test_afterProviderInputAugmentation }
+            set { providerInputRuntime.test_afterProviderInputAugmentation = newValue }
+        }
+
         var test_beforeACPToolIdleWait: (@MainActor () async throws -> Void)?
         var test_beforeScheduledACPFollowUpStart: (@MainActor () async -> Void)? {
             get { runtimeSessionStore.continuation.test_beforeScheduledACPFollowUpStart }
@@ -1208,7 +1207,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private nonisolated static let detachedTranscriptVisibleItemBuffer = 5
     private nonisolated static let detachedTranscriptEvictionChunkSize = 5
     nonisolated static let staleComposerSubmitTargetMessage = "This composer changed before the message could be sent. Please try again."
-    private nonisolated static let childAgentRunWaitDrainTimeoutSeconds: TimeInterval = 2.0
 
     #if DEBUG
         var test_afterRebindOwnershipChecks: (@MainActor () async -> Void)?
@@ -2647,38 +2645,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     #endif
 
-    private nonisolated static func defaultConnectionPolicyInstaller(
-        clientName: String,
-        windowID: Int,
-        restrictedTools: Set<String>,
-        oneShot: Bool,
-        reason: String?,
-        ttl: TimeInterval,
-        tabID: UUID?,
-        runID: UUID?,
-        additionalTools: Set<String>?,
-        purpose: MCPRunPurpose,
-        taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
-        allowsAgentExternalControlTools: Bool = false,
-        requiresExpectedAgentPID: Bool = false
-    ) async {
-        await ServerNetworkManager.shared.installClientConnectionPolicy(
-            for: clientName,
-            windowID: windowID,
-            restrictedTools: restrictedTools,
-            oneShot: oneShot,
-            reason: reason,
-            ttl: ttl,
-            tabID: tabID,
-            runID: runID,
-            additionalTools: additionalTools,
-            purpose: purpose,
-            taskLabelKind: taskLabelKind,
-            allowsAgentExternalControlTools: allowsAgentExternalControlTools,
-            requiresExpectedAgentPID: requiresExpectedAgentPID
-        )
-    }
-
     // MARK: - Initialization
 
     private weak var oracleViewModel: OracleViewModel?
@@ -2705,8 +2671,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         _ = mcpRuntime
         return runtimeHost.makeClaudeCapabilities(
             links: linkExecutionRuntime,
-            stageRecovery: { [weak self] session in
-                await self?.stageClaudeResumeRecoveryHandoffIfNeeded(for: session) ?? false
+            inputEnvironmentForSession: { [source = runtimeInputEnvironmentSource] _ in source() },
+            sessionTitle: { [weak manager = workspaceManager] session in
+                AgentSessionRestoreSupport.normalizedSessionTitle(manager?.composeTabName(with: session.tabID))
             }
         )
     }
@@ -2732,6 +2699,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     init(
         windowID: Int,
+        runtimeHost: AgentSessionRuntimeHost,
         promptManager: PromptViewModel,
         workspaceManager: WorkspaceManagerViewModel,
         mcpServer: MCPServerViewModel,
@@ -2748,6 +2716,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     ) {
         self.windowID = windowID
+        self.runtimeHost = runtimeHost
         self.promptManager = promptManager
         workspaceFileContextStore = promptManager.workspaceFileContextStore
         self.workspaceManager = workspaceManager
@@ -2764,8 +2733,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let codexWorkspacePathProvider = { [weak workspaceManager] in
             workspaceManager?.activeWorkspace?.repoPaths.first
         }
-        let (sessionWorkspacePathProvider, codexRuntimeWorkspacePathsProvider) =
-            Self.makeSessionWorkspaceProviders(fallbackWorkspacePath: codexWorkspacePathProvider)
         workspacePathProvider = codexWorkspacePathProvider
         openCodeModelParameterStreamProvider = { workspacePath, modelRaw in
             await OpenCodeACPModelPollingService.shared.subscribeModelParameters(
@@ -2779,7 +2746,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             return FileManager.default.temporaryDirectory
         }
-        connectionPolicyInstaller = Self.defaultConnectionPolicyInstaller
+        connectionPolicyInstaller = AgentSessionRuntimeHost.defaultConnectionPolicyInstaller
         mcpServerEnabler = { [weak mcpServer] in
             guard let mcpServer else { return false }
             return await mcpServer.ensureServerReadyForAgentBootstrap()
@@ -2787,43 +2754,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         providerConversationCleanupRegistry = ProviderConversationCleanupRegistry()
         shouldManageCodexTooling = true
         self.usesProductionAgentDefaultsAndModelPolling = usesProductionAgentDefaultsAndModelPolling
-        runtimeHost = AgentSessionRuntimeHost(
-            routeID: windowID,
-            tools: mcpServer.toolExecutionRuntime,
-            workspacePath: sessionWorkspacePathProvider,
-            runtimeWorkspacePaths: codexRuntimeWorkspacePathsProvider,
-            connectionPolicyInstaller: connectionPolicyInstaller,
-            modelRouterSettingsStore: modelRouterSettingsStore,
-            catalogDiagnosticsSink: catalogDiagnosticsSink,
-            perfRecorder: perfRecorder
-        )
         self.clearConsumedAttachmentsAfterProviderConsumption = clearConsumedAttachmentsAfterProviderConsumption
         workspaceSwitchProvider = AgentModeWorkspaceSwitchCleanupProvider(
             codexCoordinator: runtimeHost.codexCoordinator,
             claudeCoordinator: runtimeHost.claudeCoordinator
         )
-        codexCoordinator.setActiveAgentRunWaitDrain { [weak self] runID, runAttemptID, source, steeringMessage in
-            guard let self, let mcpServer = self.mcpServer else { return true }
-            return await mcpServer.wakeAndDrainAgentRunWaitersOwnedByActiveRun(
-                runID: runID,
-                source: source,
-                steeringMessage: steeringMessage,
-                timeoutSeconds: Self.childAgentRunWaitDrainTimeoutSeconds,
-                steeringOriginRunID: { [weak self] in
-                    guard let self,
-                          sessions.values.contains(where: {
-                              $0.runID == runID
-                                  && $0.activeRunAttemptID == runAttemptID
-                                  && $0.runState.isActive
-                          })
-                    else { return nil }
-                    return runID
-                },
-                publicationForSessionID: { [weak self] childSessionID in
-                    self?.mcpWaitPublication(sessionID: childSessionID)
-                }
-            )
-        }
         installAdministrationComposition(runtimeSessionStore.administration)
         installWorktreeComposition(runtimeSessionStore.worktrees)
         configureCodexRuntime(codexCoordinator)
@@ -2892,10 +2827,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             acpControllerFactory: @escaping ACPControllerFactory = { provider, runRequest in
                 try ACPAgentSessionController(provider: provider, runRequest: runRequest)
             },
-            connectionPolicyInstaller: @escaping ConnectionPolicyInstaller = AgentModeViewModel.defaultConnectionPolicyInstaller,
-            mcpRunRoutingCleaner: @escaping MCPRunRoutingCleaner = { runID, windowID, reason in
+            connectionPolicyInstaller: @escaping ConnectionPolicyInstaller = AgentSessionRuntimeHost.defaultConnectionPolicyInstaller,
+            mcpRunRoutingCleaner: @escaping MCPRunRoutingCleaner = { cleanup, windowID, reason in
                 await AgentSessionRuntimeHost.cleanRunRouting(
-                    runID: runID,
+                    cleanup,
                     routeID: windowID,
                     reason: reason
                 )
@@ -2905,6 +2840,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             mcpServerEnabler: @escaping MCPServerEnabler = { true },
             testMCPServer: MCPServerViewModel? = nil,
             testWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
+            testPromptManager: PromptViewModel? = nil,
             testWorkspaceManager: WorkspaceManagerViewModel? = nil,
             testCodexActiveToolQuery: CodexActiveToolQuery? = nil,
             testCodexManagedAuthRecovery: (any CodexManagedAuthRecovering)? = nil,
@@ -2932,7 +2868,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             testPerfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
         ) {
             windowID = testWindowID
-            promptManager = nil
+            promptManager = testPromptManager
             workspaceFileContextStore = testWorkspaceFileContextStore
             workspaceManager = testWorkspaceManager
             mcpServer = testMCPServer
@@ -2951,7 +2887,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             let codexWorkspacePathProvider = { testWorkspacePath }
             let (sessionWorkspacePathProvider, codexRuntimeWorkspacePathsProvider) =
-                Self.makeSessionWorkspaceProviders(fallbackWorkspacePath: codexWorkspacePathProvider)
+                AgentSessionRuntimeHost.makeSessionWorkspaceProviders(fallbackWorkspacePath: codexWorkspacePathProvider)
             workspacePathProvider = codexWorkspacePathProvider
             openCodeModelParameterStreamProvider = testOpenCodeModelParameterStreamProvider ?? { workspacePath, modelRaw in
                 await OpenCodeACPModelPollingService.shared.subscribeModelParameters(
@@ -2999,17 +2935,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     ?? { [tools = testMCPServer?.toolExecutionRuntime] runID in
                         tools?.hasActiveChildAgentRunWaits(runID: runID) ?? false
                     },
-                activeAgentRunWaitDrain: testCodexActiveAgentRunWaitDrain
-                    ?? { [weak testMCPServer] runID, _, source, steeringMessage in
-                        guard let testMCPServer else { return true }
-                        return await testMCPServer.wakeAndDrainAgentRunWaitersOwnedByActiveRun(
-                            runID: runID,
-                            source: source,
-                            steeringMessage: steeringMessage,
-                            timeoutSeconds: Self.childAgentRunWaitDrainTimeoutSeconds,
-                            publicationForSessionID: { _ in nil }
-                        )
-                    },
                 leaseRoutingTimeoutMs: testCodexLeaseRoutingTimeoutMs ?? 10000,
                 idleShutdownDelayNanos: testCodexIdleShutdownDelayNanos ?? 300_000_000_000,
                 stallWatchdogPollIntervalNanos: testCodexStallWatchdogPollIntervalNanos ?? 5_000_000_000,
@@ -3037,12 +2962,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 autoEffortConfigurationProvider: { [testModelRouterSettingsStore] in testModelRouterSettingsStore.autoEffortConfiguration() }
             )
             runtimeHost = AgentSessionRuntimeHost(
-                routeID: testWindowID, codexCoordinator: codexCoordinator, claudeCoordinator: claudeCoordinator,
+                route: testMCPServer?.routeResources ?? MCPHostRouteResources(identity: .legacyWindow(testWindowID), coordinator: nil),
+                codexCoordinator: codexCoordinator, claudeCoordinator: claudeCoordinator,
                 providerResources: .init(headless: headlessProviderFactory, acp: acpProviderFactory, controller: acpControllerFactory),
                 runRoutingCleaner: mcpRunRoutingCleaner,
                 runToolCanceller: mcpRunToolCanceller ?? { [tools = testMCPServer?.toolExecutionRuntime] runID, reason in
                     tools?.cancelActiveToolsForRun(runID: runID, reason: reason) ?? 0
-                }
+                },
+                activeAgentRunWaitDrain: testCodexActiveAgentRunWaitDrain
             )
             self.clearConsumedAttachmentsAfterProviderConsumption = clearConsumedAttachmentsAfterProviderConsumption
             workspaceSwitchProvider = AgentModeWorkspaceSwitchCleanupProvider(
@@ -3115,16 +3042,18 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             },
             input: providerInputRuntime,
             workspacePaths: { [weak self] in self?.runtimeInputWorkspacePaths() ?? [] },
-            inputWorkspace: { [weak self] in self?.runtimeInputWorkspaceSource(session: $0) },
-            initialThreadInput: { [weak self] session in
+            inputWorkspace: { [weak self] session, _ in self?.runtimeInputWorkspaceSource(session: session) },
+            initialThreadInput: { [weak self] session, _ in
                 guard let self else { return nil }
                 return captureInitialThreadInput(tabID: session.tabID, workspace: runtimeInputWorkspaceSource(session: session))
             },
             modelDisplayName: { [weak self] session in
                 self?.inputBarModelDisplayName(rawModel: session.selectedModelRaw, agentKind: session.selectedAgent) ?? session.selectedModelRaw
             },
-            start: { [weak self] session, text, options, outcome, preparation in
-                guard let self, sessions[session.tabID] === session else { return nil }
+            start: { [weak self] command, text, options, outcome, preparation in
+                let session = command.writer.session
+                guard let self, command.writer.scope === runtimeSessionStore,
+                      command.isCurrent, sessions[session.tabID] === session else { return nil }
                 return await startAgentRun(
                     tabID: session.tabID,
                     initialMessage: text,
@@ -3133,11 +3062,33 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     providerSwitchPreparation: preparation
                 )
             },
-            settleSelfCompact: { [weak self] session in self?.agentSelfCompactSettleStaleParkedNote(session) },
-            selfCompactBlocksWake: { [weak self] session in self?.agentSelfCompactBlocksNotificationWake(session) ?? true },
-            selfCompactHoldsWakeAcquisition: { [weak self] session in self?.agentSelfCompactHoldsWakeAcquisition(session) ?? true }
+            settleSelfCompact: { [weak scope = runtimeSessionStore] session in scope?.linkExecution?.agentSelfCompactSettleStaleParkedNote(session) },
+            selfCompactBlocksWake: { [weak scope = runtimeSessionStore] session in scope?.linkExecution?.agentSelfCompactBlocksNotificationWake(session) ?? true },
+            selfCompactHoldsWakeAcquisition: { [weak scope = runtimeSessionStore] session in scope?.linkExecution?.agentSelfCompactHoldsWakeAcquisition(session) ?? true }
         ), diagnostics: catalogDiagnosticsSink)
         runtime.codexCoordinator = codexCoordinator
+        runtime.activeMCPToolProbe = { [tools = runtimeHost.route.toolExecutionRuntime] runID in
+            tools.hasActiveToolExecutions(runID: runID)
+        }
+        runtimeSessionStore.worktrees.terminalContinuationLauncher = { [weak self] command, message, options, outcome in
+            guard let self, command.isCurrent, command.writer.scope === runtimeSessionStore else {
+                outcome.recordStartFailure(message: "The legacy execution host is unavailable.")
+                return
+            }
+            let session = command.writer.session
+            #if DEBUG
+                if let starter = test_selfWorktreeRelocationContinuationStarter {
+                    await starter(session, message)
+                    outcome.recordAccepted()
+                    return
+                }
+            #endif
+            _ = await startAgentRun(
+                tabID: session.tabID, initialMessage: message,
+                directStartOptions: options,
+                startOutcome: outcome
+            )
+        }
         runtime.perfRecorder = perfRecorder
         runtime.displayProps = { [weak self] endpoint in self?.monitorPillPropsByEndpoint[endpoint] }
         _ = mcpRuntime
@@ -3401,31 +3352,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
-    /// One projection contract for both initializers: session-scoped scalar
-    /// workspace path and Codex launch/execution path pair, derived from the
-    /// same fallback workspace provider.
-    private static func makeSessionWorkspaceProviders(
-        fallbackWorkspacePath: @escaping () -> String?
-    ) -> (
-        sessionWorkspacePath: (TabSession) throws -> String?,
-        codexRuntimeWorkspacePaths: (TabSession) throws -> CodexRuntimeWorkspacePaths
-    ) {
-        (
-            sessionWorkspacePath: { session in
-                try Self.effectiveWorkspacePath(
-                    for: session,
-                    fallbackWorkspacePath: fallbackWorkspacePath()
-                )
-            },
-            codexRuntimeWorkspacePaths: { session in
-                try Self.codexRuntimeWorkspacePaths(
-                    for: session,
-                    fallbackWorkspacePath: fallbackWorkspacePath()
-                )
-            }
-        )
-    }
-
     private static func codexRuntimeWorkspacePaths(
         for session: TabSession,
         fallbackWorkspacePath: String?
@@ -3581,19 +3507,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             cancelMCPToolsForRun: { [mcpRunToolCanceller] runID, reason in
                 _ = mcpRunToolCanceller(runID, reason)
             },
-            awaitNoActiveMCPTools: { [weak self, tools = mcpServer?.toolExecutionRuntime] runID in
+            awaitNoActiveMCPTools: { [weak self, tools = runtimeHost.route.toolExecutionRuntime] runID in
                 #if DEBUG
                     if let hook = self?.test_beforeACPToolIdleWait {
                         try await hook()
                         return
                     }
                 #endif
-                try await tools?.awaitNoActiveToolExecutions(runID: runID)
+                try await tools.awaitNoActiveToolExecutions(runID: runID)
             },
-            activeAgentRunWaitQuery: { [tools = mcpServer?.toolExecutionRuntime] runID in
-                tools?.hasActiveChildAgentRunWaits(runID: runID) ?? false
+            activeAgentRunWaitQuery: { [tools = runtimeHost.route.toolExecutionRuntime] runID in
+                tools.hasActiveChildAgentRunWaits(runID: runID)
             },
-            childAgentRunWaitDrainTimeoutSeconds: Self.childAgentRunWaitDrainTimeoutSeconds
+            childAgentRunWaitDrainTimeoutSeconds: AgentSessionRuntimeHost.childAgentRunWaitDrainTimeoutSeconds
         )
         _ = persistenceRuntime
         _ = attachmentRuntime
@@ -3601,83 +3527,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         _ = interactionRuntime
         return runtimeHost.makeExecution(
             dependencies: dependencies,
-            providerInput: .init(
-                buildHeadlessAgentMessage: { [input = providerInputRuntime, links = linkExecutionRuntime] session, initialMessage, _, attachments in
-                    input.buildHeadlessAgentMessage(
-                        session: session,
-                        initialMessageForRun: initialMessage,
-                        attachments: attachments,
-                        links: links
-                    )
-                },
-                augmentUserMessageForProviderSend: { [weak self] text, attachments, taggedFileAttachments, session, skipsSlashExpansion, isCurrent in
-                    guard let self else { return .init(text: text) }
-                    var failures: [AgentSessionProviderInputRuntime.ExplicitFileFailure] = []
-                    let prepared = await augmentUserMessageForProviderSend(
-                        text,
-                        attachments: attachments,
-                        taggedFileAttachments: taggedFileAttachments,
-                        agent: session?.selectedAgent,
-                        session: session,
-                        skipsSlashExpansion: skipsSlashExpansion,
-                        onTaggedFileFailures: { failures = $0 },
-                        shouldPublishCatalog: isCurrent
-                    )
-                    return .init(text: prepared, failures: failures)
-                },
-                recordTaggedFileFailures: { [weak scope = runtimeSessionStore] failures, session in
-                    guard let scope else { return }
-                    AgentSessionProviderInputRuntime.recordTaggedFileFailures(failures, session: session, scope: scope)
-                },
-                stageResumeRecoveryHandoffIfNeeded: { [weak self] session in
-                    await self?.prepareResumeRecoveryHandoff(for: session).permitsFreshSession ?? false
-                },
-                prependPendingHandoffIfNeeded: { [handoff = handoffRuntime] text, session in
-                    handoff.prependPendingHandoffIfNeeded(text, session: session)
-                },
-                recordPendingHandoffSendOutcome: { [handoff = handoffRuntime] session, didSend in
-                    handoff.recordSendOutcome(for: session, didSend: didSend)
-                },
-                claimAgentSessionLinkPrompt: { [links = linkExecutionRuntime] session, dispatchID in
-                    links.agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatchID)
-                },
-                acquireAgentSessionLinkPhysicalDispatch: { [links = linkExecutionRuntime] session, dispatchID in
-                    links.agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: dispatchID)
-                },
-                recordAgentSessionLinkPhysicalDispatchNotAttempted: { [links = linkExecutionRuntime] session, dispatchID in
-                    links.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
-                },
-                recordAgentSessionLinkPhysicalDispatchFailure: { [links = linkExecutionRuntime] session, dispatchID in
-                    links.agentSessionLinkRecordPhysicalDispatchFailure(for: session, dispatchID: dispatchID)
-                },
-                acceptAgentSessionLinkPrompt: { [links = linkExecutionRuntime] session, context, claim in
-                    links.acceptAgentSessionLinkDispatch(session: session, context: context, claim: claim)
-                },
-                proveAgentSessionLinkProviderInput: { [links = linkExecutionRuntime] session, claim in
-                    await links.agentSessionLinkProveProviderInput(for: session, claim: claim)
-                },
-                handoffAgentSessionLinkProviderInput: { [links = linkExecutionRuntime] session, dispatchID, claim, proof in
-                    links.agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatchID, claim: claim, proof: proof)
-                }
-            ),
-            onTerminalSettled: { [weak self, links = linkExecutionRuntime] session, revision, result, teardownSettled in
-                self?.agentSelfCompactTerminalSettled(
-                    session: session,
-                    revision: revision,
-                    publication: result,
-                    teardownSettled: teardownSettled
-                )
-                links.providerSwitchRunSettled(session, revision: revision, publication: result)
-                self?.providerSwitchGenerationSettled(session)
-                // Same post-publication seam: a session's own worktree switch applies only
-                // at its origin turn's settled terminal boundary.
-                self?.selfWorktreeRelocationTerminalSettled(
-                    session: session,
-                    revision: revision,
-                    publication: result,
-                    teardownSettled: teardownSettled
-                )
+            inputEnvironmentForSession: { [source = runtimeInputEnvironmentSource] _ in source() },
+            sessionTitle: { [weak manager = workspaceManager] session in
+                AgentSessionRestoreSupport.normalizedSessionTitle(manager?.composeTabName(with: session.tabID))
             },
+            providerSwitchGenerationSettled: { [weak self] session in self?.providerSwitchGenerationSettled(session) },
             prepareLaunch: { [weak self] in self?.makeFollowUpLaunch() },
             perfRecorder: perfRecorder
         )
@@ -7684,20 +7538,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return mcpRuntime.mcpReadSnapshot(for: session)
     }
 
-    func mcpWaitPublication(
-        sessionID: UUID
-    ) -> (snapshot: AgentRunMCPSnapshot, cursor: AgentRunSessionStore.WaitCursor)? {
-        guard let cursor = mcpRuntime.waitCursor(sessionID: sessionID),
-              let session = mcpRuntime.controlledWriter(sessionID: sessionID)?.session,
-              session.mcpControlContext?.registration == cursor.registration,
-              session.mcpControlContext?.currentEpoch == cursor.epoch,
-              let snapshot = mcpRuntime.mcpSnapshot(for: session)
-        else {
-            return nil
-        }
-        return (snapshot, cursor)
-    }
-
     private typealias MCPCodexHookAction = AgentSessionMCPRuntime.MCPCodexHookAction
 
     private func mcpCanonicalCodexHookResponse(from payload: MCPInteractionResponsePayload) throws -> String {
@@ -8227,24 +8067,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     && workspacePathProvider() == fallback
             })
         }
-        runtime.effects = .init(
-            drainOracle: { [weak self] session in
-                guard let self else { return false }
-                return await runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).awaitOracleBackgroundDrain(for: session)
-            },
-            cancelRun: { [weak self] session in
-                guard let self else { return }
-                AgentSessionInteractionRuntime.cancelPendingInstruction(for: session)
-                await runService.cancelRun(tabID: session.tabID, session: session, intent: .executionLocationChange, completion: .terminalPublished)
-            },
-            stageRecovery: { [weak self] command in
-                guard let self else { return .refused }
-                return await prepareResumeRecoveryHandoff(for: command.writer.session, command: command)
-            },
-            retireProvider: { [weak self] session in
-                await self?.invalidateProviderContextForExecutionLocationChange(session)
-            }
-        )
         runtime.presentation = .init(
             gateChanged: { [weak self] session in
                 self?.syncComposerUIState(tabID: session.tabID)
@@ -8610,34 +8432,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.pendingNonCodexUserInputTokenQueue.removeAll()
         session.activeNonCodexTurnTokenAccumulator = nil
         AgentModeProcessRunIdentity.clearProcessRunID(for: session)
-    }
-
-    private func invalidateProviderContextForExecutionLocationChange(_ session: TabSession) async {
-        // The runtime checked its command immediately before this call. Detach every instance
-        // and clear old-context metadata in this synchronous region, never after teardown awaits.
-        let provider = session.provider
-        session.provider = nil
-        let acp = session.acpController
-        session.acpController = nil
-        let codex: CodexAgentModeCoordinator.DetachedCodexController?
-        if session.codexController != nil || session.codexConversationID != nil || session.codexRolloutPath != nil || session.selectedAgent == .codexExec {
-            codex = codexCoordinator.detachForWorkspaceSwitchFinalizeSync(session, runIDs: session.runID.map { [$0] } ?? [])
-            codexCoordinator.clearCodexSessionState(session)
-        } else {
-            codex = nil
-        }
-        let claude = claudeCoordinator.detachForWorkspaceSwitchFinalizeSync(session)
-        session.providerSessionID = nil
-        session.providerCleanupHandle = nil
-        session.contextUsageSnapshot = nil
-        session.activeNonCodexTurnTokenAccumulator = nil
-        AgentModeProcessRunIdentity.clearProcessRunID(for: session)
-        session.isDirty = true
-        await provider?.dispose()
-        await acp?.cancelPrompt()
-        await acp?.shutdown()
-        if let codex { await codexCoordinator.retireDetachedControllerForWorkspaceSwitch(codex) }
-        if let claude { await claudeCoordinator.retireDetachedControllerForWorkspaceSwitch(claude, discardedSession: session) }
     }
 
     func updateWorktreeBindingSummariesInIndex(for session: TabSession) {
@@ -11011,8 +10805,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     else { return nil }
                     return expectedIdentity.runID
                 },
-                publicationForSessionID: { [weak self] childSessionID in
-                    self?.mcpWaitPublication(sessionID: childSessionID)
+                publicationForSessionID: { [publication = mcpRuntime] childSessionID in
+                    publication.waitPublication(sessionID: childSessionID)
                 }
             )
         }
@@ -12889,7 +12683,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) async {
         _ = boundSessionID
         guard let runID = explicitRunID ?? liveSession?.runID else { return }
-        await runtimeHost.cleanupRunRouting(runID: runID, reason: reason)
+        await runtimeHost.cleanupRunRouting(.legacyWindow(runID: runID), reason: reason)
     }
 
     func removeSessionIndex(sessionID: UUID) {
@@ -14902,20 +14696,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return nil
     }
 
-    private enum InitialNewWorktreePreparationError: LocalizedError {
-        case unavailable(String)
-        case failed(String)
-        case retainedWorktree(path: String, underlying: String)
-
-        var errorDescription: String? {
-            switch self {
-            case let .unavailable(message), let .failed(message):
-                message
-            case let .retainedWorktree(path, underlying):
-                "The new worktree was created at \(path), but could not be bound to this thread. It was not removed; use worktree management to inspect or remove it. Error: \(underlying)"
-            }
-        }
-    }
+    private typealias InitialNewWorktreePreparationError = AgentSessionWorktreeRuntime.InitialPreparationError
 
     private func prepareInitialExecutionLocation(
         _ choice: InitialStartLocation,
@@ -14926,8 +14707,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
               let workspaceManager,
               let workspace = workspaceManager.activeWorkspace,
               !workspace.isSystemWorkspace,
-              let primaryRoot = workspace.repoPaths.first,
-              let promptManager
+              workspace.repoPaths.first != nil,
+              promptManager != nil
         else {
             throw InitialNewWorktreePreparationError.unavailable(
                 "Execution location requires an active Git-backed project workspace. Select Work locally or open a Git workspace."
@@ -14942,125 +14723,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard let admission = admitWorktreeTransition(forSessionID: sessionID) else {
             throw InitialNewWorktreePreparationError.unavailable(Self.staleComposerSubmitTargetMessage)
         }
-        let primaryPath = AgentWorktreeRuntimeWorkspaceResolver.standardizedWorkspacePath((primaryRoot as NSString).expandingTildeInPath) ?? primaryRoot
-        let visibleRoots = await promptManager.workspaceFileContextStore.rootRefs(scope: .visibleWorkspace)
-        guard !Task.isCancelled, operationIsCurrent(), admission.isCurrent else {
-            throw InitialNewWorktreePreparationError.unavailable(Self.staleComposerSubmitTargetMessage)
-        }
-        guard let logicalRoot = visibleRoots.first(where: {
-            (AgentWorktreeRuntimeWorkspaceResolver.standardizedWorkspacePath($0.standardizedFullPath) ?? $0.standardizedFullPath) == primaryPath
-        }) else {
-            throw InitialNewWorktreePreparationError.unavailable(
-                "Execution location requires the primary workspace root to be loaded before starting this thread. Select Work locally or reload the workspace."
-            )
-        }
-        guard let resolvedRepo = await VCSService.shared.resolveRepo(from: URL(fileURLWithPath: primaryPath)),
-              resolvedRepo.backendKind == .git
-        else {
-            throw InitialNewWorktreePreparationError.unavailable(
-                "Execution location requires a Git-backed primary workspace root. Select Work locally or open a Git workspace."
-            )
-        }
-        guard !Task.isCancelled, operationIsCurrent(), admission.isCurrent else {
-            throw InitialNewWorktreePreparationError.unavailable(Self.staleComposerSubmitTargetMessage)
-        }
-        let repo = GitRepoDescriptor(rootURL: resolvedRepo.rootURL)
-        var createdWorktree: GitWorktreeDescriptor?
-        do {
-            let existingWorktrees = try await VCSService.shared.listGitWorktrees(at: repo.rootURL)
-            guard !Task.isCancelled,
-                  isReadyForInitialNewWorktreeCommit(session),
-                  operationIsCurrent(), admission.isCurrent
-            else {
-                throw InitialNewWorktreePreparationError.unavailable(Self.staleComposerSubmitTargetMessage)
-            }
-            let worktree: GitWorktreeDescriptor
-            let bindingSource: String
-            switch choice {
-            case .local:
-                return
-            case .newWorktree:
-                let plan = try GitWorktreeDefaultPathPlanner.planAgentStart(repoRoot: repo.rootPath, worktrees: existingWorktrees, sessionID: sessionID)
-                worktree = try await VCSService.shared.createGitWorktree(
-                    request: plan.createRequest, at: repo.rootURL,
-                    beforeCommit: { @MainActor in
-                        try admission.requireCurrent()
-                        guard self.isReadyForInitialNewWorktreeCommit(session), operationIsCurrent() else {
-                            throw InitialNewWorktreePreparationError.unavailable(Self.staleComposerSubmitTargetMessage)
-                        }
-                    }
-                )
-                createdWorktree = worktree
-                bindingSource = "agent_ui.initial_send"
-            case let .existingWorktree(selection):
-                guard let selected = existingWorktrees.first(where: {
-                    $0.repository.repositoryID == selection.repositoryID && $0.worktreeID == selection.worktreeID
-                }), !selected.isPrunable else {
-                    throw InitialNewWorktreePreparationError.failed("The selected existing worktree is no longer available. Choose another execution location.")
-                }
-                worktree = selected
-                bindingSource = "agent_ui.initial_send_existing"
-            }
-            func locationBindingFailure(_ message: String) -> InitialNewWorktreePreparationError {
-                if let createdWorktree {
-                    return .retainedWorktree(path: createdWorktree.path, underlying: message)
-                }
-                return .failed("Could not bind the selected existing worktree: \(message)")
-            }
-            guard !Task.isCancelled,
-                  isReadyForInitialNewWorktreeCommit(session),
-                  operationIsCurrent(), admission.isCurrent
-            else {
-                throw locationBindingFailure(Self.staleComposerSubmitTargetMessage)
-            }
-            let identity = try executionWorktreeVisualIdentity(worktree, session: session)
-            let binding = AgentSessionWorktreeBinding(
-                id: UUID().uuidString,
-                worktree: worktree,
-                logicalRootPath: logicalRoot.standardizedFullPath,
-                logicalRootName: logicalRoot.name,
-                visualLabel: identity.label,
-                visualColorHex: identity.colorHex,
-                source: bindingSource
-            )
-            guard !Task.isCancelled,
-                  operationIsCurrent(), admission.isCurrent,
-                  isReadyForInitialNewWorktreeCommit(session)
-            else {
-                throw locationBindingFailure(Self.staleComposerSubmitTargetMessage)
-            }
-            do {
-                _ = try await admission.command.writer.scope.worktrees.transition(
-                    [binding], admission: admission, intent: .initialSend,
-                    revalidateAuthority: {
-                        guard !Task.isCancelled, operationIsCurrent(), self.isReadyForInitialNewWorktreeCommit(session) else {
-                            throw InitialNewWorktreePreparationError.unavailable(Self.staleComposerSubmitTargetMessage)
-                        }
-                    }
-                )
-            } catch {
-                throw locationBindingFailure(
-                    (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-                )
-            }
-        } catch let error as InitialNewWorktreePreparationError {
-            throw error
-        } catch {
-            let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-            if let createdWorktree {
-                throw InitialNewWorktreePreparationError.retainedWorktree(path: createdWorktree.path, underlying: message)
-            }
-            throw InitialNewWorktreePreparationError.failed("Could not prepare the selected execution location: \(message)")
-        }
+        try await admission.command.writer.scope.worktrees.prepareInitialExecutionLocation(
+            choice, admission: admission, sessionName: resolvedSessionDisplayName(for: session.tabID),
+            operationIsCurrent: operationIsCurrent, revalidateResources: {}
+        )
     }
 
     private func isReadyForInitialNewWorktreeCommit(_ session: TabSession) -> Bool {
-        session.isPreparingInitialWorktree
-            && session.hasEmptyIdleExecutionLocation
-            && session.mcpControlContext == nil
-            && !session.isMCPOriginated
-            && session.parentSessionID == nil
-            && !session.pendingHandoff.hasPayload
+        AgentSessionWorktreeRuntime.isReadyForInitialWorktreeCommit(session)
     }
 
     private func discardFreshFirstSendDestinationIfPossible(
@@ -15691,19 +15361,22 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     // MARK: - Managed cross-session steer
 
+    private var runtimeInputEnvironmentSource: @MainActor () -> AgentSessionLinkExecutionRuntime.ManagedInputEnvironment {
+        let hadWorkspaceOwner = workspaceManager != nil
+        return { [weak manager = workspaceManager, settings = modelRouterSettingsStore, tools = runtimeHost.route.toolExecutionRuntime] in
+            let workspaceID = manager?.activeWorkspaceID
+            return .init(
+                workspaceID: workspaceID,
+                resourcesAreCurrent: { [weak manager] in
+                    if let manager { return manager.activeWorkspaceID == workspaceID }
+                    return !hadWorkspaceOwner && workspaceID == nil
+                }, settings: settings, tools: tools
+            )
+        }
+    }
+
     func managedInputEnvironment() -> AgentSessionLinkExecutionRuntime.ManagedInputEnvironment {
-        let manager = workspaceManager
-        let workspaceID = manager?.activeWorkspaceID
-        let hadWorkspaceOwner = manager != nil
-        return .init(
-            workspaceID: workspaceID,
-            resourcesAreCurrent: { [weak manager] in
-                if let manager { return manager.activeWorkspaceID == workspaceID }
-                return !hadWorkspaceOwner && workspaceID == nil
-            },
-            settings: modelRouterSettingsStore,
-            server: mcpServer
-        )
+        runtimeInputEnvironmentSource()
     }
 
     /// The provider route a managed cross-session steer would take right now, following
@@ -15943,6 +15616,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) -> UserTurnSubmissionResult {
         guard repromptedText == nil || (isLocalComposerInput && managedTurn == nil) else { return .blocked(message: "Re-prompt is local composer input only.") }
         let trimmedText = repromptedText ?? originalText
+        let canonicalHost = runtimeHost.workspaceActivation != nil ? runtimeHost : nil
+        let canonicalLocalDispatch = canonicalHost != nil
+            && isLocalComposerInput && managedTurn == nil && codexAttemptID == nil
+        if canonicalLocalDispatch {
+            guard let claim = providerSwitchClaim, claim.scope === runtimeSessionStore,
+                  claim.sourceSession === session, composerSubmitRuntime.isCurrent(claim),
+                  let command = claim.command, command.writer.session === session, command.isCurrent
+            else { return .blocked(message: Self.staleComposerSubmitTargetMessage) }
+        }
         if let message = session.operationAdmissionFailureMessage {
             return .blocked(message: message)
         }
@@ -16178,6 +15860,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             crossSessionAttribution: managedTurn?.attribution,
             dispatchedProviderText: managedTurn != nil || repromptedText != nil ? unexpandedWrappedText : nil
         )
+        let canonicalPublication: AgentSessionComposerSubmitRuntime.PublicationCleanup?
+        if canonicalLocalDispatch {
+            guard let originalHost = canonicalHost, let claim = providerSwitchClaim,
+                  let publication = originalHost.scope.submissions.captureCanonicalPublication(
+                      claim: claim, host: originalHost, item: userItem
+                  ) else { return .blocked(message: Self.staleComposerSubmitTargetMessage) }
+            canonicalPublication = publication
+        } else { canonicalPublication = nil }
         let acceptedSwitchPreparation = providerSwitchPreparation?.accepting(userItem.id, session: session)
         let turnRuntimeAnchorRollback = recordAgentTurnUserAnchor(for: session, userItem: userItem)
         session.appendItem(userItem)
@@ -16186,9 +15876,61 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         // Only the validated composer ingress supplies this positive token. Shared MCP/API
         // defaults and attachment-only synthetic bubble labels never qualify.
+        let publicationStillOwnsRow = canonicalPublication.map {
+            canonicalHost?.scope.membership(of: session)?.identity == $0.membership.identity
+                && session.sourceItemsRevision == $0.expectedSourceRevision && session.items.last == $0.item
+        } ?? true
         let localComposerCandidate = composerOrigin == .localComposer && isLocalComposerInput
-            && managedTurn == nil && codexAttemptID == nil && !trimmedText.isEmpty
+            && managedTurn == nil && codexAttemptID == nil && !trimmedText.isEmpty && publicationStillOwnsRow
             ? session.registerLocalComposerCandidate(itemID: userItem.id, at: session.items.count - 1) : nil
+        func dispatchCanonicalPreparedTurn() -> UserTurnSubmissionResult {
+            guard let claim = providerSwitchClaim, let originalHost = canonicalHost,
+                  let publication = canonicalPublication else { return .blocked(message: Self.staleComposerSubmitTargetMessage) }
+            let options = AgentDirectRunStartOptions(
+                skipsSlashExpansion: providerSkipsSlashExpansion, stopFence: stopFence,
+                localComposerCandidate: localComposerCandidate, initialUserItemID: userItem.id,
+                restorationDraftText: restorationDraftText
+            )
+            let turn = AgentSessionComposerSubmitRuntime.PreparedTurn(
+                publication: publication, message: wrappedText, attachments: attachmentsToSend,
+                taggedFiles: taggedFilesToSend, providerTaggedFiles: providerTaggedFiles,
+                userItemID: userItem.id, draftText: restorationDraftText, workflow: restorationSelectedWorkflow,
+                workflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
+                anchorRollback: turnRuntimeAnchorRollback, autoEffortSelection: autoEffortSelection,
+                options: options, providerSwitchPreparation: acceptedSwitchPreparation
+            )
+            let producer = originalHost.scope.submissions.submitCanonicalTurn(
+                turn, claim: claim, host: originalHost,
+                rejectedPresentation: { [weak self] message in
+                    guard let self, runtimeHost === originalHost, sessions[tabID] === session else { return }
+                    if currentTabID == tabID { selectedWorkflow = session.selectedWorkflow }
+                    if let repromptedText {
+                        repromptUIStore.recoveries[tabID] = .init(
+                            text: repromptedText, originalDraft: restorationDraftText, reason: message,
+                            draftAtInvalidation: originalHost.scope.drafts.text(for: tabID)
+                        )
+                    }
+                }
+            )
+            switch producer {
+            case .queued:
+                return .submitted
+            case let .refused(recovered):
+                session.settleLocalComposerOrigin(localComposerCandidate, disposition: recovered ? .rolledBack : .retained)
+                return .blocked(
+                    message: recovered ? Self.staleComposerSubmitTargetMessage
+                        : "The input was not dispatched. Its changed transcript or composer state was retained without rollback."
+                )
+            }
+        }
+        if canonicalLocalDispatch, let originalHost = canonicalHost, let claim = providerSwitchClaim,
+           !publicationStillOwnsRow || !originalHost.scope.submissions.isCurrent(claim)
+           || originalHost.workspaceActivation?.isCurrent != true || claim.command?.isCurrent != true
+        {
+            // Synchronous publication may revoke admission. Handle its original receipt before
+            // any subsequent acceptance notifications; no provider is dispatched on this path.
+            return dispatchCanonicalPreparedTurn()
+        }
         if managedTurn == nil, isLocalComposerInput,
            let endpoint = linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: tabID)
         {
@@ -16261,8 +16003,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                                 session: session
                             )
                         },
-                        publicationForSessionID: { [weak self] childSessionID in
-                            self?.mcpWaitPublication(sessionID: childSessionID)
+                        publicationForSessionID: { [publication = mcpRuntime] childSessionID in
+                            publication.waitPublication(sessionID: childSessionID)
                         }
                     )
                 }
@@ -16308,6 +16050,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return UserTurnSubmissionResult.submitted
         }
 
+        if canonicalLocalDispatch, session.selectedAgent == .codexExec { return dispatchCanonicalPreparedTurn() }
         if session.selectedAgent == .codexExec {
             let dispatchTicket = session.codexDispatchSerialGate.issueTicket()
             let producerStopFence = stopFence ?? session.composerStartCancellation?.pendingStartFence(for: session)
@@ -16563,6 +16306,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         // If agent is not running, start it
         if !session.runState.isActive {
+            if canonicalLocalDispatch { return dispatchCanonicalPreparedTurn() }
             let producerStopFence = stopFence ?? session.composerStartCancellation?.pendingStartFence(for: session)
                 ?? AgentRunStartStopFence(session: session)
             let composerStart = isLocalComposerInput && managedTurn == nil && codexAttemptID == nil
@@ -17300,11 +17044,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             onTaggedFileFailures: { taggedFileFailures = $0 }
         )
         guard shouldPublishCatalog() else { return providerText }
-        #if DEBUG
-            if effectiveAgent.acpProviderID != nil {
-                await test_afterProviderInputAugmentation?()
-            }
-        #endif
         if shouldPublishCatalog(), !Task.isCancelled { onTaggedFileFailures(taggedFileFailures) }
         return providerText
     }
@@ -17667,6 +17406,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func clearComposerDraftIfUnchanged(for claim: AgentComposerSubmitClaim) {
+        if claim.scope.executableHost?.workspaceActivation != nil {
+            claim.scope.submissions.clearSubmittedDraft(claim)
+            return
+        }
         let attempt = claim.attempt
         let session = claim.sourceSession
         guard ObjectIdentifier(session) == attempt.sourceTabSessionIdentity,

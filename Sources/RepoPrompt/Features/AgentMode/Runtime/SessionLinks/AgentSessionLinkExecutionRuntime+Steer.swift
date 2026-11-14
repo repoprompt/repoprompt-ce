@@ -19,7 +19,25 @@ extension AgentSessionLinkExecutionRuntime {
         let workspaceID: UUID?
         let resourcesAreCurrent: @MainActor () -> Bool
         let settings: GlobalSettingsStore
-        let server: MCPServerViewModel?
+        let tools: MCPToolExecutionRuntime
+        let validateResources: @MainActor (AgentSessionRuntimeStore.Command?) async -> Bool
+        let captureProviderLaunchInput: @MainActor (AgentSessionRuntimeStore.Command) async throws -> AgentProviderLaunchInput?
+
+        init(
+            workspaceID: UUID?, resourcesAreCurrent: @escaping @MainActor () -> Bool,
+            settings: GlobalSettingsStore, tools: MCPToolExecutionRuntime,
+            validateResources: (@MainActor (AgentSessionRuntimeStore.Command?) async -> Bool)? = nil,
+            captureProviderLaunchInput: @escaping @MainActor (AgentSessionRuntimeStore.Command) async throws -> AgentProviderLaunchInput? = { _ in nil }
+        ) {
+            self.workspaceID = workspaceID
+            self.resourcesAreCurrent = resourcesAreCurrent
+            self.settings = settings
+            self.tools = tools
+            // Legacy resources are synchronously borrowed. Canonical host composition supplies
+            // the real asynchronous lease check, followed by its synchronous activation fence.
+            self.validateResources = validateResources ?? { _ in resourcesAreCurrent() }
+            self.captureProviderLaunchInput = captureProviderLaunchInput
+        }
     }
 
     /// Bound on waiting for the provider-level outcome of an already-submitted managed steer. The
@@ -85,9 +103,19 @@ extension AgentSessionLinkExecutionRuntime {
             return .blocked(.endpointReadiness)
         }
 
-        // 2. Pure admission. Nothing has suspended since step 1, so the send transaction's own
-        //    admission re-reads the same state it was classified from.
-        switch agentSessionLinkSteerAdmission(for: session, liveness: admissionLiveness) {
+        // Resource IO precedes the authority commit. Keep the original writer and turn across
+        // this new suspension; the commit remains the last await before attributed-row mutation.
+        let resourceStopFence = AgentRunStartStopFence(session: session)
+        let resourceRun = session.activeRunOwnership
+        guard await environment.validateResources(command), (try? command.requireCurrent()) != nil,
+              environment.resourcesAreCurrent(), resourceStopFence.permitsStart(of: session),
+              session.activeRunOwnership == resourceRun, !Task.isCancelled
+        else { return .blocked(.endpointReadiness) }
+        let resourceLiveness = liveness()
+        guard resourceLiveness.permitsDelivery else { return .blocked(.invalidated(resourceLiveness)) }
+
+        // 2. Pure admission using the original writer after resource validation.
+        switch agentSessionLinkSteerAdmission(for: session, liveness: resourceLiveness) {
         case .idleTurn:
             return await agentSessionLinkPerformSend(
                 to: candidate,

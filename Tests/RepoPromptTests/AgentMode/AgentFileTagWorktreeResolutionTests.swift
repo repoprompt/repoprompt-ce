@@ -71,6 +71,62 @@ final class AgentFileTagWorktreeResolutionTests: XCTestCase {
     }
 
     @MainActor
+    func testRuntimeInputRechecksAdmissionAfterAsyncCanonicalCapture() async throws {
+        let fixture = try await makeBoundFixture(includeBranchOnly: false)
+        let source = AgentSessionProviderInputRuntime.WorkspaceSource(
+            store: fixture.store,
+            lookupSource: .init(activeAgentSessionID: fixture.sessionID, worktreeBindings: [fixture.binding])
+        )
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let input = scope.providerInput(
+            skillCatalog: AgentSkillCatalog(homeDirectoryURL: fixture.logicalRoot.appendingPathComponent("home")),
+            perfRecorder: NoopAgentModePerfRecorder()
+        )
+        let session = AgentTabSession(tabID: UUID())
+        for initialContext in [false, true] {
+            let gate = AgentFileTagTestAsyncGate()
+            var current = true
+            let task = Task { @MainActor in
+                if initialContext {
+                    return await input.buildInitialThreadMessageIfNeeded(
+                        session: session, initialMessage: "Inspect", input: {
+                            await gate.wait()
+                            return .init(workspace: source, selection: .init(selectedPaths: []), promptText: "Must not escape")
+                        }, isCurrent: { current }
+                    )
+                }
+                return await input.augmentUserMessage(
+                    "Inspect", attachments: [], taggedFileAttachments: [], agent: .claudeCode,
+                    workspacePaths: [fixture.logicalRoot.path], workspace: {
+                        await gate.wait()
+                        return source
+                    }, session: session, handoff: scope.handoff, ignoresPendingHandoff: true,
+                    skipsSlashExpansion: true, isCurrent: { current }
+                )
+            }
+            addTeardownBlock { task.cancel()
+                await gate.open()
+                _ = await task.value
+            }
+            try await AsyncTestWait.waitUntil("canonical input capture entered") { await gate.didEnter() }
+            current = false
+            await gate.open()
+            let result = await task.value
+            XCTAssertEqual(result, "Inspect", "Captured bytes cannot renew invalidated input admission")
+        }
+        do {
+            _ = try await input.buildInitialThreadMessageIfNeeded(
+                session: session, initialMessage: "Inspect", input: {
+                    throw AgentHostWorkspaceResources.Failure.contextUnavailable
+                }, isCurrent: { true }
+            )
+            XCTFail("Unavailable canonical input must not become a valid empty context")
+        } catch AgentHostWorkspaceResources.Failure.contextUnavailable {
+            // A genuinely empty legacy selection is still represented by a successful nil capture.
+        }
+    }
+
+    @MainActor
     func testRuntimeInputResolvesPresentationSourceAfterSkillsAndHonorsRefusal() async throws {
         let fixture = try await makeBoundFixture(includeBranchOnly: true)
         _ = await makeLookupContext(fixture: fixture)

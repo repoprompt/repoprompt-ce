@@ -65,25 +65,52 @@ struct AgentHostWorkspaceResources {
         let resources: AgentHostWorkspaceResources
         let snapshot: DomainWorkspaceSnapshot
         private let retention: WorkspaceFileContextStore.RootRetention
+        private let rootOwner: Lease?
         private(set) var isReleased = false
 
-        fileprivate init(resources: AgentHostWorkspaceResources, snapshot: DomainWorkspaceSnapshot, retention: WorkspaceFileContextStore.RootRetention) {
+        fileprivate init(resources: AgentHostWorkspaceResources, snapshot: DomainWorkspaceSnapshot, retention: WorkspaceFileContextStore.RootRetention, rootOwner: Lease? = nil) {
             self.resources = resources
             self.snapshot = snapshot
             self.retention = retention
+            self.rootOwner = rootOwner
+        }
+
+        /// Root lifetime revocation is independently readable after any actor hop. Context
+        /// document currency remains the domain authority's async check, never a local mirror.
+        var rootsAreCurrent: Bool {
+            !isReleased && retention.rootLifetimesAreCurrent && (rootOwner?.rootsAreCurrent ?? true)
         }
 
         func isCurrent() async -> Bool {
-            guard !isReleased,
+            guard rootsAreCurrent,
                   await resources.contexts?.workspaceSnapshot(snapshot.document.workspaceID) == snapshot,
                   await resources.files.isRootRetentionCurrent(retention) else { return false }
-            return !isReleased
+            return rootsAreCurrent
+        }
+
+        /// A request captures fresh canonical bytes while borrowing this activation's existing
+        /// root retention. Context edits do not allocate another root lease or update old receipts.
+        func capture(context: DomainContextIdentity) async throws -> Lease {
+            try Task.checkCancellation()
+            guard rootsAreCurrent, context.workspaceID == snapshot.document.workspaceID,
+                  let current = await resources.contexts?.workspaceSnapshot(context.workspaceID),
+                  current.health != .removed,
+                  current.contexts.contains(where: { $0.metadata.identity == context && $0.health != .removed })
+            else { throw Failure.contextUnavailable }
+            let originalPaths = Set(snapshot.document.metadata.repoPaths.map { ($0 as NSString).standardizingPath })
+            guard Set(current.document.metadata.repoPaths.map { ($0 as NSString).standardizingPath }) == originalPaths,
+                  await resources.files.isRootRetentionCurrent(retention), rootsAreCurrent
+            else { throw Failure.rootsChanged }
+            guard await resources.contexts?.workspaceSnapshot(context.workspaceID) == current else { throw Failure.contextChanged }
+            try Task.checkCancellation()
+            guard rootsAreCurrent else { throw Failure.rootsChanged }
+            return Lease(resources: resources, snapshot: current, retention: retention, rootOwner: rootOwner ?? self)
         }
 
         func release() async {
             guard !isReleased else { return }
             isReleased = true
-            await resources.files.releaseRootRetention(retention)
+            if rootOwner == nil { await resources.files.releaseRootRetention(retention) }
         }
     }
 }

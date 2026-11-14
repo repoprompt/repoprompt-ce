@@ -20,7 +20,10 @@ final class AgentSelfCompactNativeCompletionCoordinator {
     private let isCurrentOwner: @MainActor (AgentSelfCompactOwner) -> Bool
     private let dispatchNote: NoteDispatch
     private let sleep: @MainActor (Duration) async -> Void
+    typealias ProducerStarted = @MainActor (UUID, Task<Void, Never>) -> Void
+
     private let now: @MainActor () -> ContinuousClock.Instant
+    private let producerStarted: ProducerStarted
     private var deadlineTask: Task<Void, Never>?
     private var holdTask: Task<Void, Never>?
     private var noteTask: Task<Void, Never>?
@@ -36,7 +39,8 @@ final class AgentSelfCompactNativeCompletionCoordinator {
         sleep: @escaping @MainActor (Duration) async -> Void = { duration in
             try? await Task.sleep(for: duration)
         },
-        now: @escaping @MainActor () -> ContinuousClock.Instant = { ContinuousClock.now }
+        now: @escaping @MainActor () -> ContinuousClock.Instant = { ContinuousClock.now },
+        producerStarted: @escaping ProducerStarted = { _, _ in }
     ) {
         self.load = load
         self.store = store
@@ -44,6 +48,7 @@ final class AgentSelfCompactNativeCompletionCoordinator {
         self.dispatchNote = dispatchNote
         self.sleep = sleep
         self.now = now
+        self.producerStarted = producerStarted
     }
 
     @discardableResult
@@ -79,6 +84,7 @@ final class AgentSelfCompactNativeCompletionCoordinator {
             }
             store(current)
         }
+        if let deadlineTask { producerStarted(dispatchID.requestID, deadlineTask) }
         return true
     }
 
@@ -171,6 +177,7 @@ final class AgentSelfCompactNativeCompletionCoordinator {
         noteTask = Task { @MainActor [self] in
             await beginNote(requestID: attempt.id, owner: owner, teardownSettled: teardownSettled)
         }
+        if let noteTask { producerStarted(attempt.id, noteTask) }
     }
 
     /// A writer can bind after the note pipeline starts but before its physical send. Release the
@@ -290,6 +297,7 @@ final class AgentSelfCompactNativeCompletionCoordinator {
             guard !Task.isCancelled else { return }
             parkACPUnverified(requestID)
         }
+        if let holdTask { producerStarted(requestID, holdTask) }
     }
 
     private func beginVerifiedACPNote(
@@ -317,6 +325,7 @@ final class AgentSelfCompactNativeCompletionCoordinator {
         noteTask = Task { @MainActor [self] in
             await beginNote(requestID: requestID, owner: owner, teardownSettled: teardownSettled)
         }
+        if let noteTask { producerStarted(requestID, noteTask) }
     }
 
     private func parkACPUnverified(_ requestID: UUID) {

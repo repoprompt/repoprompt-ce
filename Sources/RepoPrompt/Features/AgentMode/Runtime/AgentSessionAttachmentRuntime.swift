@@ -18,6 +18,9 @@ struct AgentSessionAttachmentLocation: Equatable {
 struct AgentSessionAttachmentPlacement {
     let location: AgentSessionAttachmentLocation
     let binding: AgentPersistentSessionBindingIdentity?
+    /// The storage owner selected at reservation, not a replacement configuration at completion.
+    let validateLocation: @MainActor (AgentTabSession) async -> Bool
+    let requiresCurrentLocationBeforeIO: Bool
 }
 
 /// Owns provider consumption, retention and canonical-path repair independently of presentation.
@@ -27,7 +30,10 @@ struct AgentSessionAttachmentPlacement {
 final class AgentSessionAttachmentRuntime {
     struct Configuration {
         let location: (AgentTabSession) -> AgentSessionAttachmentLocation?
-        let locationIsCurrent: (AgentSessionAttachmentLocation, AgentTabSession) -> Bool
+        let locationIsCurrent: (AgentSessionAttachmentLocation, AgentTabSession) async -> Bool
+        /// Legacy reservations already own their move destination, even after presentation
+        /// changes. Canonical storage additionally requires a fresh authority read before IO.
+        var requiresCurrentLocationBeforeIO = false
 
         static func canonical(
             location: @escaping (AgentTabSession) -> AgentSessionAttachmentLocation?
@@ -47,6 +53,7 @@ final class AgentSessionAttachmentRuntime {
     private struct Retention {
         let task: Task<Void, Never>
         let sessionID: UUID
+        let sessionIdentity: ObjectIdentifier
         let attachments: [AgentFileAttachment]
     }
 
@@ -98,7 +105,7 @@ final class AgentSessionAttachmentRuntime {
         let binding = placement.binding ?? session.persistentSessionBindingIdentity
         guard let sessionID = binding?.sessionID,
               let root = location.retainedRoot,
-              scope.sessions[session.tabID] === session
+              let membership = scope.membership(of: session)
         else {
             clearTemporaryFiles(attachments, workspaceDirectory: location.workspaceDirectory)
             return
@@ -107,21 +114,31 @@ final class AgentSessionAttachmentRuntime {
         let restoration = session.currentRestorationBindingToken
         let token = UUID()
         let task = Task { @MainActor [self, scope, session] in
-            defer { retentionTasks[token] = nil }
+            defer {
+                retentionTasks[token] = nil
+                scope.noteSettlementChanged()
+            }
+            if placement.requiresCurrentLocationBeforeIO {
+                guard await placement.validateLocation(session) else { return }
+            }
+            guard membership.isCurrent,
+                  session.persistentSessionBindingIdentity == binding,
+                  session.currentRestorationBindingToken == restoration
+            else { return }
             let result = await AgentSessionDataService.shared.retainConsumedAttachments(
                 attachments, sessionID: sessionID, store: store, workspaceDirectory: location.workspaceDirectory
             )
             let movedPaths = attachments.filter { result.retained[$0.id] != nil }
                 .compactMap(AgentImageAttachmentAvailabilityResolver.path(for:))
             invalidatePreviews?(movedPaths + result.evictedPaths)
-            guard scope.sessions[session.tabID] === session,
+            guard await placement.validateLocation(session),
+                  membership.isCurrent,
                   session.persistentSessionBindingIdentity == binding,
-                  session.currentRestorationBindingToken == restoration,
-                  configuration?.locationIsCurrent(location, session) == true
+                  session.currentRestorationBindingToken == restoration
             else { return }
             applyRetainedAttachments(result.retained, to: session, sessionID: sessionID)
         }
-        retentionTasks[token] = Retention(task: task, sessionID: sessionID, attachments: attachments)
+        retentionTasks[token] = Retention(task: task, sessionID: sessionID, sessionIdentity: ObjectIdentifier(session), attachments: attachments)
     }
 
     private func clearTemporaryFiles(_ attachments: [AgentFileAttachment], workspaceDirectory: URL) {
@@ -131,9 +148,9 @@ final class AgentSessionAttachmentRuntime {
 
     func repairRetainedAttachmentPathsAfterHydration(_ session: AgentTabSession, sessionID: UUID) {
         guard clearsConsumedFiles, let scope,
-              scope.sessions[session.tabID] === session,
+              let membership = scope.membership(of: session),
               session.activeAgentSessionID == sessionID,
-              let location = configuration?.location(session), let root = location.retainedRoot
+              let configuration, let location = configuration.location(session), let root = location.retainedRoot
         else { return }
         let attachments = session.items.filter { $0.kind == .user }.flatMap(\.attachments)
             + session.transcript.turns.compactMap(\.request).flatMap(\.attachments)
@@ -143,18 +160,28 @@ final class AgentSessionAttachmentRuntime {
         let restoration = session.currentRestorationBindingToken
         let token = UUID()
         let task = Task { @MainActor [self, scope, session] in
-            defer { retentionTasks[token] = nil }
+            defer {
+                retentionTasks[token] = nil
+                scope.noteSettlementChanged()
+            }
+            if configuration.requiresCurrentLocationBeforeIO {
+                guard await configuration.locationIsCurrent(location, session) else { return }
+            }
+            guard membership.isCurrent,
+                  session.persistentSessionBindingIdentity == binding,
+                  session.currentRestorationBindingToken == restoration
+            else { return }
             let repaired = await Task.detached(priority: .utility) {
                 store.repairMissingPaths(attachments, sessionID: sessionID)
             }.value
-            guard scope.sessions[session.tabID] === session,
+            guard await configuration.locationIsCurrent(location, session),
+                  membership.isCurrent,
                   session.persistentSessionBindingIdentity == binding,
-                  session.currentRestorationBindingToken == restoration,
-                  configuration?.locationIsCurrent(location, session) == true
+                  session.currentRestorationBindingToken == restoration
             else { return }
             applyRetainedAttachments(repaired, to: session, sessionID: sessionID)
         }
-        retentionTasks[token] = Retention(task: task, sessionID: sessionID, attachments: attachments)
+        retentionTasks[token] = Retention(task: task, sessionID: sessionID, sessionIdentity: ObjectIdentifier(session), attachments: attachments)
     }
 
     var hasPendingRetention: Bool {
@@ -162,14 +189,20 @@ final class AgentSessionAttachmentRuntime {
     }
 
     func hasPendingRetention(for session: AgentTabSession) -> Bool {
-        guard let sessionID = session.activeAgentSessionID else { return false }
-        return retentionTasks.values.contains { $0.sessionID == sessionID }
+        retentionTasks.values.contains { $0.sessionIdentity == ObjectIdentifier(session) }
     }
 
-    /// Cancellation of a waiter is not completion of the admitted disk operation.
-    func waitForRetention() async {
-        while let operation = retentionTasks.values.first {
-            await operation.task.value
+    /// Joins admitted moves and hydration path repairs, including their in-memory publication.
+    /// Cancellation of a waiter is not completion of the admitted disk operation. A completed
+    /// join is not durability: repaired paths remain dirty until a subsequent acknowledged save.
+    func waitForRetention(for session: AgentTabSession? = nil) async {
+        let identity = session.map(ObjectIdentifier.init)
+        while true {
+            let pending = retentionTasks.values.filter { identity == nil || $0.sessionIdentity == identity }
+            guard !pending.isEmpty else { return }
+            for operation in pending {
+                await operation.task.value
+            }
         }
     }
 
@@ -236,8 +269,14 @@ final class AgentSessionAttachmentRuntime {
         }
         let reservationID = UUID()
         session.attachmentTurnState = .reserved(reservationID: reservationID, attachments: attachments)
-        session.attachmentRetentionPlacement = configuration?.location(session).map {
-            AgentSessionAttachmentPlacement(location: $0, binding: session.persistentSessionBindingIdentity)
+        session.attachmentRetentionPlacement = configuration.flatMap { configuration in
+            configuration.location(session).map { location in
+                AgentSessionAttachmentPlacement(
+                    location: location, binding: session.persistentSessionBindingIdentity,
+                    validateLocation: { await configuration.locationIsCurrent(location, $0) },
+                    requiresCurrentLocationBeforeIO: configuration.requiresCurrentLocationBeforeIO
+                )
+            }
         }
         return reservationID
     }

@@ -711,11 +711,13 @@ final class ClaudeAgentModeCoordinator {
 
     private func intentIsCurrent(
         _ intent: NativeSessionIntent,
-        for session: AgentTabSession
+        for session: AgentTabSession,
+        providerLaunchInput: AgentProviderLaunchInput? = nil
     ) -> Bool {
         hostCapabilities.isSessionCurrent(session)
             && session.operationAdmissionFailureMessage == nil
             && intent.isCurrent(for: session)
+            && providerLaunchInput?.isCurrent(for: session) != false
     }
 
     func runAttemptIsCurrent(
@@ -732,13 +734,14 @@ final class ClaudeAgentModeCoordinator {
     func ensureClaudeNativeSession(
         session: AgentTabSession,
         intent: NativeSessionIntent,
+        providerLaunchInput: AgentProviderLaunchInput? = nil,
         routingLease: MCPBootstrapLease? = nil
     ) async -> EnsureSessionOutcome {
         if let message = session.operationAdmissionFailureMessage {
             return intent.allowsFreshStartRecovery ? .superseded : .failed(message: message)
         }
         guard session.selectedAgent.usesClaudeNativeRuntime,
-              intentIsCurrent(intent, for: session)
+              intentIsCurrent(intent, for: session, providerLaunchInput: providerLaunchInput)
         else {
             return .superseded
         }
@@ -749,7 +752,7 @@ final class ClaudeAgentModeCoordinator {
         case .reconnect:
             guard !hasPendingResumeTransfer(for: session) else { return .superseded }
         }
-        guard intentIsCurrent(intent, for: session) else { return .superseded }
+        guard intentIsCurrent(intent, for: session, providerLaunchInput: providerLaunchInput) else { return .superseded }
 
         let runID = intent.runID
         let launchModelRaw = session.selectedModelRaw
@@ -777,7 +780,7 @@ final class ClaudeAgentModeCoordinator {
            runtimeVariantChanged || permissionModeChanged || bashToolChanged || mcpStrictModeChanged
         {
             let hasTurnInFlight = await existingController.hasTurnInFlight
-            guard intentIsCurrent(intent, for: session),
+            guard intentIsCurrent(intent, for: session, providerLaunchInput: providerLaunchInput),
                   sessionOwnsClaudeController(existingController, for: session)
             else {
                 return .superseded
@@ -791,14 +794,18 @@ final class ClaudeAgentModeCoordinator {
                 existingController: existingController,
                 runtimeVariantChanged: runtimeVariantChanged
             )
-            guard intentIsCurrent(intent, for: session) else { return .superseded }
+            guard intentIsCurrent(intent, for: session, providerLaunchInput: providerLaunchInput) else { return .superseded }
         }
 
         let runtimeWorkspacePath: String?
         do {
-            runtimeWorkspacePath = try workspacePathProvider(session)
+            if let providerLaunchInput {
+                runtimeWorkspacePath = try providerLaunchInput.claudeWorkspacePath(for: session)
+            } else {
+                runtimeWorkspacePath = try workspacePathProvider(session)
+            }
         } catch {
-            guard intentIsCurrent(intent, for: session) else { return .superseded }
+            guard intentIsCurrent(intent, for: session, providerLaunchInput: providerLaunchInput) else { return .superseded }
             return .failed(message: AgentRunExecutionContracts.providerStartupFailureMessage(for: error))
         }
 
@@ -817,11 +824,11 @@ final class ClaudeAgentModeCoordinator {
                 for: session,
                 captureProviderSessionID: intent.allowsFreshStartRecovery
             )
-            guard intentIsCurrent(intent, for: session) else { return .superseded }
+            guard intentIsCurrent(intent, for: session, providerLaunchInput: providerLaunchInput) else { return .superseded }
         }
 
         if session.claudeController == nil {
-            guard intentIsCurrent(intent, for: session) else { return .superseded }
+            guard intentIsCurrent(intent, for: session, providerLaunchInput: providerLaunchInput) else { return .superseded }
             let launchSettings = ControllerLaunchSettings(
                 runtimeVariant: runtimeVariant,
                 workspacePath: runtimeWorkspacePath,
@@ -839,7 +846,7 @@ final class ClaudeAgentModeCoordinator {
             session.claudeController = createdController
             controllerLaunchSettingsByTabID[session.tabID] = launchSettings
             await reconcileEventListener(for: session, controller: createdController)
-            guard intentIsCurrent(intent, for: session),
+            guard intentIsCurrent(intent, for: session, providerLaunchInput: providerLaunchInput),
                   sessionOwnsClaudeController(createdController, for: session)
             else {
                 if !sessionOwnsClaudeController(createdController, for: session) {
@@ -861,27 +868,33 @@ final class ClaudeAgentModeCoordinator {
                 effectivePermissionMode: effectivePermissionMode,
                 effectiveAllowNativeBashTool: effectiveAllowNativeBashTool,
                 effectiveMCPStrictMode: effectiveMCPStrictMode,
+                providerLaunchInput: providerLaunchInput,
                 routingLease: routingLease
             )
-            guard intentIsCurrent(intent, for: session) else { return .superseded }
+            guard intentIsCurrent(intent, for: session, providerLaunchInput: providerLaunchInput) else { return .superseded }
             updateProviderSessionIDIfNeeded(sessionRef.sessionID, for: session)
             return .ready
         } catch ControllerLifecycleError.superseded {
             return .superseded
         } catch {
-            guard intentIsCurrent(intent, for: session) else { return .superseded }
+            guard intentIsCurrent(intent, for: session, providerLaunchInput: providerLaunchInput) else { return .superseded }
             return .failed(message: "Claude native start failed: \(error.localizedDescription)")
         }
     }
 
     private func hasEffectiveClaudeControllerLaunchSettingsMismatch(
-        for session: AgentTabSession
+        for session: AgentTabSession,
+        providerLaunchInput: AgentProviderLaunchInput? = nil
     ) -> Bool {
         guard session.claudeController != nil else { return false }
         let runtimeVariant = session.selectedAgent.claudeRuntimeVariant ?? .standard
         let runtimeWorkspacePath: String?
         do {
-            runtimeWorkspacePath = try workspacePathProvider(session)
+            if let providerLaunchInput {
+                runtimeWorkspacePath = try providerLaunchInput.claudeWorkspacePath(for: session)
+            } else {
+                runtimeWorkspacePath = try workspacePathProvider(session)
+            }
         } catch {
             return true
         }
@@ -1096,6 +1109,7 @@ final class ClaudeAgentModeCoordinator {
         effectivePermissionMode: String,
         effectiveAllowNativeBashTool: Bool?,
         effectiveMCPStrictMode: Bool?,
+        providerLaunchInput: AgentProviderLaunchInput?,
         routingLease: MCPBootstrapLease?
     ) async throws -> NativeAgentRuntimeSessionRef {
         let isPeriodic = session.oversight.pendingAutoWake?.isPeriodic == true
@@ -1103,7 +1117,7 @@ final class ClaudeAgentModeCoordinator {
         let systemPromptOverride = agentModeSystemPromptOverride(for: session)
         let effortLevel = currentClaudeEffortLevel(for: session)
         guard await retainRoutingCleanup(from: routingLease, on: controller, for: session),
-              intentIsCurrent(intent, for: session),
+              intentIsCurrent(intent, for: session, providerLaunchInput: providerLaunchInput),
               sessionOwnsClaudeController(controller, for: session)
         else { throw ControllerLifecycleError.superseded }
         do {
@@ -1113,7 +1127,7 @@ final class ClaudeAgentModeCoordinator {
                 effortLevel: effortLevel,
                 systemPromptOverride: systemPromptOverride
             )
-            guard intentIsCurrent(intent, for: session),
+            guard intentIsCurrent(intent, for: session, providerLaunchInput: providerLaunchInput),
                   sessionOwnsClaudeController(controller, for: session)
             else {
                 if !sessionOwnsClaudeController(controller, for: session) {
@@ -1125,7 +1139,7 @@ final class ClaudeAgentModeCoordinator {
         } catch ControllerLifecycleError.superseded {
             throw ControllerLifecycleError.superseded
         } catch {
-            guard intentIsCurrent(intent, for: session),
+            guard intentIsCurrent(intent, for: session, providerLaunchInput: providerLaunchInput),
                   sessionOwnsClaudeController(controller, for: session)
             else {
                 if !sessionOwnsClaudeController(controller, for: session) {
@@ -1148,7 +1162,7 @@ final class ClaudeAgentModeCoordinator {
             guard await hostCapabilities.stageClaudeResumeRecoveryHandoff(session) else {
                 throw ControllerLifecycleError.superseded
             }
-            guard intentIsCurrent(intent, for: session),
+            guard intentIsCurrent(intent, for: session, providerLaunchInput: providerLaunchInput),
                   let detached = detachClaudeController(
                       controller,
                       from: session,
@@ -1167,27 +1181,31 @@ final class ClaudeAgentModeCoordinator {
             await detached.controller.shutdown()
             await stopToolTracking(detached, for: session)
             guard controllerRetirementGenerationByTabID[session.tabID] == retirementGeneration,
-                  intentIsCurrent(intent, for: session)
+                  intentIsCurrent(intent, for: session, providerLaunchInput: providerLaunchInput)
             else {
                 throw ControllerLifecycleError.superseded
             }
             if let routingLease, await routingLease.originatingRoutingCleanupReceipts() != nil {
                 guard controllerRetirementGenerationByTabID[session.tabID] == retirementGeneration,
-                      intentIsCurrent(intent, for: session),
+                      intentIsCurrent(intent, for: session, providerLaunchInput: providerLaunchInput),
                       await routingLease.reinstallPolicyForReplacementProcess(),
                       controllerRetirementGenerationByTabID[session.tabID] == retirementGeneration,
-                      intentIsCurrent(intent, for: session)
+                      intentIsCurrent(intent, for: session, providerLaunchInput: providerLaunchInput)
                 else { throw ControllerLifecycleError.superseded }
             }
 
             guard controllerRetirementGenerationByTabID[session.tabID] == retirementGeneration,
-                  intentIsCurrent(intent, for: session)
+                  intentIsCurrent(intent, for: session, providerLaunchInput: providerLaunchInput)
             else { throw ControllerLifecycleError.superseded }
 
             // A resume fallback is still the same canonical run attempt. Reuse
             // its process identity and retain the previous provider identity
             // until the fresh controller has actually started successfully.
-            let retryWorkspacePath = try workspacePathProvider(session)
+            let retryWorkspacePath: String? = if let providerLaunchInput {
+                try providerLaunchInput.claudeWorkspacePath(for: session)
+            } else {
+                try workspacePathProvider(session)
+            }
             let launchSettings = ControllerLaunchSettings(
                 runtimeVariant: runtimeVariant,
                 workspacePath: retryWorkspacePath,
@@ -1205,11 +1223,11 @@ final class ClaudeAgentModeCoordinator {
             session.claudeController = freshController
             controllerLaunchSettingsByTabID[session.tabID] = launchSettings
             await reconcileEventListener(for: session, controller: freshController)
-            guard intentIsCurrent(intent, for: session),
+            guard intentIsCurrent(intent, for: session, providerLaunchInput: providerLaunchInput),
                   sessionOwnsClaudeController(freshController, for: session)
             else { throw ControllerLifecycleError.superseded }
             guard await retainRoutingCleanup(from: routingLease, on: freshController, for: session),
-                  intentIsCurrent(intent, for: session),
+                  intentIsCurrent(intent, for: session, providerLaunchInput: providerLaunchInput),
                   sessionOwnsClaudeController(freshController, for: session)
             else { throw ControllerLifecycleError.superseded }
             let sessionRef = try await freshController.startOrResume(
@@ -1218,7 +1236,7 @@ final class ClaudeAgentModeCoordinator {
                 effortLevel: effortLevel,
                 systemPromptOverride: systemPromptOverride
             )
-            guard intentIsCurrent(intent, for: session),
+            guard intentIsCurrent(intent, for: session, providerLaunchInput: providerLaunchInput),
                   sessionOwnsClaudeController(freshController, for: session)
             else {
                 if !sessionOwnsClaudeController(freshController, for: session) {
@@ -1397,9 +1415,14 @@ final class ClaudeAgentModeCoordinator {
         selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
         reinstallRunRoutingPolicy: (@MainActor () async -> Bool)? = nil,
         inputAttemptChanged: (@MainActor (Bool) -> Void)? = nil,
+        providerLaunchInput: AgentProviderLaunchInput? = nil,
         routingLease: MCPBootstrapLease? = nil,
-        inputResourcesAreCurrent: @escaping @MainActor () -> Bool = { true }
+        inputResourcesAreCurrent callerResourcesAreCurrent: @escaping @MainActor () -> Bool = { true },
+        validateInputResources: (@MainActor () async -> Bool)? = nil
     ) async -> NativeSendOutcome {
+        let inputResourcesAreCurrent = {
+            callerResourcesAreCurrent() && providerLaunchInput?.isCurrent(for: session) != false
+        }
         guard inputResourcesAreCurrent() else { return .failed(message: "The input resource generation changed before Claude dispatch.") }
         guard intentIsCurrent(intent, for: session) else { return .superseded }
         let isSelfNote = selfCompactDispatchID?.stage == .note
@@ -1545,12 +1568,12 @@ final class ClaudeAgentModeCoordinator {
                 guard let selfCompactDispatchID,
                       session.selfCompactNoteDispatchIsCurrent(selfCompactDispatchID),
                       session.claudeController != nil,
-                      !hasEffectiveClaudeControllerLaunchSettingsMismatch(for: session),
+                      !hasEffectiveClaudeControllerLaunchSettingsMismatch(for: session, providerLaunchInput: providerLaunchInput),
                       session.providerSessionID == session.selfCompactState.active?.compactProviderConversation,
                       session.selfCompactState.active?.owner?.matchesLocalBinding(session) == true
                 else { return .superseded }
             }
-            switch isSelfNote ? .ready : await ensureClaudeNativeSession(session: session, intent: intent, routingLease: routingLease) {
+            switch isSelfNote ? .ready : await ensureClaudeNativeSession(session: session, intent: intent, providerLaunchInput: providerLaunchInput, routingLease: routingLease) {
             case .ready:
                 break
             case let .failed(message):
@@ -1581,7 +1604,7 @@ final class ClaudeAgentModeCoordinator {
                 return refusal
             }
 
-            if hasEffectiveClaudeControllerLaunchSettingsMismatch(for: session) {
+            if hasEffectiveClaudeControllerLaunchSettingsMismatch(for: session, providerLaunchInput: providerLaunchInput) {
                 if let refusal = await prepareClearTurn(controller) { return refusal }
                 guard await recycleAndRefreshTracking(controller) else { return .superseded }
                 continue
@@ -1680,7 +1703,7 @@ final class ClaudeAgentModeCoordinator {
 
             // Validate launch settings before ordinary-turn configuration application below.
             // Application can suspend, so the complete snapshot is fenced again before dispatch.
-            if hasEffectiveClaudeControllerLaunchSettingsMismatch(for: session) {
+            if hasEffectiveClaudeControllerLaunchSettingsMismatch(for: session, providerLaunchInput: providerLaunchInput) {
                 guard await recycleAndRefreshTracking(controller) else { return .superseded }
                 continue
             }
@@ -1829,7 +1852,7 @@ final class ClaudeAgentModeCoordinator {
                         intent: intent
                     )
                 }
-                if hasEffectiveClaudeControllerLaunchSettingsMismatch(for: session) {
+                if hasEffectiveClaudeControllerLaunchSettingsMismatch(for: session, providerLaunchInput: providerLaunchInput) {
                     continue
                 }
                 if routeReadiness == .notRequired,
@@ -1983,6 +2006,18 @@ final class ClaudeAgentModeCoordinator {
                     hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
                     return .superseded
                 }
+                guard await providerLaunchInput?.validate(for: session) ?? true,
+                      inputResourcesAreCurrent(), !Task.isCancelled, intentIsCurrent(intent, for: session),
+                      sessionOwnsClaudeController(controller, for: session), configurationIsCurrent(),
+                      !requiresFinalRouteFence || hostCapabilities.hasCurrentAgentSessionLinkProviderInputRoute(session, routeReadiness),
+                      await validateInputResources?() ?? true,
+                      inputResourcesAreCurrent(), !Task.isCancelled, intentIsCurrent(intent, for: session),
+                      sessionOwnsClaudeController(controller, for: session), configurationIsCurrent(),
+                      !requiresFinalRouteFence || hostCapabilities.hasCurrentAgentSessionLinkProviderInputRoute(session, routeReadiness)
+                else {
+                    hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
+                    return .superseded
+                }
                 let inputProof = await hostCapabilities.proveLocalInput(session, monitoring.claim)
                 guard inputResourcesAreCurrent() else {
                     hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
@@ -2004,7 +2039,7 @@ final class ClaudeAgentModeCoordinator {
                 let instructions = agentModeInstructionInjection(for: session)
                 guard let configurationProof,
                       configurationIsCurrent(),
-                      !hasEffectiveClaudeControllerLaunchSettingsMismatch(for: session),
+                      !hasEffectiveClaudeControllerLaunchSettingsMismatch(for: session, providerLaunchInput: providerLaunchInput),
                       !requiresFinalRouteFence || hostCapabilities.hasCurrentAgentSessionLinkProviderInputRoute(session, routeReadiness)
                 else {
                     hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)

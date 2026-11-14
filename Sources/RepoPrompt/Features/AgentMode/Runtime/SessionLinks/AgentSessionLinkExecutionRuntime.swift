@@ -24,10 +24,12 @@ final class AgentSessionLinkExecutionRuntime {
         let workspaceID: @MainActor (AgentTabSession) -> UUID?
         let input: AgentSessionProviderInputRuntime
         let workspacePaths: @MainActor () -> [String]
-        let inputWorkspace: @MainActor (AgentTabSession) -> AgentSessionProviderInputRuntime.WorkspaceSource?
-        let initialThreadInput: @MainActor (AgentTabSession) -> AgentSessionProviderInputRuntime.InitialThreadInput?
+        /// Nil command is reserved for the existing unbound local-draft recovery path.
+        /// Canonical hosts require the supplied command and never elect a replacement writer.
+        let inputWorkspace: @MainActor (AgentTabSession, AgentSessionRuntimeStore.Command?) async throws -> AgentSessionProviderInputRuntime.WorkspaceSource?
+        let initialThreadInput: @MainActor (AgentTabSession, AgentSessionRuntimeStore.Command?) async throws -> AgentSessionProviderInputRuntime.InitialThreadInput?
         let modelDisplayName: @MainActor (AgentTabSession) -> String
-        let start: @MainActor (AgentTabSession, String, AgentDirectRunStartOptions, AgentRunStartOutcomeRecorder?, AgentProviderSwitchSendPreparation?) async -> CodexAgentModeCoordinator.NativeSendOutcome?
+        let start: @MainActor (AgentSessionRuntimeStore.Command, String, AgentDirectRunStartOptions, AgentRunStartOutcomeRecorder?, AgentProviderSwitchSendPreparation?) async -> CodexAgentModeCoordinator.NativeSendOutcome?
         let settleSelfCompact: @MainActor (AgentTabSession) -> Void
         let selfCompactBlocksWake: @MainActor (AgentTabSession) -> Bool
         let selfCompactHoldsWakeAcquisition: @MainActor (AgentTabSession) -> Bool
@@ -39,6 +41,14 @@ final class AgentSessionLinkExecutionRuntime {
         let task: Task<Void, Never>
     }
 
+    /// Effect inventory only: request supersession closes dispatch admission, not originating IO.
+    struct SelfCompactEffect {
+        let session: AgentTabSession
+        let requestID: UUID
+        let task: Task<Void, Never>
+    }
+
+    var pendingSelfCompactEffects: [UUID: SelfCompactEffect] = [:]
     var pendingSendEffects: [UUID: PendingSendEffect] = [:]
     /// Provider producers join separately from terminal-save effects to avoid a terminal cycle.
     var pendingManagedInputEffects: [UUID: PendingSendEffect] = [:]
@@ -48,6 +58,8 @@ final class AgentSessionLinkExecutionRuntime {
     let catalogDiagnosticsSink: any AgentSessionLinkCatalogEventSink
     var perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     weak var codexCoordinator: CodexAgentModeCoordinator?
+    /// Required host-owned drain probe. Absence blocks terminal dispatch.
+    var activeMCPToolProbe: (@MainActor (UUID) -> Bool)?
     /// Display labels are optional and never participate in authority or receipt qualification.
     var displayProps: (@MainActor (DomainAgentSessionLinkEndpointIdentity) -> AgentMonitorPillProps?)?
 
@@ -134,21 +146,19 @@ final class AgentSessionLinkExecutionRuntime {
         scheduleSave(for: session)
     }
 
-    func agentSelfCompactSettleStaleParkedNote(_ session: AgentTabSession) {
-        commands.settleSelfCompact(session)
-    }
-
-    func agentSelfCompactBlocksNotificationWake(_ session: AgentTabSession) -> Bool {
-        commands.selfCompactBlocksWake(session)
-    }
-
     func agentSessionLinkClearWaitingOnAfterAcceptedTurn(_ session: AgentTabSession) {
         session.clearAgentSessionLinkWaitingOnAfterAcceptedTurn()
     }
 
-    func startAgentRun(tabID: UUID, initialMessage: String, directStartOptions: AgentDirectRunStartOptions, startOutcome: AgentRunStartOutcomeRecorder? = nil, providerSwitchPreparation: AgentProviderSwitchSendPreparation?) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
-        guard let session = sessions[tabID] else { return nil }
-        return await commands.start(session, initialMessage, directStartOptions, startOutcome, providerSwitchPreparation)
+    func startAgentRun(command: AgentSessionRuntimeStore.Command, initialMessage: String, directStartOptions: AgentDirectRunStartOptions, startOutcome: AgentRunStartOutcomeRecorder? = nil, providerSwitchPreparation: AgentProviderSwitchSendPreparation?) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
+        precondition(command.writer.scope === scope, "Startup must use its originating link executor")
+        do { try command.requireCurrent() }
+        catch {
+            let message = AgentRunExecutionContracts.providerStartupFailureMessage(for: error)
+            startOutcome?.recordStartFailure(message: message)
+            return .failed(message: message)
+        }
+        return await commands.start(command, initialMessage, directStartOptions, startOutcome, providerSwitchPreparation)
     }
 
     func claimEmptyComposer(for candidate: AgentSessionLinkEndpointCandidate, session: TabSession) -> AgentComposerSubmitClaim? {

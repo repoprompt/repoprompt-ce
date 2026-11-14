@@ -474,11 +474,22 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             if request["subtype"] as? String == "apply_flag_settings" { controls.append(Data()) }
             return [:]
         }, write: { writes.append($0) })
-        let (coordinator, session, intent) = try ordinaryTurnFixture(controller: controller)
+        var legacyPathReads = 0
+        let (coordinator, session, intent) = try ordinaryTurnFixture(controller: controller, workspacePath: { _ in
+            legacyPathReads += 1
+            return "/not-the-originating-request"
+        })
+        guard let sessionID = session.activeAgentSessionID,
+              case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: sessionID)
+        else { return XCTFail("Missing original restored writer") }
+        let launchInput = try AgentProviderLaunchInput(
+            origin: writer.scope.admit(session: session), workspace: .init(fallbackWorkspacePath: nil),
+            bindings: [], resourcesAreCurrent: { true }
+        )
         let send = Task {
             await coordinator.test_sendClaudeNativeMessage(
                 session: session, text: "first ordinary turn", attachments: [], intent: intent,
-                allowsCatalogRouteControllerRecovery: false
+                allowsCatalogRouteControllerRecovery: false, providerLaunchInput: launchInput
             )
         }
         defer { send.cancel()
@@ -493,6 +504,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         XCTAssertEqual(outcome, .sent, "The first turn must deliver without retry after initialization")
         XCTAssertEqual(writes.count, 1)
         XCTAssertEqual(controls.count, 1, "Reuse launch-time application; do not add a live-update round trip")
+        XCTAssertEqual(legacyPathReads, 0, "Canonical nil launch paths and synchronous mismatch checks must never consult the visible fallback")
     }
 
     func testApplicationACKSupersessionCannotReleasePromptEvenForSameValueOrABA() async throws {
@@ -656,12 +668,13 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
     @MainActor
     private func ordinaryTurnFixture(
         controller: ClaudeNativeProcessSessionController,
-        replacement: ClaudeNativeProcessSessionController? = nil
+        replacement: ClaudeNativeProcessSessionController? = nil,
+        workspacePath: @escaping (AgentTabSession) throws -> String? = { _ in nil }
     ) throws -> (ClaudeAgentModeCoordinator, AgentTabSession, ClaudeAgentModeCoordinator.NativeSessionIntent) {
         var creations = 0
         let coordinator = ClaudeAgentModeCoordinator(
             windowID: 1,
-            workspacePathProvider: { _ in nil },
+            workspacePathProvider: workspacePath,
             claudeControllerFactory: { _, _, _, _ in
                 creations += 1
                 return creations == 1 ? controller : (replacement ?? controller)
@@ -3387,8 +3400,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         var receipts: [MCPRunRoutingCleanupReceipt] = []
         do {
             let manager = ServerNetworkManager.shared
-            let route = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: nil)
-            addTeardownBlock { await route.close() }
+            let route = f.harness.host.runtimeHost.route
             let runID = try XCTUnwrap(f.session.runID)
             let client = "adopted-cleanup-\(UUID().uuidString)"
             let installed = await manager.installClientConnectionPolicy(
@@ -3421,7 +3433,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
             XCTAssertEqual(policy?.restrictedTools, ["edit_file"])
             try await feed(result("original-final"), f.controller)
             await until("original provider turn publishes") { f.session.runState == .completed && !f.session.runLifecycle.terminalCommitInProgress }
-            await AgentSessionRuntimeHost.cleanRunRouting(.registered([successor]), routeID: route.identity.routeID, reason: "fixture_complete")
+            await f.harness.host.runtimeHost.cleanupRunRouting(.registered([successor]), reason: "fixture_complete")
             let finalPolicy = await manager.debugRunPolicyState(for: runID)
             XCTAssertNil(finalPolicy)
         } catch {
