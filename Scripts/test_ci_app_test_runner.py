@@ -960,6 +960,69 @@ class TestDiscoveryTests(unittest.TestCase):
             (shards, loads),
         )
 
+class SuiteCostPlannerTests(unittest.TestCase):
+    def test_sparse_costs_spread_slow_low_count_owners_without_changing_coverage(self):
+        heavy = ['RepoPromptTests.' + name for name in (
+            'AgentSidebarRowInvalidationTests', 'SessionAdminInventoryReadTests',
+            'SessionAdminWorktreeRecoveryTests', 'WorkspaceRootCatalogDeltaTests')]
+        counts = {**{suite: 1 for suite in heavy},
+                  **{f'NewTarget.Cheap{i}': 100 for i in range(8)}}
+        shards, loads = runner.assign_suites_to_shards(counts, 4)
+        self.assertEqual([len(set(row) & set(heavy)) for row in shards], [1] * 4)
+        self.assertEqual(sorted(suite for row in shards for suite in row), sorted(counts))
+        self.assertEqual(loads, tuple(sum(counts[s] for s in row) for row in shards))
+        self.assertEqual(sum(loads), 804)  # Returned loads remain METHOD counts.
+        self.assertEqual(runner.assign_suites_to_shards(dict(reversed(counts.items())), 4),
+                         (shards, loads))
+        for index, row in enumerate(shards, 1):
+            self.assertEqual(runner.select_shard(counts, shard_count=4, shard_index=index),
+                             runner.ShardSelection(row, loads))
+
+    def test_weight_scaling_unknown_renamed_and_cross_target_symbols(self):
+        estimates = {'Target.Same.Nested': (1001, 3), 'Removed.Old': (99999, 1)}
+        weight = lambda suite, count: runner._suite_weight_ms(suite, count, estimates)
+        self.assertEqual(weight('Target.Same.Nested', 3), 1001)
+        self.assertEqual(weight('Target.Same.Nested', 4), 1335)  # Integer ceil.
+        self.assertEqual(weight('Target.Same.Nested', 1), 1001)  # No removal discount.
+        for suite in ('OtherTarget.Same.Nested', 'Target.Renamed', 'New.Suite'):
+            self.assertEqual(weight(suite, 1), 250)
+            self.assertEqual(weight(suite, 4), 1000)
+        # An obsolete row cannot add a suite; keys include target and nested class.
+        with mock.patch.object(runner, 'SLOW_SUITE_ESTIMATES', tuple(
+                (suite, ms, count) for suite, (ms, count) in estimates.items())):
+            shards, loads = runner.assign_suites_to_shards({'OtherTarget.Same.Nested': 1}, 2)
+        self.assertEqual(shards, (('OtherTarget.Same.Nested',), ()))
+        self.assertEqual(loads, (1, 0))
+
+    def test_integer_weight_count_lexical_and_shard_load_ties(self):
+        rows = (('T.A', 1000, 1), ('T.B', 1000, 4), ('T.C', 500, 2), ('T.D', 500, 1))
+        with mock.patch.object(runner, 'SLOW_SUITE_ESTIMATES', rows):
+            self.assertEqual(runner.assign_suites_to_shards(
+                {'T.D': 1, 'T.C': 2, 'T.A': 1, 'T.B': 4}, 2),
+                ((('T.B', 'T.D'), ('T.A', 'T.C')), (5, 3)))
+        # Equal cost/count: full lexical key first; equal shard loads: index first.
+        self.assertEqual(runner.assign_suites_to_shards({'Z.Same': 1, 'A.Same': 1}, 3),
+                         ((('A.Same',), ('Z.Same',), ()), (1, 1, 0)))
+        self.assertEqual(runner.assign_suites_to_shards({}, 4), (((), (), (), ()), (0, 0, 0, 0)))
+
+    def test_source_estimates_fail_closed_on_bad_or_duplicate_rows(self):
+        valid = ('Target.Suite', 1000, 2)
+        variants = [(valid, valid), (('Unqualified', 1000, 2),),
+                    (('Target..Suite', 1000, 2),), ((None, 1000, 2),),
+                    (('Target.Suite', 1000),), (None,)]
+        for value in (True, False, 0, -1, 1.5, '1000', None):
+            variants.extend([(('Target.Suite', value, 2),),
+                             (('Target.Suite', 1000, value),)])
+        for rows in variants:
+            with self.subTest(rows=rows), mock.patch.object(runner, 'SLOW_SUITE_ESTIMATES', rows), \
+                    self.assertRaises(ValueError):
+                runner.assign_suites_to_shards({}, 4)  # Even unused bad rows are rejected.
+        self.assertEqual(len(runner._validated_suite_estimates()), 20)
+        for count in (True, False, 0, -1, 1.5, '1'):
+            with self.subTest(count=count), self.assertRaises(ValueError):
+                runner.assign_suites_to_shards({'Target.Suite': count}, 4)
+
+
 class TestBundleResolutionTests(unittest.TestCase):
     def test_discover_test_bundles_parses_show_bin_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
