@@ -62,11 +62,13 @@ package enum DomainAuthorityHealth: Codable, Equatable {
     }
 }
 
+// swiftformat:disable:next redundantSendable
 package enum DomainWorkspaceTabLocation: String, Codable, Equatable, Hashable, Sendable {
     case composed
     case stashed
 }
 
+// swiftformat:disable:next redundantSendable
 package struct DomainProtectedAgentIdentity: Codable, Equatable, Hashable, Sendable {
     package let tabID: UUID
     package let location: DomainWorkspaceTabLocation
@@ -127,6 +129,7 @@ package struct DomainWorkspaceMetadata: Codable, Equatable {
     package let isHiddenInMenus: Bool
     package let consolidatedIntoWorkspaceID: UUID?
     package let isEphemeral: Bool
+    package let isSavedWorkspace: Bool?
     package let activeContextID: UUID?
     package let contexts: [DomainContextMetadata]
     package let agentIdentityClaims: [DomainProtectedAgentIdentity]
@@ -143,6 +146,7 @@ package struct DomainWorkspaceMetadata: Codable, Equatable {
         isHiddenInMenus: Bool,
         consolidatedIntoWorkspaceID: UUID? = nil,
         isEphemeral: Bool,
+        isSavedWorkspace: Bool? = nil,
         activeContextID: UUID?,
         contexts: [DomainContextMetadata],
         agentIdentityClaims: [DomainProtectedAgentIdentity] = []
@@ -158,6 +162,7 @@ package struct DomainWorkspaceMetadata: Codable, Equatable {
         self.isHiddenInMenus = isHiddenInMenus
         self.consolidatedIntoWorkspaceID = consolidatedIntoWorkspaceID
         self.isEphemeral = isEphemeral
+        self.isSavedWorkspace = isSavedWorkspace
         self.activeContextID = activeContextID
         self.contexts = contexts
         self.agentIdentityClaims = agentIdentityClaims
@@ -219,11 +224,13 @@ package enum DomainExactRootSelection: Equatable {
 }
 
 /// Exact registered-workspace routing facts, independent of session/delegation authority.
+// swiftformat:disable:next redundantSendable
 package enum DomainWorkspaceReadSelector: Equatable, Sendable {
     case id(UUID)
     case exactName(String)
 }
 
+// swiftformat:disable:next redundantSendable
 package struct DomainWorkspaceReadLocation: Equatable, Sendable {
     package let runtimeID: UUID
     package let lifecycleGeneration: UInt64
@@ -233,6 +240,7 @@ package struct DomainWorkspaceReadLocation: Equatable, Sendable {
     package let directory: URL
 }
 
+// swiftformat:disable:next redundantSendable
 package enum DomainWorkspaceLocationSelection: Equatable, Sendable {
     case matched(DomainWorkspaceReadLocation)
     case ambiguous
@@ -407,6 +415,7 @@ private enum DomainWorkspaceDocumentDecoder {
             consolidatedIntoWorkspaceID: (object["consolidatedIntoWorkspaceID"] as? String)
                 .flatMap(UUID.init(uuidString:)),
             isEphemeral: object["ephemeralFlag"] as? Bool ?? false,
+            isSavedWorkspace: object["isSavedWorkspace"] as? Bool,
             activeContextID: (object["activeComposeTabID"] as? String).flatMap(UUID.init(uuidString:)),
             contexts: contexts,
             agentIdentityClaims: agentIdentityClaims

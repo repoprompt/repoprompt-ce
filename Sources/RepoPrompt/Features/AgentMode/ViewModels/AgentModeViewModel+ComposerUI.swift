@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
 
@@ -54,70 +55,8 @@ extension AgentModeViewModel {
         return makeRunCancelTarget(tabID: tabID, session: session)
     }
 
-    func makeComposerProps(tabID explicitTabID: UUID? = nil) -> AgentComposerProps {
-        let tabID = explicitTabID ?? currentTabID
-        let session = tabID.flatMap { sessions[$0] }
-        let isMCPControlled = isMCPControlled(tabID: tabID)
-        let isCodexRunActive: Bool = {
-            guard selectedAgent == .codexExec, let tabID else { return false }
-            return isTabRunning(tabID)
-        }()
-        let cancelTarget = composerRunCancelTarget(tabID: tabID)
-        let submitTarget = makeComposerSubmitTarget(tabID: tabID, session: session)
-        let acpControls = acpModelParameterControls(session: session)
-        // Cursor's catalog can refresh while a run is active. Metadata disappearing must
-        // not unlock a model/configuration already captured by that run.
-        let acpRunLocksModelControls = session?.runState.isActive == true
-            && (selectedAgent == .cursor || !acpControls.isEmpty)
-        let routerControlsFreshTask = session.map(isGlobalModelRouterControllingFreshTask) ?? false
-        let selectedRouterServiceID = routerControlsFreshTask
-            ? modelRouterSettingsStore.modelRouterConfiguration().selectedBackendID : nil
-        let automaticRouterServiceName = selectedRouterServiceID.flatMap { modelRouterRuntime?.serviceDisplayNamesByID[$0] }
-        let autoEffortConfiguration = modelRouterSettingsStore.autoEffortConfiguration()
-        let autoEffortServiceName = autoEffortConfiguration.enabled
-            ? autoEffortConfiguration.selectedBackendID.flatMap { modelRouterRuntime?.serviceDisplayNamesByID[$0] } ?? "Unavailable service"
-            : nil
-        return AgentComposerProps(
-            computerUse: computerUseComposerProps(session: session),
-            imageAttachmentNotice: imageAttachmentNotice,
-            currentTabID: tabID,
-            submitTarget: submitTarget,
-            attachments: AgentAttachmentStripSnapshot(
-                scopeTabID: tabID,
-                attachments: pendingFileAttachments,
-                taggedFileAttachments: pendingTaggedFileAttachments
-            ),
-            runState: runState,
-            cancelTarget: cancelTarget,
-            backgroundCancelTarget: composerOracleBackgroundCancelTarget(tabID: tabID),
-            isAgentBusy: isAgentBusy,
-            isWaitingForInstruction: isWaitingForInstruction,
-            canUseLinkedAgentSession: hasLinkedAgentSession(for: tabID),
-            isCurrentTabMCPControlled: isMCPControlled,
-            areModelControlsDisabled: isMCPControlled || acpRunLocksModelControls || routerControlsFreshTask,
-            providerControls: activeProviderControlsBinding,
-            isCodexRunActive: isCodexRunActive,
-            hasAvailableAgentProviders: hasAvailableAgentProviders,
-            canSendWithCurrentProvider: canSendWithCurrentProvider,
-            isRoutingFreshTask: tabID.map { freshTaskRoutingByTabID[$0] != nil } ?? false,
-            isGlobalModelRouterControllingFreshTask: routerControlsFreshTask,
-            automaticRouterServiceName: automaticRouterServiceName,
-            autoEffortServiceName: autoEffortServiceName,
-            unavailableSelectedAgentMessage: unavailableSelectedAgentMessage,
-            selectedAgent: selectedAgent,
-            selectedModelRaw: selectedModelRaw,
-            selectedModelDisplayName: selectedModelDisplayName,
-            selectedReasoningEffortRaw: selectedReasoningEffortRaw,
-            selectedReasoningEffortDisplayName: selectedReasoningEffortDisplayName,
-            acpModelParameterControls: acpControls,
-            availableAgents: availableAgents,
-            isProviderPickerLockedForCurrentTab: isProviderPickerLocked(tabID: tabID),
-            lockedAgentSelectionMessage: lockedAgentSelectionMessage(tabID: tabID),
-            autoEditEnabled: autoEditEnabled,
-            stagedSlashCommand: stagedSlashCommandProps(tabID: tabID),
-            draftRestorationEvent: draftRestorationEvent.map(AgentDraftRestorationProps.init),
-            fileTagLookupContextIdentity: agentWorkspaceLookupContextIdentity(tabID: tabID, session: session)
-        )
+    func makeComposerProps(tabID: UUID? = nil) -> AgentComposerProps {
+        AgentComposerProjection.props(vm: self, subject: .currentTab, tabID: tabID)
     }
 
     /// Pure presentation: no companion lookup, configuration IO, or permission probing.
@@ -132,7 +71,9 @@ extension AgentModeViewModel {
         )
     }
 
-    private func acpModelParameterControls(session: TabSession?) -> [AgentComposerModelParameterControlProps] {
+    func acpModelParameterControls(session: TabSession?, agent: AgentProviderKind? = nil, model: String? = nil, parameterSelections: [ACPModelParameterSelection]? = nil) -> [AgentComposerModelParameterControlProps] {
+        let selectedAgent = agent ?? selectedAgent
+        let selectedModelRaw = model ?? selectedModelRaw
         guard let providerID = selectedAgent.acpProviderID else { return [] }
         // Pure projection over the held demand-scoped observation (OpenCode) or the
         // runtime Cursor snapshot. Never invent choices or launch discovery here. While the OpenCode observation
@@ -158,7 +99,7 @@ extension AgentModeViewModel {
         let resolved = ACPModelParameterResolver.resolve(
             providerID: providerID,
             selectedModelRaw: selectedModelRaw,
-            persistedSelections: session?.acpModelParameterSelections ?? [],
+            persistedSelections: session?.acpModelParameterSelections ?? parameterSelections ?? [],
             workspacePath: workspacePath,
             openCodeParameters: providerID == .openCode ? openCodeModelParameterObservation : nil
         )
@@ -170,7 +111,7 @@ extension AgentModeViewModel {
                 configID: parameter.definition.configID,
                 displayName: parameter.definition.displayName,
                 selectedValueRaw: parameter.selectedChoice.rawValue,
-                savedValueRaw: ACPModelParameterResolver.effectiveSelections(providerID: providerID, selectedModelRaw: selectedModelRaw, persistedSelections: session?.acpModelParameterSelections ?? []).last {
+                savedValueRaw: ACPModelParameterResolver.effectiveSelections(providerID: providerID, selectedModelRaw: selectedModelRaw, persistedSelections: session?.acpModelParameterSelections ?? parameterSelections ?? []).last {
                     $0.identity == ACPModelParameterIdentity(providerID: providerID, baseModelRaw: parameter.baseModelRaw, kind: parameter.definition.kind)
                 }?.valueRaw,
                 selectedDisplayName: parameter.selectedChoice.displayName,

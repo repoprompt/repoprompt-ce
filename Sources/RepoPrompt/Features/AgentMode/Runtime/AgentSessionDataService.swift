@@ -1342,6 +1342,26 @@ actor AgentSessionDataService {
         }
     }
 
+    /// Read-only history presentation. Unlike runtime restoration this must not repair the
+    /// payload/index, reconcile worktrees, allocate a writer, or create missing storage.
+    func readSavedConversation(id: UUID, workspaceID: UUID, directory: URL) throws -> AgentSession? {
+        try Task.checkCancellation()
+        let folder = directory.appendingPathComponent("AgentSessions")
+        let fileURL = folder.appendingPathComponent(agentSessionFilename(for: id)).standardizedFileURL
+        try AppProfileLocations.current.validateMetadataFile(fileURL)
+        guard !deletedSessionFileURLs.contains(fileURL) else { return nil }
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
+        guard canonicalAgentSessionFile(fileURL, in: folder)?.sessionID == id else {
+            throw AgentSessionDataError.invalidFilename(fileURL.lastPathComponent)
+        }
+        let session = try decoder.decode(AgentSession.self, from: validatedSessionData(from: fileURL))
+        guard session.id == id, session.workspaceID == nil || session.workspaceID == workspaceID else {
+            throw AgentSessionDataError.invalidFilename(fileURL.lastPathComponent)
+        }
+        try Task.checkCancellation()
+        return session
+    }
+
     /// Load an AgentSession from disk.
     func loadAgentSession(from fileURL: URL) async throws -> AgentSession {
         let data = try validatedSessionData(from: fileURL)

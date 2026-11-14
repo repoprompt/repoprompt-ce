@@ -1,26 +1,29 @@
 import Foundation
 
 extension AgentModeViewModel {
-    func makeStatusPillsSnapshot() -> AgentStatusPillsSnapshot {
+    func makeStatusPillsSnapshot(subject: AgentComposerSubject = .currentTab) -> AgentStatusPillsSnapshot {
+        let currentTabID: UUID? = if case let .tab(id) = subject { id } else { self.currentTabID }
+        let session = currentTabID.flatMap { sessions[$0] }
+        let current = subject.isCurrent
         #if DEBUG
             test_statusPillsSnapshotBuildCount += 1
         #endif
         return AgentStatusPillsSnapshot(
             currentTabID: currentTabID,
-            selectedWorkflow: selectedWorkflow,
+            selectedWorkflow: current ? selectedWorkflow : (session?.selectedWorkflow),
             stagedSlashCommand: stagedSlashCommandProps(tabID: currentTabID),
-            selectedAgent: selectedAgent,
-            autoEditPermissionGuidance: autoEditPermissionGuidance,
-            runState: runState,
-            autoEditEnabled: autoEditEnabled,
-            interviewFirst: interviewFirst,
-            modelRouter: modelRouterPillProps(),
-            autoEffort: autoEffortPillProps(),
+            selectedAgent: current ? selectedAgent : (session?.selectedAgent ?? .claudeCode),
+            autoEditPermissionGuidance: current ? autoEditPermissionGuidance : nil,
+            runState: current ? runState : (session?.runState ?? .idle),
+            autoEditEnabled: current ? autoEditEnabled : (session?.autoEditEnabled ?? false),
+            interviewFirst: current ? interviewFirst : false,
+            modelRouter: modelRouterPillProps(tabID: currentTabID),
+            autoEffort: autoEffortPillProps(tabID: currentTabID),
             executionLocation: executionLocationProps(tabID: currentTabID),
-            activeAgentSessionID: activeSession?.activeAgentSessionID,
-            activeRunID: activeSession?.runID,
-            monitor: currentMonitorPillProps(),
-            reprompt: repromptPillProps()
+            activeAgentSessionID: session?.activeAgentSessionID,
+            activeRunID: session?.runID,
+            monitor: currentMonitorPillProps(tabID: currentTabID),
+            reprompt: current ? repromptPillProps() : .init(unavailableReason: "Open this session in its workspace to configure reprompt.")
         )
     }
 
