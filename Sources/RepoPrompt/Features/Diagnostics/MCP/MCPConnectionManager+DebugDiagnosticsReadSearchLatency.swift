@@ -750,6 +750,8 @@ import RepoPromptShared
                 "descriptor_budget": state.capacity.descriptorBudget,
                 "active_descriptor_units": state.activeDescriptorUnits,
                 "retained_content_limit": state.capacity.retainedContent,
+                "retained_content_limit_units": state.capacity.retainedContent * 8,
+                "active_content_units": state.activeContentUnits,
                 "active": state.active,
                 "active_cpu": state.activeByKind[.cpu] ?? 0,
                 "active_io": state.activeByKind[.io] ?? 0,

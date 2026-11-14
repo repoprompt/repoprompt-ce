@@ -43,7 +43,7 @@ package enum StoreBackedWorkspaceSearchAdmissionError: LocalizedError, Equatable
 /// Per-workspace execution lane for store-backed file search.
 ///
 /// Path-only and explicitly scoped searches bypass broad admission. Unscoped content-capable
-/// searches use a fixed-capacity batch gate: a bounded set of active leases runs concurrently
+/// searches use a host-derived pending batch gate: a bounded set of active leases runs concurrently
 /// so a parallel burst (one connection's batched tool calls, or several agents on the same
 /// workspace) shares one ingress freshness flight instead of reconstructing it serially per
 /// search. Beyond the active batch, a bounded FIFO wait queue absorbs the rest of the burst;
@@ -51,8 +51,10 @@ package enum StoreBackedWorkspaceSearchAdmissionError: LocalizedError, Equatable
 package actor StoreBackedWorkspaceSearchLane {
     package struct Configuration: Equatable {
         package static let production = Configuration(
-            maxActiveLeases: 4,
-            maxQueuedWaiters: 4,
+            // This bounds pending search state/freshness flights, not CPU workers.
+            // Physical CPU and retained text are already process-wide in HostResourceBudget.
+            maxActiveLeases: HostResourceCapacity.baseline.cpu,
+            maxQueuedWaiters: HostResourceCapacity.baseline.cpu,
             maxQueueWait: .milliseconds(1500),
             retryAfterMilliseconds: 1000
         )

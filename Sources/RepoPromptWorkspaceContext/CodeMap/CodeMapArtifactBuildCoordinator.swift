@@ -220,7 +220,7 @@ struct CodeMapArtifactBuildCoordinatorPolicy: Equatable {
         maximumTotalWaiterCount: Int = 512,
         maximumWaitersPerFlight: Int = 64,
         maximumQueuedBuildCount: Int = 128,
-        maximumConcurrentBuildCount: Int = FileSystemService.codeMapArtifactBuildBulkPermitLimit,
+        maximumConcurrentBuildCount: Int = HostResourceCapacity.baseline.cpu,
         maximumLocatorIdentitiesPerFlight: Int = 16,
         maximumRetainedInputByteCount: Int = 128 * 1024 * 1024,
         maximumPendingHookEventCount: Int = 256,
@@ -341,12 +341,16 @@ struct CodeMapArtifactBuilderClient: @unchecked Sendable {
             UUID,
             TaskPriority,
             @escaping @Sendable () async throws -> CodeMapArtifactBuilderExecution
-        ) async throws -> CodeMapArtifactBuilderExecution = { ownerID, priority, operation in
-            try await FileSystemService.withCodeMapArtifactBuildPermit(
-                ownerID: ownerID,
-                priority: priority,
-                operation: operation
-            )
+        ) async throws -> CodeMapArtifactBuilderExecution = { _, priority, operation in
+            // Source is already captured: parsing must not own an I/O/bulk permit or
+            // be suppressed by an unrelated foreground search. Host CPU admission
+            // below is the physical owner. Preserve off-actor execution and settlement.
+            let task = Task.detached(priority: priority, operation: operation)
+            return try await withTaskCancellationHandler {
+                try await task.value
+            } onCancel: {
+                task.cancel()
+            }
         }
     ) {
         execute = { input, ownerID, priority in
@@ -354,7 +358,7 @@ struct CodeMapArtifactBuilderClient: @unchecked Sendable {
             return try await withPermit(ownerID, priority.taskPriority) {
                 // Input content is already captured. This lease covers only synchronous
                 // parse/extract work, never source reads or Git discovery/admission.
-                let hostLease = try await HostResourceBudget.shared.acquire(.cpu, background: true)
+                let hostLease = try await HostResourceBudget.shared.acquire(.cpu, background: priority == .background)
                 defer { hostLease.release() }
                 let buildStart = clock.nowNanoseconds()
                 let permitWait = Self.duration(from: permitStart, to: buildStart)
