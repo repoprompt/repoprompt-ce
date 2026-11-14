@@ -148,6 +148,45 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertTrue(fixture.factory.controllers.isEmpty)
     }
 
+    func testProviderSwitchRollbackDoesNotResurrectCompletedComputerUseArming() async throws {
+        var release: CheckedContinuation<String?, Never>?
+        let fixture = makeFixture([], runtimePreflight: {
+            await withCheckedContinuation { release = $0 }
+        }, freshSession: true, shouldManageCodexTooling: false)
+        let arming = Task {
+            await fixture.viewModel.armComputerUseForLocalUser(session: fixture.session, confirmOptIn: { XCTFail("Rejected preflight must not prompt")
+                return false
+            })
+        }
+        try await AsyncTestWait.waitUntil("Arming request reaches fake preflight", timeout: 3) { release != nil }
+        XCTAssertNotNil(fixture.session.codexComputerUseArmingRequestID)
+        fixture.session.selectedAgent = .claudeCode
+        let rollback = AgentModeViewModel.ProviderSwitchRollback(fixture.session)
+        release?.resume(returning: CodexComputerUseWorkflow.runtimeRequirementMessage)
+        _ = await arming.value
+        XCTAssertNil(fixture.session.codexComputerUseArmingRequestID)
+        rollback.restore(fixture.session)
+        XCTAssertEqual(fixture.session.selectedAgent, .claudeCode)
+        XCTAssertNil(fixture.session.codexComputerUseArmingRequestID, "Rollback must not resurrect a request whose async owner has finished")
+        XCTAssertNil(fixture.session.computerUseParentGrant)
+        XCTAssertTrue(fixture.factory.controllers.isEmpty)
+    }
+
+    func testProviderSwitchRollbackPreservesCurrentComputerUseArmingOwner() {
+        let session = AgentTabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        let captured = UUID()
+        session.codexComputerUseArmingRequestID = captured
+        let rollback = AgentModeViewModel.ProviderSwitchRollback(session)
+        let successor = UUID()
+        session.codexComputerUseArmingRequestID = successor
+        rollback.restore(session)
+        XCTAssertEqual(session.codexComputerUseArmingRequestID, successor, "Rollback must not replace a later arming owner")
+        session.codexComputerUseArmingRequestID = nil
+        rollback.restore(session)
+        XCTAssertNil(session.codexComputerUseArmingRequestID)
+    }
+
     func testRuntimeRejectionPrecedesComposerOptInAndSessionCreation() async {
         CodexComputerUseWorkflow.setEnabledForTesting(false)
         defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }

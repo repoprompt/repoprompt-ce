@@ -1655,6 +1655,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     let vm = fixture.viewModel
                     let session = fixture.sourceSession
                     session.providerSessionID = "restore-source"
+                    session.codexComputerUseArmingRequestID = UUID()
                     session.codexConversationID = "restore-codex"
                     session.codexRolloutPath = "/restore/path"
                     session.codexModel = "restore-model"
@@ -1677,6 +1678,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                         XCTAssertEqual(saves, 0)
                     }
                     vm.test_providerSwitchBeforeSave = { outgoing in
+                        XCTAssertNil(outgoing.codexComputerUseArmingRequestID, "Provider detach must invalidate the original arming request")
                         if fault == "prewrite" { outgoing.isInstallingHandoffWorktreeBindings = true }
                     }
                     defer { session.isInstallingHandoffWorktreeBindings = false }
@@ -1684,6 +1686,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     let id = try XCTUnwrap(vm.providerSwitchPreview?.id)
                     let applied = await vm.applyProviderSwitch(id)
                     XCTAssertFalse(applied)
+                    XCTAssertNil(session.codexComputerUseArmingRequestID, "A failed switch must not revive the invalidated arming request")
                     if fault == "prewrite" {
                         XCTAssertEqual(saves, 0)
                         XCTAssertEqual(session.providerSessionID, "restore-source")
