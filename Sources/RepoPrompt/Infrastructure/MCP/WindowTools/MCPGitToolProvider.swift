@@ -228,7 +228,7 @@ final class MCPGitToolProvider {
         dependencies = (context: context, selection: selection)
     }
 
-    private nonisolated static let maxConcurrentRepositories = 3
+    private nonisolated static let maxConcurrentRepositories = max(1, HostResourceCapacity.baseline.subprocess)
 
     nonisolated static func worktreeWarning(from worktree: ToolResultDTOs.GitToolReplyDTO.WorktreeDTO?) -> String? {
         guard let worktree, worktree.isWorktree else { return nil }

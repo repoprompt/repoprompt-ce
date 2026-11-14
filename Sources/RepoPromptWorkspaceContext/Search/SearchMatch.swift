@@ -433,12 +433,14 @@ private struct SearchDocumentBuildResult {
 
 private struct SearchFileScanBatch {
     let ordinal: Int
-    let document: SearchDocument?
+    // Compact public snippets, never a full decoded file retained behind the drain frontier.
+    let matches: [SearchMatch]
     let summary: SearchScanSummary
     let errors: [(String, RegexPatternFailure)]
 }
 
 private struct SearchScanPlan {
+    let hostBudget: HostResourceBudget
     let engine: RegexEngine?
     let literalPattern: String
     let caseInsensitive: Bool
@@ -619,7 +621,18 @@ struct OrderedSearchBatchWindow {
 
 /// Ripgrep-style asynchronous searcher, fully cancellable.
 package actor FileSearchActor {
-    package init() {}
+    private let contentBudget: HostResourceBudget
+    package init() {
+        contentBudget = .shared
+    }
+
+    #if DEBUG
+        /// Isolated admission for deterministic content-search outcome tests. Production
+        /// actors always share the process-wide budget; no token inheritance/bypass.
+        package init(contentBudgetForTesting: HostResourceBudget) {
+            contentBudget = contentBudgetForTesting
+        }
+    #endif
 
     static func pathSearchInputPrecedes(_ lhsPath: String, _ rhsPath: String) -> Bool {
         WorkspaceFileContextStore.compareUTF8Binary(lhsPath, rhsPath) == .orderedAscending
@@ -695,9 +708,8 @@ package actor FileSearchActor {
     private static let pathScanBatchSize = 128
 
     /// Maximum number of file-scan tasks that run in parallel.
-    /// We default to the number of CPU cores (but at least 4) so the search
-    /// stays responsive without flooding the executor with thousands of jobs.
-    private static let maxConcurrentTasks = max(4, ProcessInfo.processInfo.activeProcessorCount)
+    /// Pending fan-out only. Matching shares the host CPU budget across all searches.
+    private static let maxConcurrentTasks = HostResourceCapacity.baseline.cpu
 
     /// Resolves the measured production content-batch size from a stable worker count.
     /// The policy targets eight batches per worker, then clamps nonempty batches to 2...4 files.
@@ -1003,11 +1015,12 @@ package actor FileSearchActor {
     }
 
     private static func materializeMatches(
-        from batch: SearchFileScanBatch,
+        document: SearchDocument,
+        summary: SearchScanSummary,
         remaining: Int
     ) -> [SearchMatch] {
-        guard remaining > 0, let document = batch.document else { return [] }
-        let matchLimit = min(remaining, batch.summary.hits.count)
+        guard remaining > 0 else { return [] }
+        let matchLimit = min(remaining, summary.hits.count)
         return EditFlowPerf.measure(
             EditFlowPerf.Stage.Search.materializeMatches,
             EditFlowPerf.Dimensions(
@@ -1016,7 +1029,7 @@ package actor FileSearchActor {
                 contextLines: document.contextLines
             )
         ) {
-            Array(batch.summary.hits.prefix(remaining)).map { document.materialize($0) }
+            Array(summary.hits.prefix(remaining)).map { document.materialize($0) }
         }
     }
 
@@ -1356,6 +1369,7 @@ package actor FileSearchActor {
         }
 
         let plan = SearchScanPlan(
+            hostBudget: contentBudget,
             engine: engine,
             literalPattern: literalPattern,
             caseInsensitive: caseInsensitive,
@@ -1448,7 +1462,7 @@ package actor FileSearchActor {
                             }
 
                             if !countOnly, emittedMatches.count < maxResults {
-                                emittedMatches.append(contentsOf: Self.materializeMatches(from: fileResult, remaining: maxResults - emittedMatches.count))
+                                emittedMatches.append(contentsOf: fileResult.matches.prefix(maxResults - emittedMatches.count))
                             }
 
                             if !countOnly, emittedMatches.count >= maxResults {
@@ -1586,11 +1600,15 @@ package actor FileSearchActor {
             guard !Task.isCancelled else {
                 return SearchFileScanBatch(
                     ordinal: input.ordinal,
-                    document: nil,
+                    matches: [],
                     summary: SearchScanSummary(hits: [], lineMatchCount: 0),
                     errors: []
                 )
             }
+            // Bound decoded text retained by simultaneous searches waiting for CPU.
+            // This reservation is separate from physical work (memory -> I/O -> CPU).
+            let contentReservation = try await plan.hostBudget.acquire(.retainedContent)
+            defer { contentReservation.release() }
             let snapshot = try await EditFlowPerf.measure(
                 EditFlowPerf.Stage.Search.fileContentFetch,
                 EditFlowPerf.Dimensions(
@@ -1607,7 +1625,7 @@ package actor FileSearchActor {
             guard let text = snapshot.content else {
                 return SearchFileScanBatch(
                     ordinal: input.ordinal,
-                    document: nil,
+                    matches: [],
                     summary: SearchScanSummary(hits: [], lineMatchCount: 0),
                     errors: []
                 )
@@ -1615,11 +1633,17 @@ package actor FileSearchActor {
             guard !Task.isCancelled else {
                 return SearchFileScanBatch(
                     ordinal: input.ordinal,
-                    document: nil,
+                    matches: [],
                     summary: SearchScanSummary(hits: [], lineMatchCount: 0),
                     errors: []
                 )
             }
+
+            // Fetch first: holding a CPU lease across content-read admission would
+            // deadlock nested pools. Matching below is synchronous and releases on exit.
+            let hostLease = try await plan.hostBudget.acquire(.cpu)
+            defer { hostLease.release() }
+            try Task.checkCancellation()
 
             if plan.countOnly {
                 let fastPathState = EditFlowPerf.begin(
@@ -1646,7 +1670,7 @@ package actor FileSearchActor {
                     )
                     return SearchFileScanBatch(
                         ordinal: input.ordinal,
-                        document: nil,
+                        matches: [],
                         summary: summary,
                         errors: []
                     )
@@ -1686,7 +1710,9 @@ package actor FileSearchActor {
 
             return SearchFileScanBatch(
                 ordinal: input.ordinal,
-                document: (plan.countOnly || summary.hits.isEmpty) ? nil : document,
+                matches: plan.countOnly ? [] : Self.materializeMatches(
+                    document: document, summary: summary, remaining: plan.maxCollectedMatches ?? 0
+                ),
                 summary: summary,
                 errors: []
             )
@@ -1698,24 +1724,28 @@ package actor FileSearchActor {
             throw error
         } catch is CancellationError {
             throw CancellationError()
+        } catch HostResourceBudget.AdmissionError.queueFull {
+            // Admission overload is not a successful empty scan. Surface backpressure
+            // rather than silently omitting files from an otherwise successful result.
+            throw HostResourceBudget.AdmissionError.queueFull
         } catch let error as RegexPatternFailure {
             return SearchFileScanBatch(
                 ordinal: input.ordinal,
-                document: nil,
+                matches: [],
                 summary: SearchScanSummary(hits: [], lineMatchCount: 0),
                 errors: [(file.relativePath, error)]
             )
         } catch let error as PCRE2Error {
             return SearchFileScanBatch(
                 ordinal: input.ordinal,
-                document: nil,
+                matches: [],
                 summary: SearchScanSummary(hits: [], lineMatchCount: 0),
                 errors: [(file.relativePath, RepoPromptPCRE2Adapter.searchPatternError(from: error, pattern: plan.literalPattern))]
             )
         } catch {
             return SearchFileScanBatch(
                 ordinal: input.ordinal,
-                document: nil,
+                matches: [],
                 summary: SearchScanSummary(hits: [], lineMatchCount: 0),
                 errors: []
             )
@@ -2526,6 +2556,9 @@ package actor FileSearchActor {
         entries: [SearchPathInput],
         plan: SearchPathScanPlan
     ) async throws -> SearchPathBatchResult {
+        let hostLease = try await HostResourceBudget.shared.acquire(.cpu)
+        defer { hostLease.release() }
+        try Task.checkCancellation()
         let batchSize = batch.range.count
         var hits: [(ordinal: Int, path: String)] = []
         hits.reserveCapacity(min(batchSize, 8))

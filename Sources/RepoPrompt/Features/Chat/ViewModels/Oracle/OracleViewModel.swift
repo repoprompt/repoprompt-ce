@@ -515,7 +515,7 @@ class OracleViewModel: ObservableObject {
     private var workspaceChatSessionLoadGeneration: UInt64 = 0
     private var chatSessionCatalogWorkspaceID: UUID?
     private var chatSessionCatalogStoragePath: URL?
-    private let workspaceSwitchChatStubLoadConcurrency = 4
+    private let workspaceSwitchChatStubLoadConcurrency = ContentReadConcurrencyCapacity.maximumConcurrentReads
 
     /// Session management
     @Published var sessions: [ChatSession] = [] {

@@ -2273,7 +2273,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                 return debugMaxGlobalConnectionsForTesting
             }
         #endif
-        return defaultsInt("mcp.maxGlobalConnections", 128)
+        return defaultsInt("mcp.maxGlobalConnections", HostResourceCapacity.baseline.connections)
     }
 
     private var maxConnectionsPerClient: Int {

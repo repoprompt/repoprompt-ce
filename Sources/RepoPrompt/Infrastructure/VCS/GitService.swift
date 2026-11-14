@@ -4966,6 +4966,7 @@ actor GitService: WorkspaceGitClient {
             priority: priority,
             deadline: admissionDeadline
         )
+        let hostAdmission = HostGitAdmissionContext(deadline: admissionDeadline)
         do {
             try Task.checkCancellation()
             let (stdout, stderr, exitCode) = try await runAdmittedGitData(
@@ -4979,7 +4980,8 @@ actor GitService: WorkspaceGitClient {
                 stderrByteLimit: 64 * 1024,
                 admissionPriority: priority,
                 commandFamily: family,
-                commandTimeout: timeout
+                commandTimeout: timeout,
+                hostAdmission: hostAdmission
             )
             await processAdmissionController.release(admissionLease)
             guard allowedExitCodes.contains(exitCode) else {
@@ -7792,6 +7794,7 @@ actor GitService: WorkspaceGitClient {
             priority: admissionPriority,
             deadline: admissionDeadline
         )
+        let hostAdmission = HostGitAdmissionContext(deadline: admissionDeadline)
         do {
             try Task.checkCancellation()
             if let readBinding {
@@ -7810,6 +7813,7 @@ actor GitService: WorkspaceGitClient {
                     admissionPriority: admissionPriority,
                     commandFamily: .repositoryRead,
                     commandTimeout: commandTimeout,
+                    hostAdmission: hostAdmission,
                     readBinding: readBinding
                 )
                 if probe.2 != 0 {
@@ -7830,6 +7834,7 @@ actor GitService: WorkspaceGitClient {
                 admissionPriority: admissionPriority,
                 commandFamily: commandFamily ?? Self.commandFamily(for: args),
                 commandTimeout: commandTimeout,
+                hostAdmission: hostAdmission,
                 readBinding: readBinding,
                 beforeCommit: beforeCommit
             )
@@ -7863,6 +7868,7 @@ actor GitService: WorkspaceGitClient {
             priority: priority,
             deadline: admissionDeadline
         )
+        let hostAdmission = HostGitAdmissionContext(deadline: admissionDeadline)
         do {
             try Task.checkCancellation()
             let (spool, stderr, exitCode, terminationReason) = try await runAdmittedGitSpooling(
@@ -7873,7 +7879,8 @@ actor GitService: WorkspaceGitClient {
                 processQueueWaitMicroseconds: admissionLease.queueWaitMicroseconds,
                 resourcePolicy: resourcePolicy,
                 admissionPriority: priority,
-                commandFamily: family
+                commandFamily: family,
+                hostAdmission: hostAdmission
             )
             await processAdmissionController.release(admissionLease)
             if terminationReason == .uncaughtSignal {
@@ -7903,13 +7910,17 @@ actor GitService: WorkspaceGitClient {
         processQueueWaitMicroseconds: Int,
         resourcePolicy: GitRawOutputSpoolResourcePolicy,
         admissionPriority: GitProcessAdmissionPriority,
-        commandFamily: GitProcessCommandFamily
+        commandFamily: GitProcessCommandFamily,
+        hostAdmission: HostGitAdmissionContext? = nil
     ) async throws -> (GitRawOutputSpoolLease, Data, Int32, Process.TerminationReason) {
         let (args, environment) = try await preparePassiveGitRead(
             args, at: repoURL, environment: environment,
             diagnosticRepositoryPath: diagnosticRepositoryPath,
-            admissionPriority: admissionPriority, commandTimeout: resourcePolicy.activityTimeout
+            admissionPriority: admissionPriority, commandTimeout: resourcePolicy.activityTimeout,
+            hostAdmission: hostAdmission
         )
+        let hostLease = try await acquireHostGitPermit(priority: admissionPriority, deadline: hostAdmission?.takeDeadline())
+        defer { hostLease.release() }
         #if DEBUG
             let benchmarkMetricTag = WorktreeStartupInstrumentation.currentBenchmarkMetricTag
         #endif
@@ -8298,13 +8309,54 @@ actor GitService: WorkspaceGitClient {
     /// lease too, rather than recursively acquiring a per-repository slot.
     /// Do not cache this result: includes and worktree configuration can change
     /// without changing the main config's modification time.
+    private func acquireHostGitPermit(
+        priority: GitProcessAdmissionPriority,
+        deadline: GitProcessAdmissionDeadline?
+    ) async throws -> HostResourceBudget.Lease {
+        let hostDeadline = deadline.map { value in
+            MCPDomainAdmissionDeadline(
+                instant: .nanoseconds(Int64(clamping: value.uptimeNanoseconds)),
+                now: { .nanoseconds(Int64(clamping: DispatchTime.now().uptimeNanoseconds)) },
+                sleep: { try await Task.sleep(for: $0, clock: .suspending) }
+            )
+        }
+        do {
+            return try await HostResourceBudget.shared.acquire(
+                .subprocess, background: priority == .background || priority == .codemapDemand,
+                deadline: hostDeadline
+            )
+        } catch is MCPDomainAdmissionDeadline.Expired {
+            throw GitProcessAdmissionError.deadlineExceeded
+        } catch HostResourceBudget.AdmissionError.queueFull {
+            throw GitProcessAdmissionError.queueFull
+        }
+    }
+
+    /// A Git admission deadline bounds the first start, not every command in a
+    /// sequential ownership/driver/data sequence. Nested preparation shares this token.
+    private final class HostGitAdmissionContext: @unchecked Sendable {
+        private let lock = NSLock()
+        private var deadline: GitProcessAdmissionDeadline?
+        init(deadline: GitProcessAdmissionDeadline?) {
+            self.deadline = deadline
+        }
+
+        func takeDeadline() -> GitProcessAdmissionDeadline? {
+            lock.withLock {
+                defer { deadline = nil }
+                return deadline
+            }
+        }
+    }
+
     private func preparePassiveGitRead(
         _ args: [String],
         at repoURL: URL,
         environment: [String: String],
         diagnosticRepositoryPath: String,
         admissionPriority: GitProcessAdmissionPriority,
-        commandTimeout: Duration
+        commandTimeout: Duration,
+        hostAdmission: HostGitAdmissionContext? = nil
     ) async throws -> ([String], [String: String]) {
         guard GitReadSafety.isRead(args) else { return (args, environment) }
         try GitReadSafety.validateSupportedRead(args)
@@ -8317,7 +8369,8 @@ actor GitService: WorkspaceGitClient {
                 processQueueWaitMicroseconds: 0,
                 stdoutByteLimit: 1024 * 1024, stderrByteLimit: 64 * 1024,
                 admissionPriority: admissionPriority, commandFamily: .repositoryRead,
-                commandTimeout: commandTimeout
+                commandTimeout: commandTimeout,
+                hostAdmission: hostAdmission
             )
             guard exitCode == 0 || (exitCode == 1 && configuration.isEmpty && diagnostic.isEmpty) else {
                 throw GitError(message: GitReadSafety.driverQueryFailure(exitCode: exitCode, stderr: diagnostic))
@@ -8339,14 +8392,20 @@ actor GitService: WorkspaceGitClient {
         admissionPriority: GitProcessAdmissionPriority,
         commandFamily: GitProcessCommandFamily,
         commandTimeout: Duration,
+        hostAdmission: HostGitAdmissionContext? = nil,
         readBinding: GitReadRepositoryBinding? = nil,
         beforeCommit: (@Sendable () async throws -> Void)? = nil
     ) async throws -> (Data, Data, Int32) {
         let (args, environment) = try await preparePassiveGitRead(
             args, at: repoURL, environment: environment,
             diagnosticRepositoryPath: diagnosticRepositoryPath,
-            admissionPriority: admissionPriority, commandTimeout: commandTimeout
+            admissionPriority: admissionPriority, commandTimeout: commandTimeout,
+            hostAdmission: hostAdmission
         )
+        // Preparatory driver queries have settled before this acquisition: never
+        // recursively acquire a host token. Return it only after child/pipe settlement.
+        let hostLease = try await acquireHostGitPermit(priority: admissionPriority, deadline: hostAdmission?.takeDeadline())
+        defer { hostLease.release() }
         #if DEBUG
             let benchmarkMetricTag = WorktreeStartupInstrumentation.currentBenchmarkMetricTag
         #endif

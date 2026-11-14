@@ -1796,14 +1796,21 @@ extension FileSystemService {
                 let producer = Task.detached(priority: priority) {
                     let result: Result<Value, Error>
                     do {
+                        // The lease belongs to this physical producer, not its cancellation-
+                        // responsive consumer. Never return it while disk/decoder work is alive.
+                        let physicalOperation: @Sendable () async throws -> Value = {
+                            try await HostResourceBudget.shared.withPermit(
+                                .io, background: workloadClass == .codemap
+                            ) { try await operation() }
+                        }
                         let admittedOperation: @Sendable () async throws -> Value = {
                             if workloadClass == .interactiveRead {
                                 return try await contentReadWorkerLimiter.withForegroundActivity(
                                     kind: .interactiveRead,
-                                    operation
+                                    physicalOperation
                                 )
                             }
-                            return try await operation()
+                            return try await physicalOperation()
                         }
                         let value = try await EditFlowPerf.currentLifecycleCorrelationTaskLocal.withValue(lifecycleCorrelation) {
                             #if DEBUG

@@ -1,20 +1,28 @@
 import Foundation
 
 package enum MCPDomainToolAdmissionLimits {
+    /// Correctness ordering, independent of host capacity.
     package static let exclusiveConnection = 1
-    package static let controlConnection = 8
-    package static let smallReadConnection = 2
-    package static let smallReadPerWindow = 2
+    // Outer widths bound pending calls; physical work shares HostResourceBudget.
+    // Control waits must remain independent so cancel/stop can make progress.
+    // Preserve at least the existing wait/cancel headroom on small hosts: these
+    // permits often represent suspended control calls rather than CPU work.
+    package static let controlConnection = max(8, HostResourceCapacity.baseline.total)
+    package static let smallReadConnection = HostResourceCapacity.baseline.cpu
+    package static let smallReadPerWindow = HostResourceCapacity.baseline.cpu
     package static let fileReadConnection = ContentReadConcurrencyCapacity.maximumConcurrentReads
     package static let fileReadPerWindow = ContentReadConcurrencyCapacity.maximumConcurrentReads
-    package static let gitReadConnection = 2
-    package static let fileSearchConnection = 4
+    package static let gitReadConnection = max(1, HostResourceCapacity.baseline.subprocess)
+    package static let fileSearchConnection = HostResourceCapacity.baseline.cpu
+    /// Same-repository snapshot exclusion is not a host-utilization knob.
     package static let gitReadPerRepository = 1
 }
 
 /// Protocol-neutral, cancellation-safe admission keyed by the physical state resource.
 /// Connection lanes provide client ordering; this controller bounds cross-connection work.
 package final class MCPDomainToolResourceAdmissionController: @unchecked Sendable {
+    // Preserve the existing explicit package sendability contracts.
+    // swiftformat:disable redundantSendable
     package enum AdmissionError: Error, Equatable, Sendable {
         case closed
     }
@@ -31,11 +39,13 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
         case repository(String)
     }
 
+    // swiftformat:enable redundantSendable
+
     package final class Lease: @unchecked Sendable {
         private let lock = NSLock()
         private var releaseAction: (() -> Void)?
 
-        fileprivate init(releaseAction: @escaping () -> Void) {
+        init(releaseAction: @escaping () -> Void) {
             self.releaseAction = releaseAction
         }
 

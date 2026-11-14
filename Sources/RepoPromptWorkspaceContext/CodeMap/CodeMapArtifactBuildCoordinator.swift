@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptCodeMapCore
+import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptFoundation
 import RepoPromptPersistence
@@ -351,6 +352,10 @@ struct CodeMapArtifactBuilderClient: @unchecked Sendable {
         execute = { input, ownerID, priority in
             let permitStart = clock.nowNanoseconds()
             return try await withPermit(ownerID, priority.taskPriority) {
+                // Input content is already captured. This lease covers only synchronous
+                // parse/extract work, never source reads or Git discovery/admission.
+                let hostLease = try await HostResourceBudget.shared.acquire(.cpu, background: true)
+                defer { hostLease.release() }
                 let buildStart = clock.nowNanoseconds()
                 let permitWait = Self.duration(from: permitStart, to: buildStart)
                 try Task.checkCancellation()
