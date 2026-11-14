@@ -1607,7 +1607,7 @@ package actor FileSearchActor {
             }
             // Bound decoded text retained by simultaneous searches waiting for CPU.
             // This reservation is separate from physical work (memory -> I/O -> CPU).
-            let contentReservation = try await plan.hostBudget.acquire(.retainedContent)
+            let contentReservation = try await plan.hostBudget.reserveContent()
             defer { contentReservation.release() }
             let snapshot = try await EditFlowPerf.measure(
                 EditFlowPerf.Stage.Search.fileContentFetch,
@@ -1644,78 +1644,85 @@ package actor FileSearchActor {
             let hostLease = try await plan.hostBudget.acquire(.cpu)
             defer { hostLease.release() }
             try Task.checkCancellation()
+            // A fast uncontended async grant need not yield the executor. Drain Cocoa
+            // matching/bridging temporaries per file, before releasing its memory lease,
+            // rather than retaining them until an arbitrary executor autorelease boundary.
+            return try autoreleasepool {
+                // Bridged UTF-8 counting may transcode; it remains under CPU admission.
+                contentReservation.captured(utf8Bytes: text.utf8.count)
 
-            if plan.countOnly {
-                let fastPathState = EditFlowPerf.begin(
-                    EditFlowPerf.Stage.Search.countOnlyFastPath,
-                    EditFlowPerf.Dimensions(
-                        fileBytes: text.utf8.count,
-                        scanKind: scanKind(for: plan),
-                        isRegex: plan.engine != nil,
-                        countOnly: true
-                    )
-                )
-                if let summary = try Self.scanCountOnlyFastPath(plan: plan, text: text) {
-                    EditFlowPerf.end(
+                if plan.countOnly {
+                    let fastPathState = EditFlowPerf.begin(
                         EditFlowPerf.Stage.Search.countOnlyFastPath,
-                        fastPathState,
                         EditFlowPerf.Dimensions(
-                            status: "hit",
                             fileBytes: text.utf8.count,
-                            matchCount: summary.lineMatchCount,
                             scanKind: scanKind(for: plan),
                             isRegex: plan.engine != nil,
                             countOnly: true
                         )
                     )
-                    return SearchFileScanBatch(
-                        ordinal: input.ordinal,
-                        matches: [],
-                        summary: summary,
-                        errors: []
+                    if let summary = try Self.scanCountOnlyFastPath(plan: plan, text: text) {
+                        EditFlowPerf.end(
+                            EditFlowPerf.Stage.Search.countOnlyFastPath,
+                            fastPathState,
+                            EditFlowPerf.Dimensions(
+                                status: "hit",
+                                fileBytes: text.utf8.count,
+                                matchCount: summary.lineMatchCount,
+                                scanKind: scanKind(for: plan),
+                                isRegex: plan.engine != nil,
+                                countOnly: true
+                            )
+                        )
+                        return SearchFileScanBatch(
+                            ordinal: input.ordinal,
+                            matches: [],
+                            summary: summary,
+                            errors: []
+                        )
+                    }
+                    EditFlowPerf.end(
+                        EditFlowPerf.Stage.Search.countOnlyFastPath,
+                        fastPathState,
+                        EditFlowPerf.Dimensions(
+                            status: "miss",
+                            fileBytes: text.utf8.count,
+                            scanKind: scanKind(for: plan),
+                            isRegex: plan.engine != nil,
+                            countOnly: true
+                        )
                     )
                 }
-                EditFlowPerf.end(
-                    EditFlowPerf.Stage.Search.countOnlyFastPath,
-                    fastPathState,
-                    EditFlowPerf.Dimensions(
-                        status: "miss",
-                        fileBytes: text.utf8.count,
-                        scanKind: scanKind(for: plan),
-                        isRegex: plan.engine != nil,
-                        countOnly: true
-                    )
+
+                let cacheIdentity = Self.lineIndexCacheIdentity(for: file, content: text, contentRevision: snapshot.contentRevision)
+                let documentBuild = Self.searchDocument(
+                    for: text,
+                    filePath: file.fullPath,
+                    contextLines: plan.contextLines,
+                    cacheIdentity: cacheIdentity
+                )
+                let document = documentBuild.document
+                let summary = try Self.scan(
+                    engine: plan.engine,
+                    in: document,
+                    literalPattern: plan.literalPattern,
+                    caseInsensitive: plan.caseInsensitive,
+                    wholeWord: plan.wholeWord,
+                    fuzzySpaceMatching: plan.fuzzySpaceMatching,
+                    countOnly: plan.countOnly,
+                    maxCollectedMatches: plan.maxCollectedMatches,
+                    regexTraits: plan.regexTraits
+                )
+
+                return SearchFileScanBatch(
+                    ordinal: input.ordinal,
+                    matches: plan.countOnly ? [] : Self.materializeMatches(
+                        document: document, summary: summary, remaining: plan.maxCollectedMatches ?? 0
+                    ),
+                    summary: summary,
+                    errors: []
                 )
             }
-
-            let cacheIdentity = Self.lineIndexCacheIdentity(for: file, content: text, contentRevision: snapshot.contentRevision)
-            let documentBuild = Self.searchDocument(
-                for: text,
-                filePath: file.fullPath,
-                contextLines: plan.contextLines,
-                cacheIdentity: cacheIdentity
-            )
-            let document = documentBuild.document
-            let summary = try Self.scan(
-                engine: plan.engine,
-                in: document,
-                literalPattern: plan.literalPattern,
-                caseInsensitive: plan.caseInsensitive,
-                wholeWord: plan.wholeWord,
-                fuzzySpaceMatching: plan.fuzzySpaceMatching,
-                countOnly: plan.countOnly,
-                maxCollectedMatches: plan.maxCollectedMatches,
-                regexTraits: plan.regexTraits
-            )
-
-            return SearchFileScanBatch(
-                ordinal: input.ordinal,
-                matches: plan.countOnly ? [] : Self.materializeMatches(
-                    document: document, summary: summary, remaining: plan.maxCollectedMatches ?? 0
-                ),
-                summary: summary,
-                errors: []
-            )
         } catch let error as ContentReadSchedulerError {
             throw StoreBackedWorkspaceSearchAdmissionError.contentReadQueueFull(
                 retryAfterMilliseconds: error.retryAfterMilliseconds

@@ -4,6 +4,29 @@ import XCTest
 
 /// A reproducible real headless-read workload, not a live-app latency benchmark.
 final class HostResourceBurstEvidenceTests: XCTestCase {
+    func testUncontendedAdmissionServiceCost() async throws {
+        guard ProcessInfo.processInfo.environment["REPOPROMPT_TEST_SANDBOX_ROOT"] != nil,
+              FileManager.default.fileExists(atPath: ".build/host-ab/profile-gate")
+        else { throw XCTSkip("Opt-in gate microprofile through conductor") }
+        try FileManager.default.removeItem(atPath: ".build/host-ab/profile-gate")
+        for (label, budget) in [("isolated", HostResourceBudget(capacity: .baseline)), ("shared", HostResourceBudget.shared)] {
+            let before = budget.snapshot()
+            let started = DispatchTime.now().uptimeNanoseconds
+            for _ in 0 ..< 10000 {
+                let lease = try await budget.acquire(.io)
+                lease.release()
+            }
+            let elapsed = DispatchTime.now().uptimeNanoseconds - started
+            let after = budget.snapshot()
+            if label == "isolated" {
+                XCTAssertEqual(after.active, 0)
+                XCTAssertEqual(after.waiting, 0)
+                XCTAssertEqual(after.granted - before.granted, 10000)
+            }
+            print("HOST_GATE_SERVICE label=\(label) grants=10000 wall_ns=\(elapsed) admission_ns=\(after.waitNanoseconds - before.waitNanoseconds)")
+        }
+    }
+
     func testConcurrentPhysicalReadBurst() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

@@ -78,7 +78,9 @@ package actor GitProcessAdmissionController {
     package nonisolated static let defaultGlobalLimit = max(1, HostResourceCapacity.baseline.subprocess)
     // Fair-share fan-out, not a Git index lock. MCP's repository snapshot exclusion
     // and the mutation authority remain separate and unchanged.
-    package nonisolated static let defaultPerRepositoryLimit = max(1, defaultGlobalLimit / 2)
+    // Do not expand same-repository subprocess bursts beyond main's existing share
+    // until measured separately from MCP's serial repository-snapshot lane.
+    package nonisolated static let defaultPerRepositoryLimit = max(1, min(2, defaultGlobalLimit / 2))
     package nonisolated static let defaultMaximumWaiterCount = 1024
     package nonisolated static let defaultMaximumWaitersPerRepository = 256
     package nonisolated static let defaultMaximumDeadlineWaiterCount = 128

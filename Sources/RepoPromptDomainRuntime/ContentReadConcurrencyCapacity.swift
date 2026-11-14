@@ -3,6 +3,8 @@
 package enum ContentReadConcurrencyCapacity {
     package static let maximumConcurrentReads = max(2, HostResourceCapacity.baseline.io)
     package static let maximumConcurrentBulkReads = min(
-        maximumConcurrentReads - 1, HostResourceCapacity.baseline.background
+        // Retain the existing main ceiling for background prefetch until a larger
+        // bulk/CodeMap workload demonstrates a gain; host pressure can reduce it further.
+        3, maximumConcurrentReads - 1, HostResourceCapacity.baseline.background
     )
 }

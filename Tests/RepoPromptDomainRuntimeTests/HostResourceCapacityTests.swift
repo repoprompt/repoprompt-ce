@@ -10,30 +10,34 @@ final class HostResourceCapacityTests: XCTestCase {
         memory: HostResourceSample.Pressure = .normal,
         thermal: HostResourceSample.Pressure = .normal,
         descriptors: Int = 4096,
-        open: Int = 64
+        open: Int = 64,
+        availableMiB: UInt64? = nil,
+        growthMiB: UInt64 = 0
     ) -> HostResourceCapacity {
         HostResourceCapacity.resolve(HostResourceSample(
             logicalCores: cores, performanceCores: performance, memoryBytes: gib * 1024 * 1024 * 1024,
             memoryPressure: memory, thermalPressure: thermal,
-            descriptorLimit: descriptors, openDescriptors: open
+            descriptorLimit: descriptors, openDescriptors: open,
+            availableMemoryBytes: availableMiB.map { $0 * 1024 * 1024 },
+            memoryGrowthBytesPerSecond: growthMiB * 1024 * 1024
         ))
     }
 
     func testPolicyScalesWithResourcesAndReservesHostHeadroom() {
         let small = capacity()
-        XCTAssertEqual(small.total, 7)
-        XCTAssertEqual(small.cpu, 4)
-        XCTAssertEqual(small.io, 7)
-        XCTAssertEqual(small.subprocess, 4)
-        XCTAssertEqual(small.background, 2)
+        XCTAssertEqual(small.total, 8)
+        XCTAssertEqual(small.cpu, 8)
+        XCTAssertEqual(small.io, 8)
+        XCTAssertEqual(small.subprocess, 8)
+        XCTAssertEqual(small.background, 4)
         let large = capacity(cores: 24, performance: 16, gib: 64)
-        XCTAssertEqual(large.total, 23)
-        XCTAssertEqual(large.cpu, 16)
-        XCTAssertEqual(large.background, 8)
+        XCTAssertEqual(large.total, 24)
+        XCTAssertEqual(large.cpu, 24)
+        XCTAssertEqual(large.background, 12)
         XCTAssertGreaterThan(large.io, small.io)
         let lowMemory = capacity(cores: 64, performance: 48, gib: 4)
-        XCTAssertEqual(lowMemory.total, 4)
-        XCTAssertEqual(lowMemory.cpu, 4)
+        XCTAssertEqual(lowMemory.total, 7)
+        XCTAssertEqual(lowMemory.cpu, 7)
     }
 
     func testPressureReducesWorkWithoutZeroingForegroundProgress() {
@@ -48,9 +52,49 @@ final class HostResourceCapacityTests: XCTestCase {
                 if memory == .critical || thermal == .critical { XCTAssertEqual(value.total, 1) }
             }
         }
-        XCTAssertEqual(capacity(memory: .warning).total, 3)
-        XCTAssertEqual(capacity(thermal: .warning).cpu, 2)
+        XCTAssertEqual(capacity(memory: .warning), capacity())
+        XCTAssertEqual(capacity(thermal: .warning).cpu, 4)
         XCTAssertEqual(capacity(cores: 1, performance: 1, gib: 1).total, 1)
+    }
+
+    func testMeasuredHeadroomAndGrowthNotWarningFlagShapeMemoryBackoff() {
+        let nominal = capacity(availableMiB: 4096)
+        XCTAssertEqual(nominal.total, 8)
+        XCTAssertEqual(capacity(memory: .warning, availableMiB: 4096), nominal)
+        // 1 GiB headroom minus the 768 MiB host reserve, half for 64 MiB workers.
+        XCTAssertEqual(capacity(availableMiB: 1024).total, 2)
+        XCTAssertEqual(capacity(availableMiB: 512).total, 1)
+        // Compression/swapout growth of 1.5 GiB/s consumes the two-second headroom.
+        XCTAssertEqual(capacity(availableMiB: 4096, growthMiB: 1536).total, 2)
+        XCTAssertEqual(capacity(thermal: .warning, availableMiB: 4096).total, 8)
+        XCTAssertEqual(capacity(thermal: .warning, availableMiB: 4096).cpu, 4)
+        // Noncritical headroom backoff must not become a hard background pause.
+        XCTAssertEqual(capacity(availableMiB: 512).background, 1)
+        XCTAssertEqual(capacity(memory: .critical, availableMiB: 512).background, 0)
+        // A hardware-limited single-core host must still make background progress.
+        XCTAssertEqual(capacity(cores: 1, performance: 1).background, 1)
+    }
+
+    func testShrinkingCapturedContentReturnsUnusedReservationWithoutAnUpgradeWait() async throws {
+        let budget = HostResourceBudget(capacity: capacity(memory: .critical))
+        let first = try await budget.reserveContent()
+        let next = Task { try await budget.reserveContent() }
+        try await waitForWaiters(1, budget: budget)
+        XCTAssertEqual(budget.snapshot().activeContentUnits, 8)
+        first.captured(utf8Bytes: 1000)
+        XCTAssertEqual(budget.snapshot().activeContentUnits, 1)
+        // The conservative 8-unit next capture still waits, rather than overspending.
+        XCTAssertEqual(budget.snapshot().waiting, 1)
+        first.release()
+        first.captured(utf8Bytes: 0) // late shrink must neither release twice nor go negative
+        let second = try await next.value
+        XCTAssertEqual(budget.snapshot().activeContentUnits, 8)
+        second.captured(utf8Bytes: 1000)
+        let small = try await budget.acquire(.io)
+        small.release()
+        second.release()
+        XCTAssertEqual(budget.snapshot().activeContentUnits, 0)
+        XCTAssertEqual(budget.snapshot().active, 0)
     }
 
     func testDescriptorExhaustionSuspendsOnlyDescriptorWork() {
@@ -91,7 +135,7 @@ final class HostResourceCapacityTests: XCTestCase {
     }
 
     func testCPUAndSubprocessesShareOneCPUCeiling() async throws {
-        let budget = HostResourceBudget(capacity: capacity())
+        let budget = HostResourceBudget(capacity: capacity(thermal: .warning))
         let leases = try await (0 ..< 4).asyncLeases(budget)
         let process = Task { try await budget.acquire(.subprocess) }
         try await waitForWaiters(1, budget: budget)
@@ -167,7 +211,7 @@ final class HostResourceCapacityTests: XCTestCase {
     }
 
     func testBackgroundCannotOccupyForegroundReserveAndReleaseIsIdempotent() async throws {
-        let budget = HostResourceBudget(capacity: capacity())
+        let budget = HostResourceBudget(capacity: capacity(thermal: .warning))
         let first = try await budget.acquire(.cpu, background: true)
         let second = try await budget.acquire(.io, background: true)
         let background = Task { try await budget.acquire(.io, background: true) }
