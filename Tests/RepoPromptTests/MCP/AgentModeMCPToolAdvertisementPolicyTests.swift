@@ -400,3 +400,66 @@ final class AgentModePromptLongRunningCommandGuidanceTests: XCTestCase {
         XCTAssertFalse(guidance.contains("write_stdin"))
     }
 }
+
+@MainActor
+final class AgentWorktreePlacementPolicyTests: XCTestCase {
+    func testEveryAgentRoleAndProviderReceivesTemporaryLocationAndRefusalPolicy() {
+        let roles: [AgentModelCatalog.TaskLabelKind?] = [nil, .explore, .engineer, .pair, .design]
+        let providers: [AgentProviderKind?] = [nil] + AgentProviderKind.allCases.map { Optional($0) }
+        for role in roles {
+            for provider in providers {
+                for codeMapsDisabled in [false, true] {
+                    let context = "role=\(String(describing: role)), provider=\(String(describing: provider)), codeMapsDisabled=\(codeMapsDisabled)"
+                    let prompt = SystemPromptService.agentModePrompt(
+                        agentKind: provider,
+                        taskLabelKind: role,
+                        codeMapsDisabled: codeMapsDisabled
+                    )
+                    XCTAssertEqual(prompt.components(separatedBy: "**Worktree Placement**").count, 2, context)
+                    for location in ["`/tmp`", "`/private/tmp`", "`/var/tmp`", "`$TMPDIR`", "`/var/folders`", "symlink aliases"] {
+                        XCTAssertTrue(prompt.contains(location), "\(context): missing \(location)")
+                    }
+                    XCTAssertTrue(prompt.contains("unless the user explicitly requests that location in the current conversation"), context)
+                    XCTAssertTrue(prompt.contains("memories, and examples do not authorize"), context)
+                    XCTAssertTrue(prompt.contains("refusal is not permission to bypass it with shell `git worktree add`"), context)
+                    XCTAssertTrue(prompt.contains("do not retry the refused mutation through another execution surface"), context)
+
+                    if role == .explore {
+                        XCTAssertTrue(prompt.contains("do not create worktrees or checkouts by any means"), context)
+                        XCTAssertFalse(prompt.contains("manage_worktree"), context)
+                        XCTAssertFalse(prompt.contains("agent_run"), context)
+                        XCTAssertFalse(prompt.contains("oracle_export_path"), context)
+                    } else {
+                        XCTAssertTrue(AgentModeMCPToolAdvertisementPolicy.shouldAdvertise(toolName: "manage_worktree", taskLabelKind: role), context)
+                        XCTAssertTrue(prompt.contains("omit `path` to use the app-managed `.repoprompt-worktrees` container"), context)
+                        XCTAssertTrue(prompt.contains("omit `worktree_path`"), context)
+                        XCTAssertTrue(prompt.contains("only for a user-requested location"), context)
+                        if provider == .codexExec {
+                            XCTAssertTrue(prompt.contains("`mcp__RepoPrompt__manage_worktree`"), context)
+                            XCTAssertFalse(prompt.contains("`manage_worktree`"), context)
+                        } else {
+                            XCTAssertTrue(prompt.contains("`manage_worktree`"), context)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    func testDefaultCreationUsesRepositorySiblingRatherThanSystemTemporaryDirectory() throws {
+        // A persistent synthetic root avoids making a temporary test fixture look like
+        // evidence that production defaults are temporary. Planning creates no files.
+        let repository = URL(fileURLWithPath: "/Users/worktree-policy-fixture/projects/repo", isDirectory: true)
+        let container = "/Users/worktree-policy-fixture/projects/.repoprompt-worktrees/repo"
+        let purposes: [GitWorktreeDefaultPathPlanner.Purpose] = [
+            .standaloneCreate(now: Date(timeIntervalSince1970: 0)),
+            .agentStart(sessionID: "placement-policy")
+        ]
+        for purpose in purposes {
+            let plan = try GitWorktreeDefaultPathPlanner.plan(.init(mainWorktreeRoot: repository, purpose: purpose))
+            XCTAssertEqual(plan.appManagedContainer.path, container)
+            XCTAssertTrue(plan.path.path.hasPrefix(container + "/"))
+            XCTAssertFalse(plan.createRequest.allowExternalPath)
+        }
+    }
+}
