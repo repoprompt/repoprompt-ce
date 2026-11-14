@@ -100,7 +100,8 @@ final class AgentFileTagWorktreeResolutionTests: XCTestCase {
                     workspacePaths: [fixture.logicalRoot.path], workspace: {
                         await gate.wait()
                         return source
-                    }, session: session, handoff: scope.handoff, ignoresPendingHandoff: true,
+                    }, workspaceCaptureOrder: .beforeSkillExpansion,
+                    session: session, handoff: scope.handoff, ignoresPendingHandoff: true,
                     skipsSlashExpansion: true, isCurrent: { current }
                 )
             }
@@ -152,6 +153,23 @@ final class AgentFileTagWorktreeResolutionTests: XCTestCase {
         XCTAssertTrue(result.contains("<selected_skill_context name=\"inspect\""), result)
         XCTAssertTrue(result.contains("let origin = \"base\""), result)
         XCTAssertFalse(result.contains("let origin = \"worktree\""), result)
+        let canonicalCatalog = AgentSkillCatalog(homeDirectoryURL: fixture.logicalRoot.appendingPathComponent("home"))
+        let canonicalInput = AgentSessionProviderInputRuntime(skillCatalog: canonicalCatalog, perfRecorder: NoopAgentModePerfRecorder())
+        var canonicalReads = 0
+        let canonical = await canonicalInput.augmentUserMessage(
+            "/skill:inspect @Sources/App.swift", attachments: [], taggedFileAttachments: [], agent: .claudeCode,
+            workspacePaths: [], workspace: {
+                canonicalReads += 1
+                XCTAssertNil(canonicalCatalog.resolve(name: "inspect"), "Canonical roots must be captured before skill discovery")
+                return .init(store: fixture.store, lookupSource: nil, workspacePaths: [fixture.logicalRoot.path])
+            }, workspaceCaptureOrder: .beforeSkillExpansion,
+            session: nil, handoff: scope.handoff, ignoresPendingHandoff: true,
+            skipsSlashExpansion: false, isCurrent: { true }
+        )
+        XCTAssertEqual(canonicalReads, 1, "Rendered input must retain the same capture, not read successor roots")
+        XCTAssertTrue(canonical.contains("<selected_skill_context name=\"inspect\""), canonical)
+        XCTAssertTrue(canonical.contains("let origin = \"base\""), canonical)
+        XCTAssertFalse(canonical.contains("let origin = \"worktree\""), canonical)
         let refused = await input.augmentUserMessage(
             "@Sources/App.swift", attachments: [], taggedFileAttachments: [], agent: .claudeCode,
             workspacePaths: [fixture.logicalRoot.path], workspace: {

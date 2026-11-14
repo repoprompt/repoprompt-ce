@@ -34,6 +34,13 @@ extension AgentSessionProviderInputRuntime {
         }
     }
 
+    /// Legacy presentation bindings are resolved after skill discovery; canonical requests
+    /// must first capture the exact resource whose roots authorize that discovery.
+    enum WorkspaceCaptureOrder {
+        case afterSkillExpansion
+        case beforeSkillExpansion
+    }
+
     struct InitialThreadInput {
         let workspace: WorkspaceSource
         let selection: StoredSelection
@@ -47,6 +54,7 @@ extension AgentSessionProviderInputRuntime {
         agent: AgentProviderKind,
         workspacePaths: [String],
         workspace: @MainActor () async throws -> WorkspaceSource?,
+        workspaceCaptureOrder: WorkspaceCaptureOrder = .afterSkillExpansion,
         session: AgentTabSession?,
         handoff: AgentSessionHandoffRuntime,
         ignoresPendingHandoff: Bool,
@@ -55,9 +63,12 @@ extension AgentSessionProviderInputRuntime {
         onTaggedFileFailures: ([ExplicitFileFailure]) -> Void = { _ in }
     ) async rethrows -> String {
         guard isCurrent() else { return text }
-        // The same canonical capture supplies skill roots and rendered context. Its currency
-        // travels with the source; a later read must not validate bytes from this request.
-        let source = try await workspace()
+        // Canonical capture supplies both skill roots and rendered context. Legacy callers
+        // retain their post-discovery binding lookup; neither path reads the source twice.
+        var source: WorkspaceSource?
+        if workspaceCaptureOrder == .beforeSkillExpansion {
+            source = try await workspace()
+        }
         func current() -> Bool {
             isCurrent() && (source?.isCurrent() ?? true)
         }
@@ -65,6 +76,10 @@ extension AgentSessionProviderInputRuntime {
         let expanded = skipsSlashExpansion ? text : await expandSlashSkillInvocationIfNeeded(
             text, agentKind: agent, workspacePaths: source?.workspacePaths ?? workspacePaths, shouldPublishCatalog: current
         )
+        guard current() else { return expanded }
+        if workspaceCaptureOrder == .afterSkillExpansion {
+            source = try await workspace()
+        }
         guard current() else { return expanded }
         let context: Context? = if let workspace = source {
             await Context(store: workspace.store, lookup: workspace.lookupContext())
@@ -93,11 +108,15 @@ extension AgentSessionProviderInputRuntime {
         agent: AgentProviderKind,
         workspacePaths: [String],
         workspace: @MainActor () async throws -> WorkspaceSource?,
+        workspaceCaptureOrder: WorkspaceCaptureOrder = .afterSkillExpansion,
         skipsSlashExpansion: Bool,
         isCurrent: @MainActor () -> Bool
     ) async rethrows -> TaggedFileAugmentation {
         guard isCurrent() else { return .init(text: text, includedPaths: [], failures: []) }
-        let source = try await workspace()
+        var source: WorkspaceSource?
+        if workspaceCaptureOrder == .beforeSkillExpansion {
+            source = try await workspace()
+        }
         func current() -> Bool {
             isCurrent() && (source?.isCurrent() ?? true)
         }
@@ -105,6 +124,10 @@ extension AgentSessionProviderInputRuntime {
         let expanded = skipsSlashExpansion ? text : await expandSlashSkillInvocationIfNeeded(
             text, agentKind: agent, workspacePaths: source?.workspacePaths ?? workspacePaths, shouldPublishCatalog: current
         )
+        guard current() else { return .init(text: text, includedPaths: [], failures: []) }
+        if workspaceCaptureOrder == .afterSkillExpansion {
+            source = try await workspace()
+        }
         guard current() else { return .init(text: text, includedPaths: [], failures: []) }
         let context: Context? = if let source {
             await Context(store: source.store, lookup: source.lookupContext())

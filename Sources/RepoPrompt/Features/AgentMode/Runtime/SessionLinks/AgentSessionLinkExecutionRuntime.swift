@@ -33,6 +33,7 @@ final class AgentSessionLinkExecutionRuntime {
         let settleSelfCompact: @MainActor (AgentTabSession) -> Void
         let selfCompactBlocksWake: @MainActor (AgentTabSession) -> Bool
         let selfCompactHoldsWakeAcquisition: @MainActor (AgentTabSession) -> Bool
+        var workspaceCaptureOrder: AgentSessionProviderInputRuntime.WorkspaceCaptureOrder = .afterSkillExpansion
     }
 
     private(set) weak var scope: AgentSessionRuntimeStore.Scope?

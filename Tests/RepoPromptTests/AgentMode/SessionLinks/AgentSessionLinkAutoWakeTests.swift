@@ -7674,27 +7674,22 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             await controller.setRejectResume(true)
             let freshController = MonitorFakeNativeController()
             var creations = 0
+            // The coordinator captures its concrete workspace owner during initialization.
+            let manager = hasResources ? AgentSessionLinkEndpointTestSupport.makeWorkspace(
+                tabID: fixture.tabID, name: "Claude resume recovery"
+            ) : nil
+            let workspaceID = try hasResources ? XCTUnwrap(manager?.activeWorkspaceID) : UUID()
             let host = AgentModeViewModel(
                 testWindowID: -904,
                 codexControllerFactory: { _, _, _, _, _, _ in fatalError("Claude recovery must not construct Codex") },
                 claudeControllerFactory: { _, _, _, _ in
                     creations += 1
                     return creations == 1 ? controller : freshController
-                }
+                },
+                testPromptManager: manager?.promptViewModel,
+                testWorkspaceManager: manager
             )
-            // Recovery requires the same concrete workspace owner as production admission,
-            // not a restored-looking binding to an unrelated UUID on a resource-less test VM.
-            let manager: WorkspaceManagerViewModel?
-            let workspaceID: UUID
-            if hasResources {
-                manager = AgentSessionLinkEndpointTestSupport.installWorkspace(
-                    on: host, tabID: fixture.tabID, name: "Claude resume recovery"
-                )
-                workspaceID = try XCTUnwrap(manager?.activeWorkspaceID)
-            } else {
-                manager = nil
-                workspaceID = UUID()
-            }
+            host.test_setCurrentTabIDOverride(fixture.tabID)
             defer { withExtendedLifetime(manager) {} }
             let session = host.session(for: fixture.tabID)
             session.hasLoadedPersistedState = true

@@ -66,6 +66,7 @@ extension AgentSessionLinkExecutionRuntime {
                     capturedWorkspace = source
                     return source
                 },
+                workspaceCaptureOrder: commands.workspaceCaptureOrder,
                 session: session, handoff: owner.handoff, ignoresPendingHandoff: false,
                 skipsSlashExpansion: skipsSlashExpansion, isCurrent: admission, onTaggedFileFailures: { failures = $0 }
             )

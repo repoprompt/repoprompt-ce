@@ -62,6 +62,7 @@ extension AgentSessionLinkExecutionRuntime {
                     if let source { inputSources.append(source) }
                     return source
                 },
+                workspaceCaptureOrder: commands.workspaceCaptureOrder,
                 session: session, handoff: owner.handoff, ignoresPendingHandoff: true,
                 skipsSlashExpansion: skipsSlashExpansion, isCurrent: inputIsCurrent,
                 onTaggedFileFailures: { taggedFileFailures = $0 }

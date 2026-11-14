@@ -327,7 +327,8 @@ final class AgentSessionRunStartRuntime {
                         let source = try await environment.inputWorkspace(session)
                         if let source { inputSources.append(source) }
                         return source
-                    }, session: session, handoff: owner.handoff,
+                    }, workspaceCaptureOrder: environment.hostResources == nil ? .afterSkillExpansion : .beforeSkillExpansion,
+                    session: session, handoff: owner.handoff,
                     ignoresPendingHandoff: directStartOptions.ignoresPendingHandoff,
                     skipsSlashExpansion: directStartOptions.skipsSlashExpansion, isCurrent: inputIsCurrent,
                     onTaggedFileFailures: { taggedFileFailures = $0 }
