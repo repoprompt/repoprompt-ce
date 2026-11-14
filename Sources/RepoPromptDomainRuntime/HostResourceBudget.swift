@@ -25,6 +25,7 @@ package final class HostResourceBudget: @unchecked Sendable {
         package let capacity: HostResourceCapacity
         package let active: Int
         package let activeByKind: [Kind: Int]
+        package let activeContentUnits: Int
         package let activeBackground: Int
         package let waiting: Int
         package let peakActive: Int
@@ -43,6 +44,7 @@ package final class HostResourceBudget: @unchecked Sendable {
         let enqueuedAt = DispatchTime.now().uptimeNanoseconds
         var state = State.initial // all mutable state protected by the budget lock
         var continuation: CheckedContinuation<Lease, Error>?
+        var contentUnits = 8 // 64 MiB units, conservatively reserve 512 MiB before capture
         init(kind: Kind, background: Bool) {
             self.kind = kind
             self.background = background
@@ -56,6 +58,7 @@ package final class HostResourceBudget: @unchecked Sendable {
     private var active = 0
     private var activeByKind: [Kind: Int] = [:]
     private var activeBackground = 0
+    private var activeContentUnits = 0
     private var peakActive = 0
     private var granted: UInt64 = 0
     private var waitNanoseconds: UInt64 = 0
@@ -74,6 +77,7 @@ package final class HostResourceBudget: @unchecked Sendable {
                 capacity: capacity,
                 active: active,
                 activeByKind: activeByKind,
+                activeContentUnits: activeContentUnits,
                 activeBackground: activeBackground,
                 waiting: requests.count,
                 peakActive: peakActive,
@@ -149,9 +153,59 @@ package final class HostResourceBudget: @unchecked Sendable {
         return try await body()
     }
 
+    /// A shrink-only memory lease: capture first, then return unused conservative capacity.
+    /// It never waits for an upgrade while owning memory, so physical children cannot deadlock.
+    package final class ContentReservation: @unchecked Sendable {
+        private let lease: Lease
+        private let shrink: @Sendable (Int) -> Void
+        fileprivate init(lease: Lease, shrink: @escaping @Sendable (Int) -> Void) {
+            self.lease = lease
+            self.shrink = shrink
+        }
+
+        package func captured(utf8Bytes: Int) {
+            // UTF-8 byte count upper-bounds UTF-16 units. Avoid a second O(n) UTF-16 walk.
+            // 35x covers text/bridging plus worst-case per-line index arrays.
+            let bytes = min(max(0, utf8Bytes), Int.max / 35) * 35
+            let unit = 64 * 1024 * 1024
+            shrink(max(1, min(8, bytes / unit + (bytes % unit == 0 ? 0 : 1))))
+        }
+
+        package func release() {
+            lease.release()
+        }
+    }
+
+    package func reserveContent() async throws -> ContentReservation {
+        let request = Request(kind: .retainedContent, background: false)
+        let lease = try await acquireWithoutDeadline(request)
+        return ContentReservation(lease: lease) { [self, request] units in
+            let handoffs = lock.withLock {
+                guard request.state == .granted, units < request.contentUnits else { return [Handoff]() }
+                activeContentUnits -= request.contentUnits - units
+                request.contentUnits = units
+                return drain()
+            }
+            resume(handoffs)
+        }
+    }
+
     private func acquireWithoutDeadline(_ kind: Kind, background: Bool) async throws -> Lease {
+        try await acquireWithoutDeadline(Request(kind: kind, background: background))
+    }
+
+    private func acquireWithoutDeadline(_ request: Request) async throws -> Lease {
         try Task.checkCancellation()
-        let request = Request(kind: kind, background: background)
+        // Avoid a continuation and cancellation-handler registration for an uncontended
+        // grant. Queued requests still use the synchronous cancellation state machine.
+        let immediate = lock.withLock { requests.isEmpty && canGrant(request) ? grant(request) : nil }
+        if let immediate {
+            do { try Task.checkCancellation()
+                return immediate
+            } catch { immediate.release()
+                throw error
+            }
+        }
         let lease: Lease = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 let (result, handoffs): (Result<Lease, Error>?, [Handoff]) = lock.withLock {
@@ -190,7 +244,7 @@ package final class HostResourceBudget: @unchecked Sendable {
 
     private func canGrant(_ request: Request) -> Bool {
         if request.kind == .retainedContent {
-            return (activeByKind[.retainedContent] ?? 0) < capacity.retainedContent
+            return activeContentUnits + request.contentUnits <= capacity.retainedContent * 8
         }
         guard active < capacity.total else { return false }
         let descriptorCost: Int = switch request.kind {
@@ -219,15 +273,14 @@ package final class HostResourceBudget: @unchecked Sendable {
     private func grant(_ request: Request) -> Lease {
         request.state = .granted
         if request.kind != .retainedContent { active += 1 }
+        else { activeContentUnits += request.contentUnits }
         activeByKind[request.kind, default: 0] += 1
         if request.background, request.kind != .retainedContent { activeBackground += 1 }
         peakActive = max(peakActive, active)
         granted &+= 1
         waitNanoseconds &+= DispatchTime.now().uptimeNanoseconds - request.enqueuedAt
         reportBusyLocked()
-        let kind = request.kind
-        let background = request.background && request.kind != .retainedContent
-        return Lease { [self] in release(kind, background: background) }
+        return Lease { [self, request] in release(request) }
     }
 
     private typealias Handoff = (CheckedContinuation<Lease, Error>, Lease)
@@ -257,9 +310,13 @@ package final class HostResourceBudget: @unchecked Sendable {
         }
     }
 
-    private func release(_ kind: Kind, background: Bool) {
+    private func release(_ request: Request) {
         let handoffs = lock.withLock {
+            let kind = request.kind
+            let background = request.background && kind != .retainedContent
+            request.state = .cancelled // fences a late shrink racing release
             if kind != .retainedContent { active -= 1 }
+            else { activeContentUnits -= request.contentUnits }
             activeByKind[kind, default: 0] -= 1
             if activeByKind[kind] == 0 { activeByKind.removeValue(forKey: kind) }
             if background { activeBackground -= 1 }
