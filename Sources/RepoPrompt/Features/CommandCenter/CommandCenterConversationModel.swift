@@ -7,9 +7,9 @@ import RepoPromptSettingsCore
 @MainActor
 final class CommandCenterConversationModel: ObservableObject {
     struct Snapshot: Equatable {
-        let windowID: Int
+        let windowID: Int?
         let workspaceID: UUID
-        let tabID: UUID
+        let tabID: UUID?
         let title: String
         let provider: String
         let runState: String
@@ -26,6 +26,7 @@ final class CommandCenterConversationModel: ObservableObject {
 
     enum LoadResult {
         case ready(Source)
+        case saved(AgentSession, isCurrent: @MainActor () -> Bool = { true })
         case unavailable(String)
     }
 
@@ -47,6 +48,9 @@ final class CommandCenterConversationModel: ObservableObject {
     private var drafts: [Destination: String] = [:]
     private var generation = UUID()
     private var source: Source?
+    private var savedSession: AgentSession?
+    private var savedIsCurrent: (@MainActor () -> Bool)?
+    private var selectedRow: CommandCenterSessionRow?
     private var loading: Task<Void, Never>?
     private var observation: AnyCancellable?
     private var timer: AnyCancellable?
@@ -69,6 +73,7 @@ final class CommandCenterConversationModel: ObservableObject {
         detach()
         switchDraft(to: .session(row.id))
         selectedID = row.id
+        selectedRow = row
         projectID = row.workspaceID
         rowLimit = 500
         isLoading = true
@@ -83,6 +88,12 @@ final class CommandCenterConversationModel: ObservableObject {
             case let .unavailable(reason): message = reason
             case let .ready(source):
                 install(source)
+            case let .saved(session, isCurrent):
+                savedSession = session
+                savedIsCurrent = isCurrent
+                timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+                    .sink { [weak self] _ in self?.refresh() }
+                refresh()
             }
         }
     }
@@ -134,11 +145,28 @@ final class CommandCenterConversationModel: ObservableObject {
     func showEarlier() {
         guard isEnabled(), rowLimit < 5000 else { return }
         rowLimit = min(5000, rowLimit + 500)
+        if savedSession != nil { snapshot = nil }
         refresh()
     }
 
     func refresh() {
         guard isEnabled() else { stop()
+            return
+        }
+        if let savedSession, let selectedID {
+            guard savedIsCurrent?() == true else {
+                if let selectedRow { select(selectedRow) }
+                return
+            }
+            guard snapshot == nil else { return }
+            let rows = CommandCenterConversationRows.buildSaved(savedSession, limit: rowLimit)
+            snapshot = Snapshot(
+                windowID: nil, workspaceID: selectedID.workspaceID,
+                tabID: savedSession.composeTabID,
+                title: savedSession.name, provider: savedSession.agentKind ?? "",
+                runState: "saved", rows: rows.rows, hasEarlierRows: rows.hasEarlier,
+                hasPendingInteraction: false
+            )
             return
         }
         guard let source else { return }
@@ -169,6 +197,9 @@ final class CommandCenterConversationModel: ObservableObject {
         observation = nil
         timer = nil
         source = nil
+        savedSession = nil
+        savedIsCurrent = nil
+        selectedRow = nil
         snapshot = nil
         message = nil
         isLoading = false
@@ -179,6 +210,15 @@ final class CommandCenterConversationModel: ObservableObject {
 /// window's display from retained canonical compacted turns plus the live mutable suffix instead;
 /// never ask the owner to sync its active UI. Work is bounded to the requested tail (maximum 5,000).
 enum CommandCenterConversationRows {
+    /// Saved values are presentation only: no runtime normalization or persistence repair.
+    static func buildSaved(_ session: AgentSession, limit: Int) -> (rows: [AgentChatItem], hasEarlier: Bool) {
+        if let transcript = session.transcript {
+            return build(transcript: transcript, working: session.workingSourceItems(), hiddenIDs: [], limit: limit)
+        }
+        let limit = max(1, min(limit, 5000))
+        return (session.items.suffix(limit).map { $0.toItem() }, session.items.count > limit)
+    }
+
     static func build(
         transcript: AgentTranscript, working: [AgentChatItem], hiddenIDs: Set<UUID>, limit requested: Int
     ) -> (rows: [AgentChatItem], hasEarlier: Bool) {

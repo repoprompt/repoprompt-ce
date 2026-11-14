@@ -75,27 +75,61 @@ enum CommandCenterConversationHost {
         if let owner = census.uniqueRuntimeOwners[row.sessionID], owner.location.workspaceID == row.workspaceID {
             return .ready(source(for: owner, isEnabled: isEnabled))
         }
-        // Only the canonical active-workspace carrier can load an unmaterialized session here.
-        // Historical/rebound/stashed/cold carriers use explicit Open, not an owner factory or an
-        // oversight preparation whose retention/handoff lifetime belongs to a different feature.
-        guard !manager.hasPreparedRuntime(row.sessionID), let location = census.uniqueLocations[row.sessionID],
-              census.isCurrent(), location.workspaceID == row.workspaceID,
-              location.tab.id == row.tabID, location.stashedTabID == nil,
-              location.tab.activeAgentSessionID == row.sessionID,
-              location.window.workspaceManager.activeWorkspaceID == row.workspaceID
-        else {
-            return .unavailable("Open this session in its workspace to load the conversation. Its saved metadata remains listed here.")
+        guard census.uniqueRuntimeOwners[row.sessionID] == nil, !manager.hasPreparedRuntime(row.sessionID) else {
+            return .unavailable("This session's runtime moved or is being prepared. Select it again after the transition completes.")
         }
-        let window = location.window
-        _ = await window.agentModeViewModel.ensureSessionReady(tabID: location.tab.id, reconnectActiveProviders: false)
-        guard isEnabled(), !Task.isCancelled,
-              let current = SessionAdminWindows.runtimeOwner(for: row.sessionID),
-              current.location.window === window, current.location.workspaceID == row.workspaceID,
-              current.location.tab.id == location.tab.id
-        else {
-            return .unavailable("The session changed or could not be loaded. Open its workspace to continue.")
+        // Browsing history must not materialize a runtime, even when its workspace is open.
+        return await loadSaved(row, isEnabled: isEnabled)
+    }
+
+    private static func loadSaved(
+        _ row: CommandCenterSessionRow, isEnabled: @escaping @MainActor () -> Bool
+    ) async -> CommandCenterConversationModel.LoadResult {
+        let store = AppDomainRuntimeComposition.shared.runtime.workspaceStore
+        let catalog = await store.snapshot()
+        guard isEnabled(), !Task.isCancelled, !WindowStatesManager.shared.isTerminating,
+              !catalog.unavailableWorkspaceIDs.contains(row.workspaceID),
+              let document = catalog.workspaces.first(where: { $0.document.workspaceID == row.workspaceID })?.document
+        else { return .unavailable("This project's saved history is unavailable.") }
+        do {
+            guard let session = try await AgentSessionDataService.shared.readSavedConversation(
+                id: row.sessionID, workspaceID: row.workspaceID, directory: document.fileURL.deletingLastPathComponent()
+            ) else { return .unavailable("This saved conversation no longer exists.") }
+            let current = await store.snapshot()
+            guard isEnabled(), !Task.isCancelled, !WindowStatesManager.shared.isTerminating,
+                  !current.unavailableWorkspaceIDs.contains(row.workspaceID),
+                  current.workspaces.first(where: { $0.document.workspaceID == row.workspaceID })?.document.fileURL == document.fileURL
+            else { return .unavailable("The project changed while loading. Select the session again.") }
+            // A live owner may have appeared while disk I/O was suspended. Never show a saved
+            // frame in place of its newer canonical state or silently select an ambiguous owner.
+            let census = AgentSessionCarrierResolver.capture(
+                windows: WindowStatesManager.shared.sessionRuntimeWindows,
+                sessionIDs: [row.sessionID], includeRuntimeOwners: true
+            )
+            guard !census.ambiguousSessionIDs.contains(row.sessionID), !census.replicatedSessionIDs.contains(row.sessionID) else {
+                return .unavailable("This session has ambiguous owners. Open its workspace to resolve the duplicate.")
+            }
+            if let owner = census.uniqueRuntimeOwners[row.sessionID], owner.location.workspaceID == row.workspaceID {
+                return .ready(source(for: owner, isEnabled: isEnabled))
+            }
+            guard census.uniqueRuntimeOwners[row.sessionID] == nil,
+                  !WindowStatesManager.shared.hasPreparedRuntime(row.sessionID)
+            else { return .unavailable("This session's runtime moved or is being prepared. Select it again after the transition completes.") }
+            return .saved(session, isCurrent: {
+                let manager = WindowStatesManager.shared
+                let current = AgentSessionCarrierResolver.capture(
+                    windows: manager.sessionRuntimeWindows, sessionIDs: [row.sessionID], includeRuntimeOwners: true
+                )
+                return !manager.hasPreparedRuntime(row.sessionID)
+                    && current.uniqueRuntimeOwners[row.sessionID] == nil
+                    && !current.ambiguousSessionIDs.contains(row.sessionID)
+                    && !current.replicatedSessionIDs.contains(row.sessionID)
+            })
+        } catch is CancellationError {
+            return .unavailable("Conversation loading cancelled.")
+        } catch {
+            return .unavailable("The saved conversation could not be read. No files were changed.")
         }
-        return .ready(source(for: current, isEnabled: isEnabled))
     }
 
     static func source(

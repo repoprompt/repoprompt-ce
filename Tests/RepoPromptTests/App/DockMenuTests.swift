@@ -1245,3 +1245,139 @@ private actor CommandCenterLateIndex {
         published = true
     }
 }
+
+@MainActor
+final class CommandCenterSavedConversationTests: XCTestCase {
+    private func directory() throws -> URL {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: url) }
+        return url
+    }
+
+    private func session(workspaceID: UUID) -> AgentSession {
+        AgentSession(
+            id: UUID(), workspaceID: workspaceID, composeTabID: UUID(), name: "Saved history",
+            savedAt: Date(timeIntervalSince1970: 100), autoEditEnabled: false
+        ).withItems([.user("Saved question", sequenceIndex: 0), .assistant("Saved answer", sequenceIndex: 1)])
+    }
+
+    private func write(_ session: AgentSession, in directory: URL, fileID: UUID? = nil) throws -> URL {
+        let folder = directory.appendingPathComponent("AgentSessions")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let file = folder.appendingPathComponent("AgentSession-\((fileID ?? session.id).uuidString).json")
+        try JSONEncoder().encode(session).write(to: file)
+        return file
+    }
+
+    func testSavedHistoryLoadsWithoutWindowRuntimeOrStorageRepair() async throws {
+        let root = try directory(), workspaceID = UUID()
+        var saved = session(workspaceID: workspaceID)
+        saved.serializationVersion = 0
+        let file = try write(saved, in: root)
+        let original = try Data(contentsOf: file)
+        let originalFiles = try FileManager.default.subpathsOfDirectory(atPath: root.path)
+        let originalWindows = Set(WindowStatesManager.shared.sessionRuntimeWindows.map(\.windowID))
+        let service = AgentSessionDataService()
+        let loaded = try await service.readSavedConversation(id: saved.id, workspaceID: workspaceID, directory: root)
+        let value = try XCTUnwrap(loaded)
+        let row = CommandCenterSessionRow(
+            sessionID: saved.id, workspaceID: workspaceID, tabID: saved.composeTabID,
+            name: saved.name, provider: nil, attention: .saved, detail: nil,
+            provenance: .saved(recordedAt: saved.savedAt)
+        )
+        let model = CommandCenterConversationModel(isEnabled: { true }, load: { _ in .saved(value) })
+        defer { model.stop() }
+        model.select(row)
+        try await AsyncTestWait.waitUntil("saved history displayed without a runtime", timeout: 3) { model.snapshot != nil }
+        XCTAssertEqual(model.snapshot?.rows.map(\.text), ["Saved question", "Saved answer"])
+        XCTAssertEqual(model.snapshot?.runState, "saved")
+        XCTAssertNil(model.snapshot?.windowID, "History must not manufacture a workspace-action route")
+        XCTAssertEqual(Set(WindowStatesManager.shared.sessionRuntimeWindows.map(\.windowID)), originalWindows)
+        XCTAssertEqual(try Data(contentsOf: file), original)
+        XCTAssertEqual(try FileManager.default.subpathsOfDirectory(atPath: root.path), originalFiles)
+        XCTAssertEqual(value.serializationVersion, 0, "Browsing must not run persistence migrations")
+    }
+
+    func testMissingHistoryDoesNotCreateStorageAndForeignOrCorruptPayloadIsRefused() async throws {
+        let root = try directory(), workspaceID = UUID(), service = AgentSessionDataService()
+        let absent = root.appendingPathComponent("absent")
+        let missing = try await service.readSavedConversation(id: UUID(), workspaceID: workspaceID, directory: absent)
+        XCTAssertNil(missing)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: absent.path))
+        let foreign = session(workspaceID: UUID())
+        let file = try write(foreign, in: root)
+        do {
+            _ = try await service.readSavedConversation(id: foreign.id, workspaceID: workspaceID, directory: root)
+            XCTFail("Foreign workspace payload must not be presented")
+        } catch {}
+        let wrongID = UUID()
+        _ = try write(foreign, in: root, fileID: wrongID)
+        do {
+            _ = try await service.readSavedConversation(id: wrongID, workspaceID: XCTUnwrap(foreign.workspaceID), directory: root)
+            XCTFail("Filename and payload session IDs must agree")
+        } catch {}
+        let corrupt = Data("not JSON".utf8)
+        try corrupt.write(to: file)
+        do {
+            _ = try await service.readSavedConversation(id: foreign.id, workspaceID: XCTUnwrap(foreign.workspaceID), directory: root)
+            XCTFail("Corrupt history must be refused")
+        } catch {}
+        XCTAssertEqual(try Data(contentsOf: file), corrupt)
+    }
+
+    func testSavedFrameReloadsWhenLiveOwnerAppearsAndKeepsDraft() async throws {
+        let workspaceID = UUID()
+        let saved = session(workspaceID: workspaceID)
+        let row = CommandCenterSessionRow(
+            sessionID: saved.id, workspaceID: workspaceID, tabID: saved.composeTabID,
+            name: saved.name, provider: nil, attention: .saved, detail: nil,
+            provenance: .saved(recordedAt: saved.savedAt)
+        )
+        var live = false, loads = 0
+        let model = CommandCenterConversationModel(isEnabled: { true }, load: { _ in
+            loads += 1
+            if !live { return .saved(saved, isCurrent: { !live }) }
+            return .ready(.init(isCurrent: { true }, snapshot: { _ in
+                .init(
+                    windowID: 123,
+                    workspaceID: workspaceID,
+                    tabID: saved.composeTabID,
+                    title: saved.name,
+                    provider: "",
+                    runState: "working",
+                    rows: [.assistant("Live answer", sequenceIndex: 0)],
+                    hasEarlierRows: false,
+                    hasPendingInteraction: false
+                )
+            }, changes: Empty<Void, Never>().eraseToAnyPublisher()))
+        })
+        defer { model.stop() }
+        model.select(row)
+        try await AsyncTestWait.waitUntil("saved frame", timeout: 3) { model.snapshot != nil }
+        model.draft = "Keep this draft"
+        live = true
+        model.refresh()
+        try await AsyncTestWait.waitUntil("canonical live frame", timeout: 3) { model.snapshot?.windowID == 123 }
+        XCTAssertEqual(loads, 2)
+        XCTAssertEqual(model.snapshot?.rows.first?.text, "Live answer")
+        XCTAssertEqual(model.draft, "Keep this draft")
+    }
+
+    func testLegacyHistoryWithoutWorkspaceOrTabAndEarlierMessagesRemainReadable() async throws {
+        let root = try directory(), workspaceID = UUID(), service = AgentSessionDataService()
+        var saved = session(workspaceID: workspaceID)
+        saved.workspaceID = nil
+        saved.composeTabID = nil
+        saved.transcript = nil
+        saved.items = (0 ..< 550).map { AgentChatItemPersist(from: .user("Message \($0)", sequenceIndex: $0)) }
+        _ = try write(saved, in: root)
+        let loaded = try await service.readSavedConversation(id: saved.id, workspaceID: workspaceID, directory: root)
+        let value = try XCTUnwrap(loaded)
+        let tail = CommandCenterConversationRows.buildSaved(value, limit: 500)
+        XCTAssertEqual(tail.rows.count, 500)
+        XCTAssertEqual(tail.rows.first?.text, "Message 50")
+        XCTAssertTrue(tail.hasEarlier)
+        XCTAssertEqual(CommandCenterConversationRows.buildSaved(value, limit: 1000).rows.count, 550)
+    }
+}

@@ -60,8 +60,11 @@ struct CommandCenterRootView: View {
                 composer.start()
             } else { model.stop() }
         }
+        .onChange(of: conversation.snapshot?.windowID) { _, windowID in
+            if windowID != nil, let id = conversation.selectedID { composer.selectedConversationLoaded(id) }
+        }
         .onChange(of: conversation.snapshot?.tabID) { _, tabID in
-            if tabID != nil, let id = conversation.selectedID { composer.selectedConversationLoaded(id) }
+            if tabID != nil, conversation.snapshot?.windowID != nil, let id = conversation.selectedID { composer.selectedConversationLoaded(id) }
         }
         .onDisappear {
             navigationTask?.cancel()
@@ -175,9 +178,9 @@ struct CommandCenterRootView: View {
                         ForEach(snapshot.rows.filter { !MCPIntegrationHelper.isRepoPromptAskUserToolName($0.toolName) }) { item in
                             AgentMessageBubble(
                                 item: item,
-                                windowID: snapshot.windowID,
-                                currentWorkspaceID: snapshot.workspaceID,
-                                currentTabID: snapshot.tabID,
+                                windowID: snapshot.windowID ?? 0,
+                                currentWorkspaceID: snapshot.windowID == nil ? nil : snapshot.workspaceID,
+                                currentTabID: snapshot.windowID == nil ? nil : snapshot.tabID,
                                 suppressAskUserTranscriptUI: true
                             ).id(item.id)
                         }
