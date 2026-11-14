@@ -1793,7 +1793,8 @@ enum AgentAssistantLineDerivation {
             return (count, false)
         }
 
-        for char in text where char.isNewline {
+        let newlineScalars = CharacterSet.newlines
+        for scalar in text.unicodeScalars where newlineScalars.contains(scalar) {
             count += 1
             if count > limit {
                 return (count, false)
