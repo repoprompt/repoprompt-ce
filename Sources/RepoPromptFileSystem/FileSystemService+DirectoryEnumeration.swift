@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import RepoPromptDomainRuntime
 import RepoPromptFoundation
 
 extension FileSystemService {
@@ -193,13 +194,15 @@ extension FileSystemService {
                                     try await enumerationHook(folderRel)
                                 }
                             #endif
-                            return try Self.enumerateOneLevel(
-                                absFolder: absFolder,
-                                relFolder: folderRel,
-                                skipSymlinks: skipLinks,
-                                rules: rulesForFolder,
-                                preserveChildren: preservedChildren
-                            )
+                            return try await HostResourceBudget.shared.withPermit(.io, background: true) {
+                                try Self.enumerateOneLevel(
+                                    absFolder: absFolder,
+                                    relFolder: folderRel,
+                                    skipSymlinks: skipLinks,
+                                    rules: rulesForFolder,
+                                    preserveChildren: preservedChildren
+                                )
+                            }
                         }
                     }
                 }
@@ -1194,9 +1197,13 @@ extension FileSystemService {
             let testMode = await service.isTestMode
             if testMode {
                 let fm = await service.fm
-                scanResult = try Self.listDirectoryWithIgnoreDetection(context.absPath, fm: fm)
+                scanResult = try await HostResourceBudget.shared.withPermit(.io, background: true) {
+                    try Self.listDirectoryWithIgnoreDetection(context.absPath, fm: fm)
+                }
             } else {
-                scanResult = try Self.listDirectoryWithIgnoreDetection(context.absPath)
+                scanResult = try await HostResourceBudget.shared.withPermit(.io, background: true) {
+                    try Self.listDirectoryWithIgnoreDetection(context.absPath)
+                }
             }
 
             let trackCycles = !skipSymlinks && !isVirtualFS
@@ -1220,7 +1227,9 @@ extension FileSystemService {
             respectRepoIgnore: Bool,
             respectCursorignore: Bool
         ) async throws -> DirectoryChunkResult {
-            let scanResult = try Self.listDirectoryWithIgnoreDetection(context.absPath)
+            let scanResult = try await HostResourceBudget.shared.withPermit(.io, background: true) {
+                try Self.listDirectoryWithIgnoreDetection(context.absPath)
+            }
 
             let trackCycles = !skipSymlinks
             return try await buildDirectoryChunk(

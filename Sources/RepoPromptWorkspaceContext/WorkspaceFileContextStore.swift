@@ -3404,7 +3404,8 @@ package actor WorkspaceFileContextStore {
     private var scopedIngressBarrierFlightStatesByRootID: [UUID: ScopedIngressBarrierRootFlightState] = [:]
     private var completedScopedIngressBarrierCutsByRootID: [UUID: ScopedIngressBarrierCompletedCut] = [:]
     private var nextScopedIngressBarrierToken: UInt64 = 0
-    private static let maxConcurrentScopedIngressBarriers = 8
+    /// Coordination fan-out only: barriers await producers and must never hold a host-work lease.
+    private static let maxConcurrentScopedIngressBarriers = ContentReadConcurrencyCapacity.maximumConcurrentReads
     #if DEBUG
         private let debugNowNanoseconds: @Sendable () -> UInt64
         private let isCatalogShardShadowValidationEnabled: Bool

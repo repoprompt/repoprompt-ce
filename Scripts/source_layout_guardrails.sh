@@ -849,6 +849,7 @@ allowed_tracked_docs=(
   "docs/architecture/codex-user-mcp-import.md"
   "docs/architecture/context-composer.md"
   "docs/architecture/headless-mcp-runtime.md"
+  "docs/architecture/host-resource-admission.md"
   "docs/architecture/keyboard-shortcuts.md"
   "docs/architecture/mcp-lifecycle-diagnostics.md"
   "docs/architecture/model-routing.md"

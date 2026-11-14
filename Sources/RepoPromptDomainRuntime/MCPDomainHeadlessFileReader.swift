@@ -47,6 +47,8 @@ package enum MCPDomainHeadlessFileReader {
         do {
             let lease = try await workers.acquire(.appWide, admissionDeadline: deadline)
             defer { lease.release() }
+            let hostLease = try await HostResourceBudget.shared.acquire(.io, deadline: deadline)
+            defer { hostLease.release() }
             let cancellation = Cancellation()
             return try await withTaskCancellationHandler {
                 let result: String = try await withCheckedThrowingContinuation { continuation in

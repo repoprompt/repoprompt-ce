@@ -1,3 +1,4 @@
+import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptVCS
 import RepoPromptWorkspaceContext
@@ -51,6 +52,7 @@ import RepoPromptShared
                 "ok": true,
                 "op": op,
                 "capture": snapshot.payload(includeTimeline: includeTimeline),
+                "host_resources": hostResourcePayload(),
                 "delivery_events": MCPResponseDeliveryTracer.debugEventSnapshot().map(\.payload)
             ])
         }
@@ -734,6 +736,29 @@ import RepoPromptShared
                 "crawl_count": accumulator.crawlCount,
                 "current_freshness_flight_count": accumulator.currentFreshnessFlightCount,
                 "total_freshness_flight_launch_count": accumulator.totalFreshnessFlightLaunchCount
+            ]
+        }
+
+        private func hostResourcePayload() -> [String: Any] {
+            let state = HostResourceBudget.shared.snapshot()
+            return [
+                "total_limit": state.capacity.total,
+                "cpu_limit": state.capacity.cpu,
+                "io_limit": state.capacity.io,
+                "subprocess_limit": state.capacity.subprocess,
+                "background_limit": state.capacity.background,
+                "descriptor_budget": state.capacity.descriptorBudget,
+                "active_descriptor_units": state.activeDescriptorUnits,
+                "retained_content_limit": state.capacity.retainedContent,
+                "active": state.active,
+                "active_cpu": state.activeByKind[.cpu] ?? 0,
+                "active_io": state.activeByKind[.io] ?? 0,
+                "active_subprocess": state.activeByKind[.subprocess] ?? 0,
+                "retained_content": state.activeByKind[.retainedContent] ?? 0,
+                "waiting": state.waiting,
+                "peak_active": state.peakActive,
+                "grants": state.granted,
+                "wait_us": state.waitNanoseconds / 1000
             ]
         }
 
