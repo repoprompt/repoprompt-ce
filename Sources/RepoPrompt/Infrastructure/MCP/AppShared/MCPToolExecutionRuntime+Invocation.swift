@@ -118,7 +118,9 @@ extension MCPToolExecutionRuntime {
         presentation.registered(toolToken) { task.cancel() }
         registerToolExecution(
             executionID: toolToken, runID: indexedRunID, connectionID: capturedConnectionID,
-            toolName: name, lifecycleCorrelation: lifecycleCorrelation, cancel: { task.cancel() }
+            toolName: name, lifecycleCorrelation: lifecycleCorrelation,
+            runRoutingRegistrationID: invocationContext.dispatchAuthorization?.runRoutingRegistrationID,
+            cancel: { task.cancel() }
         )
         if await !validateInvocation(invocationContext, routeID, ownerIdentity) {
             task.cancel()

@@ -29,21 +29,26 @@ final class AgentSessionRunContinuationRuntime {
     }
 
     func makeRunHooks(prepareLaunch: @escaping () -> Launch?) -> AgentModeRunService.RunContinuationHooks {
+        makeRunHooks(prepareSessionLaunch: { _ in prepareLaunch() })
+    }
+
+    /// Capture the originating command before enqueueing a producer, not after its suspension.
+    func makeRunHooks(prepareSessionLaunch: @escaping (AgentTabSession) -> Launch?) -> AgentModeRunService.RunContinuationHooks {
         .init(
             startFollowUpRun: { [self] session, instruction in
                 if session.selectedAgent.acpProviderID != nil {
-                    scheduleTypedACPFollowUp(session: session, instruction: instruction, launch: prepareLaunch())
+                    scheduleTypedACPFollowUp(session: session, instruction: instruction, launch: prepareSessionLaunch(session))
                 } else {
                     let instruction = instruction.retainingStopFence(instruction.stopFence ?? AgentRunStartStopFence(session: session))
                     guard let owner = scope else { return }
-                    let launch = prepareLaunch()
+                    let launch = prepareSessionLaunch(session)
                     enqueue(owner: owner, session: session) { [self] in
                         await performFollowUp(session: session, instruction: instruction, launch: launch)
                     }
                 }
             },
             startTypedACPFollowUpRun: { [self] session, instruction in
-                scheduleTypedACPFollowUp(session: session, instruction: instruction, launch: prepareLaunch())
+                scheduleTypedACPFollowUp(session: session, instruction: instruction, launch: prepareSessionLaunch(session))
             },
             signalMCPInstructionDelivered: { [self] session in
                 await scope?.mcp.signalMCPInstructionDelivered(for: session)
@@ -75,6 +80,7 @@ final class AgentSessionRunContinuationRuntime {
             defer {
                 pendingStarts[identity]?.removeValue(forKey: id)
                 if pendingStarts[identity]?.isEmpty == true { pendingStarts.removeValue(forKey: identity) }
+                owner.noteSettlementChanged()
                 withExtendedLifetime(owner) {}
             }
             await operation()

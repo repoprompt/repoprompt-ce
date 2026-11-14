@@ -76,6 +76,55 @@ final class CodexAppServerTransportOwnerTests: XCTestCase {
         }
     }
 
+    func testPIDRegistrationRetainsOriginatingRegistrarAcrossSuspendedReplacement() async {
+        let events = OSAllocatedUnfairLock(initialState: [String]())
+        let entered = AsyncStream<Void>.makeStream()
+        let released = AsyncStream<Void>.makeStream()
+        defer {
+            entered.continuation.finish()
+            released.continuation.finish()
+        }
+        let client = CodexAppServerClient(
+            launchHost: FixtureCodexLaunchHost(root: FileManager.default.temporaryDirectory, executable: URL(fileURLWithPath: "/unused")),
+            expectedAgentPIDRegistrar: .init(
+                register: { _, _, _ in XCTFail("Owned registration must not use the legacy registrar") },
+                clear: { _, _, _ in XCTFail("Owned cleanup must not use the legacy registrar") }
+            )
+        )
+        await client.debugInstallTestTransport()
+        let runID = UUID()
+        let original = CodexAppServerClient.ExpectedAgentPIDRegistration(
+            clientName: "fixture", runID: runID,
+            registrar: .init(register: { _, _, _ in
+                events.withLock { $0.append("old.register") }
+                entered.continuation.yield(())
+                for await _ in released.stream {
+                    break
+                }
+            }, clear: { _, _, _ in events.withLock { $0.append("old.clear") } })
+        )
+        let successor = CodexAppServerClient.ExpectedAgentPIDRegistration(
+            clientName: "fixture", runID: runID,
+            registrar: .init(
+                register: { _, _, _ in events.withLock { $0.append("new.register") } },
+                clear: { _, _, _ in events.withLock { $0.append("new.clear") } }
+            )
+        )
+        let install = Task { await client.setExpectedAgentPIDRegistration(original) }
+        var entry = entered.stream.makeAsyncIterator()
+        _ = await entry.next()
+        await client.setExpectedAgentPIDRegistration(successor)
+        released.continuation.yield(())
+        await install.value
+        let activePID = await client.activeExpectedAgentPID(for: runID)
+        XCTAssertEqual(activePID, pid_t.max, "Late original registration must not erase the successor with the same PID and run")
+        XCTAssertEqual(events.withLock { $0 }, ["old.register", "old.clear", "new.register", "old.clear"])
+        await client.stop()
+        XCTAssertEqual(events.withLock { $0 }, ["old.register", "old.clear", "new.register", "old.clear", "new.clear"])
+        await client.clearExpectedAgentPIDRegistration()
+        XCTAssertEqual(events.withLock { $0.count(where: { $0 == "new.clear" }) }, 1)
+    }
+
     func testPhysicalLaunchKeepsCapturedRuntimeAndTwoConfigurationEvaluationPoints() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

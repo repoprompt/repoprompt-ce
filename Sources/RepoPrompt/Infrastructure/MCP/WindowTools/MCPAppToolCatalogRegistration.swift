@@ -35,6 +35,7 @@ enum MCPAppToolCatalogMaterializationError: Error, Equatable, CustomStringConver
 final class MCPAppToolCatalogRegistration: WindowScopedService {
     let domainRegistrationID = MCPDomainToolRegistrationID()
     let windowID: Int
+    let runRouting: MCPHostRouteResources.RunRouting?
 
     private let providers: [any MCPAppToolProviding]
     private let sharedBindings: [MCPDomainToolBinding]
@@ -49,13 +50,15 @@ final class MCPAppToolCatalogRegistration: WindowScopedService {
         providers: [any MCPAppToolProviding],
         sharedBindings: [MCPDomainToolBinding] = [],
         runtime: MCPAppToolBinder,
-        requiredToolNames: Set<String> = Set(MCPAppToolGroup.orderedToolNames)
+        requiredToolNames: Set<String> = Set(MCPAppToolGroup.orderedToolNames),
+        runRouting: MCPHostRouteResources.RunRouting? = nil
     ) {
         #if DEBUG || EDIT_FLOW_PERF
             let constructionState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPWindowToolCatalog.construction)
             defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPWindowToolCatalog.construction, constructionState) }
         #endif
         self.windowID = windowID
+        self.runRouting = runRouting
         self.providers = providers
         self.sharedBindings = sharedBindings
         self.runtime = runtime
@@ -75,7 +78,8 @@ final class MCPAppToolCatalogRegistration: WindowScopedService {
         oracleProvider: MCPOracleToolProvider,
         sharedBindings: [MCPDomainToolBinding],
         resolveSpawnParentSessionID: @escaping AgentSessionTargetOperationGuard.SpawnParentSessionResolver,
-        resolveObserverEndpoint: @escaping AgentSessionTargetOperationGuard.ObserverEndpointResolver
+        resolveObserverEndpoint: @escaping AgentSessionTargetOperationGuard.ObserverEndpointResolver,
+        runRouting: MCPHostRouteResources.RunRouting? = nil
     ) {
         self.init(
             windowID: windowID,
@@ -96,7 +100,8 @@ final class MCPAppToolCatalogRegistration: WindowScopedService {
                 MCPAgentSessionControlToolProvider(runtime: runtime, execution: execution)
             ],
             sharedBindings: sharedBindings,
-            runtime: runtime
+            runtime: runtime,
+            runRouting: runRouting
         )
     }
 

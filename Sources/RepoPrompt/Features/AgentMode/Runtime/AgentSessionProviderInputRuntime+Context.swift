@@ -4,16 +4,41 @@ import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 extension AgentSessionProviderInputRuntime {
-    /// Concrete inputs to the existing permissive presentation lookup policy. This is not
-    /// canonical admission: a saved runtime must supply an independently validated context.
+    /// Concrete lookup inputs. Canonical composition retains the originating lease checks with
+    /// these bytes; the legacy presentation adapter has only its existing enclosing admission.
+    /// Neither successful validation nor possession of a snapshot elects a writer.
     struct WorkspaceSource {
         let store: WorkspaceFileContextStore
         let lookupSource: AgentWorkspaceLookupContextSource?
+        /// Present only for an exact canonical capture; legacy callers retain their projection.
+        let workspacePaths: [String]?
+        let isCurrent: @MainActor () -> Bool
+        let validate: @MainActor () async -> Bool
+
+        init(
+            store: WorkspaceFileContextStore, lookupSource: AgentWorkspaceLookupContextSource?,
+            workspacePaths: [String]? = nil,
+            isCurrent: @escaping @MainActor () -> Bool = { true },
+            validate: @escaping @MainActor () async -> Bool = { true }
+        ) {
+            self.store = store
+            self.lookupSource = lookupSource
+            self.workspacePaths = workspacePaths
+            self.isCurrent = isCurrent
+            self.validate = validate
+        }
 
         func lookupContext() async -> WorkspaceLookupContext {
             guard let lookupSource else { return .visibleWorkspace }
             return await AgentWorkspaceLookupContextResolver.lookupContext(source: lookupSource, store: store)
         }
+    }
+
+    /// Legacy presentation bindings are resolved after skill discovery; canonical requests
+    /// must first capture the exact resource whose roots authorize that discovery.
+    enum WorkspaceCaptureOrder {
+        case afterSkillExpansion
+        case beforeSkillExpansion
     }
 
     struct InitialThreadInput {
@@ -28,33 +53,52 @@ extension AgentSessionProviderInputRuntime {
         taggedFileAttachments: [AgentTaggedFileAttachment],
         agent: AgentProviderKind,
         workspacePaths: [String],
-        workspace: @MainActor () -> WorkspaceSource?,
+        workspace: @MainActor () async throws -> WorkspaceSource?,
+        workspaceCaptureOrder: WorkspaceCaptureOrder = .afterSkillExpansion,
         session: AgentTabSession?,
         handoff: AgentSessionHandoffRuntime,
         ignoresPendingHandoff: Bool,
         skipsSlashExpansion: Bool,
         isCurrent: @MainActor () -> Bool,
         onTaggedFileFailures: ([ExplicitFileFailure]) -> Void = { _ in }
-    ) async -> String {
+    ) async rethrows -> String {
         guard isCurrent() else { return text }
+        // Canonical capture supplies both skill roots and rendered context. Legacy callers
+        // retain their post-discovery binding lookup; neither path reads the source twice.
+        var source: WorkspaceSource?
+        if workspaceCaptureOrder == .beforeSkillExpansion {
+            source = try await workspace()
+        }
+        func current() -> Bool {
+            isCurrent() && (source?.isCurrent() ?? true)
+        }
+        guard current() else { return text }
         let expanded = skipsSlashExpansion ? text : await expandSlashSkillInvocationIfNeeded(
-            text, agentKind: agent, workspacePaths: workspacePaths, shouldPublishCatalog: isCurrent
+            text, agentKind: agent, workspacePaths: source?.workspacePaths ?? workspacePaths, shouldPublishCatalog: current
         )
-        guard isCurrent() else { return expanded }
-        // Resolve mutable worktree bindings after skill discovery, at the same boundary as
-        // the original input path. Composition captures values here; it does not perform IO.
-        let context: Context? = if let workspace = workspace() {
+        guard current() else { return expanded }
+        if workspaceCaptureOrder == .afterSkillExpansion {
+            source = try await workspace()
+        }
+        guard current() else { return expanded }
+        let context: Context? = if let workspace = source {
             await Context(store: workspace.store, lookup: workspace.lookupContext())
         } else {
             nil
         }
-        guard isCurrent() else { return expanded }
-        return await finishUserMessage(
+        guard current() else { return expanded }
+        let prepared = await finishUserMessage(
             expanded, attachments: attachments, taggedFileAttachments: taggedFileAttachments,
             agent: agent, context: context, session: session, handoff: handoff,
-            ignoresPendingHandoff: ignoresPendingHandoff, isCurrent: isCurrent,
+            ignoresPendingHandoff: ignoresPendingHandoff, isCurrent: current,
             onTaggedFileFailures: onTaggedFileFailures
         )
+        #if DEBUG
+            if current(), agent.acpProviderID != nil {
+                await test_afterProviderInputAugmentation?()
+            }
+        #endif
+        return prepared
     }
 
     /// Read-only composer admission: skill and file bytes are captured before any user state changes.
@@ -63,20 +107,35 @@ extension AgentSessionProviderInputRuntime {
         taggedFileAttachments: [AgentTaggedFileAttachment],
         agent: AgentProviderKind,
         workspacePaths: [String],
-        workspace: @MainActor () -> WorkspaceSource?,
+        workspace: @MainActor () async throws -> WorkspaceSource?,
+        workspaceCaptureOrder: WorkspaceCaptureOrder = .afterSkillExpansion,
         skipsSlashExpansion: Bool,
         isCurrent: @MainActor () -> Bool
-    ) async -> TaggedFileAugmentation {
+    ) async rethrows -> TaggedFileAugmentation {
         guard isCurrent() else { return .init(text: text, includedPaths: [], failures: []) }
+        var source: WorkspaceSource?
+        if workspaceCaptureOrder == .beforeSkillExpansion {
+            source = try await workspace()
+        }
+        func current() -> Bool {
+            isCurrent() && (source?.isCurrent() ?? true)
+        }
+        guard current() else { return .init(text: text, includedPaths: [], failures: []) }
         let expanded = skipsSlashExpansion ? text : await expandSlashSkillInvocationIfNeeded(
-            text, agentKind: agent, workspacePaths: workspacePaths, shouldPublishCatalog: isCurrent
+            text, agentKind: agent, workspacePaths: source?.workspacePaths ?? workspacePaths, shouldPublishCatalog: current
         )
-        guard isCurrent() else { return .init(text: text, includedPaths: [], failures: []) }
-        let context: Context? = if let source = workspace() {
+        guard current() else { return .init(text: text, includedPaths: [], failures: []) }
+        if workspaceCaptureOrder == .afterSkillExpansion {
+            source = try await workspace()
+        }
+        guard current() else { return .init(text: text, includedPaths: [], failures: []) }
+        let context: Context? = if let source {
             await Context(store: source.store, lookup: source.lookupContext())
         } else { nil }
-        guard isCurrent() else { return .init(text: text, includedPaths: [], failures: []) }
-        return await Self.prepareTaggedFileContents(expanded, taggedFileAttachments: taggedFileAttachments, context: context)
+        guard current() else { return .init(text: text, includedPaths: [], failures: []) }
+        let prepared = await Self.prepareTaggedFileContents(expanded, taggedFileAttachments: taggedFileAttachments, context: context)
+        guard current() else { return .init(text: text, includedPaths: [], failures: []) }
+        return prepared
     }
 
     /// Resource capture remains host-composed; context construction and admission are runtime work.
@@ -84,13 +143,14 @@ extension AgentSessionProviderInputRuntime {
     func buildInitialThreadMessageIfNeeded(
         session: AgentTabSession,
         initialMessage: String,
-        input: @MainActor () -> InitialThreadInput?,
+        input: @MainActor () async throws -> InitialThreadInput?,
         isCurrent: @MainActor () -> Bool
-    ) async -> String {
-        guard isCurrent(), Self.shouldIncludeInitialThreadContext(for: session),
-              let input = input(), isCurrent() else { return initialMessage }
+    ) async rethrows -> String {
+        guard isCurrent(), Self.shouldIncludeInitialThreadContext(for: session) else { return initialMessage }
+        let captured = try await input()
+        guard isCurrent(), let input = captured, input.workspace.isCurrent() else { return initialMessage }
         let context = await initialThreadContext(input)
-        guard isCurrent() else { return initialMessage }
+        guard isCurrent(), input.workspace.isCurrent() else { return initialMessage }
         return Self.composeInitialThreadMessage(
             initialMessage: initialMessage, fileTree: context.fileTree, promptText: context.promptText
         )

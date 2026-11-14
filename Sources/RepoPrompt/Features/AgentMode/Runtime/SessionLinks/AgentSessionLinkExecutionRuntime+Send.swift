@@ -44,24 +44,42 @@ extension AgentSessionLinkExecutionRuntime {
         let instructions = providerSwitchInstructionStrings(session, includeSupplement: !inputAlreadyIncludesSupplement)
         let composerAttemptID = session.activeComposerSubmitAttempt?.id
         let stopFence = AgentRunStartStopFence(session: session)
+        var inputSources: [AgentSessionProviderInputRuntime.WorkspaceSource] = []
         func inputIsCurrent() -> Bool {
             command.isCurrent && commands.isAvailable() && isCurrent() && !Task.isCancelled
                 && commands.workspaceID(session) == resourceWorkspaceID && stopFence.permitsStart(of: session)
+                && inputSources.allSatisfy { $0.isCurrent() }
         }
         guard inputIsCurrent() else { return .failure(.targetStopped) }
         var taggedFileFailures: [AgentSessionProviderInputRuntime.ExplicitFileFailure] = []
-        let augmented = skipsAugmentation ? input : await commands.input.augmentUserMessage(
-            input, attachments: attachments, taggedFileAttachments: taggedFiles, agent: agent,
-            workspacePaths: commands.workspacePaths(), workspace: { commands.inputWorkspace(session) },
-            session: session, handoff: owner.handoff, ignoresPendingHandoff: true,
-            skipsSlashExpansion: skipsSlashExpansion, isCurrent: inputIsCurrent,
-            onTaggedFileFailures: { taggedFileFailures = $0 }
-        )
-        guard inputIsCurrent() else { return .failure(.targetStopped) }
-        let initial = await commands.input.buildInitialThreadMessageIfNeeded(
-            session: session, initialMessage: augmented,
-            input: { commands.initialThreadInput(session) }, isCurrent: inputIsCurrent
-        )
+        let augmented: String
+        let initial: String
+        do {
+            augmented = skipsAugmentation ? input : try await commands.input.augmentUserMessage(
+                input, attachments: attachments, taggedFileAttachments: taggedFiles, agent: agent,
+                workspacePaths: commands.workspacePaths(), workspace: {
+                    let source = try await commands.inputWorkspace(session, command)
+                    if let source { inputSources.append(source) }
+                    return source
+                },
+                workspaceCaptureOrder: commands.workspaceCaptureOrder,
+                session: session, handoff: owner.handoff, ignoresPendingHandoff: true,
+                skipsSlashExpansion: skipsSlashExpansion, isCurrent: inputIsCurrent,
+                onTaggedFileFailures: { taggedFileFailures = $0 }
+            )
+            guard inputIsCurrent() else { return .failure(.targetStopped) }
+            initial = try await commands.input.buildInitialThreadMessageIfNeeded(
+                session: session, initialMessage: augmented,
+                input: {
+                    let input = try await commands.initialThreadInput(session, command)
+                    if let input { inputSources.append(input.workspace) }
+                    return input
+                }, isCurrent: inputIsCurrent
+            )
+        } catch { return .failure(.targetStopped) }
+        for source in inputSources {
+            guard inputIsCurrent(), await source.validate(), inputIsCurrent() else { return .failure(.targetStopped) }
+        }
         guard inputIsCurrent() else { return .failure(.targetStopped) }
         guard !session.runState.isActive, session.activeRunOwnership == nil else { return .failure(.targetNotIdle) }
         guard sessions[session.tabID] === session,
@@ -97,7 +115,7 @@ extension AgentSessionLinkExecutionRuntime {
             inputAlreadyIncludesSupplement: inputAlreadyIncludesSupplement,
             historyToolAllowed: historyAllowed, computerUseArmed: computerUseArmed,
             catalogWindow: catalogWindow, composerAttemptID: composerAttemptID, autoWakeID: autoWakeID, stopFence: stopFence,
-            taggedFileFailures: taggedFileFailures
+            taggedFileFailures: taggedFileFailures, inputSources: inputSources
         ))
     }
 
@@ -142,6 +160,7 @@ extension AgentSessionLinkExecutionRuntime {
         defer { withExtendedLifetime(owner) {} }
         guard let preparation else { return nil }
         guard providerSwitchPreparationIsCurrent(preparation, session: session),
+              await preparation.validateInputSources(), providerSwitchPreparationIsCurrent(preparation, session: session),
               stopFence.permitsStart(of: session),
               let payload = preparation.handoff.payload
         else { return nil }
@@ -184,7 +203,9 @@ extension AgentSessionLinkExecutionRuntime {
             }
             return nil
         }
-        guard preparation.command.isCurrent, !Task.isCancelled, stopFence.permitsStart(of: session),
+        guard preparation.command.isCurrent, await preparation.validateInputSources(),
+              preparation.command.isCurrent, session.pendingHandoff == sending,
+              !Task.isCancelled, stopFence.permitsStart(of: session),
               !session.runState.isActive, session.activeRunOwnership == nil,
               session.selectedAgent == preparation.agent, session.selectedModelRaw == preparation.model,
               session.isCodexComputerUseArmed == preparation.computerUseArmed,
@@ -202,6 +223,7 @@ extension AgentSessionLinkExecutionRuntime {
 
     func providerSwitchPreparationIsCurrent(_ preparation: ProviderSwitchSendPreparation, session: TabSession) -> Bool {
         preparation.command.isCurrent && preparation.command.writer.scope === scope
+            && preparation.inputSources.allSatisfy { $0.isCurrent() }
             && preparation.command.writer.session === session
             && commands.isAvailable() && sessions[session.tabID] === session && session.currentRestorationBindingToken == preparation.binding
             && session.selectedAgent == preparation.agent && session.selectedModelRaw == preparation.model
@@ -315,7 +337,10 @@ extension AgentSessionLinkExecutionRuntime {
         session.isDirty = true
         let effectID = UUID()
         let task = Task { @MainActor [self, session, writer] in
-            defer { pendingSendEffects.removeValue(forKey: effectID) }
+            defer {
+                pendingSendEffects.removeValue(forKey: effectID)
+                writer.scope.noteSettlementChanged()
+            }
             // Admission and the scheduled write are separate actor turns. Do not let a replaced
             // claim persist this acknowledgement through the successor's tab slot.
             guard writer.isCurrent else { return }
@@ -653,7 +678,7 @@ extension AgentSessionLinkExecutionRuntime {
         // The flush awaited, so every admission fact must be re-proven before a provider is started.
         // A window teardown, an observer rebind/close, an in-place rebind that keeps the same session
         // UUID, a workspace switch, a lost composer claim, or a locally started run during that await
-        // would otherwise let `startAgentRun(tabID:)` dispatch this turn against whatever now occupies
+        // would otherwise let a tab-resolved start dispatch this turn against whatever now occupies
         // the tab — possibly a replacement binding the grant never covered.
         //
         // The probe is deliberately endpoint/window liveness only and never link liveness: manual
@@ -662,7 +687,11 @@ extension AgentSessionLinkExecutionRuntime {
         // Drift retains the durable delivery and withholds only the provider start: the row is
         // already the target's, so rolling it back here would contradict the linearization point and
         // make the same key deliverable twice.
-        guard liveSession.permitsBoundOperationAndSave,
+        guard let command = claim.command,
+              command.writer.session === liveSession,
+              command.isCurrent,
+              composerSubmitClaimIsCurrent(claim),
+              liveSession.permitsBoundOperationAndSave,
               providerSwitchPreparation.map({ providerSwitchPreparationIsCurrent($0, session: liveSession) })
               ?? (liveSession.pendingHandoff.providerSwitchDelivery == nil),
               dispatchIsCurrent()
@@ -701,7 +730,7 @@ extension AgentSessionLinkExecutionRuntime {
         // recorder is what distinguishes a Claude/ACP/headless pre-start failure from success.
         let startRecorder = AgentRunStartOutcomeRecorder()
         _ = await startAgentRun(
-            tabID: tabID,
+            command: command,
             initialMessage: dispatchedProviderMessage,
             directStartOptions: AgentDirectRunStartOptions(
                 ignoresPendingHandoff: true, stopFence: stopFence

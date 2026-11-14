@@ -1075,6 +1075,36 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         XCTAssertEqual(fixture.session.executionLocationChangeOwner, successorGate)
     }
 
+    func testSelfRelocationMissingRuntimeCapabilitiesRefusesBeforeEffects() async throws {
+        for missingLauncher in [true, false] {
+            let fixture = try await durableFixture()
+            defer { fixture.git.cleanup() }
+            let turn = try await liveSelfTurn(fixture)
+            let next = try makeNextBinding(fixture)
+            let previous = fixture.session.worktreeBindings
+            _ = try await fixture.viewModel.scheduleSelfWorktreeRelocation(
+                [next], forSessionID: fixture.sessionID,
+                originRunID: turn.runID, originRunAttemptID: turn.ownership.attemptID
+            )
+            let links = fixture.viewModel.linkExecutionRuntime
+            let worktrees = try XCTUnwrap(links.scope).worktrees
+            if missingLauncher { worktrees.terminalContinuationLauncher = nil }
+            else { links.activeMCPToolProbe = nil }
+            await endTurn(fixture, turn, state: .completed)
+            worktrees.selfWorktreeRelocationTerminalSettled(
+                session: fixture.session, revision: revision(turn, state: .completed),
+                publication: .accepted(successorEpoch: nil), teardownSettled: { true }
+            )
+            await worktrees.waitForTransitions()
+            XCTAssertNil(fixture.session.pendingSelfWorktreeRelocation)
+            XCTAssertEqual(fixture.session.worktreeBindings, previous)
+            XCTAssertFalse(fixture.session.mcpFollowUpRunPending)
+            XCTAssertTrue(fixture.session.items.contains { $0.text.contains("was not applied because the runtime continuation or tool-drain capability was unavailable") })
+            let shutdowns = await turn.native.shutdownCount
+            XCTAssertEqual(shutdowns, 0, "Missing composition must refuse before provider retirement")
+        }
+    }
+
     func testSelfRelocationAppliesAtCompletedTerminalAndContinuesInNewLocation() async throws {
         let fixture = try await durableFixture()
         defer { fixture.git.cleanup() }
@@ -1086,20 +1116,43 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         )
         fixture.viewModel.test_setAgentSessionSaver { _, _, _ in fixture.git.sandbox.appendingPathComponent("session.json") }
         let continued = expectation(description: "automatic continuation")
+        var releaseLauncher: CheckedContinuation<Void, Never>?
         var continuation: (bindings: [AgentSessionWorktreeBinding], handoffStaged: Bool, reserved: Bool, message: String)?
-        fixture.viewModel.test_selfWorktreeRelocationContinuationStarter = { session, message in
+        let worktrees = try XCTUnwrap(fixture.viewModel.linkExecutionRuntime.scope).worktrees
+        let continuationWriter = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID)).identity
+        worktrees.terminalContinuationLauncher = { command, message, options, outcome in
+            XCTAssertTrue(command.isCurrent)
+            XCTAssertEqual(command.identity, continuationWriter)
+            let session = command.writer.session
+            XCTAssertTrue(options.stopFence?.permitsStart(of: session) == true)
+            outcome.recordAccepted()
             continuation = (
                 session.worktreeBindings, session.pendingHandoff.payload != nil,
                 session.mcpFollowUpRunPending, message
             )
             continued.fulfill()
+            await withCheckedContinuation { releaseLauncher = $0 }
         }
         await endTurn(fixture, turn, state: .completed)
-        fixture.viewModel.selfWorktreeRelocationTerminalSettled(
+        worktrees.selfWorktreeRelocationTerminalSettled(
             session: fixture.session, revision: revision(turn, state: .completed),
             publication: .accepted(successorEpoch: nil), teardownSettled: { true }
         )
         await fulfillment(of: [continued], timeout: 10)
+        XCTAssertEqual(worktrees.pendingTransitions, 1, "The required worker remains owned through its suspended launcher")
+        let drainEntered = expectation(description: "relocation drain entered")
+        let drained = expectation(description: "relocation drained")
+        let waiter = Task { @MainActor in
+            drainEntered.fulfill()
+            await worktrees.waitForTransitions()
+            drained.fulfill()
+        }
+        await fulfillment(of: [drainEntered], timeout: 10)
+        XCTAssertEqual(worktrees.pendingTransitions, 1)
+        releaseLauncher?.resume()
+        await fulfillment(of: [drained], timeout: 10)
+        await waiter.value
+        XCTAssertEqual(worktrees.pendingTransitions, 0)
         let started = try XCTUnwrap(continuation)
         XCTAssertEqual(started.bindings, [next], "The continuation starts only after the binding is published")
         XCTAssertTrue(started.handoffStaged, "The fresh provider in the new cwd receives the conversation handoff")
@@ -1520,6 +1573,64 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         XCTAssertFalse(fresh.worktreeBindingTransitionInProgress)
     }
 
+    func testInitialWorktreePreparationUsesOriginalCreationCommandAcrossResourceValidation() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let source = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID))
+        let scope = source.writer.scope
+        let binding = try XCTUnwrap(fixture.session.worktreeBindings.first)
+        let listed = try await VCSService.shared.listGitWorktrees(at: URL(fileURLWithPath: binding.logicalRootPath))
+        let selected = try XCTUnwrap(listed.first { $0.worktreeID == binding.worktreeID })
+        let choice = AgentModeViewModel.InitialStartLocation.existingWorktree(.init(
+            repositoryID: selected.repository.repositoryID, repoKey: selected.repository.repoKey,
+            worktreeID: selected.worktreeID, path: selected.path, name: selected.name,
+            branch: selected.branch, head: selected.head, isDetached: selected.isDetached,
+            label: "Existing checkout", colorHex: nil, isLocked: selected.isLocked,
+            lockReason: selected.lockReason, isPrunable: selected.isPrunable, prunableReason: selected.prunableReason
+        ))
+        for replaceWriter in [false, true] {
+            let fresh = scope.makeSession(tabID: UUID())
+            let allocation = AgentSessionCreationClaim(workspaceID: source.identity.workspaceID)
+            fresh.installPersistentSessionBinding(.init(tabID: fresh.tabID, sessionID: allocation.sessionID, workspaceID: allocation.workspaceID))
+            let creation = try XCTUnwrap(fresh.acceptFreshCreation(allocation, workspaceID: allocation.workspaceID))
+            fresh.isPreparingInitialWorktree = true
+            var sessions = scope.sessions
+            sessions[fresh.tabID] = fresh
+            scope.replaceSessions(sessions)
+            let command = try scope.admit(session: fresh, requirement: .creation(creation))
+            let admission = try scope.worktrees.admit(command)
+            var validations = 0
+            do {
+                try await scope.worktrees.prepareInitialExecutionLocation(
+                    choice, admission: admission, sessionName: "Fresh runtime thread", operationIsCurrent: { true },
+                    revalidateResources: {
+                        validations += 1
+                        if replaceWriter, validations == 1 {
+                            var sessions = scope.sessions
+                            sessions.removeValue(forKey: fresh.tabID)
+                            scope.replaceSessions(sessions)
+                            sessions[fresh.tabID] = fresh
+                            scope.replaceSessions(sessions)
+                        }
+                    }
+                )
+                XCTAssertFalse(replaceWriter)
+                XCTAssertEqual(fresh.worktreeBindings.first?.worktreeID, selected.worktreeID)
+                XCTAssertFalse(fresh.pendingHandoff.hasPayload, "An empty initial thread has no provider history to recover")
+                XCTAssertTrue(command.isCurrent)
+            } catch {
+                XCTAssertTrue(replaceWriter, "Current creation must reach the actual transition: \(error)")
+                XCTAssertTrue(fresh.worktreeBindings.isEmpty)
+                XCTAssertFalse(command.isCurrent)
+            }
+            XCTAssertGreaterThan(validations, 0)
+            XCTAssertTrue(fresh.creationHandleIsCurrent(creation), "Binding effects do not acknowledge the configured first save")
+            XCTAssertFalse(fresh.permitsBoundOperationAndSave)
+            XCTAssertFalse(fresh.worktreeBindingTransitionInProgress)
+            fresh.isPreparingInitialWorktree = false
+        }
+    }
+
     func testMergePreviewAndApplyAcknowledgeActualOriginSaves() async throws {
         let fixture = try await durableFixture()
         defer { fixture.git.cleanup() }
@@ -1851,15 +1962,18 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         let manager = WorkspaceManagerViewModel(
             fileManager: files, promptViewModel: prompt, performInitialWorkspaceActivation: false
         )
-        let (viewModel, session, sessionID) = fixture(workspacePath: logical.path, windowID: windowID, scoped: false)
+        let (viewModel, session, sessionID) = fixture(
+            workspacePath: logical.path, windowID: windowID, scoped: false, prompt: prompt, manager: manager
+        )
         let workspace = WorkspaceModel(
             name: "Worktree switch", repoPaths: [logical.path], ephemeralFlag: true,
             composeTabs: [ComposeTabState(id: session.tabID, activeAgentSessionID: sessionID)], activeComposeTabID: session.tabID
         )
         manager.workspaces = [workspace]
         manager.activeWorkspace = workspace
-        viewModel.workspaceManager = manager
-        viewModel.promptManager = prompt
+        XCTAssertTrue(viewModel.workspaceManager === manager)
+        XCTAssertTrue(viewModel.promptManager === prompt)
+        XCTAssertEqual(viewModel.managedInputEnvironment().workspaceID, workspace.id)
         // The durable fixture owns an exact workspace carrier, not an unscoped test-only binding.
         // Exercise the production qualification CAS before granting restored-payload readiness.
         XCTAssertNotNil(viewModel.test_installPersistentSessionBinding(
@@ -1884,6 +1998,8 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         let materializer = WorkspaceRootBindingProjectionMaterializer(store: prompt.workspaceFileContextStore)
         let preparation = try await materializer.prepare(sessionID: sessionID, bindings: session.worktreeBindings)
         _ = try await materializer.commit(preparation)
+        // This fixture explicitly owns an empty MCP execution set.
+        viewModel.linkExecutionRuntime.activeMCPToolProbe = { _ in false }
         return DurableFixture(git: git, prompt: prompt, manager: manager, viewModel: viewModel, session: session, sessionID: sessionID)
     }
 
@@ -1919,7 +2035,10 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         }
     }
 
-    private func fixture(workspacePath: String = "/tmp/logical-worktree-admission", windowID: Int = -991, scoped: Bool = true) -> (AgentModeViewModel, AgentModeViewModel.TabSession, UUID) {
+    private func fixture(
+        workspacePath: String = "/tmp/logical-worktree-admission", windowID: Int = -991, scoped: Bool = true,
+        prompt: PromptViewModel? = nil, manager: WorkspaceManagerViewModel? = nil
+    ) -> (AgentModeViewModel, AgentModeViewModel.TabSession, UUID) {
         let viewModel = AgentModeViewModel(
             testWindowID: windowID,
             testWorkspacePath: workspacePath,
@@ -1927,7 +2046,8 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
                 preconditionFailure("Admission tests must not start a provider")
             },
             connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
-            mcpServerEnabler: { true }
+            mcpServerEnabler: { true },
+            testPromptManager: prompt, testWorkspaceManager: manager
         )
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         let sessionID = UUID()

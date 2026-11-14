@@ -71,6 +71,7 @@ final class ClaudeIntegratedAgentModeRunner {
         guard let runID = AgentModeProcessRunIdentity.existingProcessRunID(for: session),
               session.claudeController != nil, listener.pendingProviderTurnID == turnID,
               listener.subscription == nil, listener.isCurrent(),
+              let cleanup = listener.routingCleanup,
               let subscription = listener.reserve()
         else { return false }
         let owner = session.beginRunAttempt(source: "claudeNative.providerInitiated")
@@ -89,7 +90,7 @@ final class ClaudeIntegratedAgentModeRunner {
         session.installRunAttemptTerminalResources(ownership: owner) { [weak session, claudeCoordinator] state in
             {
                 guard let session, state == .cancelled || state == .failed else { return }
-                await claudeCoordinator.cleanupAdoptedRun(session: session, runID: runID)
+                await claudeCoordinator.cleanupAdoptedRun(session: session, runID: runID, cleanup: cleanup)
             }
         }
         hooks.presentation.setAgentRunActive(session, true)
@@ -139,6 +140,7 @@ final class ClaudeIntegratedAgentModeRunner {
         tabID: UUID,
         session: AgentTabSession,
         origin: AgentSessionRuntimeStore.Command,
+        providerLaunchInput: AgentProviderLaunchInput? = nil,
         initialUserMessage: String,
         initialMessageForRun: String,
         attachments: [AgentFileAttachment],
@@ -155,6 +157,7 @@ final class ClaudeIntegratedAgentModeRunner {
         // The service transfers only admitted work, without an intervening await. A refused direct
         // caller has no authority to repair a note prepared under a different admission.
         guard case .restored = origin.requirement, origin.writer.session === session, origin.isCurrent,
+              providerLaunchInput?.isCurrent(for: session) != false,
               let receipt = AgentSessionRuntimeStore.WriterReceipt(origin)
         else {
             if let preparedEvents {
@@ -295,6 +298,7 @@ final class ClaudeIntegratedAgentModeRunner {
             #endif
             guard await admitStartupLease(
                 session: session, receipt: receipt, ownership: ownership, runID: runID,
+                providerLaunchInput: providerLaunchInput,
                 listener: listener, subscription: subscription, lease: lease, acquired: false,
                 attachmentReservationID: attachmentReservationID,
                 recordsHandoff: recordsHandoff
@@ -304,6 +308,7 @@ final class ClaudeIntegratedAgentModeRunner {
                 if acquired {
                     guard await self.admitStartupLease(
                         session: session, receipt: receipt, ownership: ownership, runID: runID,
+                        providerLaunchInput: providerLaunchInput,
                         listener: listener, subscription: subscription, lease: lease, acquired: true,
                         attachmentReservationID: attachmentReservationID,
                         recordsHandoff: recordsHandoff
@@ -337,6 +342,7 @@ final class ClaudeIntegratedAgentModeRunner {
                 #endif
                 guard await self.admitStartupLease(
                     session: session, receipt: receipt, ownership: ownership, runID: runID,
+                    providerLaunchInput: providerLaunchInput,
                     listener: listener, subscription: subscription, lease: lease, acquired: true,
                     attachmentReservationID: attachmentReservationID,
                     recordsHandoff: recordsHandoff
@@ -356,6 +362,7 @@ final class ClaudeIntegratedAgentModeRunner {
                     #endif
                     guard await self.admitStartupLease(
                         session: session, receipt: receipt, ownership: ownership, runID: runID,
+                        providerLaunchInput: providerLaunchInput,
                         listener: listener, subscription: subscription, lease: lease, acquired: true,
                         attachmentReservationID: attachmentReservationID,
                         recordsHandoff: recordsHandoff
@@ -377,7 +384,9 @@ final class ClaudeIntegratedAgentModeRunner {
                         selfCompactDispatchID: selfCompactDispatchID,
                         // A replacement process's MCP child needs this run's one-shot admission
                         // policy re-armed; the lease that installed it still owns it here.
-                        reinstallRunRoutingPolicy: { await lease.reinstallPolicyForReplacementProcess() }
+                        reinstallRunRoutingPolicy: { await lease.reinstallPolicyForReplacementProcess() },
+                        providerLaunchInput: providerLaunchInput,
+                        routingLease: lease
                     )
                     if sendOutcome == .sent { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) }
                     if let dedicatedNoteID, sendOutcome != .sent {
@@ -863,6 +872,7 @@ final class ClaudeIntegratedAgentModeRunner {
         receipt: AgentSessionRuntimeStore.WriterReceipt,
         ownership: AgentRunOwnership,
         runID: UUID,
+        providerLaunchInput: AgentProviderLaunchInput?,
         listener: ClaudeControllerEventListener,
         subscription: ClaudeAttemptEventSubscription,
         lease: MCPBootstrapLease,
@@ -875,7 +885,7 @@ final class ClaudeIntegratedAgentModeRunner {
             if acquired { await lease.releaseGateForDeferredRouting() }
             return false
         }
-        guard receipt.disposition(for: session) != .current else { return true }
+        guard receipt.disposition(for: session) != .current || providerLaunchInput?.isCurrent(for: session) == false else { return true }
         listener.close(subscription, returningTail: true)
         if Self.ownsStartupAttempt(session, receipt: receipt, ownership: ownership, runID: runID) {
             if recordsHandoff { hooks.providerInput.recordPendingHandoffSendOutcome(session, false) }

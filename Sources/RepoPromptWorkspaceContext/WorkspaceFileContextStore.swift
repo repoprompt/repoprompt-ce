@@ -3104,6 +3104,13 @@ package actor WorkspaceFileContextStore {
 
     package struct RootRetention {
         fileprivate let id: UUID
+        fileprivate let lifetimeTokens: [WorkspaceContextRootLifetimeToken]
+
+        /// Synchronous revocation of the exact roots retained by this receipt. This does not
+        /// prove receipt ownership or workspace admission; the lease must still be unreleased.
+        package var rootLifetimesAreCurrent: Bool {
+            lifetimeTokens.allSatisfy(\.isCurrent)
+        }
     }
 
     private struct RetainedRootLifetime: Hashable {
@@ -12617,11 +12624,15 @@ package actor WorkspaceFileContextStore {
     /// An unloading root has already been removed from rootStatesByID before the first teardown await.
     package func retainRoots(ids: [UUID]) throws -> RootRetention {
         var lifetimes: Set<RetainedRootLifetime> = []
+        var lifetimeTokens: [WorkspaceContextRootLifetimeToken] = []
         for id in Set(ids) {
-            guard let state = rootStatesByID[id] else { throw WorkspaceFileContextStoreError.rootNotLoaded(id) }
+            guard let state = rootStatesByID[id], let lifetimeToken = rootLifetimeTokensByID[id] else {
+                throw WorkspaceFileContextStoreError.rootNotLoaded(id)
+            }
             lifetimes.insert(.init(rootID: id, lifetimeID: state.lifetimeID))
+            lifetimeTokens.append(lifetimeToken)
         }
-        let token = RootRetention(id: UUID())
+        let token = RootRetention(id: UUID(), lifetimeTokens: lifetimeTokens)
         rootRetentions[token.id] = lifetimes
         for lifetime in lifetimes {
             rootRetentionCounts[lifetime, default: 0] += 1

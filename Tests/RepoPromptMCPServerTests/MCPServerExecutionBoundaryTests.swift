@@ -130,6 +130,7 @@ private final class ServerExecutionFixture: @unchecked Sendable {
     let limiters = MCPDomainConnectionCallLimiters()
     let checks: ServerBoundaryChecks
     let marker = NSObject()
+    let runRoutingRegistrationID = UUID()
     var handle: MCPDomainToolRegistrationHandle!
     var captured: MCPServerResolvedInvocation!
     var authorization: MCPToolDispatchAuthorization!
@@ -157,10 +158,12 @@ private final class ServerExecutionFixture: @unchecked Sendable {
         let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definitions.first { $0.name == tool })
         let effectURL = fixture.effectURL
         let invocationID = fixture.invocationID
+        let runRoutingRegistrationID = fixture.runRoutingRegistrationID
         fixture.handle = try await fixture.runtime.toolRegistry.register(registrationID: .init(), scope: .window(id: 42), bindings: [
             MCPDomainToolBinding(definition: definition, operation: { _ in
                 let context = try MCPInvocationContextBridge.require(toolName: tool, diagnosticSink: { _ in })
                 XCTAssertEqual(context.invocationID, invocationID)
+                XCTAssertEqual(context.dispatchAuthorization?.runRoutingRegistrationID, runRoutingRegistrationID)
                 try Data(context.invocationID.uuidString.utf8).write(to: effectURL)
                 return .string("effect")
             })
@@ -200,7 +203,8 @@ private final class ServerExecutionFixture: @unchecked Sendable {
                 windowStateIdentity: ObjectIdentifier(fixture.marker),
                 serverViewModelIdentity: ObjectIdentifier(fixture.marker),
                 catalogRegistrationHandle: fixture.handle
-            )
+            ),
+            runRoutingRegistrationID: runRoutingRegistrationID
         )
         return fixture
     }

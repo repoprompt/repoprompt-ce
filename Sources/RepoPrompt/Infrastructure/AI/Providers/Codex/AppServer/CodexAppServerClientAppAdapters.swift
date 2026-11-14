@@ -68,7 +68,19 @@ extension CodexAppServerClient {
 }
 
 extension CodexAppServerClient.ExpectedAgentPIDRegistrar {
-    static let serverNetworkManager = Self(
+    /// Capture the originating policy, never resolve a run's current registration at cleanup.
+    static func serverNetworkManager(registration: MCPRunRoutingCleanupReceipt) -> CodexAppServerClient.ExpectedAgentPIDRegistrar {
+        .init(
+            register: { pid, clientName, runID in
+                await ServerNetworkManager.shared.registerExpectedAgentPID(pid, for: clientName, runID: runID, registration: registration)
+            },
+            clear: { pid, clientName, runID in
+                await ServerNetworkManager.shared.clearExpectedAgentPID(pid, for: clientName, runID: runID, registration: registration)
+            }
+        )
+    }
+
+    static let serverNetworkManager = CodexAppServerClient.ExpectedAgentPIDRegistrar(
         register: { pid, clientName, runID in
             await ServerNetworkManager.shared.registerExpectedAgentPID(pid, for: clientName, runID: runID)
         },

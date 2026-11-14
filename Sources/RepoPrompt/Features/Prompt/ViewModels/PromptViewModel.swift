@@ -3042,6 +3042,21 @@ class PromptViewModel: ObservableObject {
         return manager.activeWorkspaceID == workspaceID
     }
 
+    /// A visible editor's preparation boundary, not a callback installed into execution. Once
+    /// this returns, the host independently captures canonical input for its original command.
+    @MainActor
+    func publishPendingComposeInput(workspaceID: UUID, tabID: UUID) async throws {
+        try Task.checkCancellation()
+        guard let manager = workspaceManager, activeComposeTabID == tabID,
+              flushActiveComposeTabBeforeWorkspaceMutation(workspaceID: workspaceID)
+        else { throw PromptError.composeInputContextChanged }
+        _ = try await manager.publishCanonicalComposeInput(workspaceID: workspaceID, tabID: tabID)
+        try Task.checkCancellation()
+        guard workspaceManager === manager, manager.activeWorkspaceID == workspaceID,
+              activeComposeTabID == tabID
+        else { throw PromptError.composeInputContextChanged }
+    }
+
     @MainActor
     private func withComposeTabSwitching<T>(
         targetTabID: UUID? = nil,
@@ -7938,6 +7953,7 @@ extension Array {
 
 enum PromptError: Error {
     case aiServiceNotAvailable
+    case composeInputContextChanged
 }
 
 enum AIResponseError: Error {

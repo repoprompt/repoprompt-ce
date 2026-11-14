@@ -40,19 +40,127 @@ final class AgentSessionLinkHeadlessRunnerPromptAdapterTests: XCTestCase {
         _ harness: AgentSessionLinkRunnerHarness,
         session: AgentModeViewModel.TabSession,
         message: String,
-        localComposerCandidate: UUID? = nil
+        localComposerCandidate: UUID? = nil,
+        providerLaunchInput: AgentProviderLaunchInput? = nil
     ) async {
         let runner = harness.makeHeadlessRunner()
         await harness.resources.fulfill(runner.prepareRun(
             tabID: session.tabID,
             session: session,
+            providerLaunchInput: providerLaunchInput,
             initialUserMessage: message,
             initialMessageForRun: message,
             attachments: [],
             makeLease: { runID in harness.makeLease(runID: runID, tabID: session.tabID) },
+            stopFence: .init(session: session),
             localComposerCandidate: localComposerCandidate
         ))
         await session.agentTask?.value
+    }
+
+    func testHeadlessCanonicalResourcesRemainCurrentThroughFinalProviderProof() async throws {
+        for change in ["current", "resourceAdmission", "resourceProof", "stopProof"] {
+            let provider = AgentSessionLinkCapturingHeadlessProvider()
+            let harness = makeHarness(provider: provider)
+            let session = try harness.makeBoundSession(agent: .claudeCode)
+            let command = try harness.startCommand(for: session)
+            var resourcesCurrent = true
+            var validations = 0
+            let input = try AgentProviderLaunchInput(
+                origin: command, workspace: harness.workspace, bindings: [],
+                resourcesAreCurrent: { resourcesCurrent }, validateResources: {
+                    validations += 1
+                    if change == "resourceAdmission", validations == 2 { resourcesCurrent = false }
+                    return resourcesCurrent
+                }
+            )
+            harness.beforeProviderInputProof = {
+                if change == "resourceProof" { resourcesCurrent = false }
+                if change == "stopProof" { session.stopState.invalidateScheduledStarts() }
+            }
+            await startRun(harness, session: session, message: "Exact host input", providerLaunchInput: input)
+            let messages = await provider.messages
+            XCTAssertEqual(messages.count, change == "current" ? 1 : 0, change)
+            XCTAssertGreaterThanOrEqual(validations, 2, change)
+            XCTAssertNil(session.agentTask, "Refused original input must settle its producer: \(change)")
+        }
+    }
+
+    func testCompletedHeadlessProviderDisposalCleansOnlyItsOriginatingRegistration() async throws {
+        for replaceRegistration in [false, true] {
+            let route = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: nil)
+            let disposal = TestReleaseFence(name: "headless original provider disposal")
+            defer { disposal.release() }
+            let provider = AgentSessionLinkCapturingHeadlessProvider(
+                beforeStream: { runID in
+                    guard let runID, let generation = await MCPRoutingWaiter.generation(runID: runID) else {
+                        XCTFail("The actual runner must acquire its owned routing registration before dispatch")
+                        return
+                    }
+                    await MCPRoutingWaiter.notifyRouted(runID: runID, generation: generation)
+                },
+                onDispose: { await disposal.enterAndWait() }
+            )
+            let harness = makeHarness(provider: provider)
+            let session = harness.makeSession(agent: .openCode)
+            let barrier = AgentRunTerminalCommitBarrier()
+            let runner = HeadlessAgentModeRunner(hooks: harness.hooks, terminalCommitBarrier: barrier)
+            let request = await runner.prepareRun(
+                tabID: session.tabID, session: session,
+                initialUserMessage: "complete original run", initialMessageForRun: "complete original run",
+                attachments: [], makeLease: { runID in
+                    MCPBootstrapLease(
+                        spec: .agentMode(tabID: session.tabID, runID: runID, gateID: UUID(), windowID: route.identity.routeID, agent: .openCode),
+                        routingOwner: route
+                    )
+                }
+            )
+            let ownership = try XCTUnwrap(session.activeRunOwnership)
+            let runID = try XCTUnwrap(session.runID)
+            await harness.resources.fulfill(request)
+            await disposal.waitUntilEntered()
+            try await AsyncTestWait.waitUntil("headless terminal publication before teardown receipt") {
+                !session.terminalCommitInProgress && session.activeRunOwnership == nil
+            }
+            let terminalReceipt = try XCTUnwrap(barrier.captureTerminalTeardown(tabID: session.tabID, lifecycle: session.runLifecycle))
+            XCTAssertTrue(terminalReceipt.ownerships.contains(ownership))
+            var waiterEntered = false
+            var waiterCompleted = false
+            let waiter = Task { @MainActor in
+                waiterEntered = true
+                await terminalReceipt.waitForCompletion()
+                waiterCompleted = true
+            }
+            try await AsyncTestWait.waitUntil("original terminal receipt waiter") { waiterEntered }
+            waiter.cancel()
+            XCTAssertFalse(waiterCompleted, "Cancelling a waiter cannot acknowledge the held provider disposal")
+            let manager = ServerNetworkManager.shared
+            let originalPolicy = await manager.debugRunPolicyState(for: runID)
+            XCTAssertNotNil(originalPolicy, "Successful attempt settlement does not finish provider lifetime")
+            let successor: MCPBootstrapLease?
+            if replaceRegistration {
+                let lease = MCPBootstrapLease(
+                    spec: .agentMode(tabID: session.tabID, runID: runID, gateID: UUID(), windowID: route.identity.routeID, agent: .openCode),
+                    routingOwner: route
+                )
+                let acquired = await lease.acquire()
+                XCTAssertTrue(acquired)
+                successor = lease
+            } else {
+                successor = nil
+            }
+            disposal.release()
+            await session.agentTask?.value
+            await waiter.value
+            XCTAssertTrue(waiterCompleted)
+            XCTAssertEqual(session.runState, .completed)
+            let finalPolicy = await manager.debugRunPolicyState(for: runID)
+            XCTAssertEqual(finalPolicy != nil, replaceRegistration)
+            let messages = await provider.messages
+            XCTAssertEqual(messages.count, 1)
+            await successor?.finishOwnedProviderRouting()
+            await route.close()
+        }
     }
 
     func testLocalInputHeadlessAcceptanceAndRetainedTransportFailureSettleExactProducerOnce() async {

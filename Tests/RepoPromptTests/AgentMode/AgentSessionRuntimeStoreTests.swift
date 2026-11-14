@@ -4,7 +4,505 @@ import RepoPromptDomainRuntime
 import XCTest
 
 @MainActor
+enum AgentSessionHostDrainTestEffects {
+    static var empty: AgentSessionHostDrainRuntime.EffectJoin {
+        .init(hasPending: { _ in false }, drain: { _ in }, hasPendingInScope: { false }, drainScope: {})
+    }
+}
+
+@MainActor
 final class AgentSessionRuntimeStoreTests: XCTestCase {
+    func testMissingManagedOrSelfCompactJoinCapabilityRetainsWithoutProbeOrRelease() async {
+        for missingSelfCompact in [false, true] {
+            let store = AgentSessionRuntimeStore()
+            let scope = store.makeScope()
+            let session = scope.makeSession(tabID: UUID())
+            scope.replaceSessions([session.tabID: session])
+            defer {
+                scope.replaceSessions([:])
+                _ = scope.releaseWriterClaimsAfterDrain()
+                scope.acknowledgeDrain()
+            }
+            var probes = 0
+            let drain = AgentSessionHostDrainRuntime.begin(scope: scope, owner: NSObject(), adapters: .init(
+                managedInput: missingSelfCompact ? AgentSessionHostDrainTestEffects.empty : nil,
+                selfCompact: missingSelfCompact ? nil : AgentSessionHostDrainTestEffects.empty,
+                finishProvider: { _ in XCTFail("Missing capability is not provider teardown permission") },
+                probe: { _, _ in probes += 1
+                    return true
+                }
+            ))
+            XCTAssertTrue(scope.settlement(for: session).blockers.contains(.drainCapability))
+            drain.attemptRecovery()
+            guard case .retained = await drain.wait(until: .now.advanced(by: .seconds(5))) else { return XCTFail("Missing joins cannot default to idle") }
+            XCTAssertEqual(probes, 0)
+            XCTAssertTrue(scope.sessions[session.tabID] === session)
+            XCTAssertFalse(scope.releaseWriterClaimsAfterHostDrain())
+            XCTAssertEqual(store.retainedDrains.count, 1)
+        }
+    }
+
+    func testManagedAndSelfCompactEffectJoinsRemainPendingAfterVisibleStateDisappears() async {
+        for selfCompact in [false, true] {
+            let store = AgentSessionRuntimeStore()
+            let scope = store.makeScope()
+            let session = scope.makeSession(tabID: UUID())
+            scope.replaceSessions([session.tabID: session])
+            let entered = expectation(description: "exact entered producer join")
+            let gate = AgentSessionLinkStopSignal<Void>()
+            var pending = true
+            let join = AgentSessionHostDrainRuntime.EffectJoin(hasPending: { _ in pending }, drain: { exact in
+                XCTAssertTrue(exact === session)
+                entered.fulfill()
+                await gate.value()
+                pending = false
+                session.noteMonitorObservationInputsChanged()
+            }, hasPendingInScope: { pending }, drainScope: {
+                if pending {
+                    await gate.value()
+                    pending = false
+                    session.noteMonitorObservationInputsChanged()
+                }
+            })
+            let drain = AgentSessionHostDrainRuntime.begin(scope: scope, owner: NSObject(), adapters: .init(
+                managedInput: selfCompact ? AgentSessionHostDrainTestEffects.empty : join,
+                selfCompact: selfCompact ? join : AgentSessionHostDrainTestEffects.empty,
+                finishProvider: { _ in }, probe: { _, current in current() }
+            ))
+            session.selfCompactState = AgentSelfCompactState()
+            XCTAssertTrue(scope.settlement(for: session).blockers.contains(.effects))
+            XCTAssertFalse(scope.releaseWriterClaim(for: session), "Phase disappearance is not an entered producer receipt")
+            drain.attemptRecovery()
+            await fulfillment(of: [entered], timeout: 5)
+            let before = await drain.wait(until: .now)
+            XCTAssertEqual(before, .timedOut)
+            XCTAssertTrue(pending)
+            XCTAssertFalse(scope.hasReleasedWriterClaims)
+            gate.finish(())
+            let result = await drain.wait(until: .now.advanced(by: .seconds(5)))
+            XCTAssertEqual(result, .released)
+            XCTAssertFalse(pending)
+            XCTAssertTrue(store.retainedDrains.isEmpty)
+        }
+    }
+
+    func testLegacyPreparedReleaseDoesNotAdoptDormantHostPolicyOrRequireWakeups() {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let session = scope.makeSession(tabID: UUID())
+        scope.replaceSessions([session.tabID: session])
+        session.pendingInstructions = [.providerOnly("already persisted queued work")]
+        session.isDirty = true
+        scope.beginRetirement()
+        XCTAssertTrue(scope.settlement(for: session).legacyDrainCanRelease == false)
+        XCTAssertFalse(scope.releaseWriterClaimsAfterDrain(), "Legacy dirty durability remains required")
+        session.isDirty = false
+        XCTAssertFalse(scope.releaseWriterClaimsAfterHostDrain(), "Full host policy cannot discard queued work")
+        XCTAssertTrue(scope.settlementObservers.isEmpty, "Legacy caller installs no new subscription")
+        XCTAssertTrue(scope.releaseWriterClaimsAfterDrain(), "Existing prepared-owner policy stays compatible until composition cutover")
+    }
+
+    func testExplicitRecoveryRechecksUnpublishedBlockerAndReusesRetainedOwner() async throws {
+        let store = AgentSessionRuntimeStore()
+        let scope = store.makeScope()
+        let session = scope.makeSession(tabID: UUID())
+        scope.replaceSessions([session.tabID: session])
+        let finishedPump = Task<Void, Never> {}
+        await finishedPump.value
+        session.codexFallbackPumpTask = finishedPump
+        let original = NSObject(), replacement = NSObject()
+        let drain = AgentSessionHostDrainRuntime.begin(scope: scope, owner: original, adapters: .init(
+            managedInput: AgentSessionHostDrainTestEffects.empty, selfCompact: AgentSessionHostDrainTestEffects.empty,
+            finishProvider: { _ in }, probe: { _, current in current() }
+        ))
+        let reused = AgentSessionHostDrainRuntime.begin(scope: scope, owner: replacement, adapters: .init(
+            managedInput: AgentSessionHostDrainTestEffects.empty, selfCompact: AgentSessionHostDrainTestEffects.empty,
+            finishProvider: { _ in XCTFail("Must not replace original adapters") }, probe: { _, _ in false }
+        ))
+        XCTAssertTrue(reused === drain)
+        XCTAssertEqual(store.retainedDrains.count, 1)
+        drain.attemptRecovery()
+        try await AsyncTestWait.waitUntil("drain subscribed to blocker changes") { !scope.settlementObservers.isEmpty }
+        XCTAssertNil(drain.outcome)
+        session.codexFallbackPumpTask = nil
+        // No terminal/publication signal accompanies this private producer handle clearing.
+        drain.attemptRecovery()
+        let result = await drain.wait(until: .now.advanced(by: .seconds(5)))
+        XCTAssertEqual(result, .released)
+        XCTAssertTrue(store.retainedDrains.isEmpty)
+    }
+
+    func testDrainRetainsHostThroughNonterminalEffectAndAcknowledgesDeallocation() async throws {
+        let store = AgentSessionRuntimeStore()
+        let scope = store.makeScope()
+        let session = scope.makeSession(tabID: UUID())
+        scope.replaceSessions([session.tabID: session])
+        let gate = AgentSessionLinkStopSignal<Bool>()
+        let interactions = scope.interactions(routeID: -1406, approvalStore: ApplyEditsApprovalStore())
+        let effect = interactions.performEffect(for: session) { _ = await gate.value() }
+        let releaseEntered = AgentSessionLinkStopSignal<Bool>()
+        let releaseGate = AgentSessionLinkStopSignal<Bool>()
+        var resourceReleases = 0
+        var owner: NSObject? = NSObject()
+        weak var weakOwner: NSObject?
+        weakOwner = owner
+        let drain = try AgentSessionHostDrainRuntime.begin(scope: scope, owner: XCTUnwrap(owner), adapters: .init(
+            managedInput: AgentSessionHostDrainTestEffects.empty, selfCompact: AgentSessionHostDrainTestEffects.empty,
+            finishProvider: { [owner] _ in withExtendedLifetime(owner) {} }, probe: { _, current in current() }
+        ), releaseResources: {
+            XCTAssertTrue(scope.hasReleasedWriterClaims, "Resource release follows the full exact drain acknowledgement")
+            resourceReleases += 1
+            releaseEntered.finish(true)
+            _ = await releaseGate.value()
+        })
+        owner = nil
+        drain.attemptRecovery()
+        let before = await drain.wait(until: .now)
+        XCTAssertEqual(before, .timedOut)
+        XCTAssertNotNil(weakOwner)
+        XCTAssertEqual(store.retainedDrains.count, 1)
+        XCTAssertTrue(scope.isRetiring)
+        gate.finish(true)
+        await effect.value
+        _ = await releaseEntered.value()
+        let cancelledWaiter = Task { await drain.wait(until: .now.advanced(by: .seconds(5))) }
+        cancelledWaiter.cancel()
+        let cancelled = await cancelledWaiter.value
+        XCTAssertEqual(cancelled, .cancelled)
+        XCTAssertNil(drain.outcome)
+        XCTAssertNotNil(weakOwner, "Completed session effects do not skip the original resource-release producer")
+        XCTAssertEqual(store.retainedDrains.count, 1)
+        releaseGate.finish(true)
+        let result = await drain.wait(until: .now.advanced(by: .seconds(5)))
+        XCTAssertEqual(result, .released)
+        XCTAssertTrue(scope.hasReleasedWriterClaims)
+        XCTAssertEqual(resourceReleases, 1)
+        XCTAssertTrue(store.retainedDrains.isEmpty)
+        XCTAssertNil(weakOwner)
+    }
+
+    func testAcknowledgedDrainCanDeallocateScopeAndSessionGraph() async {
+        let store = AgentSessionRuntimeStore()
+        weak var weakScope: AgentSessionRuntimeStore.Scope?
+        weak var weakSession: AgentTabSession?
+        var drain: AgentSessionHostDrainRuntime?
+        do {
+            let scope = store.makeScope()
+            let session = scope.makeSession(tabID: UUID())
+            scope.replaceSessions([session.tabID: session])
+            weakScope = scope
+            weakSession = session
+            let owner = NSObject()
+            let runtime = AgentSessionHostDrainRuntime.begin(scope: scope, owner: owner, adapters: .init(
+                managedInput: AgentSessionHostDrainTestEffects.empty, selfCompact: AgentSessionHostDrainTestEffects.empty,
+                finishProvider: { [owner] _ in withExtendedLifetime(owner) {} }, probe: { _, current in current() }
+            ))
+            drain = runtime
+            runtime.attemptRecovery()
+            let result = await runtime.wait(until: .now.advanced(by: .seconds(5)))
+            XCTAssertEqual(result, .released)
+        }
+        XCTAssertNotNil(weakScope, "An external receipt can still inspect its acknowledged scope")
+        XCTAssertNotNil(drain)
+        drain = nil
+        XCTAssertNil(weakScope)
+        XCTAssertNil(weakSession)
+        XCTAssertTrue(store.retainedDrains.isEmpty)
+    }
+
+    func testDrainRejectsStaleProbeAndRecoveryCannotAdoptReacquiredClaim() async throws {
+        let store = AgentSessionRuntimeStore()
+        let scope = store.makeScope()
+        let session = scope.makeSession(tabID: UUID())
+        scope.replaceSessions([session.tabID: session])
+        let originalMembership = try XCTUnwrap(scope.membership(of: session)).identity
+        // Explicit fixture-only cleanup after assertions; production recovery may not discard
+        // this retained failed obligation or use legacy release to adopt a reacquired writer.
+        defer {
+            scope.replaceSessions([:])
+            _ = scope.releaseWriterClaimsAfterDrain()
+            scope.acknowledgeDrain()
+        }
+        let entered = expectation(description: "probe suspended")
+        let gate = AgentSessionLinkStopSignal<Bool>()
+        var probes = 0
+        let drain = AgentSessionHostDrainRuntime.begin(scope: scope, owner: NSObject(), adapters: .init(
+            managedInput: AgentSessionHostDrainTestEffects.empty, selfCompact: AgentSessionHostDrainTestEffects.empty,
+            finishProvider: { _ in }, probe: { _, _ in
+                probes += 1
+                if probes == 1 { entered.fulfill()
+                    _ = await gate.value()
+                }
+                return true
+            }
+        ))
+        drain.attemptRecovery()
+        await fulfillment(of: [entered], timeout: 5)
+        scope.replaceSessions([:])
+        scope.replaceSessions([session.tabID: session])
+        gate.finish(true)
+        guard case .retained = await drain.wait(until: .now.advanced(by: .seconds(5))) else { return XCTFail("A stale successful probe is not release") }
+        scope.noteSettlementChanged()
+        XCTAssertEqual(probes, 1)
+        XCTAssertEqual(store.retainedDrains.count, 1)
+        XCTAssertTrue(scope.sessions[session.tabID] === session)
+        drain.attemptRecovery()
+        guard case .retained = await drain.wait(until: .now.advanced(by: .seconds(5))) else { return XCTFail("Explicit recovery cannot adopt the reacquired claim") }
+        XCTAssertEqual(probes, 1, "Never probe or release a successor through the original obligation")
+        XCTAssertEqual(drain.sessionOutcomes[session.tabID]?.membership, originalMembership)
+        XCTAssertTrue(scope.sessions[session.tabID] === session)
+        XCTAssertFalse(scope.hasReleasedWriterClaims)
+    }
+
+    func testDrainRecoveryKeepsCapturedProviderReceiptInsteadOfAdoptingNewRun() async {
+        let store = AgentSessionRuntimeStore()
+        let scope = store.makeScope()
+        let session = scope.makeSession(tabID: UUID())
+        scope.replaceSessions([session.tabID: session])
+        defer {
+            scope.replaceSessions([:])
+            _ = scope.releaseWriterClaimsAfterDrain()
+            scope.acknowledgeDrain()
+        }
+        var captures = 0
+        var finishes = 0
+        let drain = AgentSessionHostDrainRuntime.begin(scope: scope, owner: NSObject(), adapters: .init(
+            managedInput: AgentSessionHostDrainTestEffects.empty, selfCompact: AgentSessionHostDrainTestEffects.empty,
+            captureProvider: { _ in
+                captures += 1
+                return .init(finish: { finishes += 1 }, probe: { _ in false })
+            }
+        ))
+        drain.attemptRecovery()
+        guard case .retained = await drain.wait(until: .now.advanced(by: .seconds(5))) else { return XCTFail("The original provider probe must retain") }
+        session.installRunID(UUID())
+        drain.attemptRecovery()
+        guard case .retained = await drain.wait(until: .now.advanced(by: .seconds(5))) else { return XCTFail("Recovery must not adopt a new run") }
+        XCTAssertEqual(captures, 1)
+        XCTAssertEqual(finishes, 1, "Do not invoke old teardown under a new execution snapshot")
+        XCTAssertFalse(scope.hasReleasedWriterClaims)
+    }
+
+    func testDrainWaiterCancellationDoesNotDrainAndSiblingCanRelease() async {
+        let store = AgentSessionRuntimeStore()
+        let scope = store.makeScope()
+        let blocked = scope.makeSession(tabID: UUID()), sibling = scope.makeSession(tabID: UUID())
+        scope.replaceSessions([blocked.tabID: blocked, sibling.tabID: sibling])
+        let entered = expectation(description: "blocked probe entered")
+        let siblingReleased = expectation(description: "sibling probe entered")
+        let gate = AgentSessionLinkStopSignal<Bool>()
+        let drain = AgentSessionHostDrainRuntime.begin(scope: scope, owner: NSObject(), adapters: .init(
+            managedInput: AgentSessionHostDrainTestEffects.empty, selfCompact: AgentSessionHostDrainTestEffects.empty,
+            finishProvider: { _ in }, probe: { session, current in
+                if session === blocked { entered.fulfill()
+                    _ = await gate.value()
+                } else { siblingReleased.fulfill() }
+                return current()
+            }
+        ))
+        drain.attemptRecovery()
+        let observer = Task { await drain.wait(until: .now.advanced(by: .seconds(30))) }
+        await fulfillment(of: [entered, siblingReleased], timeout: 5)
+        observer.cancel()
+        let cancelled = await observer.value
+        XCTAssertEqual(cancelled, .cancelled)
+        XCTAssertNil(scope.sessions[sibling.tabID])
+        XCTAssertTrue(scope.sessions[blocked.tabID] === blocked)
+        XCTAssertFalse(scope.hasReleasedWriterClaims)
+        XCTAssertEqual(store.retainedDrains.count, 1)
+        gate.finish(true)
+        let result = await drain.wait(until: .now.advanced(by: .seconds(5)))
+        XCTAssertEqual(result, .released)
+    }
+
+    func testAggregateManagedAndSelfCompactJoinsProtectRemovedObjectEffects() async {
+        for selfCompact in [false, true] {
+            let store = AgentSessionRuntimeStore()
+            let scope = store.makeScope()
+            let original = scope.makeSession(tabID: UUID())
+            scope.replaceSessions([original.tabID: original])
+            scope.replaceSessions([:])
+            let gate = AgentSessionLinkStopSignal<Void>()
+            var pending = true
+            let joins = AgentSessionHostDrainRuntime.EffectJoin(
+                hasPending: { $0 === original && pending }, drain: { _ in XCTFail("There is no live participant") },
+                hasPendingInScope: { pending }, drainScope: {
+                    await gate.value()
+                    pending = false
+                    scope.noteSettlementChanged()
+                }
+            )
+            let drain = AgentSessionHostDrainRuntime.begin(scope: scope, owner: NSObject(), adapters: .init(
+                managedInput: selfCompact ? AgentSessionHostDrainTestEffects.empty : joins,
+                selfCompact: selfCompact ? joins : AgentSessionHostDrainTestEffects.empty,
+                finishProvider: { _ in XCTFail("Removed objects are not new provider targets") }, probe: { _, _ in false }
+            ))
+            drain.attemptRecovery()
+            let before = await drain.wait(until: .now)
+            XCTAssertEqual(before, .timedOut)
+            XCTAssertFalse(scope.releaseWriterClaimsAfterHostDrain(), "An empty live census does not acknowledge aggregate producer exit")
+            XCTAssertEqual(store.retainedDrains.count, 1)
+            gate.finish(())
+            let result = await drain.wait(until: .now.advanced(by: .seconds(5)))
+            XCTAssertEqual(result, .released)
+            XCTAssertFalse(pending)
+        }
+    }
+
+    func testHostReleaseJoinsScopeInteractionCleanupForPreviouslyRemovedObject() async {
+        let store = AgentSessionRuntimeStore()
+        let scope = store.makeScope()
+        let session = scope.makeSession(tabID: UUID())
+        scope.replaceSessions([session.tabID: session])
+        let interactions = scope.interactions(routeID: -1406, approvalStore: ApplyEditsApprovalStore())
+        let gate = AgentSessionLinkStopSignal<Void>()
+        interactions.performEffect(for: session) { await gate.value() }
+        scope.replaceSessions([:])
+        let drain = AgentSessionHostDrainRuntime.begin(scope: scope, owner: NSObject(), adapters: .init(
+            managedInput: AgentSessionHostDrainTestEffects.empty, selfCompact: AgentSessionHostDrainTestEffects.empty,
+            finishProvider: { _ in }, probe: { _, current in current() }
+        ))
+        drain.attemptRecovery()
+        let before = await drain.wait(until: .now)
+        XCTAssertEqual(before, .timedOut)
+        XCTAssertFalse(scope.releaseWriterClaimsAfterHostDrain())
+        XCTAssertEqual(store.retainedDrains.count, 1)
+        gate.finish(())
+        let result = await drain.wait(until: .now.advanced(by: .seconds(5)))
+        XCTAssertEqual(result, .released)
+        XCTAssertTrue(store.retainedDrains.isEmpty)
+    }
+
+    func testHostAggregateJoinsRemovedContinuationWorktreeAndStorageAccess() async {
+        let store = AgentSessionRuntimeStore()
+        let scope = store.makeScope()
+        let session = scope.makeSession(tabID: UUID())
+        scope.replaceSessions([session.tabID: session])
+        let entered = expectation(description: "originating continuation entered")
+        let gate = AgentSessionLinkStopSignal<Void>()
+        scope.continuation.test_beforeScheduledACPFollowUpStart = {
+            entered.fulfill()
+            await gate.value()
+        }
+        scope.continuation.scheduleTypedACPFollowUp(session: session, instruction: .providerOnly("unstarted"), launch: nil)
+        await fulfillment(of: [entered], timeout: 5)
+        scope.worktrees.beginPendingOperation()
+        let saveID = UUID()
+        XCTAssertTrue(scope.saveQueue.begin(sessionID: saveID))
+        scope.replaceSessions([:])
+        let drain = AgentSessionHostDrainRuntime.begin(scope: scope, owner: NSObject(), adapters: .init(
+            managedInput: AgentSessionHostDrainTestEffects.empty, selfCompact: AgentSessionHostDrainTestEffects.empty,
+            finishProvider: { _ in XCTFail("No current participant") }, probe: { _, _ in false }
+        ))
+        drain.attemptRecovery()
+        let before = await drain.wait(until: .now)
+        XCTAssertEqual(before, .timedOut)
+        XCTAssertFalse(scope.releaseWriterClaimsAfterHostDrain())
+        gate.finish(())
+        await scope.continuation.drainPendingStarts(for: session)
+        scope.worktrees.endPendingOperation()
+        XCTAssertFalse(scope.releaseWriterClaimsAfterHostDrain(), "Storage access still belongs to its original owner")
+        XCTAssertFalse(scope.saveQueue.finish(sessionID: saveID))
+        let result = await drain.wait(until: .now.advanced(by: .seconds(5)))
+        XCTAssertEqual(result, .released)
+        XCTAssertTrue(store.retainedDrains.isEmpty)
+        XCTAssertEqual(session.runState, .idle, "Joining a removed continuation must not launch a new run")
+    }
+
+    func testDrainWakesWhenNonterminalContinuationProducerFinishes() async {
+        let store = AgentSessionRuntimeStore()
+        let scope = store.makeScope()
+        let session = scope.makeSession(tabID: UUID())
+        scope.replaceSessions([session.tabID: session])
+        let entered = expectation(description: "continuation producer suspended")
+        let gate = AgentSessionLinkStopSignal<Void>()
+        scope.continuation.test_beforeScheduledACPFollowUpStart = {
+            entered.fulfill()
+            await gate.value()
+        }
+        scope.continuation.scheduleTypedACPFollowUp(session: session, instruction: .providerOnly("unstarted"), launch: nil)
+        await fulfillment(of: [entered], timeout: 5)
+        let drain = AgentSessionHostDrainRuntime.begin(scope: scope, owner: NSObject(), adapters: .init(
+            managedInput: AgentSessionHostDrainTestEffects.empty, selfCompact: AgentSessionHostDrainTestEffects.empty,
+            finishProvider: { _ in }, probe: { _, current in current() }
+        ))
+        drain.attemptRecovery()
+        let before = await drain.wait(until: .now)
+        XCTAssertEqual(before, .timedOut)
+        XCTAssertTrue(scope.continuation.hasPendingStarts(for: session))
+        gate.finish(())
+        let result = await drain.wait(until: .now.advanced(by: .seconds(5)))
+        XCTAssertEqual(result, .released)
+        XCTAssertEqual(session.runState, .idle, "No terminal transition is needed to wake the drain")
+    }
+
+    func testShutdownUsesOneDeadlineAndRetainsAllTimedOutOwners() async {
+        let store = AgentSessionRuntimeStore()
+        let gate = AgentSessionLinkStopSignal<Void>()
+        let preparationGate = AgentSessionLinkStopSignal<Void>()
+        let captured = expectation(description: "provider identities captured after original preparation")
+        captured.expectedFulfillmentCount = 2
+        var preparationCount = 0
+        var captureCount = 0
+        var drains: [AgentSessionHostDrainRuntime] = []
+        for _ in 0 ..< 2 {
+            let scope = store.makeScope()
+            let session = scope.makeSession(tabID: UUID())
+            scope.replaceSessions([session.tabID: session])
+            let normalizedRunID = UUID()
+            let drain = AgentSessionHostDrainRuntime.begin(scope: scope, owner: NSObject(), adapters: .init(
+                managedInput: AgentSessionHostDrainTestEffects.empty, selfCompact: AgentSessionHostDrainTestEffects.empty,
+                captureProvider: { original in
+                    XCTAssertTrue(original === session)
+                    XCTAssertEqual(original.runID, normalizedRunID)
+                    captureCount += 1
+                    captured.fulfill()
+                    return .init(finish: { await gate.value() }, probe: { current in current() })
+                }
+            ))
+            drain.prepareForFinalShutdown {
+                preparationCount += 1
+                await preparationGate.value()
+                session.installRunID(normalizedRunID)
+            }
+            drain.prepareForFinalShutdown { XCTFail("Repeated shutdown cannot replace the original preparation") }
+            drains.append(drain)
+        }
+        let start = ContinuousClock.now
+        let results = await AgentSessionHostDrainRuntime.shutdown(drains)
+        XCTAssertEqual(results, [.timedOut, .timedOut])
+        XCTAssertLessThan(start.duration(to: .now), .seconds(3), "Two hosts must not each consume a two-second budget")
+        XCTAssertEqual(store.retainedDrains.count, 2)
+        XCTAssertTrue(drains.allSatisfy { !$0.scope.hasReleasedWriterClaims })
+        XCTAssertEqual(preparationCount, 2)
+        XCTAssertEqual(captureCount, 0, "A timeout is not original producer completion or permission to capture halfway through teardown")
+        preparationGate.finish(())
+        await fulfillment(of: [captured], timeout: 5)
+        gate.finish(())
+        for drain in drains {
+            let result = await drain.wait(until: .now.advanced(by: .seconds(5)))
+            XCTAssertEqual(result, .released)
+        }
+        XCTAssertTrue(store.retainedDrains.isEmpty)
+    }
+
+    func testSettlementObservationBuffersCompletionBeforeWaitAndWorktreeIsScopeWide() async {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let session = scope.makeSession(tabID: UUID())
+        scope.replaceSessions([session.tabID: session])
+        let (id, changes) = scope.observeSettlement()
+        defer { scope.removeSettlementObserver(id) }
+        scope.worktrees.beginPendingOperation()
+        scope.beginRetirement()
+        XCTAssertTrue(scope.settlement(for: session).blockers.contains(.worktree))
+        XCTAssertFalse(scope.releaseWriterClaim(for: session))
+        scope.worktrees.endPendingOperation()
+        var iterator = changes.makeAsyncIterator()
+        let completion: Void? = await iterator.next()
+        XCTAssertNotNil(completion)
+        XCTAssertTrue(scope.releaseWriterClaim(for: session))
+        XCTAssertTrue(scope.releaseWriterClaimsAfterDrain())
+    }
+
     func testPersistentWriterReceiptCannotRetainOrAdoptAnOwner() throws {
         let store = AgentSessionRuntimeStore()
         let sessionID = UUID(), workspaceID = UUID()
@@ -555,6 +1053,7 @@ final class AgentSessionRuntimeStoreTests: XCTestCase {
             codexControllerFactory: { _, _, _, _, _, _ in preconditionFailure("Store publication must not launch a provider") }
         )
         XCTAssertTrue(vm.runtimeSessionStore === vm.runtimeHost.scope)
+        XCTAssertTrue(vm.runtimeSessionStore.executableHost === vm.runtimeHost, "An existing writer scope must resolve its original executable composition")
         XCTAssertTrue(vm.codexCoordinator === vm.runtimeHost.codexCoordinator)
         XCTAssertTrue(vm.claudeCoordinator === vm.runtimeHost.claudeCoordinator)
         XCTAssertNotNil(vm.runtimeHost.scope.execution, "Compose execution before creating a visible session")

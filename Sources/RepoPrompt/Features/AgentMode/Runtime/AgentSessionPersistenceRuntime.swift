@@ -53,6 +53,27 @@ final class AgentSessionPersistenceRuntime {
         let creation: AgentSessionCreationHandle?
     }
 
+    /// A point read from the existing canonical authority. No cached workspace or new catalog
+    /// is kept here; IO placement is re-read before the write and before acknowledgment.
+    struct CanonicalStorage {
+        let workspaceID: UUID
+        let readWorkspace: (UUID) async -> WorkspaceModel?
+
+        init(workspaceID: UUID, readWorkspace: @escaping (UUID) async -> WorkspaceModel?) {
+            self.workspaceID = workspaceID
+            self.readWorkspace = readWorkspace
+        }
+
+        init(workspaceID: UUID, contexts: DomainContextStore) {
+            self.init(workspaceID: workspaceID) { id in
+                guard id == workspaceID, let snapshot = await contexts.workspaceSnapshot(id), snapshot.health != .removed,
+                      let workspace = try? JSONDecoder().decode(WorkspaceModel.self, from: snapshot.document.documentBytes),
+                      workspace.id == id else { return nil }
+                return workspace
+            }
+        }
+    }
+
     struct Composition {
         let workspace: () -> WorkspaceModel?
         let workspaceWithID: (UUID) -> WorkspaceModel?
@@ -64,6 +85,25 @@ final class AgentSessionPersistenceRuntime {
         let creationIsCurrent: (AgentSessionCreationHandle) -> Bool
         let admitBinding: (AgentTabSession) -> Admission?
         var isRestoringConfiguration: () -> Bool = { false }
+        var canonicalStorage: CanonicalStorage?
+
+        var workspaceID: UUID? {
+            canonicalStorage?.workspaceID ?? workspace()?.id
+        }
+
+        func readWorkspace() async -> WorkspaceModel? {
+            if let canonicalStorage { return await readWorkspace(withID: canonicalStorage.workspaceID) }
+            return workspace()
+        }
+
+        func readWorkspace(withID id: UUID) async -> WorkspaceModel? {
+            if let canonicalStorage {
+                guard id == canonicalStorage.workspaceID,
+                      let workspace = await canonicalStorage.readWorkspace(id), workspace.id == id else { return nil }
+                return workspace
+            }
+            return workspaceWithID(id)
+        }
     }
 
     struct Presentation {
@@ -103,8 +143,8 @@ final class AgentSessionPersistenceRuntime {
     }
 
     private func currentOwner(for sessionID: UUID) -> AgentTabSession? {
-        guard let workspace = composition?.workspace(),
-              case let .unique(writer) = scope?.resolveWriter(workspaceID: workspace.id, sessionID: sessionID),
+        guard let workspaceID = composition?.workspaceID,
+              case let .unique(writer) = scope?.resolveWriter(workspaceID: workspaceID, sessionID: sessionID),
               writer.scope === scope else { return nil }
         return writer.session
     }
@@ -283,51 +323,49 @@ final class AgentSessionPersistenceRuntime {
         guard permits(expectation, tabID: tabID) else {
             return .deferred("The originating writer changed before persistence.")
         }
+        let composition = composition
         guard composition != nil else { return .deferred("The runtime persistence composition is unavailable.") }
-        guard composition?.isSuppressed() == false || composition?.bypassesSuppression() == true
-        else {
-            #if DEBUG
-                perfRecorder.event("save.session.skipped", tabID: tabID, fields: ["reason": "suppressed"])
-            #endif
-            return .notRequired
-        }
         guard let session = sessions[tabID] else {
             #if DEBUG
                 perfRecorder.event("save.session.skipped", tabID: tabID, fields: ["reason": "missing"])
             #endif
             return .notRequired
         }
-        if composition?.isPreparedSavedHost() == true,
-           let id = session.activeAgentSessionID, AgentSessionDeletionRegistry.shared.blocksNewOversight(sessionID: id)
-        {
-            return .deferred("The saved target is being deleted or has been deleted; its retired runtime cannot write it back.")
-        }
-        if let refusal = composition?.saveAdmission(session) { return .deferred(refusal) }
         var effectiveCreationSave = creationSave
-        if let handle = creationSave?.handle {
-            guard handle.session === session, composition?.creationIsCurrent(handle) == true,
-                  session.creationHandleIsCurrent(handle)
-            else {
-                return .deferred("The session creation owner changed before persistence.")
+        /// The canonical read can suspend. Reuse the save owner's admission rules at each
+        /// storage boundary; these are not fresh command admission or cleanup authority.
+        func admissionFailure() -> AgentSessionSaveCoreResult? {
+            guard permits(expectation, tabID: tabID) else {
+                return .deferred("The originating writer changed before persistence.")
             }
-        } else if let message = session.restorationAdmissionFailureMessage {
-            return .failed(.init(operation: .save, tabID: tabID, message: message))
+            guard composition?.isSuppressed() == false || composition?.bypassesSuppression() == true else {
+                return .notRequired
+            }
+            if composition?.isPreparedSavedHost() == true,
+               let id = session.activeAgentSessionID, AgentSessionDeletionRegistry.shared.blocksNewOversight(sessionID: id)
+            {
+                return .deferred("The saved target is being deleted or has been deleted; its retired runtime cannot write it back.")
+            }
+            if let refusal = composition?.saveAdmission(session) { return .deferred(refusal) }
+            if let handle = effectiveCreationSave?.handle {
+                guard handle.session === session, composition?.creationIsCurrent(handle) == true,
+                      session.creationHandleIsCurrent(handle)
+                else { return .deferred("The session creation owner changed before persistence.") }
+            } else if let message = session.restorationAdmissionFailureMessage {
+                return .failed(.init(operation: .save, tabID: tabID, message: message))
+            }
+            guard !session.isInstallingHandoffWorktreeBindings else {
+                return .deferred("Handoff is still preparing this chat's worktree execution location.")
+            }
+            return nil
         }
-        guard !session.isInstallingHandoffWorktreeBindings else {
-            // Any save path (debounce, flush, required flush) would persist the provisional,
-            // unbound Handoff destination; Handoff saves it explicitly once installation settles.
-            return .deferred("Handoff is still preparing this chat's worktree execution location.")
-        }
+        if let failure = admissionFailure() { return failure }
         guard session.isDirty || session.activeAgentSessionID == nil else {
             #if DEBUG
                 perfRecorder.event("save.session.skipped", tabID: tabID, fields: ["reason": "clean"])
             #endif
             return .notRequired
         }
-        guard let workspace = composition?.workspace() else {
-            return .failed(.init(operation: .save, tabID: tabID, message: "Active workspace is unavailable."))
-        }
-
         let hasConversationContent = !session.items.isEmpty || !session.transcript.turns.isEmpty || session.runState.isActive || session.hasPendingQuestionUI || session.pendingApproval != nil || session.hasPendingCodexHookReviewWait || session.pendingPermissionsRequest != nil || session.pendingApplyEditsReview != nil || session.pendingWorktreeMergeReview != nil || session.worktreeMergeOperations.contains { $0.status.isActive }
         if session.activeAgentSessionID == nil, !hasConversationContent {
             return .notRequired
@@ -343,6 +381,7 @@ final class AgentSessionPersistenceRuntime {
             return .deferred("A save for this session is already in flight.")
         }
         defer {
+            defer { scope?.noteSettlementChanged() }
             if saveQueue.finish(sessionID: sessionID) {
                 if let currentOwner = currentOwner(for: sessionID) {
                     scheduleSave(for: currentOwner.tabID)
@@ -352,6 +391,19 @@ final class AgentSessionPersistenceRuntime {
                     scheduleSave(for: tabID)
                 }
             }
+        }
+        // Queue admission and its completion owner precede the first suspension, including
+        // required/configured saves which temporarily preserve the owner's debounce task.
+        guard let membership = scope?.membership(of: session) else {
+            return .deferred("The originating writer changed before persistence.")
+        }
+        let workspace = await composition?.readWorkspace()
+        guard membership.isCurrent else {
+            return .deferred("The originating writer changed before persistence.")
+        }
+        if let failure = admissionFailure() { return failure }
+        guard let workspace else {
+            return .failed(.init(operation: .save, tabID: tabID, message: "Active workspace is unavailable."))
         }
         let isActiveOwnedForSave = presentation?.isActivelyPresenting(session) == true
         let preparation = AgentSessionTranscriptRefreshRuntime.prepareSave(
@@ -393,7 +445,7 @@ final class AgentSessionPersistenceRuntime {
             name: sessionName, snapshot: persistableSnapshot
         )
         guard let saveToken = makeSaveCommitToken(for: session, workspace: workspace),
-              isSaveCommitTokenCurrent(saveToken, creationHandle: effectiveCreationSave?.handle)
+              isSaveCommitTokenCurrent(saveToken, requireWorkspaceMatch: composition?.canonicalStorage == nil, creationHandle: effectiveCreationSave?.handle)
         else {
             if permits(expectation, tabID: tabID) {
                 requestFreshSaveForCurrentOwner(sessionID: sessionID, fallbackSession: session)
@@ -432,13 +484,15 @@ final class AgentSessionPersistenceRuntime {
                 writer: writer,
                 token: saveToken,
                 storageIsCurrent: { [self] in
-                    guard isSaveCommitTokenCurrent(saveToken, creationHandle: effectiveCreationSave?.handle),
-                          let current = composition?.workspaceWithID(workspace.id) else { return false }
+                    guard let current = await composition?.readWorkspace(withID: workspace.id),
+                          current.id == workspace.id, admissionFailure() == nil,
+                          isSaveCommitTokenCurrent(saveToken, requireWorkspaceMatch: composition?.canonicalStorage == nil, creationHandle: effectiveCreationSave?.handle)
+                    else { return false }
                     return WorkspaceSessionSidecarMigration.workspaceDirectory(
                         for: current, root: AgentSessionDataService.defaultWorkspaceRootURL()
                     ).standardizedFileURL.path == saveToken.workspaceDirectoryPath
                 },
-                currentName: { [self] in composition?.displayName(tabID) ?? AgentSessionRestoreSupport.normalizedSessionTitle(nil) },
+                currentName: { composition?.displayName(tabID) ?? AgentSessionRestoreSupport.normalizedSessionTitle(nil) },
                 observingPhase: observingPhase,
                 saver: saver
             )
@@ -580,7 +634,7 @@ final class AgentSessionPersistenceRuntime {
             }
         }
 
-        guard composition?.workspace()?.id == workspaceID else {
+        guard composition?.workspaceID == workspaceID else {
             return .failure(.init(
                 operation: .save,
                 tabID: tabID,

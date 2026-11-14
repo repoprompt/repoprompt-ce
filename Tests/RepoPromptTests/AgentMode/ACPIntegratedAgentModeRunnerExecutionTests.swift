@@ -1178,6 +1178,147 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
         session.saveDebounceTask?.cancel()
     }
 
+    func testACPControllerShutdownConsumesOnlyItsOriginalRoutingRegistration() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let script = try AgentSessionLinkACPServerScript.write(to: directory)
+        let provider = AgentSessionLinkCapturingACPProvider(providerID: .antigravity, commandPath: script.path, environment: [:])
+        let request = ACPRunRequest(agentKind: .antigravity, modelString: nil, workspacePath: directory.path, resumeSessionID: nil, attachments: [], taskLabelKind: nil)
+        let original = try ACPAgentSessionController(provider: provider, runRequest: request)
+        let successor = try ACPAgentSessionController(provider: provider, runRequest: request)
+        let route = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: nil)
+        let runID = UUID(), client = "acp-controller-cleanup-\(UUID().uuidString)"
+        let manager = ServerNetworkManager.shared
+        await original.setExpectedMCPRunID(runID)
+        await successor.setExpectedMCPRunID(runID)
+        addTeardownBlock {
+            await original.shutdown()
+            await successor.shutdown()
+            await route.close()
+        }
+        let installed = await manager.installClientConnectionPolicy(
+            for: client, windowID: route.identity.routeID, restrictedTools: [], runID: runID,
+            purpose: .agentModeRun, routingOwner: route
+        )
+        let originalReceipt = try XCTUnwrap(installed)
+        let retained = await original.retainRoutingCleanup(originalReceipt)
+        XCTAssertTrue(retained)
+        let repeated = await original.retainRoutingCleanup(originalReceipt)
+        XCTAssertTrue(repeated)
+        let originalHostValue = await original.hostForRoutingHandoff(expectedRunID: runID)
+        let originalHost = try XCTUnwrap(originalHostValue)
+        await originalHost.registerExpectedAgentPID(12345, clientName: client, runID: runID)
+        let originalPIDs = await manager.debugExpectedAgentPIDs(for: client, runID: runID)
+        XCTAssertEqual(originalPIDs, [12345])
+        await route.close()
+        let reopened = MCPHostRouteResources(identity: route.identity, coordinator: nil)
+        addTeardownBlock { await reopened.close() }
+        let replacement = await manager.installClientConnectionPolicy(
+            for: client, windowID: route.identity.routeID, restrictedTools: ["edit_file"], runID: runID,
+            purpose: .agentModeRun, routingOwner: reopened
+        )
+        let successorReceipt = try XCTUnwrap(replacement)
+        let wrongOwner = await original.retainRoutingCleanup(successorReceipt)
+        XCTAssertFalse(wrongOwner)
+        let successorRetained = await successor.retainRoutingCleanup(successorReceipt)
+        XCTAssertTrue(successorRetained)
+        let successorHostValue = await successor.hostForRoutingHandoff(expectedRunID: runID)
+        let successorHost = try XCTUnwrap(successorHostValue)
+        await successorHost.registerExpectedAgentPID(12345, clientName: client, runID: runID)
+        await originalHost.clearExpectedAgentPID(12345, clientName: client, runID: runID)
+        await originalHost.registerExpectedAgentPID(12346, clientName: client, runID: runID)
+        let successorPIDs = await manager.debugExpectedAgentPIDs(for: client, runID: runID)
+        XCTAssertEqual(successorPIDs, [12345], "Old process cleanup and late registration cannot affect the successor, even after PID reuse")
+        await original.shutdown()
+        await original.shutdown()
+        XCTAssertTrue(originalReceipt.isConsumed)
+        XCTAssertFalse(successorReceipt.isConsumed)
+        let surviving = await manager.debugRunPolicyState(for: runID)
+        XCTAssertEqual(surviving?.restrictedTools, ["edit_file"])
+        let late = await original.retainRoutingCleanup(successorReceipt)
+        XCTAssertFalse(late)
+        await successor.shutdown()
+        XCTAssertTrue(successorReceipt.isConsumed)
+        let removed = await manager.debugRunPolicyState(for: runID)
+        XCTAssertNil(removed)
+        let removedPIDs = await manager.debugExpectedAgentPIDs(for: client)
+        XCTAssertTrue(removedPIDs.isEmpty)
+    }
+
+    func testACPCanonicalResourcesFenceFreshAndReusedPhysicalPrompts() async throws {
+        for reused in [false, true] {
+            for change in ["current", "resourceValidation", "writerValidation", "resourceProof", "stopProof"] {
+                let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                defer { try? FileManager.default.removeItem(at: directory) }
+                let script = try AgentSessionLinkACPServerScript.write(to: directory)
+                let provider = AgentSessionLinkCapturingACPProvider(providerID: .antigravity, commandPath: script.path)
+                let request = ACPRunRequest(agentKind: .antigravity, modelString: nil, workspacePath: directory.path, resumeSessionID: nil, attachments: [], taskLabelKind: nil)
+                let controller = try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
+                addTeardownBlock { await controller.shutdown() }
+                let harness = AgentSessionLinkRunnerHarness(
+                    headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() }, workspacePath: directory.path
+                )
+                let session = try harness.makeBoundSession(agent: .antigravity)
+                if reused {
+                    _ = try await controller.bootstrap()
+                    session.acpController = controller
+                    _ = AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
+                }
+                let origin = try harness.startCommand(for: session)
+                var resourcesCurrent = true
+                var preparingInput = false
+                let launch = try AgentProviderLaunchInput(
+                    origin: origin, workspace: harness.workspace, bindings: [], resourcesAreCurrent: { resourcesCurrent },
+                    validateResources: {
+                        if preparingInput, change == "resourceValidation" || change == "writerValidation" {
+                            await Task.yield()
+                            if change == "resourceValidation" { resourcesCurrent = false }
+                            else {
+                                let scope = origin.writer.scope
+                                var members = scope.sessions
+                                members.removeValue(forKey: session.tabID)
+                                scope.replaceSessions(members)
+                                members[session.tabID] = session
+                                scope.replaceSessions(members)
+                            }
+                        }
+                        return resourcesCurrent
+                    }
+                )
+                let runner = ACPIntegratedAgentModeRunner(hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(), toolTrackingHooks: .noOp)
+                runner.testAtStartupBoundary = { boundary in
+                    if boundary == .providerInputPreparing { preparingInput = true }
+                    if boundary == .providerInputProved {
+                        if change == "resourceProof" { resourcesCurrent = false }
+                        if change == "stopProof" { session.stopState.invalidateScheduledStarts() }
+                    }
+                }
+                let prepared = await runner.prepareRun(
+                    tabID: session.tabID, session: session, origin: origin, providerLaunchInput: launch, workspace: harness.workspace,
+                    initialUserMessage: "Exact host input", initialMessageForRun: "Exact host input", attachments: [], runRequest: request,
+                    makeLease: { harness.makeLease(runID: $0, tabID: session.tabID) }, stopFence: .init(session: session)
+                )
+                let resources = AgentRunProviderComposition(
+                    headless: { _, _ in AgentSessionLinkCapturingHeadlessProvider() }, acp: { _, _ in provider }, controller: { _, _ in controller }
+                )
+                await resources.fulfill(prepared)
+                await session.agentTask?.value
+                XCTAssertTrue(preparingInput, "reused=\(reused), \(change)")
+                XCTAssertEqual(provider.promptedMessages.count, change == "current" ? 1 : 0, "reused=\(reused), \(change)")
+                if change == "writerValidation" {
+                    XCTAssertFalse(origin.isCurrent)
+                    XCTAssertNil(session.lastTerminalCommitRevision, "A lost writer cannot settle its successor")
+                }
+                if session.runState.isActive {
+                    await harness.service.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted)
+                }
+                await controller.shutdown()
+            }
+        }
+    }
+
     func testACPTaskEntryAndLeaseCompletionKeepTheirOriginalWriter() async throws {
         typealias Boundary = ACPIntegratedAgentModeRunner.StartupBoundary
         @MainActor final class Counters {

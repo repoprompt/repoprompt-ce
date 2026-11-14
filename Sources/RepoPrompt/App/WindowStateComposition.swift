@@ -263,22 +263,42 @@ enum WindowStateCompositionFactory {
             perfRecorder: AppAgentModePerfRecorder()
         )
 
-        // 13) Agent mode (for minimal agent UI)
-        let agentModeViewModel = agentModeViewModelFactory?(windowID, promptManager, workspaceManager, mcpServer) ?? AgentModeViewModel(
-            windowID: windowID,
-            promptManager: promptManager,
-            workspaceManager: workspaceManager,
-            mcpServer: mcpServer,
-            attachmentPersistenceIsSuppressed: { AppLaunchConfiguration.current.suppressesAgentSessionPersistence },
-            oracleViewModel: oracleViewModel,
-            applyEditsApprovalStore: applyEditsApprovalStore,
-            modelRouterSettingsStore: settingsStore,
-            modelRouterRuntime: modelRouterRuntime,
-            usesProductionAgentDefaultsAndModelPolling: automaticProviderModelDiscoveryEnabled,
-            catalogDiagnosticsSink: AppAgentSessionLinkCatalogEventSink(),
-            restorePerfRecorder: AppWorkspaceRestorePerfRecorder(),
-            perfRecorder: AppAgentModePerfRecorder()
-        )
+        // 13) Allocate the executable owner before constructing its presentation or sessions.
+        // Route/activation migration is separate: this preserves the current legacy route until
+        // independent mapping and originating cleanup can be installed together.
+        let agentModeViewModel: AgentModeViewModel
+        if let agentModeViewModelFactory {
+            agentModeViewModel = agentModeViewModelFactory(windowID, promptManager, workspaceManager, mcpServer)
+        } else {
+            let paths = AgentSessionRuntimeHost.makeSessionWorkspaceProviders { [weak workspaceManager] in
+                workspaceManager?.activeWorkspace?.repoPaths.first
+            }
+            let runtimeHost = AgentSessionRuntimeHost(
+                route: routeResources,
+                workspacePath: paths.sessionWorkspacePath,
+                runtimeWorkspacePaths: paths.codexRuntimeWorkspacePaths,
+                connectionPolicyInstaller: AgentSessionRuntimeHost.defaultConnectionPolicyInstaller,
+                modelRouterSettingsStore: settingsStore,
+                catalogDiagnosticsSink: AppAgentSessionLinkCatalogEventSink(),
+                perfRecorder: AppAgentModePerfRecorder()
+            )
+            agentModeViewModel = AgentModeViewModel(
+                windowID: windowID,
+                runtimeHost: runtimeHost,
+                promptManager: promptManager,
+                workspaceManager: workspaceManager,
+                mcpServer: mcpServer,
+                attachmentPersistenceIsSuppressed: { AppLaunchConfiguration.current.suppressesAgentSessionPersistence },
+                oracleViewModel: oracleViewModel,
+                applyEditsApprovalStore: applyEditsApprovalStore,
+                modelRouterSettingsStore: settingsStore,
+                modelRouterRuntime: modelRouterRuntime,
+                usesProductionAgentDefaultsAndModelPolling: automaticProviderModelDiscoveryEnabled,
+                catalogDiagnosticsSink: AppAgentSessionLinkCatalogEventSink(),
+                restorePerfRecorder: AppWorkspaceRestorePerfRecorder(),
+                perfRecorder: AppAgentModePerfRecorder()
+            )
+        }
         agentModeViewModel.repromptService = .live(keyManager: keyManager)
         agentModeViewModel.preparedSessionRuntimes = WindowStatesManager.shared
         agentModeViewModel.providerSwitchExactOwnerProbe = { session in

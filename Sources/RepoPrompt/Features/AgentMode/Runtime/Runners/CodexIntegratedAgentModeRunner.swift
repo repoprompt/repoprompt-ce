@@ -20,6 +20,7 @@ final class CodexIntegratedAgentModeRunner {
         tabID: UUID,
         session: AgentTabSession,
         origin: AgentSessionRuntimeStore.Command,
+        providerLaunchInput: AgentProviderLaunchInput? = nil,
         initialMessageForRun: String,
         attachments: [AgentFileAttachment],
         fallbackContext: AgentTabSession.CodexFallbackSubmissionContext?,
@@ -28,6 +29,7 @@ final class CodexIntegratedAgentModeRunner {
         stopFence: AgentRunStartStopFence? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome {
         guard case .restored = origin.requirement, origin.writer.session === session, origin.isCurrent,
+              providerLaunchInput?.isCurrent(for: session) != false,
               let receipt = AgentSessionRuntimeStore.WriterReceipt(origin)
         else { return .stale(reason: "The originating Codex startup writer or attempt changed.") }
         let dedicatedNoteID = selfCompactDispatchID.flatMap { $0.stage == .note ? $0 : nil }
@@ -70,6 +72,7 @@ final class CodexIntegratedAgentModeRunner {
                 let codexTurnMCPServerEnableState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPWindowToolCatalog.codexTurnMCPServerEnable)
             #endif
             let mayPrepare = receipt.disposition(for: session) == .current
+                && providerLaunchInput?.isCurrent(for: session) != false
                 && session.activeRunOwnership == ownership && !Task.isCancelled
                 && (stopFence?.permitsStart(of: session) ?? true)
             var mcpServerReady = false
@@ -92,7 +95,8 @@ final class CodexIntegratedAgentModeRunner {
                 // a terminal receipt is cleanup authority, never permission to start another send.
                 guard receipt.disposition(for: session) != .claimLost,
                       session.activeRunOwnership == ownership else { return .stale(reason: "The originating Codex startup writer or attempt changed.") }
-                guard receipt.disposition(for: session) == .current else { return .cancelled }
+                guard receipt.disposition(for: session) == .current,
+                      providerLaunchInput?.isCurrent(for: session) != false else { return .cancelled }
                 guard mcpServerReady else {
                     return .failed(message: "MCP catalog registration failed before Agent launch.")
                 }
@@ -108,7 +112,8 @@ final class CodexIntegratedAgentModeRunner {
                     attachmentReservationID: attachmentReservationID,
                     terminalizeRejectedSend: createdOwnership,
                     autoEffortSelection: autoEffortSelection,
-                    selfCompactDispatchID: selfCompactDispatchID
+                    selfCompactDispatchID: selfCompactDispatchID,
+                    providerLaunchInput: providerLaunchInput
                 )
                 // Explicit cancellation can terminalize the original run before its
                 // suspended send observes CancellationError. Preserve the caller-level

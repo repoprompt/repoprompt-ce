@@ -29,6 +29,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
     private func makeFixture(
         restored: Bool = false,
         _ plans: [[WedgeFakeCodexController.Response]],
+        windowID: Int = 1,
         mcpServerEnabler: @escaping @MainActor @Sendable () async -> Bool = { true },
         routeOwnerValidator: @escaping CodexAgentModeCoordinator.CodexRouteOwnerValidator = { _, _, _, _ in true },
         runtimeUnavailableMessage: @escaping () -> String? = { nil },
@@ -41,7 +42,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         let factory = WedgeControllerFactory(plans: plans)
         let tabID = UUID()
         let viewModel = AgentModeViewModel(
-            testWindowID: 1,
+            testWindowID: windowID,
             testWorkspacePath: FileManager.default.temporaryDirectory.path,
             shouldManageCodexTooling: shouldManageCodexTooling,
             codexControllerFactory: { runID, _, _, _, _, _ in factory.make(runID: runID) },
@@ -2321,6 +2322,64 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         }
     }
 
+    func testRecursiveControllerReplacementRetainsOriginatingLeaseAndStopFence() async throws {
+        for stopDuringRetirement in [false, true] {
+            let route = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: nil)
+            let fixture = makeFixture(restored: true, [[.success("replacement-thread")]], windowID: route.identity.routeID)
+            let session = fixture.session
+            let runID = AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
+            let lease = MCPBootstrapLease(
+                spec: .agentMode(tabID: session.tabID, runID: runID, gateID: UUID(), windowID: route.identity.routeID, agent: .codexExec),
+                routingOwner: route
+            )
+            let acquired = await lease.acquire()
+            XCTAssertTrue(acquired)
+            let receipts = await lease.originatingRoutingCleanupReceipts()
+            let originalReceipt = try XCTUnwrap(receipts?.last)
+            let old = WedgeFakeCodexController(runID: runID, responses: [.success("original-thread")])
+            XCTAssertTrue(old.retainRoutingCleanup(originalReceipt))
+            _ = try await old.startOrResume(existing: nil, baseInstructions: "", model: nil, reasoningEffort: nil, serviceTier: nil)
+            let retirement = TestReleaseFence(name: "Codex recursive originating retirement")
+            defer { retirement.release() }
+            old.shutdownGate = retirement
+            session.codexController = old
+            let origin = CodexAgentModeCoordinator.StartupRouting(lease: lease, stopFence: .init(session: session))
+            let start = Task {
+                await fixture.coordinator.ensureCodexNativeSession(
+                    session: session, policyAlreadyInstalled: true, deferPublicationUntilRouting: true,
+                    startupRouting: origin
+                )
+            }
+            await retirement.waitUntilEntered()
+            if stopDuringRetirement { session.stopState.invalidateScheduledStarts() }
+            retirement.release()
+            await start.value
+            XCTAssertEqual(session.runID, runID, "Recursive replacement must not adopt a different run's registration")
+            XCTAssertTrue(originalReceipt.isConsumed)
+            if stopDuringRetirement {
+                XCTAssertTrue(fixture.factory.controllers.isEmpty, "Stop during the original retirement must prevent replacement construction")
+            } else {
+                let replacement = try XCTUnwrap(fixture.factory.controllers.last)
+                let renewed = try XCTUnwrap(replacement.retainedRoutingCleanup)
+                XCTAssertNotEqual(renewed.policyID, originalReceipt.policyID)
+                XCTAssertEqual(renewed.runID, runID)
+                XCTAssertEqual(replacement.policiesAtStart, [renewed.policyID])
+                await ServerNetworkManager.shared.cleanupRunRoutingState(ownedBy: originalReceipt)
+                XCTAssertFalse(renewed.isConsumed)
+                let survivingPolicy = await ServerNetworkManager.shared.debugRunPolicyState(for: runID)
+                XCTAssertNotNil(survivingPolicy)
+            }
+            session.codexEventTask?.cancel()
+            for controller in fixture.factory.controllers {
+                await controller.shutdown()
+            }
+            await lease.finishOwnedProviderRouting()
+            let finalPolicy = await ServerNetworkManager.shared.debugRunPolicyState(for: runID)
+            XCTAssertNil(finalPolicy)
+            await route.close()
+        }
+    }
+
     func testSettledOldLeaseCannotRevokeSameRunSuccessor() async {
         let runID = UUID()
         let tabID = UUID()
@@ -2767,6 +2826,26 @@ final class WedgeFakeCodexController: CodexSessionControllerPassiveStubDefaults,
     private var steers: [String] = []
     private var interrupts: [String] = []
     private var shutdowns = 0
+    private var routingCleanup: MCPRunRoutingCleanupReceipt?
+    private var startupRoutingPolicies: [UUID?] = []
+
+    var policiesAtStart: [UUID?] {
+        lock.withLock { startupRoutingPolicies }
+    }
+
+    var retainedRoutingCleanup: MCPRunRoutingCleanupReceipt? {
+        lock.withLock { routingCleanup }
+    }
+
+    func retainRoutingCleanup(_ receipt: MCPRunRoutingCleanupReceipt) -> Bool {
+        lock.withLock {
+            guard shutdowns == 0, receipt.runID == runID, !receipt.isConsumed,
+                  routingCleanup == nil || routingCleanup == receipt else { return false }
+            routingCleanup = receipt
+            return true
+        }
+    }
+
     private var qaResponses = 0
     private var recoverySnapshot: CodexNativeSessionController.ThreadSnapshot?
     private var recoverySnapshotGate: TestReleaseFence?
@@ -2877,6 +2956,7 @@ final class WedgeFakeCodexController: CodexSessionControllerPassiveStubDefaults,
     ) async throws -> CodexNativeSessionController.SessionRef {
         let response = lock.withLock { () -> Response? in
             existingIDs.append(existing?.conversationID)
+            startupRoutingPolicies.append(routingCleanup?.policyID)
             return responses.isEmpty ? nil : responses.removeFirst()
         }
         switch response {
@@ -3009,10 +3089,14 @@ final class WedgeFakeCodexController: CodexSessionControllerPassiveStubDefaults,
 
     func shutdown() async {
         if let shutdownGate { await shutdownGate.enterAndWait() }
-        lock.withLock {
+        let receipt = lock.withLock {
             active = false
             shutdowns += 1
+            let receipt = routingCleanup
+            routingCleanup = nil
+            return receipt
         }
+        if let receipt { await ServerNetworkManager.shared.cleanupRunRoutingState(ownedBy: receipt) }
         continuation.finish()
     }
 }

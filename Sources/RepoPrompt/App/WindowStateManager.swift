@@ -1481,8 +1481,28 @@ class WindowStatesManager: ObservableObject {
         }
     }
 
+    /// Snapshot the existing host census before logout fences/auth teardown begin. A presented
+    /// retained host participates once through its runtime owner, never through both adapters.
+    static func managedCodexLogoutParticipants(
+        presenters: [AgentModeViewModel], retainedHosts: [AgentSessionRuntimeHost]
+    ) -> [any CodexManagedSessionShutdownParticipant] {
+        let retainedIDs = Set(retainedHosts.map(ObjectIdentifier.init))
+        var seen: Set<ObjectIdentifier> = []
+        var participants: [any CodexManagedSessionShutdownParticipant] = []
+        for host in retainedHosts where seen.insert(ObjectIdentifier(host)).inserted {
+            participants.append(host)
+        }
+        for presenter in presenters where !retainedIDs.contains(ObjectIdentifier(presenter.runtimeHost)) {
+            if seen.insert(ObjectIdentifier(presenter.runtimeHost)).inserted { participants.append(presenter) }
+        }
+        return participants
+    }
+
     func stopCodexSessionsAndSignOut() async -> CodexManagedAuthLogoutResult {
-        let participants: [any CodexManagedSessionShutdownParticipant] = (allWindows + Array(preparedOversightWindows.values)).map(\.agentModeViewModel)
+        let participants = Self.managedCodexLogoutParticipants(
+            presenters: (allWindows + Array(preparedOversightWindows.values)).map(\.agentModeViewModel),
+            retainedHosts: AgentSessionRuntimeStore.shared.retainedExecutionHosts
+        )
         return await CodexManagedLogoutCoordinator.shared.stopSessionsAndSignOut(
             participants: participants,
             additionalTeardown: {
@@ -1501,6 +1521,19 @@ class WindowStatesManager: ObservableObject {
     /// Safe to call after `signalTermination()` — fences new work and joins provider/process
     /// teardown before MCP servers stop.
     func shutdownAllAgentSessions() async {
+        // Snapshot executable owners before any presenter close can clear membership. These
+        // hosts include detached epochs that no longer occur in the window/prepared census.
+        let store = AgentSessionRuntimeStore.shared
+        var seenHosts: Set<ObjectIdentifier> = []
+        let retainedHosts = (store.retainedExecutionHosts + store.retainedDrains.compactMap(\.scope.executableHost)).filter {
+            seenHosts.insert(ObjectIdentifier($0)).inserted
+        }
+        let retainedHostIDs = Set(retainedHosts.map(ObjectIdentifier.init))
+        var seenDrains: Set<ObjectIdentifier> = []
+        let hostDrains = (retainedHosts.map { $0.beginFinalShutdown() } + store.retainedDrains).filter {
+            seenDrains.insert(ObjectIdentifier($0)).inserted
+        }
+        let hostShutdown = Task { await AgentSessionHostDrainRuntime.shutdown(hostDrains) }
         let oracleDrain = OracleBackgroundInvocationRegistry.shared.beginShutdown()
         _ = await OracleBackgroundInvocationRegistry.awaitDrain(oracleDrain, timeout: 2)
         closingWindowReferences.removeAll { $0.value == nil }
@@ -1530,11 +1563,16 @@ class WindowStatesManager: ObservableObject {
             for window in windows where !window.isPreparedSessionOwner {
                 group.addTask { @MainActor [window] in
                     await window.contextBuilderAgentViewModel.shutdownForAppTermination()
-                    await window.agentModeViewModel.prepareForWindowClose()
+                    if !retainedHostIDs.contains(ObjectIdentifier(window.agentModeViewModel.runtimeHost)) {
+                        await window.agentModeViewModel.prepareForWindowClose()
+                    }
                 }
             }
         }
         _ = await shutdownPreparedOversightOwners(timeout: 2)
+        // One shared two-second host deadline, not a fresh budget for each controller/window.
+        // Timed-out producers and their original hosts remain retained by the canonical store.
+        _ = await hostShutdown.value
         closingWindowReferences.removeAll { reference in
             guard let window = reference.value else { return true }
             return participatingWindowIdentities.contains(ObjectIdentifier(window))

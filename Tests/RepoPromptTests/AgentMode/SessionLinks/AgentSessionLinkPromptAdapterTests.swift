@@ -2541,7 +2541,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         codexController: MonitorFakeCodexController? = nil,
         withMCPServer: Bool = false,
         connectionPolicyInstaller: AgentModeViewModel.ConnectionPolicyInstaller? = nil
-    ) throws -> Fixture {
+    ) async throws -> Fixture {
         let tabID = UUID()
         // A real run resolves its workspace before it reaches a provider, so the runner-level suites
         // need the same live workspace wiring the cross-session send suite uses.
@@ -2561,6 +2561,12 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             windowID: -1,
             settingsManager: WindowSettingsManager(windowID: -1)
         )
+        // Join the prompt's actual constructor-owned refresh, which reloads stored settings
+        // even when APISettingsViewModel's separate initial load is disabled.
+        await prompt.awaitInitialModelRefreshCompletion()
+        apiSettings.isClaudeCodeConnected = agent == .claudeCode
+        apiSettings.isCodexConnected = agent == .codexExec
+        apiSettings.isOpenCodeConnected = agent == .openCode
         let manager = WorkspaceManagerViewModel(
             fileManager: workspaceFiles,
             promptViewModel: prompt,
@@ -2619,10 +2625,11 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             },
             connectionPolicyInstaller: connectionPolicyInstaller ?? { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
             mcpServerEnabler: { true },
-            testMCPServer: mcpServer
+            testMCPServer: mcpServer,
+            testPromptManager: prompt,
+            testWorkspaceManager: manager
         )
         retained.append(viewModel)
-        viewModel.workspaceManager = manager
         viewModel.test_setCurrentTabIDOverride(tabID)
         viewModel.test_setAgentSessionSaver { _, _, _ in
             URL(fileURLWithPath: NSTemporaryDirectory())
@@ -2681,7 +2688,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
     func testLocalInputClaudeLateReadRefusalKeepsBaselineAndSupersessionOrCancellationPreventsHandoff() async throws {
         for mode in ["revoked", "superseded", "cancel"] {
             let controller = MonitorFakeNativeController()
-            let fixture = try makeFixture(agent: .claudeCode, claudeController: controller)
+            let fixture = try await makeFixture(agent: .claudeCode, claudeController: controller)
             fixture.inventory.publish(revision: 1, targetCount: 1)
             let intent = try claudeRunIntent(for: fixture.session, source: "test.claude.localInput.\(mode)")
             let startup = await fixture.viewModel.test_claudeCoordinator.test_ensureClaudeNativeSession(session: fixture.session, intent: intent)
@@ -2735,7 +2742,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             let controller = MonitorFakeNativeController()
             await controller.setFailSendAfterRecord(fails)
             await controller.setFinishEventsAfterSend(true)
-            let fixture = try makeFixture(agent: .claudeCode, claudeController: controller)
+            let fixture = try await makeFixture(agent: .claudeCode, claudeController: controller)
             let session = fixture.session
             session.installLocalInputSeed(.init())
             let item = AgentChatItem.user("Retained native composer input", sequenceIndex: session.nextSequenceIndex)
@@ -2768,7 +2775,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
 
     func testLocalComposerCodexTargetRetentionCompactionReachesClaudeCodeObserverOnce() async throws {
         let controller = MonitorFakeNativeController()
-        let observer = try makeFixture(agent: .claudeCode, claudeController: controller)
+        let observer = try await makeFixture(agent: .claudeCode, claudeController: controller)
         observer.session.oversight.autoWakeOnUpdates = false
         observer.inventory.publish(revision: 1, targetCount: 1)
         let intent = try claudeRunIntent(for: observer.session, source: "test.retention.claude.observer")
@@ -2776,7 +2783,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         XCTAssertEqual(startup, .ready)
 
         let codex = MonitorFakeCodexController(dispatches: MonitorCodexDispatchRecorder())
-        let target = try makeFixture(agent: .codexExec, codexController: codex)
+        let target = try await makeFixture(agent: .codexExec, codexController: codex)
         target.session.oversight.autoWakeOnUpdates = false
         // A real long transcript, not a large independent retained-input index. Hydration is over
         // before the grant baseline; validated composer refresh prunes the suffix during ingress.
@@ -2953,8 +2960,8 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         XCTAssertEqual(readCalls, 1)
     }
 
-    func testRetentionPreservesCanonicalOnlyRecordsAndExactPendingProducerTokens() throws {
-        let fixture = try makeFixture(agent: .codexExec)
+    func testRetentionPreservesCanonicalOnlyRecordsAndExactPendingProducerTokens() async throws {
+        let fixture = try await makeFixture(agent: .codexExec)
         let session = fixture.session
         session.installLocalInputSeed(.init())
         let history = (0 ..< 500).flatMap { turn in
@@ -3090,7 +3097,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
 
     func testClaudeNativeSendCarriesExactlyOneSupplementThenGoesQuiet() async throws {
         let controller = MonitorFakeNativeController()
-        let fixture = try makeFixture(agent: .claudeCode, claudeController: controller)
+        let fixture = try await makeFixture(agent: .claudeCode, claudeController: controller)
         fixture.inventory.publish(revision: 1, targetCount: 2)
         let intent = try claudeRunIntent(
             for: fixture.session,
@@ -3132,7 +3139,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
 
     func testClaudeNativeStaleCatalogSendsOnceWithoutRecyclingController() async throws {
         let controller = MonitorFakeNativeController()
-        let fixture = try makeFixture(agent: .claudeCode, claudeController: controller)
+        let fixture = try await makeFixture(agent: .claudeCode, claudeController: controller)
         fixture.inventory.publish(revision: 0, targetCount: 0)
         fixture.session.installRunID(UUID())
         fixture.session.claudeController = controller
@@ -3188,7 +3195,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
     private func assertClaudeClosedConnectionDuringConfiguration(pauseTermination: Bool) async throws {
         #if DEBUG
             let controller = MonitorFakeNativeController()
-            let fixture = try makeFixture(agent: .claudeCode, claudeController: controller, withMCPServer: true)
+            let fixture = try await makeFixture(agent: .claudeCode, claudeController: controller, withMCPServer: true)
             let server = try XCTUnwrap(fixture.mcpServer)
             fixture.inventory.publish(revision: 0, targetCount: 0)
             fixture.session.installRunID(UUID())
@@ -3260,13 +3267,16 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             fixture.session.appendItem(confirmed)
             let rawDraft = "preserve removing-route input"
             fixture.viewModel.storeDraftText(for: fixture.tabID, rawDraft)
-            XCTAssertEqual(
-                fixture.viewModel.submitUserTurn(
-                    text: rawDraft.trimmingCharacters(in: .whitespacesAndNewlines),
-                    tabID: fixture.tabID, rawDraftText: rawDraft
-                ),
-                .submitted
+            XCTAssertTrue(
+                fixture.viewModel.agentAvailabilityContext.claudeCodeAvailable,
+                "The fixture's connected transport must remain available after route preparation"
             )
+            let submission = fixture.viewModel.submitUserTurn(
+                text: rawDraft.trimmingCharacters(in: .whitespacesAndNewlines),
+                tabID: fixture.tabID, rawDraftText: rawDraft
+            )
+            XCTAssertEqual(submission, .submitted)
+            guard submission == .submitted else { return }
             fixture.viewModel.storeDraftText(for: fixture.tabID, "")
             await configurationGate.waitUntilEntered()
             let removal = Task {
@@ -3319,7 +3329,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
 
     func testClaudeFirstLinkDuringConfigurationRequiresCurrentRoute() async throws {
         let controller = MonitorFakeNativeController()
-        let fixture = try makeFixture(agent: .claudeCode, claudeController: controller)
+        let fixture = try await makeFixture(agent: .claudeCode, claudeController: controller)
         fixture.inventory.publish(revision: 0, targetCount: 0)
         fixture.session.installRunID(UUID())
         fixture.session.claudeController = controller
@@ -3345,7 +3355,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
 
     func testClaudeFirstLinkDuringConfigurationRequalifiesWithoutCatalogRefresh() async throws {
         let controller = MonitorFakeNativeController()
-        let fixture = try makeFixture(agent: .claudeCode, claudeController: controller)
+        let fixture = try await makeFixture(agent: .claudeCode, claudeController: controller)
         fixture.inventory.publish(revision: 0, targetCount: 0)
         fixture.session.installRunID(UUID())
         fixture.session.claudeController = controller
@@ -3384,7 +3394,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
 
     func testClaudeNativeRevocationDeliversOneClosingNotice() async throws {
         let controller = MonitorFakeNativeController()
-        let fixture = try makeFixture(agent: .claudeCode, claudeController: controller)
+        let fixture = try await makeFixture(agent: .claudeCode, claudeController: controller)
         fixture.inventory.publish(revision: 1, targetCount: 1)
         let intent = try claudeRunIntent(
             for: fixture.session,
@@ -3566,7 +3576,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         #if DEBUG
             let controller = MonitorFakeNativeController()
             let policies = MonitorRunPolicyInstallRecorder()
-            let fixture = try makeFixture(
+            let fixture = try await makeFixture(
                 agent: .claudeCode,
                 claudeController: controller,
                 connectionPolicyInstaller: policies.installer
@@ -3636,7 +3646,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         #if DEBUG
             let controller = MonitorFakeNativeController()
             let policies = MonitorRunPolicyInstallRecorder()
-            let fixture = try makeFixture(
+            let fixture = try await makeFixture(
                 agent: .claudeCode, claudeController: controller,
                 connectionPolicyInstaller: policies.installer
             )
@@ -3683,7 +3693,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         #if DEBUG
             let controller = MonitorFakeNativeController()
             let policies = MonitorRunPolicyInstallRecorder()
-            let fixture = try makeFixture(
+            let fixture = try await makeFixture(
                 agent: .claudeCode,
                 claudeController: controller,
                 connectionPolicyInstaller: policies.installer
@@ -3875,7 +3885,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
 
     func testClaudeNativeCatalogReadinessUsesExactReadyRoute() async throws {
         #if DEBUG
-            let fixture = try makeFixture(agent: .claudeCode)
+            let fixture = try await makeFixture(agent: .claudeCode)
             fixture.session.installRunID(UUID())
             let runID = try XCTUnwrap(fixture.session.runID)
             let endpoint = try XCTUnwrap(
@@ -3927,7 +3937,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
 
     func testClaudeNativeCatalogReadinessIsNotRequiredWithoutActiveOutboundLink() async throws {
         #if DEBUG
-            let fixture = try makeFixture(agent: .claudeCode)
+            let fixture = try await makeFixture(agent: .claudeCode)
             fixture.session.installRunID(UUID())
             _ = try XCTUnwrap(
                 fixture.viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: fixture.tabID)
@@ -3943,7 +3953,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
 
     func testClaudeNativeFinalCatalogFenceRejectsStaleRouteToken() async throws {
         #if DEBUG
-            let fixture = try makeFixture(agent: .claudeCode)
+            let fixture = try await makeFixture(agent: .claudeCode)
             fixture.session.installRunID(UUID())
             let runID = try XCTUnwrap(fixture.session.runID)
             let endpoint = try XCTUnwrap(
@@ -3985,7 +3995,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
     // MARK: Waiting-instruction continuations
 
     func testQueuedContinuationComposesAtDrainTimeWithCurrentMembership() async throws {
-        let fixture = try makeFixture(agent: .claudeCode)
+        let fixture = try await makeFixture(agent: .claudeCode)
         fixture.session.beginRunAttempt(source: "test.waiting.adapter")
         // The instruction was queued before any monitor existed; membership is read at drain time.
         fixture.session.pendingInstructions = ["queued instruction"]
@@ -4004,7 +4014,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
 
     func testCatalogReadinessRejectsAppliedProjectionWithoutAuthoritativeRouteToken() async throws {
         #if DEBUG
-            let fixture = try makeFixture(agent: .codexExec)
+            let fixture = try await makeFixture(agent: .codexExec)
             fixture.viewModel.test_agentSessionLinkHasActiveOutboundLink = { _ in true }
             fixture.session.installRunID(UUID())
             let runID = try XCTUnwrap(fixture.session.runID)
@@ -4059,7 +4069,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
 
     func testCodexContinuationMissingRouteRestoresInstructionWithoutResumingProvider() async throws {
         #if DEBUG
-            let fixture = try makeFixture(agent: .codexExec)
+            let fixture = try await makeFixture(agent: .codexExec)
             fixture.viewModel.test_agentSessionLinkHasActiveOutboundLink = { _ in true }
             fixture.inventory.publish(revision: 1, targetCount: 1)
             let runID = try XCTUnwrap(fixture.session.runID)
@@ -4134,7 +4144,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
 
     func testRapidCodexContinuationSubmissionsSerializeAndRestoreUnconsumedSecondInstruction() async throws {
         #if DEBUG
-            let fixture = try makeFixture(agent: .codexExec)
+            let fixture = try await makeFixture(agent: .codexExec)
             let authorityGate = CatalogAuthorityGate()
             fixture.viewModel.test_agentSessionLinkHasActiveOutboundLink = { _ in
                 await authorityGate.requirement()
@@ -4218,7 +4228,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
 
     func testCodexResumedContinuationProceedsWithoutCatalogRefresh() async throws {
         #if DEBUG
-            let fixture = try makeFixture(agent: .codexExec)
+            let fixture = try await makeFixture(agent: .codexExec)
             let authorityGate = CatalogAuthorityGate()
             fixture.viewModel.test_agentSessionLinkHasActiveOutboundLink = { _ in
                 await authorityGate.requirement()
@@ -4304,7 +4314,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
     }
 
     func testDequeuedInstructionRestoresAfterWriterReacquisitionDuringAugmentation() async throws {
-        let fixture = try makeFixture(agent: .openCode)
+        let fixture = try await makeFixture(agent: .openCode)
         let runtime = fixture.viewModel.linkExecutionRuntime
         let original = try XCTUnwrap(runtime.instructionCommand(for: fixture.session))
         let scope = original.writer.scope
@@ -4335,7 +4345,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
 
     func testLocalInputDequeuedInstructionDuringReadProofRecoversQueueOrStoppedDraftExactlyOnce() async throws {
         for stopped in [false, true] {
-            let fixture = try makeFixture(agent: .claudeCode)
+            let fixture = try await makeFixture(agent: .claudeCode)
             let input = try await AgentSessionLinkTransportLocalInputFixture.install(on: fixture.viewModel, session: fixture.session)
             addTeardownBlock { @MainActor in await input.cleanup() }
             await input.correction("QUEUE-RECOVERY-CORRECTION")
@@ -4386,7 +4396,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
     }
 
     func testLocalInputRealAuthorityWaitingContinuationPhysicalResume() async throws {
-        let fixture = try makeFixture(agent: .claudeCode)
+        let fixture = try await makeFixture(agent: .claudeCode)
         fixture.inventory.publish(revision: 1, targetCount: 1)
         let input = try await AgentSessionLinkTransportLocalInputFixture.install(on: fixture.viewModel, session: fixture.session)
         addTeardownBlock { @MainActor in await input.cleanup() }
@@ -4405,7 +4415,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
     }
 
     func testResumedContinuationCarriesExactlyOneSupplementAndConsumesItOnce() async throws {
-        let fixture = try makeFixture(agent: .claudeCode)
+        let fixture = try await makeFixture(agent: .claudeCode)
         fixture.session.beginRunAttempt(source: "test.waiting.adapter")
         fixture.inventory.publish(revision: 1, targetCount: 1)
 

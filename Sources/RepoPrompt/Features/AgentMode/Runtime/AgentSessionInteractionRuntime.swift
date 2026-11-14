@@ -39,6 +39,7 @@ final class AgentSessionInteractionRuntime {
         let task = Task { [self, owner] in
             defer {
                 pendingEffects.removeValue(forKey: id)
+                owner?.noteSettlementChanged()
                 _ = owner
             }
             await operation()
@@ -358,6 +359,7 @@ final class AgentSessionInteractionRuntime {
         let owner = scope
         let task = Task { [self, owner] in
             defer { pendingEffects.removeValue(forKey: id)
+                owner?.noteSettlementChanged()
                 _ = owner
             }
             #if DEBUG
@@ -375,6 +377,10 @@ final class AgentSessionInteractionRuntime {
             }
         }
         pendingEffects[id] = PendingEffect(sessionIdentity: ObjectIdentifier(session), task: task)
+    }
+
+    var hasPendingEffects: Bool {
+        !pendingEffects.isEmpty
     }
 
     func hasPendingEffects(for session: AgentTabSession) -> Bool {
