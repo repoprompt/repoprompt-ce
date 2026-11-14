@@ -20,17 +20,20 @@ enum MCPRouteIdentityAllocator {
     }
 
     static func allocateHost() -> MCPHostRouteIdentity {
-        MCPHostRouteIdentity(id: UUID(), routeID: allocate())
+        MCPHostRouteIdentity(id: UUID(), routeID: allocate(), kind: .independent)
     }
 }
 
 /// The UUID identifies resource ownership; the integer is a compatible transport route key.
 /// Only the legacy adapter may use a presentation's existing route until visible host cutover.
 struct MCPHostRouteIdentity: Equatable {
+    enum Kind: Equatable { case independent, legacyWindow }
+
     let id: UUID
     let routeID: Int
+    let kind: Kind
 
     static func legacyWindow(_ windowID: Int) -> Self {
-        .init(id: UUID(), routeID: windowID)
+        .init(id: UUID(), routeID: windowID, kind: .legacyWindow)
     }
 }

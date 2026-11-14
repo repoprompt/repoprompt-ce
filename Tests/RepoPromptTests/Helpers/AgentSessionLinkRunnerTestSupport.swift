@@ -211,6 +211,7 @@ final class AgentSessionLinkRunnerHarness {
         claudeControllerFactory: ClaudeAgentModeCoordinator.ClaudeControllerFactory? = nil,
         testWindowID: Int = 1,
         testMCPServer: MCPServerViewModel? = nil,
+        initialWorkspaceTabID: UUID? = nil,
         attachmentHooks: AgentModeRunService.AttachmentLifecycleHooks? = nil
     ) {
         self.stubSystemPrompt = stubSystemPrompt
@@ -233,6 +234,9 @@ final class AgentSessionLinkRunnerHarness {
             }
         }
         let serverEnabler: AgentModeViewModel.MCPServerEnabler = { true }
+        let initialWorkspace = initialWorkspaceTabID.map {
+            AgentSessionLinkEndpointTestSupport.makeWorkspace(tabID: $0, name: "Positive runner authority")
+        }
         let host = AgentModeViewModel(
             testWindowID: testWindowID,
             testWorkspacePath: workspacePath,
@@ -242,9 +246,12 @@ final class AgentSessionLinkRunnerHarness {
             acpProviderFactory: acpProviderFactory,
             connectionPolicyInstaller: policyInstaller,
             mcpServerEnabler: serverEnabler,
-            testMCPServer: testMCPServer
+            testMCPServer: testMCPServer,
+            testWorkspaceManager: initialWorkspace
         )
         self.host = host
+        if let initialWorkspace { workspaces.append(initialWorkspace) }
+        if let initialWorkspaceTabID { host.test_setCurrentTabIDOverride(initialWorkspaceTabID) }
 
         resources = AgentRunProviderComposition(
             headless: headlessProviderFactory, acp: acpProviderFactory,
@@ -496,9 +503,14 @@ final class AgentSessionLinkRunnerHarness {
         return command
     }
 
-    func makeBoundSession(agent: AgentProviderKind) throws -> AgentModeViewModel.TabSession {
-        let tabID = UUID()
-        workspaces.append(AgentSessionLinkEndpointTestSupport.installWorkspace(on: host, tabID: tabID, name: "Positive runner authority"))
+    func makeBoundSession(agent: AgentProviderKind, tabID suppliedTabID: UUID? = nil) throws -> AgentModeViewModel.TabSession {
+        let tabID = suppliedTabID ?? UUID()
+        if suppliedTabID == nil {
+            workspaces.append(AgentSessionLinkEndpointTestSupport.installWorkspace(on: host, tabID: tabID, name: "Positive runner authority"))
+        } else {
+            XCTAssertEqual(host.workspaceManager?.activeWorkspace?.activeComposeTabID, tabID)
+            XCTAssertEqual(host.managedInputEnvironment().workspaceID, host.workspaceManager?.activeWorkspaceID)
+        }
         let session = host.session(for: tabID)
         session.selectedAgent = agent
         session.hasLoadedPersistedState = true
@@ -525,9 +537,17 @@ actor AgentSessionLinkCapturingHeadlessProvider: HeadlessAgentProvider {
 
     private(set) var messages: [AgentMessage] = []
     private var failuresRemaining: Int
+    private let beforeStream: (@Sendable (UUID?) async -> Void)?
+    private let onDispose: (@Sendable () async -> Void)?
 
-    init(failuresRemaining: Int = 0) {
+    init(
+        failuresRemaining: Int = 0,
+        beforeStream: (@Sendable (UUID?) async -> Void)? = nil,
+        onDispose: (@Sendable () async -> Void)? = nil
+    ) {
         self.failuresRemaining = failuresRemaining
+        self.beforeStream = beforeStream
+        self.onDispose = onDispose
     }
 
     var messageCount: Int {
@@ -536,8 +556,9 @@ actor AgentSessionLinkCapturingHeadlessProvider: HeadlessAgentProvider {
 
     func streamAgentMessage(
         _ message: AgentMessage,
-        runID _: UUID?
+        runID: UUID?
     ) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
+        await beforeStream?(runID)
         messages.append(message)
         if failuresRemaining > 0 {
             failuresRemaining -= 1
@@ -546,7 +567,9 @@ actor AgentSessionLinkCapturingHeadlessProvider: HeadlessAgentProvider {
         return AsyncThrowingStream { $0.finish() }
     }
 
-    func dispose() async {}
+    func dispose() async {
+        await onDispose?()
+    }
 }
 
 // MARK: - ACP provider fake

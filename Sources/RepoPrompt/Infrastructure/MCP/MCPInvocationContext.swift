@@ -18,6 +18,8 @@ extension MCPInvocationContextBridge {
 }
 
 struct MCPTabContextSnapshot {
+    /// Independent route incarnation; not a transport route ID or fresh admission proof.
+    var routeOwnerIdentity: ObjectIdentifier?
     let tabID: UUID
     let windowID: Int
     let workspaceID: UUID?

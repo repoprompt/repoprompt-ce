@@ -37,6 +37,7 @@ final class MCPReadFileAutoSelectionCoordinator {
         let tabID: UUID
         let route: Route
         let bindingGeneration: UInt64
+        var routeOwnerIdentity: ObjectIdentifier?
 
         var mirrorKey: TabMirrorKey {
             TabMirrorKey(windowID: windowID, workspaceID: workspaceID, tabID: tabID)

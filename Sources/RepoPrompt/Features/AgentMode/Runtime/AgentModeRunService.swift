@@ -43,6 +43,8 @@ final class AgentModeRunService {
         let activeAgentRunWaitQuery: (_ runID: UUID) -> Bool
         /// Bounded wait for child `agent_run.wait` scopes to drain before Claude native interrupt.
         let childAgentRunWaitDrainTimeoutSeconds: TimeInterval
+        /// Pinned by executable-host composition, never resolved from the selected window.
+        var routingOwner: MCPHostRouteResources?
     }
 
     /// Neutral command/cancellation contracts shared with the direct/headless
@@ -392,6 +394,8 @@ final class AgentModeRunService {
         let expectedPIDPolicyArmer = dependencies.expectedPIDPolicyArmer
         let taskLabelKind = session.mcpControlContext?.taskLabelKind
         let allowsAgentExternalControlTools = session.mcpControlContext != nil && session.parentSessionID == nil
+        let claudeProcess = session.claudeController as? ClaudeCompatibleNativeSessionAdapter
+        let acpProcess = session.acpController
         let makeLease: (_ runID: UUID) -> MCPBootstrapLease = { runID in
             self.dependencies.bindPendingOracleReviewContext(tabID, runID)
             let leaseSpec = MCPBootstrapLeaseSpec.agentMode(
@@ -408,7 +412,13 @@ final class AgentModeRunService {
                 perfRecorder: self.perfRecorder,
                 mcpServerEnabler: mcpServerEnabler,
                 policyInstaller: MCPBootstrapLease.agentModePolicyInstaller(connectionPolicyInstaller),
-                expectedPIDPolicyArmer: expectedPIDPolicyArmer
+                expectedPIDPolicyArmer: expectedPIDPolicyArmer,
+                routingOwner: self.dependencies.routingOwner,
+                processRegistrationProvider: {
+                    if selectedAgent.usesClaudeNativeRuntime { return await claudeProcess?.routingProcessRegistration() }
+                    if selectedAgent.acpProviderID != nil { return await acpProcess?.routingProcessRegistration() }
+                    return nil
+                }
             )
         }
         if selectedAgent.usesClaudeNativeRuntime {

@@ -245,6 +245,11 @@ package actor DomainRoutingCoordinator {
         )
     }
 
+    /// Point lookup for route-owner validation; tool dispatch must not snapshot all connections.
+    package func windowDescriptor(windowID: Int) -> DomainWindowDescriptor? {
+        windows[windowID]
+    }
+
     /// Returns the coordinator-owned registration token for the live connection incarnation.
     /// Callers must never synthesize a generation from transport lifecycle counters.
     package func currentRegistration(connectionID: UUID) throws -> DomainConnectionRegistration {

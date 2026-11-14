@@ -263,16 +263,24 @@ package actor CodexAppServerClient {
     }
 
     package struct ExpectedAgentPIDRegistration: Equatable {
-        package init(clientName: String, runID: UUID) {
+        package init(clientName: String, runID: UUID, registrar: ExpectedAgentPIDRegistrar? = nil) {
             self.clientName = clientName
             self.runID = runID
+            self.registrar = registrar
         }
 
         package let clientName: String
         package let runID: UUID
+        package let registrar: ExpectedAgentPIDRegistrar?
     }
 
-    package struct ExpectedAgentPIDRegistrar {
+    /// Immutable callbacks retained by each installed PID, including deferred transport cleanup.
+    /// Identity distinguishes a successor registration that reuses the same process/run identifiers.
+    package final class ExpectedAgentPIDRegistrar: Sendable, Equatable {
+        package static func == (lhs: ExpectedAgentPIDRegistrar, rhs: ExpectedAgentPIDRegistrar) -> Bool {
+            lhs === rhs
+        }
+
         package init(register: @escaping @Sendable (_ pid: pid_t, _ clientName: String, _ runID: UUID) async -> Void, clear: @escaping @Sendable (_ pid: pid_t, _ clientName: String, _ runID: UUID) async -> Void) {
             self.register = register
             self.clear = clear
@@ -286,6 +294,7 @@ package actor CodexAppServerClient {
         let pid: pid_t
         let clientName: String
         let runID: UUID
+        let registrar: ExpectedAgentPIDRegistrar
     }
 
     private struct PendingRequestMetadata {
@@ -604,25 +613,26 @@ package actor CodexAppServerClient {
         let target = RegisteredExpectedAgentPID(
             pid: pid,
             clientName: registration.clientName,
-            runID: registration.runID
+            runID: registration.runID,
+            registrar: registration.registrar ?? expectedAgentPIDRegistrar
         )
         guard registeredExpectedAgentPID != target else { return }
         await clearRegisteredExpectedAgentPIDIfNeeded()
         guard expectedAgentPIDRegistration == registration, activeTransport?.process.pid == pid else { return }
         registeredExpectedAgentPID = target
-        await expectedAgentPIDRegistrar.register(target.pid, target.clientName, target.runID)
+        await target.registrar.register(target.pid, target.clientName, target.runID)
         guard expectedAgentPIDRegistration == registration, activeTransport?.process.pid == pid else {
             if registeredExpectedAgentPID == target {
                 registeredExpectedAgentPID = nil
             }
-            await expectedAgentPIDRegistrar.clear(target.pid, target.clientName, target.runID)
+            await target.registrar.clear(target.pid, target.clientName, target.runID)
             return
         }
     }
 
     private func clearRegisteredExpectedAgentPIDIfNeeded() async {
         guard let registered = takeRegisteredExpectedAgentPIDForDeferredClear() else { return }
-        await expectedAgentPIDRegistrar.clear(registered.pid, registered.clientName, registered.runID)
+        await registered.registrar.clear(registered.pid, registered.clientName, registered.runID)
     }
 
     private func takeRegisteredExpectedAgentPIDForDeferredClear() -> RegisteredExpectedAgentPID? {
@@ -1066,7 +1076,7 @@ package actor CodexAppServerClient {
     ) async {
         defer { retireTransportTermination(generation: generation) }
         if let expectedAgentPIDToClear {
-            await expectedAgentPIDRegistrar.clear(
+            await expectedAgentPIDToClear.registrar.clear(
                 expectedAgentPIDToClear.pid,
                 expectedAgentPIDToClear.clientName,
                 expectedAgentPIDToClear.runID
@@ -1158,7 +1168,7 @@ package actor CodexAppServerClient {
         let expectedAgentPIDToClear = registeredExpectedAgentPID
         registeredExpectedAgentPID = nil
         if let expectedAgentPIDToClear {
-            let registrar = expectedAgentPIDRegistrar
+            let registrar = expectedAgentPIDToClear.registrar
             Task.detached {
                 await registrar.clear(
                     expectedAgentPIDToClear.pid,
@@ -1193,7 +1203,7 @@ package actor CodexAppServerClient {
         guard let terminatingTransport else { return }
         await faultInjection.transportTerminationCleanup()
         if let expectedAgentPIDToClear = terminatingTransport.expectedAgentPIDToClear {
-            await expectedAgentPIDRegistrar.clear(
+            await expectedAgentPIDToClear.registrar.clear(
                 expectedAgentPIDToClear.pid,
                 expectedAgentPIDToClear.clientName,
                 expectedAgentPIDToClear.runID

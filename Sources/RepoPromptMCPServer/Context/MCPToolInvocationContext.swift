@@ -67,19 +67,23 @@ package struct MCPToolDispatchAuthorization: Sendable {
     package let lifecycleGeneration: UInt64
     package let windowIdentity: MCPWindowToolDispatchIdentity?
     package var policyAdmissionToken: MCPToolPolicyAdmissionToken?
+    /// Originating resource registration for exact cleanup; never writer or command authority.
+    package let runRoutingRegistrationID: UUID?
 
     package init(
         connectionID: UUID,
         connectionIdentity: ObjectIdentifier,
         lifecycleGeneration: UInt64,
         windowIdentity: MCPWindowToolDispatchIdentity?,
-        policyAdmissionToken: MCPToolPolicyAdmissionToken? = nil
+        policyAdmissionToken: MCPToolPolicyAdmissionToken? = nil,
+        runRoutingRegistrationID: UUID? = nil
     ) {
         self.connectionID = connectionID
         self.connectionIdentity = connectionIdentity
         self.lifecycleGeneration = lifecycleGeneration
         self.windowIdentity = windowIdentity
         self.policyAdmissionToken = policyAdmissionToken
+        self.runRoutingRegistrationID = runRoutingRegistrationID
     }
 }
 

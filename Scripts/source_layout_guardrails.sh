@@ -583,7 +583,9 @@ PY
     || ! grep -Fq 'self.releaseDisconnectedConnection(connectionID)' "$m3_host_routes" \
     || ! grep -Fq 'await self.routingPublicationTail?.value' "$m3_host_routes" \
     || ! grep -Fq 'routeResources.closeDomainRoute()' "$m3_app_read_routing" \
-    || ! grep -Fq '[UUID: DomainConnectionRegistration]' "$m3_host_routes" \
+      || ! grep -Fq '[UUID: RetainedConnection]' "$m3_host_routes" \
+      || ! grep -Fq 'let registration: DomainConnectionRegistration' "$m3_host_routes" \
+      || ! grep -Fq 'retained.policyID == ownership.policyID' "$m3_host_routes" \
     || ! grep -Fq 'connections.removeValue(forKey: connectionID)' "$m3_host_routes" \
     || ! grep -Fq 'coordinator.unregisterConnection(registration' "$m3_host_routes" \
     || ! grep -Fq 'domainRuntime.domainHost.releaseConnection(' "$m3_host_routes"; then

@@ -2920,6 +2920,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             mcpServerEnabler: @escaping MCPServerEnabler = { true },
             testMCPServer: MCPServerViewModel? = nil,
             testWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
+            testWorkspaceManager: WorkspaceManagerViewModel? = nil,
             testCodexActiveToolQuery: CodexActiveToolQuery? = nil,
             testCodexManagedAuthRecovery: (any CodexManagedAuthRecovering)? = nil,
             testCodexHookApprovalSettingsProvider: (any CodexHookApprovalSettingsProviding)? = nil,
@@ -2948,7 +2949,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             windowID = testWindowID
             promptManager = nil
             workspaceFileContextStore = testWorkspaceFileContextStore
-            workspaceManager = nil
+            workspaceManager = testWorkspaceManager
             mcpServer = testMCPServer
             self.attachmentPersistenceIsSuppressed = attachmentPersistenceIsSuppressed
             modelRouterSettingsStore = testModelRouterSettingsStore

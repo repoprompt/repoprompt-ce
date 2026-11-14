@@ -61,11 +61,25 @@ final class ACPAgentSessionControllerHostTests: XCTestCase {
                 result = {}
             print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
         """#.write(to: script, atomically: true, encoding: .utf8)
-        let host = RecordingHost()
+        let clearing = expectation(description: "original shutdown entered host cleanup")
+        let joined = expectation(description: "second shutdown joined original producer")
+        let release = AsyncStream<Void>.makeStream()
+        defer { release.continuation.finish() }
+        let host = RecordingHost(beforeClear: {
+            clearing.fulfill()
+            var iterator = release.stream.makeAsyncIterator()
+            _ = await iterator.next()
+        })
         host.setSnapshot("old")
         let provider = FixtureProvider(providerID: .grokBuild, script: script.path, observations: observations.path)
         let request = ACPRunRequest(agentKind: .grokBuild, modelString: nil, workspacePath: directory.path, resumeSessionID: nil, attachments: [], taskLabelKind: nil)
-        let controller = try ACPAgentSessionController(provider: provider, runRequest: request, host: host, allowsProviderProcessLaunchForTesting: true)
+        let controller = try ACPAgentSessionController(
+            provider: provider, runRequest: request, host: host,
+            diagnosticSink: { event in
+                if case .info("Joining ACP controller shutdown") = event { joined.fulfill() }
+            },
+            allowsProviderProcessLaunchForTesting: true
+        )
         XCTAssertEqual(host.events(), ["configuration", "preflight-init"])
         do {
             _ = try await controller.bootstrap()
@@ -80,9 +94,19 @@ final class ACPAgentSessionControllerHostTests: XCTestCase {
             host.setSnapshot("new")
             try await controller.setSessionModel("new")
             XCTAssertGreaterThanOrEqual(host.events().count(where: { $0 == "registry" }), 2)
-            await controller.shutdown()
-            XCTAssertTrue(host.events().contains("clear"))
+            let original = Task { await controller.shutdown() }
+            await fulfillment(of: [clearing], timeout: 10)
+            let repeated = Task { await controller.shutdown() }
+            repeated.cancel()
+            await fulfillment(of: [joined], timeout: 10)
+            XCTAssertFalse(host.events().contains("clear"), "The original host cleanup is still suspended")
+            release.continuation.yield(())
+            await repeated.value
+            XCTAssertTrue(host.events().contains("clear"), "A cancelled waiter must still join actual shutdown completion")
+            await original.value
+            XCTAssertEqual(host.events().count(where: { $0 == "clear" }), 1)
         } catch {
+            release.continuation.finish()
             await controller.shutdown()
             throw error
         }
@@ -152,10 +176,12 @@ private final class RecordingHost: ACPAgentSessionHost, @unchecked Sendable {
     private var initialConfiguration: ACPSessionConfiguration?
     private let clearedExpectation: XCTestExpectation?
     private let allowsDiagnostics: Bool
+    private let beforeClear: (@Sendable () async -> Void)?
 
-    init(clearedExpectation: XCTestExpectation? = nil, allowsDiagnostics: Bool = false) {
+    init(clearedExpectation: XCTestExpectation? = nil, allowsDiagnostics: Bool = false, beforeClear: (@Sendable () async -> Void)? = nil) {
         self.clearedExpectation = clearedExpectation
         self.allowsDiagnostics = allowsDiagnostics
+        self.beforeClear = beforeClear
     }
 
     private func record(_ event: String) {
@@ -273,6 +299,7 @@ private final class RecordingHost: ACPAgentSessionHost, @unchecked Sendable {
 
     func clearExpectedAgentPID(_: pid_t, clientName: String, runID _: UUID?) async {
         XCTAssertEqual(clientName, "fixture-client")
+        await beforeClear?()
         record("clear")
         clearedExpectation?.fulfill()
     }

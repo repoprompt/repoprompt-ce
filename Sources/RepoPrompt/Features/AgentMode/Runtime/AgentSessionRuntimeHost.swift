@@ -10,6 +10,12 @@ import RepoPromptShared
 /// consumes these same objects; it cannot create a second writer or provider lifecycle.
 @MainActor
 final class AgentSessionRuntimeHost {
+    enum RunRoutingCleanup {
+        case registered([MCPRunRoutingCleanupReceipt])
+        /// Compatibility adapter only; an independent host may never construct this fallback.
+        case legacyWindow(runID: UUID)
+    }
+
     typealias RunRoutingCleaner = (_ runID: UUID, _ routeID: Int, _ reason: String) async -> Void
     typealias RunToolCanceller = (_ runID: UUID, _ reason: String?) -> Int
 
@@ -140,19 +146,33 @@ final class AgentSessionRuntimeHost {
             }
         )
         capabilities.sessionRuntime = scope
-        capabilities.cleanupProviderRun = { [runToolCanceller, runRoutingCleaner, routeID] _, runID in
+        capabilities.cleanupProviderRun = { [runToolCanceller, runRoutingCleaner, routeID] cleanup in
             let reason = "claudeNative.providerInitiated"
-            _ = runToolCanceller(runID, reason)
-            await runRoutingCleaner(runID, routeID, reason)
+            switch cleanup {
+            case .registered:
+                await Self.cleanRunRouting(cleanup, routeID: routeID, reason: reason)
+            case let .legacyWindow(runID):
+                _ = runToolCanceller(runID, reason)
+                await runRoutingCleaner(runID, routeID, reason)
+            }
         }
         return capabilities
     }
 
     nonisolated static func cleanRunRouting(runID: UUID, routeID: Int, reason: String) async {
+        await cleanRunRouting(.legacyWindow(runID: runID), routeID: routeID, reason: reason)
+    }
+
+    nonisolated static func cleanRunRouting(_ cleanup: RunRoutingCleanup, routeID: Int, reason: String) async {
         _ = reason
-        await ServerNetworkManager.shared.unregisterToolObservers(for: runID)
-        await ServerNetworkManager.shared.cleanupRunRoutingState(for: runID, windowID: routeID)
-        await AgentRunCoordinator.shared.cleanupRouting(runID: runID)
+        switch cleanup {
+        case let .registered(receipts):
+            for receipt in receipts {
+                await ServerNetworkManager.shared.cleanupRunRoutingState(ownedBy: receipt)
+            }
+        case let .legacyWindow(runID):
+            await ServerNetworkManager.shared.cleanupRunRoutingState(for: runID, windowID: routeID, includingObserversAndWaiter: true)
+        }
     }
 
     func cleanupRunRouting(runID: UUID, reason: String) async {

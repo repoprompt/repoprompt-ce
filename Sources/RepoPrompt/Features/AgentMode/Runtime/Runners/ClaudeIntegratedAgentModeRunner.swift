@@ -71,6 +71,7 @@ final class ClaudeIntegratedAgentModeRunner {
         guard let runID = AgentModeProcessRunIdentity.existingProcessRunID(for: session),
               session.claudeController != nil, listener.pendingProviderTurnID == turnID,
               listener.subscription == nil, listener.isCurrent(),
+              let cleanup = listener.routingCleanup,
               let subscription = listener.reserve()
         else { return false }
         let owner = session.beginRunAttempt(source: "claudeNative.providerInitiated")
@@ -89,7 +90,7 @@ final class ClaudeIntegratedAgentModeRunner {
         session.installRunAttemptTerminalResources(ownership: owner) { [weak session, claudeCoordinator] state in
             {
                 guard let session, state == .cancelled || state == .failed else { return }
-                await claudeCoordinator.cleanupAdoptedRun(session: session, runID: runID)
+                await claudeCoordinator.cleanupAdoptedRun(session: session, runID: runID, cleanup: cleanup)
             }
         }
         hooks.presentation.setAgentRunActive(session, true)
@@ -377,7 +378,8 @@ final class ClaudeIntegratedAgentModeRunner {
                         selfCompactDispatchID: selfCompactDispatchID,
                         // A replacement process's MCP child needs this run's one-shot admission
                         // policy re-armed; the lease that installed it still owns it here.
-                        reinstallRunRoutingPolicy: { await lease.reinstallPolicyForReplacementProcess() }
+                        reinstallRunRoutingPolicy: { await lease.reinstallPolicyForReplacementProcess() },
+                        routingLease: lease
                     )
                     if sendOutcome == .sent { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) }
                     if let dedicatedNoteID, sendOutcome != .sent {

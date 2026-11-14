@@ -1697,9 +1697,10 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             )
             var handoffs: [Bool] = []
             harness.pendingHandoffSendOutcome = { _, sent in handoffs.append(sent) }
+            let terminalBarrier = AgentRunTerminalCommitBarrier()
             let runner = ClaudeIntegratedAgentModeRunner(
                 claudeCoordinator: fixture.viewModel.test_claudeCoordinator, hooks: harness.hooks,
-                terminalCommitBarrier: AgentRunTerminalCommitBarrier()
+                terminalCommitBarrier: terminalBarrier
             )
             let events = try XCTUnwrap(fixture.viewModel.test_claudeCoordinator.reserveEvents(for: session))
             var replayed = 0
@@ -1709,6 +1710,8 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             if noteID != nil { session.selfCompactState.active?.phase = .dispatchingNote }
             let previousTerminal = session.lastTerminalCommitRevision
             let counters = LeaseCounters()
+            let teardownQuery = TestReleaseFence(name: "\(variant) original terminal route query")
+            defer { teardownQuery.release() }
             let gateID = UUID()
             var boundaries: [ClaudeIntegratedAgentModeRunner.StartupBoundary] = []
             runner.testAtClaudeStartupBoundary = { boundary in
@@ -1740,6 +1743,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                         }, expectedPIDPolicyArmer: { _ in true },
                         policyClearer: { _ in await MainActor.run { counters.clears += 1 } },
                         routeAuthorityResolver: { _ in
+                            if variant.contains("Retire") { await teardownQuery.enterAndWait() }
                             await MainActor.run { counters.routeChecks += 1 }
                             return .committed
                         }
@@ -1749,6 +1753,25 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             let task = try XCTUnwrap(session.agentTask)
             let original = try XCTUnwrap(session.activeRunOwnership)
             await task.value
+            if variant.contains("Retire") {
+                await teardownQuery.waitUntilEntered()
+                XCTAssertEqual(session.lastTerminalCommitRevision?.ownership, original, variant)
+                XCTAssertEqual(counters.routeChecks, 0, "\(variant): publication is not original teardown completion")
+                let joinEntered = AsyncStream<Void>.makeStream()
+                var joined = false
+                let originalTeardown = Task { @MainActor in
+                    joinEntered.continuation.yield(())
+                    joinEntered.continuation.finish()
+                    await terminalBarrier.awaitTerminalTeardown(for: original, lifecycle: session.runLifecycle)
+                    joined = true
+                }
+                var entry = joinEntered.stream.makeAsyncIterator()
+                _ = await entry.next()
+                XCTAssertFalse(joined, "\(variant): the exact original join must wait for its gated resolver")
+                teardownQuery.release()
+                await originalTeardown.value
+                XCTAssertTrue(joined, variant)
+            }
             let sent = await fixture.nativeController.sentCount
             XCTAssertEqual(sent, variant == "none" ? 1 : 0, variant)
             XCTAssertEqual(
@@ -1781,8 +1804,8 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                 if noteID != nil { XCTAssertEqual(session.selfCompactState.active?.phase, .parked, variant) }
                 if variant != "none" {
                     XCTAssertTrue(session.claudeController === fixture.nativeController, variant)
-                    XCTAssertEqual(counters.clears, 0, "The original cancellation preserves its committed warm route")
-                    XCTAssertEqual(counters.routeChecks, 1, "The refusal must not enter post-coordinator lease cancellation a second time")
+                    XCTAssertEqual(counters.clears, 0, "\(variant): The original cancellation preserves its committed warm route")
+                    XCTAssertEqual(counters.routeChecks, 1, "\(variant): The refusal must not enter post-coordinator lease cancellation a second time")
                 }
             }
             XCTAssertNil(session.activeRunOwnership, variant)

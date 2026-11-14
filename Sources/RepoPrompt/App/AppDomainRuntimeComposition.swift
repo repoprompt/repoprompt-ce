@@ -42,6 +42,10 @@ final class AppDomainRuntimeComposition: Sendable {
     let oracleGroupRuntime: OracleGroupRuntime
     private let defaultRuntime: MCPDomainRuntime
 
+    /// A weak receipt index, not host retention or routing authority. Every resolution checks
+    /// the canonical domain generation; resource teardown removes only its own exact entry.
+    @MainActor var independentRouteOwners: [ObjectIdentifier: [Int: WeakRouteResources]] = [:]
+
     var runtime: MCPDomainRuntime {
         #if DEBUG
             if let runtime = runtimeForTesting { return runtime }

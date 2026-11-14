@@ -13,9 +13,17 @@ private struct OwnerResolver: ClaudeCodeLaunchEnvironmentResolving {
     }
 }
 
+private struct OwnerLaunchLease: ClaudeNativeConfigLease {
+    let url: URL
+    func release() {
+        try? FileManager.default.removeItem(at: url)
+    }
+}
+
 private struct OwnerHost: ClaudeNativeSessionHosting {
     var routeWitness = false
     var approvedToolName: String?
+    var launchLease: OwnerLaunchLease?
 
     func repoPromptPermissionMatch(toolName: String, requestPayload _: [String: Any]) -> ClaudeNativePermissionMatch? {
         guard toolName == approvedToolName else { return nil }
@@ -59,7 +67,7 @@ private struct OwnerHost: ClaudeNativeSessionHosting {
     }
 
     func expectedAgentClientName(for _: ClaudeCodeRuntimeVariant) -> String? {
-        nil
+        launchLease == nil ? nil : "originating-claude-process"
     }
 
     func isRawEventFileLoggingEnabled() -> Bool {
@@ -86,20 +94,21 @@ private struct OwnerHost: ClaudeNativeSessionHosting {
         }
     #endif
     func isMCPServerRunning() async -> Bool {
-        false
+        launchLease != nil
     }
 
     func prepareMCPLaunchConfig() async throws -> any ClaudeNativeConfigLease {
-        throw NSError(domain: "owner fixture", code: 1)
+        guard let launchLease else { throw NSError(domain: "owner fixture", code: 1) }
+        return launchLease
     }
 
     func registerExpectedAgentPID(_: pid_t, clientName _: String, runID _: UUID) async {}
     func clearExpectedAgentPID(_: pid_t, clientName _: String, runID _: UUID) async {}
 }
 
-private func ownerConfig() -> ClaudeCodeAgentConfig {
+private func ownerConfig(command: String = "/usr/bin/false", toolContext: AgentCLIToolContext = .discoverRun) -> ClaudeCodeAgentConfig {
     ClaudeCodeAgentConfig(
-        commandName: "/usr/bin/false",
+        commandName: command,
         additionalPathHints: [],
         modelString: nil,
         runtimeVariant: .standard,
@@ -108,7 +117,7 @@ private func ownerConfig() -> ClaudeCodeAgentConfig {
         sdkRelaunchMaxAttempts: 1,
         permissionMode: "bypassPermissions",
         allowNativeBashTool: false,
-        toolContext: .discoverRun,
+        toolContext: toolContext,
         disallowedBuiltInTools: [],
         mcpStrictMode: true,
         toolSearchEnabled: false,
@@ -117,6 +126,97 @@ private func ownerConfig() -> ClaudeCodeAgentConfig {
 }
 
 final class ClaudeNativeTurnCorrelationTests: XCTestCase {
+    func testShutdownJoinsOriginatingPIDRegistrationAndActualProcessExit() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appendingPathComponent("claude-fixture")
+        try "#!/bin/sh\nwhile IFS= read -r line; do :; done\n".write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+        let config = root.appendingPathComponent("mcp.json")
+        try "{}".write(to: config, atomically: true, encoding: .utf8)
+        let controller = ClaudeNativeProcessSessionController(
+            host: OwnerHost(launchLease: .init(url: config)), runID: UUID(), tabID: UUID(), windowID: 1,
+            workspacePath: root.path, config: ownerConfig(command: executable.path, toolContext: .agentRun),
+            environmentResolver: OwnerResolver()
+        )
+        let registrationGate = AsyncStream<Void>.makeStream()
+        let cleanupGate = AsyncStream<Void>.makeStream()
+        defer {
+            registrationGate.continuation.finish()
+            cleanupGate.continuation.finish()
+        }
+        let registered = expectation(description: "original PID registration entered")
+        let clearing = expectation(description: "original PID cleanup entered")
+        let journal = OwnerWrittenLines()
+        let returned = OwnerWrittenLines()
+        let registrar = ClaudeNativeProcessSessionController.ExpectedAgentPIDRegistrar(
+            register: { pid, _, _ in
+                journal.append(Data(String(pid).utf8))
+                registered.fulfill()
+                for await _ in registrationGate.stream {}
+                journal.append(Data("registered".utf8))
+            },
+            clear: { pid, _, _ in
+                XCTAssertEqual(journal.count, 2, "PID cleanup must join the original registration producer")
+                XCTAssertEqual(kill(pid, 0), -1, "Shutdown must positively reap the original process before PID cleanup")
+                XCTAssertEqual(errno, ESRCH)
+                clearing.fulfill()
+                for await _ in cleanupGate.stream {}
+                journal.append(Data("cleared".utf8))
+            }
+        )
+        let start = Task {
+            await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
+                do {
+                    _ = try await controller.startOrResume(
+                        existingSessionID: nil,
+                        model: nil,
+                        effortLevel: nil,
+                        systemPromptOverride: nil,
+                        expectedAgentPIDRegistrar: registrar
+                    )
+                    XCTFail("A retired startup cannot initialize")
+                } catch {}
+            }
+        }
+        addTeardownBlock {
+            registrationGate.continuation.finish()
+            cleanupGate.continuation.finish()
+            start.cancel()
+            await controller.shutdown()
+            await start.value
+        }
+        await fulfillment(of: [registered], timeout: 10)
+        let pid = try XCTUnwrap(journal.line(at: 0).flatMap { String(data: $0, encoding: .utf8) }.flatMap(Int32.init))
+        let shutdown = Task {
+            await controller.shutdown()
+            returned.append(Data())
+        }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+        while kill(pid, 0) == 0, ContinuousClock.now < deadline {
+            await Task.yield()
+        }
+        XCTAssertEqual(kill(pid, 0), -1)
+        XCTAssertEqual(errno, ESRCH)
+        XCTAssertEqual(journal.count, 1, "Retirement cannot skip the held registration")
+        XCTAssertEqual(returned.count, 0)
+        registrationGate.continuation.finish()
+        await fulfillment(of: [clearing], timeout: 10)
+        let repeated = Task {
+            await controller.shutdown()
+            XCTAssertEqual(journal.count, 3, "Even a cancelled waiter must join actual PID cleanup")
+        }
+        repeated.cancel()
+        cleanupGate.continuation.finish()
+        await repeated.value
+        await shutdown.value
+        await start.value
+        await controller.shutdown()
+        XCTAssertEqual(journal.count, 3, "Repeated teardown must not replay registration cleanup")
+        XCTAssertEqual(returned.count, 1)
+    }
+
     func testInjectedHostRoutesLaunchAndModelPoliciesWithoutApp() async throws {
         let controller = ClaudeNativeProcessSessionController(
             host: OwnerHost(routeWitness: true), runID: UUID(), tabID: UUID(), windowID: 1,
