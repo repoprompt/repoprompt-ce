@@ -2466,6 +2466,132 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         await h.host.claudeCoordinator.shutdownClaudeSession(session)
     }
 
+    func testSupersededProviderAdoptionDetachesTerminalAdapterAndJoinsBeforeRestart() async throws {
+        for action in ["restart", "replacement", "stop"] {
+            let runID = UUID(), tabID = UUID()
+            let settings = ClaudeAgentModeCoordinator.ControllerLaunchSettings(
+                runtimeVariant: .standard, workspacePath: nil, permissionMode: nil,
+                allowNativeBashTool: nil, mcpStrictMode: nil
+            )
+            let original = try XCTUnwrap(ClaudeAgentModeCoordinator.test_makeDefaultController(runID: runID, tabID: tabID, windowID: 1, launchSettings: settings) as? ClaudeCompatibleNativeSessionAdapter)
+            let replacement = try XCTUnwrap(ClaudeAgentModeCoordinator.test_makeDefaultController(runID: runID, tabID: tabID, windowID: 1, launchSettings: settings) as? ClaudeCompatibleNativeSessionAdapter)
+            let originalProcess = await original.test_processController()
+            let process = try XCTUnwrap(originalProcess)
+            let replacementProcess = await replacement.test_processController()
+            let nextProcess = try XCTUnwrap(replacementProcess)
+            await process.test_installConfigurationTransport(write: { _ in })
+            await nextProcess.test_installConfigurationTransport(write: { _ in })
+            var creations = 0
+            let h = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() }, claudeControllerFactory: { _, _, _, _ in
+                creations += 1
+                return creations == 1 ? original : replacement
+            }, initialWorkspaceTabID: tabID)
+            let session = try h.makeBoundSession(agent: .claudeCode, tabID: tabID)
+            session.runState = .completed
+            session.installRunID(runID)
+            session.providerSessionID = "application-proof-session"
+            let coordinator = h.host.claudeCoordinator
+            let initial = await coordinator.test_ensureClaudeNativeSession(session: session, intent: .reconnect(runID: runID, providerSessionID: "application-proof-session", currency: session.persistentBindingTransitionToken()))
+            XCTAssertEqual(initial, .ready)
+            XCTAssertTrue(session.claudeController === original)
+            let installed = await coordinator.test_installEventListener(for: session)
+            let listener = try XCTUnwrap(installed)
+            let id = try XCTUnwrap(session.activeAgentSessionID)
+            let registration = await AgentRunSessionStore.register(sessionID: id)
+            session.mcpControlContext = try .init(
+                sessionID: id, activationID: UUID(), writerIdentity: controlWriterIdentity(for: session), registration: registration,
+                currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil,
+                originatingConnectionID: nil, interactionTransport: .mcp(sessionID: id, originatingConnectionID: nil),
+                suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: false, taskLabelKind: .pair, autoEditOverride: nil
+            )
+            let epoch = Gate(), shutdown = Gate()
+            defer { epoch.open()
+                shutdown.open()
+                h.host.mcpRuntime.test_afterEpochBegan = nil
+            }
+            addTeardownBlock {
+                await coordinator.shutdownClaudeSession(session)
+                await original.shutdown()
+                await replacement.shutdown()
+                await AgentRunSessionStore.cleanup(registration: registration)
+            }
+            try await feed(["type": "system", "subtype": "init", "claude_code_version": "2.1.292", "capabilities": ["msg_lifecycle_v1"]], process)
+            h.host.mcpRuntime.test_afterEpochBegan = { await epoch.wait() }
+            await process.test_setBeforeShutdownCompletion { await shutdown.wait() }
+            try await feed(assistant("unadopted production-adapter work"), process)
+            await until("actual provider adoption waits at epoch preparation") { epoch.isWaiting }
+            let adoption = try XCTUnwrap(listener.adoptionTask)
+            let command = try XCTUnwrap(h.host.runtimeCommand(sessionID: id))
+            let sessions = command.writer.scope.sessions
+            command.writer.scope.replaceSessions([:])
+            command.writer.scope.replaceSessions(sessions)
+            let successor = try XCTUnwrap(h.host.runtimeCommand(sessionID: id))
+            XCTAssertNotEqual(successor.writer.identity, command.writer.identity)
+            session.providerSessionID = "successor-conversation"
+            session.mcpFollowUpRunPending = true
+            if action == "replacement" { session.claudeController = replacement }
+            epoch.open()
+            await until("actual original shutdown producer is held") { shutdown.isWaiting }
+            XCTAssertNil(session.activeRunOwnership)
+            XCTAssertEqual(session.providerSessionID, "successor-conversation")
+            XCTAssertTrue(session.mcpFollowUpRunPending, "Stale adoption cannot overwrite successor follow-up state")
+            if action == "replacement" {
+                XCTAssertTrue(session.claudeController === replacement)
+                let alive = await replacement.hasActiveSession
+                XCTAssertTrue(alive, "Old retirement cannot shut down the successor adapter")
+                shutdown.open()
+                await adoption.value
+                XCTAssertTrue(session.claudeController === replacement)
+                XCTAssertEqual(session.providerSessionID, "successor-conversation")
+            } else {
+                XCTAssertNil(session.claudeController, "A terminal adapter must be detached before its first shutdown await")
+                XCTAssertTrue(coordinator.hasPendingResumeTransfer(for: session), "A later start must join the exact old producer")
+                if action == "stop" {
+                    let fence = AgentRunStartStopFence(session: session)
+                    var returned = false
+                    let stop = Task { await h.host.cancelAgentRun(tabID: tabID)
+                        returned = true
+                    }
+                    await until("Stop advances its admission fence") { !fence.permitsStart(of: session) }
+                    XCTAssertFalse(returned, "Stop must join the superseded producer even after its listener retired")
+                    shutdown.open()
+                    await stop.value
+                    await adoption.value
+                    XCTAssertNil(session.claudeController)
+                    XCTAssertEqual(session.providerSessionID, "successor-conversation", "An unadopted producer cannot transfer identity after Stop")
+                    XCTAssertEqual(creations, 1)
+                } else {
+                    let owner = session.beginRunAttempt(source: "superseded-adapter-restart")
+                    session.runState = .running
+                    var entered = false, returned = false
+                    let restart = Task {
+                        entered = true
+                        let outcome = await coordinator.test_ensureClaudeNativeSession(session: session, intent: .runAttempt(ownership: owner, runID: runID))
+                        returned = true
+                        return outcome
+                    }
+                    await until("the next start enters while old shutdown is held") { entered }
+                    XCTAssertFalse(returned)
+                    XCTAssertEqual(creations, 1, "Replacement construction must wait for actual original producer cleanup")
+                    XCTAssertNil(session.claudeController)
+                    shutdown.open()
+                    await adoption.value
+                    let ready = await restart.value
+                    XCTAssertEqual(ready, .ready, "The next start must construct a fresh adapter, not reuse a terminal one")
+                    XCTAssertEqual(creations, 2)
+                    XCTAssertTrue(session.claudeController === replacement)
+                    XCTAssertEqual(session.activeRunOwnership, owner)
+                    let restarted = await replacement.hasActiveSession
+                    XCTAssertTrue(restarted)
+                }
+            }
+            do {
+                _ = try await original.startOrResume(existingSessionID: nil, model: nil, effortLevel: nil, systemPromptOverride: nil)
+                XCTFail("The original adapter must stay terminal; do not clear its shutdown latch")
+            } catch is CancellationError {} catch { XCTFail("Unexpected original-adapter error: \(error)") }
+        }
+    }
+
     func testProviderAdoptionCannotCrossWriterIncarnationsDuringEpochPreparation() async throws {
         for change in ["reacquire", "replaceController", "retire"] {
             let retires = change == "retire"
@@ -2512,7 +2638,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
                 XCTAssertTrue(f.session.claudeController === replacement)
                 let shutdowns = await replacement.shutdownCount
                 XCTAssertEqual(shutdowns, 0, "Old adoption cleanup must never cancel the replacement controller")
-            } else { XCTAssertTrue(f.session.claudeController === f.controller) }
+            } else { XCTAssertNil(f.session.claudeController, "A terminal unadopted controller cannot remain selected for reuse") }
             XCTAssertNil(f.listener.pendingProviderTurnID)
             XCTAssertFalse(f.listener.isBusy)
             XCTAssertFalse(f.harness.host.claudeCoordinator.hasPendingProviderWork(for: f.session))
