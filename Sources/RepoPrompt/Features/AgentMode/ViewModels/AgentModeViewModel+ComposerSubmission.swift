@@ -5,7 +5,8 @@ extension AgentModeViewModel {
     /// Local UI handoff, distinct from eventual provider dispatch. The existing claim remains
     /// the only admission authority; the pending row is merely its visible projection.
     func claimComposerSubmitForImmediatePresentation(
-        _ attempt: AgentComposerSubmitAttempt, requireActiveTabOwnership: Bool = true
+        _ attempt: AgentComposerSubmitAttempt, requireActiveTabOwnership: Bool = true,
+        presentationStore: AgentComposerUIStore? = nil
     ) -> AgentComposerSubmitClaimResult {
         if let pending = ui.composer.pendingSubmissions.values.first(where: {
             $0.sourceTabID == attempt.sourceTabID || $0.destinationTabID == attempt.sourceTabID
@@ -26,6 +27,7 @@ extension AgentModeViewModel {
             repromptDraft: submittedRepromptDraft,
             originalDraft: repromptDispatchOriginals[attempt.id]
         )
+        if let presentationStore, presentationStore !== ui.composer { presentationStore.pendingSubmissions[attempt.id] = ui.composer.pendingSubmissions[attempt.id] }
         // Move recovery ownership into the pending send, rather than discarding it.
         repromptUIStore.clearSubmittedDraft(submittedRepromptDraft)
         // claim captured the exact original before this clear. Any later typing is a new draft.

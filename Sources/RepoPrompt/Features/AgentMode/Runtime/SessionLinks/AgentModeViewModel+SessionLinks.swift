@@ -1411,8 +1411,8 @@ extension AgentModeViewModel {
 
     /// Oversee props for the tab currently on screen, or an explicitly disabled projection when the
     /// tab has no durable top-level binding yet.
-    func currentMonitorPillProps() -> AgentMonitorPillProps {
-        guard let tabID = currentTabID,
+    func currentMonitorPillProps(tabID: UUID? = nil) -> AgentMonitorPillProps {
+        guard let tabID = tabID ?? currentTabID,
               let session = sessions[tabID],
               let sessionID = session.activeAgentSessionID
         else {

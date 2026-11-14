@@ -1,5 +1,6 @@
 import AppKit
 import Carbon.HIToolbox
+import Combine
 import Foundation
 import KeyboardShortcuts
 import RepoPromptInstrumentation
@@ -14,8 +15,12 @@ final class GlobalKeyboardShortcutsCoordinator {
 
     private var didRegisterHandlers = false
     private var localBindingObserver: NSObjectProtocol?
+    private var commandCenterPreferenceObserver: AnyCancellable?
 
     private init() {
+        commandCenterPreferenceObserver = GlobalSettingsStore.shared.objectWillChange.sink { [weak self] _ in
+            MainActor.assumeIsolated { self?.reconcileCommandCenterShortcut() }
+        }
         // The library registers a hot key whenever an assignment is saved (recorder, reset, or a
         // first-launch default). Drop local bindings synchronously, before AppKit can deliver another
         // key event; the app-wide registration update arrives a run-loop turn later. Initializing the
@@ -65,6 +70,19 @@ final class GlobalKeyboardShortcutsCoordinator {
         // `enable` registers system-wide Carbon hot keys immediately; never do so while inactive.
         if KeyboardShortcuts.isEnabled {
             KeyboardShortcuts.enable(catalog.filter { applicationNames.contains($0) })
+        }
+        reconcileCommandCenterShortcut()
+    }
+
+    private func reconcileCommandCenterShortcut() {
+        guard didRegisterHandlers else { return }
+        if NSApplication.shared.isActive, KeyboardShortcuts.isEnabled,
+           GlobalSettingsStore.shared.enableKeyboardShortcuts(),
+           GlobalSettingsStore.shared.experimentalCommandCenter()
+        {
+            KeyboardShortcuts.enable([.showCommandCenter])
+        } else {
+            KeyboardShortcuts.disable([.showCommandCenter])
         }
     }
 
@@ -130,6 +148,8 @@ final class GlobalKeyboardShortcutsCoordinator {
 
     private func registerApplicationShortcuts() {
         register(.newWorkspaceWindow) { AppWindowOpener.shared.requestMainWindowFromDock() }
+        register(.showCommandCenter) { AppWindowOpener.shared.commandCenter.show() }
+        reconcileCommandCenterShortcut()
         register(.showAppSettings) { [weak self] in self?.openSettings() }
         register(.closeAppWindow) { NSApplication.shared.keyWindow?.performClose(nil) }
         register(.checkForUpdates) { [weak self] in self?.updateAction?() }

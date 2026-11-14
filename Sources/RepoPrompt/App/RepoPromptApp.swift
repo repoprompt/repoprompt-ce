@@ -178,6 +178,7 @@ struct RepoPromptSwiftUIApp: App {
         .windowToolbarStyle(.unified)
         .commands {
             UpdateMenu(sparkleManager: appDelegate.sparkleManager)
+            CommandCenterCommands()
 
             // Replace SwiftUI's automatic Cmd-N; otherwise it keeps reserving the key after a remap.
             CommandGroup(replacing: .newItem) {
@@ -207,6 +208,16 @@ struct RepoPromptSwiftUIApp: App {
                     .environmentObject(versionManager)
             }
         }
+
+        Window("Command Center", id: "command-center") {
+            CommandCenterRootView()
+                .environmentObject(fontScale)
+                .environment(\.font, fontScale.preset.font)
+                .handlesExternalEvents(preferring: [], allowing: [])
+        }
+        .defaultSize(width: 1050, height: 700)
+        // CommandCenterCommands supplies the remappable menu entry, not a second native command.
+        .commandsRemoved()
     }
 }
 

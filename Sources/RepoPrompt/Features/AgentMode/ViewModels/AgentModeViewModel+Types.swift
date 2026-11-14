@@ -403,6 +403,15 @@ extension AgentModeViewModel {
     enum MCPSessionCreationKind {
         case mcpControlled
         case oversightLane(creatorSessionID: UUID)
+        case human
+
+        /// User-visible top-level creation retains a published identity on partial failure.
+        var retainsPublishedSession: Bool {
+            switch self {
+            case .mcpControlled: false
+            case .oversightLane, .human: true
+            }
+        }
     }
 
     struct MCPSessionTarget: Equatable {

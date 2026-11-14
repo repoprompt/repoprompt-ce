@@ -648,16 +648,7 @@ extension WorkspaceModel {
     /// Legacy managed scratch roots are grouped for presentation only. No document is migrated
     /// or deleted from this heuristic, and an explicit library choice always takes precedence.
     var isTemporaryWorkspace: Bool {
-        if isEphemeral { return true }
-        if let isSavedWorkspace { return !isSavedWorkspace }
-        return !repoPaths.isEmpty && repoPaths.allSatisfy { rawPath in
-            let path = URL(fileURLWithPath: (rawPath as NSString).expandingTildeInPath).standardizedFileURL.path
-            let components = URL(fileURLWithPath: path).pathComponents
-            return path.hasPrefix("/tmp/") || path.hasPrefix("/private/tmp/")
-                || path.hasPrefix(FileManager.default.temporaryDirectory.standardizedFileURL.path + "/")
-                || components.contains(".repoprompt-worktrees")
-                || zip(components, components.dropFirst()).contains { $0 == ".codex" && $1 == "worktrees" }
-        }
+        WorkspaceLibraryClassification.isTemporary(isEphemeral: isEphemeral, isSavedWorkspace: isSavedWorkspace, repoPaths: repoPaths)
     }
 
     /// Indicates whether this workspace should not be persisted to disk

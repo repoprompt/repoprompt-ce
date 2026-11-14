@@ -25,7 +25,9 @@ extension AgentModeViewModel {
         let target: AgentRoutingExecutableTarget
     }
 
-    func modelRouterPillProps() -> AgentModelRouterPillProps {
+    func modelRouterPillProps(tabID: UUID? = nil) -> AgentModelRouterPillProps {
+        let currentTabID = tabID ?? currentTabID
+        let activeSession = currentTabID.flatMap { sessions[$0] }
         let configuration = modelRouterSettingsStore.modelRouterConfiguration()
         let available = modelRouterCanRoutePrimarySession(configuration)
         let isRouting = currentTabID.map { freshTaskRoutingByTabID[$0] != nil } ?? false
@@ -89,8 +91,8 @@ extension AgentModeViewModel {
         return effortName.map { "\(modelName) \($0)" } ?? modelName
     }
 
-    func autoEffortPillProps() -> AgentAutoEffortPillProps {
-        let session = activeSession
+    func autoEffortPillProps(tabID: UUID? = nil) -> AgentAutoEffortPillProps {
+        let session = (tabID ?? currentTabID).flatMap { sessions[$0] }
         let feedback = session?.autoEffortFeedback.flatMap { feedback in
             feedback.provider == session?.selectedAgent && feedback.selectedModelRaw == session?.selectedModelRaw
                 ? feedback : nil

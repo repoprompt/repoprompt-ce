@@ -1277,6 +1277,76 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertNil(stub["prompt"])
     }
 
+    func testBindingTitlePublisherDropsPresenterBeforeSchedulingAndMatchesLatestActiveTab() async {
+        // Negative control: the old notification-bearing chain retains the object even
+        // when its eventual consumer is an unrelated window and ignores the event.
+        let oldCenter = NotificationCenter()
+        let oldDelivered = expectation(description: "Old notification chain delivered")
+        let oldSubscription = oldCenter.publisher(for: .agentSessionBindingDidChange)
+            .receive(on: RunLoop.main)
+            .sink { _ in oldDelivered.fulfill() }
+        weak var oldPresenter: AgentModeViewModel?
+        let oldHost = { () -> AgentSessionRuntimeHost in
+            let vm = AgentModeViewModel(
+                testWindowID: 94,
+                codexControllerFactory: { _, _, _, _, _, _ in
+                    LifecycleNoopCodexController(recorder: LifecycleRecorder())
+                }
+            )
+            oldPresenter = vm
+            oldCenter.post(name: .agentSessionBindingDidChange, object: vm)
+            return vm.runtimeHost
+        }()
+        XCTAssertNotNil(oldPresenter, "The old scheduler queues the presenter-bearing Notification")
+        await fulfillment(of: [oldDelivered], timeout: 2)
+        oldSubscription.cancel()
+
+        let center = NotificationCenter()
+        let staleTabID = UUID()
+        let latestTabID = UUID()
+        var activeTabID = staleTabID
+        var handledTabs: [UUID] = []
+        var unrelatedHandled = 0
+        var deliveredCount = 0
+        let delivered = expectation(description: "Value targets delivered to both windows")
+        delivered.expectedFulfillmentCount = 6
+        let subscription = WindowState.sessionBindingTitleTargets(center: center).sink { target in
+            deliveredCount += 1
+            if target.matches(windowID: 94, activeTabID: activeTabID) { handledTabs.append(target.tabID) }
+            delivered.fulfill()
+        }
+        let unrelated = WindowState.sessionBindingTitleTargets(center: center).sink { target in
+            if target.matches(windowID: 93, activeTabID: latestTabID) { unrelatedHandled += 1 }
+            delivered.fulfill()
+        }
+        defer { subscription.cancel()
+            unrelated.cancel()
+        }
+        weak var presenter: AgentModeViewModel?
+        let host = { () -> AgentSessionRuntimeHost in
+            let vm = AgentModeViewModel(
+                testWindowID: 94,
+                codexControllerFactory: { _, _, _, _, _, _ in
+                    LifecycleNoopCodexController(recorder: LifecycleRecorder())
+                }
+            )
+            presenter = vm
+            for (windowID, tabID) in [(94, staleTabID), (94, latestTabID), (95, latestTabID)] {
+                center.post(name: .agentSessionBindingDidChange, object: vm, userInfo: ["windowID": windowID, "tabID": tabID])
+            }
+            center.post(name: .agentSessionBindingDidChange, object: vm, userInfo: ["windowID": 94])
+            return vm.runtimeHost
+        }()
+        defer { withExtendedLifetime((oldHost, host)) {} }
+        XCTAssertEqual(deliveredCount, 0, "No main-runloop delivery occurred before the lifetime assertion")
+        XCTAssertNil(presenter, "Even an unrelated window's queued title work must not retain a presenter")
+        activeTabID = latestTabID
+        await fulfillment(of: [delivered], timeout: 2)
+        XCTAssertEqual(deliveredCount, 3, "Malformed targets are dropped before scheduling")
+        XCTAssertEqual(handledTabs, [latestTabID], "Match the latest active tab at delivery, not at publication")
+        XCTAssertEqual(unrelatedHandled, 0)
+    }
+
     func testManagedRespondAnswersOnlyTheExactCurrentInteractionWithOneTimeDecisions() async throws {
         let tabID = UUID()
         let controller = ApprovalRecordingCodexController()
