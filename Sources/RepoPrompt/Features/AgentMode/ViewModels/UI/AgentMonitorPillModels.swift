@@ -434,7 +434,7 @@ enum AgentMonitorPeriodicWakeCopy {
     """
 
     static func optionLabel(seconds: Int) -> String {
-        "\(seconds / 60) min"
+        seconds >= 3600 ? "\(seconds / 3600)h" : "\(seconds / 60) min"
     }
 }
 
