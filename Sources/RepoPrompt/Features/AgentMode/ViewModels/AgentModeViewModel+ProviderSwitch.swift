@@ -692,7 +692,7 @@ extension AgentModeViewModel {
                 session: session, ignoresPendingHandoff: true, shouldPublishCatalog: live
             )
             guard live() else { return nil as String? }
-            return await self.buildInitialThreadMessageIfNeeded(tabID: session.tabID, session: session, initialMessage: initial)
+            return await self.buildInitialThreadMessageIfNeeded(tabID: session.tabID, session: session, initialMessage: initial, assumeFreshProvider: preview.destination == .codexExec)
         }
         guard live() else { return }
         guard let composed = stage ?? nil else {
@@ -706,7 +706,9 @@ extension AgentModeViewModel {
         }
         let budget = AgentProviderHandover.Budget(
             catalogWindow: linkExecutionRuntime.providerSwitchCatalogWindow(agent: preview.destination, model: preview.model),
-            instructions: preview.instructions, composedInput: "\n\n" + composed, isPreview: true
+            instructions: preview.instructions, composedInput: "\n\n" + composed, isPreview: true,
+            codexCarrierScalars: preview.destination == .codexExec
+                ? AgentProviderHandover.codexCarrierAllowance(composedInput: composed, parkedNote: session.selfCompactState.parkedNote?.frame) : nil
         )
         let server = preview.destination == .grokBuild ? RepoPromptMCPServerConfiguration.grokBuildRuntimeServerName : MCPIntegrationHelper.repoPromptMCPServerName
         let reference = try? session.activeAgentSessionID.flatMap {
@@ -749,9 +751,7 @@ extension AgentModeViewModel {
             if !stale, let payload = originalSlot.payload, let descriptor = preview.originalDescriptor,
                linkExecutionRuntime.providerSwitchReadReferenceIsCurrent(descriptor, session: session, destination: preview.destination),
                let mode = AgentProviderHandover.Mode(rawValue: descriptor.mode),
-               AgentProviderHandover.estimate(payload) <= budget.remainingCarrierTokens,
-               payload.utf8.count <= AgentProviderHandover.maximumBytes,
-               mode != .summary || payload.utf8.count <= AgentProviderHandover.maximumSummaryBytes
+               budget.fits(payload: payload, mode: mode)
             {
                 var index = preview.choices.firstIndex(where: { $0.mode == mode && !$0.hidden })
                 if index == nil, mode == .newestTurns,

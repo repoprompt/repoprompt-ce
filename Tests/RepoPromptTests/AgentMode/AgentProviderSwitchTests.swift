@@ -628,6 +628,69 @@
             }
         }
 
+        func testCodexCompleteInputBudgetFallsBackToNewestTurnsAtScale() throws {
+            let transcript = AgentTranscript(turns: [
+                fixture(request: String(repeating: "a", count: 880_000)),
+                fixture(request: String(repeating: "b", count: 150_000))
+            ])
+            let projection = try Handover.project(transcript)
+            let input = "continue"
+            let allowance = Handover.codexCarrierAllowance(composedInput: input, parkedNote: nil)
+            let budget = Handover.Budget(catalogWindow: 10_000_000, instructions: [], composedInput: input, isPreview: true, codexCarrierScalars: allowance)
+            let full = Handover.history(projection, source: source(), historyReference: nil)
+            let unrestricted = Handover.Budget(catalogWindow: 10_000_000, instructions: [], composedInput: input, isPreview: true)
+            XCTAssertTrue(unrestricted.fits(full), "The carrier and token limits must not cause the fallback")
+            XCTAssertFalse(budget.fits(full))
+            let recent = try XCTUnwrap(Handover.newestCompleteTurns(projection, source: source(), historyReference: nil, budget: budget))
+            XCTAssertEqual(recent.turnIndices, [1])
+            XCTAssertTrue(budget.fits(recent))
+            XCTAssertLessThanOrEqual((Handover.render(recent) + "\n\n" + input).unicodeScalars.count, Handover.codexMaximumInputScalars)
+        }
+
+        func testCodexScalarBoundaryCountsUnicodeScalarsNotBytesOrGraphemes() {
+            for character in ["x", "é", "e\u{301}"] {
+                let payload = "carrier"
+                let unit = character.unicodeScalars.count
+                let emptyAllowance = Handover.codexCarrierAllowance(composedInput: "", parkedNote: nil)
+                let available = emptyAllowance - payload.unicodeScalars.count
+                let count = available / unit
+                let input = String(repeating: character, count: count) + String(repeating: "x", count: available % unit)
+                for (suffix, expected) in [("", true), ("x", false)] {
+                    let allowance = Handover.codexCarrierAllowance(composedInput: input + suffix, parkedNote: nil)
+                    let budget = Handover.Budget(catalogWindow: 10_000_000, instructions: [], composedInput: "", isPreview: false, codexCarrierScalars: allowance)
+                    XCTAssertEqual(budget.fits(payload: payload, mode: .history), expected, "\(character) + \(suffix)")
+                }
+            }
+        }
+
+        func testCodexAllowanceIncludesActualParkedNoteAndLateDecorationBounds() {
+            let note = "parked é"
+            let available = Handover.codexCarrierAllowance(composedInput: "input", parkedNote: note)
+            let maxLink = AgentSessionLinkPrompts.maximumRenderedBytes + AgentSessionLinkPrompts.maximumLocalInputDeltaBytes
+                + AgentSessionLinkMessageEnvelope.escaped(AgentSessionLinkPrompts.localInputGuidance).utf8.count + 1
+            let expected = Handover.codexMaximumInputScalars - "input".unicodeScalars.count - "\n\n".count
+                - note.unicodeScalars.count - "\n\n".count - maxLink - "\n\n".count
+                - OracleBackgroundAwareness.maximumTextScalars - "\n\n".count
+            XCTAssertEqual(available, expected)
+        }
+
+        func testCodexMultiMegabyteProjectionKeepsContiguousSuffix() throws {
+            let transcript = AgentTranscript(turns: (0 ..< 512).map { _ in
+                fixture(request: String(repeating: "x", count: 8192))
+            })
+            let started = Date()
+            let projection = try Handover.project(transcript)
+            let budget = Handover.Budget(
+                catalogWindow: 10_000_000, instructions: [], composedInput: "go", isPreview: true,
+                codexCarrierScalars: Handover.codexCarrierAllowance(composedInput: "go", parkedNote: nil)
+            )
+            let suffix = try XCTUnwrap(Handover.newestCompleteTurns(projection, source: source(), historyReference: nil, budget: budget))
+            XCTAssertEqual(suffix.turnIndices.last, 511)
+            XCTAssertTrue(budget.fits(suffix))
+            XCTAssertEqual(Handover.render(suffix).unicodeScalars.count, suffix.unicodeScalarCount)
+            print("PROVIDER_SWITCH_MULTI_MEGABYTE seconds=\(Date().timeIntervalSince(started))")
+        }
+
         func testSummaryWordTargetSubtractsEscapedFramingAndEnforcesMinimum25WithoutTruncation() throws {
             let projection = try Handover.project(AgentTranscript(turns: [fixture(request: "task")]))
             let framing = try Handover.summary("", of: projection, source: source(), historyReference: nil)

@@ -17948,10 +17948,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     func buildInitialThreadMessageIfNeeded(
         tabID: UUID,
         session: TabSession,
-        initialMessage: String
+        initialMessage: String,
+        assumeFreshProvider: Bool = false
     ) async -> String {
         await providerInputRuntime.buildInitialThreadMessageIfNeeded(
-            session: session, initialMessage: initialMessage,
+            session: session, initialMessage: initialMessage, assumeFreshProvider: assumeFreshProvider,
             input: { self.captureInitialThreadInput(tabID: tabID, workspace: self.providerWorkspaceSource(tabID: tabID, session: session)) },
             isCurrent: { true }
         )

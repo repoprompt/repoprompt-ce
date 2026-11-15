@@ -143,10 +143,11 @@ extension AgentSessionProviderInputRuntime {
     func buildInitialThreadMessageIfNeeded(
         session: AgentTabSession,
         initialMessage: String,
+        assumeFreshProvider: Bool = false,
         input: @MainActor () async throws -> InitialThreadInput?,
         isCurrent: @MainActor () -> Bool
     ) async rethrows -> String {
-        guard isCurrent(), Self.shouldIncludeInitialThreadContext(for: session) else { return initialMessage }
+        guard isCurrent(), Self.shouldIncludeInitialThreadContext(for: session, assumeFreshProvider: assumeFreshProvider) else { return initialMessage }
         let captured = try await input()
         guard isCurrent(), let input = captured, input.workspace.isCurrent() else { return initialMessage }
         let context = await initialThreadContext(input)
@@ -164,8 +165,8 @@ extension AgentSessionProviderInputRuntime {
         return (tree, input.promptText)
     }
 
-    static func shouldIncludeInitialThreadContext(for session: AgentTabSession) -> Bool {
-        guard session.providerSessionID == nil else { return false }
+    static func shouldIncludeInitialThreadContext(for session: AgentTabSession, assumeFreshProvider: Bool = false) -> Bool {
+        guard assumeFreshProvider || session.providerSessionID == nil else { return false }
         guard !session.items.contains(where: itemBlocksInitialThreadContext) else { return false }
         let userMessageCount = session.items.enumerated().reduce(into: 0) { partialResult, entry in
             let (index, item) = entry

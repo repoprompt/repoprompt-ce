@@ -1960,6 +1960,78 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             }
         }
 
+        func testCodexSwitchLongerInputRefusesLocalAndLinkedBeforeAcceptance() async throws {
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                fixture.window.promptManager.apiSettingsViewModel?.isCodexConnected = true
+                session.selectedAgent = .codexExec
+                session.selectedModelRaw = AgentModel.gpt61SolMedium.rawValue
+                let empty = try switchCarrier()
+                let allowance = AgentProviderHandover.codexCarrierAllowance(composedInput: "short", parkedNote: nil)
+                try installSwitch(fixture, padding: allowance - empty.utf8.count - 1000)
+                guard case .success = await vm.linkExecutionRuntime.providerSwitchSendAdmission(session: session, input: "short") else {
+                    return XCTFail("The preview-sized input should fit")
+                }
+                let text = String(repeating: "x", count: 20000)
+                let rows = session.items.map(\.id)
+                vm.storeDraftText(for: session.tabID, text)
+                let claim = try composerClaim(fixture, text: text)
+                let local = await vm.executeComposerSubmitAttempt(text: text, claim: claim)
+                XCTAssertEqual(local, .blocked(message: "Too long to send with the handover."))
+                XCTAssertEqual(session.draftText, text)
+                XCTAssertEqual(session.items.map(\.id), rows)
+                XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .ready)
+
+                let endpoint = try XCTUnwrap(vm.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: session.tabID))
+                let candidate = try XCTUnwrap(vm.agentSessionLinkCandidate(tabID: session.tabID, sessionID: endpoint.sessionID, tabName: "Target", isWindowClosing: false))
+                let request = AgentSessionLinkSendRequest(linkID: UUID(), linkGeneration: 1, observerEndpoint: endpoint, observerDisplayName: "Observer", message: text, workflow: nil)
+                let linked = await vm.linkExecutionRuntime.agentSessionLinkPerformSend(to: candidate, request: request, liveness: {
+                    .init(observerEndpointIsLive: true, targetEndpointIsLive: true, targetWindowIsClosing: false)
+                }, commitAuthorization: { .committed })
+                XCTAssertEqual(linked, .blocked(.providerHandoverDoesNotFit))
+                XCTAssertEqual(session.items.map(\.id), rows)
+                XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .ready)
+            }
+        }
+
+        func testCodexSwitchPreviewAndSendAgreeForSameDraft() async throws {
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                fixture.window.promptManager.apiSettingsViewModel?.isCodexConnected = true
+                let assistantIndex = try XCTUnwrap(session.items.firstIndex { $0.kind == .assistant })
+                _ = try session.removeItem(at: assistantIndex)
+                session.providerSessionID = "existing-source-session"
+                fixture.window.promptManager.promptText = "Initial context from the workspace"
+                XCTAssertFalse(AgentSessionProviderInputRuntime.shouldIncludeInitialThreadContext(for: session))
+                XCTAssertTrue(AgentSessionProviderInputRuntime.shouldIncludeInitialThreadContext(for: session, assumeFreshProvider: true))
+                let draft = "continue the investigation"
+                vm.storeDraftText(for: session.tabID, draft)
+                let model = AgentModel.gpt61SolMedium.rawValue
+                let opened = await vm.openProviderSwitchPreview(agent: .codexExec, model: model, tabID: session.tabID)
+                let id = try XCTUnwrap(opened)
+                let preview = try XCTUnwrap(vm.providerSwitchPreview)
+                let selected = try XCTUnwrap(preview.selected)
+                let rendered = await vm.providerSwitchPayload(id, mode: selected)
+                let payload = try XCTUnwrap(rendered)
+                XCTAssertTrue(try XCTUnwrap(preview.budget).fits(payload: payload, mode: selected))
+                vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("codex-preview.json") }
+                let applied = await vm.applyProviderSwitch(id)
+                XCTAssertTrue(applied)
+                guard case let .success(preparation) = await vm.linkExecutionRuntime.providerSwitchSendAdmission(session: session, input: draft) else {
+                    return XCTFail("The previewed draft must remain admissible")
+                }
+                let initial = try XCTUnwrap(preparation?.initialThreadInput)
+                XCTAssertTrue(initial.contains("<current_prompt_content>\nInitial context from the workspace\n</current_prompt_content>"))
+                XCTAssertEqual(
+                    preview.budget?.codexCarrierScalars,
+                    AgentProviderHandover.codexCarrierAllowance(composedInput: initial, parkedNote: session.selfCompactState.parkedNote?.frame)
+                )
+                XCTAssertLessThanOrEqual((payload + "\n\n" + initial).unicodeScalars.count, AgentProviderHandover.codexMaximumInputScalars)
+            }
+        }
+
         func testSwitchAutoWakeContinuationAndPeriodicRefuseOnceWithoutDispatchOrRows() async throws {
             for periodic in [false, true] {
                 for unconfirmed in [false, true] {

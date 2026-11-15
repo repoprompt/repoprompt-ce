@@ -4,6 +4,16 @@ import RepoPromptDomainRuntime
 /// Provider-only, process-local reservation/acceptance. No transcript row, disk read or wake.
 @MainActor
 final class OracleBackgroundAwareness {
+    private nonisolated static func text(open: Int, ready: Int, groupID: UUID, turnID: UUID) -> String {
+        let remaining = open - 1
+        return "Oracle: \(open) open, \(ready) answers ready [g:\(groupID.uuidString)/t:\(turnID.uuidString)\(remaining == 0 ? "" : "; +\(remaining)")]"
+    }
+
+    nonisolated static let maximumTextScalars: Int = {
+        let id = UUID(uuidString: "00000000-0000-0000-0000-000000000000")!
+        return text(open: Int.max, ready: Int.max, groupID: id, turnID: id).unicodeScalars.count
+    }()
+
     struct Context: Equatable {
         let owner: OracleBackgroundInvocationRegistry.Owner
         let runID: UUID
@@ -58,8 +68,7 @@ final class OracleBackgroundAwareness {
             let open = registry.liveInvocations(for: owner)
             if let first = open.last {
                 let ready = open.reduce(0) { $0 + $1.laneOutcomes.values.count(where: { $0 == .completed }) }
-                let remaining = open.count - 1
-                cachedText = "Oracle: \(open.count) open, \(ready) answers ready [g:\(first.reference.groupID.rawValue.uuidString)/t:\(first.reference.turnID.rawValue.uuidString)\(remaining == 0 ? "" : "; +\(remaining)")]"
+                cachedText = Self.text(open: open.count, ready: ready, groupID: first.reference.groupID.rawValue, turnID: first.reference.turnID.rawValue)
             } else { cachedText = nil }
         }
         guard let text = cachedText, inFlight == nil,
