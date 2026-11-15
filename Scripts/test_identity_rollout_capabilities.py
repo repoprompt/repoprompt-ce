@@ -95,12 +95,48 @@ class CapabilityTests(unittest.TestCase):
         self.assertEqual(manifest, rollout.build_adoption(args))
         p = json.loads(self.p.read_text())
         item = manifest['appcastItems'][0]
-        self.assertEqual(item, rollout.bind_live_item(p, rollout.sha256_file(self.p)))
+        origin = rollout.bind_live_item(p, rollout.sha256_file(self.p))
+        self.assertEqual(rollout.origin_item(item, self.policy), origin)
+        self.assertEqual(item, rollout.stable_preparer_delivery(origin, self.policy))
+        # The shipped client classifies channel from /releases/download/ URL.
+        self.assertTrue(item['url'].startswith('https://github.com/' + self.policy['sparkle']['updateRepository'] + '/releases/download/'))
+        self.assertEqual(item['url'], rollout.enclosure_url(self.policy['sparkle']['updateRepository'],
+            manifest['sourceTag'], origin['enclosureName']))
+        self.assertEqual({k:v for k,v in item.items() if k != 'url'},
+                         {k:v for k,v in origin.items() if k != 'url'})
         for key in ('releaseCommit', 'marketingVersion', 'buildNumber', 'appArtifactManifest'):
             self.assertEqual(manifest[key], p[key])
         adopted = self.adoption()
         rollout.validate_manifest_pair(self.policy, adopted, adopted.parent/'appcast.xml', 'fixture', 'stable')
         self.handoff(adopted, self.p)
+
+    def test_same_build_delivery_repair_is_exact_one_way_and_immutable(self):
+        adopted = self.adoption()
+        original = json.loads(adopted.read_text())
+        original['sourceTag'] = 'stable-adopt-' + original['adoptedArtifact']['tag']
+        original['appcastItems'] = [rollout.origin_item(original['appcastItems'][0], self.policy)]
+        directory = self.root/'old-adoption'; directory.mkdir()
+        live = self.write(directory/'manifest.json', original)
+        (directory/'appcast.xml').write_text(rollout.render_appcast(original))
+        self.progression(adopted, live)
+        self.progression(adopted, adopted)
+        self.handoff(live, self.p)  # old immutable release remains readable
+        with self.assertRaises(rollout.RolloutError): self.progression(live, adopted)
+        base = json.loads(adopted.read_text())
+        for key,value in [('releaseCommit','b'*40), ('eligibilityProfile','rewritten')]:
+            bad = copy.deepcopy(base); bad[key] = value
+            self.write(adopted,bad)
+            with self.assertRaisesRegex(rollout.RolloutError,'every original'): self.progression(adopted,live)
+        for key,value in [('edSignature','changed'), ('enclosureSha256','0'*64), ('enclosureSize',123)]:
+            bad = copy.deepcopy(base); bad['appcastItems'][0][key] = value
+            self.write(adopted,bad); (adopted.parent/'appcast.xml').write_text(rollout.render_appcast(bad))
+            with self.assertRaisesRegex(rollout.RolloutError,'every original'): self.progression(adopted,live)
+        for url in [base['appcastItems'][0]['url'].replace('stable-delivery-v1','other'),
+                    base['appcastItems'][0]['url'].replace('repoprompt-ce-updates','other-repo'),
+                    original['appcastItems'][0]['url']]:
+            bad = copy.deepcopy(base); bad['appcastItems'][0]['url'] = url
+            self.write(adopted,bad); (adopted.parent/'appcast.xml').write_text(rollout.render_appcast(bad))
+            with self.assertRaises(rollout.RolloutError): self.progression(adopted,live)
 
     def test_adoption_pins_and_risk_acknowledgement_fail_closed(self):
         for key, value in [('tag','tip-000000000000'), ('buildNumber','43.24.44'), ('rolloutManifestSha256','0'*64)]:
@@ -130,6 +166,15 @@ class CapabilityTests(unittest.TestCase):
         self.assertEqual(m['appcastItems'][-1], json.loads(adopted.read_text())['appcastItems'][0])
         with self.assertRaises(rollout.RolloutError): self.progression(s,adopted)
         with self.assertRaises(rollout.RolloutError): self.progression(adopted,t)
+
+    def test_native_stable_ladder_cannot_reintroduce_tip_delivery(self):
+        transition = self.native('stable','transition','44','v1.9.2',(self.p,))
+        m = json.loads(transition.read_text())
+        m['appcastItems'][-1] = rollout.origin_item(m['appcastItems'][-1], self.policy)
+        self.write(transition,m)
+        (transition.parent/'appcast.xml').write_text(rollout.render_appcast(m))
+        with self.assertRaisesRegex(rollout.RolloutError,'Stable-delivered'):
+            rollout.validate_manifest_pair(self.policy,transition,transition.parent/'appcast.xml','fixture','stable')
 
     def test_handoff_admits_shared_bridge_but_requires_tip_to_lead(self):
         adopted = self.adoption()
@@ -212,9 +257,16 @@ class WorkflowBoundaryTests(unittest.TestCase):
             self.assertIn('not activated',result.stderr)
 
     def test_adoption_reconciliation_is_paginated_and_never_overwrites(self):
-        for scenario, okay, creates in [('absent',True,True),('matching',True,False),('different',False,False),('duplicate',False,False),('transport',False,False)]:
+        for scenario, okay, creates in [('absent',True,True),('matching',True,False),('different',False,False),('duplicate',False,False),('transport',False,False),('draftmissing',True,False),('draftempty',True,False),('draftdifferent',False,False),('publicmissing',False,False),('extra',False,False)]:
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
                 d=Path(directory); feed=d/'feed'; feed.mkdir(); (feed/'appcast.xml').write_text('reviewed')
+                (feed/'preparer.zip').write_bytes(b'exact signed archive')
+                remote=d/'remote'; remote.mkdir()
+                if scenario not in ('absent','draftempty'):
+                    (remote/'appcast.xml').write_text('tampered' if scenario in ('different','draftdifferent') else 'reviewed')
+                if scenario not in ('absent','draftempty','draftmissing','draftdifferent','publicmissing'):
+                    shutil.copy2(feed/'preparer.zip',remote/'preparer.zip')
+                if scenario=='extra': (remote/'unexpected').write_text('unreviewed')
                 work=d/'work'; work.mkdir()
                 stub=d/'gh'
                 stub.write_text('''#!/usr/bin/env python3
@@ -222,12 +274,21 @@ import json,os,pathlib,shutil,sys
 args=sys.argv[1:]; scenario=os.environ['SCENARIO']; root=pathlib.Path(os.environ['FIXTURE'])
 with (root/'calls').open('a') as f: f.write(json.dumps(args)+'\\n')
 if args[0]=='api':
-    assert '--paginate' in args and '--slurp' in args
-    if scenario=='transport': sys.exit(7)
-    r={'tag_name':'stable-adopt-tip-111111111111','prerelease':False}
-    print(json.dumps([[],[] if scenario=='absent' else [r,r] if scenario=='duplicate' else [r]]))
+    if '--jq' in args:
+        query=args[args.index('--jq')+1]
+        print('true' if query=='.draft' and scenario.startswith('draft') else 'false' if query=='.draft' else len(list((root/'remote').iterdir())))
+    else:
+        assert '--paginate' in args and '--slurp' in args
+        if scenario=='transport': sys.exit(7)
+        r={'tag_name':'stable-adopt-tip-111111111111','prerelease':False,'draft':scenario.startswith('draft')}
+        print(json.dumps([[],[] if scenario=='absent' else [r,r] if scenario=='duplicate' else [r]]))
 elif args[:2]==['release','download']:
-    output=pathlib.Path(args[args.index('--dir')+1]); (output/'appcast.xml').write_text('tampered' if scenario=='different' else 'reviewed')
+    output=pathlib.Path(args[args.index('--dir')+1])
+    for p in (root/'remote').iterdir(): shutil.copy2(p,output/p.name)
+elif args[:2]==['release','upload']:
+    assert scenario.startswith('draft') and '--clobber' not in args
+    p=pathlib.Path(args[3]); assert not (root/'remote'/p.name).exists()
+    shutil.copy2(p,root/'remote'/p.name)
 elif args[:2]==['release','create']: pass
 else: sys.exit(99)
 '''); stub.chmod(0o755)
@@ -236,7 +297,9 @@ else: sys.exit(99)
                 self.assertEqual(result.returncode==0,okay,result.stdout+result.stderr)
                 calls=[json.loads(line) for line in (d/'calls').read_text().splitlines()]
                 self.assertEqual(any(call[:2]==['release','create'] for call in calls),creates)
-                self.assertFalse(any(call[:2] in (['release','upload'],['release','delete']) for call in calls))
+                self.assertFalse(any(call[:2]==['release','delete'] or '--clobber' in call for call in calls))
+                uploads=[call for call in calls if call[:2]==['release','upload']]
+                self.assertEqual(len(uploads),2 if scenario=='draftempty' else 1 if scenario=='draftmissing' else 0)
 
     def test_stable_transition_package_build_and_promotion_branches(self):
         fixture=CapabilityTests(); fixture.setUp(); self.addCleanup(fixture.doCleanups)

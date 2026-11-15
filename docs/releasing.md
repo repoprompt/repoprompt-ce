@@ -322,9 +322,22 @@ approvals put the transition into motion; merging capability code alone does not
    Reverify this historical pin against live artifacts before merging. Keep `version.env` and
    `tip-rollout.json` unchanged. Dispatch **Adopt Archived Tip Preparer into Stable** from `main`
    (no inputs). Approve its protected `release` job only after secret-free verification, helper
-   smokes and compatibility pass. It publishes metadata at `stable-adopt-tip-1e1d9fe4bbc6` in the
-   Stable updates repository, pointing to P's original Tip enclosure. It does not create a source
-   release, move `v1.9.0`, copy/modify the app, or need Eric's signing/notarization credentials.
+   smokes, real Stable-43 updater discovery, and compatibility pass. It publishes a new immutable
+   `stable-adopt-tip-1e1d9fe4bbc6-stable-delivery-v1` release in the Stable updates repository,
+   mirroring P's **exact ZIP bytes** and artifact manifest. The enclosure must use the Stable
+   repository: the shipped client's channel rule classifies Tip-repository URLs as Tip, even in
+   a Stable feed. The original Tip tag, manifest pin, source commit, hash, size and signature remain
+   authoritative. Do not rebuild, resign, renotarize, change versions, or overwrite `v1.9.0` or the
+   historical metadata-only adoption release. No Eric credentials are required.
+   The only same-build repair admitted is historical adoption → this exact deterministic mirror,
+   with every non-transport field identical. Reverse repairs and other same-build changes fail.
+   Verification replays the pinned shipped channel classifier and runs the published Stable 43
+   bundle's actual embedded `SPUUpdater.checkForUpdates` against the candidate feed. After
+   publication, it checks the public mirrored ZIP's API hash/size and runs the updater against the
+   **normal public Stable URL**. Evidence is retained as workflow artifacts; failures after
+   publication mean PUBLIC-but-unverified, not permission to overwrite or advance the ladder.
+   The headless driver uses isolated preferences and dismisses without downloading/installing;
+   this is discovery evidence, not a visible-app UI, installation, or credential migration proof.
    Verify Stable's public appcast and rollout manifest; observe the initial cohort. Launching and
    successfully committing preparation, not merely downloading P, is the client prerequisite.
 2. **Tip T.** In a separate reviewed change, set Tip to transition/successor identity/disabled
@@ -346,7 +359,11 @@ approvals put the transition into motion; merging capability code alone does not
 
 Every stage retains the exact P/T provenance and assets. All feed mutations share a publication
 lane, recheck live state, and fail closed if Tip does not lead Stable or their shared bridge differs.
-Never prune the adopted Tip release. Retain recovery assets and Eric's material for the rollback
+Never prune or edit the adopted Tip release, the original metadata-only Stable adoption, or the
+Stable `*-stable-delivery-v1` mirror: future Stable ladders retain that mirror URL. Interrupted
+**draft** uploads resume only missing assets after every existing asset matches byte-for-byte;
+public assets are never supplemented or overwritten. Conflicting bytes require operator review,
+not deletion or `--clobber`. Retain recovery assets and Eric's material for the rollback
 window. Samuel's current notarization access still needs a real accepted submission; historical
 notarization success is not that proof. If P itself needs a runtime correction, stop and reassess:
 release-tooling changes cannot retrofit the archived binary.

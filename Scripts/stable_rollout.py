@@ -460,6 +460,27 @@ def enclosure_url(update_repository: str, tag: str, name: str) -> str:
     return f"https://github.com/{update_repository}/releases/download/{tag}/{name}"
 
 
+def stable_delivery_tag(tip_tag: str) -> str:
+    return f"stable-adopt-{tip_tag}-stable-delivery-v1"
+
+
+def stable_preparer_delivery(item: dict, policy: dict) -> dict:
+    """Change transport only; the item tag/manifest pin remain the Tip origin."""
+    delivered = dict(item)
+    if item_origin(item, policy, "stable") == "tip":
+        delivered["url"] = enclosure_url(update_repository(policy, "stable"),
+                                         stable_delivery_tag(item["tag"]), item["enclosureName"])
+    return delivered
+
+
+def origin_item(item: dict, policy: dict) -> dict:
+    """Compare authenticated bridge identity independent of its validated mirror."""
+    origin = dict(item)
+    if item_origin(item, policy, "stable") == "tip":
+        origin["url"] = enclosure_url(update_repository(policy, "tip"), item["tag"], item["enclosureName"])
+    return origin
+
+
 def item_origin(item: dict, policy: dict, channel: str) -> str:
     if channel == "stable" and str(item.get("tag", "")).startswith("tip-"):
         if item.get("role") != "preparer":
@@ -479,6 +500,7 @@ def validate_item_shape(
     app_name: str,
     channel: str,
 ) -> None:
+    delivery_channel = channel
     channel = item_origin(item, policy, channel)
     minimum_system = policy["sparkle"]["minimumSystemVersion"]
     role = item.get("role")
@@ -510,7 +532,12 @@ def validate_item_shape(
             )
     elif not isinstance(enclosure_name, str) or not enclosure_name.endswith(ROLE_ENCLOSURE_SUFFIX[role]):
         raise RolloutError(f"appcast item {position} enclosure name has the wrong role suffix")
-    if item.get("url") != enclosure_url(update_repository(policy, channel), tag, enclosure_name):
+    allowed_urls = {enclosure_url(update_repository(policy, channel), tag, enclosure_name)}
+    if delivery_channel == "stable" and channel == "tip":
+        # Read historical publications, but allow only the deterministic Stable
+        # mirror, never an arbitrary cross-repository redirect or release tag.
+        allowed_urls.add(enclosure_url(update_repository(policy, "stable"), stable_delivery_tag(tag), enclosure_name))
+    if item.get("url") not in allowed_urls:
         raise RolloutError(f"appcast item {position} enclosure URL mismatch: {item.get('url')!r}")
     size = item.get("enclosureSize")
     if not isinstance(size, int) or size <= 0:
@@ -789,6 +816,8 @@ def build_manifest(args: argparse.Namespace) -> tuple[dict, str]:
             str(predecessor_item["buildNumber"]),
             entry.get("sourceChannel", channel),
         )
+        if channel == "stable":
+            predecessor_item = stable_preparer_delivery(predecessor_item, policy)
         items.append(predecessor_item)
 
     for position, item in enumerate(items, start=1):
@@ -914,6 +943,8 @@ def validate_manifest_pair(
             )
         origin = item_origin(item, policy, channel)
         validate_item_shape(item, position, policy, "RepoPrompt", channel)
+        if channel == "stable" and not adoption and origin == "tip" and item != stable_preparer_delivery(item, policy):
+            raise RolloutError("native Stable ladders must retain the Stable-delivered preparer")
         if position == 1 and not adoption:
             if item["rolloutManifestName"] is not None or item["rolloutManifestSha256"] is not None:
                 raise RolloutError(f"{label} newest appcast item must not refer to itself")
@@ -941,8 +972,13 @@ def validate_manifest_pair(
         ("buildNumber", "buildNumber"),
     ):
         if adoption and manifest_key == "sourceTag":
-            if manifest.get("sourceTag") != f"stable-adopt-{newest.get('tag')}":
+            if manifest.get("sourceTag") not in {f"stable-adopt-{newest.get('tag')}", stable_delivery_tag(newest.get('tag'))}:
                 raise RolloutError("adoption publication tag must preserve Tip provenance")
+            projected = (stable_preparer_delivery(newest, policy)
+                         if manifest["sourceTag"] == stable_delivery_tag(newest["tag"])
+                         else origin_item(newest, policy))
+            if newest != projected:
+                raise RolloutError("adoption delivery URL differs from its publication tag")
             continue
         if manifest.get(manifest_key) != newest.get(item_key):
             raise RolloutError(
@@ -1176,10 +1212,10 @@ def build_adoption(args: argparse.Namespace) -> dict:
     if tip["sourceTag"] != authority["tag"] or tip["buildNumber"] != authority["buildNumber"]:
         raise RolloutError("adopted Tip tag/build differs from authorization")
     manifest = dict(tip)
-    manifest.update(schemaVersion=2, channel="stable", sourceTag=f"stable-adopt-{tip['sourceTag']}",
+    manifest.update(schemaVersion=2, channel="stable", sourceTag=stable_delivery_tag(tip['sourceTag']),
                     eligibilityProfile=declaration["eligibilityProfile"], updateRepository=update_repository(policy, "stable"))
     manifest["adoptedArtifact"] = {**authority, "channel": "tip", "updateRepository": update_repository(policy, "tip")}
-    manifest["appcastItems"] = [bind_live_item(tip, digest)]
+    manifest["appcastItems"] = [stable_preparer_delivery(bind_live_item(tip, digest), policy)]
     return manifest
 
 
@@ -1200,7 +1236,7 @@ def run_adoption_values(args: argparse.Namespace) -> None:
     authority = declaration.get("adoptedArtifact")
     if authority is None:
         raise RolloutError("no archived preparer adoption is activated")
-    print("\t".join((authority["tag"], authority["buildNumber"], authority["rolloutManifestSha256"], f"stable-adopt-{authority['tag']}")))
+    print("\t".join((authority["tag"], authority["buildNumber"], authority["rolloutManifestSha256"], stable_delivery_tag(authority['tag']))))
 
 
 def run_validate_live_stable_progression(args: argparse.Namespace) -> None:
@@ -1217,6 +1253,19 @@ def run_validate_live_stable_progression(args: argparse.Namespace) -> None:
         return
     live_path = Path(args.live_manifest)
     live = validate_manifest_pair(policy, live_path, Path(args.live_appcast), "live", "stable")
+    # One narrowly defined transport repair, not permission for a same-build
+    # app replacement or an immutable-tag rewrite. Compare every origin field.
+    if "adoptedArtifact" in live and "adoptedArtifact" in candidate:
+        origin_tag = live["adoptedArtifact"]["tag"]
+        if (live["sourceTag"] == f"stable-adopt-{origin_tag}"
+                and candidate["sourceTag"] == stable_delivery_tag(origin_tag)):
+            repaired = dict(live)
+            repaired["sourceTag"] = stable_delivery_tag(origin_tag)
+            repaired["appcastItems"] = [stable_preparer_delivery(live["appcastItems"][0], policy)]
+            if candidate != repaired:
+                raise RolloutError("Stable delivery repair must preserve every original preparer field")
+            print("OK: exact same-build preparer transport repair; no app bytes or provenance changed.")
+            return
     if candidate["sourceTag"] == live["sourceTag"]:
         if candidate_path.read_bytes() != live_path.read_bytes() or Path(args.candidate_appcast).read_bytes() != Path(args.live_appcast).read_bytes():
             raise RolloutError("published Stable tag has different bytes")
@@ -1475,7 +1524,7 @@ def run_validate_stable_tip_floor(args: argparse.Namespace) -> None:
             stable_bridge = [item for item in stable_manifest["appcastItems"] if item["role"] == "preparer"]
             tip_bridge = ([bind_live_item(manifest, sha256_file(Path(args.tip_manifest)))] if role == "preparer"
                           else [item for item in manifest["appcastItems"] if item["role"] == "preparer"])
-            if stable_bridge != tip_bridge or len(stable_bridge) != 1:
+            if len(stable_bridge) != 1 or [origin_item(i, policy) for i in stable_bridge] != tip_bridge:
                 raise RolloutError("Stable and Tip must retain exactly the same authenticated preparer")
     if role in {"legacy", "preparer"}:
         print(f"OK: the {role} Tip role does not require a retained preparer floor.")
@@ -1495,7 +1544,7 @@ def run_validate_stable_tip_floor(args: argparse.Namespace) -> None:
                 f"Stable={stable_build} preparer={preparer_build}"
             )
         stable_preparers = [item for item in stable_manifest["appcastItems"] if item["role"] == "preparer"]
-        if len(stable_preparers) != 1 or stable_preparers[0] != preparers[0]:
+        if len(stable_preparers) != 1 or origin_item(stable_preparers[0], policy) != preparers[0]:
             raise RolloutError("Stable and Tip must retain exactly the same authenticated preparer")
     print(
         "OK: Stable/Tip preparer floor or authenticated shared bridge is preserved: "

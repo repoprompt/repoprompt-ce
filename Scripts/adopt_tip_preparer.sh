@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# No-build Stable bootstrap: retain the immutable Tip enclosure and its original
+# No-build Stable bootstrap: mirror the immutable Tip enclosure and retain its original
 # provenance. Never import a signing identity or submit new notarization.
 set -euo pipefail
 MODE="${1:-verify}"
@@ -86,11 +86,14 @@ if [[ "$MODE" == verify ]]; then
     exit 0
 fi
 : "${PUBLIC_UPDATE_GH_TOKEN:?Protected publication token required}"
-# Only metadata is published to Stable. The signed enclosure remains at Tip.
+# Serve exact authenticated bytes from Stable: shipped clients infer the channel
+# from the enclosure repository. Keep the immutable original Tip release too.
 mkdir "$WORK/feed"
 cp "$WORK/adoption.json" "$WORK/feed/$rollout_name"
 cp "$WORK/appcast.xml" "$WORK/feed/appcast.xml"
-(cd "$WORK/feed"; shasum -a 256 appcast.xml "$rollout_name" > SHA256SUMS)
+cp "$ADOPTION_OUTPUT_DIR/$enclosure" "$WORK/feed/$enclosure"
+cp "$ADOPTION_OUTPUT_DIR/$manifest_name" "$WORK/feed/$manifest_name"
+(cd "$WORK/feed"; shasum -a 256 appcast.xml "$rollout_name" "$enclosure" "$manifest_name" > SHA256SUMS)
 update_gh() { GH_TOKEN="$PUBLIC_UPDATE_GH_TOKEN" gh "$@"; }
 prepare_adoption_release "$WORK/feed" "$stable_repository" "$adoption_tag" \
     "Unchanged Tip preparer $tag ($build). Runtime credential migration UNVERIFIED, accepted risk. Authorization: ${GITHUB_SHA:-local}." "$WORK"
@@ -112,4 +115,20 @@ for attempt in 1 2 3 4 5 6 7; do
     [[ "$attempt" == 7 ]] || sleep 5
 done
 [[ "$converged" == true ]] || { echo 'Adoption is public but latest feed did not converge after bounded reads; inspect before retrying' >&2; exit 1; }
-echo "Published unchanged archived preparer through Stable. Runtime credential migration remains UNVERIFIED."
+# GitHub's newly uploaded mirror must bind the very same bytes and public URL.
+python3 - "$WORK/published-latest.json" "$WORK/adoption.json" <<'PY'
+import json,sys
+r=json.load(open(sys.argv[1])); m=json.load(open(sys.argv[2])); item=m['appcastItems'][0]
+assets=[a for a in r['assets'] if a['name']==item['enclosureName'] and a.get('state')=='uploaded']
+if (len(assets)!=1 or assets[0].get('browser_download_url')!=item['url']
+        or assets[0].get('size')!=item['enclosureSize']
+        or assets[0].get('digest')!='sha256:'+item['enclosureSha256']):
+    sys.exit('Adoption is PUBLIC but mirrored ZIP API binding failed; inspect before retrying')
+PY
+# Publication is a point of no return. On a failed discovery check, report a
+# public-but-unverified state; do not roll back, delete, or overwrite the release.
+if ! bash "$SCRIPT_DIR/check_stable_preparer_update.sh" public "$ADOPTION_OUTPUT_DIR/$rollout_name" "$ADOPTION_OUTPUT_DIR/public-updater-check"; then
+    echo 'Adoption is PUBLIC but the real Stable 43 updater check failed; inspect evidence before any retry or transition' >&2
+    exit 1
+fi
+echo "Published unchanged archived preparer through Stable delivery; actual Stable 43 updater discovery passed. Runtime credential migration remains UNVERIFIED."
