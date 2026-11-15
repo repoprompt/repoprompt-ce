@@ -403,6 +403,28 @@ final class AgentModePromptLongRunningCommandGuidanceTests: XCTestCase {
 
 @MainActor
 final class AgentWorktreePlacementPolicyTests: XCTestCase {
+    #if DEBUG
+        func testRegisteredAppToolsAdvertiseManagedCreationWithoutPromptHistory() async throws {
+            // Materialize the real window catalog: provider -> binder -> canonical
+            // registration -> JSONSchema projection, with no conversation history.
+            try await ContextBuilderMultiRootDiscoveryDriver.withDriver { driver in
+                let tools = await driver.window.mcpServer.windowMCPTools
+                for (name, pathKey) in [("manage_worktree", "path"), ("agent_run", "worktree_path")] {
+                    let tool = try XCTUnwrap(tools.first { $0.name == name })
+                    XCTAssertTrue(tool.description.components(separatedBy: "\n")[0].contains(".repoprompt-worktrees"), name)
+                    XCTAssertTrue(tool.description.contains("unless the user explicitly requests that location"), name)
+                    // Inspect the actual advertised schema, not domainBinding(),
+                    // which would look up the canonical definition again.
+                    let schema = try JSONDecoder().decode(Value.self, from: JSONEncoder().encode(tool.inputSchema))
+                    let properties = try XCTUnwrap(schema.objectValue?["properties"]?.objectValue)
+                    let help = try XCTUnwrap(properties[pathKey]?.objectValue?["description"]?.stringValue)
+                    XCTAssertTrue(help.contains(".repoprompt-worktrees"), name)
+                    XCTAssertTrue(help.contains("omit"), name)
+                }
+            }
+        }
+    #endif
+
     func testEveryAgentRoleAndProviderReceivesTemporaryLocationAndRefusalPolicy() {
         let roles: [AgentModelCatalog.TaskLabelKind?] = [nil, .explore, .engineer, .pair, .design]
         let providers: [AgentProviderKind?] = [nil] + AgentProviderKind.allCases.map { Optional($0) }
@@ -435,7 +457,8 @@ final class AgentWorktreePlacementPolicyTests: XCTestCase {
                         XCTAssertTrue(prompt.contains("omit `worktree_path`"), context)
                         XCTAssertTrue(prompt.contains("only for a user-requested location"), context)
                         if provider == .codexExec {
-                            XCTAssertTrue(prompt.contains("`mcp__RepoPrompt__manage_worktree`"), context)
+                            XCTAssertTrue(prompt.contains("`mcp__RepoPromptCE__manage_worktree`"), context)
+                            XCTAssertFalse(prompt.contains("`mcp__RepoPrompt__manage_worktree`"), context)
                             XCTAssertFalse(prompt.contains("`manage_worktree`"), context)
                         } else {
                             XCTAssertTrue(prompt.contains("`manage_worktree`"), context)

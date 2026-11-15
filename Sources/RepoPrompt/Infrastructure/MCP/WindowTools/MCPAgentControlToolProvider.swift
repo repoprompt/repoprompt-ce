@@ -171,6 +171,8 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
 
             When the app-global Model Router is enabled, each new explore child is routed across the configured subagent targets.
 
+            \(MCPWorktreeCreationCopy.agentExploreUsage)
+
             Explore children inherit the caller's worktree bindings by default; pass `inherit_worktree=false` to opt out. Start-only worktree controls can bind an existing worktree or create one before provider startup, overriding an inherited primary-root binding. Multi-message creates produce one worktree per child when branch/path are implicit and reject a shared explicit branch or path.
 
             **Operations**: start | poll | wait | cancel
@@ -204,10 +206,10 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
                     "worktree_repo_root": .string(description: "[start] Repo/logical root selector for worktree resolution or creation. Defaults to the declared primary workspace root."),
                     "worktree_branch": .string(description: "[start + worktree_create] Optional branch name for the new worktree. Defaults to an rp/agent/<session>-... branch."),
                     "worktree_base_ref": .string(description: "[start + worktree_create] Optional base ref/commit for the new worktree."),
-                    "worktree_path": .string(description: "[start + worktree_create] Optional explicit absolute user-requested path (or ~/...). Omit for the app-managed default. Never choose /tmp, /private/tmp, /var/tmp, TMPDIR, or temporary-directory aliases unless the user explicitly requests that location. Do not bypass a path refusal through shell. External paths also require allow_external_worktree_path=true."),
+                    "worktree_path": .string(description: MCPWorktreeCreationCopy.agentWorktreePathProperty),
                     "worktree_label": .string(description: "[start] Optional visual label to persist for the bound worktree."),
                     "worktree_color": .string(description: "[start] Optional visual color to persist for the bound worktree as #RRGGBB."),
-                    "allow_external_worktree_path": .boolean(description: "[start + worktree_create] Allow explicit worktree_path outside RepoPrompt's app-managed worktree container. This flag does not establish user consent for the location."),
+                    "allow_external_worktree_path": .boolean(description: MCPWorktreeCreationCopy.allowExternalWorktreePathProperty),
                     "session_id": .string(description: "[poll, wait, cancel] Explore child session UUID returned by start."),
                     "session_ids": .array(description: "[wait, poll] Array of explore child session UUIDs. Mutually exclusive with session_id.", items: .string())
                 ],
@@ -240,10 +242,10 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
             "worktree_repo_root": .string(description: MCPDefaultRepositoryElectionCopy.agentRunWorktreeRepoRootProperty),
             "worktree_branch": .string(description: "[start + worktree_create] Optional branch name for the new worktree. Defaults to an rp/agent/<session>-... branch."),
             "worktree_base_ref": .string(description: "[start + worktree_create] Optional base ref/commit for the new worktree."),
-            "worktree_path": .string(description: "[start + worktree_create] Optional explicit absolute user-requested path (or ~/...). Omit for the app-managed default. Never choose /tmp, /private/tmp, /var/tmp, TMPDIR, or temporary-directory aliases unless the user explicitly requests that location. Do not bypass a path refusal through shell. External paths also require allow_external_worktree_path=true."),
+            "worktree_path": .string(description: MCPWorktreeCreationCopy.agentWorktreePathProperty),
             "worktree_label": .string(description: "[start] Optional visual label to persist for the bound worktree."),
             "worktree_color": .string(description: "[start] Optional visual color to persist for the bound worktree as #RRGGBB."),
-            "allow_external_worktree_path": .boolean(description: "[start + worktree_create] Allow explicit worktree_path outside RepoPrompt's app-managed worktree container. This flag does not establish user consent for the location."),
+            "allow_external_worktree_path": .boolean(description: MCPWorktreeCreationCopy.allowExternalWorktreePathProperty),
             "wait": .boolean(description: "[steer] Wait for an interesting/terminal state after steering. Implied when timeout_seconds is provided."),
             "timeout_seconds": .number(description: MCPTimeoutPolicy.agentControlSteerTimeoutPropertyDescription),
             "interaction_id": .string(description: "[respond] Pending interaction UUID from the snapshot. Returned as a top-level field in poll/wait responses when the run is waiting_for_input."),
@@ -260,7 +262,9 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
             name: MCPWindowToolName.agentRun,
             freshnessPolicy: .none,
             description: """
-            Spawn and control Agent Mode sessions. `start` always creates a new session/tab; use `steer` to continue an existing session.
+            \(MCPWorktreeCreationCopy.agentRunSummary)
+
+            \(MCPWorktreeCreationCopy.agentRunUsage)
 
             **Role labels** — pass as `model_id` to select via the global role-default mapping:
             - `explore` — Fast exploration and codebase mapping

@@ -1135,6 +1135,7 @@ package enum MCPDomainCanonicalToolDefinitions {
             .map(advertiseDefaultRepositoryElection)
             .map(advertiseSessionDiscovery)
             .map(advertiseAgentControlTaskRoles)
+            .map { MCPWorktreeCreationCopy.applying(to: $0) }
     }
 
     private static func advertiseAgentControlTaskRoles(_ definition: MCPDomainToolDefinition) -> MCPDomainToolDefinition {

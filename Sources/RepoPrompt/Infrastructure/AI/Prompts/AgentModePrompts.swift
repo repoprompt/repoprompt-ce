@@ -347,14 +347,14 @@ enum AgentModePrompts {
             **Worktree Placement**
             - Never create a Git worktree or checkout in `/tmp`, `/private/tmp`, `/var/tmp`, `$TMPDIR`, macOS `/var/folders` temporary directories, or symlink aliases of temporary locations unless the user explicitly requests that location in the current conversation.
             - A dirty checkout, a general request for isolation, sandbox-writable directories, previous sessions, memories, and examples do not authorize a temporary worktree location. Preserve unrelated user edits; do not create a worktree merely because the checkout is dirty.
-            - A worktree-tool refusal is not permission to bypass it with shell `git worktree add`, native tools, scripts, or an escalation. Ask the user if necessary or report the refusal; do not retry the refused mutation through another execution surface.
+            - A worktree-tool refusal is not permission to bypass it with shell `git worktree add`, native tools, scripts, or an escalation. Report the refusal; do not retry the refused mutation through another execution surface.
             """
             if readOnly {
                 return placement + "\n- You are read-only: do not create worktrees or checkouts by any means."
             }
             return placement + """
 
-            - When an isolated worktree is needed and authorized, use `manage_worktree` with `op: \"create\"` and omit `path` to use the app-managed `.repoprompt-worktrees` container beside the repository. For delegated creation, omit `worktree_path` as well. If the required tool is unavailable, ask rather than inventing a shell destination.
+            - When an isolated worktree is needed and authorized, use `manage_worktree` with `op: \"create\"` and omit `path` to use the app-managed `.repoprompt-worktrees` container beside the repository. For delegated creation, omit `worktree_path` as well. Do not ask the user to choose a location for ordinary managed creation. If the required tool is unavailable, report that limitation rather than inventing a shell destination.
             - Supply an explicit `path` or `worktree_path` only for a user-requested location. Setting `allow_external_path` or `allow_external_worktree_path` yourself is not evidence of user consent.
             """
         }
