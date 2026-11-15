@@ -181,10 +181,16 @@ successful runtime-proof result. The normal proof requirements below remain outs
 must review that risk again in the activation PR, including recovery and fresh-install policy.
 
 The no-new-Eric path adopts the *unchanged* Tip preparer through Stable. It does not rebuild, resign,
-renotarize, relabel the binary, or overwrite Stable v1.9.0. Stable publishes a metadata-only
-`stable-adopt-tip-<sha>` release; its enclosure still points to the immutable Tip release. The Stable
-manifest carries the Tip manifest SHA-256, tag, build, original source commit, artifact-manifest binding,
-and signature. An adopted preparer cannot become a general-purpose cross-channel artifact import.
+renotarize, relabel the binary, or overwrite Stable v1.9.0. Stable mirrors the exact ZIP bytes in
+`stable-adopt-tip-<sha>-stable-delivery-v1`. Delivery must use the Stable repository because the
+shipped client's update-result channel rule infers channel from the enclosure URL. The original
+metadata-only `stable-adopt-tip-<sha>` remains immutable and readable, but its Tip URL cannot be
+used for repaired Stable delivery. Only that historical → deterministic mirror same-build repair
+is admitted, with every origin field identical; no reverse move or arbitrary same-build rewrite.
+The Stable manifest carries the original Tip manifest SHA-256, tag, build, source commit,
+artifact-manifest binding, size and signature. Cross-channel guards compare the validated original
+bridge identity, not the transport URL. Native Stable T/S retain this Stable-delivered P projection.
+An adopted preparer cannot become a general-purpose cross-channel artifact import.
 Only the oldest P may originate in Tip; Stable T/S must be native Stable releases.
 
 `Scripts/stable_rollout.py` owns declaration admission, deterministic adoption generation/validation,
@@ -204,9 +210,10 @@ The publication job independently reverifies the pinned bytes and current ladder
 `release` environment. A draft with different bytes is not overwritten. These checks do **not** run
 the credential migration or prove its runtime success.
 
-Retention is now cross-channel: once Stable adopts P, **never prune or edit that Tip release or its
-assets**, even after Tip advances. Both channels' T/S retain the same Tip-origin P and its exact
-manifest digest. Keep P/T recovery assets and Eric's material for the supported rollback window.
+Retention is now cross-channel: once Stable adopts P, **never prune or edit that Tip release, the
+historical Stable adoption, or the Stable delivery mirror and their assets**, even after Tip advances.
+Both channels' T/S retain the same Tip-origin P and its exact manifest digest; Stable delivery also
+depends on the immutable mirror URL. Keep P/T recovery assets and Eric's material for the supported rollback window.
 See [the activation runbook](../releasing.md#no-new-eric-activation-runbook).
 
 ## Required proof gate

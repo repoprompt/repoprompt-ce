@@ -64,24 +64,58 @@ if p.stat().st_size != a['size'] or (digest and 'sha256:' + hashlib.sha256(p.rea
 PY
 }
 
-# Reconcile metadata-only adoption drafts without overwriting any asset. Caller
+# Reconcile adoption drafts without overwriting any asset. Caller
 # supplies update_gh (protected token wrapper) and rechecks handoff before publish.
 prepare_adoption_release() {
     local feed="$1" repository="$2" tag="$3" notes="$4" work="$5"
     update_gh api --paginate --slurp "repos/$repository/releases?per_page=100" > "$work/releases.json" || return 1
-    local existing
-    existing="$(python3 - "$work/releases.json" "$tag" <<'PY'
+    local existing release_id observed
+    observed="$(python3 - "$work/releases.json" "$tag" <<'PY'
 import json,sys
 releases=[r for page in json.load(open(sys.argv[1])) for r in page if r['tag_name']==sys.argv[2]]
 if len(releases)>1: sys.exit('Duplicate adoption release tags; refusing ambiguous mutation')
 if releases and releases[0].get('prerelease') is not False: sys.exit('Adoption release must not be a prerelease')
-print('yes' if releases else 'no')
+if releases:
+    release_id=releases[0].get('id')
+    if type(release_id) is not int or release_id<=0: sys.exit('Observed adoption release lacks a valid API ID')
+    print(('draft' if releases[0].get('draft') is True else 'public')+'\t'+str(release_id))
+else:
+    print('no\t0')
 PY
 )" || return 1
-    if [[ "$existing" == yes ]]; then
+    IFS=$'\t' read -r existing release_id <<< "$observed"
+    if [[ "$existing" != no ]]; then
         mkdir "$work/existing"
-        update_gh release download "$tag" --repo "$repository" --dir "$work/existing" || return 1
-        diff -qr "$feed" "$work/existing" || return 1
+        # An empty draft can result from an interrupted first upload.
+        local asset_count
+        asset_count="$(update_gh api "repos/$repository/releases/$release_id" --jq '.assets | length')" || return 1
+        if [[ "$asset_count" != 0 ]]; then
+            update_gh release download "$tag" --repo "$repository" --dir "$work/existing" || return 1
+        fi
+        python3 - "$feed" "$work/existing" "$existing" > "$work/missing-assets" <<'PY' || return 1
+import filecmp,pathlib,sys
+expected,actual=map(pathlib.Path,sys.argv[1:3])
+for p in actual.iterdir():
+    target=expected/p.name
+    if not p.is_file() or not target.is_file() or not filecmp.cmp(p,target,shallow=False):
+        sys.exit('Existing adoption asset differs; never overwrite: '+p.name)
+missing=sorted(p.name for p in expected.iterdir() if not (actual/p.name).exists())
+if missing and sys.argv[3]!='draft': sys.exit('Published adoption is incomplete; never mutate it')
+print('\n'.join(missing),end='\n' if missing else '')
+PY
+        local name
+        while IFS= read -r name; do
+            [[ -n "$name" ]] || continue
+            [[ "$(update_gh api "repos/$repository/releases/$release_id" --jq .draft)" == true ]] || return 1
+            update_gh release upload "$tag" "$feed/$name" --repo "$repository" || return 1
+        done < "$work/missing-assets"
+        if [[ -s "$work/missing-assets" ]]; then
+            mkdir "$work/resumed"
+            update_gh release download "$tag" --repo "$repository" --dir "$work/resumed" || return 1
+            diff -qr "$feed" "$work/resumed" || return 1
+        else
+            diff -qr "$feed" "$work/existing" || return 1
+        fi
     else
         update_gh release create "$tag" "$feed/"* --repo "$repository" --draft --latest=false \
             --title "RepoPrompt CE archived preparer" --notes "$notes" || return 1
