@@ -326,8 +326,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
 
         let logicalRoot = try await logicalRoot(for: context)
         let logicalRootPath = logicalRoot.standardizedFullPath
-        var mutationRootMappings = await context.lookupContext.domainMutationPhysicalRootMappings(
-            store: dependencies.context.promptVM.workspaceFileContextStore
+        var mutationRootMappings = try await context.lookupContext.domainMutationPhysicalRootMappings(
+            store: (dependencies.context.requirePromptVM()).workspaceFileContextStore
         )
         mutationRootMappings.append(
             .init(
@@ -983,7 +983,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         } else {
             activeWorkspace
         }
-        let visibleRoots = await dependencies.context.promptVM.workspaceFileContextStore.rootRefs(scope: lookupContext.rootScope)
+        let visibleRoots = try await (dependencies.context.requirePromptVM()).workspaceFileContextStore.rootRefs(scope: lookupContext.rootScope)
         let allRepos = await discoverGitRepos(in: visibleRoots)
         return DiscoveryContext(
             metadata: metadata,

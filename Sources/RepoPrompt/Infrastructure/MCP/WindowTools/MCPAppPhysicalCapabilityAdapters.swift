@@ -416,9 +416,11 @@ enum MCPAppPhysicalCapabilityAdapters {
 
     struct Context {
         let windowID: Int
-        let promptVM: PromptViewModel
-        let workspaceManager: WorkspaceManagerViewModel?
-        let selectionCoordinator: WorkspaceSelectionCoordinator?
+        // A complete catalog may outlive its presentation. Physical dispatch still requires its
+        // original server; capability storage must not secretly extend the presentation lifetime.
+        weak var promptVM: PromptViewModel?
+        weak var workspaceManager: WorkspaceManagerViewModel?
+        weak var selectionCoordinator: WorkspaceSelectionCoordinator?
         let applyEditsApprovalStore: ApplyEditsApprovalStore
         let captureRequestMetadata: CaptureRequestMetadata
         let resolveImplicitContextBuilderGitTarget: ResolveImplicitContextBuilderGitTarget
@@ -435,6 +437,14 @@ enum MCPAppPhysicalCapabilityAdapters {
         let commitPrimaryGitDiffArtifactsToCurrentTab: CommitPrimaryGitDiffArtifactsToCurrentTab
         let replaceAdvertisedGitArtifactsForCurrentTab: ReplaceAdvertisedGitArtifactsForCurrentTab
         let invalidateAdvertisedGitArtifactsForCurrentTab: InvalidateAdvertisedGitArtifactsForCurrentTab
+
+        @MainActor
+        func requirePromptVM() throws -> PromptViewModel {
+            guard let promptVM else {
+                throw MCPError.internalError("Physical prompt capability is unavailable")
+            }
+            return promptVM
+        }
     }
 
     struct Selection {

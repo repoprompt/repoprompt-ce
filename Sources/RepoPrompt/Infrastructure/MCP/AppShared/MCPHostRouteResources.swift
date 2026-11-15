@@ -59,6 +59,66 @@ final class MCPHostRouteResources {
     /// Catalog construction alone must not keep a presentation VM alive.
     private var contextCleanupOwner: AnyObject?
 
+    var readSideEffectCoordinator: DomainReadSideEffectCoordinator {
+        domainRuntime.readSideEffectCoordinator
+    }
+
+    func fileTreeContextIsCurrent(_ original: MCPTabContextSnapshot, connectionID: UUID) -> Bool {
+        guard !isClosing, let current = runRouteBindings.tabContextByConnectionID[connectionID] else { return false }
+        return current.windowID == original.windowID && current.workspaceID == original.workspaceID
+            && current.tabID == original.tabID && current.runID == original.runID
+            && current.readFileAutoSelectionGeneration == original.readFileAutoSelectionGeneration
+            && current.routeOwnerIdentity == original.routeOwnerIdentity
+            && current.fileToolAuthoritySourceIdentity == original.fileToolAuthoritySourceIdentity
+    }
+
+    /// Consume only this route's existing connection receipt. Query dispatch never binds a new
+    /// connection, follows a presenter or adopts a same-ID replacement.
+    func fileTreeReadHandle(metadata: MCPRequestMetadata, context: DomainContextIdentity) async throws -> DomainReadContextHandle {
+        guard !isClosing, let coordinator, let connectionID = metadata.connectionID,
+              let retained = connections[connectionID],
+              let routed = runRouteBindings.tabContextByConnectionID[connectionID],
+              metadata.windowID == identity.routeID,
+              routed.windowID == identity.routeID, routed.routeOwnerIdentity == ObjectIdentifier(self),
+              routed.workspaceID == context.workspaceID, routed.tabID == context.contextID,
+              runRouteBindings.connectionIDToRunID[connectionID].map({ $0 == routed.runID }) ?? true,
+              metadata.tabContextHint.map({ $0.tabID == context.contextID && ($0.workspaceID == nil || $0.workspaceID == context.workspaceID) }) ?? true
+        else { throw MCPFileToolAuthorityFailure.unavailable }
+        let handle = try await coordinator.resolveReadContext(connection: retained.registration)
+        guard !isClosing, connections[connectionID]?.registration == retained.registration,
+              fileTreeContextIsCurrent(routed, connectionID: connectionID),
+              handle.context == context,
+              MCPServerViewModel.domainReadBindingSatisfiesRequestedRun(requestedRunID: routed.runID, resolvedBindingKind: handle.bindingKind)
+        else { throw MCPFileToolAuthorityFailure.superseded }
+        return handle
+    }
+
+    func drainFileTreeSelection(metadata: MCPRequestMetadata) async throws {
+        guard !isClosing, let connectionID = metadata.connectionID,
+              let context = runRouteBindings.tabContextByConnectionID[connectionID],
+              context.windowID == identity.routeID, context.routeOwnerIdentity == ObjectIdentifier(self)
+        else { throw MCPFileToolAuthorityFailure.unavailable }
+        let key = MCPReadFileAutoSelectionCoordinator.ContextKey(
+            windowID: context.windowID, workspaceID: context.workspaceID, tabID: context.tabID,
+            route: .bound(connectionID: connectionID, runID: context.runID),
+            bindingGeneration: context.readFileAutoSelectionGeneration, routeOwnerIdentity: context.routeOwnerIdentity
+        )
+        guard let coordinator = readFileAutoSelectionCoordinator else { return }
+        var keys: [MCPReadFileAutoSelectionCoordinator.ContextKey] = []
+        if let lineage = runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID[connectionID],
+           lineage.successorKey == key, let runID = context.runID,
+           runRouteBindings.connectionIDByRunID[runID] == connectionID,
+           runRouteBindings.connectionIDToRunID[connectionID] == runID
+        {
+            keys = lineage.predecessorKeys
+        }
+        for candidate in keys + [key] {
+            try await MCPServerViewModel.requireReadFileAutoSelectionPrerequisite {
+                await coordinator.drain(.canonicalSelection, for: candidate)
+            }
+        }
+    }
+
     var historyWorkspaceLocations: HistoryWorkspaceLocationResolver {
         .init(workspaceStore: { [domainRuntime] in domainRuntime.workspaceStore })
     }

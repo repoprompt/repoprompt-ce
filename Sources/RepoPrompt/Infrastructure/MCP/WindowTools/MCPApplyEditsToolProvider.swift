@@ -148,9 +148,9 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
             ) {
                 return Self.retryableFailureSummary(request: request, failure: failure)
             }
-            if let failure = await MCPMutationRetryableFailure.mutationScopeFailure(
+            if let failure = try await MCPMutationRetryableFailure.mutationScopeFailure(
                 for: lookupContext,
-                store: dependencies.context.promptVM.workspaceFileContextStore
+                store: (dependencies.context.requirePromptVM()).workspaceFileContextStore
             ) {
                 return Self.retryableFailureSummary(request: request, failure: failure)
             }
@@ -160,7 +160,7 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
             } catch let issue as PathResolutionIssue {
                 throw MCPError.invalidParams(PathResolutionIssueRenderer.message(for: issue))
             }
-            let store = await MainActor.run { dependencies.context.promptVM.workspaceFileContextStore }
+            let store = try await MainActor.run { try (dependencies.context.requirePromptVM()).workspaceFileContextStore }
             let roots = await store.rootRefs(scope: lookupContext.rootScope)
             let namespace = lookupContext.exactFileNamespace(storeRoots: roots)
             let resolution: WorkspaceExactExistingFileResolution
@@ -418,7 +418,7 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
     ) async -> String {
         await EditFlowPerf.measure(EditFlowPerf.Stage.ApplyEdits.flushDeltas) {
             do {
-                _ = try await dependencies.context.promptVM.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
+                _ = try await (dependencies.context.requirePromptVM()).workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
                     userPath: userPath,
                     fallbackScope: rootScope,
                     timeout: .seconds(2)
