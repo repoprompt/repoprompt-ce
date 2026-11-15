@@ -551,7 +551,7 @@ final class MCPGitToolProvider {
             runPurpose: metadata.runPurpose
         )
         let declaredRepoPaths = workspace.repoPaths
-        let visibleRoots = await dependencies.context.promptVM.workspaceFileContextStore.rootRefs(scope: lookupContext.rootScope)
+        let visibleRoots = try await (dependencies.context.requirePromptVM()).workspaceFileContextStore.rootRefs(scope: lookupContext.rootScope)
         let requestContext = MCPGitRequestContext(rootRefs: visibleRoots, vcsService: vcsService)
         let allRepos = await requestContext.allRepos()
         let explicitTokens = parseExplicitRepoRoots(from: args).map { tokens in
@@ -580,7 +580,7 @@ final class MCPGitToolProvider {
                 requestsArtifactPublication: requestsArtifactPublication,
                 operation: contextBuilderOperation,
                 allRepositories: allRepos,
-                store: dependencies.context.promptVM.workspaceFileContextStore
+                store: (dependencies.context.requirePromptVM()).workspaceFileContextStore
             )
         } catch let error as MCPContextBuilderGitReviewPolicyError {
             throw MCPError.invalidParams(error.localizedDescription)
@@ -772,7 +772,7 @@ final class MCPGitToolProvider {
                         publishedOutcomes,
                         publishedArtifactSetCount: publishedSets.count,
                         fence: publicationFence,
-                        store: dependencies.context.promptVM.workspaceFileContextStore
+                        store: (dependencies.context.requirePromptVM()).workspaceFileContextStore
                     )
                 } catch let error as MCPContextBuilderGitReviewPolicyError {
                     stagedAdvertisementsByInvocation[advertisementInvocationID] = MCPGitStagedAdvertisement(
@@ -784,7 +784,7 @@ final class MCPGitToolProvider {
             }
 
             try Task.checkCancellation()
-            let ingress = await dependencies.context.promptVM.workspaceFileContextStore.ingressPublishedGitArtifacts(
+            let ingress = try await (dependencies.context.requirePromptVM()).workspaceFileContextStore.ingressPublishedGitArtifacts(
                 WorkspacePublishedGitArtifactIngressRequest(
                     root: root,
                     artifacts: publishedSets.flatMap(\.orderedArtifacts)

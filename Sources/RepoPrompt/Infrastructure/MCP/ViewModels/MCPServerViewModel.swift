@@ -1341,8 +1341,8 @@ final class MCPServerViewModel: ObservableObject {
     private lazy var windowToolRuntime = makeWindowToolRuntime(route: routeResources)
 
     @MainActor
-    private func makeWindowToolRuntime(route routeResources: MCPHostRouteResources) -> MCPAppToolBinder {
-        routeResources.makeToolBinder(service: service, validateInvocation: validateInvocation) { [weak self, windowID = routeResources.identity.routeID] name, freshnessPolicy, args, implementation in
+    private func makeWindowToolRuntime(route routeResources: MCPHostRouteResources, independentFileTree: Bool = false) -> MCPAppToolBinder {
+        routeResources.makeToolBinder(service: service, validateInvocation: validateInvocation, independentFileTree: independentFileTree) { [weak self, windowID = routeResources.identity.routeID] name, freshnessPolicy, args, implementation in
             // Unmigrated preparation still requires its real physical/presentation owner.
             guard let self else {
                 throw MCPError.internalError("Window deallocated while executing \(name)")
@@ -2268,12 +2268,17 @@ final class MCPServerViewModel: ObservableObject {
     /// The physical route and executable hosts use the same complete catalog factory.
     /// Capabilities capture the supplied route; the physical window only supplies their operations.
     @MainActor
-    func makeToolCatalog(route routeResources: MCPHostRouteResources) -> MCPAppToolCatalogRegistration {
-        let runtime = makeWindowToolRuntime(route: routeResources)
+    func makeToolCatalog(route routeResources: MCPHostRouteResources, fileTree: MCPFileTreeReadResources? = nil) -> MCPAppToolCatalogRegistration {
+        precondition(fileTree == nil || routeResources.identity.kind == .independent)
+        let runtime = makeWindowToolRuntime(route: routeResources, independentFileTree: fileTree != nil)
         let context = makeWindowToolContextCapabilities(route: routeResources)
         let selection = makeWindowToolSelectionCapabilities(route: routeResources)
         let files = makeWindowToolFileCapabilities(route: routeResources)
         let execution = makeWindowToolExecutionCapabilities(route: routeResources)
+        let treeBinding = fileTree?.binding(route: routeResources)
+        let sharedBindings = makeDomainReadToolProvider(route: routeResources).bindings.map { binding in
+            binding.definition.name == MCPWindowToolName.getFileTree ? (treeBinding ?? binding) : binding
+        }
         return MCPAppToolCatalogRegistration(
             windowID: routeResources.identity.routeID,
             runtime: runtime,
@@ -2283,7 +2288,7 @@ final class MCPServerViewModel: ObservableObject {
             execution: execution,
             fileProvider: MCPFileToolProvider(runtime: runtime, context: context, selection: selection, files: files),
             oracleProvider: MCPOracleToolProvider(runtime: runtime, execution: execution),
-            sharedBindings: makeDomainReadToolProvider(route: routeResources).bindings,
+            sharedBindings: sharedBindings,
             resolveSpawnParentSessionID: { [weak self] metadata, targetWindow in
                 guard let self else { return nil }
                 return await resolveSpawnParentSessionID(route: routeResources, metadata: metadata, targetWindow: targetWindow)
@@ -7010,88 +7015,19 @@ final class MCPServerViewModel: ObservableObject {
         startPath: String?,
         lookupContext: WorkspaceLookupContext = .visibleWorkspace
     ) async throws -> (result: FileTreeResult, rootCount: Int, emptyReason: MCPStoreBackedFileTreeEmptyReason?) {
-        let presentationMode: WorkspaceFileTreePresentationMode
-        switch mode.lowercased() {
-        case "selected": presentationMode = .selected
-        case "full": presentationMode = .full
-        case "folders": presentationMode = .folders
-        case "auto": presentationMode = .auto
-        default: throw MCPError.invalidParams("invalid mode: \(mode)")
+        // Keep historical mode-error precedence before resolving the physical selection.
+        guard ["selected", "full", "folders", "auto"].contains(mode.lowercased()) else {
+            throw MCPError.invalidParams("invalid mode: \(mode)")
         }
-
-        let filePathDisplay = await MainActor.run { promptVM.filePathDisplayOption }
-        let showCodeMapMarkers = await MainActor.run { !promptVM.codeMapsGloballyDisabled }
-        let selection = try await lookupContext.physicalizeSelection(storedSelectionForCurrentTabContext(route: routeResources, includeCodemapPathsWhenSelectedUsage: true))
-        if presentationMode == .selected,
-           selection.isEmptyForSelectedFileTree
-        {
-            return (FileTreeResult(
-                tree: "No files are selected.",
-                usedSelectedMarker: false,
-                usedCodeMapMarker: false,
-                wasTruncated: false,
-                note: "Selection is empty"
-            ), 0, .selectionEmpty)
-        }
-        let store = promptVM.workspaceFileContextStore
-        let fileTree = await store.makeCurrentSnapshotFileTreePresentation(
-            selection: selection,
-            request: WorkspaceFileTreePresentationRequest(
-                mode: presentationMode,
-                filePathDisplay: filePathDisplay,
-                onlyIncludeRootsWithSelectedFiles: presentationMode == .selected,
-                includeLegend: false,
-                showCodeMapMarkers: showCodeMapMarkers,
-                rootScope: lookupContext.rootScope,
-                startPath: startPath.map { lookupContext.translateInputPath($0) },
-                maxDepth: maxDepth
-            ),
-            lookupContext: lookupContext,
-            profile: .mcpRead
+        let display = await MainActor.run { promptVM.filePathDisplayOption }
+        let markers = await MainActor.run { !promptVM.codeMapsGloballyDisabled }
+        let selection = try await storedSelectionForCurrentTabContext(route: routeResources, includeCodemapPathsWhenSelectedUsage: true)
+        return try await MCPFileTreeReadResources.build(
+            store: promptVM.workspaceFileContextStore, selection: selection,
+            display: display, showCodeMapMarkers: markers,
+            mode: mode, maxDepth: maxDepth, startPath: startPath, lookupContext: lookupContext,
+            workspaceMessage: { [self] path in await workspaceContextMessage(forOperation: MCPWindowToolName.getFileTree, path: path) }
         )
-        let selectedProjectionIsEmpty = presentationMode == .selected
-            && selection.manualCodemapPaths.isEmpty
-            && fileTree.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        if fileTree.rootCount == 0 || selectedProjectionIsEmpty {
-            let hasStartPath = startPath?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-            let selectedPathsUnavailable = presentationMode == .selected && !hasStartPath
-            let msg = if selectedPathsUnavailable {
-                "No selected files could be resolved in the loaded workspace."
-            } else if hasStartPath {
-                await workspaceContextMessage(forOperation: MCPWindowToolName.getFileTree, path: startPath)
-            } else {
-                "The resolved workspace has no configured roots."
-            }
-            let emptyReason: MCPStoreBackedFileTreeEmptyReason = if hasStartPath {
-                .requestedPathOutsideLoadedRoots
-            } else if presentationMode == .selected {
-                .selectionEmpty
-            } else {
-                .rootProjectionEmpty
-            }
-            let note = if selectedPathsUnavailable {
-                "Selected files are unavailable"
-            } else if hasStartPath {
-                "Requested path is outside the loaded roots"
-            } else {
-                "No roots configured"
-            }
-            return (FileTreeResult(
-                tree: msg,
-                usedSelectedMarker: false,
-                usedCodeMapMarker: false,
-                wasTruncated: false,
-                note: note
-            ), 0, emptyReason)
-        }
-
-        return (FileTreeResult(
-            tree: fileTree.content,
-            usedSelectedMarker: fileTree.content.contains(" *"),
-            usedCodeMapMarker: showCodeMapMarkers && fileTree.content.contains(" +"),
-            wasTruncated: false,
-            note: nil
-        ), fileTree.rootCount, nil)
     }
 
     @MainActor
