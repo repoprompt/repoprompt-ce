@@ -172,7 +172,7 @@ final class MCPSelectionToolProvider: MCPAppToolProviding {
         let sliceInputs = parsedInputs.sliceInputs
         let sliceParseErrors = parsedInputs.sliceErrors
         let mode = args["mode"]?.stringValue?.lowercased() ?? "full"
-        if await dependencies.context.promptVM.codeMapsGloballyDisabled, mode == "codemap_only" || op == "demote" {
+        if try await (dependencies.context.requirePromptVM()).codeMapsGloballyDisabled, mode == "codemap_only" || op == "demote" {
             throw MCPError.invalidParams(MCPServerViewModel.codeMapsGloballyDisabledMCPMessage)
         }
         try Task.checkCancellation()
@@ -197,7 +197,7 @@ final class MCPSelectionToolProvider: MCPAppToolProviding {
         let lookupRootScope = lookupContext.rootScope
         if op != "get" {
             await MCPToolExecutionHandlerPhaseContext.report(.manageSelectionIngressWait)
-            _ = await dependencies.context.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupRootScope)
+            _ = try await (dependencies.context.requirePromptVM()).workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupRootScope)
             await MCPToolExecutionHandlerPhaseContext.report(.manageSelectionIngressWait, transition: .completed)
         }
         try Task.checkCancellation()

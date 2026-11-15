@@ -9,12 +9,13 @@ extension MCPHostRouteResources {
     func makeToolBinder(
         service: MCPService,
         validateInvocation: @escaping MCPToolInvocationValidator,
+        independentFileTree: Bool = false,
         windowExecution: @escaping MCPAppToolBinder.ExecuteTool
     ) -> MCPAppToolBinder {
         MCPAppToolBinder(windowID: identity.routeID) { [self] name, freshness, arguments, implementation in
             try await invokeBoundTool(
                 service: service, name: name, freshness: freshness, arguments: arguments,
-                validateInvocation: validateInvocation, windowExecution: windowExecution, implementation: implementation
+                validateInvocation: validateInvocation, independentFileTree: independentFileTree, windowExecution: windowExecution, implementation: implementation
             )
         }
     }
@@ -22,18 +23,21 @@ extension MCPHostRouteResources {
     private func invokeBoundTool(
         service: MCPService, name: String, freshness: MCPToolFreshnessPolicy,
         arguments: [String: Value], validateInvocation: @escaping MCPToolInvocationValidator,
+        independentFileTree: Bool,
         windowExecution: @escaping MCPAppToolBinder.ExecuteTool,
         implementation: @escaping MCPAppToolBinder.ProviderImplementation
     ) async throws -> Value {
         // Capture exactly once, before preparation or provider work can suspend.
         let context = try service.captureInvocationContext(toolName: name, expectedWindowID: identity.routeID)
-        if identity.kind == .independent, name == MCPWindowToolName.history {
-            // History's existing domain contract is workspace-independent and provider-managed.
+        if identity.kind == .independent,
+           name == MCPWindowToolName.history || (independentFileTree && name == MCPWindowToolName.getFileTree)
+        {
+            // Only explicitly migrated read capabilities may use route-owned preparation.
             // A future freshness requirement must not be silently bypassed here.
             guard case .providerManaged = freshness else {
-                throw MCPError.internalError("History requires its provider-managed freshness contract")
+                throw MCPError.internalError("Independent reads require their provider-managed freshness contract")
             }
-            return try await executeHistoryInvocation(context, validateInvocation: validateInvocation) {
+            return try await executeIndependentReadInvocation(context, validateInvocation: validateInvocation) {
                 try await implementation(.init(toolName: name, windowID: self.identity.routeID, context: context), arguments)
             }
         }
@@ -44,7 +48,7 @@ extension MCPHostRouteResources {
 
     /// Pin the original descriptor/catalog proof for the whole invocation. The existing runtime
     /// owns registration, cancellation and completion; a waiter never acquires a successor route.
-    private func executeHistoryInvocation(
+    private func executeIndependentReadInvocation(
         _ context: ToolInvocationContext,
         validateInvocation: @escaping MCPToolInvocationValidator,
         body: @escaping @Sendable () async throws -> Value
@@ -54,6 +58,14 @@ extension MCPHostRouteResources {
         // routes never borrow the selected window or a manager fallback to manufacture it.
         let indexedRunID = context.connectionID.flatMap {
             runRouteBindings.connectionIDToRunID[$0] ?? runRouteBindings.tabContextByConnectionID[$0]?.runID
+        }
+        let treeContext = context.toolName == MCPWindowToolName.getFileTree ? context.connectionID.flatMap {
+            runRouteBindings.tabContextByConnectionID[$0]
+        } : nil
+        let treeContextIsCurrent: @MainActor @Sendable () -> Bool = { [self] in
+            guard context.toolName == MCPWindowToolName.getFileTree else { return true }
+            guard let treeContext, let connectionID = context.connectionID else { return false }
+            return fileTreeContextIsCurrent(treeContext, connectionID: connectionID)
         }
         #if DEBUG || EDIT_FLOW_PERF
             let lifecycleCorrelation = EditFlowPerf.currentLifecycleCorrelation
@@ -71,14 +83,26 @@ extension MCPHostRouteResources {
             .init(toolName: context.toolName, windowID: identity.routeID, context: context),
             ownerIdentity: ownerIdentity, indexedRunID: indexedRunID, lifecycleCorrelation: lifecycleCorrelation,
             validateInvocation: { [self] invocation, routeID, owner in
-                await historyInvocationIsCurrent(
+                guard await treeContextIsCurrent() else { return false }
+                let valid = await independentReadInvocationIsCurrent(
                     invocation, dispatch: dispatch, routeID: routeID, owner: owner, validateInvocation: validateInvocation
                 )
-            }, body: body
+                let stillCurrent = await treeContextIsCurrent()
+                return valid && stillCurrent
+            }, body: { [self] in
+                let value = try await body()
+                if context.toolName == MCPWindowToolName.getFileTree {
+                    guard await independentReadInvocationIsCurrent(
+                        context, dispatch: dispatch, routeID: identity.routeID,
+                        owner: ownerIdentity, validateInvocation: validateInvocation
+                    ), await treeContextIsCurrent() else { throw ServerNetworkManager.ToolDispatchAdmissionError.windowTerminal }
+                }
+                return value
+            }
         )
     }
 
-    private func historyInvocationIsCurrent(
+    private func independentReadInvocationIsCurrent(
         _ invocation: ToolInvocationContext, dispatch: MCPWindowToolDispatchIdentity,
         routeID: Int, owner: ObjectIdentifier, validateInvocation: MCPToolInvocationValidator
     ) async -> Bool {
