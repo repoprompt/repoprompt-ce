@@ -1,9 +1,16 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "channel": "stable",
-  "currentRole": "legacy",
-  "eligibilityProfile": "stable-rollout-v1",
-  "expectedMigrationPhase": "disabled",
+  "currentRole": "preparer",
+  "eligibilityProfile": "stable-shared-tip-preparer-v1",
+  "expectedMigrationPhase": "legacy-preparer",
   "expectedSigningIdentity": "legacy",
-  "predecessors": []
+  "predecessors": [],
+  "runtimeMigrationProof": "unverified-accepted-risk",
+  "adoptedArtifact": {
+    "type": "tip-preparer-adoption-v1",
+    "tag": "tip-1e1d9fe4bbc6",
+    "buildNumber": "43.24.43",
+    "rolloutManifestSha256": "03153738c5b09ecffa6a56841e5fc2f9113ebd54a4ed8306e48d6df171770de4"
+  }
 }
