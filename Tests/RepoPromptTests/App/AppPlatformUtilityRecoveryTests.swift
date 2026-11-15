@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import Compression
 import CryptoKit
@@ -9,6 +10,93 @@ import RepoPromptSecureStorage
 import XCTest
 
 final class AppPlatformUtilityRecoveryTests: XCTestCase {
+    @MainActor
+    func testDelegateExposesOpenURLsSelector() {
+        XCTAssertTrue(AppDelegate.instancesRespond(to: #selector(NSApplicationDelegate.application(_:open:))))
+    }
+
+    @MainActor
+    func testQueuedURLWindowWaitsForOpenerAndCoalescesUntilRegistration() {
+        let opener = AppWindowOpener.shared
+        opener.resetForTesting()
+        defer { opener.resetForTesting() }
+        var opened = 0
+        opener.requestWindowForQueuedURLs(hasLiveWindows: true, hasPendingURLs: true)
+        opener.requestWindowForQueuedURLs(hasLiveWindows: false, hasPendingURLs: false)
+        XCTAssertEqual(opener.pendingDockWindowRequestCount, 0)
+        opener.requestWindowForQueuedURLs(hasLiveWindows: false, hasPendingURLs: true)
+        opener.requestWindowForQueuedURLs(hasLiveWindows: false, hasPendingURLs: true)
+        XCTAssertTrue(opener.pendingURLWindowRequest)
+        opener.install { opened += 1 }
+        opener.install { opened += 1 }
+        XCTAssertEqual(opened, 1)
+        opener.requestWindowForQueuedURLs(hasLiveWindows: false, hasPendingURLs: true)
+        XCTAssertEqual(opened, 1)
+        opener.mainWindowRegistered()
+        opener.requestWindowForQueuedURLs(hasLiveWindows: false, hasPendingURLs: true)
+        XCTAssertEqual(opened, 2)
+    }
+
+    @MainActor
+    func testRegistrationRetiresURLBootstrapButPreservesExplicitWindowRequest() {
+        let opener = AppWindowOpener.shared
+        opener.resetForTesting()
+        defer { opener.resetForTesting() }
+        var opened = 0
+        opener.requestWindowForQueuedURLs(hasLiveWindows: false, hasPendingURLs: true)
+        opener.mainWindowRegistered()
+        opener.install { opened += 1 }
+        XCTAssertEqual(opened, 0)
+        opener.resetForTesting()
+        opener.requestWindowForQueuedURLs(hasLiveWindows: false, hasPendingURLs: true)
+        opener.requestMainWindowFromDock()
+        opener.mainWindowRegistered()
+        opener.install { opened += 1 }
+        XCTAssertEqual(opened, 1)
+    }
+
+    @MainActor
+    func testEitherWindowInstallerDrainsPendingRequestsOnlyOnce() {
+        let opener = AppWindowOpener.shared
+        defer { opener.resetForTesting() }
+        for commandsFirst in [true, false] {
+            for urlRequest in [true, false] {
+                opener.resetForTesting()
+                var commandsOpened = 0
+                var windowOpened = 0
+                let commandsInstall = { opener.install { commandsOpened += 1 } }
+                let windowInstall = { opener.install { windowOpened += 1 } }
+                if urlRequest {
+                    opener.requestWindowForQueuedURLs(hasLiveWindows: false, hasPendingURLs: true)
+                } else {
+                    opener.requestMainWindowFromDock()
+                }
+                if commandsFirst {
+                    commandsInstall()
+                    windowInstall()
+                } else {
+                    windowInstall()
+                    commandsInstall()
+                }
+                XCTAssertEqual(commandsOpened, commandsFirst ? 1 : 0)
+                XCTAssertEqual(windowOpened, commandsFirst ? 0 : 1)
+            }
+        }
+    }
+
+    @MainActor
+    func testForwardOpenURLsPreservesOrderAndDuplicates() async throws {
+        let first = try XCTUnwrap(URL(string: "repoprompt-ce://prompt?content=first"))
+        let second = try XCTUnwrap(URL(string: "repoprompt://open/example"))
+        var received: [URL] = []
+
+        await AppDelegate.forwardOpenURLs([first, second, first]) { url in
+            received.append(url)
+        }
+
+        XCTAssertEqual(received, [first, second, first])
+    }
+
     func testSparkleUpdaterManagerRunsOnMainActorFromDetachedCaller() async {
         let (detachedCallerWasOnMainThread, managerRanOnMainThread) = await Task.detached {
             let detachedCallerWasOnMainThread = Thread.isMainThread

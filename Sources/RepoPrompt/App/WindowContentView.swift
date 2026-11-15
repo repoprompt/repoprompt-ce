@@ -10,6 +10,7 @@ import SwiftUI
 /// This view holds exactly one @StateObject WindowState, meaning
 /// each new Window/Scene gets its own WindowState.
 struct WindowContentView: View {
+    @Environment(\.openWindow) private var openWindow
     @EnvironmentObject var versionManager: VersionManager
     /// Not observed: only the lifecycle callbacks below use it, and observing it re-evaluated every
     /// window root whenever any window opened or closed.
@@ -18,7 +19,6 @@ struct WindowContentView: View {
     }
 
     @EnvironmentObject var sparkleManager: SparkleUpdaterManager
-    @Environment(\.openWindow) private var openWindow
 
     /// The WindowState itself (your big manager of fileManager, promptManager, etc.)
     @StateObject private var windowState = WindowState(
@@ -62,7 +62,7 @@ struct WindowContentView: View {
                     }
                 }
 
-                // Install the openWindow action into AppWindowOpener for programmatic window creation
+                AppWindowOpener.shared.mainWindowRegistered()
                 AppWindowOpener.shared.install {
                     openWindow(id: "main")
                 }

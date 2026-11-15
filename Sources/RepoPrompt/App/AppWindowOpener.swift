@@ -19,22 +19,28 @@ import SwiftUI
 /// 1. A SwiftUI view calls `install(openMainWindow:)` to register the action
 /// 2. Non-SwiftUI code calls `openMainWindow()` to trigger window creation
 @MainActor
-final class AppWindowOpener {
+final class AppWindowOpener: ObservableObject {
     static let shared = AppWindowOpener()
     let commandCenter = CommandCenterWindowOpener()
 
     private var openMainWindowImpl: (() -> Void)?
-    private var pendingDockWindowRequestCount = 0
+    @Published private(set) var pendingDockWindowRequestCount = 0
+    private var queuedURLWindowInFlight = false
+    @Published private(set) var pendingURLWindowRequest = false
 
     private init() {}
 
     /// Installs the openWindow action from a SwiftUI view.
-    /// Called from WindowContentView on appear.
+    /// MainWindowCommands supports zero-window startup; WindowContentView also installs on appearance.
     func install(openMainWindow: @escaping () -> Void) {
         openMainWindowImpl = openMainWindow
 
         let pendingRequestCount = pendingDockWindowRequestCount
-        pendingDockWindowRequestCount = 0
+        if pendingRequestCount > 0 { pendingDockWindowRequestCount = 0 }
+        if pendingURLWindowRequest {
+            pendingURLWindowRequest = false
+            openMainWindow()
+        }
         for _ in 0 ..< pendingRequestCount {
             openMainWindow()
         }
@@ -48,6 +54,21 @@ final class AppWindowOpener {
             return
         }
         openMainWindowImpl()
+    }
+
+    func requestWindowForQueuedURLs(hasLiveWindows: Bool, hasPendingURLs: Bool) {
+        guard !hasLiveWindows, hasPendingURLs, !queuedURLWindowInFlight else { return }
+        queuedURLWindowInFlight = true
+        if let openMainWindowImpl {
+            openMainWindowImpl()
+        } else {
+            pendingURLWindowRequest = true
+        }
+    }
+
+    func mainWindowRegistered() {
+        queuedURLWindowInFlight = false
+        if pendingURLWindowRequest { pendingURLWindowRequest = false }
     }
 
     /// Opens a new main window.
@@ -72,6 +93,8 @@ final class AppWindowOpener {
         func resetForTesting() {
             openMainWindowImpl = nil
             pendingDockWindowRequestCount = 0
+            queuedURLWindowInFlight = false
+            pendingURLWindowRequest = false
         }
     #endif
 }
@@ -84,6 +107,26 @@ enum WindowOpenError: Error, LocalizedError {
         switch self {
         case .openerUnavailable:
             "Window opener not available. No SwiftUI view has installed the openWindow action."
+        }
+    }
+}
+
+struct MainWindowCommands: Commands {
+    let title: String
+    @Environment(\.openWindow) private var openWindow
+    @ObservedObject private var opener = AppWindowOpener.shared
+
+    var body: some Commands {
+        CommandGroup(replacing: .newItem) {
+            Button(title) {
+                opener.requestMainWindowFromDock()
+            }
+            .onChange(of: opener.pendingURLWindowRequest, initial: true) { _, _ in
+                opener.install { openWindow(id: "main") }
+            }
+            .onChange(of: opener.pendingDockWindowRequestCount, initial: true) { _, _ in
+                opener.install { openWindow(id: "main") }
+            }
         }
     }
 }

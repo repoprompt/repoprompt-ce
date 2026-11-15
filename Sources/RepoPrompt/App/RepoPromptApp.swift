@@ -164,15 +164,8 @@ struct RepoPromptSwiftUIApp: App {
                 // Override environment font
                 .environment(\.font, fontScale.preset.font)
                 .environment(\.repoPromptFontScalePreset, fontScale.preset)
-                // Advertise URL handling on existing windows so SwiftUI does not create
-                // an extra scene before the global deep-link router can choose the target.
-                .handlesExternalEvents(preferring: ["*"], allowing: ["*"])
-                .onOpenURL { incomingURL in
-                    Task { @MainActor in
-                        await AppDeepLinkRouter.shared.route(url: incomingURL)
-                    }
-                }
         }
+        .handlesExternalEvents(matching: [])
         // .windowStyle(.hiddenTitleBar)
         .windowStyle(.automatic)
         .windowToolbarStyle(.unified)
@@ -181,11 +174,7 @@ struct RepoPromptSwiftUIApp: App {
             CommandCenterCommands()
 
             // Replace SwiftUI's automatic Cmd-N; otherwise it keeps reserving the key after a remap.
-            CommandGroup(replacing: .newItem) {
-                Button(shortcutDisplay.title("New Workspace Window", for: .newWorkspaceWindow)) {
-                    AppWindowOpener.shared.requestMainWindowFromDock()
-                }
-            }
+            MainWindowCommands(title: shortcutDisplay.title("New Workspace Window", for: .newWorkspaceWindow))
 
             // macOS standard "Settings…" (⌘,) menu item
             CommandGroup(replacing: .appSettings) {
@@ -215,6 +204,7 @@ struct RepoPromptSwiftUIApp: App {
                 .environment(\.font, fontScale.preset.font)
                 .handlesExternalEvents(preferring: [], allowing: [])
         }
+        .handlesExternalEvents(matching: [])
         .defaultSize(width: 1050, height: 700)
         // CommandCenterCommands supplies the remappable menu entry, not a second native command.
         .commandsRemoved()
