@@ -82,6 +82,7 @@ jobs:
             --repo "$SOURCE_GITHUB_REPOSITORY" \
             --dir reviewed-assets \
             --pattern '*.zip' \
+            --pattern '*.pkg' \
             --pattern SHA256SUMS \
             --pattern '*-artifact-manifest.json'
 
@@ -94,7 +95,7 @@ jobs:
           actual_digest="$(shasum -a 256 "$checksums" | awk '{ print $1 }')"
           [[ "$actual_digest" == "$REVIEWED_CHECKSUMS_SHA256" ]] || { echo "Reviewed SHA256SUMS digest mismatch" >&2; exit 1; }
           shopt -s nullglob
-          archives=(reviewed-assets/*.zip)
+          archives=(reviewed-assets/*.zip reviewed-assets/*.pkg)
           artifact_manifests=(reviewed-assets/*-artifact-manifest.json)
           [[ "${#archives[@]}" == "1" ]] || { echo "Expected exactly one reviewed ZIP" >&2; exit 1; }
           [[ "${#artifact_manifests[@]}" == "1" ]] || { echo "Expected exactly one reviewed artifact manifest" >&2; exit 1; }
@@ -102,7 +103,12 @@ jobs:
           [[ "$(wc -l < reviewed-assets/reviewed-zip.sha256 | tr -d ' ')" == "1" ]] || { echo "Reviewed ZIP checksum entry mismatch" >&2; exit 1; }
           (cd reviewed-assets && shasum -a 256 -c reviewed-zip.sha256)
           mkdir extracted
-          ditto -x -k "${archives[0]}" extracted
+          if [[ "${archives[0]}" == *.pkg ]]; then
+            REPOPROMPT_ENABLE_IDENTITY_TRANSITION_PKG=1 ./trusted-control-plane/Scripts/build_identity_transition_pkg.sh validate \
+              "${archives[0]}" --expanded-payload-dir extracted
+          else
+            ditto -x -k "${archives[0]}" extracted
+          fi
           ./trusted-control-plane/Scripts/validate_embedded_mcp_helper_layout.sh \
             "extracted/RepoPrompt CE.app" \
             "Reviewed ZIP MCP helper layout"
@@ -155,6 +161,7 @@ jobs:
           name: ${{ steps.archive-name.outputs.name }}
           path: |
             reviewed-assets/*.zip
+            reviewed-assets/*.pkg
             reviewed-assets/SHA256SUMS
             reviewed-assets/*-artifact-manifest.json
           if-no-files-found: error
@@ -177,6 +184,9 @@ jobs:
       - compatibility
     if: github.ref == 'refs/heads/main'
     environment: release
+    concurrency:
+      group: rollout-publication
+      queue: max
     runs-on: macos-26
     permissions:
       contents: write
@@ -199,7 +209,7 @@ jobs:
 
       - name: Reject dormant rollout roles and sibling publication
         run: |
-          python3 trusted-control-plane/Scripts/stable_rollout.py workflow-guard \
+          python3 trusted-control-plane/Scripts/stable_rollout.py workflow-guard --operation promote \
             --declaration release-source/release-rollout.json \
             --policy trusted-control-plane/Scripts/apple_identity_policy.json
 

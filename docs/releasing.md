@@ -292,6 +292,67 @@ channel remains **Stable**. Returning from Tip Builds to Stable may not downgrad
 immediately; users may need to wait for a newer stable build or reinstall the
 stable app manually.
 
+### No-new-Eric activation runbook
+
+The capability PR does **not** activate publication. Both rollout declarations stay unchanged.
+End-to-end credential migration is **UNVERIFIED**. Artifact/contract/smoke checks are not evidence
+that the Keychain bridge succeeds. The following later activation PRs and protected workflow
+approvals put the transition into motion; merging capability code alone does not.
+
+1. **Stable adopts the existing P, with no new app release.** After capability code is on protected
+   main, review a separate `release-rollout.json` schema-2 activation:
+   ```json
+   {
+     "schemaVersion": 2,
+     "channel": "stable",
+     "currentRole": "preparer",
+     "eligibilityProfile": "stable-shared-tip-preparer-v1",
+     "expectedMigrationPhase": "legacy-preparer",
+     "expectedSigningIdentity": "legacy",
+     "predecessors": [],
+     "runtimeMigrationProof": "unverified-accepted-risk",
+     "adoptedArtifact": {
+       "type": "tip-preparer-adoption-v1",
+       "tag": "tip-1e1d9fe4bbc6",
+       "buildNumber": "43.24.43",
+       "rolloutManifestSha256": "03153738c5b09ecffa6a56841e5fc2f9113ebd54a4ed8306e48d6df171770de4"
+     }
+   }
+   ```
+   Reverify this historical pin against live artifacts before merging. Keep `version.env` and
+   `tip-rollout.json` unchanged. Dispatch **Adopt Archived Tip Preparer into Stable** from `main`
+   (no inputs). Approve its protected `release` job only after secret-free verification, helper
+   smokes and compatibility pass. It publishes metadata at `stable-adopt-tip-1e1d9fe4bbc6` in the
+   Stable updates repository, pointing to P's original Tip enclosure. It does not create a source
+   release, move `v1.9.0`, copy/modify the app, or need Eric's signing/notarization credentials.
+   Verify Stable's public appcast and rollout manifest; observe the initial cohort. Launching and
+   successfully committing preparation, not merely downloading P, is the client prerequisite.
+2. **Tip T.** In a separate reviewed change, set Tip to transition/successor identity/disabled
+   phase, pin the published P manifest, and remove its old reset authority as required by schema 1.
+   Merging the declaration can trigger automatic publication after qualifying CI. A new Samuel
+   Application-signed app and Samuel Installer-signed/notarized PKG must have a build above P.
+3. **Stable T.** Only after Tip T is public, change Stable to schema 2, `transition`, `successor`
+   signing identity, phase `disabled`, and retain `runtimeMigrationProof: "unverified-accepted-risk"`.
+   Remove `adoptedArtifact`. Set `predecessors` to P's `{role, tag, rolloutManifestSha256,
+   sourceChannel: "tip"}`. Change `version.env` bundle/team to Samuel and use a new integer build
+   greater than `43.24.43` (e.g. 44, subject to current version reservation). Use the normal
+   **Publish Release → review signed draft SHA256SUMS → Promote Release** process. The artifact
+   is a PKG, not a ZIP/DMG pair. Configure Samuel's Application, Installer, profile and notary
+   `SUCCESSOR_*` secrets in the protected `release` environment first. No fallback to Eric is used.
+4. **Tip S, then Stable S.** Each activation pins T and P in newest-first order. Stable predecessors
+   carry `sourceChannel: "stable"` for T and `sourceChannel: "tip"` for the shared P. Publish normal
+   Samuel ZIP/DMG artifacts. Native Stable builds remain integers; Tip derives its epoch from the
+   first component of Stable's maximum build and must stay newer than it. Do not skip T.
+
+Every stage retains the exact P/T provenance and assets. All feed mutations share a publication
+lane, recheck live state, and fail closed if Tip does not lead Stable or their shared bridge differs.
+Never prune the adopted Tip release. Retain recovery assets and Eric's material for the rollback
+window. Samuel's current notarization access still needs a real accepted submission; historical
+notarization success is not that proof. If P itself needs a runtime correction, stop and reassess:
+release-tooling changes cannot retrofit the archived binary.
+
+### Separate channel feeds
+
 The app uses separate Sparkle feeds:
 
 ```text
@@ -314,7 +375,7 @@ phase, predecessor manifest digests, and any schema-2 reset authority. Every rol
 feed URL and `appcast.xml` asset, with retained top-level entries in that appcast; there are no
 transition/successor sibling feeds and no Sparkle-key change. Tip workflows must never write to
 `repoprompt-ce-updates` or use `v*` tags, and must not feed into `Promote Release`. Stable promotion
-remains the only path that updates the stable appcast.
+and the explicit archived-preparer adoption workflow are the only paths that update the Stable appcast.
 
 `Publish Tip` runs automatically after successful main-push CI in the source repository. When an
 automatic run leaves the rolling queue, it considers the authenticated successful triggering
@@ -354,8 +415,9 @@ merging T; advance it again with T and P digests before merging S. Each publishe
 immutable `tip-<shortsha>` tag and the tip-only repository's latest release. Do not mark it as a
 prerelease, because GitHub excludes prereleases from `releases/latest`.
 
-Current checkpoint: Stable 1.4.0 is the official Stable epoch at build `36`. The authenticated live Tip
-is transition tag `tip-57b572038048`, build `35.15.39`, with rollout-manifest SHA-256
+Historical replacement-preparer checkpoint (superseded by the no-new-Eric runbook above):
+Stable 1.4.0 was the official Stable epoch at build `36`. The authenticated Tip at that checkpoint
+was transition tag `tip-57b572038048`, build `35.15.39`, with rollout-manifest SHA-256
 `c8d28103b5e95370fc0de7df19c34797552e99803228794754bfbfe292e3e421`; it retains preparer
 `tip-2f94412e6ab5` at build `35.15.18`, whose rollout-manifest SHA-256 is
 `3c69703fa7582105633b36e8874fe2a28e1832aabb776351e68dbf3367e122db`. That retained P is below

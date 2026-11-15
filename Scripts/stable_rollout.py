@@ -7,8 +7,8 @@ duplicated in the declaration; they are derived from `version.env` and
 `Scripts/apple_identity_policy.json` and cross-checked here.
 
 Commands:
-- ``workflow-guard``: protected workflows call this to reject transition or
-  successor roles, sibling predecessors, and the successor identity.
+- ``workflow-guard``: admit only declaration-authorized build/promote/adopt operations;
+  schema-1 Stable remains legacy/preparer and schema-2 explicitly enables the shared ladder.
 - ``current-role``: print the declared role for shell callers.
 - ``feed-url``: print the policy-owned feed URL for one channel.
 - ``packaging-context``: emit policy-derived bundle, team, application, and installer identity labels.
@@ -18,8 +18,10 @@ Commands:
   policy, version metadata, and enclosure/app-manifest digests.
 - ``validate-live-tip-progression``: prove the candidate rolls or advances the
   authenticated public Tip ladder without skipping or rewriting retained history.
-- ``validate-stable-tip-floor``: keep Stable builds below the retained preparer so
-  an unprepared Stable client cannot satisfy the transition hard gate.
+- ``validate-stable-tip-floor``: keep unprepared Stable builds below Tip's P, or
+  authenticate the exact shared bridge and ensure Tip leads Stable's role.
+- ``generate-adoption`` / ``validate-adoption``: unchanged Tip P projection for Stable.
+- ``validate-live-stable-progression``: preserve Stable P -> T -> S history.
 - ``max-build``: greatest Sparkle build in an appcast (monotonicity input).
 - ``sibling-values``: TSV projection of predecessor items for shell loops.
 
@@ -111,6 +113,9 @@ DECLARATION_KEYS = {
     "predecessors",
 }
 TIP_RESET_DECLARATION_KEYS = DECLARATION_KEYS | {"resetAuthority"}
+STABLE_CAPABILITY_KEYS = DECLARATION_KEYS | {"runtimeMigrationProof"}
+ADOPTION_TYPE = "tip-preparer-adoption-v1"
+RUNTIME_PROOF_ACCEPTED_RISK = "unverified-accepted-risk"
 RESET_AUTHORITY_KEYS = {"type", "liveTip", "stableEpoch", "retainedPreparer"}
 RESET_LIVE_TIP_KEYS = {"role", "tag", "buildNumber", "rolloutManifestSha256"}
 RESET_STABLE_EPOCH_KEYS = {"marketingVersion", "buildNumber"}
@@ -317,6 +322,10 @@ def load_declaration(path: Path) -> dict:
     schema_version = declaration.get("schemaVersion")
     if schema_version == DECLARATION_SCHEMA_VERSION:
         expected_keys = DECLARATION_KEYS
+    elif schema_version == 2 and declaration.get("channel") == "stable":
+        expected_keys = STABLE_CAPABILITY_KEYS
+        if "adoptedArtifact" in declaration:
+            expected_keys = expected_keys | {"adoptedArtifact"}
     elif schema_version == TIP_DECLARATION_SCHEMA_VERSION:
         expected_keys = TIP_RESET_DECLARATION_KEYS
     else:
@@ -326,8 +335,7 @@ def load_declaration(path: Path) -> dict:
             "rollout declaration keys must be exactly "
             + ", ".join(sorted(expected_keys))
         )
-    if schema_version == TIP_DECLARATION_SCHEMA_VERSION and declaration.get("channel") != "tip":
-        raise RolloutError("rollout declaration schema version 2 is only supported for Tip")
+    stable_capability = schema_version == 2 and declaration.get("channel") == "stable"
     if declaration["channel"] not in CHANNELS:
         raise RolloutError(f"rollout declaration channel must be one of {', '.join(CHANNELS)}")
     role = declaration["currentRole"]
@@ -347,7 +355,8 @@ def load_declaration(path: Path) -> dict:
     if not isinstance(predecessors, list):
         raise RolloutError("rollout declaration predecessors must be a list")
     for position, entry in enumerate(predecessors, start=1):
-        if not isinstance(entry, dict) or set(entry) != PREDECESSOR_KEYS:
+        expected_predecessor_keys = PREDECESSOR_KEYS | ({"sourceChannel"} if stable_capability else set())
+        if not isinstance(entry, dict) or set(entry) != expected_predecessor_keys:
             raise RolloutError(
                 f"predecessor {position} keys must be exactly " + ", ".join(sorted(PREDECESSOR_KEYS))
             )
@@ -355,9 +364,14 @@ def load_declaration(path: Path) -> dict:
             raise RolloutError(f"predecessor {position} has unknown role {entry['role']!r}")
         if not isinstance(entry["tag"], str) or not entry["tag"]:
             raise RolloutError(f"predecessor {position} tag must be a nonempty string")
-        if declaration["channel"] == "stable" and not entry["tag"].startswith("v"):
+        origin = entry.get("sourceChannel", declaration["channel"])
+        if origin not in CHANNELS:
+            raise RolloutError("predecessor sourceChannel must be stable or tip")
+        if stable_capability and origin == "tip" and (entry["role"] != "preparer" or position != len(predecessors)):
+            raise RolloutError("only the oldest preparer may originate in Tip")
+        if origin == "stable" and not entry["tag"].startswith("v"):
             raise RolloutError(f"predecessor {position} Stable tag must look like v<marketing-version>")
-        if declaration["channel"] == "tip" and not entry["tag"].startswith("tip-"):
+        if origin == "tip" and not (re.fullmatch(r"tip-[0-9a-f]{12}", entry["tag"]) if stable_capability else entry["tag"].startswith("tip-")):
             raise RolloutError(f"predecessor {position} Tip tag must start with tip-")
         digest = entry["rolloutManifestSha256"]
         if not isinstance(digest, str) or len(digest) != 64 or not all(c in "0123456789abcdef" for c in digest):
@@ -369,7 +383,25 @@ def load_declaration(path: Path) -> dict:
             + " -> ".join(chain)
             + " is not an allowed newest-first rollout chain"
         )
-    if schema_version == TIP_DECLARATION_SCHEMA_VERSION:
+    if stable_capability:
+        if declaration["runtimeMigrationProof"] != RUNTIME_PROOF_ACCEPTED_RISK:
+            raise RolloutError("Stable activation must explicitly acknowledge unverified-accepted-risk runtime migration")
+        adoption = declaration.get("adoptedArtifact")
+        if adoption is not None:
+            if role != "preparer" or predecessors:
+                raise RolloutError("archived adoption requires a single preparer with no predecessors")
+            if not isinstance(adoption, dict) or set(adoption) != {"type", "tag", "buildNumber", "rolloutManifestSha256"}:
+                raise RolloutError("malformed archived preparer adoption authority")
+            if adoption["type"] != ADOPTION_TYPE or not re.fullmatch(r"tip-[0-9a-f]{12}", str(adoption["tag"])):
+                raise RolloutError("adoption requires a pinned Tip preparer tag")
+            if not isinstance(adoption["buildNumber"], str):
+                raise RolloutError("adopted preparer buildNumber must be a string")
+            parse_build(adoption["buildNumber"], "adopted preparer build")
+            if not re.fullmatch(r"[0-9a-f]{64}", str(adoption["rolloutManifestSha256"])):
+                raise RolloutError("adoption requires a SHA-256 manifest pin")
+        elif role not in {"transition", "successor"} or predecessors[-1].get("sourceChannel") != "tip":
+            raise RolloutError("Stable schema 2 requires adoption or T/S retaining the shared Tip preparer")
+    elif schema_version == TIP_DECLARATION_SCHEMA_VERSION:
         validate_reset_authority_shape(declaration)
     return declaration
 
@@ -428,6 +460,18 @@ def enclosure_url(update_repository: str, tag: str, name: str) -> str:
     return f"https://github.com/{update_repository}/releases/download/{tag}/{name}"
 
 
+def item_origin(item: dict, policy: dict, channel: str) -> str:
+    if channel == "stable" and str(item.get("tag", "")).startswith("tip-"):
+        if item.get("role") != "preparer":
+            raise RolloutError("only a preparer may be adopted from Tip")
+        if item.get("rolloutManifestName") != "identity-rollout.json" or not re.fullmatch(
+            r"[0-9a-f]{64}", str(item.get("rolloutManifestSha256", ""))
+        ):
+            raise RolloutError("adopted preparer must retain its exact Tip manifest binding")
+        return "tip"
+    return channel
+
+
 def validate_item_shape(
     item: dict,
     position: int,
@@ -435,6 +479,7 @@ def validate_item_shape(
     app_name: str,
     channel: str,
 ) -> None:
+    channel = item_origin(item, policy, channel)
     minimum_system = policy["sparkle"]["minimumSystemVersion"]
     role = item.get("role")
     if role not in ROLES:
@@ -618,7 +663,9 @@ def render_appcast(manifest: dict) -> str:
 
 def load_manifest(path: Path) -> dict:
     manifest = load_json(path, "rollout manifest")
-    if manifest.get("schemaVersion") != MANIFEST_SCHEMA_VERSION:
+    if manifest.get("schemaVersion") != MANIFEST_SCHEMA_VERSION and not (
+        manifest.get("schemaVersion") == 2 and manifest.get("channel") == "stable" and "adoptedArtifact" in manifest
+    ):
         raise RolloutError("rollout manifest schema version mismatch")
     if not isinstance(manifest.get("appcastItems"), list) or not manifest["appcastItems"]:
         raise RolloutError("rollout manifest must contain appcast items")
@@ -643,7 +690,8 @@ def load_predecessor_manifests(
                 f"expected {entry['rolloutManifestSha256']}, got {digest}"
             )
         manifest = normalize_manifest_floor_authority(load_manifest(path))
-        if manifest.get("channel") != declaration["channel"]:
+        origin = entry.get("sourceChannel", declaration["channel"])
+        if manifest.get("channel") != origin:
             raise RolloutError(
                 f"predecessor {position} channel mismatch: declaration says {declaration['channel']}, "
                 f"manifest says {manifest.get('channel')}"
@@ -659,7 +707,7 @@ def load_predecessor_manifests(
                 f"manifest says {manifest.get('sourceTag')}"
             )
         current_item = manifest["appcastItems"][0]
-        validate_item_shape(current_item, position, policy, app_name, declaration["channel"])
+        validate_item_shape(current_item, position, policy, app_name, origin)
         loaded.append(manifest)
     return loaded
 
@@ -739,7 +787,7 @@ def build_manifest(args: argparse.Namespace) -> tuple[dict, str]:
             app_name,
             str(predecessor_item["marketingVersion"]),
             str(predecessor_item["buildNumber"]),
-            channel,
+            entry.get("sourceChannel", channel),
         )
         items.append(predecessor_item)
 
@@ -812,21 +860,23 @@ def run_validate(args: argparse.Namespace) -> None:
     )
 
 
-def validate_tip_manifest_pair(
+def validate_manifest_pair(
     policy: dict,
     manifest_path: Path,
     appcast_path: Path,
     label: str,
+    channel: str = "tip",
 ) -> dict:
     manifest = normalize_manifest_floor_authority(load_manifest(manifest_path))
-    if set(manifest) != MANIFEST_KEYS:
+    adoption = channel == "stable" and manifest.get("schemaVersion") == 2
+    if set(manifest) != MANIFEST_KEYS | ({"adoptedArtifact"} if adoption else set()):
         raise RolloutError(
             f"{label} rollout manifest keys must be exactly "
             + ", ".join(sorted(MANIFEST_KEYS))
         )
-    if manifest.get("channel") != "tip":
-        raise RolloutError(f"{label} rollout manifest must describe the Tip channel")
-    if manifest.get("updateRepository") != update_repository(policy, "tip"):
+    if manifest.get("channel") != channel:
+        raise RolloutError(f"{label} rollout manifest must describe the {channel} channel")
+    if manifest.get("updateRepository") != update_repository(policy, channel):
         raise RolloutError(f"{label} Tip update repository differs from policy")
 
     role = manifest.get("currentRole")
@@ -862,24 +912,38 @@ def validate_tip_manifest_pair(
                 f"{label} appcast item {position} keys must be exactly "
                 + ", ".join(sorted(APPCAST_ITEM_KEYS))
             )
-        validate_item_shape(item, position, policy, "RepoPrompt", "tip")
-        if position == 1:
+        origin = item_origin(item, policy, channel)
+        validate_item_shape(item, position, policy, "RepoPrompt", channel)
+        if position == 1 and not adoption:
             if item["rolloutManifestName"] is not None or item["rolloutManifestSha256"] is not None:
                 raise RolloutError(f"{label} newest appcast item must not refer to itself")
         else:
-            if item["rolloutManifestName"] != "identity-rollout.json":
+            if item["rolloutManifestName"] != rollout_manifest_name("RepoPrompt", str(item["marketingVersion"]), str(item["buildNumber"]), origin):
                 raise RolloutError(f"{label} retained item {position} has the wrong manifest name")
             if not re.fullmatch(r"[0-9a-f]{64}", str(item["rolloutManifestSha256"])):
                 raise RolloutError(f"{label} retained item {position} has a malformed manifest digest")
     validate_item_ladder(items)
 
     newest = items[0]
+    if adoption:
+        authority = manifest["adoptedArtifact"]
+        if not isinstance(authority, dict) or set(authority) != {"type", "channel", "updateRepository", "tag", "buildNumber", "rolloutManifestSha256"}:
+            raise RolloutError("malformed adopted artifact provenance")
+        if (role != "preparer" or len(items) != 1 or authority["type"] != ADOPTION_TYPE
+            or authority["channel"] != "tip" or authority["updateRepository"] != update_repository(policy, "tip")
+            or authority["tag"] != newest["tag"] or authority["buildNumber"] != newest["buildNumber"]
+            or authority["rolloutManifestSha256"] != newest["rolloutManifestSha256"]):
+            raise RolloutError("adoption provenance differs from retained Tip preparer")
     for manifest_key, item_key in (
         ("sourceTag", "tag"),
         ("currentRole", "role"),
         ("marketingVersion", "marketingVersion"),
         ("buildNumber", "buildNumber"),
     ):
+        if adoption and manifest_key == "sourceTag":
+            if manifest.get("sourceTag") != f"stable-adopt-{newest.get('tag')}":
+                raise RolloutError("adoption publication tag must preserve Tip provenance")
+            continue
         if manifest.get(manifest_key) != newest.get(item_key):
             raise RolloutError(
                 f"{label} rollout manifest {manifest_key} differs from its newest appcast item"
@@ -892,6 +956,18 @@ def validate_tip_manifest_pair(
     if render_appcast(manifest) != appcast:
         raise RolloutError(f"{label} Tip appcast does not match its rollout manifest")
     return manifest
+
+
+def validate_tip_manifest_pair(policy: dict, manifest_path: Path, appcast_path: Path, label: str) -> dict:
+    return validate_manifest_pair(policy, manifest_path, appcast_path, label, "tip")
+
+
+def bind_live_item(live: dict, digest: str) -> dict:
+    item = dict(live["appcastItems"][0])
+    if "adoptedArtifact" not in live:
+        item["rolloutManifestName"] = rollout_manifest_name("RepoPrompt", str(item["marketingVersion"]), str(item["buildNumber"]), live["channel"])
+        item["rolloutManifestSha256"] = digest
+    return item
 
 
 def expected_retained_history(live: dict, live_digest: str, candidate_role: str) -> list[dict]:
@@ -907,16 +983,12 @@ def expected_retained_history(live: dict, live_digest: str, candidate_role: str)
             )
         return live_items[1:]
     if live_role == "preparer" and candidate_role == "transition":
-        newest = dict(live_items[0])
-        newest["rolloutManifestName"] = "identity-rollout.json"
-        newest["rolloutManifestSha256"] = live_digest
+        newest = bind_live_item(live, live_digest)
         return [newest]
     if live_role == "transition" and candidate_role == "successor":
         if [item["role"] for item in live_items[1:]] != ["preparer"]:
             raise RolloutError("live transition must retain exactly the preparer predecessor")
-        newest = dict(live_items[0])
-        newest["rolloutManifestName"] = "identity-rollout.json"
-        newest["rolloutManifestSha256"] = live_digest
+        newest = bind_live_item(live, live_digest)
         return [newest, *live_items[1:]]
     raise RolloutError(
         "candidate Tip rollout role would regress or skip the live rollout state: "
@@ -1089,6 +1161,88 @@ def run_validate_live_tip_progression(args: argparse.Namespace) -> None:
     )
 
 
+def build_adoption(args: argparse.Namespace) -> dict:
+    policy = load_policy(Path(args.policy))
+    declaration = load_declaration(Path(args.declaration))
+    authority = declaration.get("adoptedArtifact")
+    if declaration["channel"] != "stable" or authority is None:
+        raise RolloutError("no archived preparer adoption is activated")
+    digest = sha256_file(Path(args.tip_manifest))
+    if digest != authority["rolloutManifestSha256"]:
+        raise RolloutError("adopted Tip manifest digest mismatch")
+    tip = validate_tip_manifest_pair(policy, Path(args.tip_manifest), Path(args.tip_appcast), "adopted")
+    if tip["currentRole"] != "preparer" or len(tip["appcastItems"]) != 1:
+        raise RolloutError("adoption requires the single-item Eric preparer")
+    if tip["sourceTag"] != authority["tag"] or tip["buildNumber"] != authority["buildNumber"]:
+        raise RolloutError("adopted Tip tag/build differs from authorization")
+    manifest = dict(tip)
+    manifest.update(schemaVersion=2, channel="stable", sourceTag=f"stable-adopt-{tip['sourceTag']}",
+                    eligibilityProfile=declaration["eligibilityProfile"], updateRepository=update_repository(policy, "stable"))
+    manifest["adoptedArtifact"] = {**authority, "channel": "tip", "updateRepository": update_repository(policy, "tip")}
+    manifest["appcastItems"] = [bind_live_item(tip, digest)]
+    return manifest
+
+
+def run_adoption(args: argparse.Namespace) -> None:
+    manifest = build_adoption(args)
+    rendered = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    appcast = render_appcast(manifest)
+    if args.command == "generate-adoption":
+        Path(args.manifest_output).write_text(rendered, encoding="utf-8")
+        Path(args.appcast_output).write_text(appcast, encoding="utf-8")
+    elif Path(args.manifest).read_text() != rendered or Path(args.appcast).read_text() != appcast:
+        raise RolloutError("adoption artifacts differ from pinned Tip projection")
+    print("OK: unchanged Tip preparer adopted; runtime credential migration remains UNVERIFIED.")
+
+
+def run_adoption_values(args: argparse.Namespace) -> None:
+    declaration = load_declaration(Path(args.declaration))
+    authority = declaration.get("adoptedArtifact")
+    if authority is None:
+        raise RolloutError("no archived preparer adoption is activated")
+    print("\t".join((authority["tag"], authority["buildNumber"], authority["rolloutManifestSha256"], f"stable-adopt-{authority['tag']}")))
+
+
+def run_validate_live_stable_progression(args: argparse.Namespace) -> None:
+    policy = load_policy(Path(args.policy))
+    candidate_path = Path(args.candidate_manifest)
+    candidate = validate_manifest_pair(policy, candidate_path, Path(args.candidate_appcast), "candidate", "stable")
+    if "adoptedArtifact" not in candidate and not re.fullmatch(r"[0-9]+", str(candidate["buildNumber"])):
+        raise RolloutError("native Stable builds must be integers")
+    if bool(args.live_manifest) != bool(args.live_appcast):
+        raise RolloutError("live manifest and appcast must be supplied together")
+    if not args.live_manifest:
+        if candidate["currentRole"] not in {"legacy", "preparer"}:
+            raise RolloutError("Stable must establish a legacy/preparer baseline first")
+        return
+    live_path = Path(args.live_manifest)
+    live = validate_manifest_pair(policy, live_path, Path(args.live_appcast), "live", "stable")
+    if candidate["sourceTag"] == live["sourceTag"]:
+        if candidate_path.read_bytes() != live_path.read_bytes() or Path(args.candidate_appcast).read_bytes() != Path(args.live_appcast).read_bytes():
+            raise RolloutError("published Stable tag has different bytes")
+        return
+    if parse_build(candidate["buildNumber"], "candidate") <= parse_build(live["buildNumber"], "live"):
+        raise RolloutError("candidate Stable build must be strictly newer than live Stable")
+    if live["currentRole"] == "legacy" and candidate["currentRole"] in {"legacy", "preparer"}:
+        expected = []
+    else:
+        expected = expected_retained_history(live, sha256_file(live_path), candidate["currentRole"])
+    if candidate["appcastItems"][1:] != expected:
+        raise RolloutError("Stable retained history differs from authenticated live ladder")
+    print("OK: Stable progression preserves the exact preparer/transition history.")
+
+
+def run_tip_build_number(args: argparse.Namespace) -> None:
+    stable = max_build_from_appcast(Path(args.stable_appcast))
+    epoch = stable.split(".")[0]
+    if not re.fullmatch(r"[0-9]{1,4}", epoch) or not 1 <= args.sequence <= 9999:
+        raise RolloutError("Tip epoch/sequence exceeds supported build range")
+    build = f"{int(epoch)}.{args.sequence // 100}.{args.sequence % 100}"
+    if parse_build(build, "Tip") <= parse_build(stable, "Stable"):
+        raise RolloutError("Tip build must be newer than Stable")
+    print(build)
+
+
 def run_feed_url(args: argparse.Namespace) -> None:
     policy = load_policy(Path(args.policy))
     key = "tipFeedURL" if args.channel == "tip" else "stableFeedURL"
@@ -1101,6 +1255,14 @@ def run_workflow_guard(args: argparse.Namespace) -> None:
     if declaration["channel"] != "stable":
         raise RolloutError("protected Stable workflows require a Stable rollout declaration")
     role = declaration["currentRole"]
+    if declaration.get("schemaVersion") == 2:
+        adoption = "adoptedArtifact" in declaration
+        if adoption != (args.operation == "adopt"):
+            raise RolloutError("archived adoption requires the no-build adopt operation; T/S require build or promote")
+        print(f"OK: explicit Stable capability admitted for {args.operation}: {role}; runtime proof UNVERIFIED.")
+        return
+    if args.operation == "adopt":
+        raise RolloutError("archived adoption is not activated by this declaration")
     if role not in WORKFLOW_ALLOWED_ROLES:
         raise RolloutError(
             f"protected workflows reject the {role} rollout role until successor rollout enablement"
@@ -1245,7 +1407,10 @@ def run_signing_mode(args: argparse.Namespace) -> None:
 def run_predecessor_values(args: argparse.Namespace) -> None:
     declaration = load_declaration(Path(args.declaration))
     for entry in declaration["predecessors"]:
-        print("\t".join((entry["role"], entry["tag"], entry["rolloutManifestSha256"])))
+        values = (entry["role"], entry["tag"], entry["rolloutManifestSha256"])
+        if declaration.get("schemaVersion") == 2 and declaration["channel"] == "stable":
+            values += (entry["sourceChannel"],)
+        print("\t".join(values))
 
 
 def stable_epoch_from_appcast(path: Path) -> dict[str, str]:
@@ -1300,6 +1465,18 @@ def run_validate_stable_tip_floor(args: argparse.Namespace) -> None:
         "Tip floor",
     )
     role = manifest["currentRole"]
+    stable_manifest = None
+    if args.stable_manifest:
+        stable_manifest = validate_manifest_pair(policy, Path(args.stable_manifest), Path(args.stable_appcast), "Stable handoff", "stable")
+        ranks = {"legacy": 0, "preparer": 1, "transition": 2, "successor": 3}
+        if ranks[stable_manifest["currentRole"]] > ranks[role]:
+            raise RolloutError("Tip must rehearse the role before Stable advances")
+        if stable_manifest["currentRole"] in {"transition", "successor"} or "adoptedArtifact" in stable_manifest:
+            stable_bridge = [item for item in stable_manifest["appcastItems"] if item["role"] == "preparer"]
+            tip_bridge = ([bind_live_item(manifest, sha256_file(Path(args.tip_manifest)))] if role == "preparer"
+                          else [item for item in manifest["appcastItems"] if item["role"] == "preparer"])
+            if stable_bridge != tip_bridge or len(stable_bridge) != 1:
+                raise RolloutError("Stable and Tip must retain exactly the same authenticated preparer")
     if role in {"legacy", "preparer"}:
         print(f"OK: the {role} Tip role does not require a retained preparer floor.")
         return
@@ -1312,12 +1489,16 @@ def run_validate_stable_tip_floor(args: argparse.Namespace) -> None:
     if not parse_build(stable_build, "Stable maximum build") < parse_build(
         preparer_build, "retained Tip preparer build"
     ):
-        raise RolloutError(
-            "Stable maximum build must remain below the retained Tip preparer build: "
-            f"Stable={stable_build} preparer={preparer_build}"
-        )
+        if stable_manifest is None or stable_manifest["currentRole"] == "legacy":
+            raise RolloutError(
+                "Stable maximum build must remain below the retained Tip preparer build unless an authenticated shared ladder is supplied: "
+                f"Stable={stable_build} preparer={preparer_build}"
+            )
+        stable_preparers = [item for item in stable_manifest["appcastItems"] if item["role"] == "preparer"]
+        if len(stable_preparers) != 1 or stable_preparers[0] != preparers[0]:
+            raise RolloutError("Stable and Tip must retain exactly the same authenticated preparer")
     print(
-        "OK: Stable maximum build remains below the retained Tip preparer: "
+        "OK: Stable/Tip preparer floor or authenticated shared bridge is preserved: "
         f"Stable={stable_build} preparer={preparer_build}."
     )
 
@@ -1365,6 +1546,7 @@ def build_parser() -> argparse.ArgumentParser:
     guard = subparsers.add_parser("workflow-guard")
     guard.add_argument("--declaration", required=True)
     guard.add_argument("--policy", required=True)
+    guard.add_argument("--operation", choices=("build", "promote", "adopt"), default="build")
     guard.set_defaults(func=run_workflow_guard)
 
     current_role = subparsers.add_parser("current-role")
@@ -1425,7 +1607,39 @@ def build_parser() -> argparse.ArgumentParser:
     stable_floor.add_argument("--stable-appcast", required=True)
     stable_floor.add_argument("--tip-manifest", required=True)
     stable_floor.add_argument("--tip-appcast", required=True)
+    stable_floor.add_argument("--stable-manifest")
     stable_floor.set_defaults(func=run_validate_stable_tip_floor)
+
+    for command in ("generate-adoption", "validate-adoption"):
+        adoption = subparsers.add_parser(command)
+        adoption.add_argument("--policy", required=True)
+        adoption.add_argument("--declaration", required=True)
+        adoption.add_argument("--tip-manifest", required=True)
+        adoption.add_argument("--tip-appcast", required=True)
+        if command == "generate-adoption":
+            adoption.add_argument("--manifest-output", required=True)
+            adoption.add_argument("--appcast-output", required=True)
+        else:
+            adoption.add_argument("--manifest", required=True)
+            adoption.add_argument("--appcast", required=True)
+        adoption.set_defaults(func=run_adoption)
+
+    adoption_values = subparsers.add_parser("adoption-values")
+    adoption_values.add_argument("--declaration", required=True)
+    adoption_values.set_defaults(func=run_adoption_values)
+
+    stable_progression = subparsers.add_parser("validate-live-stable-progression")
+    stable_progression.add_argument("--policy", required=True)
+    stable_progression.add_argument("--candidate-manifest", required=True)
+    stable_progression.add_argument("--candidate-appcast", required=True)
+    stable_progression.add_argument("--live-manifest")
+    stable_progression.add_argument("--live-appcast")
+    stable_progression.set_defaults(func=run_validate_live_stable_progression)
+
+    tip_number = subparsers.add_parser("tip-build-number")
+    tip_number.add_argument("--stable-appcast", required=True)
+    tip_number.add_argument("--sequence", type=int, required=True)
+    tip_number.set_defaults(func=run_tip_build_number)
 
     max_build = subparsers.add_parser("max-build")
     max_build.add_argument("--appcast", required=True)

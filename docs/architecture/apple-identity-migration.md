@@ -167,10 +167,47 @@ exact manifest digest before merging T.
 
 The workflow capability for T is explicit and deterministic: after a reviewed transition declaration
 reaches protected `main` and CI passes, GitHub selects and publishes that exact commit automatically.
-The declaration change must not merge until the runtime proof below is complete, including a reviewed
+The normal release gate is completion of the runtime proof below, including a reviewed
 recovery story for a lost committed P journal and a policy that distinguishes a fresh successor
 installation from a client that skipped the preparer/transition bridge. S also requires a later
 declaration change containing both T's and P's exact manifest digests.
+
+## Dormant Stable capability and archived-P handoff
+
+Capability code alone does not activate either channel. The checked-in Stable legacy and Tip preparer
+declarations remain the activation authority. Stable schema 2 explicitly acknowledges
+`runtimeMigrationProof: "unverified-accepted-risk"`; it is an accepted-risk release lane, **not** a
+successful runtime-proof result. The normal proof requirements below remain outstanding. A maintainer
+must review that risk again in the activation PR, including recovery and fresh-install policy.
+
+The no-new-Eric path adopts the *unchanged* Tip preparer through Stable. It does not rebuild, resign,
+renotarize, relabel the binary, or overwrite Stable v1.9.0. Stable publishes a metadata-only
+`stable-adopt-tip-<sha>` release; its enclosure still points to the immutable Tip release. The Stable
+manifest carries the Tip manifest SHA-256, tag, build, original source commit, artifact-manifest binding,
+and signature. An adopted preparer cannot become a general-purpose cross-channel artifact import.
+Only the oldest P may originate in Tip; Stable T/S must be native Stable releases.
+
+`Scripts/stable_rollout.py` owns declaration admission, deterministic adoption generation/validation,
+Stable progression, and the cross-channel guard. The guard admits Stable at/above Tip's P only with an
+authenticated Stable manifest/appcast pair retaining **exactly the same P**. Tip must lead Stable's
+role (P before T before S); higher unprepared legacy Stable builds still fail closed. Both publishers
+reobserve the other feed before publication, and all three publication jobs share
+`rollout-publication` concurrency. Live observations require authenticated GitHub release metadata and
+size/SHA-256 agreement for each downloaded asset (historical assets without an API digest are fetched
+through their authenticated API asset identity and size-checked); anonymous mutable feed XML is not
+handoff authority.
+
+Stable adoption's workflow has no signing, notarization, or Sparkle-private-key secrets. It verifies
+P's original signature, stapled ticket, embedded Samuel anchor, binary metadata, and artifact-manifest
+binding, then runs helper/packaged smokes without inherited secrets and older-macOS compatibility.
+The publication job independently reverifies the pinned bytes and current ladder under the protected
+`release` environment. A draft with different bytes is not overwritten. These checks do **not** run
+the credential migration or prove its runtime success.
+
+Retention is now cross-channel: once Stable adopts P, **never prune or edit that Tip release or its
+assets**, even after Tip advances. Both channels' T/S retain the same Tip-origin P and its exact
+manifest digest. Keep P/T recovery assets and Eric's material for the supported rollback window.
+See [the activation runbook](../releasing.md#no-new-eric-activation-runbook).
 
 ## Required proof gate
 
