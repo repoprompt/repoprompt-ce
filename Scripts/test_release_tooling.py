@@ -89,7 +89,7 @@ class PromotionCurlConfigTests(unittest.TestCase):
                                PUBLIC_UPDATE_GH_TOKEN="fixture\ninvalid",
                                CONFIG_RECEIPT=str(receipt))
             result = subprocess.run(
-                ["bash", "-c", 'source "$1"; TMP_DIR="$(mktemp -d)"; verify_strictly_newer_build',
+                ["bash", "-c", 'source "$1"; TMP_DIR="$(mktemp -d)"; verify_tip_handoff(){ touch "$CONFIG_RECEIPT.handoff"; }; verify_strictly_newer_build',
                  "test", str(SCRIPT_DIR / "promote_release.sh")],
                 env=environment, text=True, capture_output=True, timeout=10,
             )
@@ -125,7 +125,7 @@ print("404", end="")
                                    CONFIG_RECEIPT=str(root / "receipt"),
                                    FAIL_TRANSPORT="1" if fail_transport else "0")
                 result = subprocess.run(
-                    ["bash", "-c", 'source "$1"; TMP_DIR="$(mktemp -d)"; verify_strictly_newer_build',
+                    ["bash", "-c", 'source "$1"; TMP_DIR="$(mktemp -d)"; verify_tip_handoff(){ touch "$CONFIG_RECEIPT.handoff"; }; verify_strictly_newer_build',
                      "test", str(SCRIPT_DIR / "promote_release.sh")],
                     env=environment, text=True, capture_output=True, timeout=10,
                 )
@@ -133,6 +133,7 @@ print("404", end="")
                 config = Path((root / "receipt").read_text())
                 self.assertFalse(config.exists())
                 self.assertFalse(config.parent.exists())
+                self.assertEqual((root / 'receipt.handoff').exists(), not fail_transport)
                 self.assertNotIn(environment["PUBLIC_UPDATE_GH_TOKEN"], result.stdout + result.stderr)
 
 

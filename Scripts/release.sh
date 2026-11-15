@@ -51,10 +51,8 @@ fail() {
     exit 1
 }
 
-# release.sh builds legacy/preparer application artifacts only. The reviewed
-# release-rollout.json declaration is the single role authority: transition or
-# successor declarations, sibling predecessors, and the successor identity all
-# fail here before signing or GitHub mutation.
+# The reviewed declaration remains the activation authority. Archived adoption
+# is a separate no-build operation and is never admitted here.
 require_dormant_rollout_declaration() {
     require_file "$ROLLOUT_DECLARATION"
     require_file "$APPLE_IDENTITY_POLICY"
@@ -713,6 +711,18 @@ stage_publish_release() {
     stage_archive
 }
 
+build_notarized_stable_transition_package() {
+    local output="$1"
+    REPOPROMPT_ENABLE_IDENTITY_TRANSITION_PKG=1 \
+        "$CONTROL_PLANE_SCRIPTS_DIR/build_identity_transition_pkg.sh" build \
+        --app "$APP_BUNDLE" --output "$output" --installer-identity "$EXPECTED_INSTALLER_IDENTITY"
+    submit_notarization "$output"
+    REPOPROMPT_ENABLE_IDENTITY_TRANSITION_PKG=1 \
+        "$CONTROL_PLANE_SCRIPTS_DIR/build_identity_transition_pkg.sh" staple "$output"
+    REPOPROMPT_ENABLE_IDENTITY_TRANSITION_PKG=1 \
+        "$CONTROL_PLANE_SCRIPTS_DIR/build_identity_transition_pkg.sh" validate "$output" --expected-app "$APP_BUNDLE"
+}
+
 publish_staged_release() {
     require_command ditto
     require_command gh
@@ -721,6 +731,16 @@ publish_staged_release() {
     verify_publish_inputs
     require_env REPOPROMPT_APPROVED_SOURCE_ROOT
     TMP_DIR="$(mktemp -d)"
+    # Resolve reviewed predecessors before signing/notarization or Sentry mutation.
+    source "$CONTROL_PLANE_SCRIPTS_DIR/release_observation.sh"
+    local predecessor_args=(--declaration "$ROLLOUT_DECLARATION") predecessor_role predecessor_tag predecessor_digest predecessor_channel repository
+    while IFS=$'\t' read -r predecessor_role predecessor_tag predecessor_digest predecessor_channel; do
+        [[ -n "$predecessor_tag" ]] || continue
+        repository="$(python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); print(p["sparkle"]["tipUpdateRepository" if sys.argv[2] == "tip" else "updateRepository"])' "$APPLE_IDENTITY_POLICY" "${predecessor_channel:-stable}")"
+        OBSERVATION_GH_TOKEN="$GH_TOKEN" fetch_observed_rollout_pair "$repository" "$predecessor_tag" "${predecessor_channel:-stable}" "$TMP_DIR/predecessor-$predecessor_role"
+        [[ "$(shasum -a 256 "$TMP_DIR/predecessor-$predecessor_role/manifest.json" | awk '{print $1}')" == "$predecessor_digest" ]] || fail "Predecessor manifest digest mismatch"
+        predecessor_args+=(--predecessor-manifest "$TMP_DIR/predecessor-$predecessor_role/manifest.json")
+    done < <(python3 "$STABLE_ROLLOUT_TOOL" predecessor-values --declaration "$ROLLOUT_DECLARATION")
     preflight_sentry_release_access
 
     [[ -d "$APP_BUNDLE" ]] || fail "Missing secret-free staged app bundle: $APP_BUNDLE"
@@ -748,41 +768,48 @@ publish_staged_release() {
     prepare_sentry_release
     upload_required_sentry_symbols
 
+    local role primary_artifact
+    role="$(python3 "$STABLE_ROLLOUT_TOOL" current-role --declaration "$ROLLOUT_DECLARATION")"
+    primary_artifact="$UPDATE_ZIP"
     local distribution_dir="$TMP_DIR/distribution"
     mkdir -p "$distribution_dir"
     ditto "$APP_BUNDLE" "$distribution_dir/$DISTRIBUTION_APP_BUNDLE_NAME"
-    ditto -c -k --norsrc --keepParent "$distribution_dir/$DISTRIBUTION_APP_BUNDLE_NAME" "$UPDATE_ZIP"
-    validate_distribution_zip "$UPDATE_ZIP" "$FINAL_ARTIFACT_MANIFEST" "Final distribution" "$SIGNING_TEAM_ID"
+    if [[ "$role" == transition ]]; then
+        primary_artifact="$DIST_DIR/$ARCHIVE_BASENAME.pkg"
+        build_notarized_stable_transition_package "$primary_artifact"
+    else
+        ditto -c -k --norsrc --keepParent "$distribution_dir/$DISTRIBUTION_APP_BUNDLE_NAME" "$UPDATE_ZIP"
+        validate_distribution_zip "$UPDATE_ZIP" "$FINAL_ARTIFACT_MANIFEST" "Final distribution" "$SIGNING_TEAM_ID"
 
-    hdiutil create -volname "$DISPLAY_NAME" -srcfolder "$distribution_dir" -ov -format UDZO "$DMG"
-    submit_notarization "$DMG"
-    xcrun stapler staple "$DMG"
-    xcrun stapler validate "$DMG"
+        hdiutil create -volname "$DISPLAY_NAME" -srcfolder "$distribution_dir" -ov -format UDZO "$DMG"
+        submit_notarization "$DMG"
+        xcrun stapler staple "$DMG"
+        xcrun stapler validate "$DMG"
+    fi
 
     local enclosure_signature
     enclosure_signature="$(printf '%s' "$SPARKLE_PRIVATE_KEY" |
-        "$SIGN_UPDATE" --ed-key-file - -p "$UPDATE_ZIP" |
+        "$SIGN_UPDATE" --ed-key-file - -p "$primary_artifact" |
         tr -d '\r\n')"
     [[ -n "$enclosure_signature" ]] || fail "Unable to produce the Sparkle EdDSA signature for the update archive"
     python3 "$STABLE_ROLLOUT_TOOL" generate \
-        --declaration "$ROLLOUT_DECLARATION" \
         --policy "$APPLE_IDENTITY_POLICY" \
         --version-env "$ROOT_DIR/version.env" \
         --release-tag "$RELEASE_TAG" \
         --release-commit "$RELEASE_COMMIT" \
         --migration-phase "${REPOPROMPT_IDENTITY_MIGRATION_PHASE:-disabled}" \
-        --allowed-roles legacy,preparer \
-        --enclosure "$UPDATE_ZIP" \
+        "${predecessor_args[@]}" \
+        --enclosure "$primary_artifact" \
         --enclosure-signature "$enclosure_signature" \
         --app-artifact-manifest "$FINAL_ARTIFACT_MANIFEST" \
         --appcast-output "$APPCAST" \
         --manifest-output "$ROLLOUT_MANIFEST"
 
+    local checksum_extras=("$(basename "$primary_artifact")")
+    [[ "$role" == transition ]] || checksum_extras+=("$(basename "$DMG")")
     (
         cd "$DIST_DIR"
-        shasum -a 256 \
-            "$(basename "$UPDATE_ZIP")" \
-            "$(basename "$DMG")" \
+        shasum -a 256 "${checksum_extras[@]}" \
             "$(basename "$APPCAST")" \
             "$(basename "$FINAL_ARTIFACT_MANIFEST")" \
             "$(basename "$ROLLOUT_MANIFEST")" \
@@ -792,8 +819,7 @@ publish_staged_release() {
     "$CONTROL_PLANE_SCRIPTS_DIR/verify_remote_release_commit.sh" "$RELEASE_TAG" "$RELEASE_COMMIT"
     local release_args=(
         "$RELEASE_TAG"
-        "$UPDATE_ZIP"
-        "$DMG"
+        "$primary_artifact"
         "$APPCAST"
         "$CHECKSUMS"
         "$FINAL_ARTIFACT_MANIFEST"
@@ -806,6 +832,7 @@ publish_staged_release() {
         --draft
         --target "$RELEASE_COMMIT"
     )
+    [[ "$role" == transition ]] || release_args+=("$DMG")
     local existing_release_state=""
     if existing_release_state="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)"; then
         fail "GitHub release $RELEASE_TAG already exists (isDraft=$existing_release_state). Refusing to repeat publish-staged; inspect the existing release, then run release.sh finalize-sentry to idempotently recover Sentry finalization."
