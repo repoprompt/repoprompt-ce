@@ -917,6 +917,8 @@ class SystemPromptService {
         *User Interaction:*
         - `ask_user` - Ask the user a question when you need clarification\(setStatusInList)\(codexToolPriorityGuidance)\(progressUpdatesGuidance)
 
+        \(AgentModePrompts.Fragments.worktreePlacementPolicy())
+
         **Workflow Guidance**\(sessionStartGuidance)
 
         1. **For questions about the code**: \(codeQuestionWorkflow)
