@@ -5,6 +5,7 @@ import copy
 import hashlib
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -159,10 +160,11 @@ class CapabilityTests(unittest.TestCase):
         self.write(t,bad)
         with self.assertRaisesRegex(rollout.RolloutError,'different bytes'): self.progression(t,duplicate/'manifest.json')
 
-    def test_operation_matrix_and_declarations_remain_dormant(self):
+    def test_operation_matrix_keeps_legacy_and_adoption_paths_separate(self):
+        legacy = self.native('stable','legacy','43','v1.9.0')
         args = self.adoption_args()
         transition = self.native('stable','transition','44','v1.9.2',(self.p,))
-        for declaration, allowed in [(ROOT/'release-rollout.json',{'build','promote'}),
+        for declaration, allowed in [(legacy.parent/'declaration.json',{'build','promote'}),
                                      (Path(args.declaration),{'adopt'}),
                                      (transition.parent/'declaration.json',{'build','promote'})]:
             for operation in ('build','promote','adopt'):
@@ -170,8 +172,7 @@ class CapabilityTests(unittest.TestCase):
                 if operation in allowed: rollout.run_workflow_guard(a)
                 else:
                     with self.assertRaises(rollout.RolloutError): rollout.run_workflow_guard(a)
-        self.assertEqual(rollout.load_declaration(ROOT/'release-rollout.json')['currentRole'],'legacy')
-        self.assertEqual(rollout.load_declaration(ROOT/'tip-rollout.json')['currentRole'],'preparer')
+        self.assertEqual(rollout.load_declaration(legacy.parent/'declaration.json')['currentRole'],'legacy')
 
     def test_build_number_above_dotted_stable_and_bad_ranges(self):
         stable = self.adoption()
@@ -199,9 +200,16 @@ class WorkflowBoundaryTests(unittest.TestCase):
             self.assertIn('group: rollout-publication',(ROOT/'.github/workflows'/name).read_text())
 
     def test_adoption_rejected_before_download_when_not_activated(self):
-        result=subprocess.run(['bash',str(ROOT/'Scripts/adopt_tip_preparer.sh'),'verify'],capture_output=True,text=True)
-        self.assertNotEqual(result.returncode,0)
-        self.assertIn('not activated',result.stderr)
+        # Use an inactive fixture, not today's checked-in declaration: a later
+        # reviewed activation must not require weakening a permanent test.
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); scripts=root/'Scripts'; scripts.mkdir()
+            for name in ('adopt_tip_preparer.sh','stable_rollout.py','release_observation.sh','apple_identity_policy.json'):
+                shutil.copy2(ROOT/'Scripts'/name,scripts/name)
+            (root/'release-rollout.json').write_text(json.dumps(CapabilityTests().declaration('stable','legacy')))
+            result=subprocess.run(['bash',str(scripts/'adopt_tip_preparer.sh'),'verify'],capture_output=True,text=True)
+            self.assertNotEqual(result.returncode,0)
+            self.assertIn('not activated',result.stderr)
 
     def test_adoption_reconciliation_is_paginated_and_never_overwrites(self):
         for scenario, okay, creates in [('absent',True,True),('matching',True,False),('different',False,False),('duplicate',False,False),('transport',False,False)]:
