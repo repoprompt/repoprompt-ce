@@ -1342,12 +1342,12 @@ final class MCPServerViewModel: ObservableObject {
 
     @MainActor
     private func makeWindowToolRuntime(route routeResources: MCPHostRouteResources) -> MCPAppToolBinder {
-        MCPAppToolBinder(windowID: routeResources.identity.routeID) { [weak self, service = self.service, windowID = routeResources.identity.routeID] name, freshnessPolicy, args, implementation in
+        routeResources.makeToolBinder(service: service, validateInvocation: validateInvocation) { [weak self, windowID = routeResources.identity.routeID] name, freshnessPolicy, args, implementation in
+            // Unmigrated preparation still requires its real physical/presentation owner.
             guard let self else {
                 throw MCPError.internalError("Window deallocated while executing \(name)")
             }
-            // Capture the one app-binding ingress before runTool or provider work can suspend.
-            let invocationContext = try service.captureInvocationContext(toolName: name, expectedWindowID: windowID)
+            let invocationContext = try MCPInvocationContextBridge.require(toolName: name, expectedWindowID: windowID)
             return try await runTool(
                 route: routeResources,
                 name,
@@ -2117,14 +2117,43 @@ final class MCPServerViewModel: ObservableObject {
         context: windowToolContextCapabilities,
         selection: windowToolSelectionCapabilities
     )
+    #if DEBUG
+        var historyScannerFactoryForTesting: (@Sendable () -> any HistorySessionScanning)?
+    #endif
+
     @MainActor
-    private lazy var historyToolProvider = MCPHistoryToolProvider(
-        runtime: windowToolRuntime, workspaceStore: domainWorkspaceAuthorityClient?.store
-    )
+    private lazy var historyToolProvider: MCPHistoryToolProvider = {
+        #if DEBUG
+            let scannerFactory = historyScannerFactoryForTesting
+        #else
+            let scannerFactory: (@Sendable () -> any HistorySessionScanning)? = nil
+        #endif
+        return MCPHistoryToolProvider(
+            runtime: windowToolRuntime, workspaceStore: domainWorkspaceAuthorityClient?.store,
+            scannerFactory: scannerFactory
+        )
+    }()
+
     @MainActor
     private func makeDomainReadToolProvider(route routeResources: MCPHostRouteResources) -> MCPDomainReadToolProvider {
-        MCPDomainReadToolProvider(
-            resolveContext: { [weak self] toolName, requirement in
+        // The existing history backend owns only its scanner/workspace-store authority. Retain
+        // that capability directly, not the server or its prompt/workspace presentation graph.
+        #if DEBUG
+            let scannerFactory = historyScannerFactoryForTesting
+        #else
+            let scannerFactory: (@Sendable () -> any HistorySessionScanning)? = nil
+        #endif
+        let independentHistory = routeResources.identity.kind == .independent ? MCPHistoryToolProvider(
+            workspaceLocations: routeResources.historyWorkspaceLocations, scannerFactory: scannerFactory
+        ) : nil
+        return MCPDomainReadToolProvider(
+            resolveContext: { [weak self, independentHistory] toolName, requirement in
+                if toolName == MCPWindowToolName.history, independentHistory != nil,
+                   requirement == .workspaceIndependent
+                {
+                    _ = try MCPInvocationContextBridge.require(toolName: toolName, expectedWindowID: routeResources.identity.routeID)
+                    return DomainReadInvocationContext(handle: nil, connectionID: nil)
+                }
                 guard let self else {
                     throw MCPError.internalError("Window deallocated while resolving \(toolName) context")
                 }
@@ -2157,7 +2186,10 @@ final class MCPServerViewModel: ObservableObject {
                     failure: failure
                 )
             },
-            backend: MCPDomainReadToolBackend { [weak self] toolName, context, args, sideEffects in
+            backend: MCPDomainReadToolBackend { [weak self, independentHistory] toolName, context, args, sideEffects in
+                if toolName == MCPWindowToolName.history, let independentHistory {
+                    return try await independentHistory.executeDomainRead(context: context, args: args)
+                }
                 guard let self else {
                     throw MCPError.internalError("Window deallocated while executing \(toolName)")
                 }

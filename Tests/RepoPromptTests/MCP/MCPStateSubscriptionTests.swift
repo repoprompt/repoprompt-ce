@@ -2,12 +2,88 @@ import Darwin
 import Foundation
 import MCP
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 @testable import RepoPromptMCPServer
 import RepoPromptProcess
 import RepoPromptSecureStorage
 import RepoPromptShared
 @testable import RepoPromptWorkspaceContext
 import XCTest
+
+private actor RouteInvocationGate {
+    private var entered = false
+    private var released = false
+    private var entries: [CheckedContinuation<Void, Never>] = []
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private(set) var validationCalls = 0
+
+    func recordValidation() -> Bool {
+        validationCalls += 1
+        return true
+    }
+
+    func enter() async {
+        entered = true
+        let pending = entries
+        entries.removeAll()
+        pending.forEach { $0.resume() }
+        if !released { await withCheckedContinuation { waiters.append($0) } }
+    }
+
+    func waitUntilEntered() async {
+        if !entered { await withCheckedContinuation { entries.append($0) } }
+    }
+
+    func release() {
+        released = true
+        let pending = waiters
+        waiters.removeAll()
+        pending.forEach { $0.resume() }
+    }
+}
+
+private actor RouteHistoryScanner: HistorySessionScanning {
+    enum Failure: Error { case scan }
+    private(set) var scans = 0
+    private var fails = false
+    private var gate: RouteInvocationGate?
+
+    func setFailure(_ value: Bool) {
+        fails = value
+    }
+
+    func block(on gate: RouteInvocationGate) {
+        fails = false
+        self.gate = gate
+    }
+
+    func scanAllWorkspaces() async throws -> [HistoryWorkspaceScanResult] {
+        scans += 1
+        if fails { throw Failure.scan }
+        await gate?.enter()
+        try Task.checkCancellation()
+        return []
+    }
+
+    func scanAllWorkspacesRefreshing() async throws -> [HistoryWorkspaceScanResult] {
+        try await scanAllWorkspaces()
+    }
+
+    nonisolated func sessionsMatchingFilters(
+        _: [HistoryWorkspaceScanResult], workspace _: String?, agentKind _: String?, model _: String?,
+        filePath _: String?, from _: Date?, to _: Date?
+    ) -> [HistoryFilteredSessionRecord] {
+        []
+    }
+
+    func loadTranscriptForSearch(sessionID _: UUID, workspaceDir _: URL) async throws -> AgentTranscript {
+        throw Failure.scan
+    }
+
+    func transcriptDerivedFieldsAreStale(for _: AgentSessionMetadataRecord, sessionID _: UUID, workspaceDir _: URL) async -> Bool {
+        false
+    }
+}
 
 /// Regression coverage for per-subscriber MCP state streams.
 ///
@@ -146,7 +222,7 @@ final class MCPStateSubscriptionTests: XCTestCase {
     }
 
     @MainActor
-    private func makeServerViewModel(service: MCPService) -> MCPServerViewModel {
+    private func makeServerViewModel(service: MCPService, validation: MCPToolInvocationValidator? = nil) -> MCPServerViewModel {
         let store = WorkspaceFileContextStore()
         let fileManager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
         let keyManager = KeyManager(
@@ -188,8 +264,288 @@ final class MCPStateSubscriptionTests: XCTestCase {
             },
             ensureGitDataRootLoaded: { _, _ in
                 throw MCPError.internalError("git-data loading is not used by these tests")
+            },
+            validateInvocation: validation ?? { context, routeID, owner in
+                await ServerNetworkManager.shared.validateToolInvocationContext(
+                    context, expectedWindowID: routeID, expectedServerViewModelIdentity: owner
+                )
             }
         )
+    }
+
+    @MainActor
+    private func makeHistoryRouteRuntime() async throws -> MCPDomainRuntime {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("route-binding-\(UUID())")
+        let runtime = MCPDomainRuntime(configuration: .init(
+            mode: .app, profileIdentifier: UUID().uuidString, storageDirectory: directory,
+            workspaceStorageDirectory: directory.appendingPathComponent("workspaces"),
+            eventDirectory: directory.appendingPathComponent("events"),
+            temporaryDirectory: directory.appendingPathComponent("tmp"), externalReloadInterval: nil
+        ))
+        try await runtime.start()
+        addTeardownBlock {
+            _ = await runtime.shutdown()
+            try? FileManager.default.removeItem(at: directory)
+        }
+        return runtime
+    }
+
+    @MainActor
+    private func registeredHistoryAfterServerRelease(
+        runtime: MCPDomainRuntime, scanner: RouteHistoryScanner,
+        identity: MCPHostRouteIdentity? = nil, validation: MCPToolInvocationValidator? = nil
+    ) async throws -> (MCPHostRouteResources, MCPDomainResolvedTool, MCPDomainResolvedTool) {
+        let route = MCPHostRouteResources(
+            identity: identity ?? MCPRouteIdentityAllocator.allocateHost(), coordinator: runtime.routingCoordinator, runtime: runtime
+        )
+        addTeardownBlock { await route.close() }
+        let service = makeService()
+        var server: MCPServerViewModel? = makeServerViewModel(service: service, validation: validation)
+        let serverIsReleased = { @MainActor [weak server] in server == nil }
+        server?.historyScannerFactoryForTesting = { scanner }
+        let catalog = try XCTUnwrap(server).makeToolCatalog(route: route)
+        _ = await route.ensureRegistered(workspaceID: nil, contextID: nil, revision: 0)
+        let handle = try await route.registerCatalog(catalog)
+        let captured = await runtime.toolRegistry.resolve(toolName: "history", scope: .window(id: route.identity.routeID))
+        let history = try XCTUnwrap(captured)
+        XCTAssertEqual(history.handle, handle)
+        let other = await runtime.toolRegistry.resolve(toolName: "read_file", scope: .window(id: route.identity.routeID))
+        server?.stopServiceObservation()
+        server = nil
+        await waitUntil { serverIsReleased() }
+        XCTAssertTrue(serverIsReleased(), "The registered invocation binding must not retain its server VM")
+        return try (route, history, XCTUnwrap(other))
+    }
+
+    @MainActor
+    private func invokeRegistered(_ tool: MCPDomainResolvedTool, routeID: Int, connectionID: UUID? = nil) async throws -> Value {
+        let invocation = ToolInvocationContext.trustedLocal(
+            toolName: tool.binding.definition.name,
+            metadata: .init(connectionID: connectionID, clientName: nil, windowID: routeID)
+        )
+        return try await MCPInvocationContextBridge.withInvocation(invocation) {
+            try await tool.binding(["op": .string("list_sessions")])
+        }
+    }
+
+    @MainActor
+    func testRegisteredHistoryBindingOutlivesServerButNotOriginalRoute() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
+            let scanner = RouteHistoryScanner()
+            let (route, history, readFile) = try await registeredHistoryAfterServerRelease(runtime: runtime, scanner: scanner)
+            let workspace = WorkspaceModel(name: "Route-only history authority", repoPaths: [])
+            let authority = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: route.identity.routeID)
+            _ = try await authority.create(
+                workspace, fileURL: runtime.configuration.workspaceStorageDirectory.appendingPathComponent("route-only.json")
+            )
+            guard case let .matched(location) = await route.historyWorkspaceLocations.resolve(.id(workspace.id)) else {
+                return XCTFail("History must read the route runtime's store, not the absent server authority")
+            }
+            XCTAssertEqual(location.runtimeID, runtime.identity.runtimeID)
+            XCTAssertEqual(location.workspaceID, workspace.id)
+            let value = try await invokeRegistered(history, routeID: route.identity.routeID)
+            XCTAssertEqual(value.objectValue?["total_sessions"], .int(0))
+            let scans = await scanner.scans
+            XCTAssertEqual(scans, 1, "The actual registered catalog binding must reach the existing history backend")
+            XCTAssertEqual(route.toolExecutionRuntime.activeExecutionCount, 0)
+            do {
+                _ = try await invokeRegistered(readFile, routeID: route.identity.routeID)
+                XCTFail("Unmigrated file capabilities must still require their real physical owner")
+            } catch let error as MCPError {
+                XCTAssertEqual(error, .internalError("Window deallocated while executing read_file"))
+            }
+            route.closeDomainAdmission()
+            do {
+                _ = try await invokeRegistered(history, routeID: route.identity.routeID)
+                XCTFail("Closing the original route must refuse even with a retained binding")
+            } catch ServerNetworkManager.ToolDispatchAdmissionError.windowTerminal {}
+            let finalScans = await scanner.scans
+            XCTAssertEqual(finalScans, 1)
+        }
+    }
+
+    @MainActor
+    func testRegisteredHistoryNetworkInvocationRequiresExactOriginalDispatchProof() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
+            let recorder = RouteInvocationGate()
+            let scanner = RouteHistoryScanner()
+            let (route, history, _) = try await registeredHistoryAfterServerRelease(
+                runtime: runtime, scanner: scanner, validation: { _, _, _ in await recorder.recordValidation() }
+            )
+            let handle = try XCTUnwrap(route.catalogHandle)
+            let captured = await ServerNetworkManager.shared.captureWindowToolDispatchIdentity(
+                windowID: route.identity.routeID, catalogRegistrationHandle: handle
+            )
+            let original = try XCTUnwrap(captured)
+            let foreignOwner = NSObject()
+            let connectionID = UUID()
+            for change in ["catalog", "owner", "missing", "none"] {
+                let dispatch = MCPWindowToolDispatchIdentity(
+                    windowID: original.windowID, windowStateIdentity: original.windowStateIdentity,
+                    serverViewModelIdentity: change == "owner" ? ObjectIdentifier(foreignOwner) : original.serverViewModelIdentity,
+                    catalogRegistrationHandle: change == "catalog" ? .init(
+                        registryID: handle.registryID, registrationID: .init(), generation: handle.generation
+                    ) : handle
+                )
+                let invocationID = UUID()
+                let context = ToolInvocationContext(
+                    origin: .network, invocationID: invocationID, requestID: nil, toolName: "history",
+                    metadata: .init(connectionID: connectionID, clientName: nil, windowID: route.identity.routeID, invocationID: invocationID),
+                    dispatchAuthorization: change == "missing" ? nil : .init(
+                        connectionID: connectionID, connectionIdentity: ObjectIdentifier(foreignOwner), lifecycleGeneration: 1,
+                        windowIdentity: dispatch
+                    )
+                )
+                let before = await recorder.validationCalls
+                do {
+                    _ = try await MCPInvocationContextBridge.withInvocation(context) {
+                        try await history.binding(["op": .string("list_sessions")])
+                    }
+                    XCTAssertEqual(change, "none")
+                } catch MCPInvocationContextFailure.missingAuthorization {
+                    XCTAssertEqual(change, "missing")
+                } catch ServerNetworkManager.ToolDispatchAdmissionError.windowTerminal {
+                    XCTAssertTrue(change == "catalog" || change == "owner")
+                }
+                let after = await recorder.validationCalls
+                if change == "none" { XCTAssertGreaterThan(after, before) }
+                else { XCTAssertEqual(after, before, "Wrong original proof must refuse before the injected validator") }
+            }
+            let scans = await scanner.scans
+            XCTAssertEqual(scans, 1)
+        }
+    }
+
+    @MainActor
+    func testEnteredRouteMappingRetainsOnlyOriginalCleanupOwnerUntilConsumed() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
+            let route = MCPHostRouteResources(
+                identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: runtime.routingCoordinator, runtime: runtime
+            )
+            addTeardownBlock { await route.close() }
+            var server: MCPServerViewModel? = makeServerViewModel(service: makeService())
+            let serverIsReleased = { @MainActor [weak server] in server == nil }
+            let catalog = try XCTUnwrap(server).makeToolCatalog(route: route)
+            _ = await route.ensureRegistered(workspaceID: nil, contextID: nil, revision: 0)
+            _ = try await route.registerCatalog(catalog)
+            let network = ServerNetworkManager.shared
+            let receiptValue = await network.installClientConnectionPolicy(
+                for: "binding-cleanup-\(UUID())", windowID: route.identity.routeID,
+                restrictedTools: [], runID: UUID(), purpose: .agentModeRun, routingOwner: route
+            )
+            let receipt = try XCTUnwrap(receiptValue)
+            let installed = route.installPendingPolicy(receipt, connectionID: UUID(), clientName: nil, tabID: nil)
+            XCTAssertNotNil(installed)
+            server?.stopServiceObservation()
+            server = nil
+            XCTAssertFalse(serverIsReleased(), "An entered mapping retains its exact physical cleanup adapter")
+            await route.close()
+            XCTAssertFalse(serverIsReleased(), "Closing admission is not acknowledgement of mapping cleanup")
+            await network.cleanupRunRoutingState(ownedBy: receipt)
+            await waitUntil { serverIsReleased() }
+            XCTAssertTrue(serverIsReleased())
+        }
+    }
+
+    @MainActor
+    func testRegisteredHistoryRechecksCatalogRevocationAcrossInvocationAwait() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
+            let scanner = RouteHistoryScanner()
+            let gate = RouteInvocationGate()
+            let (route, history, _) = try await registeredHistoryAfterServerRelease(
+                runtime: runtime, scanner: scanner, validation: { _, _, _ in
+                    await gate.enter()
+                    return true
+                }
+            )
+            let pending = Task { try await self.invokeRegistered(history, routeID: route.identity.routeID) }
+            await gate.waitUntilEntered()
+            let original = try XCTUnwrap(route.catalogHandle)
+            await route.unregisterCatalog(original)
+            await gate.release()
+            do {
+                _ = try await pending.value
+                XCTFail("Catalog revocation during admission must prevent provider entry")
+            } catch ServerNetworkManager.ToolDispatchAdmissionError.windowTerminal {}
+            let scans = await scanner.scans
+            XCTAssertEqual(scans, 0)
+            XCTAssertEqual(route.toolExecutionRuntime.activeExecutionCount, 0)
+        }
+    }
+
+    @MainActor
+    func testRegisteredHistoryNeverFollowsSameIDReplacementOrLateCleanup() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
+            let originalScanner = RouteHistoryScanner()
+            let (original, history, _) = try await registeredHistoryAfterServerRelease(runtime: runtime, scanner: originalScanner)
+            let handle = try XCTUnwrap(original.catalogHandle)
+            let originalDescriptor = try XCTUnwrap(original.descriptor)
+            await original.unregisterCatalog(handle)
+            let successorScanner = RouteHistoryScanner()
+            let (successor, replacement, _) = try await registeredHistoryAfterServerRelease(
+                runtime: runtime, scanner: successorScanner, identity: original.identity
+            )
+            let successorDescriptor = try XCTUnwrap(successor.descriptor)
+            XCTAssertNotEqual(originalDescriptor.generation, successorDescriptor.generation)
+            do {
+                _ = try await invokeRegistered(history, routeID: original.identity.routeID)
+                XCTFail("The old binding must not borrow the successor's catalog or route proof")
+            } catch ServerNetworkManager.ToolDispatchAdmissionError.windowTerminal {}
+            await original.close()
+            let routing = await runtime.routingCoordinator.snapshot()
+            XCTAssertTrue(routing.windows.contains {
+                $0.windowID == successorDescriptor.windowID && $0.generation == successorDescriptor.generation && !$0.isClosing
+            }, "Late close must leave the successor domain descriptor registered")
+            let value = try await invokeRegistered(replacement, routeID: successor.identity.routeID)
+            XCTAssertEqual(value.objectValue?["total_sessions"], .int(0))
+            let oldScans = await originalScanner.scans
+            let newScans = await successorScanner.scans
+            XCTAssertEqual(oldScans, 0)
+            XCTAssertEqual(newScans, 1, "Original cleanup must leave the replacement route usable")
+        }
+    }
+
+    @MainActor
+    func testRegisteredHistoryPreservesProviderErrorCancellationAndEnteredWork() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
+            let scanner = RouteHistoryScanner()
+            let (route, history, _) = try await registeredHistoryAfterServerRelease(runtime: runtime, scanner: scanner)
+            await scanner.setFailure(true)
+            do {
+                _ = try await invokeRegistered(history, routeID: route.identity.routeID)
+                XCTFail("The original provider error must not become a route failure or retry")
+            } catch RouteHistoryScanner.Failure.scan {}
+            let gate = RouteInvocationGate()
+            await scanner.block(on: gate)
+            let connectionID = UUID(), runID = UUID()
+            let installed = await ServerNetworkManager.shared.installClientConnectionPolicy(
+                for: "history-index-\(UUID())", windowID: route.identity.routeID,
+                restrictedTools: [], runID: runID, purpose: .agentModeRun, routingOwner: route
+            )
+            let cleanup = try XCTUnwrap(installed)
+            XCTAssertEqual(route.runRouteBindings.register(
+                connectionID: connectionID, runID: runID, windowID: route.identity.routeID, cleanupReceipt: cleanup
+            ), .registered(displacedConnectionID: nil))
+            let pending = Task { try await self.invokeRegistered(history, routeID: route.identity.routeID, connectionID: connectionID) }
+            await gate.waitUntilEntered()
+            XCTAssertTrue(route.toolExecutionRuntime.hasActiveToolExecutions(runID: runID))
+            pending.cancel()
+            await gate.release()
+            do {
+                _ = try await pending.value
+                XCTFail("Cancellation must remain cancellation after provider entry")
+            } catch is MCPToolExecutionCancelledError {}
+            let scans = await scanner.scans
+            XCTAssertEqual(scans, 2, "Entered provider work is retained; no retry or effect rollback is fabricated")
+            XCTAssertEqual(route.toolExecutionRuntime.activeExecutionCount, 0)
+            await ServerNetworkManager.shared.cleanupRunRoutingState(ownedBy: cleanup)
+        }
     }
 
     /// Composition must leave old events untouched: pruning belongs to window

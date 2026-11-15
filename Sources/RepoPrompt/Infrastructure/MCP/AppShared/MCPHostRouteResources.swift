@@ -29,7 +29,7 @@ final class MCPHostRouteResources {
     /// registration or teardown; the original route and token are passed to every operation.
     struct RunRouting {
         let install: @MainActor (MCPHostRouteResources, MCPRunRoutingCleanupReceipt, UUID, String?, UUID?) -> PolicyContextInstallation?
-        let rollback: @MainActor (MCPHostRouteResources, MCPRunRouteBindings.PendingPolicyToken, String?, UUID?) -> MCPServerViewModel.PendingPolicyRunIDMappingRollbackResult
+        let rollback: @MainActor (MCPHostRouteResources, MCPRunRouteBindings.PendingPolicyToken, String?, UUID?) -> MCPServerViewModel.PendingPolicyRunIDMappingRollbackResult?
         let removeContext: @MainActor (MCPHostRouteResources, MCPRunRoutingCleanupReceipt, UUID) -> Void
     }
 
@@ -55,6 +55,20 @@ final class MCPHostRouteResources {
     private(set) var catalogHandle: MCPDomainToolRegistrationHandle?
     private var catalog: MCPAppToolCatalogRegistration?
     private var runRouting: RunRouting?
+    /// Only an entered context/mapping producer retains its original physical cleanup adapter.
+    /// Catalog construction alone must not keep a presentation VM alive.
+    private var contextCleanupOwner: AnyObject?
+
+    var historyWorkspaceLocations: HistoryWorkspaceLocationResolver {
+        .init(workspaceStore: { [domainRuntime] in domainRuntime.workspaceStore })
+    }
+
+    func retainContextCleanupOwner(_ owner: AnyObject) -> Bool {
+        guard contextCleanupOwner == nil || contextCleanupOwner === owner else { return false }
+        contextCleanupOwner = owner
+        return true
+    }
+
     private var presentationRevision: UInt64 = 0
     private var routingPublicationTail: Task<Void, Never>?
 
@@ -283,11 +297,14 @@ final class MCPHostRouteResources {
         releaseContextOwnerIfUnregisteredAndDrained()
     }
 
-    private func releaseContextOwnerIfUnregisteredAndDrained() {
-        guard catalogHandle == nil, runRouteBindings.connectionIDToRunID.isEmpty,
+    func releaseContextOwnerIfUnregisteredAndDrained() {
+        guard runRouteBindings.connectionIDToRunID.isEmpty,
               !runRouteBindings.hasRetainedCleanupOwnership else { return }
-        catalog = nil
-        runRouting = nil
+        contextCleanupOwner = nil
+        if catalogHandle == nil {
+            catalog = nil
+            runRouting = nil
+        }
     }
 
     /// Retain the observed registration even if close has just begun: teardown must retract an

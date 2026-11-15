@@ -3962,8 +3962,10 @@ extension MCPServerViewModel {
     func makeRunRouting(route routeResources: MCPHostRouteResources) -> MCPHostRouteResources.RunRouting {
         precondition(routeResources !== self.routeResources)
         return .init(
-            install: { [self] routeResources, receipt, connectionID, clientName, tabID in
-                guard receipt.routeOwner === routeResources, !receipt.isConsumed else { return nil }
+            install: { [weak self] routeResources, receipt, connectionID, clientName, tabID in
+                guard let self, receipt.routeOwner === routeResources, !receipt.isConsumed,
+                      routeResources.retainContextCleanupOwner(self) else { return nil }
+                defer { routeResources.releaseContextOwnerIfUnregisteredAndDrained() }
                 let token: PendingPolicyRunIDMappingToken?
                 var workspaceID: UUID?
                 if let tabID {
@@ -3985,13 +3987,16 @@ extension MCPServerViewModel {
                 guard let token else { return nil }
                 return .init(token: token, workspaceID: workspaceID, tabID: routeResources.runRouteBindings.tabContextByConnectionID[connectionID]?.tabID)
             },
-            rollback: { [self] routeResources, token, clientName, generation in
-                rollbackPendingPolicyRunIDMapping(
+            rollback: { [weak self] routeResources, token, clientName, generation in
+                guard let self else { return nil }
+                defer { routeResources.releaseContextOwnerIfUnregisteredAndDrained() }
+                return rollbackPendingPolicyRunIDMapping(
                     route: routeResources, token, clientName: clientName, windowID: routeResources.identity.routeID,
                     signalRoutingFailure: false, routingWaitGeneration: generation
                 )
             },
-            removeContext: { [self] routeResources, receipt, connectionID in
+            removeContext: { [weak self] routeResources, receipt, connectionID in
+                guard let self else { return }
                 removeTabContext(
                     route: routeResources, forConnectionID: connectionID, clientName: nil,
                     windowID: receipt.routeID, runID: receipt.runID, removeQueuedPendingContext: false
