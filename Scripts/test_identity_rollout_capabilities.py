@@ -275,12 +275,15 @@ args=sys.argv[1:]; scenario=os.environ['SCENARIO']; root=pathlib.Path(os.environ
 with (root/'calls').open('a') as f: f.write(json.dumps(args)+'\\n')
 if args[0]=='api':
     if '--jq' in args:
+        if '/releases/tags/' in args[1] and scenario.startswith('draft'):
+            print('HTTP 404: drafts are not returned by tag',file=sys.stderr); sys.exit(44)
+        assert args[1]=='repos/owner/repo/releases/42'
         query=args[args.index('--jq')+1]
         print('true' if query=='.draft' and scenario.startswith('draft') else 'false' if query=='.draft' else len(list((root/'remote').iterdir())))
     else:
         assert '--paginate' in args and '--slurp' in args
         if scenario=='transport': sys.exit(7)
-        r={'tag_name':'stable-adopt-tip-111111111111','prerelease':False,'draft':scenario.startswith('draft')}
+        r={'id':42,'tag_name':'stable-adopt-tip-111111111111','prerelease':False,'draft':scenario.startswith('draft')}
         print(json.dumps([[],[] if scenario=='absent' else [r,r] if scenario=='duplicate' else [r]]))
 elif args[:2]==['release','download']:
     output=pathlib.Path(args[args.index('--dir')+1])
@@ -297,6 +300,12 @@ else: sys.exit(99)
                 self.assertEqual(result.returncode==0,okay,result.stdout+result.stderr)
                 calls=[json.loads(line) for line in (d/'calls').read_text().splitlines()]
                 self.assertEqual(any(call[:2]==['release','create'] for call in calls),creates)
+                detail_calls=[call for call in calls if call[0]=='api' and '--jq' in call]
+                self.assertTrue(all(call[1]=='repos/owner/repo/releases/42' for call in detail_calls))
+                if scenario=='draftmissing':
+                    self.assertEqual([call[call.index('--jq')+1] for call in detail_calls],['.assets | length','.draft'])
+                if scenario=='draftempty':
+                    self.assertEqual([call[call.index('--jq')+1] for call in detail_calls],['.assets | length','.draft','.draft'])
                 self.assertFalse(any(call[:2]==['release','delete'] or '--clobber' in call for call in calls))
                 uploads=[call for call in calls if call[:2]==['release','upload']]
                 self.assertEqual(len(uploads),2 if scenario=='draftempty' else 1 if scenario=='draftmissing' else 0)

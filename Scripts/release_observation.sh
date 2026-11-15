@@ -69,20 +69,26 @@ PY
 prepare_adoption_release() {
     local feed="$1" repository="$2" tag="$3" notes="$4" work="$5"
     update_gh api --paginate --slurp "repos/$repository/releases?per_page=100" > "$work/releases.json" || return 1
-    local existing
-    existing="$(python3 - "$work/releases.json" "$tag" <<'PY'
+    local existing release_id observed
+    observed="$(python3 - "$work/releases.json" "$tag" <<'PY'
 import json,sys
 releases=[r for page in json.load(open(sys.argv[1])) for r in page if r['tag_name']==sys.argv[2]]
 if len(releases)>1: sys.exit('Duplicate adoption release tags; refusing ambiguous mutation')
 if releases and releases[0].get('prerelease') is not False: sys.exit('Adoption release must not be a prerelease')
-print(('draft' if releases[0].get('draft') is True else 'public') if releases else 'no')
+if releases:
+    release_id=releases[0].get('id')
+    if type(release_id) is not int or release_id<=0: sys.exit('Observed adoption release lacks a valid API ID')
+    print(('draft' if releases[0].get('draft') is True else 'public')+'\t'+str(release_id))
+else:
+    print('no\t0')
 PY
 )" || return 1
+    IFS=$'\t' read -r existing release_id <<< "$observed"
     if [[ "$existing" != no ]]; then
         mkdir "$work/existing"
         # An empty draft can result from an interrupted first upload.
         local asset_count
-        asset_count="$(update_gh api "repos/$repository/releases/tags/$tag" --jq '.assets | length')" || return 1
+        asset_count="$(update_gh api "repos/$repository/releases/$release_id" --jq '.assets | length')" || return 1
         if [[ "$asset_count" != 0 ]]; then
             update_gh release download "$tag" --repo "$repository" --dir "$work/existing" || return 1
         fi
@@ -100,7 +106,7 @@ PY
         local name
         while IFS= read -r name; do
             [[ -n "$name" ]] || continue
-            [[ "$(update_gh api "repos/$repository/releases/tags/$tag" --jq .draft)" == true ]] || return 1
+            [[ "$(update_gh api "repos/$repository/releases/$release_id" --jq .draft)" == true ]] || return 1
             update_gh release upload "$tag" "$feed/$name" --repo "$repository" || return 1
         done < "$work/missing-assets"
         if [[ -s "$work/missing-assets" ]]; then
