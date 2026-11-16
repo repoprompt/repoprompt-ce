@@ -110,6 +110,31 @@ prepare_dist() {
 }
 
 run_preflight() {
+    require_dormant_rollout_declaration
+    run_source_preflight
+}
+
+# Tip owns its rollout independently of Stable's adoption/build authorization.
+# This read-only entry point cannot admit any Stable build or publish operation.
+run_tip_preflight() {
+    local context
+    require_file "$STABLE_ROLLOUT_TOOL"
+    require_file "$APPLE_IDENTITY_POLICY"
+    require_file "$APPROVED_SOURCE_ROOT/tip-rollout.json"
+    context="$(python3 "$STABLE_ROLLOUT_TOOL" packaging-context \
+        --declaration "$APPROVED_SOURCE_ROOT/tip-rollout.json" \
+        --policy "$APPLE_IDENTITY_POLICY" \
+        --version-env "$APPROVED_SOURCE_ROOT/version.env")" || return 1
+    (
+        eval "$context"
+        [[ "$ROLLOUT_CHANNEL" == tip ]] || fail "Tip preflight requires a Tip rollout declaration"
+        run_source_preflight
+    )
+}
+
+# Shared source, legal, vendor, installer-launcher and CLI checks. Channel
+# authorization belongs to the explicit wrappers above, never an environment flag.
+run_source_preflight() {
     require_command plutil
     require_command shasum
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/swiftpm_notice_guardrails.sh"
@@ -152,7 +177,6 @@ run_preflight() {
     require_file "$SIGN_UPDATE"
     require_file "$SPARKLE_FRAMEWORK_INFO"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/build_identity_transition_pkg.sh"
-    require_dormant_rollout_declaration
 
     local sparkle_version feed_url
     sparkle_version="$(plutil -extract CFBundleShortVersionString raw "$SPARKLE_FRAMEWORK_INFO")"
@@ -849,6 +873,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     case "$MODE" in
         sync-cli-version) sync_mcp_cli_version ;;
         preflight) run_preflight ;;
+        preflight-tip) run_tip_preflight ;;
         artifact) package_release_candidate ;;
         stage-publish) stage_publish_release ;;
         stage-verify-source) stage_verify_source ;;
@@ -858,6 +883,6 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
         stage-archive) stage_archive ;;
         publish-staged) publish_staged_release ;;
         finalize-sentry) recover_sentry_finalization ;;
-        *) fail "Usage: $0 sync-cli-version|preflight|artifact|stage-publish|stage-verify-source|stage-prepare|stage-package|stage-validate|stage-archive|publish-staged|finalize-sentry" ;;
+        *) fail "Usage: $0 sync-cli-version|preflight|preflight-tip|artifact|stage-publish|stage-verify-source|stage-prepare|stage-package|stage-validate|stage-archive|publish-staged|finalize-sentry" ;;
     esac
 fi

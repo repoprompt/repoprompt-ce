@@ -226,7 +226,10 @@ class SparkleInstallerLauncherGuardTests(unittest.TestCase):
 
     def test_release_preflight_and_staged_validation_run_the_guard(self) -> None:
         release = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
-        preflight = release.split("run_preflight() {", 1)[1].split("\n}", 1)[0]
+        for wrapper in ("run_preflight", "run_tip_preflight"):
+            body = release.split(f"{wrapper}() {{", 1)[1].split("\n}", 1)[0]
+            self.assertIn("run_source_preflight", body)
+        preflight = release.split("run_source_preflight() {", 1)[1].split("\n}", 1)[0]
         self.assertIn('"$CONTROL_PLANE_SCRIPTS_DIR/validate_sparkle_installer_launcher.py"', preflight)
         self.assertIn('--info-plist "$ROOT_DIR/AppBundle/Info.plist.template"', preflight)
         staged = (SCRIPT_DIR / "validate_staged_release.sh").read_text(encoding="utf-8")
