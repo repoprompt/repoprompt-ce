@@ -28,7 +28,7 @@ jobs:
     outputs:
       failure: ${{ steps.diagnostics.outputs.failure }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         id: actions-checkout-v6
         with:
           ref: ${{ github.sha }}
@@ -42,7 +42,7 @@ jobs:
       # the declared checkout with Sentry enabled, not consume a cached success.
       - name: Restore checksum-verified dependency binaries only
         id: restore-checksum-verified-dependency-binaries-only
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             .build/artifacts

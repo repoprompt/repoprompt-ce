@@ -29,7 +29,7 @@ jobs:
       context: ${{ steps.candidate.outputs.context }}
       range: ${{ steps.candidate.outputs.range }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         id: actions-checkout-v6
         with:
           ref: ${{ github.sha }}
@@ -64,7 +64,7 @@ jobs:
     steps:
       - name: Check out repository
         id: check-out-repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -73,7 +73,7 @@ jobs:
         run: make ci-portable-selftest
       - name: Set up Node for pinned Codex CLI
         id: set-up-node-for-pinned-codex-cli
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 24
       - name: Install pinned Codex CLI
@@ -128,7 +128,7 @@ jobs:
     steps:
       - name: Check out repository
         id: check-out-repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -157,7 +157,7 @@ jobs:
 
       - name: Restore SwiftPM dependencies and provider support cache
         id: rootbundles-cache
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             .build/checkouts
@@ -175,7 +175,7 @@ jobs:
 
       - name: Restore checksum-verified SwiftPM binary artifacts
         id: binaries-cache
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             .build/artifacts
@@ -241,7 +241,7 @@ jobs:
       - name: Retain type-check measurements on success and failure
         id: retain-type-check-measurements-on-success-and-failure
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: typecheck-timing-${{ github.run_id }}-${{ github.run_attempt }}
           path: .build/modularization/typecheck-timing.json
@@ -251,7 +251,7 @@ jobs:
       - name: Upload failed root test build log
         id: upload-failed-root-test-build-log
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           overwrite: true
           name: root-build-tests-failure-${{ github.run_id }}-${{ github.run_attempt }}
@@ -274,7 +274,7 @@ jobs:
       - name: Retain failed compiler index diagnostics
         id: retain-failed-compiler-index-diagnostics
         if: ${{ failure() && steps.compiler_index_gate.outcome == 'failure' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: compiler-index-failure-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -298,7 +298,7 @@ jobs:
       - name: Retain full module execution logs
         id: retain-full-module-execution-logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           overwrite: true
           name: module-execution-${{ github.run_id }}-${{ github.run_attempt }}
@@ -320,7 +320,7 @@ jobs:
 
       - name: Share expected coverage independently of the runnable products
         id: share-expected-coverage-independently-of-the-runnable-products
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ steps.producer.outputs.coverage_artifact }}
           path: |
@@ -332,7 +332,7 @@ jobs:
 
       - name: Share the single build with test shards
         id: share-the-single-build-with-test-shards
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           if-no-files-found: error
           name: ${{ steps.producer.outputs.build_artifact }}
@@ -343,7 +343,7 @@ jobs:
       - name: Save checksum-verified SwiftPM binary artifacts (main only)
         id: save-checksum-verified-swiftpm-binary-artifacts-main-only
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.binaries-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             .build/artifacts
@@ -357,7 +357,7 @@ jobs:
       - name: Save SwiftPM dependencies and provider support cache (main only)
         id: save-swiftpm-dependencies-and-provider-support-cache-main-only
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.rootbundles-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             .build/checkouts
@@ -410,7 +410,7 @@ jobs:
     steps:
       - name: Check out repository
         id: check-out-repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -421,7 +421,7 @@ jobs:
 
       - name: Download the single root build
         id: download-the-single-root-build
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: ${{ steps.selected.outputs.build_artifact }}
 
@@ -448,7 +448,7 @@ jobs:
       - name: Retain execution receipts and full shard logs
         id: retain-execution-receipts-and-full-shard-logs
         if: ${{ always() && steps.execution.outcome == 'success' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ steps.execution.outputs[format('artifact_{0}', matrix.shard)] }}
           path: .build/ci-test-results/shard-${{ matrix.shard }}*
@@ -485,7 +485,7 @@ jobs:
     steps:
       - name: Check out repository
         id: check-out-repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -510,7 +510,7 @@ jobs:
 
       - name: Download expected coverage
         id: download-expected-coverage
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: ${{ steps.selected.outputs.coverage_artifact }}
           path: expected-coverage
@@ -519,28 +519,28 @@ jobs:
       # including ancestors of a partial retry. Never select artifacts by recency.
       - name: Download shard 1 execution receipt
         id: download-shard-1-execution-receipt
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: ${{ steps.selected.outputs.receipt_artifact_1 }}
           path: shard-execution
 
       - name: Download shard 2 execution receipt
         id: download-shard-2-execution-receipt
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: ${{ steps.selected.outputs.receipt_artifact_2 }}
           path: shard-execution
 
       - name: Download shard 3 execution receipt
         id: download-shard-3-execution-receipt
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: ${{ steps.selected.outputs.receipt_artifact_3 }}
           path: shard-execution
 
       - name: Download shard 4 execution receipt
         id: download-shard-4-execution-receipt
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: ${{ steps.selected.outputs.receipt_artifact_4 }}
           path: shard-execution
@@ -575,7 +575,7 @@ jobs:
     steps:
       - name: Check out repository
         id: check-out-repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
