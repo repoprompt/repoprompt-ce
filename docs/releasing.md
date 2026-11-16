@@ -394,6 +394,14 @@ transition/successor sibling feeds and no Sparkle-key change. Tip workflows must
 `repoprompt-ce-updates` or use `v*` tags, and must not feed into `Promote Release`. Stable promotion
 and the explicit archived-preparer adoption workflow are the only paths that update the Stable appcast.
 
+Tip source staging runs `Scripts/release.sh preflight-tip` before dependency resolution and again
+following packaging. It validates the approved source's `tip-rollout.json` and identity policy, then
+runs the same source/legal/vendor/installer-launcher/CLI checks as Stable. It must not consult
+Stable's adoption/build admission: Stable can adopt archived P while Tip prepares a later stage.
+Normal `preflight` and all Stable build/publish operations still enforce `release-rollout.json`;
+`preflight-tip` is read-only and does not authorize a Stable build or any publication. Passing it
+does not establish signing/notarization success or activate Tip T.
+
 `Publish Tip` runs automatically after successful main-push CI in the source repository. When an
 automatic run leaves the rolling queue, it considers the authenticated successful triggering
 event alongside up to 300 recent successful `ci.yml` main-push runs, then selects the newest

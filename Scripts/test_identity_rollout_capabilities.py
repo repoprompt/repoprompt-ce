@@ -310,6 +310,92 @@ else: sys.exit(99)
                 uploads=[call for call in calls if call[:2]==['release','upload']]
                 self.assertEqual(len(uploads),2 if scenario=='draftempty' else 1 if scenario=='draftmissing' else 0)
 
+    def test_tip_preflight_uses_approved_tip_authority_not_stable_adoption(self):
+        fixture=CapabilityTests(); fixture.setUp(); self.addCleanup(fixture.doCleanups)
+        tip_t=fixture.native('tip','transition','43.24.44','tip-222222222222',(fixture.p,))
+        tip_s=fixture.native('tip','successor','43.24.45','tip-333333333333',(tip_t,fixture.p))
+        approved=fixture.root/'approved'; approved.mkdir()
+        staged=fixture.root/'staged'; staged.mkdir()
+        for directory in (approved,staged): shutil.copy2(ROOT/'version.env',directory/'version.env')
+        shutil.copy2(fixture.adoption_args().declaration,approved/'release-rollout.json')
+        # The staged root is not the authorization root; a wrong-root lookup
+        # must fail rather than silently using this decoy.
+        (staged/'tip-rollout.json').write_text('{}')
+        env={**os.environ,'REPOPROMPT_RELEASE_SOURCE_ROOT':str(staged),
+             'REPOPROMPT_APPROVED_SOURCE_ROOT':str(approved),
+             'REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR':str(ROOT/'Scripts')}
+        command=['bash','-c','set -euo pipefail; source "$1"; run_source_preflight(){ printf "shared:%s:%s:%s\\n" "$ROLLOUT_CHANNEL" "$ROLLOUT_ROLE" "$EXPECTED_APP_BUNDLE_ID"; }; "$2"',
+                 'test',str(ROOT/'Scripts/release.sh')]
+        for manifest,role in ((fixture.p,'preparer'),(tip_t,'transition'),(tip_s,'successor')):
+            shutil.copy2(manifest.parent/'declaration.json',approved/'tip-rollout.json')
+            result=subprocess.run(command+['run_tip_preflight'],env=env,capture_output=True,text=True)
+            self.assertEqual(result.returncode,0,result.stderr)
+            identity=fixture.policy['identities'][rollout.ROLE_IDENTITY[role]]['bundleIdentifier']
+            self.assertIn('shared:tip:'+role+':'+identity,result.stdout)
+            stable=subprocess.run(command+['run_preflight'],env=env,capture_output=True,text=True)
+            self.assertNotEqual(stable.returncode,0)
+            self.assertIn('no-build adopt operation',stable.stderr)
+            self.assertNotIn('shared:',stable.stdout)
+        for invalid in ('missing','malformed','stable-channel','bad-version'):
+            shutil.copy2(fixture.p.parent/'declaration.json',approved/'tip-rollout.json')
+            shutil.copy2(ROOT/'version.env',approved/'version.env')
+            if invalid=='missing': (approved/'tip-rollout.json').unlink()
+            elif invalid=='malformed': (approved/'tip-rollout.json').write_text('{}')
+            elif invalid=='stable-channel':
+                (approved/'tip-rollout.json').write_text(json.dumps(fixture.declaration('stable','legacy')))
+            else: (approved/'version.env').write_text('BUILD_NUMBER=invalid\n')
+            result=subprocess.run(command+['run_tip_preflight'],env=env,capture_output=True,text=True)
+            self.assertNotEqual(result.returncode,0,invalid)
+            self.assertNotIn('shared:',result.stdout,invalid)
+        shutil.copy2(fixture.p.parent/'declaration.json',approved/'tip-rollout.json')
+        shutil.copy2(ROOT/'version.env',approved/'version.env')
+        failing=command.copy(); failing[2]=failing[2].replace('run_source_preflight(){ printf','run_source_preflight(){ false; printf')
+        result=subprocess.run(failing+['run_tip_preflight'],env=env,capture_output=True,text=True)
+        self.assertNotEqual(result.returncode,0)
+        self.assertNotIn('shared:',result.stdout)
+        self.assertIn('preflight-tip) run_tip_preflight ;;',(ROOT/'Scripts/release.sh').read_text())
+
+    def test_tip_staging_runs_tip_preflight_before_resolve_and_after_package(self):
+        fixture=CapabilityTests(); fixture.setUp(); self.addCleanup(fixture.doCleanups)
+        source=fixture.root/'source'; source.mkdir()
+        shutil.copy2(ROOT/'version.env',source/'version.env')
+        shutil.copy2(fixture.p.parent/'declaration.json',source/'tip-rollout.json')
+        shutil.copy2(fixture.adoption_args().declaration,source/'release-rollout.json')
+        scripts=fixture.root/'stubs'; scripts.mkdir(); receipt=fixture.root/'calls'
+        wrapper='''#!/bin/bash
+set -euo pipefail
+export REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR="$REAL_SCRIPTS"
+source "$REAL_SCRIPTS/release.sh"
+run_source_preflight(){
+    [[ "$ROOT_DIR" == "$EXPECTED_ROOT" && "$APPROVED_SOURCE_ROOT" == "$EXPECTED_ROOT" ]] || exit 89
+    printf 'shared:%s:%s\\n' "$ROLLOUT_CHANNEL" "$ROLLOUT_ROLE" >> "$RECEIPT"
+}
+case "$MODE" in
+preflight-tip) run_tip_preflight ;;
+preflight) run_preflight ;;
+*) exit 90 ;;
+esac
+'''
+        (scripts/'release.sh').write_text(wrapper); (scripts/'release.sh').chmod(0o755)
+        (scripts/'package_app.sh').write_text('#!/bin/bash\nprintf "package\\n" >> "$RECEIPT"\n')
+        (scripts/'package_app.sh').chmod(0o755)
+        body='''set -euo pipefail
+source "$REAL_SCRIPTS/main_tip_release.sh"
+unset REPOPROMPT_RELEASE_SOURCE_ROOT REPOPROMPT_APPROVED_SOURCE_ROOT REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR
+CONTROL_PLANE_SCRIPTS_DIR="$STUB_SCRIPTS"
+require_command(){ :; }
+resolve_without_lockfile_drift(){ printf 'resolve\\n' >> "$RECEIPT"; }
+prepare_dist(){ :; }
+validate_packaged_legal(){ printf 'packaged-validation\\n' >> "$RECEIPT"; exit 88; }
+stage_tip
+'''
+        env={**os.environ,'REPOPROMPT_RELEASE_SOURCE_ROOT':str(source),'REPOPROMPT_APPROVED_SOURCE_ROOT':str(source),
+             'REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR':str(ROOT/'Scripts'),'REAL_SCRIPTS':str(ROOT/'Scripts'),
+             'STUB_SCRIPTS':str(scripts),'EXPECTED_ROOT':str(source),'RECEIPT':str(receipt),'TIP_COMMIT':'a'*40,'TIP_BUILD_NUMBER':'43.24.44'}
+        result=subprocess.run(['bash','-c',body],env=env,capture_output=True,text=True)
+        self.assertEqual(result.returncode,88,result.stdout+result.stderr)
+        self.assertEqual(receipt.read_text().splitlines(),['shared:tip:preparer','resolve','package','shared:tip:preparer','packaged-validation'])
+
     def test_stable_transition_package_build_and_promotion_branches(self):
         fixture=CapabilityTests(); fixture.setUp(); self.addCleanup(fixture.doCleanups)
         transition=fixture.native('stable','transition','44','v1.9.2',(fixture.p,))

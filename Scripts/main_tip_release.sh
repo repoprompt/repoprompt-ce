@@ -511,8 +511,11 @@ stage_tip() {
     require_command shasum
     [[ "$TIP_BUILD_NUMBER" =~ ^[0-9]{1,4}\.[0-9]{1,2}\.[0-9]{1,2}$ ]] ||
         fail "TIP_BUILD_NUMBER must be a three-component numeric build version"
+    REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
+        REPOPROMPT_APPROVED_SOURCE_ROOT="$APPROVED_SOURCE_ROOT" \
+        REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR="$CONTROL_PLANE_SCRIPTS_DIR" \
+        "$CONTROL_PLANE_SCRIPTS_DIR/release.sh" preflight-tip
     resolve_without_lockfile_drift
-    "$CONTROL_PLANE_SCRIPTS_DIR/release.sh" preflight
     prepare_dist
     "$RUN_WITHOUT_GITHUB_TOKENS" env -u SIGN_IDENTITY \
         REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
@@ -526,7 +529,10 @@ stage_tip() {
         REPOPROMPT_ENABLE_SENTRY=1 \
         RELEASE_ALLOW_ADHOC_SIGNING=1 \
         "$CONTROL_PLANE_SCRIPTS_DIR/package_app.sh" release
-    "$CONTROL_PLANE_SCRIPTS_DIR/release.sh" preflight
+    REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
+        REPOPROMPT_APPROVED_SOURCE_ROOT="$APPROVED_SOURCE_ROOT" \
+        REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR="$CONTROL_PLANE_SCRIPTS_DIR" \
+        "$CONTROL_PLANE_SCRIPTS_DIR/release.sh" preflight-tip
     validate_packaged_legal "$APP_BUNDLE"
     validate_public_app "$APP_BUNDLE" "$BUILD_ARTIFACT_MANIFEST" "Tip staging"
     REPOPROMPT_ENABLE_SENTRY=1 require_release_sentry_symbols_when_enabled \
