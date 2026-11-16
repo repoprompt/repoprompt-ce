@@ -809,8 +809,21 @@ print(Path(os.environ["ADMISSION_CI_RUNS"]).read_text())
         (self.source / "Scripts").mkdir()
         for path in (ROLLOUT_TOOL, POLICY, SCRIPT_DIR / "tip_ci_selection.py"):
             shutil.copyfile(path, self.source / "Scripts" / path.name)
-        for name in ("tip-rollout.json", "version.env"):
-            shutil.copyfile(ROOT_DIR / name, self.source / name)
+        shutil.copyfile(ROOT_DIR / "version.env", self.source / "version.env")
+        # Admission scenarios below model a preparer baseline. Do not inherit
+        # today's activation role and silently require unrelated T/S HTTP data.
+        (self.source / "tip-rollout.json").write_text(
+            json.dumps({
+                "schemaVersion": 1,
+                "channel": "tip",
+                "currentRole": "preparer",
+                "eligibilityProfile": "tip-identity-dress-rehearsal-v1",
+                "expectedMigrationPhase": "legacy-preparer",
+                "expectedSigningIdentity": "legacy",
+                "predecessors": [],
+            }) + "\n",
+            encoding="utf-8",
+        )
         self._git(self.source, "add", ".")
         self._git(self.source, "commit", "-qm", "tested candidate")
         self.candidate = self._git(self.source, "rev-parse", "HEAD")

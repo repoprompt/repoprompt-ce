@@ -48,7 +48,8 @@ rechecks protected `main`, validates the authenticated public Tip appcast/manife
 monotonic `P → T → S` state machine while allowing newer same-role builds with exact retained
 manifest bytes, and verifies retained enclosure size/SHA-256 from immutable release assets.
 For T and S, setup and publication also require the greatest Stable build to remain strictly below
-P's retained Tip build; otherwise an unprepared later Stable build could satisfy T's Sparkle floor.
+P's retained Tip build, unless Stable retains exactly the same authenticated P through the shared
+ladder described below; otherwise an unprepared later Stable build could satisfy T's Sparkle floor.
 Draft creation, asset upload, and publication are reconciled by observation after ambiguous network
 outcomes; existing bytes are never overwritten. A completed release is then audited anonymously,
 asset by asset, before it is accepted as the latest Tip release.
@@ -151,19 +152,30 @@ declaration with P's exact manifest digest before merging T. After T is verified
 declaration with both exact predecessor digests before merging S. Successful protected-main CI
 automatically publishes each reviewed role; no second dispatch approval is required.
 
-Stable 1.4.0 (build `36`) is now the official Stable epoch. The authenticated live Tip is
-transition tag `tip-57b572038048`, build `35.15.39`, with `identity-rollout.json` SHA-256
-`c8d28103b5e95370fc0de7df19c34797552e99803228794754bfbfe292e3e421`; it retains P
-`tip-2f94412e6ab5` at build `35.15.18`, whose manifest SHA-256 is
-`3c69703fa7582105633b36e8874fe2a28e1832aabb776351e68dbf3367e122db`. Because that retained P
-is below Stable 36, normal T -> P progression remains forbidden. The schema-2 checked-in Tip
-declaration contains the sole explicit `resetAuthority` for this exact live transition, retained P,
-and Stable epoch. The release tool matches every recorded tag, manifest digest, retained-P fact, and
-Stable epoch fact against the authenticated public files and rejects absent, mismatched, or tampered
-reset data; it does not add a generic progression bypass or silently discard authenticated history.
-The replacement P must be newer than both live Tip `35.15.39` and Stable `36` (the next Tip encoding
-begins at `36.0.x`). After publication, clear the reset authority and advance the declaration with P's
-exact manifest digest before merging T.
+### Tip transition activation (2026-11-16)
+
+The published replacement P is `tip-1e1d9fe4bbc6`, build `43.24.43`. Its original
+`identity-rollout.json` SHA-256 is
+`03153738c5b09ecffa6a56841e5fc2f9113ebd54a4ed8306e48d6df171770de4`.
+Stable also delivers these unchanged P bytes through
+`stable-adopt-tip-1e1d9fe4bbc6-stable-delivery-v1`. The Tip declaration now pins this P,
+removes the completed historical reset authority, and selects the normal schema-1 T chain.
+Stable's declaration and repository-wide `version.env` remain unchanged.
+
+This is an explicitly accepted-risk activation, **not a passed runtime migration proof**.
+Run `43814742800` passed staging and Eric signing but Apple rejected notarization with HTTP 403
+for a missing/expired agreement. T selects Samuel's Application, Installer, provisioning profile,
+and notarization credentials; it does not require another Eric build or submission. Existing P must
+remain available byte-for-byte. Phase `disabled` is the transition role's expected phase (successor identity), not
+permission to discard the committed bridge or skip P.
+
+Merging this declaration and completing qualifying protected-main CI can automatically publish T;
+there is no separate dispatch approval. Require Samuel's credential preflight, PKG signing,
+accepted notarization/stapling, packaged smoke, compatibility, and live-ladder gates to pass.
+Current Samuel notarization access and end-to-end credential continuity remain unproven until
+actually exercised. A skipped-P manual installation is not a supported shortcut: retain the P-first
+Sparkle ladder, and treat blocked credential access as a recovery case rather than a successful
+migration. Keep the original P and recovery assets; do not automatically advance S or Stable T.
 
 The workflow capability for T is explicit and deterministic: after a reviewed transition declaration
 reaches protected `main` and CI passes, GitHub selects and publishes that exact commit automatically.
@@ -174,8 +186,8 @@ declaration change containing both T's and P's exact manifest digests.
 
 ## Dormant Stable capability and archived-P handoff
 
-Capability code alone does not activate either channel. The checked-in Stable legacy and Tip preparer
-declarations remain the activation authority. Stable schema 2 explicitly acknowledges
+Capability code alone does not activate either channel. The checked-in channel declarations
+remain the activation authority. Stable schema 2 explicitly acknowledges
 `runtimeMigrationProof: "unverified-accepted-risk"`; it is an accepted-risk release lane, **not** a
 successful runtime-proof result. The normal proof requirements below remain outstanding. A maintainer
 must review that risk again in the activation PR, including recovery and fresh-install policy.
