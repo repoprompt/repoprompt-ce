@@ -75,6 +75,7 @@ extension AgentSessionRuntimeHost {
             settleSelfCompact: { [weak scope] session in scope?.linkExecution?.agentSelfCompactSettleStaleParkedNote(session) },
             selfCompactBlocksWake: { [weak scope] session in scope?.linkExecution?.agentSelfCompactBlocksNotificationWake(session) ?? true },
             selfCompactHoldsWakeAcquisition: { [weak scope] session in scope?.linkExecution?.agentSelfCompactHoldsWakeAcquisition(session) ?? true },
+            managedInputEnvironment: makeCanonicalInputEnvironment(),
             workspaceCaptureOrder: .beforeSkillExpansion
         ), diagnostics: diagnostics)
         runtime.codexCoordinator = codexCoordinator

@@ -846,8 +846,8 @@ operations and a retry replays the stored receipt.
 | Between states, idle but not yet send-ready, or settled during the fence | Refused; nothing staged and the key is released | `target_busy` |
 | A provider or state with no live steering | Refused before staging | `steer_unavailable` |
 
-The running routes go through the target's own `submitPreparedUserTurn`, so a steer reaches the
-provider exactly as a local composer message would. What they never touch is composer state: no
+The running routes use the target session writer's managed input runtime. The runtime captures
+the host's workspace resources before authorizing delivery. It leaves composer state untouched: no
 draft, attachment, tagged file, workflow, interview preference, or file-selection side effect is
 read, cleared, or restored, and every withdrawal path carries an empty restoration draft, so an
 overseer's words can never reappear in the target user's composer as the user's own. ACP uses a
@@ -858,8 +858,9 @@ original provider envelope in `pendingInstructions` for the follow-up, not in th
 An interrupted attributed ACP row replays its exact dispatched envelope from
 `dispatchedProviderText`; older attributed rows lacking that field are still dropped rather than
 reconstructed from raw transcript words. After the commit fence the transaction re-proves both
-endpoints, the workspace, and admission synchronously; a run that settled during the fence is
-refused as `target_busy` rather than started from a deferred path.
+endpoints, workspace, writer, attempt, and Stop generation synchronously. A settled or replaced
+attempt returns `target_busy`. Stop or caller cancellation before the row is staged leaves no row or
+provider input. Once the runtime accepts input, its originating provider producer settles the receipt.
 A provider path that withdraws the row reports `steer_not_accepted` (key released); one whose
 outcome cannot be observed reports `steer_unconfirmed` with `delivered_unknown: true` (key spent).
 ACP records the `session/prompt` pipe write independently of its end-of-turn response. If that

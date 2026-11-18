@@ -149,7 +149,7 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
         liveness: @escaping AgentSessionLinkSendLivenessProbe = { liveLiveness },
         commit: @escaping @MainActor () async -> AgentSessionLinkSendCommitOutcome = { .committed }
     ) async -> AgentSessionLinkSendTransactionOutcome {
-        await fixture.viewModel.agentSessionLinkPerformSteer(
+        await fixture.viewModel.linkExecutionRuntime.agentSessionLinkPerformSteer(
             to: fixture.candidate,
             request: request ?? makeRequest(),
             liveness: liveness,
@@ -490,6 +490,66 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
         XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
     }
 
+    func testSteerCannotFollowSuccessorAttemptOnSameWriterDuringAuthorization() async throws {
+        let fixture = try makeFixture()
+        makeRunning(fixture)
+        let session = fixture.session
+        let original = try XCTUnwrap(session.activeRunOwnership)
+
+        let outcome = await steer(fixture) {
+            _ = session.beginRunAttempt(source: "successor-during-managed-steer")
+            return .committed
+        }
+
+        XCTAssertNotEqual(session.activeRunOwnership, original)
+        XCTAssertEqual(outcome, .blocked(.targetBusy))
+        XCTAssertTrue(session.items.isEmpty)
+        XCTAssertTrue(session.pendingClaudeSteeringInstructions.isEmpty)
+    }
+
+    func testStopFenceChangeDuringAuthorizationRefusesBeforePublication() async throws {
+        let fixture = try makeFixture()
+        makeRunning(fixture)
+
+        let outcome = await steer(fixture) {
+            fixture.session.stopState.invalidateScheduledStarts()
+            return .committed
+        }
+
+        XCTAssertEqual(outcome, .blocked(.targetStopped))
+        XCTAssertTrue(fixture.session.items.isEmpty)
+        XCTAssertTrue(fixture.session.pendingClaudeSteeringInstructions.isEmpty)
+    }
+
+    func testCancelledAuthorizationWaitCannotStageManagedInput() async throws {
+        let fixture = try makeFixture()
+        makeRunning(fixture)
+        let gate = AgentSessionLinkStopSignal<Void>()
+        var enteredAuthorization = false
+        let operation = Task { @MainActor in
+            await steer(fixture) {
+                enteredAuthorization = true
+                await gate.value()
+                return .committed
+            }
+        }
+        addTeardownBlock { @MainActor in
+            operation.cancel()
+            gate.finish(())
+            _ = await operation.value
+        }
+        try await AsyncTestWait.waitUntil("managed authorization suspended") {
+            await MainActor.run { enteredAuthorization }
+        }
+
+        operation.cancel()
+        gate.finish(())
+        let outcome = await operation.value
+        XCTAssertEqual(outcome, .blocked(.steerNotAccepted))
+        XCTAssertTrue(fixture.session.items.isEmpty)
+        XCTAssertTrue(fixture.session.pendingClaudeSteeringInstructions.isEmpty)
+    }
+
     func testBetweenStatesRefusesAsBusy() async throws {
         let fixture = try makeFixture()
         makeRunning(fixture)
@@ -798,12 +858,15 @@ final class AgentSessionManagedInputRuntimeTests: XCTestCase {
     }
 
     private func fixture(
+        store: AgentSessionRuntimeStore = AgentSessionRuntimeStore(),
+        inputResourcesAreCurrent: @escaping @MainActor () -> Bool = { true },
+        validateInputResources: (@MainActor (AgentSessionRuntimeStore.Command?) async -> Bool)? = nil,
         inputWorkspace: @escaping @MainActor (AgentTabSession) async throws -> AgentSessionProviderInputRuntime.WorkspaceSource? = { _ in nil },
         initialThreadInput: @escaping @MainActor (AgentTabSession) async throws -> AgentSessionProviderInputRuntime.InitialThreadInput? = { _ in
             .init(workspace: .init(store: WorkspaceFileContextStore(), lookupSource: nil), selection: .init(selectedPaths: []), promptText: nil)
         }
     ) throws -> Fixture {
-        let scope = AgentSessionRuntimeStore().makeScope()
+        let scope = store.makeScope()
         let session = scope.makeSession(tabID: UUID())
         let workspaceID = UUID(), sessionID = UUID()
         session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID, workspaceID: workspaceID))
@@ -811,7 +874,8 @@ final class AgentSessionManagedInputRuntimeTests: XCTestCase {
         session.hasLoadedPersistedState = true
         session.selectedAgent = .claudeCode
         scope.replaceSessions([session.tabID: session])
-        let links = scope.makeLinkExecution(routeID: 401, commands: .init(
+        let tools = MCPToolExecutionRuntime()
+        let links = scope.makeLinkExecution(routeID: MCPRouteIdentityAllocator.allocateHost().routeID, commands: .init(
             isAvailable: { true }, modelAvailability: { .init() }, workspaceID: { _ in workspaceID },
             input: scope.providerInput(skillCatalog: AgentSkillCatalog(), perfRecorder: NoopAgentModePerfRecorder()),
             workspacePaths: { [] }, inputWorkspace: { session, command in
@@ -827,7 +891,16 @@ final class AgentSessionManagedInputRuntimeTests: XCTestCase {
             start: { _, _, _, _, _ in XCTFail("Active managed input must not call the legacy start adapter")
                 return nil
             },
-            settleSelfCompact: { _ in }, selfCompactBlocksWake: { _ in false }, selfCompactHoldsWakeAcquisition: { _ in false }
+            settleSelfCompact: { _ in }, selfCompactBlocksWake: { _ in false }, selfCompactHoldsWakeAcquisition: { _ in false },
+            managedInputEnvironment: { _ in
+                .init(
+                    workspaceID: workspaceID,
+                    resourcesAreCurrent: inputResourcesAreCurrent,
+                    settings: .shared,
+                    tools: tools,
+                    validateResources: validateInputResources
+                )
+            }
         ), diagnostics: NoopAgentSessionLinkCatalogEventSink())
         let endpoint = try XCTUnwrap(links.agentSessionLinkObserverEndpoint(tabID: session.tabID))
         let candidate = AgentSessionLinkEndpointCandidate(
@@ -839,7 +912,7 @@ final class AgentSessionManagedInputRuntimeTests: XCTestCase {
             roleAllowsOutboundMonitoring: true, displayName: "Runtime input", providerDisplayName: nil,
             locationLabel: nil, restorationReadiness: session.qualifiedRestorationReadiness
         )
-        return Fixture(scope: scope, session: session, links: links, candidate: candidate, tools: MCPToolExecutionRuntime())
+        return Fixture(scope: scope, session: session, links: links, candidate: candidate, tools: tools)
     }
 
     private func environment(
@@ -873,12 +946,18 @@ final class AgentSessionManagedInputRuntimeTests: XCTestCase {
     )
 
     func testWaitingManagedInputExecutesWithoutPresentationAndKeepsAttribution() async throws {
-        let f = try fixture()
+        let f = try fixture(store: .shared)
         let response = try await waiting(f)
+        addTeardownBlock { @MainActor in
+            f.session.instructionContinuation?.resume(throwing: CancellationError())
+            f.session.instructionWait = nil
+            _ = try? await response.value
+        }
         let request = request()
-        let outcome = await f.links.agentSessionLinkPerformSteer(
-            to: f.candidate, request: request, liveness: { Self.live }, commitAuthorization: { .committed },
-            environment: environment(f)
+        let host = WindowStatesManager.shared
+        XCTAssertNil(host.window(withID: f.candidate.windowID))
+        let outcome = await host.agentSessionLinkPerformSteer(
+            to: f.candidate, request: request, liveness: { Self.live }, commitAuthorization: { .committed }
         )
         guard case let .delivered(delivery) = outcome else { return XCTFail("Unexpected outcome: \(outcome)") }
         let delivered = try await response.value
@@ -893,15 +972,14 @@ final class AgentSessionManagedInputRuntimeTests: XCTestCase {
     }
 
     func testResourceRevocationAtLastSecurityAwaitLeavesNoRowOrProviderEffect() async throws {
-        let f = try fixture()
-        let response = try await waiting(f)
         var current = true
+        let f = try fixture(inputResourcesAreCurrent: { current })
+        let response = try await waiting(f)
         let outcome = await f.links.agentSessionLinkPerformSteer(
             to: f.candidate, request: request(), liveness: { Self.live },
             commitAuthorization: { current = false
                 return .committed
-            },
-            environment: environment(f, isCurrent: { current })
+            }
         )
         XCTAssertEqual(outcome, .blocked(.endpointReadiness))
         XCTAssertTrue(f.session.items.isEmpty)
@@ -920,7 +998,7 @@ final class AgentSessionManagedInputRuntimeTests: XCTestCase {
                 f.scope.replaceSessions([:])
                 f.scope.replaceSessions([f.session.tabID: f.session])
                 return .committed
-            }, environment: environment(f)
+            }
         )
         XCTAssertEqual(outcome, .blocked(.endpointReadiness))
         XCTAssertTrue(f.session.items.isEmpty)
@@ -973,12 +1051,10 @@ final class AgentSessionManagedInputRuntimeTests: XCTestCase {
         let ticket = f.session.codexDispatchSerialGate.issueTicket()
         let ownsGate = await f.session.codexDispatchSerialGate.awaitTurn(ticket)
         XCTAssertTrue(ownsGate)
-        let environment = environment(f)
         let request = request()
         let observer = Task { @MainActor in
             await f.links.agentSessionLinkPerformSteer(
-                to: f.candidate, request: request, liveness: { Self.live }, commitAuthorization: { .committed },
-                environment: environment
+                to: f.candidate, request: request, liveness: { Self.live }, commitAuthorization: { .committed }
             )
         }
         try await AsyncTestWait.waitUntil("managed row before provider gate") { await MainActor.run { f.session.items.contains { $0.kind == .user } } }
@@ -1009,17 +1085,16 @@ final class AgentSessionManagedInputRuntimeTests: XCTestCase {
     }
 
     func testResourceRevocationAfterRowAcceptanceWithdrawsOnlyTheUndispatchedInput() async throws {
-        let f = try fixture()
+        var current = true
+        let f = try fixture(inputResourcesAreCurrent: { current })
         let response = try await waiting(f)
         let ticket = f.session.codexDispatchSerialGate.issueTicket()
         let ownsGate = await f.session.codexDispatchSerialGate.awaitTurn(ticket)
         XCTAssertTrue(ownsGate)
-        var current = true
-        let environment = environment(f, isCurrent: { current })
         let request = request()
         let observer = Task { @MainActor in
             await f.links.agentSessionLinkPerformSteer(
-                to: f.candidate, request: request, liveness: { Self.live }, commitAuthorization: { .committed }, environment: environment
+                to: f.candidate, request: request, liveness: { Self.live }, commitAuthorization: { .committed }
             )
         }
         try await AsyncTestWait.waitUntil("accepted row before resource loss") { await MainActor.run { f.session.items.contains { $0.kind == .user } } }
@@ -1036,16 +1111,16 @@ final class AgentSessionManagedInputRuntimeTests: XCTestCase {
     }
 
     func testAsyncResourceValidationRechecksTheAcceptedWaitingInstruction() async throws {
-        let f = try fixture()
-        let response = try await waiting(f)
         let gate = AgentSessionLinkStopSignal<Void>()
         var validations = 0
         var validationEntered = false
         var current = true
-        let environment = AgentSessionLinkExecutionRuntime.ManagedInputEnvironment(
-            workspaceID: f.candidate.workspaceID, resourcesAreCurrent: { current }, settings: .shared, tools: f.tools,
-            validateResources: { command in
-                XCTAssertTrue(command?.writer.session === f.session)
+        weak var expectedSession: AgentTabSession?
+        let f = try fixture(
+            inputResourcesAreCurrent: { current },
+            validateInputResources: { command in
+                XCTAssertTrue(command?.writer.session === expectedSession)
+                XCTAssertTrue(command?.isCurrent == true)
                 validations += 1
                 guard validations == 2 else { return true }
                 validationEntered = true
@@ -1053,10 +1128,12 @@ final class AgentSessionManagedInputRuntimeTests: XCTestCase {
                 return true // Resource success cannot renew the original synchronous admission.
             }
         )
+        expectedSession = f.session
+        let response = try await waiting(f)
         let request = request()
         let observer = Task { @MainActor in
             await f.links.agentSessionLinkPerformSteer(
-                to: f.candidate, request: request, liveness: { Self.live }, commitAuthorization: { .committed }, environment: environment
+                to: f.candidate, request: request, liveness: { Self.live }, commitAuthorization: { .committed }
             )
         }
         addTeardownBlock { @MainActor in

@@ -33,6 +33,8 @@ final class AgentSessionLinkExecutionRuntime {
         let settleSelfCompact: @MainActor (AgentTabSession) -> Void
         let selfCompactBlocksWake: @MainActor (AgentTabSession) -> Bool
         let selfCompactHoldsWakeAcquisition: @MainActor (AgentTabSession) -> Bool
+        /// Capture resource currency from the writer's own host at managed Steer admission.
+        var managedInputEnvironment: (@MainActor (AgentTabSession) -> ManagedInputEnvironment)?
         var workspaceCaptureOrder: AgentSessionProviderInputRuntime.WorkspaceCaptureOrder = .afterSkillExpansion
     }
 

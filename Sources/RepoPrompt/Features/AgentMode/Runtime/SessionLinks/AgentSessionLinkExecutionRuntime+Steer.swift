@@ -6,8 +6,7 @@ import RepoPromptSettingsCore
 //
 // An idle target goes through the ordinary attributed send transaction — durable row before the run
 // starts — framed as managed direction. A running target, or one waiting for its next instruction,
-// is steered through the same submission routing a local composer message takes
-// (`submitAgentSessionLinkManagedSteer`), after the authority commit fence re-proved the user's
+// is steered through the writer's noncomposer submission after the authority fence re-proves the user's
 // management delegation. This file owns no authority and no idempotency: the bridge reserved the
 // ledger entry and supplies the fence. Invariant: every refusal before submission leaves the target
 // byte-identical, and nothing here reads, clears, or restores the target user's composer.
@@ -82,8 +81,7 @@ extension AgentSessionLinkExecutionRuntime {
         to candidate: AgentSessionLinkEndpointCandidate,
         request: AgentSessionLinkSendRequest,
         liveness: @escaping AgentSessionLinkSendLivenessProbe,
-        commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome,
-        environment: ManagedInputEnvironment
+        commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
     ) async -> AgentSessionLinkSendTransactionOutcome {
         var managedRequest = request
         managedRequest.framing = .management
@@ -96,7 +94,8 @@ extension AgentSessionLinkExecutionRuntime {
         guard admissionLiveness.permitsDelivery else {
             return .blocked(.invalidated(admissionLiveness))
         }
-        guard let command = admit(candidate), environment.resourcesAreCurrent(),
+        guard let command = admit(candidate),
+              let environment = commands.managedInputEnvironment?(session), environment.resourcesAreCurrent(),
               environment.workspaceID == candidate.workspaceID,
               commands.workspaceID(session) == candidate.workspaceID
         else {
@@ -105,11 +104,12 @@ extension AgentSessionLinkExecutionRuntime {
 
         // Resource IO precedes the authority commit. Keep the original writer and turn across
         // this new suspension; the commit remains the last await before attributed-row mutation.
-        let resourceStopFence = AgentRunStartStopFence(session: session)
-        let resourceRun = session.activeRunOwnership
+        let stopFence = AgentRunStartStopFence(session: session)
+        let originatingAttempt = session.activeRunOwnership
+        let originatingRunID = session.runID
         guard await environment.validateResources(command), (try? command.requireCurrent()) != nil,
-              environment.resourcesAreCurrent(), resourceStopFence.permitsStart(of: session),
-              session.activeRunOwnership == resourceRun, !Task.isCancelled
+              environment.resourcesAreCurrent(), stopFence.permitsStart(of: session),
+              session.activeRunOwnership == originatingAttempt, session.runID == originatingRunID, !Task.isCancelled
         else { return .blocked(.endpointReadiness) }
         let resourceLiveness = liveness()
         guard resourceLiveness.permitsDelivery else { return .blocked(.invalidated(resourceLiveness)) }
@@ -147,6 +147,11 @@ extension AgentSessionLinkExecutionRuntime {
         }
         guard postCommitLiveness.permitsDelivery else {
             return .blocked(.invalidated(postCommitLiveness, postCommit: true))
+        }
+        guard !Task.isCancelled else { return .blocked(.steerNotAccepted) }
+        guard stopFence.permitsStart(of: liveSession) else { return .blocked(.targetStopped) }
+        guard liveSession.activeRunOwnership == originatingAttempt, liveSession.runID == originatingRunID else {
+            return .blocked(.targetBusy)
         }
         guard command.isCurrent, environment.resourcesAreCurrent(),
               commands.workspaceID(liveSession) == candidate.workspaceID
@@ -192,13 +197,14 @@ extension AgentSessionLinkExecutionRuntime {
             sink: sink
         )
         let acceptedAt = Date()
-        guard submitAgentSessionLinkManagedSteer(
+        guard submitNoncomposerSteer(
             tabID: candidate.tabID,
             session: liveSession,
             displayText: managedRequest.message,
-            turn: turn,
+            turn: AgentNoncomposerTurn(managed: turn),
             route: route,
-            environment: environment
+            environment: environment,
+            originatingCommand: command
         ),
             let targetItemID = sink.appendedItemID
         else {
