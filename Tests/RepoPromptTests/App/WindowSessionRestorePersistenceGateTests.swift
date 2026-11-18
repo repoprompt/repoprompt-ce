@@ -122,6 +122,39 @@ final class WindowSessionRestorePersistenceGateTests: XCTestCase {
         XCTAssertTrue(gate.shouldPersistNow(reason: "workspaceSwitch"))
     }
 
+    func testSnapshotKeepsUnclaimedEntriesWhenALiveWindowCloses() {
+        func entry(name: String, instance: Int) -> WindowSessionEntry {
+            WindowSessionEntry(
+                windowKind: .standard,
+                workspaceID: UUID(),
+                workspaceName: name,
+                isSystemWorkspace: false,
+                isEphemeral: false,
+                primaryRepoPath: nil,
+                lastFocused: false,
+                workspaceInstanceNumber: instance,
+                mcpToolsEnabled: true
+            )
+        }
+
+        let live = entry(name: "Live", instance: 1)
+        let closing = entry(name: "Closing", instance: 2)
+        let unclaimed = entry(name: "Unclaimed", instance: 3)
+        let snapshot = WindowSessionSnapshotBuilder.build(
+            version: 4,
+            candidates: [
+                WindowSessionCaptureCandidate(windowID: 1, entry: live),
+                WindowSessionCaptureCandidate(windowID: 2, entry: closing)
+            ],
+            excludedWindowIDs: [2],
+            unclaimedRestoreEntries: [unclaimed]
+        )
+
+        XCTAssertEqual(snapshot.windows.map(\.workspaceID), [live.workspaceID, unclaimed.workspaceID])
+        XCTAssertEqual(snapshot.windows.last?.workspaceInstanceNumber, 3)
+        XCTAssertEqual(snapshot.windows.last?.mcpToolsEnabled, true)
+    }
+
     func testWindowClosedMidRestoreReleasesGateAndUnknownWindowFinishIsHarmless() {
         var gate = WindowSessionRestorePersistenceGate()
         gate.beginRestoringWindow(7)

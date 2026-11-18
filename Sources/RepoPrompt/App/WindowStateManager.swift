@@ -49,7 +49,8 @@ enum WindowSessionSnapshotBuilder {
     static func build(
         version: Int,
         candidates: [WindowSessionCaptureCandidate],
-        excludedWindowIDs: Set<Int>
+        excludedWindowIDs: Set<Int>,
+        unclaimedRestoreEntries: [WindowSessionEntry] = []
     ) -> WindowSessionSnapshot {
         var entries: [WindowSessionEntry] = []
         for candidate in candidates {
@@ -57,6 +58,7 @@ enum WindowSessionSnapshotBuilder {
             guard let entry = candidate.entry else { continue }
             entries.append(entry)
         }
+        entries.append(contentsOf: unclaimedRestoreEntries)
         return WindowSessionSnapshot(version: version, windows: entries)
     }
 }
@@ -1305,15 +1307,16 @@ class WindowStatesManager: ObservableObject {
         updateAgentSessionOversightTopologyState()
     }
 
-    /// Each window supplies its own capture decision (restore protection included); explicit-close
-    /// exclusion stays here, in `WindowSessionSnapshotBuilder`.
+    /// Keep queued entries after the grace period releases persistence. Claiming an
+    /// entry removes it from the queue, so the restored window supplies its own capture.
     private func captureCurrentSession() -> WindowSessionSnapshot {
         let candidates = allWindows.map { $0.sessionCaptureCandidate() }
 
         return WindowSessionSnapshotBuilder.build(
             version: 4,
             candidates: candidates,
-            excludedWindowIDs: explicitlyClosingWindowIDs
+            excludedWindowIDs: explicitlyClosingWindowIDs,
+            unclaimedRestoreEntries: restoreQueue
         )
     }
 
