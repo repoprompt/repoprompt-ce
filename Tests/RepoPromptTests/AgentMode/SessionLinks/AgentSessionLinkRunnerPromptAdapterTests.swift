@@ -2116,6 +2116,10 @@ final class AgentSessionLinkLocalInputTests: XCTestCase {
             XCTAssertNil(noOffers)
             XCTAssertFalse(baseline.fragment.contains("user_input"))
             let decorated = try XCTUnwrap(h.decorate(baseline))
+            XCTAssertLessThanOrEqual(
+                decorated.fragment.utf8.count,
+                AgentSessionLinkPrompts.maximumRenderedBytes + AgentSessionLinkPrompts.maximumLocalInputDeltaBytes + escaped.utf8.count + 1
+            )
             let expectedBytes = name == "short" ? (8649, 8927, 87) : name == "capped" ? (8649, 9572, 732) : (8808, 12659, 3660)
             XCTAssertEqual(baseline.fragment.utf8.count, expectedBytes.0)
             XCTAssertEqual(decorated.fragment.utf8.count, expectedBytes.1)

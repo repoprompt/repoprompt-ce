@@ -104,10 +104,11 @@ extension AgentSessionLinkExecutionRuntime {
            supplementalInput.utf8.count > current.utf8.count { budgetInstructions[budgetInstructions.count - 1] = supplementalInput }
         let budget = AgentProviderHandover.Budget(
             catalogWindow: catalogWindow,
-            instructions: budgetInstructions, composedInput: "\n\n" + initial, isPreview: false
+            instructions: budgetInstructions, composedInput: "\n\n" + initial, isPreview: false,
+            codexCarrierScalars: agent == .codexExec
+                ? AgentProviderHandover.codexCarrierAllowance(composedInput: initial, parkedNote: session.selfCompactState.parkedNote?.frame) : nil
         )
-        guard descriptor.mode != "summary" || bytes <= AgentProviderHandover.maximumSummaryBytes,
-              AgentProviderHandover.estimate(payload) <= budget.remainingCarrierTokens
+        guard let mode = AgentProviderHandover.Mode(rawValue: descriptor.mode), budget.fits(payload: payload, mode: mode)
         else { return .failure(.providerHandoverDoesNotFit) }
         return .success(ProviderSwitchSendPreparation(
             command: command, binding: binding, handoff: handoff, agent: agent, model: model, rawInput: input,
