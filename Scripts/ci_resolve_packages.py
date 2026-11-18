@@ -124,7 +124,14 @@ def main() -> int:
     parser.add_argument('--root', type=Path, default=Path.cwd())
     parser.add_argument('--scratch-path')
     args = parser.parse_args()
-    return resolve(args.root, args.scratch_path)
+    cold_primary = (
+        args.scratch_path is None
+        and (args.root / 'Package.resolved').is_file()
+        and not (args.root / '.build' / 'workspace-state.json').is_file()
+    )
+    if cold_primary:
+        print('Primary SwiftPM workspace cache is absent; allowing 600s per resolution attempt', flush=True)
+    return resolve(args.root, args.scratch_path, timeout=600 if cold_primary else 300)
 
 
 if __name__ == '__main__':

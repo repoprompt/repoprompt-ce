@@ -201,6 +201,25 @@ class ResolutionTests(unittest.TestCase):
             resolver.seed_scratch_repositories(root, '.build/swiftbuild', timeout=300)
             self.assertEqual(seeded.read_text(), 'scratch can change independently')
 
+    def test_cli_grants_a_larger_budget_only_to_cold_primary_pinned_resolution(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base_args = ['ci_resolve_packages.py', '--root', str(root)]
+            with mock.patch.object(resolver, 'resolve', return_value=0) as resolve:
+                with mock.patch.object(sys, 'argv', base_args):
+                    self.assertEqual(resolver.main(), 0)
+                    resolve.assert_called_with(root, None, timeout=300)
+                    (root / 'Package.resolved').write_text('{}')
+                    self.assertEqual(resolver.main(), 0)
+                    resolve.assert_called_with(root, None, timeout=600)
+                    (root / '.build').mkdir()
+                    (root / '.build' / 'workspace-state.json').write_text('{}')
+                    self.assertEqual(resolver.main(), 0)
+                    resolve.assert_called_with(root, None, timeout=300)
+                with mock.patch.object(sys, 'argv', base_args + ['--scratch-path', '.build/swiftbuild']):
+                    self.assertEqual(resolver.main(), 0)
+                    resolve.assert_called_with(root, '.build/swiftbuild', timeout=300)
+
     def test_existing_lockfile_cannot_be_rewritten_by_resolution(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
