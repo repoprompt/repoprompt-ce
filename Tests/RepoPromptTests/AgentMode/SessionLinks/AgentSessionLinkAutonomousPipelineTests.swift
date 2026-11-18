@@ -783,7 +783,7 @@ final class LiveWindowEndpointHost: AgentSessionLinkEndpointHost {
         guard let viewModel = viewModelsByWindowID[candidate.windowID] else {
             return .failure(.endpointInvalidated)
         }
-        return await viewModel.agentSessionLinkTranscriptPage(
+        return await viewModel.linkExecutionRuntime.agentSessionLinkTranscriptPage(
             for: candidate,
             anchor: anchor,
             direction: direction,
