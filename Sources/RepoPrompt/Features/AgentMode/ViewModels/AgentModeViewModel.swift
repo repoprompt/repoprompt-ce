@@ -1145,16 +1145,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         /// Stays at zero while the sidebar search box is empty.
         var test_sidebarSearchFieldsMaterializationCount = 0
         private var test_afterDurableChildTabCreation: (@MainActor () async -> Void)?
-        /// Runs on the `@MainActor` inside `agentSessionLinkTranscriptPage(...)`, after the page has
-        /// been materialized off the actor and before the release gate re-proves the endpoint.
-        ///
-        /// Not `private`: the read path lives in `AgentModeViewModel+SessionLinkTranscript`. It exists
-        /// because that gate is only meaningful for a page that already exists, and no collaborator at
-        /// this layer can be substituted to occupy the window — the view model is itself the
-        /// materializer, and its input is an inert `Sendable` snapshot. Driving the window from outside
-        /// instead means racing the read from another task, which is how the regression test for this
-        /// gate came to fail on *correct* behavior when the read legitimately finished first.
-        var test_afterSessionLinkTranscriptPageMaterialized: (@MainActor () async -> Void)?
         private var test_afterExplicitTabSessionReady: (@MainActor () async -> Void)?
         private var test_afterProvisionalExistingTabBindingInstalled: (@MainActor () async -> Void)?
         private var test_afterDurableExplicitTabSessionBinding: (@MainActor () async -> Void)?
