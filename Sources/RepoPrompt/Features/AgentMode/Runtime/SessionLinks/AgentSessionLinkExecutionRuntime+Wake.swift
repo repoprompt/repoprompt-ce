@@ -1908,7 +1908,7 @@ extension AgentSessionLinkExecutionRuntime {
                 return nil
             }
             if let suppressed,
-               admissionFingerprint(suppressed) == admissionFingerprint(fingerprint)
+               !addsAdmissionContent(fingerprint, after: suppressed)
             {
                 return nil
             }
@@ -1957,33 +1957,26 @@ extension AgentSessionLinkExecutionRuntime {
             hasConcreteAdmittingEntry || overflowAloneMayWake
         }
 
-        private var admittingAttentionOccurrenceSet:
-            Set<AgentSessionLinkPassiveStatusNotices.AttentionOccurrenceIdentity>
-        {
-            Set(admittingAttentionOccurrences)
+        /// A receipt can shrink the queue without producing a new wake reason. Compare the
+        /// current occurrences against the failure, so settling edges cannot re-arm survivors.
+        private func addsRoutineContent(
+            _ fingerprint: AgentSessionLinkPassiveStatusNotices.WakeEligibilityFingerprint,
+            after suppressed: AgentSessionLinkPassiveStatusNotices.WakeEligibilityFingerprint
+        ) -> Bool {
+            if fingerprint.queueEpoch != suppressed.queueEpoch || fingerprint.overflowProduced > suppressed.overflowProduced {
+                return true
+            }
+            guard !fingerprint.edges.isEmpty, fingerprint.edges != suppressed.edges else { return false }
+            let previousEdges = Set(suppressed.edges)
+            return fingerprint.edges.contains { !previousEdges.contains($0) }
         }
 
-        private func admissionFingerprint(
-            _ fingerprint: AgentSessionLinkPassiveStatusNotices.WakeEligibilityFingerprint
-        ) -> AgentSessionLinkPassiveStatusNotices.WakeEligibilityFingerprint {
-            let admitted = admittingAttentionOccurrenceSet
-            return AgentSessionLinkPassiveStatusNotices.WakeEligibilityFingerprint(
-                queueEpoch: fingerprint.queueEpoch,
-                edges: fingerprint.edges,
-                attentionOccurrences: fingerprint.attentionOccurrences.filter(admitted.contains),
-                overflowProduced: fingerprint.overflowProduced
-            )
-        }
-
-        private func attentionFreeFingerprint(
-            _ fingerprint: AgentSessionLinkPassiveStatusNotices.WakeEligibilityFingerprint
-        ) -> AgentSessionLinkPassiveStatusNotices.WakeEligibilityFingerprint {
-            AgentSessionLinkPassiveStatusNotices.WakeEligibilityFingerprint(
-                queueEpoch: fingerprint.queueEpoch,
-                edges: fingerprint.edges,
-                attentionOccurrences: [],
-                overflowProduced: fingerprint.overflowProduced
-            )
+        private func addsAdmissionContent(
+            _ fingerprint: AgentSessionLinkPassiveStatusNotices.WakeEligibilityFingerprint,
+            after suppressed: AgentSessionLinkPassiveStatusNotices.WakeEligibilityFingerprint
+        ) -> Bool {
+            addsRoutineContent(fingerprint, after: suppressed)
+                || !unsuppressedAdmittingAttentionOccurrences(suppressed: suppressed).isEmpty
         }
 
         func unsuppressedAdmittingAttentionOccurrences(
@@ -2001,7 +1994,7 @@ extension AgentSessionLinkExecutionRuntime {
             suppressed: AgentSessionLinkPassiveStatusNotices.WakeEligibilityFingerprint?
         ) -> Bool {
             guard hasOrdinaryAdmissionBasis, let suppressed else { return false }
-            return attentionFreeFingerprint(suppressed) == attentionFreeFingerprint(fingerprint)
+            return !addsRoutineContent(fingerprint, after: suppressed)
         }
 
         /// Whether the publication has a basis that is not the exact structural failure already
@@ -2020,7 +2013,7 @@ extension AgentSessionLinkExecutionRuntime {
             guard hasAdmissionBasis else { return false }
             if isManual { return true }
             guard let suppressed else { return true }
-            return admissionFingerprint(suppressed) != admissionFingerprint(fingerprint)
+            return addsAdmissionContent(fingerprint, after: suppressed)
         }
 
         /// Attention is required when no ordinary basis admits, or when attention is the only thing
@@ -2040,13 +2033,9 @@ extension AgentSessionLinkExecutionRuntime {
                     return newlyAdmitting
                 }
                 guard let suppressed else { return first }
-                // If the queue reverted to the exact projected failure, the old occurrence is not
-                // a replacement basis. Returning nil preserves the already-required successor so
-                // preparation fails closed. A distinct non-attention structural change retains the
-                // legacy fingerprint re-arm and may still use the rendered occurrence.
-                guard admissionFingerprint(suppressed) != admissionFingerprint(fingerprint) else {
-                    return nil
-                }
+                // A newly produced status or overflow may still re-arm this occurrence. A receipt
+                // settling existing content cannot replace the attempt's required successor.
+                guard addsRoutineContent(fingerprint, after: suppressed) else { return nil }
                 return first
             }
             guard ordinaryAdmissionBasisIsSuppressed(
