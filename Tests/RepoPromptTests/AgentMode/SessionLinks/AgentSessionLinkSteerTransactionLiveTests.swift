@@ -496,10 +496,10 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
         let session = fixture.session
         let original = try XCTUnwrap(session.activeRunOwnership)
 
-        let outcome = await steer(fixture) {
+        let outcome = await steer(fixture, commit: {
             _ = session.beginRunAttempt(source: "successor-during-managed-steer")
             return .committed
-        }
+        })
 
         XCTAssertNotEqual(session.activeRunOwnership, original)
         XCTAssertEqual(outcome, .blocked(.targetBusy))
@@ -511,10 +511,10 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
         let fixture = try makeFixture()
         makeRunning(fixture)
 
-        let outcome = await steer(fixture) {
+        let outcome = await steer(fixture, commit: {
             fixture.session.stopState.invalidateScheduledStarts()
             return .committed
-        }
+        })
 
         XCTAssertEqual(outcome, .blocked(.targetStopped))
         XCTAssertTrue(fixture.session.items.isEmpty)
@@ -527,11 +527,11 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
         let gate = AgentSessionLinkStopSignal<Void>()
         var enteredAuthorization = false
         let operation = Task { @MainActor in
-            await steer(fixture) {
+            await steer(fixture, commit: {
                 enteredAuthorization = true
                 await gate.value()
                 return .committed
-            }
+            })
         }
         addTeardownBlock { @MainActor in
             operation.cancel()
