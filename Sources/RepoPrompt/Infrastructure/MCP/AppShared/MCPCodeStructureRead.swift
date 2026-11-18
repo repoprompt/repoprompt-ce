@@ -1,6 +1,6 @@
 import Foundation
-import RepoPromptFileSystem
-import RepoPromptShared
+import RepoPromptFoundation
+import RepoPromptInstrumentation
 import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
