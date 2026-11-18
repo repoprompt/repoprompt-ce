@@ -708,6 +708,14 @@ applies the same rule only to the active compose tab, decorates a freshly resolv
 flows through `displayedWindowTitle` to native tabs, the Agent titlebar cluster, `NSWindow.title`,
 and Dock window lists.
 
+## Transcript reads use the session writer
+
+The link read captures a canonical transcript snapshot from the exact writer and materializes the
+sanitized page off the main actor. Before releasing it, the runtime compares the writer
+incarnation again. Removing and reacquiring the same session object invalidates an in-flight
+read even when its visible endpoint fields still match. The bridge revalidates both endpoints and
+mints the successor cursor under the current read grant before the tool returns the page.
+
 ## One post-storage invalidation seam, two consumer schedulers
 
 `agentSessionLinkMutateProjectionStorage` is the sole mutation boundary for the exact projection

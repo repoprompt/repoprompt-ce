@@ -519,6 +519,10 @@ package final class AzureOpenAIProvider: AIProvider {
             (.gpt5CodexMed, "low")
         case .gpt61Terra, .gpt61TerraNone, .gpt61TerraLow, .gpt61TerraHigh, .gpt61TerraXHigh, .gpt61TerraMax:
             (.gpt61Terra, host.defaultReasoningEffort(for: model))
+        case .gpt62Sol, .gpt62SolLow, .gpt62SolHigh, .gpt62SolXHigh, .gpt62SolMax:
+            (.gpt62Sol, host.defaultReasoningEffort(for: model))
+        case .gpt62Astra, .gpt62AstraLow, .gpt62AstraHigh, .gpt62AstraXHigh, .gpt62AstraMax:
+            (.gpt62Astra, host.defaultReasoningEffort(for: model))
         case .gpt61Sol, .gpt61SolLow, .gpt61SolHigh, .gpt61SolXHigh, .gpt61SolMax:
             (.gpt61Sol, host.defaultReasoningEffort(for: model))
         case .gpt6Astra, .gpt6AstraLow, .gpt6AstraHigh, .gpt6AstraXHigh, .gpt6AstraMax:
@@ -547,6 +551,8 @@ package final class AzureOpenAIProvider: AIProvider {
         case .gpt5, .gpt5Low, .gpt5High, .gpt5XHigh,
              .gpt54, .gpt54Low, .gpt54High, .gpt54XHigh,
              .gpt54Mini, .gpt54MiniLow, .gpt54MiniHigh, .gpt54MiniXHigh, .gpt54Nano,
+             .gpt62Sol, .gpt62SolLow, .gpt62SolHigh, .gpt62SolXHigh, .gpt62SolMax,
+             .gpt62Astra, .gpt62AstraLow, .gpt62AstraHigh, .gpt62AstraXHigh, .gpt62AstraMax,
              .gpt61Sol, .gpt61SolLow, .gpt61SolHigh, .gpt61SolXHigh, .gpt61SolMax,
              .gpt61Terra, .gpt61TerraNone, .gpt61TerraLow, .gpt61TerraHigh, .gpt61TerraXHigh, .gpt61TerraMax,
              .gpt6Astra, .gpt6AstraLow, .gpt6AstraHigh, .gpt6AstraXHigh, .gpt6AstraMax,

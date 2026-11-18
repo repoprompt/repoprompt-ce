@@ -1279,6 +1279,47 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         }
     }
 
+    func testRestoredWorktreeAdmissionUsesExactCanonicalHostWithoutPresenter() async throws {
+        let (host, f, _, _, _, _, authority) = try await hostStartupFixture(
+            canonicalWorkspace: true, boundCanonicalCarrier: true
+        )
+        host.scope.worktrees.captureResources = { _ in
+            XCTFail("The canonical writer must not consult a presenting worktree adapter")
+            return nil
+        }
+        let command = try host.scope.admit(session: f.session)
+        let admission = try await host.scope.worktrees.admitForExecution(command)
+        XCTAssertEqual(admission.command.identity, command.identity)
+        XCTAssertNotNil(admission.resources.store)
+        try admission.requireCurrent()
+
+        let current = await authority.canonicalWorkspaceSnapshot(command.identity.workspaceID)
+        let snapshot = try XCTUnwrap(current)
+        var changed = try JSONDecoder().decode(WorkspaceModel.self, from: snapshot.document.documentBytes)
+        let index = try XCTUnwrap(changed.composeTabs.firstIndex(where: { $0.id == f.session.tabID }))
+        changed.composeTabs[index].promptText = "Unrelated to execution placement"
+        let result = try await authority.replaceWorkingFailClosed(
+            changed, fileURL: snapshot.document.fileURL, expectedWorkspaceRevision: snapshot.revisions.workingRevision
+        )
+        XCTAssertEqual(result.disposition, .applied)
+        let validatePlacement = try XCTUnwrap(admission.resources.validatePlacement)
+        try await validatePlacement()
+
+        let latest = await authority.canonicalWorkspaceSnapshot(command.identity.workspaceID)
+        let edited = try XCTUnwrap(latest)
+        changed.composeTabs[index].activeAgentSessionID = UUID()
+        let displaced = try await authority.replaceWorkingFailClosed(
+            changed, fileURL: edited.document.fileURL, expectedWorkspaceRevision: edited.revisions.workingRevision
+        )
+        XCTAssertEqual(displaced.disposition, .applied)
+        XCTAssertTrue(command.isCurrent, "The old writer can still exist while canonical placement changes")
+        do {
+            try await validatePlacement()
+            XCTFail("A captured worktree operation must refuse a successor carrier")
+        } catch AgentSessionWorktreeRuntime.TransitionError.stale {}
+        XCTAssertTrue(f.session.worktreeBindings.isEmpty)
+    }
+
     func testHostStartupRevalidatesAsyncResourceAdmissionAndContinuationStop() async throws {
         for (change, heldAdmission) in [("context", 1), ("context", 2), ("activation", 2), ("writer", 2), ("worktree", 2), ("stop", 2), ("cancel", 2), ("continuationStop", 2)] {
             let (host, f, resources, provider, activations, changeContext, _) = try await hostStartupFixture()

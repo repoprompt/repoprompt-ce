@@ -421,8 +421,15 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
     /// Capture elects nothing and requires no hydrated bindings: merge apply needs only its admission roots.
     @MainActor
     private struct TargetCapture {
-        let command: AgentSessionRuntimeStore.Command
-        let resources: AgentSessionWorktreeRuntime.Resources
+        let admission: AgentSessionWorktreeRuntime.Admission
+        var command: AgentSessionRuntimeStore.Command {
+            admission.command
+        }
+
+        var resources: AgentSessionWorktreeRuntime.Resources {
+            admission.resources
+        }
+
         var workspaceID: UUID {
             command.identity.workspaceID
         }
@@ -507,10 +514,9 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
     private func captureTarget(
         _ command: AgentSessionRuntimeStore.Command, isStillAuthorized: @MainActor () -> Bool
     ) async throws -> TargetCapture {
-        guard command.isCurrent,
-              let resources = command.writer.scope.worktrees.captureResources?(command), resources.isCurrent(),
-              let store = resources.store
-        else { throw SessionAdminHostError.sessionUnavailable }
+        let admission = try await admitWorktreeCommand(command, isStillAuthorized: isStillAuthorized)
+        let resources = admission.resources
+        guard let store = resources.store else { throw SessionAdminHostError.sessionUnavailable }
         let bindingSource = TargetCapture.bindingSource(command)
         func requireCurrent() throws {
             try Task.checkCancellation()
@@ -560,11 +566,27 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
             }
         }
         let capture = TargetCapture(
-            command: command, resources: resources,
-            roots: roots, repos: repos, repoByRootPath: repoByRootPath, bindingSource: bindingSource
+            admission: admission, roots: roots, repos: repos,
+            repoByRootPath: repoByRootPath, bindingSource: bindingSource
         )
         try requireCurrent()
         return capture
+    }
+
+    private func admitWorktreeCommand(
+        _ command: AgentSessionRuntimeStore.Command, isStillAuthorized: @MainActor () -> Bool
+    ) async throws -> AgentSessionWorktreeRuntime.Admission {
+        guard isStillAuthorized(), command.isCurrent else { throw SessionAdminHostError.authorityEnded }
+        let runtime = command.writer.scope.worktrees
+        let admission: AgentSessionWorktreeRuntime.Admission
+        do {
+            admission = try await runtime.admitForExecution(command)
+        } catch AgentSessionWorktreeRuntime.TransitionError.unavailable {
+            throw SessionAdminHostError.sessionUnavailable
+        }
+        guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
+        try admission.requireCurrent()
+        return admission
     }
 
     /// Create/bind require the target's authoritative, hydrated bindings and their validated projection
@@ -752,13 +774,14 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         let target = try await resolveRepository(repoRoot, authority: authority)
         // Placement and the target's bindings must hold until the Git commit fence. A committed worktree is
         // returned even if authority changes afterwards, so the handler can record its ownership.
-        let authorize: @MainActor () throws -> Void = {
+        let authorize: @MainActor () async throws -> Void = {
+            try await capture.resources.validatePlacement?()
             guard !Task.isCancelled, isStillAuthorized(), authority.isCurrent
             else { throw SessionAdminHostError.authorityEnded }
         }
-        try authorize()
+        try await authorize()
         let existing = try await vcsService.listGitWorktrees(at: target.repo.rootURL)
-        try authorize()
+        try await authorize()
         let mainRoot = existing.first(where: \.isMain)?.path ?? target.repo.rootPath
         // Refusals name the checkout Git runs in, plus the workspace root it serves when that differs.
         let executionRepository = target.repo.rootURL.standardizedFileURL.path
@@ -806,7 +829,7 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         )
         // Step 2: the container is derived from that admitted repository (never from arguments), so it
         // is created only now, then the destination is admitted under it.
-        try authorize()
+        try await authorize()
         try FileManager.default.createDirectory(at: plan.appManagedContainer, withIntermediateDirectories: true)
         let snapshot = try await DomainMutationPathFence.admit(
             requestedPaths: [target.repo.rootURL.standardizedFileURL.path, plan.path.standardizedFileURL.path],
@@ -920,6 +943,7 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         // The transition's exact no-op path has no beforeCommit callback. A released ownership row
         // may still be reactivated by that bind, so even this path receives identity admission.
         if existing == desired {
+            try await capture.resources.validatePlacement?()
             guard !Task.isCancelled, isStillAuthorized(), authority.isCurrent else { throw SessionAdminHostError.authorityEnded }
             try admit()
             committed()
@@ -927,7 +951,7 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         // Placement and target bindings are re-checked at entry and at `beforeCommit`; the transition's own
         // publication afterwards never counts as supersession.
         try await transition(
-            desired, command: capture.command,
+            desired, admission: capture.admission,
             isStillAuthorized: { isStillAuthorized() && authority.isCurrent },
             admitBindings: admit, bindingsCommitted: committed
         )
@@ -969,15 +993,14 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         let existing = session.worktreeBindings
         let removed = existing.filter { worktreeID == nil || $0.worktreeID == worktreeID }
         guard !removed.isEmpty else { return [] }
-        guard let resources = command.writer.scope.worktrees.captureResources?(command), resources.isCurrent() else {
-            throw SessionAdminHostError.sessionUnavailable
-        }
+        let admission = try await admitWorktreeCommand(command, isStillAuthorized: isStillAuthorized)
+        guard admission.bindings == existing else { throw SessionAdminHostError.authorityEnded }
         guard isIdle(session) else { throw SessionAdminHostError.notIdle }
         let remaining = existing.filter { worktreeID != nil && $0.worktreeID != worktreeID }
         let removedIDs = Set(removed.map(\.worktreeID))
         try await transition(
-            remaining, command: command,
-            isStillAuthorized: { isStillAuthorized() && resources.isCurrent() },
+            remaining, admission: admission,
+            isStillAuthorized: isStillAuthorized,
             // Publication, not the later required save, is the commit point for the removal.
             bindingsCommitted: { bindingsRemoved(removedIDs) }
         )
@@ -990,16 +1013,17 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
     /// Shared production transition seam: consent is composed with the same writer capability.
     func transition(
         _ desired: [AgentSessionWorktreeBinding],
-        command: AgentSessionRuntimeStore.Command,
+        admission: AgentSessionWorktreeRuntime.Admission,
         isStillAuthorized: @escaping @MainActor () -> Bool,
         admitBindings: @escaping @MainActor () throws -> Void = {},
         bindingsCommitted: @escaping @MainActor () -> Void = {}
     ) async throws {
+        let command = admission.command
         guard !Task.isCancelled, command.isCurrent, isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
         var published = false
         do {
             _ = try await command.writer.scope.worktrees.transition(
-                desired, command: command, intent: .externalManagement,
+                desired, admission: admission, intent: .externalManagement,
                 beforeCommit: {
                     guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
                     try admitBindings()
@@ -1108,7 +1132,7 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         defer { manager.endPreparedOversightPreparation(sessionID) }
         let command = try await preparedCommand(sessionID, isStillAuthorized: isStillAuthorized)
         let runtime = command.writer.scope.worktrees
-        let admission = try runtime.admit(command)
+        let admission = try await admitWorktreeCommand(command, isStillAuthorized: isStillAuthorized)
         let preview = try await runtime.previewMerge(
             admission: admission, repoRoot: repoRoot, target: mergeTarget ?? "@main",
             revalidateAuthority: {
@@ -1124,12 +1148,12 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         defer { manager.endPreparedOversightPreparation(sessionID) }
         let command = try await preparedCommand(sessionID, isStillAuthorized: isStillAuthorized)
         let runtime = command.writer.scope.worktrees
-        let admission = try runtime.admit(command)
         // Fence the merge's source and target worktrees to the target session's workspace roots and
         // their repositories, as `createWorktree` does; the user still decides in the review prompt.
         // Capture only: the saved operation owns its endpoints, so no default repository is elected.
         let operation = try runtime.statusMerge(command: command, operationID: operationID)
         let capture = try await captureTarget(command, isStillAuthorized: isStillAuthorized)
+        let admission = capture.admission
         guard !capture.repos.isEmpty else {
             throw SessionAdminHostError.invalid("The target session's workspace has no Git repository.")
         }

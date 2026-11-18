@@ -916,16 +916,31 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         maxOutputBytes: Int,
         readerSessionID: UUID?
     ) async -> Result<AgentSessionLinkTranscriptPage, AgentSessionLinkReadUnavailableReason> {
-        guard let window = window(withID: candidate.windowID), !window.isClosing else {
-            return .failure(.endpointInvalidated)
+        guard !isTerminating,
+              case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
+                  sessionID: candidate.sessionID, expectedWorkspaceID: candidate.workspaceID
+              ), let runtime = writer.scope.linkExecution
+        else { return .failure(.endpointInvalidated) }
+        let sourceIsAvailable: @MainActor () -> Bool
+        if writer.scope.executableHost?.workspaceActivation?.isCurrent == true {
+            sourceIsAvailable = { [weak self] in self?.isTerminating == false }
+        } else {
+            guard let window = window(withID: candidate.windowID),
+                  window.agentModeViewModel.linkExecutionRuntime === runtime
+            else { return .failure(.endpointInvalidated) }
+            sourceIsAvailable = { [weak self, weak window] in
+                guard let self, let window else { return false }
+                return !isTerminating && !window.isClosing && self.window(withID: candidate.windowID) === window
+            }
         }
-        return await window.agentModeViewModel.agentSessionLinkTranscriptPage(
+        return await runtime.agentSessionLinkTranscriptPage(
             for: candidate,
             anchor: anchor,
             direction: direction,
             maxItems: maxItems,
             maxOutputBytes: maxOutputBytes,
-            readerSessionID: readerSessionID
+            readerSessionID: readerSessionID,
+            sourceIsAvailable: sourceIsAvailable
         )
     }
 

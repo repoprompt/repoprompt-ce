@@ -1980,6 +1980,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
 
     func testCreateLanePreservesPrecommitDiagnosticAndReusesUnallocatedKey() async throws {
         try await withActivatedLaneFixture { fixture in
+            _ = await installLaneWorkspace(in: fixture.window)
             let args: [String: Value] = ["op": .string("create_lane"), "idempotency_key": .string("admission-recovery")]
             fixture.host.laneCreationError = AgentSessionLaneDestinationFailure.admissionRejected(.init(
                 reason: "workspace_persistence_rejected",
