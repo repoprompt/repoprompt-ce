@@ -1,6 +1,7 @@
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptCodexProvider
+import RepoPromptSecureStorage
 import XCTest
 
 @MainActor
@@ -78,9 +79,9 @@ final class CodexManagedAuthTransitionTests: XCTestCase {
     /// always succeeds.
     private final class ScriptedAccountClient: CodexManagedAuthRPCClient, @unchecked Sendable {
         private let lock = NSLock()
-        private var accountReads: [String]
+        private var accountReads: [String?]
 
-        init(accountReads: [String]) {
+        init(accountReads: [String?]) {
             self.accountReads = accountReads
         }
 
@@ -93,6 +94,7 @@ final class CodexManagedAuthTransitionTests: XCTestCase {
             lock.lock()
             let accountID = accountReads.isEmpty ? "" : accountReads.removeFirst()
             lock.unlock()
+            guard let accountID else { throw URLError(.timedOut) }
             guard !accountID.isEmpty else {
                 return ["account": NSNull(), "requiresOpenaiAuth": true]
             }
@@ -128,6 +130,65 @@ final class CodexManagedAuthTransitionTests: XCTestCase {
             try? await Task.sleep(nanoseconds: 5_000_000)
         }
         return false
+    }
+
+    func testColdTimeoutDoesNotClaimSignOutOrEraseKnownAccount() async {
+        let client = ScriptedAccountClient(accountReads: [nil, "acct-A", nil, ""])
+        let service = CodexManagedAuthRecoveryService(clientFactory: { client }, refreshRequestTimeout: 1)
+        let unavailable = CodexManagedAuthRefreshResult.temporarilyUnavailable(
+            message: CodexManagedAuthRecoveryClassifier.temporaryVerificationFailureMessage
+        )
+
+        let cold = await service.refreshManagedAccount()
+        XCTAssertEqual(cold, unavailable)
+        _ = await service.refreshManagedAccount()
+        let warm = await service.refreshManagedAccount()
+        XCTAssertEqual(warm, unavailable)
+        let retained = await service.managedAccountSnapshot()
+        XCTAssertEqual(retained?.accountID, "acct-A")
+
+        let expired = await service.refreshManagedAccount()
+        XCTAssertEqual(expired, .requiresUserLogin(message: CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage))
+        let cleared = await service.managedAccountSnapshot()
+        XCTAssertNil(cleared)
+    }
+
+    @MainActor
+    func testColdConnectionCheckKeepsThePersistedCodexConnectionWhenRefreshTimesOut() async {
+        let defaults = UserDefaults.standard
+        let key = "CodexCLIConnected"
+        let previous = defaults.object(forKey: key)
+        defaults.set(true, forKey: key)
+        defer { defaults.set(previous, forKey: key) }
+
+        let client = ScriptedAccountClient(accountReads: [nil, nil])
+        let recovery = CodexManagedAuthRecoveryService(clientFactory: { client }, refreshRequestTimeout: 1)
+        let keys = KeyManager(secureService: SecureKeysService(secureStorage: TestSecureStorageBackend()))
+        let settings = APISettingsViewModel(
+            aiQueriesService: AIQueriesService(keyManager: keys), keyManager: keys, loadStoredDataOnInit: false,
+            codexManagedAuthRecovery: recovery, codexSessionFence: CodexManagedSessionFence(),
+            codexExecutablePreflight: { _ in
+                .init(
+                    commandName: "codex",
+                    resolvedCommand: "codex",
+                    status: .available,
+                    runtime: nil,
+                    userMessage: "",
+                    debugMessage: ""
+                )
+            }
+        )
+        defer { settings.prepareForWindowClose() }
+
+        XCTAssertTrue(settings.isCodexConnected)
+        do {
+            _ = try await settings.testCodexConnection()
+            XCTFail("The transient verification failure should be visible to the user")
+        } catch {
+            XCTAssertEqual(settings.codexError, CodexManagedAuthRecoveryClassifier.temporaryVerificationFailureMessage)
+        }
+        XCTAssertTrue(settings.isCodexConnected)
+        XCTAssertTrue(defaults.bool(forKey: key))
     }
 
     func testReportsRecoveryAndAccountChangeOnlyAndOrdersSignOutInTheSameStream() async {

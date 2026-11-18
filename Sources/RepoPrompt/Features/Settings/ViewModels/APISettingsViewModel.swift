@@ -1454,8 +1454,11 @@ public class APISettingsViewModel: ObservableObject {
         case let .recovered(account):
             managedCodexAccount = account
             return true
-        case .requiresUserLogin, .executableUnavailable:
+        case .requiresUserLogin:
             managedCodexAccount = nil
+            return false
+        case .temporarilyUnavailable, .executableUnavailable:
+            // A transport or runtime failure says nothing about the saved connection.
             return false
         }
     }
@@ -3129,14 +3132,13 @@ public class APISettingsViewModel: ObservableObject {
             collector.append("Disposing Claude Code provider resources")
             await provider.dispose()
             collector.append("Claude Code provider disposed")
-            isClaudeCodeConnected = ok
-            if !ok || !wasConnected {
+            guard ok else { return false }
+            isClaudeCodeConnected = true
+            if !wasConnected {
                 await WindowStatesManager.shared.providerQuotaRuntime.claude.invalidate()
             }
-            setContextBuilderProviderVerified(.claudeCode, verified: ok)
-            if ok {
-                claudeCodeCLIStatus = .binaryPresent
-            }
+            setContextBuilderProviderVerified(.claudeCode, verified: true)
+            claudeCodeCLIStatus = .binaryPresent
             notifyClaudeCompatibleBackendRuntimeAvailabilityIfNeeded(previousStatus: previousStatus)
             claudeCodeError = nil
             UserDefaults.standard.set(isClaudeCodeConnected, forKey: "ClaudeCodeConnected")
@@ -3146,30 +3148,18 @@ public class APISettingsViewModel: ObservableObject {
                 object: nil,
                 userInfo: ["windowID": 0]
             )
-            if ok {
-                collector.append("Claude Code marked as connected")
-                claudeCodeLogCollector = nil
-            }
-            return isClaudeCodeConnected
+            collector.append("Claude Code marked as connected")
+            claudeCodeLogCollector = nil
+            return true
         } catch {
             collector.append("Connection test threw error: \(error.localizedDescription)")
             collector.append("Disposing Claude Code provider resources after failure")
             await provider.dispose()
             collector.append("Claude Code provider disposed")
-            await WindowStatesManager.shared.providerQuotaRuntime.claude.invalidate()
-            isClaudeCodeConnected = false
-            setContextBuilderProviderVerified(.claudeCode, verified: false)
             claudeCodeCLIStatus = Self.errorLooksLikeClaudeCodeBinaryMissing(error)
                 ? .binaryMissing(message: "Claude Code CLI isn't installed or isn't on PATH.")
                 : .binaryPresent
             notifyClaudeCompatibleBackendRuntimeAvailabilityIfNeeded(previousStatus: previousStatus)
-            UserDefaults.standard.set(isClaudeCodeConnected, forKey: "ClaudeCodeConnected")
-            await updateAvailableModels()
-            NotificationCenter.default.post(
-                name: .claudeCodeConnectionChanged,
-                object: nil,
-                userInfo: ["windowID": 0]
-            )
             var friendlyMessage: String = if let providerError = error as? AIProviderError {
                 switch providerError {
                 case let .invalidConfiguration(detail):
@@ -3504,15 +3494,8 @@ public class APISettingsViewModel: ObservableObject {
         let resolution = await codexExecutablePreflight(collector)
         guard codexSessionFence.allowsAuthenticationPublication(authenticationGeneration) else { return false }
         guard resolution.status == .available else {
-            managedCodexAccount = nil
             collector.append("Codex executable unavailable before managed authentication refresh")
-            await applyCodexConnectionState(
-                connected: false,
-                error: resolution.userMessage,
-                phase: .executableUnavailable(message: resolution.userMessage),
-                updateModels: true,
-                publicationToken: authenticationGeneration
-            )
+            applyCodexConnectionPhase(.executableUnavailable(message: resolution.userMessage), error: resolution.userMessage)
             collector.append("User guidance: \(resolution.userMessage)")
             throw AIProviderError.invalidConfiguration(detail: resolution.userMessage)
         }
@@ -3540,15 +3523,11 @@ public class APISettingsViewModel: ObservableObject {
             collector.append("User guidance: \(message)")
             throw AIProviderError.invalidConfiguration(detail: message)
         case let .executableUnavailable(message):
-            managedCodexAccount = nil
-            collector.append("Codex executable unavailable before health check")
-            await applyCodexConnectionState(
-                connected: false,
-                error: message,
-                phase: .executableUnavailable(message: message),
-                updateModels: true,
-                publicationToken: authenticationGeneration
-            )
+            applyCodexConnectionPhase(.executableUnavailable(message: message), error: message)
+            collector.append("User guidance: \(message)")
+            throw AIProviderError.invalidConfiguration(detail: message)
+        case let .temporarilyUnavailable(message):
+            applyCodexConnectionPhase(.failed(message: message), error: message)
             collector.append("User guidance: \(message)")
             throw AIProviderError.invalidConfiguration(detail: message)
         }
@@ -3566,10 +3545,15 @@ public class APISettingsViewModel: ObservableObject {
             await provider.dispose()
             guard codexSessionFence.allowsAuthenticationPublication(authenticationGeneration) else { return false }
             collector.append("Codex CLI provider disposed")
+            guard ok else {
+                let message = "Codex CLI health check returned an empty response."
+                applyCodexConnectionPhase(.failed(message: message), error: message)
+                return false
+            }
             await applyCodexConnectionState(
-                connected: ok,
-                error: ok ? nil : "Codex CLI health check returned an empty response.",
-                phase: ok ? .connected(resolvedExecutable: resolution.displayDescription) : .failed(message: "Codex CLI health check returned an empty response."),
+                connected: true,
+                error: nil,
+                phase: .connected(resolvedExecutable: resolution.displayDescription),
                 updateModels: true,
                 publicationToken: authenticationGeneration
             )
@@ -3586,13 +3570,7 @@ public class APISettingsViewModel: ObservableObject {
             guard codexSessionFence.allowsAuthenticationPublication(authenticationGeneration) else { return false }
             collector.append("Codex CLI provider disposed")
             let finalMessage = friendlyCodexMessage(for: error)
-            await applyCodexConnectionState(
-                connected: false,
-                error: finalMessage,
-                phase: codexFailurePhase(for: finalMessage),
-                updateModels: true,
-                publicationToken: authenticationGeneration
-            )
+            applyCodexConnectionPhase(codexFailurePhase(for: finalMessage), error: finalMessage)
             collector.append("User guidance: \(finalMessage)")
             throw error
         }
