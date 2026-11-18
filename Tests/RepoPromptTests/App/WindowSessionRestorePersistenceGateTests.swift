@@ -155,6 +155,40 @@ final class WindowSessionRestorePersistenceGateTests: XCTestCase {
         XCTAssertEqual(snapshot.windows.last?.mcpToolsEnabled, true)
     }
 
+    #if DEBUG
+        @MainActor
+        func testLiveSwitchCannotTakeAnUnclaimedRestoreNumber() {
+            let sessionURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("windowSessions-\(UUID().uuidString).json")
+            let manager = WindowStatesManager.makeForTesting(windowSessionFileURL: sessionURL)
+            let target = WorkspaceModel(name: "Saved", repoPaths: [])
+            let outgoing = WorkspaceModel(name: "Outgoing", repoPaths: [])
+            let returningID = WindowState.reserveWindowIDForTesting()
+            let freshID = WindowState.reserveWindowIDForTesting()
+            let restoredID = WindowState.reserveWindowIDForTesting()
+
+            XCTAssertEqual(manager.recordWorkspaceSwitch(forWindowID: returningID, to: target), 1)
+            manager.recordWorkspaceSwitch(forWindowID: returningID, to: outgoing)
+            let unclaimed = WindowSessionEntry(
+                windowKind: .standard,
+                workspaceID: target.id,
+                workspaceName: target.name,
+                isSystemWorkspace: false,
+                isEphemeral: false,
+                primaryRepoPath: nil,
+                lastFocused: false,
+                workspaceInstanceNumber: 1
+            )
+            manager.preseedInstanceNumberStateForTesting(from: WindowSessionSnapshot(version: 4, windows: [unclaimed]))
+            manager.setUnclaimedRestoreEntriesForTesting([unclaimed])
+
+            XCTAssertEqual(manager.recordWorkspaceSwitch(forWindowID: returningID, to: target), 2)
+            XCTAssertEqual(manager.recordWorkspaceSwitch(forWindowID: freshID, to: target), 3)
+            manager.setUnclaimedRestoreEntriesForTesting([])
+            XCTAssertEqual(manager.recordWorkspaceSwitch(forWindowID: restoredID, to: target), 1)
+        }
+    #endif
+
     func testWindowClosedMidRestoreReleasesGateAndUnknownWindowFinishIsHarmless() {
         var gate = WindowSessionRestorePersistenceGate()
         gate.beginRestoringWindow(7)
