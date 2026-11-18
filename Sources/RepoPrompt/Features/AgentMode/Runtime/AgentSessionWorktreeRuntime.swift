@@ -52,12 +52,14 @@ final class AgentSessionWorktreeRuntime {
         let storageDirectory: URL?
         /// Hydrating a saved session does not imply its workspace roots have finished loading.
         let awaitRootReadiness: @MainActor () async throws -> Void
+        let validatePlacement: (@MainActor () async throws -> Void)?
         let isCurrent: @MainActor () -> Bool
 
         init(
             store: WorkspaceFileContextStore?, fallbackWorkspacePath: String?,
             declaredRepoPaths: [String], storageDirectory: URL? = nil,
             awaitRootReadiness: @escaping @MainActor () async throws -> Void,
+            validatePlacement: (@MainActor () async throws -> Void)? = nil,
             isCurrent: @escaping @MainActor () -> Bool
         ) {
             self.store = store
@@ -65,6 +67,7 @@ final class AgentSessionWorktreeRuntime {
             self.declaredRepoPaths = declaredRepoPaths
             self.storageDirectory = storageDirectory
             self.awaitRootReadiness = awaitRootReadiness
+            self.validatePlacement = validatePlacement
             self.isCurrent = isCurrent
         }
     }
@@ -98,6 +101,22 @@ final class AgentSessionWorktreeRuntime {
             throw TransitionError.unavailable("The session's execution workspace is unavailable.")
         }
         return Admission(command: command, resources: resources, bindings: command.writer.session.worktreeBindings)
+    }
+
+    /// Canonical hosts borrow their own activation at ingress. Legacy callers keep the
+    /// synchronous presenter adapter until visible composition is switched over.
+    func admitForExecution(_ command: AgentSessionRuntimeStore.Command) async throws -> Admission {
+        guard let scope, command.writer.scope === scope, command.isCurrent else { throw TransitionError.stale }
+        guard let host = scope.executableHost, let activation = host.workspaceActivation else {
+            return try admit(command)
+        }
+        let bindings = command.writer.session.worktreeBindings
+        let rootIDs = try await activation.loadedRootIDs(for: command, route: host.route)
+        guard command.isCurrent, command.writer.session.worktreeBindings == bindings else { throw TransitionError.stale }
+        let admission = try await activation.captureWorktreeAdmission(command: command, rootIDs: rootIDs, route: host.route)
+        try admission.requireCurrent()
+        guard admission.bindings == bindings else { throw TransitionError.stale }
+        return admission
     }
 
     struct Effects {
@@ -168,7 +187,7 @@ final class AgentSessionWorktreeRuntime {
         // suspended before entry use the admission overload, which validates their older snapshot.
         guard command.writer.session.worktreeBindings != desiredBindings else { return desiredBindings }
         return try await transition(
-            desiredBindings, admission: admit(command), intent: intent,
+            desiredBindings, admission: admitForExecution(command), intent: intent,
             startupContext: startupContext, initializationHintsByBindingID: initializationHintsByBindingID,
             beforeCommit: beforeCommit, revalidateAuthority: revalidateAuthority,
             commitAuthority: commitAuthority, afterCommit: afterCommit
@@ -195,6 +214,11 @@ final class AgentSessionWorktreeRuntime {
         let previousBindings = admission.bindings
         guard previousBindings != desiredBindings else { return previousBindings }
         let resources = admission.resources
+        if let validatePlacement = resources.validatePlacement {
+            try await validatePlacement()
+            try await revalidateAuthority?()
+            try admission.requireCurrent()
+        }
         guard let effects else { throw TransitionError.unavailable("The session's execution workspace is unavailable.") }
         let requiresAcknowledgedSave = switch intent {
         case .externalManagement, .userExecutionLocationChange: true
@@ -230,6 +254,11 @@ final class AgentSessionWorktreeRuntime {
             guard command.isCurrent, resources.isCurrent(), session.worktreeBindings == previousBindings else {
                 throw TransitionError.stale
             }
+        }
+        func revalidate() async throws {
+            try await resources.validatePlacement?()
+            try await revalidateAuthority?()
+            try requireCurrent()
         }
         if let startupContext { WorktreeStartupInstrumentation.record(.bindingTransitionStarted, context: startupContext) }
         let executionRootsChanged = Self.changesExecutionRoots(
@@ -300,12 +329,10 @@ final class AgentSessionWorktreeRuntime {
                 try Self.requireIdle(session, ownsExecutionLocationGate: ownsExecutionLocationGate)
             }
             try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(desiredBindings)
-            try await revalidateAuthority?()
-            try requireCurrent()
+            try await revalidate()
             try await beforeCommit?()
             try requireCurrent()
-            try await revalidateAuthority?()
-            try requireCurrent()
+            try await revalidate()
             try Task.checkCancellation()
             try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(desiredBindings)
             guard !executionRootsChanged || session.runState.isActive == changedDuringActiveRun else { throw TransitionError.stale }
@@ -340,26 +367,26 @@ final class AgentSessionWorktreeRuntime {
                         }
                     }
                     try requireCurrent()
-                    try await revalidateAuthority?()
-                    try requireCurrent()
+                }
+                if !changedDuringActiveRun || resources.validatePlacement != nil {
+                    try await revalidate()
                 }
                 try commitAuthority? {}
                 try requireCurrent()
+                guard !session.runState.isActive else { throw TransitionError.stale }
                 providerContextInvalidated = true
                 await effects.retireProvider(session)
                 try requireCurrent()
                 guard !session.runState.isActive else { throw TransitionError.stale }
             }
-            try await revalidateAuthority?()
-            try requireCurrent()
+            try await revalidate()
             try Task.checkCancellation()
             try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(desiredBindings)
             if let materializer, let preparation {
                 _ = try await materializer.commit(preparation)
                 ownershipCommitted = true
             }
-            try await revalidateAuthority?()
-            try requireCurrent()
+            try await revalidate()
             try Task.checkCancellation()
             guard !executionRootsChanged || !session.runState.isActive else { throw TransitionError.stale }
             let previousLocation = presentation?.location(session)
