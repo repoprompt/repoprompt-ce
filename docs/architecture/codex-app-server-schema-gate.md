@@ -21,9 +21,9 @@ consumes at its current integration boundary.
 
 ## Version contract
 
-- The contract floor is **Codex CLI 0.164.0**.
-- Local validation accepts 0.164.0 or newer so a developer can detect drift before CI moves.
-- CI installs exactly `@openai/codex@0.164.0`, making the required check deterministic.
+- The contract floor is **Codex CLI 0.170.0**.
+- Local validation accepts 0.170.0 or newer so a developer can detect drift before CI moves.
+- CI installs exactly `@openai/codex@0.170.0`, making the required check deterministic.
 - The gate fails before generation when the installed CLI is older than the floor.
 
 This schema baseline and exact CI pin are distinct from
@@ -65,7 +65,7 @@ hook-key → `{trusted_hash}` object shape cannot be expressed by the current ch
 After a trust write, the post-write `hooks/list` result is the semantic success authority;
 `config/batchWrite.status` alone is not.
 
-The current 0.164.0 baseline checks 47 methods, 217 parameter paths, and 125 response paths. A failure names
+The current 0.170.0 baseline checks 48 methods, 230 parameter paths, and 143 response paths. A failure names
 the union, method, and exact missing field, required field, response path, or enum value.
 
 This is intentionally not a complete protocol mirror. New upstream methods do not fail the gate
@@ -232,6 +232,21 @@ correcting retained reasoning being counted again in Responses Lite usage and
 triggering premature compaction. This does not establish the social-media post's
 numeric example or a universal context-window size. Artifact and schema checks alone
 do not demonstrate long-context behavioral improvement.
+
+## 0.170.0 rotation findings (2026-11-18)
+
+The official arm64 CLI passes the experimental projection at 48 methods,
+230 parameter paths, and 143 response paths. The bounded MCP import schema
+matches the new upstream config schema after removing descriptions and defaults.
+The bundled pin, schema floor, and exact CI installer advance together.
+The external runtime floor stays at 0.149.0.
+
+Both official macOS packages add a signed `bin/codex-exec-server`. Its
+release-signing entitlement profile is empty. The voice source inventory
+now identifies PCRE2 10.48.
+
+GPT-6.2 Sol and Astra are discovered through `model/list`, including
+the reasoning efforts and account-specific speed tiers the server advertises.
 
 ## Files and tests
 
