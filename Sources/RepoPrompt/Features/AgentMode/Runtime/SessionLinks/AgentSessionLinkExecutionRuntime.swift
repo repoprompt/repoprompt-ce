@@ -86,6 +86,8 @@ final class AgentSessionLinkExecutionRuntime {
     }
 
     #if DEBUG
+        /// Occupies the boundary between completed off-actor materialization and release.
+        var test_afterSessionLinkTranscriptPageMaterialized: (@MainActor () async -> Void)?
         var test_endpointRead: (() -> Void)?
         var test_selfCompactAfterSupport: (() async -> Void)?
         var test_beforeRoutineIdleFollowUpStart: ((AgentTabSession, UUID) -> Bool)?
