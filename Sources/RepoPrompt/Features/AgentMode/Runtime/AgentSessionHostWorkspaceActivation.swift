@@ -158,28 +158,39 @@ final class AgentSessionHostWorkspaceActivation {
         return selected.map(\.id)
     }
 
-    func captureCreationWorktreeAdmission(
+    func captureWorktreeAdmission(
         command: AgentSessionRuntimeStore.Command, rootIDs: [UUID], route: MCPHostRouteResources
     ) async throws -> AgentSessionWorktreeRuntime.Admission {
-        guard case .creation = command.requirement else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
+        let bindings = command.writer.session.worktreeBindings
         let lease = try await captureLease(command: command, rootIDs: rootIDs, route: route)
         let workspace = try JSONDecoder().decode(WorkspaceModel.self, from: lease.snapshot.document.documentBytes)
         guard !workspace.isSystemWorkspace,
               workspace.composeTabs.count(where: { $0.id == command.writer.session.tabID && $0.activeAgentSessionID == command.identity.sessionID }) == 1
         else { throw AgentHostWorkspaceResources.Failure.contextUnavailable }
         let current: @MainActor () -> Bool = {
-            self.isCurrent && !route.isClosing && lease.rootsAreCurrent && command.isCurrent
+            self.isCurrent && !route.isClosing && lease.rootsAreCurrent
         }
-        return .init(command: command, resources: .init(
+        let validatePlacement: @MainActor () async throws -> Void = {
+            try Task.checkCancellation()
+            try command.requireCurrent()
+            guard current() else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
+            let context = DomainContextIdentity(workspaceID: command.identity.workspaceID, contextID: command.writer.session.tabID)
+            let refreshed = try await lease.capture(context: context)
+            let document = try JSONDecoder().decode(WorkspaceModel.self, from: refreshed.snapshot.document.documentBytes)
+            guard current(), document.id == workspace.id, !document.isSystemWorkspace,
+                  document.repoPaths == workspace.repoPaths, document.customStoragePath == workspace.customStoragePath,
+                  document.composeTabs.count(where: { $0.id == context.contextID && $0.activeAgentSessionID == command.identity.sessionID }) == 1
+            else { throw AgentSessionWorktreeRuntime.TransitionError.stale }
+            try command.requireCurrent()
+        }
+        try await validatePlacement()
+        let admission = AgentSessionWorktreeRuntime.Admission(command: command, resources: .init(
             store: resources.files, fallbackWorkspacePath: workspace.repoPaths.first,
             declaredRepoPaths: workspace.repoPaths, storageDirectory: workspace.customStoragePath,
-            awaitRootReadiness: {
-                try command.requireCurrent()
-                guard current(), await lease.isCurrent() else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
-                try command.requireCurrent()
-                guard current() else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
-            }, isCurrent: current
-        ), bindings: command.writer.session.worktreeBindings)
+            awaitRootReadiness: validatePlacement, validatePlacement: validatePlacement, isCurrent: current
+        ), bindings: bindings)
+        try admission.requireCurrent()
+        return admission
     }
 
     private func captureLease(

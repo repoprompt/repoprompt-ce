@@ -57,6 +57,7 @@ extension AgentSessionWorktreeRuntime {
 
         func authorize() async throws {
             try requireCurrent()
+            try await admission.resources.validatePlacement?()
             try await revalidateAuthority?()
             try requireCurrent()
         }

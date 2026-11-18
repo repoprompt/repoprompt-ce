@@ -87,6 +87,17 @@ extension AIModel {
         ModelInfo(model: .gpt54MiniXHigh, rawValue: "gpt-5.4-mini-xhigh", actualName: "gpt-5.4-mini", displayName: "GPT-5.4 Mini XHigh", provider: ProviderIndex.openAI),
         ModelInfo(model: .gpt54Nano, rawValue: "gpt-5.4-nano", actualName: nil, displayName: "GPT-5.4 Nano", provider: ProviderIndex.openAI),
 
+        ModelInfo(model: .gpt62Sol, rawValue: "gpt-6.2-sol", actualName: nil, displayName: "GPT-6.2 Sol Med", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt62SolLow, rawValue: "gpt-6.2-sol-low", actualName: "gpt-6.2-sol", displayName: "GPT-6.2 Sol Low", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt62SolHigh, rawValue: "gpt-6.2-sol-high", actualName: "gpt-6.2-sol", displayName: "GPT-6.2 Sol High", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt62SolXHigh, rawValue: "gpt-6.2-sol-xhigh", actualName: "gpt-6.2-sol", displayName: "GPT-6.2 Sol XHigh", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt62SolMax, rawValue: "gpt-6.2-sol-max", actualName: "gpt-6.2-sol", displayName: "GPT-6.2 Sol Max", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt62Astra, rawValue: "gpt-6.2-astra", actualName: nil, displayName: "GPT-6.2 Astra Med", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt62AstraLow, rawValue: "gpt-6.2-astra-low", actualName: "gpt-6.2-astra", displayName: "GPT-6.2 Astra Low", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt62AstraHigh, rawValue: "gpt-6.2-astra-high", actualName: "gpt-6.2-astra", displayName: "GPT-6.2 Astra High", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt62AstraXHigh, rawValue: "gpt-6.2-astra-xhigh", actualName: "gpt-6.2-astra", displayName: "GPT-6.2 Astra XHigh", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt62AstraMax, rawValue: "gpt-6.2-astra-max", actualName: "gpt-6.2-astra", displayName: "GPT-6.2 Astra Max", provider: ProviderIndex.openAI),
+
         // GPT-6 family. GPT-6.1 Sol has no none/minimal effort; GPT-6 Sol is retained for pinning.
         ModelInfo(model: .gpt61Sol, rawValue: "gpt-6.1-sol", actualName: nil, displayName: "GPT-6.1 Sol Med", provider: ProviderIndex.openAI),
         ModelInfo(model: .gpt61SolLow, rawValue: "gpt-6.1-sol-low", actualName: "gpt-6.1-sol", displayName: "GPT-6.1 Sol Low", provider: ProviderIndex.openAI),
@@ -873,6 +884,16 @@ extension AIModel {
             .gpt54MiniHigh,
             .gpt54MiniXHigh,
             .gpt54Nano,
+            .gpt62Sol,
+            .gpt62SolLow,
+            .gpt62SolHigh,
+            .gpt62SolXHigh,
+            .gpt62SolMax,
+            .gpt62Astra,
+            .gpt62AstraLow,
+            .gpt62AstraHigh,
+            .gpt62AstraXHigh,
+            .gpt62AstraMax,
             .gpt61Sol,
             .gpt61SolLow,
             .gpt61SolHigh,
@@ -1078,10 +1099,15 @@ extension AIModel {
         case .gpt5Low, .gpt54Low, .gpt5CodexLow, .o3Low: return "low"
         // GPT-6 family (API)
         case .gpt61TerraNone: return "none"
+        case .gpt62SolMax, .gpt62AstraMax: return "max"
         case .gpt6AstraProMax, .gpt61TerraMax, .gpt61SolMax, .gpt6AstraMax: return "max"
+        case .gpt62SolXHigh, .gpt62AstraXHigh: return "xhigh"
         case .gpt6AstraProXHigh, .gpt61TerraXHigh, .gpt61SolXHigh, .gpt6AstraXHigh, .gpt6LunaXHigh: return "xhigh"
+        case .gpt62SolHigh, .gpt62AstraHigh: return "high"
         case .gpt6AstraProHigh, .gpt61TerraHigh, .gpt61SolHigh, .gpt6AstraHigh, .gpt6LunaHigh: return "high"
+        case .gpt62Sol, .gpt62Astra: return "medium"
         case .gpt6AstraPro, .gpt61Terra, .gpt61Sol, .gpt6Astra, .gpt6Luna, .gpt6Sol: return "medium"
+        case .gpt62SolLow, .gpt62AstraLow: return "low"
         case .gpt6AstraProLow, .gpt61TerraLow, .gpt61SolLow, .gpt6AstraLow, .gpt6LunaLow: return "low"
         // Codex CLI models
         case .codexCliGpt61SolUltra, .codexCliGpt56SolUltra, .codexCliGpt56TerraUltra: return "ultra"

@@ -90,7 +90,7 @@ extension AgentSessionRuntimeHost {
                 throw AgentHostWorkspaceResources.Failure.contextUnavailable
             }
             if initialLocation != .local {
-                let admission = try await resources.captureCreationWorktreeAdmission(command: command, rootIDs: rootIDs, route: route)
+                let admission = try await resources.captureWorktreeAdmission(command: command, rootIDs: rootIDs, route: route)
                 try requireOrigin()
                 try await scope.worktrees.prepareInitialExecutionLocation(
                     initialLocation, admission: admission,
