@@ -1996,7 +1996,8 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
         }
 
         func testCodexSwitchPreviewAndSendAgreeForSameDraft() async throws {
-            try await withFixture { fixture in
+            // Keep fixture persistence out of the file map shared by preview and send.
+            try await withFixture(isolatedRepository: true) { fixture in
                 let vm = fixture.viewModel
                 let session = fixture.sourceSession
                 fixture.window.promptManager.apiSettingsViewModel?.isCodexConnected = true
