@@ -385,7 +385,7 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
         _ aggregate: WorkspaceCodemapStructureAggregateResult,
         revalidation: [WorkspaceCodemapRootEpoch: WorkspaceCodemapStructureGraphRevalidationResult] = [:]
     ) -> ToolResultDTOs.CodeStructureReplyDTO {
-        MCPServerViewModel.codeStructureReplyDTO(
+        MCPCodeStructureRead.codeStructureReplyDTO(
             aggregate: aggregate,
             presentation: nil,
             revalidation: revalidation,
