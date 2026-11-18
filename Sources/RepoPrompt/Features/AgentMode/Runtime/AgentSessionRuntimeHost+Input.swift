@@ -77,6 +77,14 @@ extension AgentSessionRuntimeHost {
             selfCompactHoldsWakeAcquisition: { [weak scope] session in scope?.linkExecution?.agentSelfCompactHoldsWakeAcquisition(session) ?? true },
             workspaceCaptureOrder: .beforeSkillExpansion
         ), diagnostics: diagnostics)
+        if route.identity.kind == .independent {
+            route.installModelEndpointResolver { [weak activation, weak runtime] tabID in
+                guard activation?.isCurrent == true,
+                      let runtime, let endpoint = runtime.agentSessionLinkObserverEndpoint(tabID: tabID),
+                      let command = runtime.admit(endpoint: endpoint) else { return nil }
+                return .init(endpoint: endpoint, writer: command.identity)
+            }
+        }
         runtime.codexCoordinator = codexCoordinator
         runtime.perfRecorder = perfRecorder
         runtime.activeMCPToolProbe = { [tools = route.toolExecutionRuntime] in tools.hasActiveToolExecutions(runID: $0) }

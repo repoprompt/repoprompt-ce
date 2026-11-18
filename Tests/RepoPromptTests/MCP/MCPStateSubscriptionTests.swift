@@ -105,6 +105,67 @@ private actor RouteHistoryScanner: HistorySessionScanning {
 /// `unsubscribeFromStateUpdates` finishes only that subscriber's stream, and a
 /// view model can be deallocated once observation stops.
 final class MCPStateSubscriptionTests: XCTestCase {
+    @MainActor
+    func testModelEndpointRefusesWriterReacquisitionOnTheSameBinding() throws {
+        let store = AgentSessionRuntimeStore()
+        let scope = store.makeScope()
+        let sessionID = UUID()
+        let workspaceID = UUID()
+        let tabID = UUID()
+        let runID = UUID()
+        let connectionID = UUID()
+        let route = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: nil)
+        let routeID = route.identity.routeID
+        let session = AgentTabSession(tabID: tabID)
+        session.installPersistentSessionBinding(.init(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID))
+        session.hasLoadedPersistedState = true
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        scope.replaceSessions([tabID: session])
+        let original = try scope.admit(session: session)
+        let endpoint = DomainAgentSessionLinkEndpointIdentity(
+            windowID: routeID, workspaceID: workspaceID, tabID: tabID, sessionID: sessionID,
+            persistentBindingGeneration: original.writer.binding.generation,
+            bindingTransitionGeneration: session.bindingTransitionGeneration
+        )
+        route.installModelEndpointResolver { [weak scope] requestedTabID in
+            guard requestedTabID == tabID, let scope, let session = scope.sessions[tabID],
+                  let command = try? scope.admit(session: session) else { return nil }
+            return .init(endpoint: endpoint, writer: command.identity)
+        }
+
+        let receipt = MCPRunRoutingCleanupReceipt(
+            managerIdentity: ObjectIdentifier(store), policyID: UUID(), runID: runID, routeID: routeID,
+            routingAuthorityGeneration: 1, routingWaitGeneration: nil, routeOwner: route
+        )
+        _ = try XCTUnwrap(route.runRouteBindings.beginPendingPolicy(
+            connectionID: connectionID, runID: runID, windowID: routeID, cleanupReceipt: receipt
+        ))
+        var context = MCPTabContextSnapshot(
+            tabID: tabID, windowID: routeID, workspaceID: workspaceID, promptText: "",
+            selection: .init(), selectedMetaPromptIDs: [], tabName: "Original",
+            runID: runID, activeAgentSessionID: sessionID, explicitlyBound: false
+        )
+        context.routeOwnerIdentity = ObjectIdentifier(route)
+        route.runRouteBindings.tabContextByConnectionID[connectionID] = context
+        route.publishBinding(connectionID: connectionID, context: context, cleanupReceipt: receipt)
+        XCTAssertEqual(route.modelObserverEndpoint(
+            registration: receipt, connectionID: connectionID, workspaceID: workspaceID, tabID: tabID
+        ), endpoint)
+        XCTAssertNil(route.modelObserverEndpoint(
+            registration: receipt, connectionID: connectionID, workspaceID: UUID(), tabID: tabID
+        ))
+
+        scope.replaceSessions([:])
+        scope.replaceSessions([tabID: session])
+        let reacquired = try scope.admit(session: session)
+        XCTAssertNotEqual(reacquired.identity, original.identity)
+        XCTAssertEqual(session.bindingTransitionGeneration, endpoint.bindingTransitionGeneration)
+        route.publishBinding(connectionID: connectionID, context: context, cleanupReceipt: receipt)
+        XCTAssertNil(route.modelObserverEndpoint(
+            registration: receipt, connectionID: connectionID, workspaceID: workspaceID, tabID: tabID
+        ))
+    }
+
     private func makeService() -> MCPService {
         MCPService(
             hostBootstrapOperation: {},

@@ -4184,61 +4184,73 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         )
     }
 
+    private struct RunCatalogEndpointProjection: Equatable, Sendable {
+        let connectionID: UUID
+        let endpoint: DomainAgentSessionLinkEndpointIdentity
+    }
+
+    private func runCatalogEndpointProjection(
+        runID: UUID, windowID: Int, tabID: UUID, workspaceID: UUID?,
+        registration: MCPRunRoutingCleanupReceipt?
+    ) async -> RunCatalogEndpointProjection? {
+        await MainActor.run {
+            if let registration, let owner = registration.routeOwner {
+                guard let workspaceID, let connectionID = owner.runRouteBindings.connectionID(forRunID: runID),
+                      let endpoint = owner.registeredModelObserverEndpoint(
+                          registration: registration, connectionID: connectionID, workspaceID: workspaceID, tabID: tabID
+                      )
+                else { return nil }
+                return .init(connectionID: connectionID, endpoint: endpoint)
+            }
+            guard let window = WindowStatesManager.shared.window(withID: windowID),
+                  let connectionID = window.mcpServer.runRouteBindings.connectionID(forRunID: runID),
+                  window.mcpServer.runRouteBindings.hasCurrentMapping(
+                      runID: runID, connectionID: connectionID, expectedTabID: tabID
+                  ),
+                  let endpoint = window.agentModeViewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: tabID)
+            else { return nil }
+            return .init(connectionID: connectionID, endpoint: endpoint)
+        }
+    }
+
     /// Returns exact actor-owned route/policy/connection proof, independently of catalog discovery.
     func authoritativeRunCatalogRouteToken(
         runID: UUID,
         windowID: Int,
         tabID: UUID
     ) async -> AgentSessionLinkRunCatalogRouteToken? {
-        let candidate = await MainActor.run { () -> (UUID, DomainAgentSessionLinkEndpointIdentity)? in
-            guard let window = WindowStatesManager.shared.window(withID: windowID),
-                  let connectionID = window.mcpServer.runRouteBindings.connectionIDByRunID[runID],
-                  window.mcpServer.runRouteBindings.hasCurrentMapping(
-                      runID: runID,
-                      connectionID: connectionID,
-                      expectedTabID: tabID
-                  ),
-                  let endpoint = window.agentModeViewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: tabID)
-            else { return nil }
-            return (connectionID, endpoint)
+        let state = runPolicyStateByRunID[runID]
+        let workspaceID = state?.workspaceID
+        let registration = state?.cleanupReceipt
+        func originalPolicyIsCurrent() -> Bool {
+            guard let registration, registration.routeOwner != nil else {
+                return runPolicyStateByRunID[runID]?.cleanupReceipt?.routeOwner == nil
+            }
+            return registration.runID == runID && registration.routeID == windowID && ownsRunRegistration(registration)
         }
-        guard let (connectionID, endpoint) = candidate,
-              let actorSnapshot = authoritativeRunRouteActorSnapshot(
-                  runID: runID,
-                  connectionID: connectionID,
-                  windowID: windowID,
-                  tabID: tabID
-              ),
-              let routingAuthorityGeneration = runRoutingAuthorityGenerationByRunID[runID],
-              let connectionLifecycleGeneration = actorSnapshot.connectionLifecycleGeneration
+        guard originalPolicyIsCurrent(), let candidate = await runCatalogEndpointProjection(
+            runID: runID, windowID: windowID, tabID: tabID, workspaceID: workspaceID, registration: registration
+        ), originalPolicyIsCurrent() else { return nil }
+        let connectionID = candidate.connectionID
+        guard let actorSnapshot = authoritativeRunRouteActorSnapshot(
+            runID: runID, connectionID: connectionID, windowID: windowID, tabID: tabID
+        ), let routingAuthorityGeneration = runRoutingAuthorityGenerationByRunID[runID],
+        let connectionLifecycleGeneration = actorSnapshot.connectionLifecycleGeneration
         else { return nil }
 
-        let mappingIsStillCurrent = await MainActor.run {
-            guard let window = WindowStatesManager.shared.window(withID: windowID),
-                  window.mcpServer.runRouteBindings.hasCurrentMapping(
-                      runID: runID,
-                      connectionID: connectionID,
-                      expectedTabID: tabID
-                  )
-            else { return false }
-            return window.agentModeViewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: tabID) == endpoint
-        }
-        guard mappingIsStillCurrent,
+        let revalidated = await runCatalogEndpointProjection(
+            runID: runID, windowID: windowID, tabID: tabID, workspaceID: workspaceID, registration: registration
+        )
+        guard revalidated == candidate, originalPolicyIsCurrent(),
               let revalidatedActorSnapshot = authoritativeRunRouteActorSnapshot(
-                  runID: runID,
-                  connectionID: connectionID,
-                  windowID: windowID,
-                  tabID: tabID
-              ),
-              revalidatedActorSnapshot == actorSnapshot,
+                  runID: runID, connectionID: connectionID, windowID: windowID, tabID: tabID
+              ), revalidatedActorSnapshot == actorSnapshot,
               runRoutingAuthorityGenerationByRunID[runID] == routingAuthorityGeneration,
               revalidatedActorSnapshot.connectionLifecycleGeneration == connectionLifecycleGeneration
         else { return nil }
 
         return AgentSessionLinkRunCatalogRouteToken(
-            runID: runID,
-            observerEndpoint: endpoint,
-            connectionID: connectionID,
+            runID: runID, observerEndpoint: candidate.endpoint, connectionID: connectionID,
             routingAuthorityGeneration: routingAuthorityGeneration,
             connectionLifecycleGeneration: connectionLifecycleGeneration
         )
@@ -4538,19 +4550,31 @@ actor ServerNetworkManager: MCPServerConnectionHost {
     private func cachedModelCatalogRouteToken(connectionID: UUID) async -> AgentSessionLinkRunCatalogRouteToken? {
         guard let route = cachedModelRunRoute(connectionID: connectionID) else { return nil }
         let admittedModelRouteToken = MCPInvocationContextBridge.current?.dispatchAuthorization?.windowIdentity?.modelRouteToken
-        let endpoint = await MainActor.run { () -> DomainAgentSessionLinkEndpointIdentity? in
-            guard let server = WindowStatesManager.shared.modelRoutingWindow(withID: route.windowID)?.mcpServer else { return nil }
-            return server.cachedModelObserverEndpoint(
-                resources: server.routeResources, connectionID: connectionID,
-                route: route, modelRouteToken: admittedModelRouteToken
+        let registration = runPolicyStateByRunID[route.runID]?.cleanupReceipt
+        let endpoint: DomainAgentSessionLinkEndpointIdentity?
+        if let registration, let owner = registration.routeOwner {
+            guard ownsRunRegistration(registration), registration.routeID == route.windowID else { return nil }
+            endpoint = await owner.registeredModelObserverEndpoint(
+                registration: registration, connectionID: connectionID, workspaceID: route.workspaceID, tabID: route.tabID
             )
+            guard ownsRunRegistration(registration) else { return nil }
+        } else {
+            endpoint = await MainActor.run {
+                guard let server = WindowStatesManager.shared.modelRoutingWindow(withID: route.windowID)?.mcpServer else { return nil }
+                return server.cachedModelObserverEndpoint(
+                    resources: server.routeResources, connectionID: connectionID,
+                    route: route, modelRouteToken: admittedModelRouteToken
+                )
+            }
         }
         guard let endpoint, cachedModelRunRoute(connectionID: connectionID) == route else { return nil }
-        return AgentSessionLinkRunCatalogRouteToken(
+        let token = AgentSessionLinkRunCatalogRouteToken(
             runID: route.runID, observerEndpoint: endpoint, connectionID: connectionID,
             routingAuthorityGeneration: route.routingAuthorityGeneration,
             connectionLifecycleGeneration: route.connectionLifecycleGeneration
         )
+        guard admittedModelRouteToken.map({ $0 == token }) ?? true else { return nil }
+        return token
     }
 
     private struct AuthoritativeRunRouteActorSnapshot: Equatable {
