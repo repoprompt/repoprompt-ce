@@ -666,7 +666,7 @@ enum AgentSessionLinkTranscriptSanitizer {
     ///
     /// The **caller** materializes and sorts the whole canonical projection before this runs, so an
     /// authorized read is still `O(transcript)` end-to-end — that part now happens off the
-    /// `@MainActor`. See `AgentModeViewModel.canonicalTranscript(from:sourceItemsRevision:)` for why
+    /// `@MainActor`. See `AgentSessionLinkExecutionRuntime.canonicalTranscript(from:sourceItemsRevision:)` for why
     /// memoizing it needs a transcript-side revision this layer does not have.
     ///
     /// - Parameter anchor: `nil` means "fresh page". A supplied `.beforeStart` anchor is a *resumed*

@@ -619,10 +619,11 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
             _ = await MainActor.run { scopes.revoke(scopeID: scope.id) }
         }
         fixture.viewModel.test_setAgentSessionSaver { _, _, _ in fixture.git.sandbox.appendingPathComponent("session.json") }
+        let command = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID))
+        let admission = try command.writer.scope.worktrees.admit(command)
         do {
             try await SessionAdminWindowsWorktreeHost().transition(
-                [], command: XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID)),
-                isStillAuthorized: { scopes.hasLiveScope(grantedTo: grantee) }
+                [], admission: admission, isStillAuthorized: { scopes.hasLiveScope(grantedTo: grantee) }
             )
             XCTFail("Revoked scope must refuse publication")
         } catch let receipt as AgentSessionWorktreeRuntime.PartialTransition {
