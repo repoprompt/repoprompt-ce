@@ -21,6 +21,7 @@ struct AgentQuietTranscriptDisplayCache {
 
     let key: Key
     let result: AgentTranscriptProjectionBuilder.DisplayMaskResult
+    let renderEntries: AgentTranscriptRenderEntries
 }
 
 @MainActor
@@ -67,7 +68,9 @@ extension AgentModeViewModel {
                 anchorVisits: result.anchorVisits, archiveBlockVisits: archive.blockVisits, archiveRowVisits: archive.rowVisits
             )
         }
-        session.quietTranscriptDisplayCache = .init(key: key, result: result)
+        session.quietTranscriptDisplayCache = .init(
+            key: key, result: result, renderEntries: .init(blocks: result.presentation.visibleBlocks)
+        )
         #if DEBUG
             perfRecorder.increment("quiet.display.cache.build", tabID: session.tabID)
             perfRecorder.event("quiet.display.work", tabID: session.tabID, fields: [
@@ -84,9 +87,9 @@ extension AgentModeViewModel {
         let paneInput = transcriptPaneInput(tabID: tabID, session: session)
         let scopedBase = scopedActiveTranscriptPresentation(for: tabID)
         let cached = session.flatMap { session in
-            session.quietTranscriptDisplayCache.flatMap { $0.key == quietDisplayKey(session, base: scopedBase) ? $0.result : nil }
+            session.quietTranscriptDisplayCache.flatMap { $0.key == quietDisplayKey(session, base: scopedBase) ? $0 : nil }
         }
-        let scopedPresentation = cached?.presentation ?? scopedBase
+        let scopedPresentation = cached?.result.presentation ?? scopedBase
         // Existing rows/history survive a rejected operation, not a content-identity replacement.
         let canPresentExistingTranscript = paneInput.content?.canPresentExistingTranscript(for: paneInput.target) == true
         let contentScopeMismatches = activeTranscriptContentScopeMismatches(paneInput.target)
@@ -96,6 +99,7 @@ extension AgentModeViewModel {
         return AgentTranscriptUISnapshot(
             currentTabID: tabID,
             presentation: presentation,
+            renderEntries: contentScopeMismatches && !canPresentExistingTranscript ? nil : cached?.renderEntries,
             isHydrated: isActiveTranscriptPresentationHydrated(for: tabID),
             presentationRevision: activeTranscriptPresentationRevision(for: tabID),
             displayMaskRevision: session?.quietLedger.displayMaskRevision ?? 0,
@@ -104,7 +108,7 @@ extension AgentModeViewModel {
             activeBashLiveExecutionByItemID: activeBashLiveExecutionByItemID,
             runtimeFooterByItemID: agentMessageRuntimeFooters(for: tabID),
             fallbackFollowArmingState: session?.transcriptAutoFollowArmingState ?? .armed,
-            archivedBlocks: canPresentExistingTranscript ? cached?.archivedBlocks ?? session?.archivedTranscriptSnapshot.blocks ?? [] : [],
+            archivedBlocks: canPresentExistingTranscript ? cached?.result.archivedBlocks ?? session?.archivedTranscriptSnapshot.blocks ?? [] : [],
             panePresentation: AgentTranscriptPanePresentation.resolve(paneInput)
                 // Nil rejects stale candidate evidence; it never authorizes welcome (§4.5).
                 ?? .restoring,

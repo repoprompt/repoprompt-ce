@@ -40,13 +40,19 @@ struct AgentToolCardRenderState: Equatable {
     let renderMode: AgentToolCardRenderMode?
 }
 
-struct AgentToolCardRenderStatePreferenceKey: PreferenceKey {
-    static var defaultValue: [UUID: AgentToolCardRenderState] = [:]
-
-    static func reduce(value: inout [UUID: AgentToolCardRenderState], nextValue: () -> [UUID: AgentToolCardRenderState]) {
-        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+#if DEBUG
+    extension EnvironmentValues {
+        @Entry var collectsAgentToolCardRenderStates = false
     }
-}
+
+    struct AgentToolCardRenderStatePreferenceKey: PreferenceKey {
+        static var defaultValue: [UUID: AgentToolCardRenderState] = [:]
+
+        static func reduce(value: inout [UUID: AgentToolCardRenderState], nextValue: () -> [UUID: AgentToolCardRenderState]) {
+            value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+        }
+    }
+#endif
 
 extension ToolCardContainer where Content == ToolMarkdownExpandedContent {
     init(
@@ -101,6 +107,9 @@ struct ToolCardContainer<Content: View>: View {
     @ViewBuilder let content: () -> Content
 
     @Environment(\.colorScheme) private var colorScheme
+    #if DEBUG
+        @Environment(\.collectsAgentToolCardRenderStates) private var collectsRenderStates
+    #endif
 
     init(
         iconName: String,
@@ -143,11 +152,22 @@ struct ToolCardContainer<Content: View>: View {
     }
 
     var body: some View {
+        #if DEBUG
+            if collectsRenderStates {
+                cardLayout.preference(key: AgentToolCardRenderStatePreferenceKey.self, value: debugRenderStatePreference)
+            } else {
+                cardLayout
+            }
+        #else
+            cardLayout
+        #endif
+    }
+
+    private var cardLayout: some View {
         HStack {
             cardBody
             Spacer(minLength: 40)
         }
-        .preference(key: AgentToolCardRenderStatePreferenceKey.self, value: debugRenderStatePreference)
     }
 
     private var cardBody: some View {

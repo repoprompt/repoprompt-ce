@@ -3,7 +3,11 @@ import RepoPromptInstrumentation
 
 struct AgentTranscriptUISnapshot: Equatable {
     var currentTabID: UUID?
-    var presentation: AgentTranscriptPresentationSnapshot
+    var presentation: AgentTranscriptPresentationSnapshot {
+        didSet { renderEntries = nil }
+    }
+
+    var renderEntries: AgentTranscriptRenderEntries?
     var isHydrated: Bool
     var presentationRevision: Int
     var displayMaskRevision: UInt64 = 0
@@ -67,6 +71,10 @@ final class AgentTranscriptUIStore: ObservableObject {
                 perfRecorder.recordStoreUpdate("transcript", published: false)
             #endif
             return
+        }
+        var snapshot = snapshot
+        if snapshot.renderEntries == nil {
+            snapshot.renderEntries = .init(blocks: snapshot.presentation.visibleBlocks)
         }
         #if DEBUG
             perfRecorder.recordStoreUpdate(
