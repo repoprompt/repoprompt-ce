@@ -1128,10 +1128,11 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         XCTAssertEqual(bound.activeAgentSessionID, f.endpoint.sessionID)
         let canCommit = await route.canCommitPendingPolicy(receipt, token: installed.token)
         XCTAssertTrue(canCommit)
-        let routed = try await route.fileReadHandle(
-            metadata: .init(connectionID: connection, clientName: clientName, windowID: route.identity.routeID),
-            context: .init(workspaceID: f.endpoint.workspaceID, contextID: session.tabID)
-        )
+        let coordinator = try XCTUnwrap(route.coordinator)
+        let routing = await coordinator.snapshot()
+        let registration = try XCTUnwrap(routing.connections.first { $0.registration.connectionID == connection }?.registration)
+        let routed = try await coordinator.resolveReadContext(connection: registration)
+        XCTAssertEqual(routed.context, DomainContextIdentity(workspaceID: f.endpoint.workspaceID, contextID: session.tabID))
         XCTAssertEqual(routed.bindingKind, .runScoped(runID: runID))
 
         let staleRollback = route.rollbackPendingPolicy(original, token: installed.token, clientName: clientName)
