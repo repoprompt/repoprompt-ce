@@ -6,6 +6,17 @@ import Foundation
 enum AgentProviderHandover {
     static let maximumBytes = 1_048_576
     static let maximumSummaryBytes = 65536
+    /// Codex counts Unicode scalars in all text input items, not UTF-8 bytes.
+    static let codexMaximumInputScalars = 1_048_576
+
+    static func codexCarrierAllowance(composedInput: String, parkedNote: String?) -> Int {
+        let note = parkedNote.map { $0.unicodeScalars.count + "\n\n".unicodeScalars.count } ?? 0
+        let link = AgentSessionLinkPrompts.maximumRenderedBytes
+            + AgentSessionLinkPrompts.maximumLocalInputDeltaBytes
+            + AgentSessionLinkMessageEnvelope.escaped(AgentSessionLinkPrompts.localInputGuidance).utf8.count + 1
+        let late = link + "\n\n".count + OracleBackgroundAwareness.maximumTextScalars + "\n\n".count
+        return codexMaximumInputScalars - composedInput.unicodeScalars.count - "\n\n".count - note - late
+    }
 
     enum Mode: String {
         case history
@@ -70,6 +81,7 @@ enum AgentProviderHandover {
         let hasImageOmission: Bool
         let historyReference: HistoryReference?
         let utf8Bytes: Int
+        let unicodeScalarCount: Int
         var estimatedTokens: Double {
             estimate(bytes: utf8Bytes)
         }
@@ -84,6 +96,7 @@ enum AgentProviderHandover {
         let windowSource: WindowSource
         let instructionTokens: Double
         let inputTokens: Double
+        let codexCarrierScalars: Int?
         var marginTokens: Double {
             Double(window) * 0.1
         }
@@ -94,21 +107,27 @@ enum AgentProviderHandover {
 
         /// Only catalog/configured window metadata belongs here, never source occupancy/native usage.
         /// Instructions are existing RP-composed strings; hidden harness/tool overhead uses the margin.
-        init(catalogWindow: Int?, instructions: [String], composedInput: String, isPreview: Bool) {
+        init(catalogWindow: Int?, instructions: [String], composedInput: String, isPreview: Bool, codexCarrierScalars: Int? = nil) {
             let known = catalogWindow.flatMap { $0 > 0 ? $0 : nil }
             window = known ?? 128_000
             windowSource = known == nil ? .assumed : .catalog
             instructionTokens = instructions.reduce(0) { $0 + estimate($1) }
             inputTokens = isPreview ? max(2048, estimate(composedInput)) : estimate(composedInput)
+            self.codexCarrierScalars = codexCarrierScalars
         }
 
         func fits(_ carrier: Carrier) -> Bool {
-            fits(bytes: carrier.utf8Bytes, mode: carrier.mode)
+            fits(bytes: carrier.utf8Bytes, scalars: carrier.unicodeScalarCount, mode: carrier.mode)
         }
 
-        fileprivate func fits(bytes: Int, mode: Mode) -> Bool {
+        func fits(payload: String, mode: Mode) -> Bool {
+            fits(bytes: payload.utf8.count, scalars: payload.unicodeScalars.count, mode: mode)
+        }
+
+        fileprivate func fits(bytes: Int, scalars: Int, mode: Mode) -> Bool {
             bytes <= maximumBytes && (mode != .summary || bytes <= maximumSummaryBytes)
                 && estimate(bytes: bytes) <= remainingCarrierTokens
+                && (codexCarrierScalars.map { scalars <= $0 } ?? true)
         }
 
         fileprivate var summaryByteAllowance: Int {
@@ -154,22 +173,28 @@ enum AgentProviderHandover {
         // Measure each turn once, plus the candidate's small omission framing. Materialize only
         // the final suffix; repeatedly prepending and serializing growing candidates is quadratic.
         let framing = carrier(source: source, mode: .newestTurns, turns: [], omitted: nil, tools: false, images: false, reference: nil, body: []).utf8Bytes
+        let scalarFraming = carrier(source: source, mode: .newestTurns, turns: [], omitted: nil, tools: false, images: false, reference: nil, body: []).unicodeScalarCount
         var turnBytes = 0
+        var turnScalars = 0
         var hasTools = false
         var selectedStart: Int?
         for position in projection.turns.indices.reversed() {
             let turn = projection.turns[position]
             guard turn.settled else { break }
-            turnBytes += turnBody(turn).utf8.count
+            let body = turnBody(turn)
+            turnBytes += body.utf8.count
+            turnScalars += body.unicodeScalars.count
             hasTools = hasTools || turn.hasTools
             let omitted = position > 0 ? projection.turns[0].index ... projection.turns[position - 1].index : nil
             let omissionBytes = omitted.map { olderMarker($0, reference: historyReference).utf8.count } ?? 0
+            let omissionScalars = omitted.map { olderMarker($0, reference: historyReference).unicodeScalars.count } ?? 0
             let bodyCount = projection.turns.count - position + (omitted == nil ? 0 : 1) + (hasTools ? 1 : 0)
             let bytes = framing + turnBytes + omissionBytes + (hasTools ? toolMarker.utf8.count : 0) + bodyCount - 1
+            let scalars = scalarFraming + turnScalars + omissionScalars + (hasTools ? toolMarker.unicodeScalars.count : 0) + bodyCount - 1
             // Keep scanning older positions on a miss: size is not monotone, because reaching
             // position 0 drops the whole omission marker, so the all-turns candidate can fit where
             // an intermediate suffix could not. Unsettled turns still stop the scan outright.
-            guard budget.fits(bytes: bytes, mode: .newestTurns) else { continue }
+            guard budget.fits(bytes: bytes, scalars: scalars, mode: .newestTurns) else { continue }
             selectedStart = position
         }
         guard let selectedStart else { return nil }
@@ -381,6 +406,7 @@ enum AgentProviderHandover {
             hasImageOmission: images,
             historyReference: omitted == nil ? nil : reference,
             utf8Bytes: writer.bytes,
+            unicodeScalarCount: writer.scalars,
             source: source,
             body: body
         )
@@ -389,9 +415,11 @@ enum AgentProviderHandover {
     private struct Writer {
         let collectText: Bool
         var bytes = 0
+        var scalars = 0
         var text = ""
         mutating func append(_ value: String) {
             bytes += value.utf8.count
+            scalars += value.unicodeScalars.count
             if collectText { text += value }
         }
     }
