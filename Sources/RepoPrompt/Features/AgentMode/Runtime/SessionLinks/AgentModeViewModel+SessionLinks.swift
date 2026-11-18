@@ -385,8 +385,9 @@ extension AgentModeViewModel {
     func agentSessionLinkRunFacts(
         for candidate: AgentSessionLinkEndpointCandidate, capturedStatus: DomainAgentSessionLinkStatus
     ) -> AgentRunQuietFacts? {
-        guard case let .success(session) = agentSessionLinkReadableSession(for: candidate),
-              session.permitsBoundOperationAndSave else { return nil }
+        guard case let .success(writer) = linkExecutionRuntime.transcriptWriter(for: candidate),
+              writer.session.permitsBoundOperationAndSave else { return nil }
+        let session = writer.session
         // The snapshot's status, not owner release or a later mutable runState, chooses the cutoff.
         let state: AgentSessionRunState = switch capturedStatus {
         case .idle: .idle
