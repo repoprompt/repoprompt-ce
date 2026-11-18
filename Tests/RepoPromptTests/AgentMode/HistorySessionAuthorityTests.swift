@@ -159,6 +159,56 @@ final class HistorySessionAuthorityTests: XCTestCase {
         XCTAssertEqual(decodeCount, decodesAfter + 1)
     }
 
+    func testCalendarTimeUsesSameLocalDayForBoundsAndGroupKeys() async throws {
+        let workspace = tempRoot.appendingPathComponent("Workspaces/DateBoundary", isDirectory: true)
+        let sessionID = UUID()
+        try seedWorkspaceContents(at: workspace, sessions: [(sessionID, "Date boundary")])
+
+        let formatter = ISO8601DateFormatter()
+        let start = try XCTUnwrap(formatter.date(from: "2026-07-04T02:00:00Z"))
+        let transcript = AgentTranscript(turns: [AgentTranscriptTurn(startedAt: start)])
+        let session = AgentSession(id: sessionID, name: "Date boundary", savedAt: start, transcript: transcript)
+        try JSONEncoder().encode(session).write(to: sessionFileURL(sessionID, in: workspace))
+        var record = makeStubRecord(id: sessionID, name: session.name)
+        record.firstActivityAt = start
+        record.lastActivityAt = start
+        record.transcriptTurnCount = 1
+        try JSONEncoder().encode(AgentSessionMetadataIndex(entries: [record]))
+            .write(to: workspace.appendingPathComponent("AgentSessions/AgentSessionIndex.json"))
+        let scanner = makeScanner(applicationSupportRoot: tempRoot)
+
+        for (zone, localDate, otherDate) in [
+            ("America/Los_Angeles", "2026-07-03", "2026-07-04"),
+            ("Asia/Tokyo", "2026-07-04", "2026-07-03")
+        ] {
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = try XCTUnwrap(TimeZone(identifier: zone))
+            for (day, expectedKeys) in [(localDate, [localDate]), (otherDate, [])] {
+                let reply = try await HistoryMCPToolService.execute(
+                    args: ["op": .string("time"), "group_by": .string("day"), "date_from": .string(day), "date_to": .string(day)],
+                    scanner: scanner,
+                    calendar: calendar
+                )
+                guard case let .time(result) = reply else { return XCTFail("Expected time reply, got \(reply)") }
+                XCTAssertEqual(result.groups.map(\.key), expectedKeys, "\(zone) \(day)")
+            }
+        }
+    }
+
+    func testCalendarBoundsSpanShortDayAndPreserveExactDatetime() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(identifier: "America/Los_Angeles"))
+        let formatter = ISO8601DateFormatter()
+        let start = try XCTUnwrap(formatter.date(from: "2026-03-08T08:00:00Z"))
+        let nextDay = try XCTUnwrap(formatter.date(from: "2026-03-09T07:00:00Z"))
+        let upperBound = try XCTUnwrap(HistoryMCPToolService.parseDateBound("2026-03-08", isUpperBound: true, calendar: calendar))
+
+        XCTAssertEqual(HistoryMCPToolService.parseDateBound("2026-03-08", isUpperBound: false, calendar: calendar), start)
+        XCTAssertLessThan(upperBound, nextDay)
+        XCTAssertGreaterThan(upperBound, nextDay.addingTimeInterval(-1))
+        XCTAssertEqual(HistoryMCPToolService.parseDateBound("2026-03-09T00:00:00-07:00", isUpperBound: true, calendar: calendar), nextDay)
+    }
+
     // MARK: - Helpers
 
     private func makeScanner(applicationSupportRoot: URL) -> HistorySessionScanner {
