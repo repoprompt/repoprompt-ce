@@ -203,7 +203,7 @@ struct ApplyEditsResultCard: View {
                 ToolMarkdownExpandedContent(item: item)
             }
         }
-        .updatingEditCardPresentation(key: presentationCacheKey, isMostRecentEdit: isMostRecentEdit, isExpanded: $isExpanded) {
+        .updatingEditCardPresentation(key: presentationCacheKey, isMostRecentEdit: isMostRecentEdit, isExpanded: _isExpanded.automaticBinding) {
             cachedPresentation = buildPresentation()
         }
     }
@@ -409,7 +409,7 @@ struct CursorNativeEditResultCard: View {
                 }
             }
         }
-        .updatingEditCardPresentation(key: presentationCacheKey, isMostRecentEdit: isMostRecentEdit, isExpanded: $isExpanded) {
+        .updatingEditCardPresentation(key: presentationCacheKey, isMostRecentEdit: isMostRecentEdit, isExpanded: _isExpanded.automaticBinding) {
             cachedPresentation = CursorNativeEditResultPresentation.build(for: item)
         }
     }
@@ -581,7 +581,7 @@ struct ApplyPatchResultCard: View {
                 ToolMarkdownExpandedContent(item: item)
             }
         }
-        .updatingEditCardPresentation(key: presentationCacheKey, isMostRecentEdit: isMostRecentEdit, isExpanded: $isExpanded) {
+        .updatingEditCardPresentation(key: presentationCacheKey, isMostRecentEdit: isMostRecentEdit, isExpanded: _isExpanded.automaticBinding) {
             cachedPresentation = buildPresentation()
         }
     }

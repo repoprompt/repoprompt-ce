@@ -68,12 +68,16 @@ struct AgentTranscriptDisclosureScope {
     let itemID: UUID
 
     @MainActor
-    func binding(for control: String, fallback: Binding<Bool>) -> Binding<Bool> {
+    func binding(for control: String, fallback: Binding<Bool>, recordsChoice: Bool = true) -> Binding<Bool> {
         let key = AgentTranscriptUIStore.DisclosureKey(workspaceID: workspaceID, tabID: tabID, itemID: itemID, control: control)
         return Binding(
             get: { store.disclosureChoice(for: key) ?? fallback.wrappedValue },
             set: {
-                store.setDisclosureChoice($0, for: key)
+                if recordsChoice {
+                    store.setDisclosureChoice($0, for: key)
+                } else if store.disclosureChoice(for: key) != nil {
+                    return
+                }
                 fallback.wrappedValue = $0
             }
         )
@@ -103,25 +107,24 @@ struct AgentTranscriptDisclosure: DynamicProperty {
         self.control = control
     }
 
-    var hasChoice: Bool {
-        scope?.hasChoice(for: control) ?? false
-    }
-
     var wrappedValue: Bool {
         get { projectedValue.wrappedValue }
         nonmutating set {
-            // Preserve existing live auto-expansion rules without retaining untouched rows.
-            if hasChoice {
-                projectedValue.wrappedValue = newValue
-            } else {
-                localChange = newValue
-            }
+            binding(recordsChoice: false).wrappedValue = newValue
         }
     }
 
     var projectedValue: Binding<Bool> {
+        binding(recordsChoice: true)
+    }
+
+    var automaticBinding: Binding<Bool> {
+        binding(recordsChoice: false)
+    }
+
+    private func binding(recordsChoice: Bool) -> Binding<Bool> {
         let fallback = Binding(get: { localChange ?? initialValue }, set: { localChange = $0 })
-        return scope?.binding(for: control, fallback: fallback) ?? fallback
+        return scope?.binding(for: control, fallback: fallback, recordsChoice: recordsChoice) ?? fallback
     }
 }
 
@@ -138,14 +141,20 @@ final class AgentTranscriptUIStore: ObservableObject {
     }
 
     /// Only user-operated disclosures are recorded; reading a row does not populate this map.
-    private var disclosureChoices: [DisclosureKey: Bool] = [:]
+    private var disclosureChoices: [UUID: [DisclosureKey: Bool]] = [:]
 
     func disclosureChoice(for key: DisclosureKey) -> Bool? {
-        disclosureChoices[key]
+        guard let tabID = key.tabID else { return nil }
+        return disclosureChoices[tabID]?[key]
     }
 
     func setDisclosureChoice(_ value: Bool, for key: DisclosureKey) {
-        disclosureChoices[key] = value
+        guard let tabID = key.tabID else { return }
+        disclosureChoices[tabID, default: [:]][key] = value
+    }
+
+    func clearDisclosureChoices(for tabID: UUID) {
+        disclosureChoices.removeValue(forKey: tabID)
     }
 
     func update(_ snapshot: AgentTranscriptUISnapshot) {

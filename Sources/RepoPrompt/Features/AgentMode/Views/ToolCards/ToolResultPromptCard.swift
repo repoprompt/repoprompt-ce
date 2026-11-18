@@ -173,7 +173,7 @@ struct PromptResultCard: View {
             }
         }
         .onAppear {
-            if !_isExpanded.hasChoice { reconcileExpansion() }
+            reconcileExpansion()
         }
         .onChange(of: item.toolResultJSON) { _, _ in
             reconcileExpansion()

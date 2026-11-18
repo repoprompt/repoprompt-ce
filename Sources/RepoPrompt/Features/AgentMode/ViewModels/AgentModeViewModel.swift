@@ -509,6 +509,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             // Preserve @Published's will-change ordering without a second stored dictionary.
             objectWillChange.send()
             runtimeSessionStore.replaceSessions(newValue)
+            for tabID in previous.keys where newValue[tabID] == nil {
+                ui.transcript.clearDisclosureChoices(for: tabID)
+            }
             synchronizeRunPresentationAttachments(previous: previous)
             rebuildAgentSessionLinkSubagentCensus(reconcileLiveObservers: true)
             syncSidebarUIState(refresh: true, reason: .sessionList)
@@ -7347,6 +7350,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.createdByOverseerSessionID = nil
         session.organizationalParentID = nil
         session.delegationScopeID = nil
+        ui.transcript.clearDisclosureChoices(for: session.tabID)
         session.setItemsSilently([], reason: .routeActivation)
         session.clearDerivedTranscriptCaches()
         session.hasSentFirstMessage = false
@@ -18100,6 +18104,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard let session = sessions[tabID] else { return }
         runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).closeOracleBackground(for: session)
 
+        ui.transcript.clearDisclosureChoices(for: tabID)
         session.setItemsSilently([], reason: .clearedChat)
         session.clearDerivedTranscriptCaches()
         session.pendingFileAttachments.removeAll()
