@@ -6,6 +6,8 @@ import argparse
 from pathlib import Path
 import signal
 import subprocess
+import sys
+import tempfile
 import time
 from ci_process_session import defer_cancellation_during_cleanup, terminate_session
 
@@ -57,6 +59,34 @@ def run_resolution(command, *, cwd, check, timeout):
     return subprocess.CompletedProcess(command, status)
 
 
+def seed_scratch_repositories(root: Path, scratch_path: str, timeout: int) -> None:
+    """Reuse the primary resolution's mirrors for this package’s secondary build directory."""
+    source = root / '.build' / 'repositories'
+    destination = root / scratch_path / 'repositories'
+    if not source.is_dir() or source.is_symlink() or destination.exists() or destination.is_symlink():
+        return
+
+    # Keep SwiftPM's workspace state, checkouts and products local to each scratch path.
+    # On the macOS runner a copy-on-write clone avoids re-cloning large Git repositories.
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='.repositories-seed-', dir=destination.parent) as directory:
+            staged = Path(directory) / 'repositories'
+            options = '-cR' if sys.platform == 'darwin' else '-R'
+            copied = run_resolution(
+                ['/bin/cp', options, str(source.resolve()), str(staged.resolve())],
+                cwd=root, check=False, timeout=timeout,
+            )
+            if copied.returncode != 0:
+                print('::warning::Could not seed SwiftPM repositories; resolving normally', flush=True)
+                return
+            staged.rename(destination)
+    except (OSError, subprocess.TimeoutExpired):
+        print('::warning::Could not seed SwiftPM repositories; resolving normally', flush=True)
+        return
+    print('Seeded scratch SwiftPM repositories from the primary package resolution', flush=True)
+
+
 def resolve(root: Path, scratch_path: str | None = None, *, attempts: int = 3,
             timeout: int = 300, run=run_resolution, sleep=time.sleep) -> int:
     if not 1 <= attempts <= 5 or not 1 <= timeout <= 600:
@@ -64,9 +94,12 @@ def resolve(root: Path, scratch_path: str | None = None, *, attempts: int = 3,
     command = ['swift', 'package']
     # The dependency-free provider package has no lockfile. Root/Sentry jobs
     # always have one: prohibit pin rewrites there while resolving downloads.
-    if (root / 'Package.resolved').is_file():
+    pinned = (root / 'Package.resolved').is_file()
+    if pinned:
         command.append('--force-resolved-versions')
     if scratch_path:
+        if pinned:
+            seed_scratch_repositories(root, scratch_path, timeout)
         command += ['--scratch-path', scratch_path]
     command += ['resolve']
     for attempt in range(1, attempts + 1):

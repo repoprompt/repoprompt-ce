@@ -176,6 +176,31 @@ class ResolutionTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs['timeout'], 300)
         sleep.assert_called_once_with(10)
 
+    def test_secondary_pinned_resolution_seeds_mirrors_only_before_resolving(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'Package.resolved').write_text('{}')
+            primary = root / '.build'
+            mirror = primary / 'repositories' / 'dependency-123'
+            mirror.mkdir(parents=True)
+            (mirror / 'HEAD').write_text('ref: refs/heads/main\n')
+            (primary / 'workspace-state.json').write_text('{}')
+            scratch = primary / 'swiftbuild'
+            seeded = scratch / 'repositories' / mirror.name / 'HEAD'
+
+            def run(command, **_options):
+                self.assertIn('--force-resolved-versions', command)
+                self.assertEqual(seeded.read_text(), (mirror / 'HEAD').read_text())
+                self.assertFalse((scratch / 'workspace-state.json').exists())
+                seeded.write_text('scratch can change independently')
+                self.assertEqual((mirror / 'HEAD').read_text(), 'ref: refs/heads/main\n')
+                return subprocess.CompletedProcess(command, 0)
+
+            self.assertEqual(resolver.resolve(root, '.build/swiftbuild', run=run), 0)
+            self.assertFalse(list(scratch.glob('.repositories-seed-*')))
+            resolver.seed_scratch_repositories(root, '.build/swiftbuild', timeout=300)
+            self.assertEqual(seeded.read_text(), 'scratch can change independently')
+
     def test_existing_lockfile_cannot_be_rewritten_by_resolution(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
