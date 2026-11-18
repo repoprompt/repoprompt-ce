@@ -47,7 +47,7 @@ struct ContentViewSheetPresenter: ViewModifier {
             }
             // MCP Status sheet
             .sheet(isPresented: $showMCPStatusSheet) {
-                MCPStatusView(server: viewModel.state.mcpServer)
+                MCPStatusView(server: viewModel.state.mcpServer, windowID: viewModel.state.windowID)
             }
     }
 }

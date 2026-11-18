@@ -44,6 +44,37 @@ final class MCPBackgroundModeCoordinator: NSObject {
         removeStatusItem()
     }
 
+    func showConnectionsDashboard() {
+        let windows = WindowStatesManager.shared.allWindows.filter { !$0.isClosing && $0.nsWindow != nil }
+        let keyWindow = NSApplication.shared.keyWindow
+        let target = windows.first { $0.nsWindow === (keyWindow?.sheetParent ?? keyWindow) }
+            ?? windows.last { $0.nsWindow?.isVisible == true }
+            ?? windows.last
+        guard let target else { return }
+        showConnectionsDashboard(in: target)
+    }
+
+    private func showConnectionsDashboard(in target: WindowState) {
+        guard !WindowStatesManager.shared.isTerminating,
+              NSApplication.shared.modalWindow == nil,
+              !target.isClosing, let window = target.nsWindow, window.attachedSheet == nil
+        else { return }
+        if backgroundedWindowID == target.windowID {
+            restore()
+        } else {
+            if window.isMiniaturized { window.deminiaturize(nil) }
+            target.focusWindowIfPossible()
+        }
+        NotificationCenter.default.post(name: .showMCPStatusWindow, object: nil, userInfo: ["windowID": target.windowID])
+    }
+
+    @objc private func showConnectionsDashboardAction(_ sender: Any?) {
+        guard let backgroundedWindowID,
+              let target = WindowStatesManager.shared.allWindows.first(where: { $0.windowID == backgroundedWindowID })
+        else { return }
+        showConnectionsDashboard(in: target)
+    }
+
     @objc private func restoreAction(_ sender: Any?) {
         restore()
     }
@@ -87,6 +118,9 @@ final class MCPBackgroundModeCoordinator: NSObject {
         let showItem = NSMenuItem(title: "Show RepoPrompt", action: #selector(restoreAction(_:)), keyEquivalent: "")
         showItem.target = self
         menu.addItem(showItem)
+        let connectionsItem = NSMenuItem(title: "Show MCP Connections…", action: #selector(showConnectionsDashboardAction(_:)), keyEquivalent: "")
+        connectionsItem.target = self
+        menu.addItem(connectionsItem)
         menu.addItem(.separator())
         let quitItem = NSMenuItem(title: "Quit RepoPrompt", action: #selector(quitAction(_:)), keyEquivalent: "q")
         quitItem.target = self
