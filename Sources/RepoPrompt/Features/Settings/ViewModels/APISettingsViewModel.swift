@@ -297,6 +297,10 @@ public class APISettingsViewModel: ObservableObject {
     @Published var claudeCodeError: String? = nil
     private var claudeCodeLogCollector: CLIProcessLogCollector?
 
+    var showsClaudeCodeConnectedBadge: Bool {
+        isClaudeCodeConnected && claudeCodeError == nil
+    }
+
     var isClaudeCodeBinaryPresent: Bool {
         isClaudeCodeConnected || claudeCodeCLIStatus.binaryPresent
     }
@@ -3113,7 +3117,9 @@ public class APISettingsViewModel: ObservableObject {
 
     // MARK: - Claude Code
 
-    func testClaudeCodeConnection() async throws -> Bool {
+    func testClaudeCodeConnection(
+        probe: @MainActor (ClaudeCodeProvider) async throws -> Bool = { try await $0.testConnection(timeout: 30) }
+    ) async throws -> Bool {
         let wasConnected = isClaudeCodeConnected
         let previousStatus = claudeCodeCLIStatus
         let collector = CLIProcessLogCollector()
@@ -3127,12 +3133,15 @@ public class APISettingsViewModel: ObservableObject {
         collector.append("Created Claude Code provider for health check")
 
         do {
-            let ok = try await provider.testConnection(timeout: 30)
+            let ok = try await probe(provider)
             collector.append("Health check completed with status: \(ok ? "success" : "empty response")")
             collector.append("Disposing Claude Code provider resources")
             await provider.dispose()
             collector.append("Claude Code provider disposed")
-            guard ok else { return false }
+            guard ok else {
+                claudeCodeError = "Claude Code CLI returned no text during the connection check. Try again."
+                return false
+            }
             isClaudeCodeConnected = true
             if !wasConnected {
                 await WindowStatesManager.shared.providerQuotaRuntime.claude.invalidate()

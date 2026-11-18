@@ -373,6 +373,8 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
             } catch {
                 if let message = Self.executableUnavailableMessage(from: error) {
                     result = .executableUnavailable(message: message)
+                } else if Self.isPermanentAccountReadRefreshRejection(error) {
+                    result = .requiresUserLogin(message: CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage)
                 } else {
                     result = .temporarilyUnavailable(message: CodexManagedAuthRecoveryClassifier.temporaryVerificationFailureMessage)
                 }
@@ -906,6 +908,26 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
                 try await sleep(backoff)
             }
         }
+    }
+
+    private static func isPermanentAccountReadRefreshRejection(_ error: Error) -> Bool {
+        guard let clientError = error as? CodexAppServerClient.ClientError,
+              case let .requestFailed(failure) = clientError,
+              failure.method == "account/read", failure.code == -32603
+        else {
+            return false
+        }
+        // Codex 0.170 reports a permanent workspace-routing refresh rejection as
+        // an internal error with a fixed message and no structured reason. Other
+        // internal errors, including routing or network failures, remain inconclusive.
+        let lead = "Your access token could not be refreshed"
+        let guidance = ". Please log out and sign in again."
+        return [
+            "",
+            " because your refresh token has expired",
+            " because your refresh token was already used",
+            " because your refresh token was revoked"
+        ].contains { failure.message == lead + $0 + guidance }
     }
 
     private static func isClearlyTransientAccountReadFailure(_ error: Error) -> Bool {
