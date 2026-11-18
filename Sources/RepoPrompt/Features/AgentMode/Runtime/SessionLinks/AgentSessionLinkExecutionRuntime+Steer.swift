@@ -95,7 +95,7 @@ extension AgentSessionLinkExecutionRuntime {
             return .blocked(.invalidated(admissionLiveness))
         }
         guard let command = admit(candidate),
-              let environment = commands.managedInputEnvironment?(session), environment.resourcesAreCurrent(),
+              let environment = commands.managedInputEnvironment(session), environment.resourcesAreCurrent(),
               environment.workspaceID == candidate.workspaceID,
               commands.workspaceID(session) == candidate.workspaceID
         else {
