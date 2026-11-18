@@ -409,7 +409,7 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                 try Task.checkCancellation()
                 let lookupContext = authority.lookupContext
                 try Task.checkCancellation()
-                _ = try await authority.store.awaitAppliedIngress(
+                _ = await authority.store.awaitAppliedIngress(
                     rootScope: lookupContext.rootScope
                 )
                 try Task.checkCancellation()
@@ -428,7 +428,7 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                     requestedPaths = translated
                     for path in translated {
                         try Task.checkCancellation()
-                        if let issue = try await authority.store
+                        if let issue = await authority.store
                             .exactPathResolutionIssue(
                                 for: path,
                                 kind: .either,
