@@ -126,7 +126,7 @@ final class AgentSessionLinkAttributionPersistenceTests: XCTestCase {
             AgentChatItem.assistant("Rerunning now.", sequenceIndex: 8)
         ]
         let transcript = AgentTranscriptIO.buildTranscript(from: items)
-        let canonical = AgentModeViewModel.canonicalTranscript(
+        let canonical = AgentSessionLinkExecutionRuntime.canonicalTranscript(
             from: transcript,
             sourceItemsRevision: 1
         )
