@@ -4184,7 +4184,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         )
     }
 
-    private struct RunCatalogEndpointProjection: Equatable, Sendable {
+    private struct RunCatalogEndpointProjection: Equatable {
         let connectionID: UUID
         let endpoint: DomainAgentSessionLinkEndpointIdentity
     }
