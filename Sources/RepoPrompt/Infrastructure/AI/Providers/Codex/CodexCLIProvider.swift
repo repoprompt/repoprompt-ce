@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 import RepoPromptCodexProvider
@@ -102,6 +103,56 @@ final class CodexCLIProvider: AIProvider {
         let task: Task<Void, Never>
     }
 
+    /// Owns the transport and the fresh thread for a single provider attempt.
+    actor RequestAppServer {
+        private static let logger = Logger(subsystem: "com.repoprompt.agents", category: "CodexCLIProvider")
+
+        let client: CodexAppServerClient
+        private var temporaryConversationID: String?
+        private var threadRetirement: Task<Void, Never>?
+
+        init(client: CodexAppServerClient) {
+            self.client = client
+        }
+
+        /// Bind before submitting the first turn, which is what persists the rollout.
+        /// A stop that wins this race closes a still-unmaterialized thread.
+        func associateTemporaryConversation(_ id: String) throws {
+            guard threadRetirement == nil else { throw CancellationError() }
+            guard temporaryConversationID == nil else {
+                throw AIProviderError.invalidResponse(detail: "The one-shot Codex request already owns a conversation.")
+            }
+            temporaryConversationID = id
+        }
+
+        func stop() async {
+            if threadRetirement == nil {
+                let conversationID = temporaryConversationID
+                let client = client
+                // Cancellation of a consumer must not prevent the owned server from
+                // settling its temporary thread before the request closes the transport.
+                threadRetirement = Task {
+                    guard let conversationID else { return }
+                    let handle = ProviderConversationCleanupHandle(
+                        provider: String(describing: AIProviderType.codex),
+                        conversationID: conversationID
+                    )
+                    let cleanup = CodexConversationCleanupService(
+                        requestExecutor: { method, params, timeout in
+                            try await client.request(method: method, params: params, timeout: timeout)
+                        },
+                        timeout: 3
+                    )
+                    let outcome = await cleanup.cleanup(handle, action: .delete)
+                    if case .succeeded = outcome { return }
+                    Self.logger.warning("Codex temporary conversation cleanup failed: \(outcome.message ?? "Unknown error", privacy: .private)")
+                }
+            }
+            await threadRetirement?.value
+            await client.stop()
+        }
+    }
+
     private let workingDirectory: String?
     private let launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot
     private let enableDebugLogging: Bool
@@ -122,7 +173,7 @@ final class CodexCLIProvider: AIProvider {
     private let activeStreamTasksLock = NSLock()
     private var activeStreamTasks: [UUID: Task<Void, Never>] = [:]
     private let activeRequestClientsLock = NSLock()
-    private var activeRequestClients: [UUID: CodexAppServerClient] = [:]
+    private var activeRequestClients: [UUID: RequestAppServer] = [:]
 
     init(
         workingDirectory: String? = nil,
@@ -292,14 +343,14 @@ final class CodexCLIProvider: AIProvider {
 
         while true {
             do {
-                let text = try await withActiveRequestAppServerClient(id: requestID) { appServerClient in
+                let text = try await withActiveRequestAppServer(id: requestID) { requestServer in
                     try await runTurnCollectingText(
                         baseInstructions: baseInstructions,
                         prompt: prompt,
                         requestedModelIdentifier: nil,
                         fallbackReasoningEffort: nil,
                         excludeServers: currentExcludeServers,
-                        appServerClient: appServerClient,
+                        requestServer: requestServer,
                         requestTimeout: appliedTimeout,
                         contextWindowSelection: contextWindowSelection
                     )
@@ -363,7 +414,7 @@ final class CodexCLIProvider: AIProvider {
             let brokenServers = await CodexBrokenServersCache.shared.getAll()
 
             do {
-                try await withActiveRequestAppServerClient(id: requestID) { appServerClient in
+                try await withActiveRequestAppServer(id: requestID) { requestServer in
                     try await runSingleStreamAttempt(
                         baseInstructions: baseInstructions,
                         prompt: prompt,
@@ -372,7 +423,7 @@ final class CodexCLIProvider: AIProvider {
                         fallbackReasoningEffort: fallbackReasoningEffort,
                         serviceTier: serviceTier,
                         excludeServers: brokenServers,
-                        appServerClient: appServerClient,
+                        requestServer: requestServer,
                         requestTimeout: defaultRequestTimeout,
                         contextWindowSelection: contextWindowSelection,
                         continuation: continuation
@@ -469,11 +520,12 @@ final class CodexCLIProvider: AIProvider {
         fallbackReasoningEffort: String?,
         serviceTier: String?,
         excludeServers: Set<String>,
-        appServerClient: CodexAppServerClient?,
+        requestServer: RequestAppServer?,
         requestTimeout: TimeInterval,
         contextWindowSelection: CodexContextWindowPreferences.Selection,
         continuation: AsyncThrowingStream<AIStreamResult, Error>.Continuation
     ) async throws {
+        let appServerClient = requestServer?.client
         let selection = appServerSelection(
             requestedModelIdentifier: requestedModelIdentifier,
             fallbackReasoningEffort: fallbackReasoningEffort,
@@ -509,6 +561,7 @@ final class CodexCLIProvider: AIProvider {
                     reasoningEffort: selection.reasoningEffort,
                     serviceTier: selection.serviceTier
                 )
+                try await requestServer?.associateTemporaryConversation(sessionRef.conversationID)
                 let turnReceipt = try await controller.startUserTurn(
                     text: prompt,
                     attachments: attachments,
@@ -517,6 +570,7 @@ final class CodexCLIProvider: AIProvider {
                     serviceTier: selection.serviceTier
                 )
 
+                let cleanupSessionRef = requestServer == nil ? sessionRef : nil
                 var sawCompletion = false
                 let reconciliationState = TerminalReconciliationState(
                     startedAt: ProcessInfo.processInfo.systemUptime
@@ -607,7 +661,7 @@ final class CodexCLIProvider: AIProvider {
                         switch status {
                         case .completed:
                             sawCompletion = true
-                            continuation.yield(Self.messageStopEvent(sessionRef: sessionRef, usage: exactUsage))
+                            continuation.yield(Self.messageStopEvent(sessionRef: cleanupSessionRef, usage: exactUsage))
                             break eventLoop
                         case .interrupted:
                             throw CancellationError()
@@ -673,7 +727,7 @@ final class CodexCLIProvider: AIProvider {
                         sawCompletion = true
                         // A terminal snapshot proves text completion, not exhaustive raw-response delivery.
                         // Even the final response usage may arrive after its item/completed notification.
-                        continuation.yield(Self.messageStopEvent(sessionRef: sessionRef))
+                        continuation.yield(Self.messageStopEvent(sessionRef: cleanupSessionRef))
                     case .interrupted:
                         throw CancellationError()
                     case .failed:
@@ -713,10 +767,11 @@ final class CodexCLIProvider: AIProvider {
         fallbackReasoningEffort: String?,
         serviceTier: String? = nil,
         excludeServers: Set<String>,
-        appServerClient: CodexAppServerClient?,
+        requestServer: RequestAppServer?,
         requestTimeout: TimeInterval,
         contextWindowSelection: CodexContextWindowPreferences.Selection
     ) async throws -> String {
+        let appServerClient = requestServer?.client
         let selection = appServerSelection(
             requestedModelIdentifier: requestedModelIdentifier,
             fallbackReasoningEffort: fallbackReasoningEffort,
@@ -740,13 +795,14 @@ final class CodexCLIProvider: AIProvider {
                     appServerClient: appServerClient,
                     requestTimeout: requestTimeout
                 )
-                _ = try await controller.startOrResume(
+                let sessionRef = try await controller.startOrResume(
                     existing: nil,
                     baseInstructions: baseInstructions,
                     model: selection.model,
                     reasoningEffort: selection.reasoningEffort,
                     serviceTier: selection.serviceTier
                 )
+                try await requestServer?.associateTemporaryConversation(sessionRef.conversationID)
                 _ = try await controller.startUserTurn(
                     text: prompt,
                     attachments: [],
@@ -1020,30 +1076,25 @@ final class CodexCLIProvider: AIProvider {
         )
     }
 
-    private func withActiveRequestAppServerClient<T>(
+    private func withActiveRequestAppServer<T>(
         id: UUID,
-        operation: (CodexAppServerClient?) async throws -> T
+        operation: (RequestAppServer?) async throws -> T
     ) async throws -> T {
-        let appServerClient = makeRequestAppServerClient()
-        if let appServerClient {
-            registerActiveRequestClient(appServerClient, id: id)
+        let requestServer = makeRequestAppServerClient().map { RequestAppServer(client: $0) }
+        if let requestServer {
+            registerActiveRequestClient(requestServer, id: id)
         }
         defer {
             unregisterActiveRequestClient(id)
         }
         do {
-            let result = try await operation(appServerClient)
-            await stopRequestAppServerClient(appServerClient)
+            let result = try await operation(requestServer)
+            await requestServer?.stop()
             return result
         } catch {
-            await stopRequestAppServerClient(appServerClient)
+            await requestServer?.stop()
             throw error
         }
-    }
-
-    private func stopRequestAppServerClient(_ appServerClient: CodexAppServerClient?) async {
-        guard let appServerClient else { return }
-        await appServerClient.stop()
     }
 
     static func interactiveToolPolicy() -> CodexOverrides.ToolPolicy {
@@ -1311,7 +1362,7 @@ final class CodexCLIProvider: AIProvider {
         tasks.forEach { $0.cancel() }
     }
 
-    private func registerActiveRequestClient(_ client: CodexAppServerClient, id: UUID) {
+    private func registerActiveRequestClient(_ client: RequestAppServer, id: UUID) {
         activeRequestClientsLock.lock()
         activeRequestClients[id] = client
         activeRequestClientsLock.unlock()
@@ -1323,7 +1374,7 @@ final class CodexCLIProvider: AIProvider {
         activeRequestClientsLock.unlock()
     }
 
-    private func snapshotActiveRequestClients() -> [CodexAppServerClient] {
+    private func snapshotActiveRequestClients() -> [RequestAppServer] {
         activeRequestClientsLock.lock()
         let clients = Array(activeRequestClients.values)
         activeRequestClientsLock.unlock()
