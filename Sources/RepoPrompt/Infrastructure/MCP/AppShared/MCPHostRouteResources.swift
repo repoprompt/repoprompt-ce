@@ -72,32 +72,57 @@ final class MCPHostRouteResources {
             && current.fileToolAuthoritySourceIdentity == original.fileToolAuthoritySourceIdentity
     }
 
-    /// Consume only this route's existing connection receipt. Query dispatch never binds a new
-    /// connection, follows a presenter or adopts a same-ID replacement.
-    func fileReadHandle(metadata: MCPRequestMetadata, context: DomainContextIdentity) async throws -> DomainReadContextHandle {
-        guard !isClosing, let coordinator, let connectionID = metadata.connectionID,
+    @MainActor
+    struct FileReadConnection {
+        let context: DomainContextIdentity
+        fileprivate let registration: DomainConnectionRegistration
+        fileprivate let policyID: UUID?
+        fileprivate let tab: MCPTabContextSnapshot
+
+        var lookupSource: AgentWorkspaceLookupContextSource {
+            .init(activeAgentSessionID: tab.activeAgentSessionID, worktreeBindingState: tab.worktreeBindingState)
+        }
+    }
+
+    /// Capture the current connection before selection or domain reads can suspend, and use its
+    /// bound tab for the entire invocation. The route's active presentation is irrelevant here.
+    func fileReadConnection(metadata: MCPRequestMetadata, workspaceID: UUID) throws -> FileReadConnection {
+        guard !isClosing, let connectionID = metadata.connectionID,
               let retained = connections[connectionID],
               let routed = runRouteBindings.tabContextByConnectionID[connectionID],
               metadata.windowID == identity.routeID,
               routed.windowID == identity.routeID, routed.routeOwnerIdentity == ObjectIdentifier(self),
-              routed.workspaceID == context.workspaceID, routed.tabID == context.contextID,
+              routed.workspaceID == workspaceID,
               runRouteBindings.connectionIDToRunID[connectionID].map({ $0 == routed.runID }) ?? true,
-              metadata.tabContextHint.map({ $0.tabID == context.contextID && ($0.workspaceID == nil || $0.workspaceID == context.workspaceID) }) ?? true
+              metadata.tabContextHint.map({ $0.tabID == routed.tabID && ($0.workspaceID == nil || $0.workspaceID == workspaceID) }) ?? true
         else { throw MCPFileToolAuthorityFailure.unavailable }
-        let handle = try await coordinator.resolveReadContext(connection: retained.registration)
-        guard !isClosing, connections[connectionID]?.registration == retained.registration,
-              fileReadContextIsCurrent(routed, connectionID: connectionID),
-              handle.context == context,
-              MCPServerViewModel.domainReadBindingSatisfiesRequestedRun(requestedRunID: routed.runID, resolvedBindingKind: handle.bindingKind)
+        return FileReadConnection(
+            context: .init(workspaceID: workspaceID, contextID: routed.tabID),
+            registration: retained.registration, policyID: retained.policyID, tab: routed
+        )
+    }
+
+    func fileReadConnectionIsCurrent(_ connection: FileReadConnection) -> Bool {
+        let connectionID = connection.registration.connectionID
+        guard let retained = connections[connectionID] else { return false }
+        return retained.registration == connection.registration && retained.policyID == connection.policyID
+            && fileReadContextIsCurrent(connection.tab, connectionID: connectionID)
+            && (runRouteBindings.connectionIDToRunID[connectionID].map { $0 == connection.tab.runID } ?? true)
+    }
+
+    func fileReadHandle(for connection: FileReadConnection) async throws -> DomainReadContextHandle {
+        guard let coordinator else { throw MCPFileToolAuthorityFailure.unavailable }
+        guard fileReadConnectionIsCurrent(connection) else { throw MCPFileToolAuthorityFailure.superseded }
+        let handle = try await coordinator.resolveReadContext(connection: connection.registration)
+        guard fileReadConnectionIsCurrent(connection), handle.context == connection.context,
+              MCPServerViewModel.domainReadBindingSatisfiesRequestedRun(requestedRunID: connection.tab.runID, resolvedBindingKind: handle.bindingKind)
         else { throw MCPFileToolAuthorityFailure.superseded }
         return handle
     }
 
-    func drainFileReadSelection(metadata: MCPRequestMetadata) async throws {
-        guard !isClosing, let connectionID = metadata.connectionID,
-              let context = runRouteBindings.tabContextByConnectionID[connectionID],
-              context.windowID == identity.routeID, context.routeOwnerIdentity == ObjectIdentifier(self)
-        else { throw MCPFileToolAuthorityFailure.unavailable }
+    func drainFileReadSelection(for connection: FileReadConnection) async throws {
+        let context = connection.tab
+        let connectionID = connection.registration.connectionID
         let key = MCPReadFileAutoSelectionCoordinator.ContextKey(
             windowID: context.windowID, workspaceID: context.workspaceID, tabID: context.tabID,
             route: .bound(connectionID: connectionID, runID: context.runID),
@@ -113,6 +138,7 @@ final class MCPHostRouteResources {
             keys = lineage.predecessorKeys
         }
         for candidate in keys + [key] {
+            guard fileReadConnectionIsCurrent(connection) else { throw MCPFileToolAuthorityFailure.superseded }
             try await MCPServerViewModel.requireReadFileAutoSelectionPrerequisite {
                 await coordinator.drain(.canonicalSelection, for: candidate)
             }
