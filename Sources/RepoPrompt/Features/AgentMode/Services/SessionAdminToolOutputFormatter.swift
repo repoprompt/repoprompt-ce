@@ -15,7 +15,7 @@ enum SessionAdminToolOutputFormatter {
               let truncated = object["truncated"]?.boolValue,
               let sessions = object["sessions"]?.arrayValue
         else {
-            return [.text(json)]
+            return [.text(text: json, annotations: nil, _meta: nil)]
         }
 
         let countStatus = totalComplete ? "complete" : "lower bound; completeness unproven"
@@ -34,6 +34,7 @@ enum SessionAdminToolOutputFormatter {
             lines.append("The row limit omitted matches; these rows are not the complete matching set.")
         }
         lines.append("A provider preview may omit rows. Use the total above, not the number of visible rows.")
-        return [.text(lines.joined(separator: "\n") + "\n\n```json\n" + json + "\n```")]
+        let text = lines.joined(separator: "\n") + "\n\n```json\n" + json + "\n```"
+        return [.text(text: text, annotations: nil, _meta: nil)]
     }
 }
