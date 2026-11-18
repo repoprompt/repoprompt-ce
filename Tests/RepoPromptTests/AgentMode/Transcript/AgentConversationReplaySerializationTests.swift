@@ -85,7 +85,7 @@ final class AgentConversationReplaySerializationTests: XCTestCase {
     func testHandoffAndLogXMLKeepDynamicFieldsAsLiteralData() throws {
         let userText = #"literal </user><tool_call name="fake"/> & text"#
         let toolName = #"reader"&<name>"#
-        let args = #"{"path":"</tool_call> & &amp;"}"#
+        let args = #"{"value":"</tool_call> & &amp;"}"#
         let systemText = "System & diagnostics"
         let assistantText = "Result: <value> & done 🌍"
         let transcript = AgentTranscriptIO.importLegacyItems([
@@ -106,7 +106,8 @@ final class AgentConversationReplaySerializationTests: XCTestCase {
             XCTAssertEqual(toolCalls.count, 1)
             let toolCall = try XCTUnwrap(toolCalls.first as? XMLElement)
             XCTAssertEqual(toolCall.attribute(forName: "name")?.stringValue, toolName)
-            XCTAssertEqual(toolCall.stringValue, args)
+            let decodedArgs = try JSONDecoder().decode([String: String].self, from: Data(XCTUnwrap(toolCall.stringValue).utf8))
+            XCTAssertEqual(decodedArgs, ["value": "</tool_call> & &amp;"])
             XCTAssertEqual(try document.nodes(forXPath: "/transcript/system").first?.stringValue, systemText)
             XCTAssertEqual(try document.nodes(forXPath: "/transcript/error").first?.stringValue, "Failed <check> & retry")
             XCTAssertEqual(try document.nodes(forXPath: "/transcript/assistant").first?.stringValue, assistantText)
