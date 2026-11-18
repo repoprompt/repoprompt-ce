@@ -43,11 +43,11 @@ the closed app's version history.
 
 ## Bundled Codex artifact
 
-Debug and release packaging include the complete official OpenAI Codex 0.164.0
+Debug and release packaging include the complete official OpenAI Codex 0.170.0
 standalone package. The authority is the repository-owned
 [`Vendor/Codex/manifest.json`](../Vendor/Codex/manifest.json), which pins the
-official [`rust-v0.164.0` release](https://github.com/openai/codex/releases/tag/rust-v0.164.0),
-the official [`codex-package_SHA256SUMS`](https://github.com/openai/codex/releases/download/rust-v0.164.0/codex-package_SHA256SUMS),
+official [`rust-v0.170.0` release](https://github.com/openai/codex/releases/tag/rust-v0.170.0),
+the official [`codex-package_SHA256SUMS`](https://github.com/openai/codex/releases/download/rust-v0.170.0/codex-package_SHA256SUMS),
 both macOS package assets, their complete extracted layouts, file hashes,
 architectures, and primary executable signing identities. The upstream release
 publishes SHA-256 sums but does not document a public GPG, minisign, or SLSA
@@ -79,12 +79,11 @@ contains only its selected target directory, while explicit
 contain both `aarch64-apple-darwin/` and `x86_64-apple-darwin/`. Runtime selection
 fails closed unless the package matching the running app architecture is present.
 Each target subtree preserves `codex-package.json`, `bin/codex`,
-`bin/codex-code-mode-host`, `codex-resources/`, `codex-path/`, and all additional
-package resources; the binaries inside remain thin and must match the directory's
-target architecture. Codex 0.156.0 adds `codex-resources/voice/`, including a
-voice host, native libraries/plugins, source provenance, and their licences. All
-30 macOS Mach-Os are Developer ID signed by `OpenAI OpCo, LLC` (team
-`2DC432GLL2`) with hardened runtime and timestamps in the official packages.
+`bin/codex-code-mode-host`, `bin/codex-exec-server`, `codex-resources/`,
+`codex-path/`, and all additional package resources. Every binary is thin and matches its target architecture. Codex 0.156.0 adds `codex-resources/voice/`, including a
+voice host, native libraries/plugins, source provenance, and their licences.
+Each architecture has 30 Mach-Os. The three executables under `bin/` are Developer ID signed by
+`OpenAI OpCo, LLC` (team `2DC432GLL2`) with hardened runtime and timestamps.
 
 Host-native debug packaging preserves those upstream signatures and exact bytes.
 Privileged release signing deliberately re-signs every manifest-owned Mach-O with
@@ -113,8 +112,8 @@ External version validation uses the captured launch environment, including its 
 search path.
 RepoPrompt rejects custom executables older than 0.149.0, the last proven external
 compatibility floor. This is intentionally distinct from the exact bundled and schema-gate
-pin at 0.164.0: the bounded app-server projection passes unchanged at 47 methods,
-217 parameter paths, and 125 response paths, and this bundle rotation adds no new
+pin at 0.170.0: the bounded app-server projection passes unchanged at 48 methods,
+230 parameter paths, and 143 response paths, and this bundle rotation adds no new
 outgoing request requirement. Bundled and external runtimes both use
 RepoPrompt-owned `CODEX_HOME` and `CODEX_SQLITE_HOME` directories under
 `~/Library/Application Support/RepoPrompt CE/Codex/{Debug,Release}/`, leaving
@@ -132,11 +131,10 @@ instead of guessing when the code-mode policy is ambiguous, uses dotted or inlin
 definitions that would redefine the owned table/keys, or uses
 `non_prefixed_mcp_tool_names`.
 
-The 0.164.0 standalone packages no longer contain bundled Zsh. The reviewed
-rotation removes its three layout entries, Mach-O/signing inventory entry, and
-obsolete licence. Both architectures retain the native voice runtime and its
-complete legal inventory. Future unreviewed layout drift still fails the guarded
-candidate tool.
+The 0.170.0 packages add `bin/codex-exec-server`. Both architectures pin the
+helper's OpenAI signature and assign it the empty release entitlement profile.
+The voice runtime's source inventory is refreshed for PCRE2 10.48. Future
+unreviewed layout drift still fails the guarded candidate tool.
 
 To diagnose acquisition independently of a build, run:
 
@@ -144,7 +142,7 @@ To diagnose acquisition independently of a build, run:
 python3 Scripts/codex_runtime_artifact.py acquire --arch all
 python3 Scripts/codex_runtime_artifact.py verify \
   --arch aarch64-apple-darwin \
-  --package .build/codex-runtime/0.164.0/aarch64-apple-darwin
+  --package .build/codex-runtime/0.170.0/aarch64-apple-darwin
 python3 Scripts/codex_runtime_artifact.py stage-bundle \
   --arch all \
   --cache-root .build/codex-runtime \
@@ -233,13 +231,10 @@ inventory/architecture, normalized-payload, and OpenAI signing-identity drift.
 The official output directory contains a proposed `candidate-manifest.json`,
 `candidate-provenance.json`, sanitized `release-metadata.json`, the upstream
 checksum file, self-checksums, and a deterministic `candidate-report.md`. The live
-0.164.0 pin remains authoritative
+0.170.0 pin remains authoritative
 until a maintainer reviews and deliberately applies a complete rotation change.
 
-The known-good rollback for the 0.164.0 rotation is Codex 0.159.0
-(`rust-v0.159.0`; arm64 package archive SHA-256
-`7748d07d7921a67b91d015e9d0f43177c675977e67f955b2f8fb96dc880dd5d7`, x86_64
-package archive SHA-256 `ab64d30288454124c7c15abd81672a9dfda7e3e723d76c4cfa6c0aba4b439017`).
+The previous bundle pin for the 0.170.0 rotation is Codex 0.164.0.
 After a reviewed rotation, roll back by reverting the complete rotation change and
 rebuilding from the restored manifest rather than mixing old and new authority files.
 

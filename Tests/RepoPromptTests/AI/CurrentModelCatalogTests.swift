@@ -84,6 +84,16 @@ final class CurrentModelCatalogTests: XCTestCase {
 
     func testDirectOpenAIGPT6EntriesUseResponsesAPIWithEfforts() {
         let expectations: [(AIModel, String, String, String)] = [
+            (.gpt62Sol, "gpt-6.2-sol", "gpt-6.2-sol", "medium"),
+            (.gpt62SolLow, "gpt-6.2-sol-low", "gpt-6.2-sol", "low"),
+            (.gpt62SolHigh, "gpt-6.2-sol-high", "gpt-6.2-sol", "high"),
+            (.gpt62SolXHigh, "gpt-6.2-sol-xhigh", "gpt-6.2-sol", "xhigh"),
+            (.gpt62SolMax, "gpt-6.2-sol-max", "gpt-6.2-sol", "max"),
+            (.gpt62Astra, "gpt-6.2-astra", "gpt-6.2-astra", "medium"),
+            (.gpt62AstraLow, "gpt-6.2-astra-low", "gpt-6.2-astra", "low"),
+            (.gpt62AstraHigh, "gpt-6.2-astra-high", "gpt-6.2-astra", "high"),
+            (.gpt62AstraXHigh, "gpt-6.2-astra-xhigh", "gpt-6.2-astra", "xhigh"),
+            (.gpt62AstraMax, "gpt-6.2-astra-max", "gpt-6.2-astra", "max"),
             (.gpt61Sol, "gpt-6.1-sol", "gpt-6.1-sol", "medium"),
             (.gpt61SolLow, "gpt-6.1-sol-low", "gpt-6.1-sol", "low"),
             (.gpt61SolHigh, "gpt-6.1-sol-high", "gpt-6.1-sol", "high"),

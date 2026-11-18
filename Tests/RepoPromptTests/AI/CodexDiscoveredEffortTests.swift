@@ -31,7 +31,7 @@ final class CodexDiscoveredEffortTests: XCTestCase {
 
     func testUltrafastAppearsOnlyAfterCapabilityRefreshAndPreservesRequestSelection() throws {
         let tier = CodexModelServiceTier(id: "ultrafast", name: "Ultrafast", description: "Account speed tier")
-        for id in ["gpt-6-astra", "gpt-6.1-sol", "future-model"] {
+        for id in ["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6-astra", "gpt-6.1-sol", "future-model"] {
             let without = CodexDynamicModelRecord(
                 id: id, model: id, displayName: id, description: "", isDefault: true,
                 supportedReasoningEfforts: [.init(reasoningEffort: "max", description: "")],
@@ -69,6 +69,16 @@ final class CodexDiscoveredEffortTests: XCTestCase {
             XCTAssertEqual(selection.appServerEffortParam, effort.rawValue, option.id)
             XCTAssertEqual(selection.cliModelArgs, ["--model", "gpt-future"], option.id)
             XCTAssertEqual(selection.cliReasoningConfigArgs, ["-c", "model_reasoning_effort=\(effort.rawValue)"], option.id)
+        }
+    }
+
+    func testSavedGPT62EffortsResolveBeforeCodexDiscovery() {
+        for id in ["gpt-6.2-sol", "gpt-6.2-astra"] {
+            for effort in ["max", "ultra"] {
+                let selection = CodexModelSpecifier(raw: "\(id)-\(effort)", discoveredRecords: [])
+                XCTAssertEqual(selection.appServerModelParam, id)
+                XCTAssertEqual(selection.appServerEffortParam, effort)
+            }
         }
     }
 

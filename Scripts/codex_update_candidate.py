@@ -552,7 +552,7 @@ def render_report(
             "",
             "- Package path/kind/executable layout matches the known-good manifest for both targets; drift would have failed the run.",
             "- Mach-O inventory and thin per-target architecture policy match the known-good manifest; drift would have failed the run.",
-            "- Both primary executables match the pinned OpenAI signing identities, hardened-runtime policy, and trusted-timestamp requirement.",
+            "- The primary executables match the pinned OpenAI signing identities, hardened-runtime policy, and trusted-timestamp requirement.",
         ]
     )
     for target in artifact.BUNDLE_TARGETS:

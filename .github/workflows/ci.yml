@@ -78,7 +78,7 @@ jobs:
           node-version: 24
       - name: Install pinned Codex CLI
         id: install-pinned-codex-cli
-        run: npm install --global @openai/codex@0.164.0
+        run: npm install --global @openai/codex@0.170.0
       - name: Validate Codex app-server schema contract
         id: validate-codex-app-server-schema-contract
         run: make codex-schema-check

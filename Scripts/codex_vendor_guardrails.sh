@@ -145,9 +145,14 @@ for path in ("bin/codex", "bin/codex-code-mode-host"):
 expected_release_profiles["codex-resources/voice/bin/codex-voice-host"] = AUDIO_INPUT_PROFILE
 if manifest.get("releaseSigningEntitlements") != expected_release_profiles:
     sys.exit("pinned release-signing profiles must grant only the approved V8 and voice audio-input entitlements")
-for policy in manifest.get("signedExecutables", []):
-    if policy.get("entitlements") != V8_PROFILE:
-        sys.exit(f"vendor signature policy for {policy.get('path')} must pin exactly the two approved V8 entitlements")
+expected_vendor_profiles = {
+    "bin/codex": V8_PROFILE,
+    "bin/codex-code-mode-host": V8_PROFILE,
+    "bin/codex-exec-server": {},
+}
+vendor_profiles = {policy["path"]: policy.get("entitlements") for policy in manifest["signedExecutables"]}
+if vendor_profiles != expected_vendor_profiles:
+    sys.exit("pinned vendor signature policies must grant V8 entitlements only to Codex and its code-mode host")
 plist = plistlib.loads(Path("AppBundle/CodexV8JIT.entitlements").read_bytes())
 if plist != V8_PROFILE:
     sys.exit("AppBundle/CodexV8JIT.entitlements must contain exactly the two approved V8 entitlements")

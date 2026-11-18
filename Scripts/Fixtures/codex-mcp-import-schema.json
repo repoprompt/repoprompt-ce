@@ -1,5 +1,5 @@
 {
-  "codexVersion": "0.164.0",
+  "codexVersion": "0.170.0",
   "definitions": {
     "AppToolApproval": {
       "enum": [
@@ -300,5 +300,5 @@
       ]
     }
   },
-  "source": "https://github.com/openai/codex/blob/rust-v0.164.0/codex-rs/core/config.schema.json"
+  "source": "https://github.com/openai/codex/blob/rust-v0.170.0/codex-rs/core/config.schema.json"
 }

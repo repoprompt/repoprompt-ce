@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "minimumCodexVersion": "0.164.0",
+  "minimumCodexVersion": "0.170.0",
   "experimental": true,
   "methodChecks": [
     {

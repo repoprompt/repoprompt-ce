@@ -22,6 +22,16 @@ public enum AIModel: Equatable, Hashable {
     case gpt54Nano
 
     // GPT-6 family (OpenAI Responses API)
+    case gpt62Sol
+    case gpt62SolLow
+    case gpt62SolHigh
+    case gpt62SolXHigh
+    case gpt62SolMax
+    case gpt62Astra
+    case gpt62AstraLow
+    case gpt62AstraHigh
+    case gpt62AstraXHigh
+    case gpt62AstraMax
     case gpt61Sol
     case gpt61SolLow
     case gpt61SolHigh
@@ -274,6 +284,16 @@ public enum AIModel: Equatable, Hashable {
         case gpt54MiniHigh
         case gpt54MiniXHigh
         case gpt54Nano
+        case gpt62Sol
+        case gpt62SolLow
+        case gpt62SolHigh
+        case gpt62SolXHigh
+        case gpt62SolMax
+        case gpt62Astra
+        case gpt62AstraLow
+        case gpt62AstraHigh
+        case gpt62AstraXHigh
+        case gpt62AstraMax
         case gpt61Sol
         case gpt61SolLow
         case gpt61SolHigh
@@ -506,6 +526,26 @@ public enum AIModel: Equatable, Hashable {
             .staticCase(.gpt54MiniXHigh)
         case .gpt54Nano:
             .staticCase(.gpt54Nano)
+        case .gpt62Sol:
+            .staticCase(.gpt62Sol)
+        case .gpt62SolLow:
+            .staticCase(.gpt62SolLow)
+        case .gpt62SolHigh:
+            .staticCase(.gpt62SolHigh)
+        case .gpt62SolXHigh:
+            .staticCase(.gpt62SolXHigh)
+        case .gpt62SolMax:
+            .staticCase(.gpt62SolMax)
+        case .gpt62Astra:
+            .staticCase(.gpt62Astra)
+        case .gpt62AstraLow:
+            .staticCase(.gpt62AstraLow)
+        case .gpt62AstraHigh:
+            .staticCase(.gpt62AstraHigh)
+        case .gpt62AstraXHigh:
+            .staticCase(.gpt62AstraXHigh)
+        case .gpt62AstraMax:
+            .staticCase(.gpt62AstraMax)
         case .gpt61Sol:
             .staticCase(.gpt61Sol)
         case .gpt61SolLow:

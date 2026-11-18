@@ -24,7 +24,7 @@ import test_codex_runtime_artifact as artifact_fixtures
 ROOT = Path(__file__).resolve().parent.parent
 TOOL = ROOT / "Scripts" / "codex_update_candidate.py"
 BASELINE = ROOT / "Vendor" / "Codex" / "manifest.json"
-VERSION = "0.165.0"
+VERSION = "0.171.0"
 TAG = f"rust-v{VERSION}"
 TARGETS = (
     ("aarch64-apple-darwin", "arm64"),
@@ -68,6 +68,7 @@ set -euo pipefail
 if [[ "$1" == "--remove-signature" ]]; then exit 1; fi
 if [[ "$1" == "--verify" ]]; then exit 0; fi
 if [[ "$*" == *"--entitlements"* ]]; then
+    if [[ "${!#}" == */codex-exec-server ]]; then exit 0; fi
     printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>com.apple.security.cs.allow-jit</key><true/><key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/></dict></plist>\n'
     exit 0
 fi
@@ -109,6 +110,7 @@ EOF
             "target": target,
             "variant": "codex",
             "entrypoint": "bin/codex",
+            "execServer": "bin/codex-exec-server",
             "resourcesDir": "codex-resources",
             "pathDir": "codex-path",
         }
@@ -257,7 +259,7 @@ EOF
             "minimumExternalVersion",
             "License and NOTICE review",
             "Manual approval and soak",
-            "0.164.0",
+            "0.170.0",
             str(self.lipo),
             str(self.codesign),
         ):
@@ -418,7 +420,7 @@ EOF
 
         not_newer = self._run(
             self.temp / "not-newer",
-            selector=("--version", "0.164.0"),
+            selector=("--version", "0.170.0"),
             expected=1,
         )
         self.assertIn("must be newer", not_newer.stderr)
