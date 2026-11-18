@@ -4,7 +4,7 @@ import SwiftUI
 struct PromptResultCard: View {
     let item: AgentChatItem
     let promptManager: PromptViewModel?
-    @State private var isExpanded: Bool
+    @AgentTranscriptDisclosure private var isExpanded: Bool
 
     private func compactIdentifier(_ value: String?) -> String? {
         guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return nil }
@@ -15,7 +15,7 @@ struct PromptResultCard: View {
     init(item: AgentChatItem, promptManager: PromptViewModel? = nil) {
         self.item = item
         self.promptManager = promptManager
-        _isExpanded = State(initialValue: Self.shouldAutoExpandInitially(item: item))
+        _isExpanded = AgentTranscriptDisclosure(wrappedValue: Self.shouldAutoExpandInitially(item: item), "PromptResultCard")
     }
 
     private static func shouldAutoExpandInitially(item: AgentChatItem) -> Bool {
@@ -173,7 +173,7 @@ struct PromptResultCard: View {
             }
         }
         .onAppear {
-            reconcileExpansion()
+            if !_isExpanded.hasChoice { reconcileExpansion() }
         }
         .onChange(of: item.toolResultJSON) { _, _ in
             reconcileExpansion()

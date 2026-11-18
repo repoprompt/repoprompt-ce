@@ -259,7 +259,7 @@ enum AppSettingsCardPresentationBuilder {
 
 struct AppSettingsResultCard: View {
     let item: AgentChatItem
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("AppSettingsResultCard") private var isExpanded = false
 
     private var presentation: AppSettingsCardPresentation {
         AppSettingsCardPresentationBuilder.build(

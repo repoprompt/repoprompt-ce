@@ -134,7 +134,12 @@ struct CollapsibleCodeBlock: View {
     let previewLineCount: Int
     let allowInteraction: Bool
 
-    @State private var isExpanded = false
+    @State private var localExpansion = false
+    private let expansion: Binding<Bool>?
+    private var isExpanded: Bool {
+        expansion?.wrappedValue ?? localExpansion
+    }
+
     @State private var isCopyHovering = false
     @ObservedObject private var fontScale = FontScaleManager.shared
 
@@ -143,11 +148,12 @@ struct CollapsibleCodeBlock: View {
         return baseFontSize * fontScale.preset.scaleFactor
     }
 
-    init(content: String, language: String? = nil, previewLineCount: Int = 10, allowInteraction: Bool = true) {
+    init(content: String, language: String? = nil, previewLineCount: Int = 10, allowInteraction: Bool = true, expansion: Binding<Bool>? = nil) {
         self.content = content
         self.language = language
         self.previewLineCount = previewLineCount
         self.allowInteraction = allowInteraction
+        self.expansion = expansion
     }
 
     private var lines: [String] {
@@ -233,7 +239,7 @@ struct CollapsibleCodeBlock: View {
     private var expandCollapseButton: some View {
         Button(action: {
             withAnimation(.easeInOut(duration: 0.2)) {
-                isExpanded.toggle()
+                (expansion ?? $localExpansion).wrappedValue.toggle()
             }
         }) {
             HStack(spacing: 4) {

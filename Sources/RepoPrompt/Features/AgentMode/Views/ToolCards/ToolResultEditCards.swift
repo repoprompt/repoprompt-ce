@@ -27,14 +27,14 @@ private extension View {
 struct ApplyEditsResultCard: View {
     let item: AgentChatItem
     let isMostRecentEdit: Bool
-    @State private var isExpanded: Bool
+    @AgentTranscriptDisclosure private var isExpanded: Bool
     @State private var cachedPresentation: Presentation?
     private static let legacySummaryDiffScanByteThreshold = 24000
 
     init(item: AgentChatItem, isMostRecentEdit: Bool = true) {
         self.item = item
         self.isMostRecentEdit = isMostRecentEdit
-        _isExpanded = State(initialValue: Self.shouldAutoExpandInitially(item: item, isMostRecentEdit: isMostRecentEdit))
+        _isExpanded = AgentTranscriptDisclosure(wrappedValue: Self.shouldAutoExpandInitially(item: item, isMostRecentEdit: isMostRecentEdit), "ApplyEditsResultCard")
         _cachedPresentation = State(initialValue: nil)
     }
 
@@ -344,16 +344,16 @@ struct CursorNativeEditResultPresentation: Equatable {
 struct CursorNativeEditResultCard: View {
     let item: AgentChatItem
     let isMostRecentEdit: Bool
-    @State private var isExpanded: Bool
+    @AgentTranscriptDisclosure private var isExpanded: Bool
     @State private var cachedPresentation: CursorNativeEditResultPresentation?
 
     init(item: AgentChatItem, isMostRecentEdit: Bool = true) {
         self.item = item
         self.isMostRecentEdit = isMostRecentEdit
-        _isExpanded = State(initialValue: CursorNativeEditResultPresentation.shouldAutoExpandInitially(
+        _isExpanded = AgentTranscriptDisclosure(wrappedValue: CursorNativeEditResultPresentation.shouldAutoExpandInitially(
             item: item,
             isMostRecentEdit: isMostRecentEdit
-        ))
+        ), "CursorNativeEditResultCard")
         _cachedPresentation = State(initialValue: nil)
     }
 
@@ -418,13 +418,13 @@ struct CursorNativeEditResultCard: View {
 struct ApplyPatchResultCard: View {
     let item: AgentChatItem
     let isMostRecentEdit: Bool
-    @State private var isExpanded: Bool
+    @AgentTranscriptDisclosure private var isExpanded: Bool
     @State private var cachedPresentation: Presentation?
 
     init(item: AgentChatItem, isMostRecentEdit: Bool = true) {
         self.item = item
         self.isMostRecentEdit = isMostRecentEdit
-        _isExpanded = State(initialValue: Self.shouldAutoExpandInitially(item: item, isMostRecentEdit: isMostRecentEdit))
+        _isExpanded = AgentTranscriptDisclosure(wrappedValue: Self.shouldAutoExpandInitially(item: item, isMostRecentEdit: isMostRecentEdit), "ApplyPatchResultCard")
         _cachedPresentation = State(initialValue: nil)
     }
 

@@ -222,7 +222,7 @@ private struct AgentReasoningEffortBadge: View {
 
 struct AgentRunResultCard: View {
     let item: AgentChatItem
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("AgentRunResultCard") private var isExpanded = false
 
     private var args: ToolArgsDTOs.AgentRunArgs? {
         ToolJSON.decodeArgs(ToolArgsDTOs.AgentRunArgs.self, from: item.toolArgsJSON)
@@ -308,7 +308,7 @@ private struct AgentExploreBatchStartPresentation {
 
 struct AgentExploreResultCard: View {
     let item: AgentChatItem
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("AgentExploreResultCard") private var isExpanded = false
 
     private var args: ToolArgsDTOs.AgentExploreArgs? {
         ToolJSON.decodeArgs(ToolArgsDTOs.AgentExploreArgs.self, from: item.toolArgsJSON)
@@ -370,7 +370,7 @@ struct AgentExploreResultCard: View {
 
 struct AgentManageResultCard: View {
     let item: AgentChatItem
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("AgentManageResultCard") private var isExpanded = false
 
     private var args: ToolArgsDTOs.AgentManageArgs? {
         ToolJSON.decodeArgs(ToolArgsDTOs.AgentManageArgs.self, from: item.toolArgsJSON)

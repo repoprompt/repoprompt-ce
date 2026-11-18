@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptInstrumentation
+import SwiftUI
 
 struct AgentTranscriptUISnapshot: Equatable {
     var currentTabID: UUID?
@@ -60,10 +61,92 @@ struct AgentTranscriptUISnapshot: Equatable {
     }
 }
 
+struct AgentTranscriptDisclosureScope {
+    let store: AgentTranscriptUIStore
+    let workspaceID: UUID?
+    let tabID: UUID?
+    let itemID: UUID
+
+    @MainActor
+    func binding(for control: String, fallback: Binding<Bool>) -> Binding<Bool> {
+        let key = AgentTranscriptUIStore.DisclosureKey(workspaceID: workspaceID, tabID: tabID, itemID: itemID, control: control)
+        return Binding(
+            get: { store.disclosureChoice(for: key) ?? fallback.wrappedValue },
+            set: {
+                store.setDisclosureChoice($0, for: key)
+                fallback.wrappedValue = $0
+            }
+        )
+    }
+
+    @MainActor
+    func hasChoice(for control: String) -> Bool {
+        store.disclosureChoice(for: .init(workspaceID: workspaceID, tabID: tabID, itemID: itemID, control: control)) != nil
+    }
+}
+
+extension EnvironmentValues {
+    @Entry var agentTranscriptDisclosureScope: AgentTranscriptDisclosureScope? = nil
+}
+
+/// The mounted row invalidates locally; only explicit interaction creates a retained choice.
+@MainActor
+@propertyWrapper
+struct AgentTranscriptDisclosure: DynamicProperty {
+    @Environment(\.agentTranscriptDisclosureScope) private var scope
+    @State private var initialValue: Bool
+    @State private var localChange: Bool?
+    private let control: String
+
+    init(wrappedValue: Bool, _ control: String) {
+        _initialValue = State(initialValue: wrappedValue)
+        self.control = control
+    }
+
+    var hasChoice: Bool {
+        scope?.hasChoice(for: control) ?? false
+    }
+
+    var wrappedValue: Bool {
+        get { projectedValue.wrappedValue }
+        nonmutating set {
+            // Preserve existing live auto-expansion rules without retaining untouched rows.
+            if hasChoice {
+                projectedValue.wrappedValue = newValue
+            } else {
+                localChange = newValue
+            }
+        }
+    }
+
+    var projectedValue: Binding<Bool> {
+        let fallback = Binding(get: { localChange ?? initialValue }, set: { localChange = $0 })
+        return scope?.binding(for: control, fallback: fallback) ?? fallback
+    }
+}
+
 @MainActor
 final class AgentTranscriptUIStore: ObservableObject {
     var perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     @Published private(set) var snapshot: AgentTranscriptUISnapshot = .empty
+
+    struct DisclosureKey: Hashable {
+        let workspaceID: UUID?
+        let tabID: UUID?
+        let itemID: UUID
+        let control: String
+    }
+
+    /// Only user-operated disclosures are recorded; reading a row does not populate this map.
+    private var disclosureChoices: [DisclosureKey: Bool] = [:]
+
+    func disclosureChoice(for key: DisclosureKey) -> Bool? {
+        disclosureChoices[key]
+    }
+
+    func setDisclosureChoice(_ value: Bool, for key: DisclosureKey) {
+        disclosureChoices[key] = value
+    }
 
     func update(_ snapshot: AgentTranscriptUISnapshot) {
         guard self.snapshot != snapshot else {

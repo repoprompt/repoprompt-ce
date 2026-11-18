@@ -287,6 +287,10 @@ struct AgentTranscriptRow: View, @MainActor Equatable {
         .environment(\.markdownFileLinkOpener, MarkdownFileLinkOpener { target in
             await promptManager.fileManager.openFileForMarkdownLink(target)
         })
+        .environment(\.agentTranscriptDisclosureScope, .init(
+            store: agentModeVM.ui.transcript, workspaceID: inputs.workspaceID,
+            tabID: inputs.tabID, itemID: inputs.item.id
+        ))
         .environment(\.agentToolCardAutoExpandEnabled, inputs.autoExpandEnabled)
         .environment(\.agentLiveBashExecutionByItemID, inputs.liveBashExecution.map { [inputs.item.id: $0] } ?? [:])
         .environment(\.agentApprovalVisible, inputs.approvalVisible)
@@ -734,7 +738,7 @@ struct AgentMessageBubble: View {
 
                     // Arguments (if present and not already summarized inline)
                     if let args = item.toolArgsJSON, !args.isEmpty, shouldShowFullArgs(toolName: item.toolName) {
-                        CollapsibleCodeBlock(
+                        AgentTranscriptCodePreview(
                             content: formatJSON(args),
                             language: "json",
                             previewLineCount: 5
@@ -1823,7 +1827,7 @@ private struct CollapsibleAssistantTranscriptContent: View {
         fontScale.preset
     }
 
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("CollapsibleAssistantTranscriptContent") private var isExpanded = false
     private let previewLineCount = 10
 
     private var collapsedPreviewMaxHeight: CGFloat {
@@ -1889,10 +1893,10 @@ private struct CollapsibleAssistantTranscriptContent: View {
                 Button {
                     if isExpanded {
                         withAnimation(.easeInOut(duration: 0.2)) {
-                            isExpanded = false
+                            $isExpanded.wrappedValue = false
                         }
                     } else {
-                        isExpanded = true
+                        $isExpanded.wrappedValue = true
                     }
                 } label: {
                     HStack(spacing: 4) {
@@ -1960,6 +1964,24 @@ private struct AskUserQuestionResultView: View {
 
 // CollapsibleUserMessage is now in Common/CollapsibleUserMessage.swift
 
+private struct AgentTranscriptCodePreview: View {
+    let content: String
+    let language: String?
+    let previewLineCount: Int
+    var allowInteraction = true
+    @AgentTranscriptDisclosure("CodePreview") private var isExpanded = false
+
+    var body: some View {
+        CollapsibleCodeBlock(
+            content: content,
+            language: language,
+            previewLineCount: previewLineCount,
+            allowInteraction: allowInteraction,
+            expansion: $isExpanded
+        )
+    }
+}
+
 // MARK: - Tool Result Content View
 
 /// Renders tool result content with markdown support and collapsible preview
@@ -1968,7 +1990,7 @@ struct ToolResultContentView: View {
     let toolName: String?
     let previewLineCount: Int
 
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("ToolResultContentView") private var isExpanded = false
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
@@ -2030,7 +2052,7 @@ struct ToolResultContentView: View {
                 DiffContentView(content: displayContent)
             } else if isJSONContent {
                 // Render JSON with formatting
-                CollapsibleCodeBlock(
+                AgentTranscriptCodePreview(
                     content: prettyPrintJSON(displayContent),
                     language: "json",
                     previewLineCount: previewLineCount
@@ -2130,7 +2152,7 @@ private func messageExpansionButton(
 /// Renders diff content with proper syntax highlighting for additions/deletions
 private struct DiffContentView: View {
     let content: String
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("DiffContentView") private var isExpanded = false
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {

@@ -117,7 +117,7 @@ enum WorktreeMergeCardPresentationBuilder {
 
 struct ToolResultWorktreeMergeCard: View {
     let item: AgentChatItem
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("ToolResultWorktreeMergeCard") private var isExpanded = false
 
     private var reply: ToolResultDTOs.ManageWorktreeReplyDTO? {
         ToolJSON.decode(ToolResultDTOs.ManageWorktreeReplyDTO.self, from: item.toolResultJSON)

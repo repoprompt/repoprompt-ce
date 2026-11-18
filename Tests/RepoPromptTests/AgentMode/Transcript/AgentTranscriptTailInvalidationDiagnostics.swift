@@ -93,6 +93,29 @@
             let description: String
         }
 
+        func testDisclosureChoiceSurvivesRecreatedRow() {
+            let store = AgentTranscriptUIStore()
+            let workspaceID = UUID()
+            let tabID = UUID()
+            let itemID = UUID()
+            let control = "CollapsibleAssistantTranscriptContent"
+            var firstLocalValue = false
+            let first = AgentTranscriptDisclosureScope(store: store, workspaceID: workspaceID, tabID: tabID, itemID: itemID)
+            let firstBinding = first.binding(for: control, fallback: Binding(get: { firstLocalValue }, set: { firstLocalValue = $0 }))
+            XCTAssertFalse(firstBinding.wrappedValue)
+            XCTAssertFalse(first.hasChoice(for: control))
+            firstBinding.wrappedValue = true
+
+            // A newly mounted row starts with a fresh local default, but reads the existing choice.
+            let recreated = AgentTranscriptDisclosureScope(store: store, workspaceID: workspaceID, tabID: tabID, itemID: itemID)
+            XCTAssertTrue(recreated.binding(for: control, fallback: .constant(false)).wrappedValue)
+            XCTAssertFalse(recreated.binding(for: "CodePreview", fallback: .constant(false)).wrappedValue)
+            let otherTab = AgentTranscriptDisclosureScope(store: store, workspaceID: workspaceID, tabID: UUID(), itemID: itemID)
+            XCTAssertFalse(otherTab.binding(for: control, fallback: .constant(false)).wrappedValue)
+            recreated.binding(for: control, fallback: .constant(true)).wrappedValue = false
+            XCTAssertFalse(first.binding(for: control, fallback: .constant(true)).wrappedValue)
+        }
+
         func testRevealWorkDoesNotGrowWithHistory() async throws {
             let short = try await countRevealWork(turns: 6)
             let long = try await countRevealWork(turns: 60)
