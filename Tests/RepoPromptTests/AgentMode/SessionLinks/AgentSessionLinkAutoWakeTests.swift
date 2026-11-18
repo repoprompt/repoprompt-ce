@@ -1084,6 +1084,80 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         }
     }
 
+    func testProviderPolicyRoutesOnlyTheCanonicalHostCarrierWithoutPresentation() async throws {
+        let (host, f, _, _, _, _, authority) = try await hostStartupFixture(
+            canonicalWorkspace: true, boundCanonicalCarrier: true, registersProviderRoute: true
+        )
+        let session = f.session
+        let route = host.route
+        let runID = try XCTUnwrap(session.runID)
+        let network = ServerNetworkManager.shared
+        let clientName = "canonical-provider-route-\(UUID())"
+        func installPolicy() async -> MCPRunRoutingCleanupReceipt? {
+            await network.installClientConnectionPolicy(
+                for: clientName, windowID: host.routeID, restrictedTools: [],
+                runID: runID, purpose: .agentModeRun, routingOwner: route
+            )
+        }
+        let withoutAttempt = await installPolicy()
+        XCTAssertNil(withoutAttempt, "A run identifier alone confers no provider authority")
+        session.beginRunAttempt(source: "provider.route.initial")
+        let originalValue = await installPolicy()
+        let original = try XCTUnwrap(originalValue)
+        addTeardownBlock { await network.cleanupRunRoutingState(ownedBy: original) }
+
+        session.beginRunAttempt(source: "provider.route.successor")
+        let stale = await route.installPendingPolicy(original, connectionID: UUID(), clientName: clientName, tabID: session.tabID)
+        XCTAssertNil(stale, "An older policy cannot reacquire the successor attempt under the same run ID")
+        let issued = await installPolicy()
+        let receipt = try XCTUnwrap(issued)
+        addTeardownBlock { await network.cleanupRunRoutingState(ownedBy: receipt) }
+        let wrongConnection = UUID()
+        let wrong = await route.installPendingPolicy(receipt, connectionID: wrongConnection, clientName: clientName, tabID: UUID())
+        XCTAssertNil(wrong)
+        XCTAssertNil(route.runRouteBindings.connectionID(forRunID: runID))
+
+        let connection = UUID()
+        let installation = await route.installPendingPolicy(receipt, connectionID: connection, clientName: clientName, tabID: nil)
+        let installed = try XCTUnwrap(installation)
+        XCTAssertEqual(installed.tabID, session.tabID)
+        XCTAssertEqual(installed.workspaceID, f.endpoint.workspaceID)
+        let bound = try XCTUnwrap(route.runRouteBindings.tabContextByConnectionID[connection])
+        XCTAssertEqual(bound.routeOwnerIdentity, ObjectIdentifier(route))
+        XCTAssertEqual(bound.promptText, "Exact canonical prompt")
+        XCTAssertEqual(bound.activeAgentSessionID, f.endpoint.sessionID)
+        let canCommit = await route.canCommitPendingPolicy(receipt, token: installed.token)
+        XCTAssertTrue(canCommit)
+        let routed = try await route.fileReadHandle(
+            metadata: .init(connectionID: connection, clientName: clientName, windowID: route.identity.routeID),
+            context: .init(workspaceID: f.endpoint.workspaceID, contextID: session.tabID)
+        )
+        XCTAssertEqual(routed.bindingKind, .runScoped(runID: runID))
+
+        let staleRollback = route.rollbackPendingPolicy(original, token: installed.token, clientName: clientName)
+        XCTAssertEqual(staleRollback, .supersededBySameConnection)
+        await network.cleanupRunRoutingState(ownedBy: original)
+        XCTAssertEqual(route.runRouteBindings.connectionID(forRunID: runID), connection)
+
+        let current = await authority.canonicalWorkspaceSnapshot(f.endpoint.workspaceID)
+        let snapshot = try XCTUnwrap(current)
+        var workspace = try JSONDecoder().decode(WorkspaceModel.self, from: snapshot.document.documentBytes)
+        let carrier = try XCTUnwrap(workspace.composeTabs.firstIndex(where: { $0.id == session.tabID }))
+        workspace.composeTabs[carrier].activeAgentSessionID = UUID()
+        let result = try await authority.replaceWorkingFailClosed(
+            workspace, fileURL: snapshot.document.fileURL, expectedWorkspaceRevision: snapshot.revisions.workingRevision
+        )
+        XCTAssertEqual(result.disposition, .applied)
+        let canCommitAfterReplacement = await route.canCommitPendingPolicy(receipt, token: installed.token)
+        XCTAssertFalse(canCommitAfterReplacement)
+        XCTAssertEqual(route.rollbackPendingPolicy(receipt, token: installed.token, clientName: nil), .restored)
+        XCTAssertNil(route.runRouteBindings.tabContextByConnectionID[connection])
+        XCTAssertNil(route.runRouteBindings.connectionID(forRunID: runID))
+        let replacement = await route.installPendingPolicy(receipt, connectionID: UUID(), clientName: clientName, tabID: session.tabID)
+        XCTAssertNil(replacement)
+        await network.cleanupRunRoutingState(ownedBy: receipt)
+    }
+
     func testHostInputCompositionRetainsCanonicalCaptureWithoutPresenterOrWriterRenewal() async throws {
         let (host, f, _, _, _, _, authority) = try await hostStartupFixture(
             canonicalWorkspace: true, boundCanonicalCarrier: true, canonicalInput: true
@@ -1348,7 +1422,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
     /// the external provider is scripted; startup is never intercepted or delegated to a VM.
     private func hostStartupFixture(
         canonicalWorkspace: Bool = false, boundCanonicalCarrier: Bool = false, canonicalInput: Bool = false,
-        commandWillExecute: (@Sendable (DomainWorkspaceCommandEnvelope) async -> Void)? = nil
+        registersProviderRoute: Bool = false, commandWillExecute: (@Sendable (DomainWorkspaceCommandEnvelope) async -> Void)? = nil
     ) async throws -> (
         AgentSessionRuntimeHost, Fixture, AgentSessionHostStartupResources,
         AgentSessionLinkCapturingACPProvider, AgentWorkspaceSessionIndexStore, @MainActor () async throws -> Void,
@@ -1367,7 +1441,12 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         }
         let script = try AgentSessionLinkACPServerScript.write(to: directory)
         let provider = AgentSessionLinkCapturingACPProvider(providerID: .openCode, commandPath: script.path)
-        let route = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: nil)
+        let routeIdentity = MCPRouteIdentityAllocator.allocateHost()
+        let route = if registersProviderRoute {
+            MCPHostRouteResources(identity: routeIdentity, coordinator: domain.routingCoordinator, runtime: domain)
+        } else {
+            MCPHostRouteResources(identity: routeIdentity, coordinator: nil)
+        }
         let policy: AgentRunExecutionContracts.ConnectionPolicyInstaller = { _, _, _, _, _, _, _, runID, _, _, _, _, _ in
             if let runID { await MCPRoutingWaiter.notifyRouted(runID: runID) }
         }

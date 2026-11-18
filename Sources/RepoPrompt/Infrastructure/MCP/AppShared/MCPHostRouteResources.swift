@@ -19,6 +19,21 @@ final class MCPHostRouteResources {
         .init(owner: ObjectIdentifier(self), connectionID: connectionID)
     }
 
+    struct ProviderContext {
+        let snapshot: MCPTabContextSnapshot
+        let isCurrent: @MainActor @Sendable () -> Bool
+        let validateCarrier: @MainActor @Sendable () async -> Bool
+    }
+
+    typealias ProviderContextResolver = @MainActor @Sendable () async -> ProviderContext?
+    typealias ProviderContextSource = @MainActor (_ runID: UUID, _ tabID: UUID?) -> ProviderContextResolver?
+
+    enum ProviderContextAdmission {
+        case compatibility
+        case refused
+        case canonical(ProviderContextResolver)
+    }
+
     struct PolicyContextInstallation {
         let token: MCPRunRouteBindings.PendingPolicyToken
         let workspaceID: UUID?
@@ -29,7 +44,7 @@ final class MCPHostRouteResources {
     /// registration or teardown; the original route and token are passed to every operation.
     struct RunRouting {
         let install: @MainActor (MCPHostRouteResources, MCPRunRoutingCleanupReceipt, UUID, String?, UUID?) -> PolicyContextInstallation?
-        let rollback: @MainActor (MCPHostRouteResources, MCPRunRouteBindings.PendingPolicyToken, String?, UUID?) -> MCPServerViewModel.PendingPolicyRunIDMappingRollbackResult?
+        let rollback: @MainActor (MCPHostRouteResources, MCPRunRouteBindings.PendingPolicyToken, String?, UUID?) -> MCPRunRouteBindings.PendingPolicyRollbackResult?
         let removeContext: @MainActor (MCPHostRouteResources, MCPRunRoutingCleanupReceipt, UUID) -> Void
     }
 
@@ -55,6 +70,7 @@ final class MCPHostRouteResources {
     private(set) var catalogHandle: MCPDomainToolRegistrationHandle?
     private var catalog: MCPAppToolCatalogRegistration?
     private var runRouting: RunRouting?
+    private(set) var providerContextSource: ProviderContextSource?
     /// Only an entered context/mapping producer retains its original physical cleanup adapter.
     /// Catalog construction alone must not keep a presentation VM alive.
     private var contextCleanupOwner: AnyObject?
@@ -271,20 +287,74 @@ final class MCPHostRouteResources {
         return true
     }
 
-    func installPendingPolicy(_ receipt: MCPRunRoutingCleanupReceipt, connectionID: UUID, clientName: String?, tabID: UUID?) -> PolicyContextInstallation? {
-        guard !isClosing, !receipt.isConsumed, receipt.routeOwner === self else { return nil }
-        return runRouting?.install(self, receipt, connectionID, clientName, tabID)
+    func installProviderContextSource(_ source: @escaping ProviderContextSource) {
+        precondition(identity.kind == .independent && providerContextSource == nil)
+        precondition(!isClosing && !runRouteBindings.hasRetainedCleanupOwnership)
+        providerContextSource = source
+        runRouting = nil
     }
 
-    func rollbackPendingPolicy(_ receipt: MCPRunRoutingCleanupReceipt, token: MCPRunRouteBindings.PendingPolicyToken, clientName: String?) -> MCPServerViewModel.PendingPolicyRunIDMappingRollbackResult? {
+    func admitProviderContext(runID: UUID, tabID: UUID?) -> ProviderContextAdmission {
+        guard !isClosing else { return .refused }
+        guard let providerContextSource else { return .compatibility }
+        guard let resolve = providerContextSource(runID, tabID) else { return .refused }
+        return .canonical(resolve)
+    }
+
+    func installPendingPolicy(_ receipt: MCPRunRoutingCleanupReceipt, connectionID: UUID, clientName: String?, tabID: UUID?) async -> PolicyContextInstallation? {
+        guard !isClosing, !receipt.isConsumed, receipt.routeOwner === self else { return nil }
+        guard providerContextSource != nil else {
+            return runRouting?.install(self, receipt, connectionID, clientName, tabID)
+        }
+        guard let resolve = receipt.providerContextResolver, let context = await resolve() else { return nil }
+        return installProviderContext(context, receipt: receipt, connectionID: connectionID, tabID: tabID)
+    }
+
+    func canCommitPendingPolicy(_ receipt: MCPRunRoutingCleanupReceipt, token: MCPRunRouteBindings.PendingPolicyToken) async -> Bool {
+        func isCurrent() -> Bool {
+            !isClosing && receipt.routeOwner === self && !receipt.isConsumed
+                && runRouteBindings.cleanupOwnership(for: token.connectionID)?.policyID == receipt.policyID
+                && runRouteBindings.isCurrent(token)
+        }
+        guard isCurrent() else { return false }
+        if let validate = token.validateProviderCarrier {
+            await settleRoutingPublications()
+            guard isCurrent(), await providerBindingIsPublished(receipt, connectionID: token.connectionID),
+                  await validate()
+            else { return false }
+        }
+        return isCurrent()
+    }
+
+    private func providerBindingIsPublished(_ receipt: MCPRunRoutingCleanupReceipt, connectionID: UUID) async -> Bool {
+        guard let coordinator else { return true }
+        guard let registration = connections[connectionID], registration.policyID == receipt.policyID,
+              let context = runRouteBindings.tabContextByConnectionID[connectionID], let workspaceID = context.workspaceID,
+              let handle = try? await coordinator.resolveReadContext(connection: registration.registration),
+              connections[connectionID]?.registration == registration.registration,
+              handle.context == DomainContextIdentity(workspaceID: workspaceID, contextID: context.tabID),
+              handle.bindingKind == .runScoped(runID: receipt.runID)
+        else { return false }
+        return true
+    }
+
+    func rollbackPendingPolicy(_ receipt: MCPRunRoutingCleanupReceipt, token: MCPRunRouteBindings.PendingPolicyToken, clientName: String?) -> MCPRunRouteBindings.PendingPolicyRollbackResult? {
         guard receipt.routeOwner === self else { return nil }
+        if providerContextSource != nil {
+            return rollbackProviderContext(receipt, token: token)
+        }
         return runRouting?.rollback(self, token, clientName, receipt.routingWaitGeneration)
     }
 
     func consumeCleanup(_ receipt: MCPRunRoutingCleanupReceipt) async {
         guard receipt.routeOwner === self else { return }
         runRouteBindings.consumeCleanup(receipt) { connectionID in
-            runRouting?.removeContext(self, receipt, connectionID)
+            if providerContextSource != nil {
+                removeProviderContext(connectionID: connectionID, runID: receipt.runID)
+                runRouteBindings.presentationWindowByConnection.removeValue(forKey: connectionID)
+            } else {
+                runRouting?.removeContext(self, receipt, connectionID)
+            }
             // The mutable snapshot may already have been consumed by a committed child; its
             // original domain registration still needs release. Repeated release is exact/idempotent.
             publishRelease(connectionID: connectionID)
@@ -320,7 +390,7 @@ final class MCPHostRouteResources {
             throw RegistrationFailure.closing
         }
         self.catalog = catalog
-        runRouting = catalog.runRouting
+        runRouting = providerContextSource == nil ? catalog.runRouting : nil
         catalogHandle = registration.handle
         return registration.handle
     }

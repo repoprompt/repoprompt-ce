@@ -147,15 +147,24 @@ actor MCPToolCatalogReadiness {
             )
         }
         windowStateOperation = { windowID in
-            await MainActor.run {
-                guard let server = WindowStatesManager.shared.window(withID: windowID)?.mcpServer else {
+            await { @MainActor () -> WindowRegistrationState? in
+                switch await AppDomainRuntimeComposition.shared.independentRouteResources(routeID: windowID) {
+                case .unavailable:
                     return nil
+                case let .available(owner):
+                    let active = await owner.hasActiveCatalog()
+                    guard !owner.isClosing else { return nil }
+                    return WindowRegistrationState(toolsEnabled: active, toolsRequested: true)
+                case .unregistered:
+                    guard let server = WindowStatesManager.shared.window(withID: windowID)?.mcpServer else {
+                        return nil
+                    }
+                    return WindowRegistrationState(
+                        toolsEnabled: server.windowToolsEnabled,
+                        toolsRequested: server.windowToolsAreRequested
+                    )
                 }
-                return WindowRegistrationState(
-                    toolsEnabled: server.windowToolsEnabled,
-                    toolsRequested: server.windowToolsAreRequested
-                )
-            }
+            }()
         }
         sharedCheckRetirementDuration = Self.defaultSharedCheckRetirementDuration
         sharedCheckRetirementSleep = { duration in
