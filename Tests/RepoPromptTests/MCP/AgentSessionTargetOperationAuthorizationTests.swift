@@ -34,10 +34,10 @@ final class AgentSessionTargetOperationAuthorizationTests: XCTestCase {
         }
     }
 
-    func testInvocationBridgeMissingContextFailsClosedWithInjectedDiagnostic() throws {
+    func testInvocationBridgeMissingContextFailsClosedWithInjectedDiagnostic() async {
         let diagnostics = InvocationDiagnostics()
-        try MCPInvocationContextBridge.$diagnosticSink.withValue({ diagnostics.record($0) }) {
-            try MCPInvocationContextBridge.currentTaskLocal.withValue(nil) {
+        await MCPInvocationContextBridge.withDiagnosticSink({ diagnostics.record($0) }) {
+            MCPInvocationContextBridge.currentTaskLocal.withValue(nil) {
                 XCTAssertThrowsError(try MCPInvocationContextBridge.require(toolName: "ask_oracle")) { error in
                     XCTAssertEqual(error as? MCPInvocationContextFailure, .missingExpectedContext)
                 }
