@@ -858,7 +858,7 @@ final class AgentSessionManagedInputRuntimeTests: XCTestCase {
     }
 
     private func fixture(
-        store: AgentSessionRuntimeStore = AgentSessionRuntimeStore(),
+        store: AgentSessionRuntimeStore? = nil,
         inputResourcesAreCurrent: @escaping @MainActor () -> Bool = { true },
         validateInputResources: (@MainActor (AgentSessionRuntimeStore.Command?) async -> Bool)? = nil,
         inputWorkspace: @escaping @MainActor (AgentTabSession) async throws -> AgentSessionProviderInputRuntime.WorkspaceSource? = { _ in nil },
@@ -866,7 +866,7 @@ final class AgentSessionManagedInputRuntimeTests: XCTestCase {
             .init(workspace: .init(store: WorkspaceFileContextStore(), lookupSource: nil), selection: .init(selectedPaths: []), promptText: nil)
         }
     ) throws -> Fixture {
-        let scope = store.makeScope()
+        let scope = (store ?? AgentSessionRuntimeStore()).makeScope()
         let session = scope.makeSession(tabID: UUID())
         let workspaceID = UUID(), sessionID = UUID()
         session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID, workspaceID: workspaceID))
