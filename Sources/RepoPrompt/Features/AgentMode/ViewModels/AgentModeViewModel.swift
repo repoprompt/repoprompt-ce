@@ -3072,7 +3072,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             },
             settleSelfCompact: { [weak scope = runtimeSessionStore] session in scope?.linkExecution?.agentSelfCompactSettleStaleParkedNote(session) },
             selfCompactBlocksWake: { [weak scope = runtimeSessionStore] session in scope?.linkExecution?.agentSelfCompactBlocksNotificationWake(session) ?? true },
-            selfCompactHoldsWakeAcquisition: { [weak scope = runtimeSessionStore] session in scope?.linkExecution?.agentSelfCompactHoldsWakeAcquisition(session) ?? true }
+            selfCompactHoldsWakeAcquisition: { [weak scope = runtimeSessionStore] session in scope?.linkExecution?.agentSelfCompactHoldsWakeAcquisition(session) ?? true },
+            managedInputEnvironment: { [weak self] _ in self?.runtimeInputEnvironmentSource() }
         ), diagnostics: catalogDiagnosticsSink)
         runtime.codexCoordinator = codexCoordinator
         runtime.activeMCPToolProbe = { [tools = runtimeHost.route.toolExecutionRuntime] runID in

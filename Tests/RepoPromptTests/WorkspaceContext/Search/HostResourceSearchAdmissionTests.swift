@@ -79,6 +79,22 @@ import XCTest
             XCTAssertEqual(budget.snapshot().activeContentUnits, 0)
         }
 
+        func testMaterializedSearchPreservesLineOffsetsAndContextAcrossMixedNewlines() async throws {
+            let search = FileSearchActor(contentBudgetForTesting: HostResourceBudget(capacity: .baseline))
+            let options = SearchOptions(mode: .content, caseInsensitive: false, contextLines: 1)
+            let file = AdmissionSearchFile(text: "🚀 zero\r\n\r\né hit\r漢 hit\nCafe\u{301} hit")
+
+            for (pattern, isRegex) in [("hit", false), (#"h[i]t"#, true)] {
+                let matches = try await search.search(
+                    pattern: pattern, isRegex: isRegex, options: options, in: [file]
+                )
+                XCTAssertEqual(matches.map(\.lineNumber), [2, 3, 4])
+                XCTAssertEqual(matches.map(\.lineText), ["é hit", "漢 hit", "Cafe\u{301} hit"])
+                XCTAssertEqual(matches.map(\.contextBefore), [[""], ["é hit"], ["漢 hit"]])
+                XCTAssertEqual(matches.map(\.contextAfter), [["漢 hit"], ["Cafe\u{301} hit"], nil])
+            }
+        }
+
         func testOverloadedContentSearchThrowsInsteadOfSilentlyOmittingTheFile() async throws {
             let capacity = HostResourceCapacity.resolve(HostResourceSample(
                 logicalCores: 8, performanceCores: 4, memoryBytes: 24 * 1024 * 1024 * 1024,

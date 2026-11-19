@@ -67,6 +67,7 @@ enum HistoryMCPToolService {
         args: [String: Value],
         scanner: HistorySessionScanning,
         budget: HistoryExecutionBudget = .default,
+        calendar: Calendar = .current,
         nowProvider: @escaping @Sendable () -> ContinuousClock.Instant = { ContinuousClock().now }
     ) async throws -> HistoryToolReply {
         let startedAt = nowProvider()
@@ -92,7 +93,7 @@ enum HistoryMCPToolService {
             case "search":
                 return try await executeSearch(args: args, scanner: scanner, requestBudget: requestBudget)
             case "time":
-                return try await executeTime(args: args, scanner: scanner, requestBudget: requestBudget)
+                return try await executeTime(args: args, scanner: scanner, requestBudget: requestBudget, calendar: calendar)
             case "get_session":
                 return try await executeGetSession(args: args, scanner: scanner, requestBudget: requestBudget)
             default:
@@ -745,7 +746,8 @@ enum HistoryMCPToolService {
     private static func executeTime(
         args: [String: Value],
         scanner: HistorySessionScanning,
-        requestBudget: HistoryRequestBudget
+        requestBudget: HistoryRequestBudget,
+        calendar: Calendar
     ) async throws -> HistoryToolReply {
         guard let groupBy = args["group_by"]?.stringValue, !groupBy.isEmpty else {
             return .error(HistoryErrorReply(error: "Missing or empty required parameter 'group_by'. Valid values: day, week, month, session, workspace"))
@@ -758,8 +760,19 @@ enum HistoryMCPToolService {
 
         let workspaceFilter = args["workspace"]?.stringValue
         let sessionIDFilter = args["session_id"]?.stringValue
-        let dateFrom = try parseValidatedDateBound(args["date_from"]?.stringValue, parameterName: "date_from", isUpperBound: false)
-        let dateTo = try parseValidatedDateBound(args["date_to"]?.stringValue, parameterName: "date_to", isUpperBound: true)
+        // Date-only bounds and ISO date labels share the calendar's time zone.
+        let usesCalendarGrouping = ["day", "week", "month"].contains(groupBy)
+        var groupingCalendar = Calendar(identifier: .gregorian)
+        groupingCalendar.timeZone = calendar.timeZone
+        groupingCalendar.firstWeekday = calendar.firstWeekday
+        groupingCalendar.minimumDaysInFirstWeek = calendar.minimumDaysInFirstWeek
+        let boundsCalendar = usesCalendarGrouping ? groupingCalendar : nil
+        let dateFrom = try parseValidatedDateBound(
+            args["date_from"]?.stringValue, parameterName: "date_from", isUpperBound: false, calendar: boundsCalendar
+        )
+        let dateTo = try parseValidatedDateBound(
+            args["date_to"]?.stringValue, parameterName: "date_to", isUpperBound: true, calendar: boundsCalendar
+        )
         let includeDetails = args["include_details"]?.boolValue ?? false
         let limit = clampLimit(args["limit"]?.intValue, default: 30, max: 100)
         let maxSessionsScanned = try resolveMaxSessionsScanned(args["max_sessions_scanned"])
@@ -786,10 +799,11 @@ enum HistoryMCPToolService {
         // loading — each turn's duration is attributed to the day it occurred, preventing
         // double counting across day-scoped queries. Session/workspace grouping stays
         // metadata-only (no per-day splitting needed).
-        if ["day", "week", "month"].contains(groupBy) {
+        if usesCalendarGrouping {
             return try await executeTimeCalendarGrouped(
                 filtered,
                 groupBy: groupBy,
+                calendar: groupingCalendar,
                 idleThresholdMinutes: idleThresholdMinutes,
                 includeDetails: includeDetails,
                 dateFrom: dateFrom,
@@ -1050,6 +1064,7 @@ enum HistoryMCPToolService {
     private static func executeTimeCalendarGrouped(
         _ sessions: [HistoryFilteredSessionRecord],
         groupBy: String,
+        calendar: Calendar,
         idleThresholdMinutes: Int,
         includeDetails: Bool,
         dateFrom: Date?,
@@ -1061,7 +1076,7 @@ enum HistoryMCPToolService {
         scanner: HistorySessionScanning,
         requestBudget: HistoryRequestBudget
     ) async throws -> HistoryToolReply {
-        let calendar = Calendar.current
+        let dateLabels = makeDateOnlyFormatter(timeZone: calendar.timeZone)
 
         /// Group boundary for a date: [start, end) + key. Used to clip each turn's
         /// interval to the group it falls in, so a turn that crosses a group boundary
@@ -1069,23 +1084,17 @@ enum HistoryMCPToolService {
         /// — preventing an overlap with a turn in the next group from being counted
         /// twice (the all-turns session path merges it once).
         func groupBounds(for date: Date) -> (start: Date, end: Date, key: String)? {
-            let dayStart = calendar.startOfDay(for: date)
+            let component: Calendar.Component
             switch groupBy {
-            case "day":
-                let end = calendar.date(byAdding: .day, value: 1, to: dayStart) ?? dayStart
-                return (dayStart, end, iso8601DateOnly.string(from: dayStart))
-            case "week":
-                guard let weekStart = calendar.date(from: calendar.dateComponents([.yearForWeekOfYear, .weekOfYear], from: dayStart)) else { return nil }
-                let end = calendar.date(byAdding: .day, value: 7, to: weekStart) ?? weekStart
-                return (weekStart, end, iso8601DateOnly.string(from: weekStart))
-            case "month":
-                let comps = calendar.dateComponents([.year, .month], from: dayStart)
-                guard let monthStart = calendar.date(from: comps) else { return nil }
-                let end = calendar.date(byAdding: .month, value: 1, to: monthStart) ?? monthStart
-                return (monthStart, end, String(format: "%d-%02d", comps.year ?? 0, comps.month ?? 0))
-            default:
-                return nil
+            case "day": component = .day
+            case "week": component = .weekOfYear
+            case "month": component = .month
+            default: return nil
             }
+            guard let interval = calendar.dateInterval(of: component, for: date) else { return nil }
+            let fullDate = dateLabels.string(from: interval.start)
+            let key = component == .month ? String(fullDate.dropLast(3)) : fullDate
+            return (interval.start, interval.end, key)
         }
 
         var sessionsScanned = 0
@@ -1836,11 +1845,9 @@ enum HistoryMCPToolService {
 
     // MARK: - Helpers
 
-    /// Parse a date bound. ISO 8601 datetime values use the exact instant. Date-only
-    /// values (e.g. `"2026-01-15"`) resolve to **start-of-day** (`00:00:00 UTC`) for
-    /// lower bounds and **end-of-day** (`23:59:59 UTC`) for upper bounds, so `date_to`
-    /// is inclusive of the named day rather than excluding it.
-    static func parseDateBound(_ value: String?, isUpperBound: Bool) -> Date? {
+    /// Datetime bounds represent exact instants. Date-only bounds use the
+    /// calendar's day when supplied, and default to UTC for other history queries.
+    static func parseDateBound(_ value: String?, isUpperBound: Bool, calendar: Calendar? = nil) -> Date? {
         guard let stringValue = value, !stringValue.isEmpty else { return nil }
         if let date = iso8601WithFractionalSeconds.date(from: stringValue) {
             return date
@@ -1848,15 +1855,25 @@ enum HistoryMCPToolService {
         if let date = iso8601DateTime.date(from: stringValue) {
             return date
         }
-        // Date-only format (e.g. "2026-01-15"). Lower bound = start of day; upper bound
-        // = end of day so the named day is included.
+        if let calendar {
+            let formatter = makeDateOnlyFormatter(timeZone: calendar.timeZone)
+            guard let date = formatter.date(from: stringValue),
+                  let day = calendar.dateInterval(of: .day, for: date) else { return nil }
+            // Include the last representable instant before the next local day.
+            return isUpperBound ? Date(timeIntervalSinceReferenceDate: day.end.timeIntervalSinceReferenceDate.nextDown) : day.start
+        }
         guard let midnight = iso8601DateOnly.date(from: stringValue) else { return nil }
         return isUpperBound ? midnight.addingTimeInterval(86399) : midnight
     }
 
-    static func parseValidatedDateBound(_ value: String?, parameterName: String, isUpperBound: Bool) throws -> Date? {
+    static func parseValidatedDateBound(
+        _ value: String?,
+        parameterName: String,
+        isUpperBound: Bool,
+        calendar: Calendar? = nil
+    ) throws -> Date? {
         guard let value, !value.isEmpty else { return nil }
-        guard let parsed = parseDateBound(value, isUpperBound: isUpperBound) else {
+        guard let parsed = parseDateBound(value, isUpperBound: isUpperBound, calendar: calendar) else {
             throw HistoryValidationError(message: "Invalid '\(parameterName)' value '\(value)': expected ISO 8601 date or datetime")
         }
         return parsed
@@ -2051,11 +2068,14 @@ enum HistoryMCPToolService {
 
     /// ISO 8601 full date (`yyyy-MM-dd`) — used to parse date-only bounds and to render
     /// day/week group keys.
-    private static let iso8601DateOnly: ISO8601DateFormatter = {
+    private static let iso8601DateOnly = makeDateOnlyFormatter(timeZone: .gmt)
+
+    private static func makeDateOnlyFormatter(timeZone: TimeZone) -> ISO8601DateFormatter {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withFullDate]
+        formatter.timeZone = timeZone
         return formatter
-    }()
+    }
 
     // MARK: - Validation Error
 

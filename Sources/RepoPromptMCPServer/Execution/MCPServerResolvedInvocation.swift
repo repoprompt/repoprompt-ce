@@ -43,7 +43,7 @@ package struct MCPServerResolvedInvocation: Sendable {
         diagnosticSink: @escaping @Sendable (MCPInvocationContextFailure) -> Void,
         testOperation: @Sendable () async -> (@Sendable () async throws -> Value)? = { nil }
     ) async throws -> Value {
-        try await MCPInvocationContextBridge.$diagnosticSink.withValue(diagnosticSink) {
+        try await MCPInvocationContextBridge.withDiagnosticSink(diagnosticSink) {
             try await MCPInvocationContextBridge.withInvocation(context) {
                 #if DEBUG
                     if let operation = await testOperation() {

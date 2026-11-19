@@ -203,7 +203,21 @@ package enum MCPInvocationContextBridge {
         currentTaskLocal.get()
     }
 
-    @TaskLocal package static var diagnosticSink: (@Sendable (MCPInvocationContextFailure) -> Void)?
+    #if DEBUG
+        package static let diagnosticSinkTaskLocal = BoxedTaskLocal<(@Sendable (MCPInvocationContextFailure) -> Void)?>(nil)
+    #endif
+
+    /// Invocation-context diagnostics are only reported in debug builds.
+    package static func withDiagnosticSink<T>(
+        _ sink: @escaping @Sendable (MCPInvocationContextFailure) -> Void,
+        operation: () async throws -> T
+    ) async rethrows -> T {
+        #if DEBUG
+            try await diagnosticSinkTaskLocal.withValue(sink, operation: operation)
+        #else
+            try await operation()
+        #endif
+    }
 
     package static func require(
         toolName: String,
@@ -246,7 +260,7 @@ package enum MCPInvocationContextBridge {
         fallback: @Sendable (MCPInvocationContextFailure) -> Void
     ) -> MCPInvocationContextFailure {
         #if DEBUG
-            if let diagnosticSink {
+            if let diagnosticSink = diagnosticSinkTaskLocal.get() {
                 diagnosticSink(failure)
             } else {
                 fallback(failure)

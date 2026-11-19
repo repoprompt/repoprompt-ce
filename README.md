@@ -36,6 +36,15 @@ tap. The cask consumes the promoted public updater ZIP from
 it does not build from source. Source-build paths remain below for contributors
 and local development.
 
+### Recover an early Sparkle update failure
+
+If RepoPrompt CE **1.0.0 (build 1)** reports “An error occurred while connecting to
+the installer,” install the signed **1.0.2 (build 3)** manually from its
+[GitHub release](https://github.com/repoprompt/repoprompt-ce/releases/tag/v1.0.2).
+Quit the running app, open the release DMG and replace the old app in
+Applications. Keep your Application Support data in place. Open the replacement
+and confirm its version in **About RepoPrompt CE** before resuming in-app updates.
+
 ### Build and launch locally
 
 For development and quick evaluation, double-click

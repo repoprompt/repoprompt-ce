@@ -305,83 +305,111 @@ final class MCPFileToolProvider: MCPAppToolProviding {
         authority: ReadAuthority
     ) async throws -> Value {
         let dependencies = authority.dependencies
-        return try await Self.withActiveWorktreeStartupBenchmarkTag(lookupContext: authority.lookupContext) {
-            try await MCPToolWorkCountDiagnostics.withGitInvocation(
-                operation: MCPWindowToolName.getCodeStructure
-            ) {
+        return try await Self.executeGetCodeStructure(args: args, authority: .init(
+            store: dependencies.context.requirePromptVM().workspaceFileContextStore,
+            lookupContext: authority.lookupContext,
+            validate: { try await self.validate(authority) },
+            resolveExplicit: dependencies.files.resolveFilesForCodeStructure,
+            resolveSelected: { lookupContext, limit in
+                if !authority.isRunlessOneShotHint {
+                    try await MCPServerViewModel.requireReadFileAutoSelectionPrerequisite {
+                        try await dependencies.files.drainReadFileAutoSelection(authority.metadata, .canonicalSelection)
+                    }
+                }
+                return try await dependencies.context.resolveSelectedFilesForCodeStructure(authority.metadata, lookupContext, limit)
+            },
+            buildReply: dependencies.files.buildCodeStructureDTO
+        ))
+    }
+
+    struct CodeStructureAuthority {
+        let store: WorkspaceFileContextStore
+        let lookupContext: WorkspaceLookupContext
+        let validate: @MainActor () async throws -> Void
+        let resolveExplicit: MCPAppPhysicalCapabilityAdapters.ResolveFilesForCodeStructure
+        let resolveSelected: @MainActor (WorkspaceLookupContext, Int) async throws -> [WorkspaceFileRecord]
+        let buildReply: MCPAppPhysicalCapabilityAdapters.BuildCodeStructureDTO
+    }
+
+    nonisolated static func codeStructureRequest(_ args: [String: Value]) throws -> WorkspaceCodemapStructureRequest {
+        let allowedKeys: Set = ["paths", "expand", "depth", "signatures", "size"]
+        guard Set(args.keys).isSubset(of: allowedKeys) else {
+            throw MCPError.invalidParams("unknown get_code_structure parameter")
+        }
+
+        let direction: WorkspaceCodemapStructureTraversalDirection?
+        if let value = args["expand"] {
+            guard let raw = value.stringValue else {
+                throw MCPError.invalidParams("expand must be 'uses', 'used_by', or 'both'")
+            }
+            direction = switch raw {
+            case "uses": .referencedDefinitions
+            case "used_by": .referrers
+            case "both": .both
+            default: throw MCPError.invalidParams("expand must be 'uses', 'used_by', or 'both'")
+            }
+        } else {
+            direction = nil
+        }
+
+        let suppliedDepth: Int
+        if let value = args["depth"] {
+            guard let depth = value.intValue else {
+                throw MCPError.invalidParams("depth must be an integer")
+            }
+            suppliedDepth = depth
+        } else {
+            suppliedDepth = 1
+        }
+        guard (1 ... 4).contains(suppliedDepth) else {
+            throw MCPError.invalidParams("depth must be between 1 and 4")
+        }
+
+        let includesSignatures: Bool
+        if let value = args["signatures"] {
+            guard let signatures = value.boolValue else {
+                throw MCPError.invalidParams("signatures must be a boolean")
+            }
+            includesSignatures = signatures
+        } else {
+            includesSignatures = true
+        }
+
+        let size: WorkspaceCodemapGraphOutputSize
+        if let value = args["size"] {
+            guard let rawSize = value.stringValue,
+                  let parsedSize = WorkspaceCodemapGraphOutputSize(rawValue: rawSize)
+            else {
+                throw MCPError.invalidParams("size must be 'small', 'medium', or 'large'")
+            }
+            size = parsedSize
+        } else {
+            size = .medium
+        }
+        let budget = WorkspaceCodemapGraphPolicy.initial.queryBudget(
+            size: size,
+            includesSignatures: includesSignatures
+        )
+        return WorkspaceCodemapStructureRequest(
+            direction: direction,
+            maximumDepth: direction == nil ? 0 : suppliedDepth,
+            includesSignatures: includesSignatures,
+            size: size,
+            budget: budget
+        )
+    }
+
+    static func executeGetCodeStructure(args: [String: Value], authority: CodeStructureAuthority) async throws -> Value {
+        try await withActiveWorktreeStartupBenchmarkTag(lookupContext: authority.lookupContext) {
+            try await MCPToolWorkCountDiagnostics.withGitInvocation(operation: MCPWindowToolName.getCodeStructure) {
                 try Task.checkCancellation()
-                let allowedKeys: Set = ["paths", "expand", "depth", "signatures", "size"]
-                guard Set(args.keys).isSubset(of: allowedKeys) else {
-                    throw MCPError.invalidParams("unknown get_code_structure parameter")
-                }
-
-                let direction: WorkspaceCodemapStructureTraversalDirection?
-                if let value = args["expand"] {
-                    guard let raw = value.stringValue else {
-                        throw MCPError.invalidParams("expand must be 'uses', 'used_by', or 'both'")
-                    }
-                    direction = switch raw {
-                    case "uses": .referencedDefinitions
-                    case "used_by": .referrers
-                    case "both": .both
-                    default: throw MCPError.invalidParams("expand must be 'uses', 'used_by', or 'both'")
-                    }
-                } else {
-                    direction = nil
-                }
-
-                let suppliedDepth: Int
-                if let value = args["depth"] {
-                    guard let depth = value.intValue else {
-                        throw MCPError.invalidParams("depth must be an integer")
-                    }
-                    suppliedDepth = depth
-                } else {
-                    suppliedDepth = 1
-                }
-                guard (1 ... 4).contains(suppliedDepth) else {
-                    throw MCPError.invalidParams("depth must be between 1 and 4")
-                }
-
-                let includesSignatures: Bool
-                if let value = args["signatures"] {
-                    guard let signatures = value.boolValue else {
-                        throw MCPError.invalidParams("signatures must be a boolean")
-                    }
-                    includesSignatures = signatures
-                } else {
-                    includesSignatures = true
-                }
-
-                let size: WorkspaceCodemapGraphOutputSize
-                if let value = args["size"] {
-                    guard let rawSize = value.stringValue,
-                          let parsedSize = WorkspaceCodemapGraphOutputSize(rawValue: rawSize)
-                    else {
-                        throw MCPError.invalidParams("size must be 'small', 'medium', or 'large'")
-                    }
-                    size = parsedSize
-                } else {
-                    size = .medium
-                }
-                let budget = WorkspaceCodemapGraphPolicy.initial.queryBudget(
-                    size: size,
-                    includesSignatures: includesSignatures
-                )
-                let request = WorkspaceCodemapStructureRequest(
-                    direction: direction,
-                    maximumDepth: direction == nil ? 0 : suppliedDepth,
-                    includesSignatures: includesSignatures,
-                    size: size,
-                    budget: budget
-                )
+                let request = try codeStructureRequest(args)
 
                 await MCPToolExecutionHandlerPhaseContext.report(.getCodeStructureSeedResolution)
-                let metadata = authority.metadata
                 try Task.checkCancellation()
                 let lookupContext = authority.lookupContext
                 try Task.checkCancellation()
-                _ = try await (dependencies.context.requirePromptVM()).workspaceFileContextStore.awaitAppliedIngress(
+                _ = await authority.store.awaitAppliedIngress(
                     rootScope: lookupContext.rootScope
                 )
                 try Task.checkCancellation()
@@ -400,7 +428,7 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                     requestedPaths = translated
                     for path in translated {
                         try Task.checkCancellation()
-                        if let issue = try await (dependencies.context.requirePromptVM()).workspaceFileContextStore
+                        if let issue = await authority.store
                             .exactPathResolutionIssue(
                                 for: path,
                                 kind: .either,
@@ -410,25 +438,16 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                             throw MCPError.invalidParams(PathResolutionIssueRenderer.message(for: issue))
                         }
                     }
-                    files = try await dependencies.files.resolveFilesForCodeStructure(
+                    files = try await authority.resolveExplicit(
                         translated,
                         lookupContext.rootScope,
-                        MCPServerViewModel.codeStructureSeedLimit(for: request)
+                        MCPCodeStructureRead.maximumSeedCount
                     )
                 } else {
-                    if !authority.isRunlessOneShotHint {
-                        try await MCPServerViewModel.requireReadFileAutoSelectionPrerequisite {
-                            try await dependencies.files.drainReadFileAutoSelection(metadata, .canonicalSelection)
-                        }
-                    }
-                    files = try await dependencies.context.resolveSelectedFilesForCodeStructure(
-                        metadata,
-                        lookupContext,
-                        MCPServerViewModel.codeStructureSeedLimit(for: request)
-                    )
+                    files = try await authority.resolveSelected(lookupContext, MCPCodeStructureRead.maximumSeedCount)
                 }
                 try Task.checkCancellation()
-                let reply = try await dependencies.files.buildCodeStructureDTO(
+                let reply = try await authority.buildReply(
                     files,
                     request,
                     true,
@@ -436,7 +455,7 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                     lookupContext
                 )
                 try Task.checkCancellation()
-                try await validate(authority)
+                try await authority.validate()
                 return try Value(reply)
             }
         }
