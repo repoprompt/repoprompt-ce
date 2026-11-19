@@ -1128,10 +1128,10 @@ final class AgentQuietRetainedViewFeasibilityTests: XCTestCase {
                 defer { try? FileManager.default.removeItem(at: directory) }
                 let window = WindowState()
                 let vm = window.agentModeViewModel
-                let tabID = UUID(), sessionID = UUID()
-                let manager = AgentSessionLinkEndpointTestSupport.installWorkspace(on: vm, tabID: tabID, name: "W4 fresh hydration")
+                let manager = window.workspaceManager
                 await manager.awaitInitialized()
-                var workspace = try XCTUnwrap(manager.activeWorkspace)
+                let tabID = UUID(), sessionID = UUID()
+                var workspace = WorkspaceModel(name: "W4 fresh hydration", repoPaths: [], ephemeralFlag: true, composeTabs: [ComposeTabState(id: tabID, name: "T1")], activeComposeTabID: tabID)
                 workspace.customStoragePath = directory
                 workspace.composeTabs[0].activeAgentSessionID = sessionID
                 manager.workspaces = [workspace]
@@ -1139,8 +1139,16 @@ final class AgentQuietRetainedViewFeasibilityTests: XCTestCase {
                 let payload = AgentSession(id: sessionID, workspaceID: workspace.id, composeTabID: tabID, name: "W4 retained", transcript: retained)
                 _ = try await AgentSessionDataService.shared.saveAgentSession(payload, for: workspace)
                 window.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: false)
+                // Settle adoption on the same manager that owns this window's workspace callbacks.
+                let adoption = vm.test_receiveWorkspaceSwitchNotification(workspace)
+                await vm.test_handleWorkspaceSwitch(workspace, owner: adoption)
+                vm.test_setCurrentTabIDOverride(tabID)
                 let fresh = await vm.ensureSessionReady(tabID: tabID, reconnectActiveProviders: false)
-                XCTAssertTrue(fresh.qualifiedRestorationReadiness.isAuthoritative)
+                guard fresh.qualifiedRestorationReadiness.isAuthoritative else {
+                    XCTFail("Expected authoritative hydration for tier \(tier), tools=\(tools): \(fresh.qualifiedRestorationReadiness)")
+                    await vm.test_retireAndCancelFixture()
+                    return
+                }
                 XCTAssertEqual(fresh.quietLedger.facts, .zero)
                 XCTAssertTrue(fresh.quietLedger.hiddenSourceIDs.isEmpty)
                 XCTAssertNil(fresh.quietDisplayCandidate)
