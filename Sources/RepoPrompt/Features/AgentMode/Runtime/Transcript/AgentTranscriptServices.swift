@@ -4033,9 +4033,10 @@ enum AgentTranscriptIO {
                     guard !AgentTranscriptToolVisibilityPolicy.shouldSuppressRow(row),
                           let toolName = AgentTranscriptToolVisibilityPolicy.normalizedVisibleToolName(row.toolName) else { continue }
                     let args = truncateArgs(row.toolArgsJSON, max: maxToolArgsCharacters)
+                    let name = escapeTranscriptXML(toolName, attribute: true)
                     let xml = args.isEmpty
-                        ? "<tool_call name=\"\(toolName)\"/>"
-                        : "<tool_call name=\"\(toolName)\">\(args)</tool_call>"
+                        ? "<tool_call name=\"\(name)\"/>"
+                        : "<tool_call name=\"\(name)\">\(escapeTranscriptXML(args))</tool_call>"
                     forkItems.append(ForkItem(pos: pos, payload: .rawXML(xml), dropPriority: .toolCall, turnID: tid))
                     pos += 1
                 case .toolResult, .thinking:
@@ -4158,7 +4159,7 @@ enum AgentTranscriptIO {
         for output in outputs {
             switch output {
             case let .tagged(tag, text):
-                lines.append("<\(tag)>\(text)</\(tag)>")
+                lines.append("<\(tag)>\(escapeTranscriptXML(text))</\(tag)>")
             case let .rawXML(xml):
                 lines.append(xml)
             }
@@ -4168,6 +4169,29 @@ enum AgentTranscriptIO {
         }
         lines.append("</transcript>")
         return lines.joined(separator: "\n")
+    }
+
+    /// Encode dynamic XML fields. XML 1.0 cannot represent disallowed scalars
+    /// even as numeric references, so substitute a visible replacement in the export.
+    private static func escapeTranscriptXML(_ text: String, attribute: Bool = false) -> String {
+        var escaped = String()
+        escaped.reserveCapacity(text.utf8.count)
+        for scalar in text.unicodeScalars {
+            switch scalar.value {
+            case 0x26: escaped += "&amp;"
+            case 0x3C: escaped += "&lt;"
+            case 0x3E: escaped += "&gt;"
+            case 0x22 where attribute: escaped += "&quot;"
+            case 0x9 where attribute: escaped += "&#9;"
+            case 0xA where attribute: escaped += "&#10;"
+            case 0xD: escaped += "&#13;"
+            case 0x9, 0xA, 0x20 ... 0xD7FF, 0xE000 ... 0xFFFD, 0x10000 ... 0x10FFFF:
+                escaped.unicodeScalars.append(scalar)
+            default:
+                escaped += "\u{FFFD}"
+            }
+        }
+        return escaped
     }
 
     /// Builds a spartan XML transcript for MCP log monitoring.
