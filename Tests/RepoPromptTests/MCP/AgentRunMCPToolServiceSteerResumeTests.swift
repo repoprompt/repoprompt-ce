@@ -321,7 +321,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         } catch {
             XCTAssertTrue(String(describing: error).contains(AgentModeViewModel.mcpResidentBusyError), "\(error)")
         }
-        XCTAssertEqual(vm.agentSessionLinkSteerAdmission(for: session, liveness: .init(
+        XCTAssertEqual(vm.linkExecutionRuntime.agentSessionLinkSteerAdmission(for: session, liveness: .init(
             observerEndpointIsLive: true, targetEndpointIsLive: true, targetWindowIsClosing: false
         )), .blocked(.targetLoading))
         do {

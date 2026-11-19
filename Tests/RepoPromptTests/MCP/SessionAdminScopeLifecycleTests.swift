@@ -5248,7 +5248,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
             return observed.contains(.unknown) ? .unknown : .idle
         }
 
-        func archive(_ sessionIDs: [UUID], isAuthorized: @escaping @MainActor (UUID) -> Bool) async -> Set<UUID> {
+        func archive(_ sessionIDs: [UUID], isAuthorized: @escaping @MainActor (UUID) -> Bool) async -> AgentSessionArchiveOutcome {
             var changed: Set<UUID> = []
             for id in sessionIDs where states[id]?.isArchived == false {
                 // Like the real stash: a suspension (preflight), then the commit-time context check.
@@ -5259,7 +5259,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
                 states[id]?.isArchived = true
                 changed.insert(id)
             }
-            return changed
+            return .init(archived: changed)
         }
 
         func unarchive(

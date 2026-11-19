@@ -33,6 +33,8 @@ final class AgentSessionLinkExecutionRuntime {
         let settleSelfCompact: @MainActor (AgentTabSession) -> Void
         let selfCompactBlocksWake: @MainActor (AgentTabSession) -> Bool
         let selfCompactHoldsWakeAcquisition: @MainActor (AgentTabSession) -> Bool
+        /// Capture resource currency from the writer's own host at managed Steer admission.
+        var managedInputEnvironment: @MainActor (AgentTabSession) -> ManagedInputEnvironment? = { _ in nil }
         var workspaceCaptureOrder: AgentSessionProviderInputRuntime.WorkspaceCaptureOrder = .afterSkillExpansion
     }
 
@@ -86,6 +88,8 @@ final class AgentSessionLinkExecutionRuntime {
     }
 
     #if DEBUG
+        /// Occupies the boundary between completed off-actor materialization and release.
+        var test_afterSessionLinkTranscriptPageMaterialized: (@MainActor () async -> Void)?
         var test_endpointRead: (() -> Void)?
         var test_selfCompactAfterSupport: (() async -> Void)?
         var test_beforeRoutineIdleFollowUpStart: ((AgentTabSession, UUID) -> Bool)?

@@ -110,7 +110,7 @@ final class AgentSessionLinkReadEndpointIncarnationTests: XCTestCase {
         _ fixture: Fixture,
         candidate: AgentSessionLinkEndpointCandidate? = nil
     ) async -> Result<AgentSessionLinkTranscriptPage, AgentSessionLinkReadUnavailableReason> {
-        await fixture.viewModel.agentSessionLinkTranscriptPage(
+        await fixture.viewModel.linkExecutionRuntime.agentSessionLinkTranscriptPage(
             for: candidate ?? fixture.candidate,
             anchor: nil,
             direction: .tail,
@@ -195,7 +195,7 @@ final class AgentSessionLinkReadEndpointIncarnationTests: XCTestCase {
     /// broken `read`.
     func testReadRefusesWhenTheEndpointIsReboundWhileTheOffActorPageIsInFlight() async throws {
         let fixture = try makeFixture()
-        fixture.viewModel.test_afterSessionLinkTranscriptPageMaterialized = {
+        fixture.viewModel.linkExecutionRuntime.test_afterSessionLinkTranscriptPageMaterialized = {
             @MainActor [session = fixture.session] in
             let generation = session.beginPersistentBindingTransition()
             session.finishPersistentBindingTransition(generation: generation)
@@ -215,6 +215,31 @@ final class AgentSessionLinkReadEndpointIncarnationTests: XCTestCase {
             fixture.candidate.domainEndpoint,
             "the rebind must have been applied while the read held its materialized page"
         )
+    }
+
+    func testReadRefusesWhenTheSameEndpointReacquiresItsWriterDuringMaterialization() async throws {
+        let fixture = try makeFixture()
+        let runtime = fixture.viewModel.linkExecutionRuntime
+        let original = try runtime.transcriptWriter(for: fixture.candidate).get()
+        defer { runtime.test_afterSessionLinkTranscriptPageMaterialized = nil }
+        runtime.test_afterSessionLinkTranscriptPageMaterialized = {
+            original.scope.replaceSessions([:])
+            original.scope.replaceSessions([fixture.tabID: fixture.session])
+        }
+
+        let result = await page(fixture)
+        guard case .failure(.endpointInvalidated) = result else {
+            return XCTFail("A completed page cannot transfer to a reacquired writer")
+        }
+        XCTAssertEqual(runtime.agentSessionLinkObserverEndpoint(tabID: fixture.tabID), fixture.candidate.domainEndpoint)
+        let current = try runtime.transcriptWriter(for: fixture.candidate).get()
+        XCTAssertTrue(current.session === original.session)
+        XCTAssertNotEqual(current.identity, original.identity)
+        runtime.test_afterSessionLinkTranscriptPageMaterialized = nil
+        guard case let .success(rows) = await page(fixture) else {
+            return XCTFail("A fresh read must succeed under the current writer")
+        }
+        XCTAssertEqual(rows.items.map(\.text), ["first request", "first response"])
     }
 
     /// The routing conversion used by tool advertisement and projection addressing must be exact.

@@ -191,7 +191,7 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
         session.recordRestorationAuthoritative(.persistedPayloadApplied)
         session.markCurrentBindingHydrated()
         let target = try XCTUnwrap(viewModel.agentSessionLinkCandidates(isWindowClosing: false).first { $0.sessionID == sessionID })
-        _ = try viewModel.agentSessionLinkReadableSession(for: target).get()
+        _ = try viewModel.linkExecutionRuntime.transcriptWriter(for: target).get()
         XCTAssertTrue(session.permitsBoundOperationAndSave)
         XCTAssertNotNil(session.quietRunFacts(capturedState: .waitingForUser))
         func evidence() -> Bool? {

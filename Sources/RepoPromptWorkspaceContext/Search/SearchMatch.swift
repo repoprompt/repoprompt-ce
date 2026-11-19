@@ -243,7 +243,6 @@ private struct SearchLineIndex {
     let lineStartsUTF8: [Int]
 
     init(content: String) {
-        let nsContent = content as NSString
         guard !content.isEmpty else {
             lineRanges = []
             lineStartsUTF16 = []
@@ -261,9 +260,7 @@ private struct SearchLineIndex {
         var lineStartUTF16 = 0
         var lineStartUTF8 = 0
         var offsetUTF16 = 0
-        var offsetUTF8 = 0
-        let scalars = content.unicodeScalars
-        var index = scalars.startIndex
+        var previousWasCarriageReturn = false
 
         func appendLine(endingAtUTF16 endUTF16: Int) {
             startsUTF16.append(lineStartUTF16)
@@ -271,35 +268,30 @@ private struct SearchLineIndex {
             ranges.append(NSRange(location: lineStartUTF16, length: endUTF16 - lineStartUTF16))
         }
 
-        func consume(_ scalar: UnicodeScalar) {
-            offsetUTF16 += scalar.utf16.count
-            offsetUTF8 += scalar.utf8.count
-        }
-
-        while index < scalars.endIndex {
-            let scalar = scalars[index]
-            if scalar.value == 13 || scalar.value == 10 { // CR or LF
-                appendLine(endingAtUTF16: offsetUTF16)
-                consume(scalar)
-                index = scalars.index(after: index)
-
-                if scalar.value == 13, index < scalars.endIndex, scalars[index].value == 10 {
-                    consume(scalars[index])
-                    index = scalars.index(after: index)
+        var utf8Content = content
+        utf8Content.withUTF8 { utf8 in
+            for (offsetUTF8, byte) in utf8.enumerated() {
+                if byte == 0x0D || byte == 0x0A { // CR, LF, or a single CRLF boundary
+                    if byte == 0x0D || !previousWasCarriageReturn {
+                        appendLine(endingAtUTF16: offsetUTF16)
+                    }
+                    offsetUTF16 += 1
+                    lineStartUTF16 = offsetUTF16
+                    lineStartUTF8 = offsetUTF8 + 1
+                    previousWasCarriageReturn = byte == 0x0D
+                } else {
+                    // Continuation bytes contribute no UTF-16 units. Four-byte
+                    // scalars encode as pairs, all other leading bytes as one unit.
+                    if byte < 0x80 || byte >= 0xC0 {
+                        offsetUTF16 += byte >= 0xF0 ? 2 : 1
+                    }
+                    previousWasCarriageReturn = false
                 }
-
-                lineStartUTF16 = offsetUTF16
-                lineStartUTF8 = offsetUTF8
-            } else {
-                consume(scalar)
-                index = scalars.index(after: index)
             }
         }
 
-        if lineStartUTF16 < nsContent.length {
-            startsUTF16.append(lineStartUTF16)
-            startsUTF8.append(lineStartUTF8)
-            ranges.append(NSRange(location: lineStartUTF16, length: nsContent.length - lineStartUTF16))
+        if lineStartUTF16 < offsetUTF16 {
+            appendLine(endingAtUTF16: offsetUTF16)
         }
 
         lineRanges = ranges

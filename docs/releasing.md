@@ -1144,6 +1144,27 @@ account `repoprompt-ce`. It refuses to overwrite an existing public test tag
 and publishes that tag with `--latest=false`, so a private-source smoke run
 cannot replace the stable feed selected by `latest/download/appcast.xml`.
 
+## Verify a Stable update through Sparkle
+
+Packaged MCP smoke verifies the candidate's startup and helper. A Sparkle
+installation starts in the updater bundled with the previous app, so it requires
+a separate run. For an ordinary Stable update that keeps the signing identity,
+install the preceding public release in a disposable macOS VM. After promotion,
+use **Check for Updates…** in that app, install the offered update, and confirm
+that the relaunched app reports the promoted version and build and still opens
+the test workspace. Record both builds and the result. Before promotion, a
+tag-specific updater-smoke feed requires a predecessor configured for that feed.
+Signature, layout, and MCP smoke reports alone leave Sparkle installation
+unverified. Follow the [identity migration ladder](architecture/apple-identity-migration.md)
+for a signing-identity transition.
+
+The source and staging preflights reject the sandbox-only Sparkle installer
+launcher setting for an unsandboxed CE build. Promotion also checks the Sparkle
+symlinks and executable bits in the extracted ZIP and mounted DMG against the
+trusted framework. The updater installed with v1.0.0 retains its original
+launcher setting even when the feed offers a corrected version. For that
+specific failure, share the [v1.0.2 manual-install steps](../README.md#recover-an-early-sparkle-update-failure).
+
 ## Promote and verify
 
 After reviewing the source draft ZIP and DMG, compute the SHA-256 digest of the

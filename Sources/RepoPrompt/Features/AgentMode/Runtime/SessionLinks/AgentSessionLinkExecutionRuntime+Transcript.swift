@@ -4,7 +4,7 @@ import RepoPromptDomainRuntime
 // The canonical transcript an observer may `read` from a live target endpoint.
 //
 // Owns `AgentSessionLinkCanonicalTranscript` — the exact user-visible conversation plus the cursor
-// metadata — the view-model accessor that snapshots it for one generation-bearing endpoint, and the
+// metadata — the runtime accessor that snapshots it for one generation-bearing endpoint, and the
 // `read` accessor that hands that snapshot to `AgentSessionLinkTranscriptSanitizer` for the coarse,
 // budgeted, redacted page the tool returns. It authors no sanitization rule of its own. Invariant:
 // the snapshot names the exact incarnation it was taken from, so a rebind cannot serve a
@@ -37,40 +37,30 @@ enum AgentSessionLinkReadUnavailableReason: String, Error, Equatable {
     case endpointInvalidated = "endpoint_invalidated"
 }
 
-extension AgentModeViewModel {
-    /// Proves that one exact live endpoint incarnation is readable right now, and hands back its
-    /// session.
-    ///
-    /// Returns `.targetLoading` rather than a partially hydrated or stale projection, so an observer
-    /// never receives a truncated history that would later appear to have "lost" rows.
-    ///
-    /// The identity check is the **full** endpoint incarnation, not `(tabID, activeAgentSessionID)`.
-    /// `read` authorizes and revalidates its candidate, then awaits its opaque cursor resolution
-    /// before reaching this point; an in-place rebind that keeps the same session UUID advances the
-    /// binding generations while leaving that weaker pair equal, so a UUID-level check would let the
-    /// page be materialized from a replacement incarnation the grant never covered.
-    ///
-    /// It is one predicate rather than an inline guard precisely because a read now crosses a
-    /// suspension point: the same proof runs before the transcript snapshot is taken and again after
-    /// the off-actor materialization returns, so an authorized read can never be released against a
-    /// different incarnation than the one it started on.
-    func agentSessionLinkReadableSession(
+extension AgentSessionLinkExecutionRuntime {
+    /// Read admission carries exact session and scope incarnation without admitting a mutation.
+    func transcriptWriter(
         for candidate: AgentSessionLinkEndpointCandidate
-    ) -> Result<TabSession, AgentSessionLinkReadUnavailableReason> {
-        guard let session = sessions[candidate.tabID],
-              session.activeAgentSessionID == candidate.sessionID,
-              let identity = agentSessionLifecycleIdentity(
-                  tabID: candidate.tabID,
-                  expectedSessionID: candidate.sessionID
-              ),
-              identity.monitorEndpoint(windowID: windowID) == candidate.domainEndpoint
-        else {
+    ) -> Result<AgentSessionRuntimeStore.Writer, AgentSessionLinkReadUnavailableReason> {
+        guard let scope, !scope.isRetiring, !scope.hasReleasedWriterClaims, commands.isAvailable(),
+              routeID == candidate.windowID, let session = sessions[candidate.tabID],
+              let binding = session.persistentSessionBindingIdentity,
+              binding.sessionID == candidate.sessionID, binding.workspaceID == candidate.workspaceID,
+              binding.generation == candidate.persistentBindingGeneration,
+              session.bindingTransitionGeneration == candidate.bindingTransitionGeneration,
+              commands.workspaceID(session) == candidate.workspaceID,
+              !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: candidate.sessionID),
+              !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: candidate.sessionID)
+        else { return .failure(.endpointInvalidated) }
+        switch scope.resolveWriter(sessionID: candidate.sessionID, expectedWorkspaceID: candidate.workspaceID) {
+        case let .unique(writer) where writer.scope === scope && writer.session === session:
+            guard session.hasLoadedPersistedState, !scope.isAwaitingWorkspaceAdoption else { return .failure(.targetLoading) }
+            return .success(writer)
+        case .unavailable(.bindingTransition):
+            return .failure(.targetLoading)
+        default:
             return .failure(.endpointInvalidated)
         }
-        guard session.hasLoadedPersistedState, !session.bindingTransitionInProgress else {
-            return .failure(.targetLoading)
-        }
-        return .success(session)
     }
 
     /// Pure canonical projection: runtime tool-result policy, then the canonical archived + working
@@ -147,20 +137,24 @@ extension AgentModeViewModel {
         direction: AgentSessionLinkReadDirectionInput,
         maxItems: Int,
         maxOutputBytes: Int,
-        readerSessionID: UUID?
+        readerSessionID: UUID?,
+        sourceIsAvailable: @MainActor () -> Bool = { true }
     ) async -> Result<AgentSessionLinkTranscriptPage, AgentSessionLinkReadUnavailableReason> {
+        guard sourceIsAvailable(), !Task.isCancelled else { return .failure(.endpointInvalidated) }
+        let identity: AgentSessionRuntimeStore.WriterIdentity
         let transcript: AgentTranscript
         let sourceItemsRevision: UInt64
-        switch agentSessionLinkReadableSession(for: candidate) {
-        case let .success(session):
-            transcript = session.transcript
-            sourceItemsRevision = UInt64(max(0, session.sourceItemsRevision))
+        switch transcriptWriter(for: candidate) {
+        case let .success(writer):
+            identity = writer.identity
+            transcript = writer.session.transcript
+            sourceItemsRevision = UInt64(max(0, writer.session.sourceItemsRevision))
         case let .failure(reason):
             return .failure(reason)
         }
 
         let page = await Task.detached(priority: .userInitiated) {
-            let canonical = AgentModeViewModel.canonicalTranscript(
+            let canonical = AgentSessionLinkExecutionRuntime.canonicalTranscript(
                 from: transcript,
                 sourceItemsRevision: sourceItemsRevision
             )
@@ -181,11 +175,14 @@ extension AgentModeViewModel {
             // `test_afterSessionLinkTranscriptPageMaterialized`.
             await test_afterSessionLinkTranscriptPageMaterialized?()
         #endif
-        if case let .failure(reason) = agentSessionLinkReadableSession(for: candidate) {
-            // The endpoint moved under the await. Refuse rather than hand an authorized reader a page
-            // built from an incarnation its grant may never have covered.
+        guard sourceIsAvailable(), !Task.isCancelled else { return .failure(.endpointInvalidated) }
+        switch transcriptWriter(for: candidate) {
+        case let .success(current) where current.identity == identity:
+            return .success(page)
+        case let .failure(reason):
             return .failure(reason)
+        default:
+            return .failure(.endpointInvalidated)
         }
-        return .success(page)
     }
 }

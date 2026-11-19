@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptSecureStorage
 import RepoPromptSettingsCore
 import XCTest
 
@@ -446,6 +447,45 @@ final class AgentRepromptSubmissionTests: XCTestCase {
         XCTAssertEqual(result, .submitted)
         XCTAssertEqual(fixture.session.items.last(where: { $0.kind == .user })?.text, "Prepared brief")
         XCTAssertEqual(fixture.session.pendingClaudeSteeringInstructions.last?.providerText, "Prepared brief")
+    }
+
+    func testConnectedClaudeCanRepromptExplicitlyWithoutEnablingOrdinarySend() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        let keys = KeyManager(secureService: SecureKeysService(secureStorage: TestSecureStorageBackend()))
+        let api = APISettingsViewModel(
+            aiQueriesService: AIQueriesService(keyManager: keys), keyManager: keys, loadStoredDataOnInit: false
+        )
+        api.isClaudeCodeConnected = true
+        await api.updateAvailableModels()
+        let prompt = PromptViewModel(
+            fileManager: WorkspaceFilesViewModel(), apiSettingsViewModel: api,
+            windowID: -696, settingsManager: WindowSettingsManager(windowID: -696), refreshAvailableModelsOnInit: false
+        )
+        let vm = fixture.viewModel
+        vm.promptManager = prompt
+        vm.setRepromptIncludesRecentChat(false)
+        let model = try XCTUnwrap(vm.resolvedRepromptModel())
+        XCTAssertEqual(model.providerType, .claudeCode)
+        vm.repromptService = .init(transport: { _, _, publish in try await publish("One-draft rewrite") })
+
+        let receipt = AgentRepromptDisclosure.key + "claudeCode.no-chat"
+        let oldReceipt = UserDefaults.standard.object(forKey: receipt)
+        UserDefaults.standard.removeObject(forKey: receipt)
+        defer { UserDefaults.standard.set(oldReceipt, forKey: receipt) }
+
+        vm.repromptEnabled = true
+        XCTAssertFalse(try fixture.begin(text: "Keep this draft local"), "Ordinary Send needs authorization for this payload")
+        vm.repromptEnabled = false
+        XCTAssertFalse(try fixture.begin(text: "Rewrite this only when asked"))
+        let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: fixture.session.tabID, session: fixture.session))
+        XCTAssertTrue(vm.requestComposerRepromptAgain(target: target, text: fixture.session.draftText))
+        try await ready(fixture)
+        XCTAssertEqual(fixture.session.draftText, "One-draft rewrite")
+        XCTAssertFalse(vm.repromptEnabled)
+        XCTAssertFalse(UserDefaults.standard.bool(forKey: receipt))
+        XCTAssertNil(vm.repromptUIStore.autoSendRequest)
+        XCTAssertTrue(fixture.session.items.isEmpty)
     }
 
     func testQuestionsAndOneShotFallBackToReviewEvenInAutoMode() async throws {

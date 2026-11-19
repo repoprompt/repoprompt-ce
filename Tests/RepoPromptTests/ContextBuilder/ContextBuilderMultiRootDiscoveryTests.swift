@@ -10,6 +10,50 @@ import XCTest
 #if DEBUG
     @MainActor
     final class ContextBuilderMultiRootDiscoveryTests: XCTestCase {
+        func testMissingOracleRejectsPlanBeforeDiscoveryAndOffersContextOnlyFallback() async throws {
+            try await ContextBuilderMultiRootDiscoveryDriver.withDriver(routedRuntime: true) { driver in
+                let settings = GlobalSettingsStore.shared
+                let previousExposure = settings.mcpShowModelPresets()
+                settings.setMCPShowModelPresets(false, commit: false)
+                defer { settings.setMCPShowModelPresets(previousExposure, commit: false) }
+
+                settings.setWorkspaceAgentModelsProfile(workspaceID: driver.fixture.workspace.id, profile: .init(
+                    contextBuilderAgentRaw: AgentProviderKind.claudeCode.rawValue
+                ))
+                XCTAssertNil(settings.effectiveAgentModelsProfile(workspaceID: driver.fixture.workspace.id).planningModelRaw)
+                let context = try await driver.resolve()
+                let parent = try await driver.connectInvokingAgent(context)
+                let rejected = try await driver.fixture.perform("missing Oracle rejection") {
+                    try await driver.invoke(using: parent, responseType: "plan")
+                }
+                let error = ContextBuilderMultiRootDiscoveryDriver.text(rejected)
+                XCTAssertEqual(rejected.isError, true, error)
+                XCTAssertTrue(error.contains("[-32602] Invalid params:"), error)
+                XCTAssertTrue(error.contains("omit response_type, oracle_preset, and export_response"), error)
+                XCTAssertEqual(driver.constructed, 0, "Oracle admission must fail before discovery starts")
+
+                driver.streamBody = { runID in
+                    let child = try await driver.connectChild(runID: runID)
+                    try await driver.discover(using: child, loadUnrelatedRoot: false)
+                }
+                let contextOnly = try await driver.fixture.perform("context-only fallback") {
+                    try await parent.client.callTool(name: "context_builder", arguments: [
+                        "instructions": .string("Collect context for the plan"), "_rawJSON": .bool(true)
+                    ])
+                }
+                XCTAssertNotEqual(contextOnly.isError, true, ContextBuilderMultiRootDiscoveryDriver.text(contextOnly))
+                XCTAssertEqual(driver.constructed, 1)
+                let committed = try XCTUnwrap(driver.committed)
+                try await driver.assertReleased(runID: committed.nestedRunID)
+            }
+        }
+
+        func testAgentModePromptQualifiesContextBuilderOracleResponses() {
+            let prompt = SystemPromptService.agentModePrompt()
+            XCTAssertTrue(prompt.contains("require a configured Oracle model or an exposed compatible Model Preset"))
+            XCTAssertTrue(prompt.contains("If Oracle is unavailable, gather context with `context_builder` without a `response_type`"))
+        }
+
         func testActualContextBuilderReviewPackagesSiblingRootsOrReturnsLocalizedOwnershipRefusal() async throws {
             for isGit in [true, false] {
                 try await ContextBuilderMultiRootDiscoveryDriver.withDriver(routedRuntime: true) { driver in

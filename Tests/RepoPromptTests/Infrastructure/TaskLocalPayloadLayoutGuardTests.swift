@@ -32,7 +32,6 @@ final class TaskLocalPayloadLayoutGuardTests: XCTestCase {
             "final class",
         "Sources/RepoPrompt/Infrastructure/MCP/MCPToolWorkCountDiagnostics.swift#currentGitCapture": "final class",
         "Sources/RepoPrompt/Infrastructure/MCP/MCPToolWorkCountDiagnostics.swift#currentReadFileCapture": "final class",
-        "Sources/RepoPromptMCPServer/Context/MCPToolInvocationContext.swift#diagnosticSink": "closure",
         "Sources/RepoPrompt/Infrastructure/MCP/MCPToolObserverDiagnostics.swift#recorder": "final class",
         "Sources/RepoPromptWorkspaceContext/Search/WorkspaceFileSearchDebugTiming.swift#collector": "final class",
         "Sources/RepoPromptWorkspaceContext/Search/WorkspaceFileSearchDebugTiming.swift#catalogBuildObserver":
@@ -116,6 +115,7 @@ final class TaskLocalPayloadLayoutGuardTests: XCTestCase {
         assertPointerSizedCarrier(MCPDomainMutationCommitContext.controllerTaskLocal)
         assertPointerSizedCarrier(MCPRequestTimelineContext.currentTaskLocal)
         #if DEBUG
+            assertPointerSizedCarrier(MCPInvocationContextBridge.diagnosticSinkTaskLocal)
             assertPointerSizedCarrier(OracleReviewPackagingDiagnostics.currentTaskLocal)
             assertPointerSizedCarrier(WorktreeStartupBenchmarkDiagnostics.currentPendingStartTaskLocal)
             assertPointerSizedCarrier(WorktreeStartupInstrumentation.currentBenchmarkMetricTagTaskLocal)

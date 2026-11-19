@@ -67,35 +67,53 @@ if actual != expected:
 PYTHON
 }
 
-verify_manifest
-
 compare_trees() {
-    python3 - "$1" "$2" <<'PYTHON'
+    python3 - "$1" "$2" "${3:-full}" <<'PYTHON'
 import hashlib
 import os
+import stat
 import sys
 from pathlib import Path
+
+layout_only = sys.argv[3] == "layout"
 
 def snapshot(root: Path):
     values = {}
     for path in sorted(root.rglob("*")):
         relative = str(path.relative_to(root))
-        if path.is_symlink():
+        mode = path.lstat().st_mode
+        if stat.S_ISLNK(mode):
             values[relative] = ("link", os.readlink(path))
-        elif path.is_dir():
-            values[relative] = ("dir", "")
-        elif path.is_file():
-            values[relative] = ("file", hashlib.sha256(path.read_bytes()).hexdigest())
-        else:
-            values[relative] = ("other", "")
+        elif stat.S_ISREG(mode):
+            executable = mode & 0o111
+            if not layout_only or executable:
+                digest = None if layout_only else hashlib.sha256(path.read_bytes()).hexdigest()
+                values[relative] = ("file", executable, digest)
+        elif not layout_only:
+            values[relative] = ("dir",) if stat.S_ISDIR(mode) else ("other",)
     return values
 
 left = Path(sys.argv[1])
 right = Path(sys.argv[2])
-if snapshot(left) != snapshot(right):
-    raise SystemExit(f"Sparkle tree mismatch: {right} does not match trusted baseline {left}")
+expected, actual = snapshot(left), snapshot(right)
+if expected != actual:
+    changed = sorted(path for path in expected.keys() | actual.keys() if expected.get(path) != actual.get(path))
+    subject = "layout" if layout_only else "tree"
+    raise SystemExit(f"Sparkle {subject} mismatch: {right} differs from {left} at {', '.join(changed)}")
 PYTHON
 }
+
+if [[ "$CANDIDATE_FRAMEWORK" == --packaged-layout ]]; then
+    [[ "$#" -eq 2 && -d "$2" && ! -L "$2" ]] ||
+        fail "Expected a packaged Sparkle.framework directory"
+    # Re-signing changes file contents. Check that packaging preserved the
+    # symlink targets and executable permission bits of the trusted framework.
+    compare_trees "$TRUSTED_FRAMEWORK" "$2" layout
+    printf 'OK: Packaged Sparkle symlinks and executable permissions match the trusted framework.\n'
+    exit 0
+fi
+
+verify_manifest
 
 compare_trees "$TRUSTED_FRAMEWORK" "$SOURCE_VENDOR/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
 compare_trees "$TRUSTED_VENDOR/Sparkle.xcframework/macos-arm64_x86_64/dSYMs" "$SOURCE_VENDOR/Sparkle.xcframework/macos-arm64_x86_64/dSYMs"
