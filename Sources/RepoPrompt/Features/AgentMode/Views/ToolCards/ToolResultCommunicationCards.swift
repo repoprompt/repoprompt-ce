@@ -93,7 +93,7 @@ struct ChatSendResultCard: View {
 
 struct ChatsResultCard: View {
     let item: AgentChatItem
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("ChatsResultCard") private var isExpanded = false
 
     private var dto: ChatsReplyDTO? {
         ToolJSON.decode(ChatsReplyDTO.self, from: item.toolResultJSON)
@@ -165,7 +165,7 @@ struct ChatsResultCard: View {
 
 struct ListModelsResultCard: View {
     let item: AgentChatItem
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("ListModelsResultCard") private var isExpanded = false
 
     private var dto: ToolResultDTOs.ListModelsReply? {
         ToolJSON.decode(ToolResultDTOs.ListModelsReply.self, from: item.toolResultJSON)
@@ -210,7 +210,7 @@ struct ListModelsResultCard: View {
 
 struct ManageWorkspacesResultCard: View {
     let item: AgentChatItem
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("ManageWorkspacesResultCard") private var isExpanded = false
 
     private var dto: ManageWorkspacesResponse? {
         ToolJSON.decode(ManageWorkspacesResponse.self, from: item.toolResultJSON)

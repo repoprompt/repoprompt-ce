@@ -4,7 +4,7 @@ import SwiftUI
 struct UnknownToolResultCard: View {
     let item: AgentChatItem
     let title: String
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("UnknownToolResultCard") private var isExpanded = false
 
     private var status: ToolCardStatus {
         ToolResultStatusResolver.resolve(toolIsError: item.toolIsError, raw: item.toolResultJSON, fallback: .neutral)
