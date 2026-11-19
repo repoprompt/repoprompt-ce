@@ -144,7 +144,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
     private func steer(_ fixture: Fixture, request: AgentSessionLinkSendRequest) async
         -> AgentSessionLinkSendTransactionOutcome
     {
-        await fixture.viewModel.agentSessionLinkPerformSteer(
+        await fixture.viewModel.linkExecutionRuntime.agentSessionLinkPerformSteer(
             to: fixture.candidate, request: request,
             liveness: { Self.liveness }, commitAuthorization: { .committed }
         )
@@ -1286,7 +1286,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         fixture.session.acpController = nil
         XCTAssertNil(fixture.viewModel.agentSessionLinkManagedSteerRoute(for: fixture.session))
         XCTAssertEqual(
-            fixture.viewModel.agentSessionLinkSteerAdmission(for: fixture.session, liveness: Self.liveness),
+            fixture.viewModel.linkExecutionRuntime.agentSessionLinkSteerAdmission(for: fixture.session, liveness: Self.liveness),
             .blocked(.steerUnavailable)
         )
         fixture.session.selectedAgent = .claudeCode

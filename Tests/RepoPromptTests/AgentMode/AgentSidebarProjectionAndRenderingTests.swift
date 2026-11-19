@@ -1701,3 +1701,37 @@ private struct LegacyClosureRowList: View {
         }
     }
 }
+
+final class AgentWorktreeIndicatorTests: XCTestCase {
+    func testCompactMarkerDistinguishesPersistedStylesAndUnavailableWorktrees() {
+        let summary = AgentSessionWorktreeBindingSummary(
+            id: "binding",
+            repositoryID: "repository",
+            repoKey: "repo",
+            logicalRootPath: "/project",
+            logicalRootName: "Project",
+            worktreeID: "worktree",
+            worktreeRootPath: "/feature",
+            boundAt: Date(timeIntervalSince1970: 0)
+        )
+        let cases: [(WorktreeVisualMarkerStyle, AgentWorktreeIndicator.CompactMarker)] = [
+            (.dot, .dot), (.ring, .ring), (.capsule, .capsule)
+        ]
+
+        for (style, expectedMarker) in cases {
+            let identity = WorktreeVisualIdentity(label: "Feature", colorHex: "#123456", markerStyle: style)
+            let available = AgentWorktreeIndicator.make(summary: summary, resolvedIdentity: identity, isAvailable: true)
+            let unavailable = AgentWorktreeIndicator.make(summary: summary, resolvedIdentity: identity, isAvailable: false)
+
+            XCTAssertEqual(available.compactMarker, expectedMarker)
+            XCTAssertEqual(unavailable.compactMarker, .unavailable)
+            XCTAssertEqual(unavailable.markerStyle, style)
+            XCTAssertEqual(available.capsuleText, "WT Feature")
+            XCTAssertEqual(available.accessibilityText, "Bound to worktree Feature for root Project")
+            XCTAssertEqual(unavailable.accessibilityText, "Bound to worktree Feature for root Project, worktree unavailable")
+        }
+
+        XCTAssertGreaterThan(AgentWorktreeIndicator.CompactMarker.capsule.size.width, AgentWorktreeIndicator.CompactMarker.capsule.size.height)
+        XCTAssertEqual(AgentWorktreeIndicator.CompactMarker.dot.size.width, AgentWorktreeIndicator.CompactMarker.dot.size.height)
+    }
+}

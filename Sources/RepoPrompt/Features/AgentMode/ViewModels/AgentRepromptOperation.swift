@@ -12,7 +12,6 @@ final class AgentRepromptOperation {
     let model: AIModel?
     private let store: AgentRepromptUIStore
     private let service: AgentRepromptService?
-    private let initialError: AgentRepromptError?
     private let isCurrent: () -> Bool
     private let applyDraft: (String) -> UInt64?
     private let currentDraft: () -> String
@@ -64,7 +63,7 @@ final class AgentRepromptOperation {
     init(
         id: UUID = UUID(), sourceTabID: UUID, rawDraft: String, draftGeneration: UInt64,
         request: AgentRepromptRequest, model: AIModel?, service: AgentRepromptService?, store: AgentRepromptUIStore,
-        initialError: AgentRepromptError? = nil, initialDraft: String? = nil, mode: AgentRepromptMode = .review,
+        initialDraft: String? = nil, mode: AgentRepromptMode = .review,
         currentDraft: @escaping () -> String, applyDraft: @escaping (String) -> UInt64?,
         chooseEffort: @escaping (AIModel) async -> AIModel = { $0 }, isCurrent: @escaping () -> Bool
     ) {
@@ -77,7 +76,6 @@ final class AgentRepromptOperation {
         self.request = request
         self.model = model
         self.service = service
-        self.initialError = initialError
         self.store = store
         self.currentDraft = currentDraft
         self.applyDraft = applyDraft
@@ -137,7 +135,6 @@ final class AgentRepromptOperation {
         presentation?.error = nil
         task = Task { [self] in
             do {
-                if let initialError { throw initialError }
                 guard let model, let service else { throw AgentRepromptError.missingModel }
                 // The same ceiling includes the optional effort judgment, not just provider time.
                 let race = AgentRepromptCallRace<AgentRepromptResult>()

@@ -49,7 +49,8 @@ enum WindowSessionSnapshotBuilder {
     static func build(
         version: Int,
         candidates: [WindowSessionCaptureCandidate],
-        excludedWindowIDs: Set<Int>
+        excludedWindowIDs: Set<Int>,
+        unclaimedRestoreEntries: [WindowSessionEntry] = []
     ) -> WindowSessionSnapshot {
         var entries: [WindowSessionEntry] = []
         for candidate in candidates {
@@ -57,6 +58,7 @@ enum WindowSessionSnapshotBuilder {
             guard let entry = candidate.entry else { continue }
             entries.append(entry)
         }
+        entries.append(contentsOf: unclaimedRestoreEntries)
         return WindowSessionSnapshot(version: version, windows: entries)
     }
 }
@@ -1305,15 +1307,16 @@ class WindowStatesManager: ObservableObject {
         updateAgentSessionOversightTopologyState()
     }
 
-    /// Each window supplies its own capture decision (restore protection included); explicit-close
-    /// exclusion stays here, in `WindowSessionSnapshotBuilder`.
+    /// Keep queued entries after the grace period releases persistence. Claiming an
+    /// entry removes it from the queue, so the restored window supplies its own capture.
     private func captureCurrentSession() -> WindowSessionSnapshot {
         let candidates = allWindows.map { $0.sessionCaptureCandidate() }
 
         return WindowSessionSnapshotBuilder.build(
             version: 4,
             candidates: candidates,
-            excludedWindowIDs: explicitlyClosingWindowIDs
+            excludedWindowIDs: explicitlyClosingWindowIDs,
+            unclaimedRestoreEntries: restoreQueue
         )
     }
 
@@ -1436,6 +1439,10 @@ class WindowStatesManager: ObservableObject {
         /// Seeds instance numbers from `snapshot` exactly as session restore does.
         func preseedInstanceNumberStateForTesting(from snapshot: WindowSessionSnapshot?) {
             preseedInstanceNumberState(from: snapshot)
+        }
+
+        func setUnclaimedRestoreEntriesForTesting(_ entries: [WindowSessionEntry]) {
+            restoreQueue = entries
         }
 
         /// Installs `state` (empty by default) and returns the state it replaced.
@@ -1630,6 +1637,11 @@ class WindowStatesManager: ObservableObject {
         }
 
         let wsID = ws.id
+        // The snapshot still carries these identities. A live switch cannot take
+        // an instance number from a saved entry waiting for a window to claim it.
+        let unclaimedNumbers = Set(
+            restoreQueue.lazy.filter { $0.workspaceID == wsID }.compactMap(\.workspaceInstanceNumber)
+        )
 
         // 1) Try to reclaim a remembered number for this window and workspace if not occupied
         if let remembered = windowWorkspaceNumberHistory[windowID]?[wsID] {
@@ -1637,8 +1649,8 @@ class WindowStatesManager: ObservableObject {
                 otherWindowID != windowID && current.workspaceID == wsID && current.number == remembered
             }
             // Settled adoption must not claim a pending saved window's routing identity.
-            let isReserved = !consumeRestoredNumbers
-                && (restoredInstanceNumbersByWorkspace[wsID]?.contains(remembered) ?? false)
+            let isReserved = unclaimedNumbers.contains(remembered)
+                || (!consumeRestoredNumbers && (restoredInstanceNumbersByWorkspace[wsID]?.contains(remembered) ?? false))
             if !isOccupied, !isReserved {
                 let assignedNumber = remembered
                 assignedInstanceByWindowID[windowID] = (workspaceID: wsID, number: assignedNumber)
@@ -1659,9 +1671,10 @@ class WindowStatesManager: ObservableObject {
         // 2) Try to consume a restored instance number for this workspace
         var assignedNumber: Int
         if consumeRestoredNumbers,
-           var restored = restoredInstanceNumbersByWorkspace[wsID], !restored.isEmpty
+           var restored = restoredInstanceNumbersByWorkspace[wsID],
+           let availableIndex = restored.firstIndex(where: { !unclaimedNumbers.contains($0) })
         {
-            assignedNumber = restored.removeFirst()
+            assignedNumber = restored.remove(at: availableIndex)
             restoredInstanceNumbersByWorkspace[wsID] = restored
         } else if let next = nextInstanceNumberByWorkspace[wsID] {
             // 3) Fallback: assign from the monotonic counter (only if seeded from valid data)

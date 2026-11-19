@@ -212,6 +212,7 @@ class PromptViewModel: ObservableObject {
 
     struct ComposeTabMutationReport: Equatable {
         var removedComposeTabIDs: Set<UUID> = []
+        var stashIDsByComposeTabID: [UUID: UUID] = [:]
         var removedStashedTabIDs: Set<UUID> = []
         var noOpReasons: Set<ComposeTabRemovalReason> = []
         var rejections: [ComposeTabMutationRejection] = []
@@ -223,6 +224,7 @@ class PromptViewModel: ObservableObject {
 
         mutating func merge(_ other: Self) {
             removedComposeTabIDs.formUnion(other.removedComposeTabIDs)
+            stashIDsByComposeTabID.merge(other.stashIDsByComposeTabID) { _, newer in newer }
             removedStashedTabIDs.formUnion(other.removedStashedTabIDs)
             noOpReasons.formUnion(other.noOpReasons)
             rejections.append(contentsOf: other.rejections)
@@ -4456,11 +4458,13 @@ class PromptViewModel: ObservableObject {
             flushAndSnapshotActiveTab(in: manager, workspaceIndex: index)
         }
         var stashedTabs = manager.workspaces[index].stashedTabs
+        var newStashIDs: [UUID: UUID] = [:]
         if reason == .stash {
             let refreshedTabs = manager.workspaces[index].composeTabs
             for tabID in tabsBeingClosed {
                 guard let refreshedTab = refreshedTabs.first(where: { $0.id == tabID }) else { continue }
                 let stashedTab = StashedTab(tab: refreshedTab)
+                newStashIDs[tabID] = stashedTab.id
                 if let existingIndex = stashedTabs.firstIndex(where: { $0.tab.id == tabID }) {
                     stashedTabs[existingIndex] = stashedTab
                 } else {
@@ -4491,6 +4495,7 @@ class PromptViewModel: ObservableObject {
             return rejection(.mutationContextChanged, message: "The workspace changed before tab removal.")
         }
         report.removedComposeTabIDs.formUnion(tabsBeingClosed)
+        report.stashIDsByComposeTabID = newStashIDs
         dirtyTabIDs.subtract(resolvedIDs)
 
         func currentRemovalOwner() -> (index: Int, workspace: WorkspaceModel)? {

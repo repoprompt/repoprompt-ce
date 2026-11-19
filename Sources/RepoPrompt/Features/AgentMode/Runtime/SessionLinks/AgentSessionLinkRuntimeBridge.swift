@@ -476,9 +476,8 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
     /// Synchronous liveness of both endpoint incarnations of one send, plus the target window's
     /// teardown state, answered in a single MainActor pass.
     ///
-    /// The transaction runs on the *target's* view model, which can see only its own window. Observer
-    /// liveness and the target window's real closing state are therefore facts only the host that
-    /// owns every window can supply. Reading them must never focus, activate, or switch a window.
+    /// The host supplies observer liveness and target closing state to the target writer.
+    /// Reading these facts must never focus, activate, or switch a window.
     func agentSessionLinkSendLiveness(
         observer: DomainAgentSessionLinkEndpointIdentity,
         target: DomainAgentSessionLinkEndpointIdentity

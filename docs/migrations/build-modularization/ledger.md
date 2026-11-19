@@ -9026,3 +9026,24 @@ Presentation-partition handoff audit: all 157 assigned clone pairs have a dispos
 Combined integration merged the presentation handoff normally and retired all 31 remaining caller-map declarations, retargeting production/test callers to the existing runtime or projection owner. The provider-switch default cancellation closure, weak/optional receiver behavior and owner-validated sidebar/worktree lookups are unchanged; the five original-inventory exceptions remain the documented window close/drain seams or non-forwarding UI/address accessors, alongside protocol witnesses. The runtime/services audit now resolves 167 of 180 assigned pairs, retaining the 13 previously documented signature, DTO or distinct-authority cases. Integration review `m9-consolidation-integra-12863F` covered the source retargets; its mechanical receiver/attribute findings were corrected, and runtime defaults and unchanged assertion-kind counts were checked separately. Both products pass `37547bdb-1080-4c53-93bd-c12a70d53f76`; all 256 changed Swift files pass scoped strict lint, with the final receiver correction re-linted. Against main `f21344cc4`, the integrated change is Sources +5,269/−10,307 (net −5,038), Tests +1,223/−1,110 (net +113). No local app tests, broad/isolation runs, index check or hosted CI-log inspection was added. Publication remains held until transcript projection fix #1692 lands.
 
 Publication integration now includes main `f4ee56ca6` (#1692) by a normal merge. Its tool-name cache, narration-aware cluster cache keys and index-based grouping remain intact; the shared summary formatter accepts the original processing context instead of restoring duplicated formatting code. Both products pass `3b0160c5-afc6-4a7d-ae9a-1db17a421102`, and scoped strict lint passes all 258 selected Swift files including the incoming regression test. The final comparison against that main is Sources +5,272/−10,306 (net −5,034), Tests +1,223/−1,110 (net +113). The earlier publication hold is released; app tests and hosted CI remain with CI/overseer ownership.
+
+## M9 production-path audit and managed Steer ingress (2026-11-18)
+
+At main `a580a554c`, #1652–#1690 provide the neutral values, writer admission, first-save
+cancellation capability, exact saved-payload loader, and the configuration and worktree command
+routes. #1709, #1714 and #1715 move managed input, originating provider cleanup, and the host
+drain into runtime owners. The earlier Stage 0 before/after retirement is in merged #1415.
+
+Managed Steer now enters the same exact-writer route as Send and Stop. Its resource snapshot
+comes from the admitted writer’s composition. The caller’s cancellation, the original Stop fence,
+and the original run/attempt identity are checked again after authorization and before the
+attributed row. The provider producer receives the original writer command and settles its existing
+receipt after staging. The view-model Steer transaction forwarder is removed.
+
+`WindowStateComposition` still composes visible hosts with the legacy MCP route, and saved-target
+preparation still uses the prepared-window owner when a new runtime is needed. The independent
+route has history and file-tree coverage from #1722 and #1723. Production activation needs
+host-owned tool capabilities and endpoint discovery. After activation, the close and workspace-switch
+paths can release presentation leases, and a deferred visit can rehydrate after the final save and
+drain acknowledge settlement. Those lifecycle acceptance gates remain open in #1406. M10 still
+owns the app-free target move.

@@ -131,6 +131,30 @@ extension AgentWorktreeIndicator {
 // MARK: - Presentation helpers
 
 extension AgentWorktreeIndicator {
+    enum CompactMarker: Equatable {
+        case dot
+        case ring
+        case capsule
+        case unavailable
+
+        var size: CGSize {
+            switch self {
+            case .capsule: CGSize(width: 11, height: 5)
+            case .dot, .ring, .unavailable: CGSize(width: 7, height: 7)
+            }
+        }
+    }
+
+    /// Availability takes precedence over the persisted marker style.
+    var compactMarker: CompactMarker {
+        guard isAvailable else { return .unavailable }
+        switch markerStyle {
+        case .dot: return .dot
+        case .ring: return .ring
+        case .capsule: return .capsule
+        }
+    }
+
     /// Tint color resolved from `colorHex`; falls back to the accent color when
     /// the hex cannot be parsed.
     var color: Color {

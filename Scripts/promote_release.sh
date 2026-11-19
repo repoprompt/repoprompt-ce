@@ -459,6 +459,8 @@ validate_app_bundle() {
         --arch all \
         --bundle "$app_bundle/Contents/Resources/BundledRuntimes/Codex" \
         --signed-team-identifier "$SIGNING_TEAM_ID"
+    "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_vendor.sh" --packaged-layout \
+        "$app_bundle/Contents/Frameworks/Sparkle.framework"
     validate_embedded_mcp_helper_layout "$app_bundle" "Reviewed ZIP MCP helper layout"
     "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" \
         "$app_bundle" \
@@ -480,6 +482,8 @@ validate_dmg_matches_zip_app() {
     [[ -d "$dmg_app" ]] || fail "DMG does not contain $DISTRIBUTION_APP_BUNDLE_NAME at its root"
     diff -qr "$APP_BUNDLE" "$dmg_app" ||
         fail "DMG app contents do not match the verified update ZIP app"
+    "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_vendor.sh" --packaged-layout \
+        "$dmg_app/Contents/Frameworks/Sparkle.framework"
     validate_embedded_mcp_helper_layout "$dmg_app" "Mounted DMG MCP helper layout"
     python3 "$CONTROL_PLANE_SCRIPTS_DIR/codex_runtime_artifact.py" \
         --manifest "$ROOT_DIR/Vendor/Codex/manifest.json" verify-bundle \

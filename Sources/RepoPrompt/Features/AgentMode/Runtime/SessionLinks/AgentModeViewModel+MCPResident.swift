@@ -235,7 +235,7 @@ extension AgentModeViewModel {
                 tabID: session.tabID, session: session, displayText: frame,
                 turn: turn, route: route, workflow: workflow
             ) else { throw MCPError.invalidParams(Self.mcpResidentBusyError) }
-            let outcome = await sink.awaitOutcome(timeoutSeconds: Self.agentSessionLinkManagedSteerOutcomeTimeoutSeconds)
+            let outcome = await sink.awaitOutcome(timeoutSeconds: AgentSessionLinkExecutionRuntime.agentSessionLinkManagedSteerOutcomeTimeoutSeconds)
             switch outcome {
             case let .delivered(state):
                 switch state {
