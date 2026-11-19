@@ -1083,6 +1083,7 @@ extension AgentSessionLinkExecutionRuntime {
             displayAttribution: claim.passive?.displayAttribution
         )
         guard marker.id == wakeID, session.appendAcceptedHostMarker(marker) else { return }
+        AgentSessionLinkRuntimeBridge.shared.recordAcceptedWake(claim, at: acceptedAt)
         session.isDirty = true
         requestUIRefresh(tabID: endpoint.tabID)
         scheduleSave(for: endpoint.tabID)

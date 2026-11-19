@@ -1383,7 +1383,8 @@ package actor DomainAgentSessionLinkAuthority {
         requests: [DomainAgentSessionLinkWaitRequest],
         until predicate: DomainAgentSessionLinkWaitPredicate = .change,
         timeoutSeconds: TimeInterval,
-        observerInput: DomainAgentSessionLinkWaitInput? = nil
+        observerInput: DomainAgentSessionLinkWaitInput? = nil,
+        onAdmission: (@Sendable () -> Void)? = nil
     ) async -> DomainAgentSessionLinkWaitResult {
         guard !isDraining, !isShutDown else {
             return DomainAgentSessionLinkWaitResult(outcome: .shuttingDown, targets: [])
@@ -1459,9 +1460,11 @@ package actor DomainAgentSessionLinkAuthority {
         }
         // 3. Immediate resolution in request order.
         if let outcome = firstSatisfiedOutcome(registrations: registrations, predicate: predicate) {
+            onAdmission?()
             return waitResult(outcome: outcome, registrations: registrations)
         }
         if timeoutSeconds <= 0 {
+            onAdmission?()
             return waitResult(outcome: .timedOut, registrations: registrations)
         }
 
@@ -1510,6 +1513,7 @@ package actor DomainAgentSessionLinkAuthority {
                     return
                 }
                 if let outcome = firstSatisfiedOutcome(registrations: registrations, predicate: predicate) {
+                    onAdmission?()
                     continuation.resume(returning: waitResult(outcome: outcome, registrations: registrations))
                     return
                 }
@@ -1532,6 +1536,7 @@ package actor DomainAgentSessionLinkAuthority {
                     continuation: continuation,
                     timeoutTask: timeoutTask
                 )
+                onAdmission?()
             }
         } onCancel: {
             Task { await self.cancelWaiter(waiterID) }

@@ -1400,6 +1400,19 @@ Labels are stripped of format and bidi scalars, and the sentence's own curly quo
 folded to ASCII inside a label, so an untrusted name cannot close the
 quoted span the grammar opened around it. The transcript row's canonical raw text remains unchanged.
 
+## Link activity for local viewers
+
+`Overseer/link-activity.sqlite` is a disposable database beside `Overseer/continuity.sqlite` in the app's application-support directory. It stores only link and session UUIDs and the most recent timestamp of each kind. RepoPrompt never reads it for authorization, delivery, or restoration.
+
+Schema version 1 (`PRAGMA user_version`) has two tables:
+
+- `link_activity`: `link_id` (primary key), `observer_session_id`, `target_session_id`, `last_wake_at`, `last_instruction_at`, `last_watch_at`, `last_attention_at`. IDs are UUID text. Timestamps are fractional Unix seconds in UTC (`REAL`). A `NULL` timestamp means no recorded activity of that kind.
+- `activity_state`: `singleton` (always `1`) and `revision`, incremented in the same transaction as each successful flush. Recreating the database resets the revision. Read both tables in one read transaction if you need the revision and rows from the same snapshot.
+
+A **wake** records when a provider accepts a lane-update wake, including Wake now, for every link whose status or attention request was rendered. The recorder skips overflow that does not identify links, wakes started by an observer's timer, and passive content in ordinary user turns. An **instruction** records accepted send, steer, stop, respond, or compact work for that target, excluding idempotent replays. A **watch** uses the start time of a successful poll or read, or the admission time of a wait. An admitted wait counts even if it later times out or is cancelled. **Attention** records an accepted explicit `request_attention` from the target toward the observer, including requests that coalesce with an existing one. Automatic user-wait notices do not count.
+
+The recorder batches writes in the background at least five seconds apart. Unlink cleanup is best effort, and a failed write or app exit can leave stale rows or lose recent activity. If SQLite reports corruption, the recorder attempts to rename the damaged database and its companion files aside before recreating the database. In SQLite's DELETE journal mode, each successful flush commits to the main file. Open the live file with `mode=ro` for SQLite locking without write access. SQLite's [`immutable=1`](https://sqlite.org/uri.html) skips locking and change detection, so results can be unreliable during a write. For best-effort display with that flag, reopen on each refresh.
+
 ## Bounded race fixes and known deferred work
 
 Purposeful attention could be a one-shot signal followed by target idleness, so three races that status

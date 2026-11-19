@@ -6,7 +6,7 @@ import RepoPromptACPProviders
 import RepoPromptAIContracts
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
-import RepoPromptPersistence
+@testable import RepoPromptPersistence
 import RepoPromptSettingsCore
 import XCTest
 
@@ -5699,6 +5699,64 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         }
         XCTAssertEqual(fixture.host.sendLivenessReadings.count, 2)
         XCTAssertTrue(fixture.host.sendLivenessReadings.allSatisfy(\.permitsDelivery))
+    }
+
+    func testActivityWriteFailureDoesNotAffectAcceptedSend() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("link-activity.sqlite")
+        let recorder = AgentSessionLinkActivityRecorder(databaseURL: url, interval: .seconds(1))
+        let fixture = makeFixture()
+        fixture.bridge.installActivityRecorder(recorder)
+        _ = await addLink(fixture)
+        let itemID = UUID()
+        fixture.host.sendOutcome = .delivered(.init(
+            targetItemID: itemID,
+            acceptedAt: Date(timeIntervalSince1970: 2000),
+            deliveryState: .runStarted,
+            resultingRunState: "running"
+        ))
+        let resolved = await authorizedSendTarget(fixture)
+        let target = try XCTUnwrap(resolved)
+        guard case let .receipt(delivery) = await fixture.bridge.send(
+            target: target, message: "ship it", idempotencyKey: "recorder-first", workflowReference: nil
+        ) else { return XCTFail("Expected the target's delivery receipt") }
+        XCTAssertEqual(delivery.targetItemID, itemID.uuidString)
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while true {
+            let scheduled = await recorder.scheduled
+            if FileManager.default.fileExists(atPath: url.path), !scheduled { break }
+            guard ContinuousClock.now < deadline else { return XCTFail("Accepted send did not flush activity") }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let db = try SessionCatalogDatabase(url: url)
+        let bindings: [SessionCatalogDatabase.Binding] = [.text(target.lease.linkID.uuidString)]
+        let timestampQuery = "SELECT cast(last_instruction_at AS INTEGER) FROM link_activity WHERE link_id = ?"
+        XCTAssertEqual(try db.integer(timestampQuery, bindings), 2000)
+        try db.execute("BEGIN IMMEDIATE")
+        defer { try? db.execute("ROLLBACK") }
+        fixture.host.sendOutcome = .delivered(.init(
+            targetItemID: UUID(),
+            acceptedAt: Date(timeIntervalSince1970: 3000),
+            deliveryState: .runStarted,
+            resultingRunState: "running"
+        ))
+        guard case let .receipt(second) = await fixture.bridge.send(
+            target: target, message: "continue", idempotencyKey: "recorder-locked", workflowReference: nil
+        ) else { return XCTFail("The target must deliver even when activity cannot be written") }
+        XCTAssertEqual(second.acceptedAt.timeIntervalSince1970, 3000)
+        let flushDeadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while await !recorder.hasBufferedActivity(for: target.lease.activityLink) {
+            guard ContinuousClock.now < flushDeadline else { return XCTFail("Accepted send did not enqueue activity") }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        while await recorder.scheduled {
+            guard ContinuousClock.now < flushDeadline else { return XCTFail("Recorder failed to settle") }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(try db.integer(timestampQuery, bindings), 2000)
+        XCTAssertEqual(fixture.host.sendRequests.count, 2)
     }
 
     func testDeliveredSendRetainsAStableReceiptAndReplaysItForADuplicateRetry() async throws {
