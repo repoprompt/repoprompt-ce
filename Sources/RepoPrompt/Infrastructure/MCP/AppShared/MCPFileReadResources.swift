@@ -7,16 +7,14 @@ import RepoPromptSettingsCore
 import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
-/// Explicit resources for one independent route/context. This is not a workspace authority:
-/// all bytes, revisions, root lifetimes and binding projections come from existing owners.
+/// Shared file read resources for one independent workspace activation. Each invocation uses
+/// its own connection proof and borrows this activation's root retention.
 @MainActor
 struct MCPFileReadResources {
     static let toolNames: Set<String> = [MCPWindowToolName.getFileTree, MCPWindowToolName.getCodeStructure]
 
-    let context: DomainContextIdentity
     let workspace: AgentHostWorkspaceResources.Lease
     let settings: GlobalSettingsStore
-    let lookupSource: @MainActor () throws -> AgentWorkspaceLookupContextSource
     #if DEBUG
         var beforeReplyValidationForTesting: (@MainActor () async -> Void)?
     #endif
@@ -24,12 +22,35 @@ struct MCPFileReadResources {
     /// These bindings use the route's coordinator and the shared read tool definitions.
     func binding(named name: String, route: MCPHostRouteResources) -> MCPDomainToolBinding? {
         guard Self.toolNames.contains(name) else { return nil }
+        guard let definition = MCPDomainReadToolDefinitions.definition(named: name) else {
+            preconditionFailure("Missing canonical read definition for \(name)")
+        }
+        return MCPDomainToolBinding(definition: definition) { args in
+            try await invoke(tool: name, route: route, args: args)
+        }
+    }
+
+    private func invoke(tool: String, route: MCPHostRouteResources, args: [String: Value]) async throws -> Value {
+        let readsSelection: Bool
+        if tool == MCPWindowToolName.getCodeStructure {
+            _ = try MCPFileToolProvider.codeStructureRequest(args)
+            readsSelection = args["paths"] == nil
+        } else {
+            readsSelection = (args["type"]?.stringValue ?? "files") == "files"
+                && args["mode"]?.stringValue?.lowercased() == "selected"
+                && (args["max_depth"] == nil || args["max_depth"]?.intValue != nil)
+        }
+        // Defer reporting routing errors until the shared provider has checked parameters.
+        let admission = Result {
+            let request = try MCPInvocationContextBridge.require(toolName: tool, expectedWindowID: route.identity.routeID)
+            return try route.fileReadConnection(metadata: request.metadata, workspaceID: workspace.snapshot.document.workspaceID)
+        }
         let provider = MCPDomainReadToolProvider(
-            resolveContext: { tool, _ in
-                let request = try MCPInvocationContextBridge.require(toolName: tool, expectedWindowID: route.identity.routeID)
-                return try await DomainReadInvocationContext(
-                    handle: route.fileReadHandle(metadata: request.metadata, context: context), connectionID: request.connectionID
-                )
+            resolveContext: { _, _ in
+                let connection = try admission.get()
+                if readsSelection { try await route.drainFileReadSelection(for: connection) }
+                let handle = try await route.fileReadHandle(for: connection)
+                return DomainReadInvocationContext(handle: handle, connectionID: handle.connectionID)
             },
             refreshContext: { handle in
                 guard let coordinator = route.coordinator else { throw MCPFileToolAuthorityFailure.unavailable }
@@ -39,42 +60,26 @@ struct MCPFileReadResources {
                 guard let failure = error as? MCPFileToolAuthorityFailure else { return nil }
                 return try MCPFileToolProvider.authorityFailureValue(toolName: tool, args: args, failure: failure)
             },
-            backend: .init { tool, invocation, args, _ in try await execute(tool: tool, route: route, invocation: invocation, args: args) },
+            backend: .init { tool, invocation, args, _ in
+                try await execute(tool: tool, route: route, connection: admission.get(), invocation: invocation, args: args)
+            },
             sideEffects: route.readSideEffectCoordinator
         )
-        guard let binding = provider.binding(named: name) else {
-            preconditionFailure("Missing canonical read definition for \(name)")
+        guard let binding = provider.binding(named: tool) else {
+            preconditionFailure("Missing canonical read binding for \(tool)")
         }
-        return MCPDomainToolBinding(definition: binding.definition) { args in
-            // Match the physical tool's finite prerequisite and parameter precedence. Drain before
-            // handle capture; the shared provider then drains its own high-water and refreshes it.
-            let readsSelection: Bool
-            if name == MCPWindowToolName.getCodeStructure {
-                _ = try MCPFileToolProvider.codeStructureRequest(args)
-                readsSelection = args["paths"] == nil
-            } else {
-                readsSelection = (args["type"]?.stringValue ?? "files") == "files"
-                    && args["mode"]?.stringValue?.lowercased() == "selected"
-                    && (args["max_depth"] == nil || args["max_depth"]?.intValue != nil)
-            }
-            if readsSelection {
-                let request = try MCPInvocationContextBridge.require(toolName: name, expectedWindowID: route.identity.routeID)
-                try await route.drainFileReadSelection(metadata: request.metadata)
-            }
-            return try await binding(args)
-        }
+        return try await binding(args)
     }
 
-    func execute(
-        tool: String, route: MCPHostRouteResources, invocation: DomainReadInvocationContext, args: [String: Value]
+    private func execute(
+        tool: String, route: MCPHostRouteResources, connection: MCPHostRouteResources.FileReadConnection,
+        invocation: DomainReadInvocationContext, args: [String: Value]
     ) async throws -> Value {
         do {
-            guard let handle = invocation.handle, handle.context == context else {
-                throw MCPFileToolAuthorityFailure.unavailable
-            }
-            let request = try MCPInvocationContextBridge.require(
-                toolName: tool, expectedWindowID: route.identity.routeID
-            )
+            let context = connection.context
+            guard let handle = invocation.handle, handle.context == context,
+                  route.fileReadConnectionIsCurrent(connection)
+            else { throw MCPFileToolAuthorityFailure.superseded }
             let lease = try await workspace.capture(context: context)
             guard let canonical = lease.snapshot.contexts.first(where: { $0.metadata.identity == context }) else {
                 throw MCPFileToolAuthorityFailure.unavailable
@@ -84,13 +89,10 @@ struct MCPFileReadResources {
             else {
                 throw MCPFileToolAuthorityFailure.superseded
             }
-            let source = try lookupSource()
+            let source = connection.lookupSource
             guard source.activeAgentSessionID == canonical.metadata.activeAgentSessionID,
-                  let connectionID = request.connectionID,
-                  route.runRouteBindings.tabContextByConnectionID[connectionID]?.fileToolAuthoritySourceIdentity == source.authorityIdentity
-            else {
-                throw MCPFileToolAuthorityFailure.superseded
-            }
+                  route.fileReadConnectionIsCurrent(connection)
+            else { throw MCPFileToolAuthorityFailure.superseded }
             let store = lease.resources.files
             let roots = await store.rootRefs(scope: .visibleWorkspace)
             guard Set(roots.map { ($0.fullPath as NSString).standardizingPath })
@@ -110,12 +112,10 @@ struct MCPFileReadResources {
             } else { lifetime = nil }
             let validate: @MainActor () async throws -> Void = {
                 try Task.checkCancellation()
-                let refreshed = try await route.fileReadHandle(metadata: request.metadata, context: context)
+                let refreshed = try await route.fileReadHandle(for: connection)
                 guard refreshed.runtimeID == handle.runtimeID, refreshed.runtimeGeneration == handle.runtimeGeneration,
                       refreshed.connectionGeneration == handle.connectionGeneration, refreshed.bindingKind == handle.bindingKind,
                       refreshed.workspaceRevision == handle.workspaceRevision, refreshed.contextRevision == handle.contextRevision,
-                      !route.isClosing, try lookupSource() == source,
-                      route.runRouteBindings.tabContextByConnectionID[connectionID]?.fileToolAuthoritySourceIdentity == source.authorityIdentity,
                       await lease.isCurrent(),
                       await Set(store.rootRefs(scope: .visibleWorkspace)) == Set(roots)
                 else { throw MCPFileToolAuthorityFailure.superseded }
@@ -123,7 +123,7 @@ struct MCPFileReadResources {
                     throw MCPFileToolAuthorityFailure.worktreeScopeUnavailable
                 }
                 // Recheck synchronous revocations after the last actor hop as well.
-                guard lease.rootsAreCurrent, !route.isClosing, try lookupSource() == source else {
+                guard lease.rootsAreCurrent, route.fileReadConnectionIsCurrent(connection) else {
                     throw MCPFileToolAuthorityFailure.superseded
                 }
             }

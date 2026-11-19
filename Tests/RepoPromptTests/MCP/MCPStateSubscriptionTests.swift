@@ -355,12 +355,11 @@ final class MCPStateSubscriptionTests: XCTestCase {
             worktreeID: identity.worktreeID, worktreeRootPath: physical.path,
             commonGitDir: identity.repository.commonGitDir, isMainWorktree: identity.isMain, source: "test"
         )] } ?? []
-        let source = AgentWorkspaceLookupContextSource(activeAgentSessionID: tab.activeAgentSessionID, worktreeBindings: bindings)
         let suiteName = "RouteTree.\(UUID())"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         addTeardownBlock { defaults.removePersistentDomain(forName: suiteName) }
         let settings = GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: directory.appendingPathComponent("settings.json")))
-        var resources = MCPFileReadResources(context: context, workspace: lease, settings: settings, lookupSource: { source })
+        var resources = MCPFileReadResources(workspace: lease, settings: settings)
         if let gate { resources.beforeReplyValidationForTesting = { await gate.enter() } }
         var server: MCPServerViewModel? = makeServerViewModel(service: makeService(), validation: validation)
         let released = { @MainActor [weak server, weak prompt = server?.promptVM, weak manager = server?.workspaceManager] in
@@ -480,6 +479,51 @@ final class MCPStateSubscriptionTests: XCTestCase {
     }
 
     @MainActor
+    func testRegisteredFileReadsKeepTwoConnectionsScopedToTheirOwnTabs() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
+            let fixture = try await registeredTreeAfterServerRelease(runtime: runtime)
+            var workspace = fixture.workspace
+            var secondTab = ComposeTabState()
+            secondTab.selection = StoredSelection(selectedPaths: [fixture.root.fullPath + "/BaseOnly.swift"])
+            workspace.composeTabs.append(secondTab)
+            let document = try DomainWorkspaceDocument.decode(documentBytes: JSONEncoder().encode(workspace), fileURL: fixture.documentURL)
+            _ = await runtime.workspaceStore.registerReadDocument(document)
+
+            let route = fixture.route
+            let secondConnectionID = UUID()
+            var second = MCPTabContextSnapshot(
+                tabID: secondTab.id, windowID: route.identity.routeID, workspaceID: workspace.id,
+                promptText: "", selection: .init(), selectedMetaPromptIDs: [], tabName: "Second", runID: nil, explicitlyBound: true
+            )
+            second.routeOwnerIdentity = ObjectIdentifier(route)
+            route.runRouteBindings.tabContextByConnectionID[secondConnectionID] = second
+            route.publishBinding(connectionID: secondConnectionID, context: second)
+            await route.settleRoutingPublications()
+            XCTAssertEqual(route.descriptor?.activeContextID, secondTab.id)
+
+            let codeStructure = await runtime.toolRegistry.resolve(toolName: MCPWindowToolName.getCodeStructure, scope: .window(id: route.identity.routeID))
+            let codeBinding = try XCTUnwrap(codeStructure).binding
+            let pairs = [(fixture.connectionID, "Selected.swift", "BaseOnly.swift"), (secondConnectionID, "BaseOnly.swift", "Selected.swift")]
+            for (id, expected, unexpected) in pairs {
+                let metadata = MCPRequestMetadata(connectionID: id, clientName: nil, windowID: route.identity.routeID)
+                let treeRequest = ToolInvocationContext.trustedLocal(toolName: MCPWindowToolName.getFileTree, metadata: metadata)
+                let reply = try await MCPInvocationContextBridge.withInvocation(treeRequest) { try await fixture.tree.binding(["mode": .string("selected")]) }
+                let tree = try XCTUnwrap(reply.objectValue?["tree"]?.stringValue)
+                XCTAssertTrue(tree.contains(expected), tree)
+                XCTAssertFalse(tree.contains(unexpected), tree)
+
+                let codeRequest = ToolInvocationContext.trustedLocal(toolName: MCPWindowToolName.getCodeStructure, metadata: metadata)
+                let code = try await MCPInvocationContextBridge.withInvocation(codeRequest) { try await codeBinding(["signatures": .bool(false)]) }
+                let seeds = (code.objectValue?["roots"]?.arrayValue ?? []).flatMap { root in
+                    (root.objectValue?["seeds"]?.arrayValue ?? []).compactMap { $0.objectValue?["path"]?.stringValue }
+                }
+                XCTAssertEqual(seeds.map { ($0 as NSString).lastPathComponent }, [expected], String(describing: code))
+            }
+        }
+    }
+
+    @MainActor
     func testRegisteredCodeStructureRejectsContextReplacedBeforeReply() async throws {
         let runtime = try await makeHistoryRouteRuntime()
         try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
@@ -584,8 +628,8 @@ final class MCPStateSubscriptionTests: XCTestCase {
         try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
             let fixture = try await registeredTreeAfterServerRelease(runtime: runtime)
             let metadata = MCPRequestMetadata(connectionID: fixture.connectionID, clientName: nil, windowID: fixture.route.identity.routeID)
-            let context = DomainContextIdentity(workspaceID: fixture.workspace.id, contextID: fixture.workspace.composeTabs[0].id)
-            let handle = try await fixture.route.fileReadHandle(metadata: metadata, context: context)
+            let connection = try fixture.route.fileReadConnection(metadata: metadata, workspaceID: fixture.workspace.id)
+            let handle = try await fixture.route.fileReadHandle(for: connection)
             var changed = fixture.workspace
             changed.composeTabs[0].selection = StoredSelection(selectedPaths: [fixture.root.fullPath + "/BaseOnly.swift"])
             let document = try DomainWorkspaceDocument.decode(documentBytes: JSONEncoder().encode(changed), fileURL: fixture.documentURL)
