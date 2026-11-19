@@ -35,6 +35,13 @@ final class MCPRunRouteBindings {
         var promotedContext: MCPTabContextSnapshot?
         var promotedContextClientName: String?
         var promotedContextWindowID: Int?
+        var validateProviderCarrier: (@MainActor @Sendable () async -> Bool)?
+    }
+
+    enum PendingPolicyRollbackResult: Equatable {
+        case restored
+        case supersededBySameConnection
+        case supersededByOtherConnection
     }
 
     enum RegistrationResult: Equatable {
@@ -306,5 +313,72 @@ final class MCPRunRouteBindings {
             presentationWindowByConnection.removeValue(forKey: token.connectionID)
         }
         return true
+    }
+
+    func readFileAutoSelectionContextKey(
+        connectionID: UUID,
+        context: MCPTabContextSnapshot
+    ) -> MCPReadFileAutoSelectionCoordinator.ContextKey {
+        MCPReadFileAutoSelectionCoordinator.ContextKey(
+            windowID: context.windowID,
+            workspaceID: context.workspaceID,
+            tabID: context.tabID,
+            route: .bound(connectionID: connectionID, runID: context.runID),
+            bindingGeneration: context.readFileAutoSelectionGeneration,
+            routeOwnerIdentity: context.routeOwnerIdentity
+        )
+    }
+
+    func installReadFileAutoSelectionHandoverLineage(
+        for token: PendingPolicyToken
+    ) {
+        guard let successorContext = tabContextByConnectionID[token.connectionID],
+              successorContext.runID == token.runID
+        else {
+            readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: token.connectionID)
+            return
+        }
+        let successorKey = readFileAutoSelectionContextKey(
+            connectionID: token.connectionID,
+            context: successorContext
+        )
+
+        guard let displacedConnectionID = token.displacedConnectionID else {
+            let preservesCurrentSuccessor = token.displacedConnectionRunID == token.runID
+                && connectionIDByRunID[token.runID] == token.connectionID
+                && connectionIDToRunID[token.connectionID] == token.runID
+                && readFileAutoSelectionHandoverLineageByConnectionID[token.connectionID]?.successorKey == successorKey
+            if !preservesCurrentSuccessor {
+                readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: token.connectionID)
+            }
+            return
+        }
+
+        readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: token.connectionID)
+        guard token.displacedConnectionRunID == token.runID,
+              let displacedContext = tabContextByConnectionID[displacedConnectionID],
+              displacedContext.runID == token.runID,
+              successorContext.windowID == displacedContext.windowID,
+              successorContext.workspaceID == displacedContext.workspaceID,
+              successorContext.tabID == displacedContext.tabID
+        else { return }
+
+        let displacedKey = readFileAutoSelectionContextKey(
+            connectionID: displacedConnectionID,
+            context: displacedContext
+        )
+        var predecessorKeys: [MCPReadFileAutoSelectionCoordinator.ContextKey] = []
+        if let inherited = readFileAutoSelectionHandoverLineageByConnectionID[displacedConnectionID],
+           inherited.successorKey == displacedKey
+        {
+            predecessorKeys.append(contentsOf: inherited.predecessorKeys)
+        }
+        if !predecessorKeys.contains(displacedKey) {
+            predecessorKeys.append(displacedKey)
+        }
+        readFileAutoSelectionHandoverLineageByConnectionID[token.connectionID] = .init(
+            successorKey: successorKey,
+            predecessorKeys: predecessorKeys
+        )
     }
 }

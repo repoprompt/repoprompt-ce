@@ -4501,6 +4501,20 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         codexStartupClaimsByTabID[session.tabID]?.sessionID == ObjectIdentifier(session)
     }
 
+    /// Cold compaction resumes the controller before it can begin a turn attempt. Capture
+    /// that exact controller startup claim so provider routing can admit the initial connection.
+    func captureProviderStartupClaim(for session: AgentTabSession) -> (@MainActor @Sendable () -> Bool)? {
+        let tabID = session.tabID
+        guard session.selectedAgent == .codexExec,
+              let claim = codexStartupClaimsByTabID[tabID], claim.sessionID == ObjectIdentifier(session)
+        else { return nil }
+        return { [weak self, weak session] in
+            guard let session, session.selectedAgent == .codexExec,
+                  let current = self?.codexStartupClaimsByTabID[tabID] else { return false }
+            return current.sessionID == claim.sessionID && current.token == claim.token
+        }
+    }
+
     private func stageCodexNativeSessionStartResult(
         _ result: CodexNativeSessionStartResult,
         for session: AgentTabSession,
