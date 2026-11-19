@@ -3821,6 +3821,77 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         )
     }
 
+    func testSettlingUnrelatedStatusDoesNotRearmFailedAttention() throws {
+        typealias Notices = AgentSessionLinkPassiveStatusNotices
+        let fixture = try makeFixture(fenceProviderLaunch: true)
+        let runtime = fixture.viewModel.linkExecutionRuntime
+        try publishInventory(fixture, revision: 1)
+        fixture.session.oversight.autoWakeOnUpdates = true
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+        var notices = Notices(observerEndpoint: endpoint, queueEpoch: Self.laneQueueEpoch)
+        func sample(_ index: Int, _ status: Notices.Status) -> Notices.Sample {
+            .init(
+                reference: Self.laneReference(index), targetEndpoint: Self.laneTargetEndpoint(index),
+                targetSessionID: Self.targetID(index), displayName: "Lane \(index)", status: status,
+                idleForSend: status == .idle
+            )
+        }
+        notices.enable(samples: [sample(0, .idle), sample(1, .running)], linkSetRevision: 1)
+        notices.setAutoWakeLanes((0 ..< 2).map { index in
+            .init(
+                reference: Self.laneReference(index), targetEndpoint: Self.laneTargetEndpoint(index),
+                targetSessionID: Self.targetID(index), isEffectivelySelected: true
+            )
+        })
+        notices.reconcile(samples: [sample(0, .idle), sample(1, .idle)], linkSetRevision: 1, deliverable: true)
+        XCTAssertEqual(notices.requestAttention(
+            reference: Self.laneReference(0), targetEndpoint: Self.laneTargetEndpoint(0),
+            targetSessionID: Self.targetID(0), linkSetRevision: 1
+        ), .accepted)
+        let initial = notices.snapshot
+        let attention = try XCTUnwrap(initial.attentionRequests.first)
+        XCTAssertEqual(initial.entries.map(\.reference), [Self.laneReference(1)])
+        runtime.agentSessionLinkPublishPassiveStatusNotices(initial, to: endpoint)
+
+        var wake = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        wake.task?.cancel()
+        let context = try XCTUnwrap(runtime.agentSessionLinkPromptContext(for: fixture.session))
+        let failedClaim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaimStore.claim(
+            dispatchID: .autoWake(wakeID: wake.wakeID),
+            epoch: context.epoch,
+            inventory: context.inventory,
+            passiveNotices: context.passiveNotices,
+            render: { _ in
+                AgentSessionLinkPromptRenderResult(
+                    fragment: "[attention only]",
+                    passiveBatch: .init(
+                        entries: [], attentionRequests: [attention],
+                        overflowProducedThrough: 0, includesUnattributedOverflow: false
+                    )
+                )
+            }
+        ))
+        wake.phase = .preparingDispatch
+        wake.task = nil
+        fixture.session.oversight.pendingAutoWake = wake
+        XCTAssertTrue(runtime.agentSessionLinkAcquirePhysicalDispatch(for: fixture.session, dispatchID: failedClaim.dispatchID))
+        runtime.agentSessionLinkRecordPhysicalDispatchFailure(for: fixture.session, dispatchID: failedClaim.dispatchID)
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+        let failed = try XCTUnwrap(fixture.session.oversight.suppressedWakeFingerprint)
+        XCTAssertEqual(failed.edges.map(\.reference), [Self.laneReference(1)])
+        XCTAssertEqual(failed.attentionOccurrences, [attention.occurrence])
+
+        // A natural turn accepted only the status row. Apply its partial receipt to the real reducer
+        // and publish the result, as the bridge does on acceptance.
+        notices.apply(.init(snapshot: initial, deliveredAttentionRequests: []))
+        XCTAssertTrue(notices.snapshot.entries.isEmpty)
+        XCTAssertEqual(notices.snapshot.attentionRequests.map(\.occurrence), [attention.occurrence])
+        runtime.agentSessionLinkPublishPassiveStatusNotices(notices.snapshot, to: endpoint)
+        defer { fixture.session.oversight.pendingAutoWake?.task?.cancel() }
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+        XCTAssertEqual(fixture.session.oversight.suppressedWakeFingerprint, failed)
+    }
+
     func testNewAttentionRearmsFailedAttentionAndIsTheExactRequiredBasis() throws {
         let fixture = try makeFixture()
         try publishInventory(fixture, revision: 1)
