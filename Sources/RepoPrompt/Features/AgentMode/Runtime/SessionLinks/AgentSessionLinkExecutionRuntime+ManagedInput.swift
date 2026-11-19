@@ -18,24 +18,14 @@ extension AgentSessionLinkExecutionRuntime {
     }
 
     @discardableResult
-    func submitAgentSessionLinkManagedSteer(
-        tabID: UUID, session: TabSession, displayText: String,
-        turn: AgentSessionLinkManagedTurn, route: AgentSessionLinkManagedSteerRoute,
-        environment: ManagedInputEnvironment
-    ) -> Bool {
-        submitNoncomposerSteer(
-            tabID: tabID, session: session, displayText: displayText,
-            turn: AgentNoncomposerTurn(managed: turn), route: route, environment: environment
-        )
-    }
-
-    @discardableResult
     func submitNoncomposerSteer(
         tabID: UUID, session: TabSession, displayText: String, turn: AgentNoncomposerTurn,
         route: AgentSessionLinkManagedSteerRoute, workflow: AgentWorkflowDefinition? = nil,
-        environment: ManagedInputEnvironment
+        environment: ManagedInputEnvironment,
+        originatingCommand: AgentSessionRuntimeStore.Command? = nil
     ) -> Bool {
-        guard let owner = scope, let command = admit(endpoint: turn.endpoint), command.isCurrent,
+        guard let owner = scope, let command = originatingCommand ?? admit(endpoint: turn.endpoint),
+              command.isCurrent, command.writer.scope === owner,
               owner.sessions[tabID] === session, command.writer.session === session,
               environment.workspaceID == command.identity.workspaceID,
               environment.resourcesAreCurrent(), commands.workspaceID(session) == environment.workspaceID,

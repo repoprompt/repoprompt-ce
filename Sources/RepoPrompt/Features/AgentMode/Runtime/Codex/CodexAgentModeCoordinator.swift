@@ -5408,11 +5408,11 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 deleteDeferredFilesWhenFailureHasNoInFlight: true
             )
             return true
-        case let .executableUnavailable(message):
+        case let .executableUnavailable(message), let .temporarilyUnavailable(message):
             await finalizeCodexRun(
                 session,
                 turnStatus: .failed,
-                reason: "codex-executable-unavailable",
+                reason: "managed-auth-verification-unavailable",
                 errorMessage: message,
                 notifyOnCompleted: false,
                 deleteDeferredFilesWhenFailureHasNoInFlight: true
@@ -7148,7 +7148,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 case let .requiresUserLogin(guidance):
                     _ = markCodexReconnectNeeded(for: session, source: "managed-auth-recovery-required-during-start")
                     effectiveError = AIProviderError.invalidConfiguration(detail: guidance)
-                case let .executableUnavailable(message):
+                case let .executableUnavailable(message), let .temporarilyUnavailable(message):
                     effectiveError = AIProviderError.invalidConfiguration(detail: message)
                 case .recovered:
                     let expectedController = session.codexController

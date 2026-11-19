@@ -1039,7 +1039,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             await links.agentSessionLinkPerformSteer(
                 to: candidate, request: request,
                 liveness: { .init(observerEndpointIsLive: true, targetEndpointIsLive: true, targetWindowIsClosing: false) },
-                commitAuthorization: { .committed }, environment: environment
+                commitAuthorization: { .committed }
             )
         }
         defer {

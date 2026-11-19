@@ -1066,8 +1066,8 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         )
     }
 
-    /// Routes one managed steer to the exact owning window, refusing during teardown before any
-    /// target state is touched. Nothing here focuses or activates the window.
+    /// Routes managed steering through the exact session writer. The liveness probe still
+    /// supplies the host's current presentation-close admission policy.
     func agentSessionLinkPerformSteer(
         to candidate: AgentSessionLinkEndpointCandidate,
         request: AgentSessionLinkSendRequest,
@@ -1075,10 +1075,10 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
     ) async -> AgentSessionLinkSendTransactionOutcome {
         guard !isTerminating else { return .blocked(.shuttingDown) }
-        guard let window = window(withID: candidate.windowID), !window.isClosing else {
+        guard let runtime = agentSessionLinkCommandRuntime(for: candidate) else {
             return .blocked(.endpointHost)
         }
-        return await window.agentModeViewModel.agentSessionLinkPerformSteer(
+        return await runtime.agentSessionLinkPerformSteer(
             to: candidate,
             request: request,
             liveness: liveness,

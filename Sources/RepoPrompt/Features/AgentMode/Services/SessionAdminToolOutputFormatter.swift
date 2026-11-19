@@ -4,6 +4,7 @@ import MCP
 /// The complete structured result remains unchanged beneath this bounded summary.
 enum SessionAdminToolOutputFormatter {
     static func format(args: [String: Value], value: Value) -> [MCP.Tool.Content] {
+        let json = ToolOutputFormatter.rawJSONString(value)
         guard args["op"]?.stringValue == "inventory",
               let object = value.objectValue,
               object["result"]?.stringValue == "ok",
@@ -14,7 +15,7 @@ enum SessionAdminToolOutputFormatter {
               let truncated = object["truncated"]?.boolValue,
               let sessions = object["sessions"]?.arrayValue
         else {
-            return ToolOutputFormatter.formatGeneric(value: value)
+            return [.text(text: json, annotations: nil, _meta: nil)]
         }
 
         let countStatus = totalComplete ? "complete" : "lower bound; completeness unproven"
@@ -33,6 +34,7 @@ enum SessionAdminToolOutputFormatter {
             lines.append("The row limit omitted matches; these rows are not the complete matching set.")
         }
         lines.append("A provider preview may omit rows. Use the total above, not the number of visible rows.")
-        return [.text(lines.joined(separator: "\n") + "\n\n```json\n" + ToolOutputFormatter.prettyJSON(value) + "\n```")]
+        let text = lines.joined(separator: "\n") + "\n\n```json\n" + json + "\n```"
+        return [.text(text: text, annotations: nil, _meta: nil)]
     }
 }
