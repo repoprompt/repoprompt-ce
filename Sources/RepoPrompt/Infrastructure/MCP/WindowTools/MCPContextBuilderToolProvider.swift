@@ -520,6 +520,10 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                 responseType: responseType?.rawValue,
                 oraclePreset: oraclePreset
             )
+        } catch OracleExecutionResolutionError.missingConfiguredOracleModel {
+            throw MCPError.invalidParams(
+                "Context Builder requires an Oracle model for plan, question, or review responses. Select an Oracle model in Agent Models or use an exposed compatible Model Preset. To gather context and continue planning or review yourself, omit response_type, oracle_preset, and export_response."
+            )
         } catch let error as OracleExecutionResolutionError {
             throw MCPError.invalidParams(error.localizedDescription)
         }

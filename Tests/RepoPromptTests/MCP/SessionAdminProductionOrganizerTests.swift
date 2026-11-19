@@ -1538,11 +1538,94 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
         XCTAssertEqual(capture(), incremental, "Incremental indexes must preserve every full-rebuild claim and duplicate rule", file: file, line: line)
     }
 
+    func testArchiveReportsLocalStashWithoutClaimingPersistenceAfterSaveRejection() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let fixture = try await Fixture.make(ephemeral: false)
+            let manager = fixture.window.workspaceManager
+            defer { manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil) }
+            do {
+                manager.markWorkspaceDirty(workspaceID: fixture.workspaceID)
+                let baseline = await manager.pollAndSaveStateWithOutcomeAsync(workspaceID: fixture.workspaceID)
+                XCTAssertTrue(baseline.acceptedForLifecycleAdmission)
+                let baselineWorkspace = await manager.durableWorkspaceForMutationReadback(workspaceID: fixture.workspaceID)
+                let savedBefore = try XCTUnwrap(baselineWorkspace)
+                XCTAssertTrue(savedBefore.composeTabs.contains { $0.id == fixture.targetTab.id })
+                XCTAssertTrue(savedBefore.stashedTabs.isEmpty)
+
+                // Invalidate each prepared write. Both the stash's queued save and the later
+                // acknowledgement must exhaust the real workspace owner's stale-write retries.
+                manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { workspaceID, _, _ in
+                    await MainActor.run {
+                        guard workspaceID == fixture.workspaceID,
+                              manager.activeWorkspace?.stashedTabs.contains(where: { $0.tab.id == fixture.targetTab.id }) == true
+                        else { return }
+                        manager.markWorkspaceDirty(workspaceID: workspaceID)
+                    }
+                }
+                let reply = try await fixture.call("archive", [:])
+                XCTAssertEqual(reply["result"], .string("partial"))
+                XCTAssertEqual(reply["changed_count"], .int(0))
+                XCTAssertEqual(reply["local_changes"], .bool(true))
+                XCTAssertNotEqual(reply[AgentSessionAdminRendering.committedChangesKey], .bool(true))
+                XCTAssertNil(reply["undo_token"])
+                let item = try XCTUnwrap(reply["items"]?.arrayValue?.first?.objectValue)
+                XCTAssertEqual(item["status"], .string("failed"))
+                XCTAssertEqual(item["reason"], .string("persistence_rejected"))
+                XCTAssertEqual(item["local_changes"], .bool(true))
+                XCTAssertEqual(item["persistence_confirmed"], .bool(false))
+                XCTAssertTrue(try fixture.workspace().stashedTabs.contains { $0.tab.id == fixture.targetTab.id })
+
+                await manager.debugDrainScheduledSaves()
+                let afterArchive = await manager.durableWorkspaceForMutationReadback(workspaceID: fixture.workspaceID)
+                let savedAfter = try XCTUnwrap(afterArchive)
+                XCTAssertTrue(savedAfter.composeTabs.contains { $0.id == fixture.targetTab.id })
+                XCTAssertTrue(savedAfter.stashedTabs.isEmpty)
+                manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil)
+                await fixture.cleanup()
+            } catch {
+                manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil)
+                await fixture.cleanup()
+                throw error
+            }
+        }
+    }
+
+    func testArchiveCallerCancellationKeepsThePublishedStashSaveScheduled() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let fixture = try await Fixture.make(ephemeral: false)
+            let manager = fixture.window.workspaceManager
+            let prompt = fixture.window.promptManager
+            let gate = ArchiveCompletionGate()
+            let listener = prompt.addComposeTabsDidRemoveListener { tabIDs, reason, workspaceID in
+                if tabIDs.contains(fixture.targetTab.id), reason == .stash, workspaceID == fixture.workspaceID {
+                    await gate.hold()
+                }
+                return []
+            }
+            let archive = Task { @MainActor in try await fixture.call("archive", [:]) }
+
+            // This hook only runs after the local transition and its save scheduling point.
+            await fulfillment(of: [gate.entered], timeout: 10)
+            let local = manager.activeWorkspace
+            XCTAssertTrue(local?.stashedTabs.contains { $0.tab.id == fixture.targetTab.id } == true)
+            archive.cancel()
+            // The caller remains held in cleanup, so only the independently queued save can commit.
+            await manager.debugDrainScheduledSaves()
+            let durable = await manager.durableWorkspaceForMutationReadback(workspaceID: fixture.workspaceID)
+            XCTAssertTrue(durable?.stashedTabs.contains { $0.tab.id == fixture.targetTab.id } == true)
+            XCTAssertFalse(durable?.composeTabs.contains { $0.id == fixture.targetTab.id } == true)
+            gate.resume()
+            _ = await archive.result
+            prompt.removeComposeTabsDidRemoveListener(listener)
+            await fixture.cleanup()
+        }
+    }
+
     func testArchiveUndoRestoresSidebarCarrierWithoutSelectingTheTarget() async throws {
         try await MCPSharedServerTestLease.shared.withLease { _ in
             let fixture = try await Fixture.make(ephemeral: false)
             let manager = fixture.window.workspaceManager
-            let gate = UnarchiveSaveGate()
+            let gate = ArchiveCompletionGate()
             defer {
                 gate.resume()
                 manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil)
@@ -1550,6 +1633,10 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
             do {
                 let archived = try await fixture.call("archive", [:])
                 XCTAssertEqual(archived["changed_count"], .int(1))
+                let durableArchive = await manager.durableWorkspaceForMutationReadback(workspaceID: fixture.workspaceID)
+                let archivedWorkspace = try XCTUnwrap(durableArchive)
+                XCTAssertFalse(archivedWorkspace.composeTabs.contains { $0.id == fixture.targetTab.id })
+                XCTAssertEqual(archivedWorkspace.stashedTabs.map(\.tab.id), [fixture.targetTab.id])
                 let workspace = try fixture.workspace()
                 XCTAssertFalse(workspace.composeTabs.contains { $0.id == fixture.targetTab.id })
                 XCTAssertEqual(workspace.stashedTabs.map(\.tab.id), [fixture.targetTab.id])
@@ -1718,8 +1805,8 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
     }
 
     @MainActor
-    private final class UnarchiveSaveGate {
-        let entered = XCTestExpectation(description: "unarchive owner save is held")
+    private final class ArchiveCompletionGate {
+        let entered = XCTestExpectation(description: "archive journey reaches its hold point")
         private var didEnter = false
         private var released = false
         private var continuations: [CheckedContinuation<Void, Never>] = []

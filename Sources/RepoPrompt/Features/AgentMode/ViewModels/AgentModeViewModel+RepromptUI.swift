@@ -2,8 +2,8 @@ import Foundation
 import RepoPromptAIContracts
 import RepoPromptSettingsCore
 
-/// V4 acknowledges one rewrite billing route, attachment names, and the optional recent-chat exposure.
-/// Earlier receipts did not cover attachment names and cannot authorize this disclosure.
+/// Records authorization for intercepting ordinary Send on a specific route and payload.
+/// An explicit one-draft Re-prompt action does not consult or change this receipt.
 enum AgentRepromptDisclosure {
     static let key = "agentReprompt.rewriteRecipient.v4."
     static func isAcknowledged(providerID: String?, defaults: UserDefaults) -> Bool {
@@ -15,7 +15,7 @@ enum AgentRepromptDisclosure {
         defaults.set(true, forKey: key + providerID)
     }
 
-    /// Essential informed-consent facts, kept short enough to read before enabling.
+    /// Describes the request alongside the composer controls.
     static func summary(modelName: String, routeName: String, includesRecentChat: Bool) -> [String] {
         let payload = includesRecentChat
             ? "your message, guidance, attachment names, the session title and recent chat excerpts"
@@ -25,16 +25,6 @@ enum AgentRepromptDisclosure {
             "\(routeName) billing and retention apply. Avoid secrets.",
             "Model Router or Auto Effort, if on, may judge the draft before you send."
         ]
-    }
-
-    /// Describes the current, user-configurable Re-prompt bindings (empty when cleared).
-    static func howItWorks(rewriteKey: String, sendOriginalKey: String) -> String {
-        let rewrite = rewriteKey.isEmpty ? "" : ", \(rewriteKey) rewrites again"
-        let original = sendOriginalKey.isEmpty ? "" : ", \(sendOriginalKey) sends the original immediately"
-        return "Send or Return rewrites the message in the composer; press either again to send the visible text. "
-            + "You can keep editing at any time; typing stops the rewrite. Esc restores the original for your next Send\(rewrite)\(original). "
-            + "Clarification is optional; an answer may trigger one more rewrite. Send automatically mode "
-            + "(Re-prompt menu) dispatches completed rewrites unless a question or slash-leading text needs review."
     }
 }
 
@@ -151,44 +141,46 @@ extension AgentModeViewModel {
         updateRepromptPreferences { $0.agentRepromptIncludesRecentChat = enabled ? nil : false }
     }
 
-    func repromptPillProps() -> AgentRepromptPillProps {
-        let resolution = repromptModelResolution()
-        let model = resolution.model
-        let recipient = model.map { model in
-            let route = ClaudeCodeAIModelCatalog.compatibleBackendDescriptor(for: model).map { String(describing: $0.backendID) }
-                ?? String(describing: model.providerType)
-            return route + (repromptIncludesRecentChat ? ".recent-chat" : ".no-chat")
-        }
-        return .init(
-            isOn: repromptEnabled, isAvailable: model != nil, isPreparing: repromptOperation?.phase.isStreaming == true,
-            modelDisplayName: model?.displayName ?? "Choose a model", providerID: recipient,
-            requiresDisclosure: !AgentRepromptDisclosure.isAcknowledged(providerID: recipient, defaults: .standard),
-            unavailableReason: resolution.unavailableReason
+    private func repromptAutomaticRecipient(for model: AIModel) -> String {
+        let route = ClaudeCodeAIModelCatalog.compatibleBackendDescriptor(for: model).map { String(describing: $0.backendID) }
+            ?? String(describing: model.providerType)
+        return route + (repromptIncludesRecentChat ? ".recent-chat" : ".no-chat")
+    }
+
+    func repromptCanRewriteOnSend(model: AIModel) -> Bool {
+        repromptAvailability != nil || AgentRepromptDisclosure.isAcknowledged(
+            providerID: repromptAutomaticRecipient(for: model), defaults: .standard
         )
     }
 
-    func setRepromptEnabled(_ enabled: Bool, acknowledgingProviderID: String? = nil) {
+    func repromptPillProps() -> AgentRepromptPillProps {
+        let resolution = repromptModelResolution()
+        let model = resolution.model
+        return .init(
+            isOn: repromptEnabled && (model.map { repromptCanRewriteOnSend(model: $0) } ?? true),
+            isAvailable: model != nil, isPreparing: repromptOperation?.phase.isStreaming == true,
+            modelDisplayName: model?.displayName ?? "Choose a model", unavailableReason: resolution.unavailableReason,
+            dataDisclosure: model.map { model in
+                AgentRepromptDisclosure.summary(
+                    modelName: model.displayName, routeName: repromptRouteName(for: model),
+                    includesRecentChat: repromptIncludesRecentChat
+                )
+            } ?? []
+        )
+    }
+
+    func setRepromptEnabled(_ enabled: Bool) {
         if enabled {
-            let props = repromptPillProps()
-            guard props.isAvailable, let providerID = props.providerID else { return }
-            if let acknowledgingProviderID {
-                guard acknowledgingProviderID == providerID else { return }
-                AgentRepromptDisclosure.acknowledge(providerID: providerID, defaults: .standard)
-            }
-            guard AgentRepromptDisclosure.isAcknowledged(providerID: providerID, defaults: .standard) else { return }
+            guard let model = repromptModelResolution(pinningDefault: true).model else { return }
+            AgentRepromptDisclosure.acknowledge(providerID: repromptAutomaticRecipient(for: model), defaults: .standard)
         } else {
             // Turning Re-prompt off stops every rewrite, including those in sessions not on screen.
             for operation in Array(repromptOperations.values) where operation.phase.isBusy {
                 operation.cancel()
             }
+            if repromptOperations.isEmpty { repromptDefaultModel = nil }
         }
         repromptEnabled = enabled
-        if enabled {
-            // Freeze the consented route synchronously, with no await since recipient validation.
-            _ = repromptModelResolution(pinningDefault: true)
-        } else if repromptOperations.isEmpty {
-            repromptDefaultModel = nil
-        }
         ui.statusPills.update(makeStatusPillsSnapshot())
     }
 

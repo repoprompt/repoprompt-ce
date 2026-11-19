@@ -79,7 +79,7 @@ final class MCPHostRouteResources {
         domainRuntime.readSideEffectCoordinator
     }
 
-    func fileTreeContextIsCurrent(_ original: MCPTabContextSnapshot, connectionID: UUID) -> Bool {
+    func fileReadContextIsCurrent(_ original: MCPTabContextSnapshot, connectionID: UUID) -> Bool {
         guard !isClosing, let current = runRouteBindings.tabContextByConnectionID[connectionID] else { return false }
         return current.windowID == original.windowID && current.workspaceID == original.workspaceID
             && current.tabID == original.tabID && current.runID == original.runID
@@ -90,7 +90,7 @@ final class MCPHostRouteResources {
 
     /// Consume only this route's existing connection receipt. Query dispatch never binds a new
     /// connection, follows a presenter or adopts a same-ID replacement.
-    func fileTreeReadHandle(metadata: MCPRequestMetadata, context: DomainContextIdentity) async throws -> DomainReadContextHandle {
+    func fileReadHandle(metadata: MCPRequestMetadata, context: DomainContextIdentity) async throws -> DomainReadContextHandle {
         guard !isClosing, let coordinator, let connectionID = metadata.connectionID,
               let retained = connections[connectionID],
               let routed = runRouteBindings.tabContextByConnectionID[connectionID],
@@ -102,14 +102,14 @@ final class MCPHostRouteResources {
         else { throw MCPFileToolAuthorityFailure.unavailable }
         let handle = try await coordinator.resolveReadContext(connection: retained.registration)
         guard !isClosing, connections[connectionID]?.registration == retained.registration,
-              fileTreeContextIsCurrent(routed, connectionID: connectionID),
+              fileReadContextIsCurrent(routed, connectionID: connectionID),
               handle.context == context,
               MCPServerViewModel.domainReadBindingSatisfiesRequestedRun(requestedRunID: routed.runID, resolvedBindingKind: handle.bindingKind)
         else { throw MCPFileToolAuthorityFailure.superseded }
         return handle
     }
 
-    func drainFileTreeSelection(metadata: MCPRequestMetadata) async throws {
+    func drainFileReadSelection(metadata: MCPRequestMetadata) async throws {
         guard !isClosing, let connectionID = metadata.connectionID,
               let context = runRouteBindings.tabContextByConnectionID[connectionID],
               context.windowID == identity.routeID, context.routeOwnerIdentity == ObjectIdentifier(self)

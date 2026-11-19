@@ -183,6 +183,56 @@ final class CodexMCPDiscoveryPolicyTests: XCTestCase {
 final class CodexAppServerFramingTests: XCTestCase {
     private let budget = 64 * 1024 * 1024
 
+    func testOneShotRetirementRefusesLateThreadBindingBeforeFirstTurn() async {
+        let owner = CodexCLIProvider.RequestAppServer(client: CodexAppServerClient())
+        await owner.stop()
+
+        do {
+            try await owner.associateTemporaryConversation("late-thread")
+            XCTFail("A stopped request must not admit a new thread's first turn")
+        } catch is CancellationError {
+            // The caller skips turn/start.
+        } catch {
+            XCTFail("Expected cancellation, got \(error)")
+        }
+    }
+
+    func testCancelledOneShotRetirementDeletesExactConversationBeforeClosingTransport() async throws {
+        let sent = AsyncStream<Data>.makeStream()
+        defer { sent.continuation.finish() }
+        let client = CodexAppServerClient(
+            writeFrameHandler: { _, frame in sent.continuation.yield(frame) },
+            livenessProbe: { _ in true }
+        )
+        await client.debugInstallTestTransport()
+        let generation = await client.debugTransportGeneration()
+        let owner = CodexCLIProvider.RequestAppServer(client: client)
+        try await owner.associateTemporaryConversation("owned-thread")
+
+        let firstStop = Task {
+            await owner.stop()
+            sent.continuation.finish()
+        }
+        firstStop.cancel()
+        async let concurrentStop: Void = owner.stop()
+
+        var writes = sent.stream.makeAsyncIterator()
+        let nextFrame = await writes.next()
+        let frame = try XCTUnwrap(nextFrame)
+        let request = try XCTUnwrap(JSONSerialization.jsonObject(with: frame) as? [String: Any])
+        XCTAssertEqual(request["method"] as? String, "thread/delete")
+        XCTAssertEqual(request["params"] as? [String: String], ["threadId": "owned-thread"])
+        let response = try JSONSerialization.data(withJSONObject: ["id": XCTUnwrap(request["id"]), "result": [String: Any]()])
+        await client.debugIngestStdoutChunk(response + Data([10]), generation: generation)
+
+        await firstStop.value
+        await concurrentStop
+        let liveGeneration = await client.healthyTransportGeneration()
+        XCTAssertNil(liveGeneration)
+        let anotherFrame = await writes.next()
+        XCTAssertNil(anotherFrame)
+    }
+
     func testRawItemOptOutInitializationAndFakeServerContract() async throws {
         let requestClient = try XCTUnwrap(CodexCLIProvider().makeRequestAppServerClient())
         let requestOptOut = await requestClient.optOutNotificationMethods

@@ -34,9 +34,9 @@ final class AgentSessionTargetOperationAuthorizationTests: XCTestCase {
         }
     }
 
-    func testInvocationBridgeMissingContextFailsClosedWithInjectedDiagnostic() throws {
+    func testInvocationBridgeMissingContextFailsClosedWithInjectedDiagnostic() async throws {
         let diagnostics = InvocationDiagnostics()
-        try MCPInvocationContextBridge.$diagnosticSink.withValue({ diagnostics.record($0) }) {
+        try await MCPInvocationContextBridge.withDiagnosticSink({ diagnostics.record($0) }) {
             try MCPInvocationContextBridge.currentTaskLocal.withValue(nil) {
                 XCTAssertThrowsError(try MCPInvocationContextBridge.require(toolName: "ask_oracle")) { error in
                     XCTAssertEqual(error as? MCPInvocationContextFailure, .missingExpectedContext)
@@ -1612,7 +1612,7 @@ final class DelegationMembershipCensusTests: XCTestCase {
         XCTAssertTrue(organizer.setPinned(true, sessionIDs: [target]).isEmpty)
         XCTAssertTrue(organizer.setGroup("Rejected replica group", order: 1, sessionIDs: [target]).isEmpty)
         let archived = await organizer.archive([target], isAuthorized: { _ in true })
-        XCTAssertTrue(archived.isEmpty)
+        XCTAssertTrue(archived.archived.isEmpty)
         XCTAssertEqual(windows.map(\.workspaceManager.workspaces), beforeWorkspaces)
         XCTAssertEqual(windows.map(\.agentModeViewModel.sessionIndex), beforeIndexes)
         XCTAssertEqual(undoTokens, 0)
@@ -1808,7 +1808,7 @@ final class DelegationMembershipCensusTests: XCTestCase {
         // one writable physical carrier after its awaited preflight.
         let archived = await organizer.archive([target], isAuthorized: { _ in true })
         XCTAssertEqual(preflightVisits, 1)
-        XCTAssertTrue(archived.isEmpty)
+        XCTAssertTrue(archived.archived.isEmpty)
         XCTAssertEqual(owner.workspaceManager.activeWorkspace, settledOwnerWorkspace)
         XCTAssertEqual(peer.workspaceManager.activeWorkspace, try XCTUnwrap(beforePeerWorkspace))
         XCTAssertEqual(owner.agentModeViewModel.sessionIndex, beforeOwnerIndex)
@@ -2192,7 +2192,7 @@ final class DelegationMembershipCensusTests: XCTestCase {
         XCTAssertTrue(organizer.setPinned(true, sessionIDs: [sessionID]).isEmpty, context)
         XCTAssertTrue(organizer.setGroup("Must not regroup", order: 1, sessionIDs: [sessionID]).isEmpty, context)
         let archived = await organizer.archive([sessionID], isAuthorized: { _ in true })
-        XCTAssertTrue(archived.isEmpty, context)
+        XCTAssertTrue(archived.archived.isEmpty, context)
         XCTAssertEqual(windows.map(\.workspaceManager.workspaces), beforeWorkspaces, context)
         XCTAssertEqual(windows.map(\.agentModeViewModel.sessionIndex), beforeIndexes, context)
     }

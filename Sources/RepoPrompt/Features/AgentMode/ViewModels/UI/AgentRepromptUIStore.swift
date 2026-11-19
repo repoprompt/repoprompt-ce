@@ -126,13 +126,6 @@ final class AgentRepromptUIStore: ObservableObject {
         return request.operationID
     }
 
-    struct OneShotDisclosureRequest: Identifiable {
-        let id = UUID()
-        let target: AgentComposerSubmitTarget
-        let text: String
-        let generation: UInt64
-    }
-
     struct Recovery: Equatable {
         let id = UUID()
         let text: String
@@ -144,7 +137,7 @@ final class AgentRepromptUIStore: ObservableObject {
     }
 
     /// One-shot request for a specific tab's composer to retake native focus after Re-prompt
-    /// chrome (for example the disclosure popover) closes. The composer applies it only when
+    /// chrome closes. The composer applies it only when
     /// its tab matches and focus is not owned by another live field or window.
     struct ComposerFocusRequest: Equatable {
         let id = UUID()
@@ -159,7 +152,6 @@ final class AgentRepromptUIStore: ObservableObject {
     }
 
     @Published var autoSendRequests: [UUID: AutoSendRequest] = [:]
-    @Published var oneShotDisclosureRequest: OneShotDisclosureRequest?
     @Published var presentations: [UUID: Presentation] = [:]
     @Published var draftUpdate: DraftUpdate?
     @Published var pendingQuestionsByTab: [UUID: AgentAskUserPendingState] = [:]

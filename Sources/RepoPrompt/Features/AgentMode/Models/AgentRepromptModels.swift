@@ -150,11 +150,10 @@ struct AgentRepromptStreamParser {
 }
 
 enum AgentRepromptError: Error, LocalizedError, Equatable {
-    case missingModel, sizeLimit, timeout, invalidResponse, provider, disclosureRequired, incomplete
+    case missingModel, sizeLimit, timeout, invalidResponse, provider, incomplete
 
     var errorDescription: String? {
         switch self {
-        case .disclosureRequired: "Re-prompt's data disclosure needs review. Turn Re-prompt off and on to review it, or press Return to send as typed."
         case .missingModel: "The selected Re-prompt model is unavailable. Connect it or choose another in Agent Models settings."
         case .sizeLimit: "Re-prompt text exceeds its size limit. Shorten it and try again."
         case .timeout: "Re-prompt timed out. Partial text is recoverable; retry or use the original."

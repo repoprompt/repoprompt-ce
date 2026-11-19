@@ -73,6 +73,8 @@ struct MCPConnectionsCounter: View {
                 isHovering = hovering
             }
         }
-        .hoverTooltip(connectionCount == 0 ? "No connections - View status" : "\(connectionCount) connection\(connectionCount == 1 ? "" : "s")\(hasActivity ? " - Active" : "") - View status")
+        .accessibilityLabel("MCP Connections")
+        .accessibilityValue("\(connectionCount) app connections")
+        .hoverTooltip("View MCP connections across the app (\(connectionCount)\(hasActivity ? ", active" : ""))")
     }
 }

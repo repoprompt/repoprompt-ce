@@ -610,20 +610,23 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
         let backend = backend
         let holdsControl = holdsControl
         let scope = context.batch.scope
-        let archived = await backend.archive(ids, isAuthorized: { id in
+        var outcome = await backend.archive(ids, isAuthorized: { id in
             guard context.isCurrent(id) else {
                 refusals.clear(id)
                 return false
             }
             return refusals.admit(id, backend.runState(of: id) == .idle || holdsControl(scope))
         })
-        return AgentSessionArchiveOutcome(archived: archived, requiresControl: refusals.refused.subtracting(archived))
+        outcome.requiresControl = refusals.refused.subtracting(outcome.archived)
+        return outcome
     }
 
     private func recordArchive(_ context: Context, attempted: [UUID], outcome: AgentSessionArchiveOutcome) {
         for id in attempted {
             if outcome.archived.contains(id) {
                 context.add(id, .changed)
+            } else if let failure = outcome.failures[id] {
+                recordStashFailure(failure, id: id, context: context)
             } else if outcome.requiresControl.contains(id) {
                 context.add(id, .skipped, "requires_control")
             } else {
@@ -645,20 +648,24 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
             if outcome.restored.contains(id) {
                 context.add(id, .changed)
             } else if let failure = outcome.failures[id] {
-                context.items.append(AgentSessionAdminItemResult(
-                    sessionID: id, status: .failed, reason: failure.reason,
-                    detail: [
-                        "local_changes": .bool(failure.localChanges),
-                        "persistence_confirmed": .bool(failure.persistenceConfirmed)
-                    ]
-                ))
-                if failure.localChanges { context.extra["local_changes"] = .bool(true) }
-                if failure.persistenceConfirmed {
-                    context.extra[AgentSessionAdminRendering.committedChangesKey] = .bool(true)
-                }
+                recordStashFailure(failure, id: id, context: context)
             } else {
                 context.add(id, .skipped, "not_restorable")
             }
+        }
+    }
+
+    private func recordStashFailure(_ failure: AgentSessionStashFailure, id: UUID, context: Context) {
+        context.items.append(AgentSessionAdminItemResult(
+            sessionID: id, status: .failed, reason: failure.reason,
+            detail: [
+                "local_changes": .bool(failure.localChanges),
+                "persistence_confirmed": .bool(failure.persistenceConfirmed)
+            ]
+        ))
+        if failure.localChanges { context.extra["local_changes"] = .bool(true) }
+        if failure.persistenceConfirmed {
+            context.extra[AgentSessionAdminRendering.committedChangesKey] = .bool(true)
         }
     }
 
