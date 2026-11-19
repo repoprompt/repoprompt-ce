@@ -494,7 +494,7 @@ struct AgentMessageBubble: View {
             if isHiddenAgentTool(renderItem.toolName) {
                 EmptyView()
             } else if isAskUserTool(renderItem.toolName) {
-                askUserQuestionExchangeView
+                askUserQuestionExchangeView(for: renderItem)
             } else if normalizedToolName == "context_builder", let contextBuilderContext {
                 ContextBuilderResultCard(item: renderItem, context: contextBuilderContext)
                     .id(rawToolResultPayloadRenderRevision)
@@ -832,7 +832,7 @@ struct AgentMessageBubble: View {
     }
 
     /// Completed question exchange (tool_result state) - shows Q&A grouped together
-    private var askUserQuestionExchangeView: some View {
+    private func askUserQuestionExchangeView(for item: AgentChatItem) -> some View {
         let summary = parseAskUserQuestionSummaryRobust(args: item.toolArgsJSON, result: item.toolResultJSON)
         return askUserQuestionBubble {
             VStack(alignment: .leading, spacing: 10) {
@@ -1578,7 +1578,7 @@ struct AgentMessageBubble: View {
 
 // MARK: - Ask User Question Summary
 
-private struct AskUserQuestionSummary {
+struct AskUserQuestionSummary {
     struct Question: Identifiable {
         let id: String
         let header: String?
@@ -1646,6 +1646,10 @@ private struct AskUserQuestionResult: Decodable {
     let skipped: Bool?
     let timedOut: Bool?
 
+    var hasResponseFields: Bool {
+        answers != nil || response != nil || skipped != nil || timedOut != nil
+    }
+
     private enum CodingKeys: String, CodingKey {
         case answers
         case response
@@ -1654,12 +1658,11 @@ private struct AskUserQuestionResult: Decodable {
     }
 }
 
-/// Robust parsing that handles the structured ask_user contract and display-only historical scalar transcripts.
-/// Write-side scalar requests are rejected by the MCP API; this parser intentionally keeps old transcript data readable.
-private func parseAskUserQuestionSummaryRobust(args: String?, result: String?) -> AskUserQuestionSummary {
-    let argsDTO = ToolJSON.decode(AskUserQuestionArgs.self, from: args)
-    let resultDTO = ToolJSON.decode(AskUserQuestionResult.self, from: result)
+/// Render structured ask_user replies and retained scalar transcripts.
+func parseAskUserQuestionSummaryRobust(args: String?, result: String?) -> AskUserQuestionSummary {
+    let argsDTO = ToolJSON.decodeResult(AskUserQuestionArgs.self, from: args)
     let resultString = result?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let resultDTO = decodeAskUserQuestionResult(resultString)
     let structuredQuestions = argsDTO?.questions ?? []
     let isStructured = !structuredQuestions.isEmpty
     let timedOut = resultDTO?.timedOut ?? false
@@ -1713,10 +1716,20 @@ private func parseAskUserQuestionSummaryRobust(args: String?, result: String?) -
     )
 }
 
-private func parseAskUserQuestionSummary(args: String?, result: String?) -> AskUserQuestionSummary? {
-    let argsDTO = ToolJSON.decode(AskUserQuestionArgs.self, from: args)
-    guard argsDTO?.question != nil || !(argsDTO?.questions?.isEmpty ?? true) else { return nil }
-    return parseAskUserQuestionSummaryRobust(args: args, result: result)
+private func decodeAskUserQuestionResult(_ result: String?) -> AskUserQuestionResult? {
+    let direct = ToolJSON.decodeResult(AskUserQuestionResult.self, from: result)
+    if direct?.hasResponseFields == true {
+        return direct
+    }
+    // The MCP formatter encloses JSON in a text block. Claude can supply that block's text
+    // directly, while Codex can supply it inside a CallTool result envelope.
+    let text = ToolJSON.preferredStructuredResultJSON(from: result, requireEnvelope: true) ?? result
+    let openingFence = "```json\n"
+    let closingFence = "\n```"
+    guard let text, text.hasPrefix(openingFence), text.hasSuffix(closingFence) else { return direct }
+    let json = String(text.dropFirst(openingFence.count).dropLast(closingFence.count))
+    let unfenced = ToolJSON.decodeResult(AskUserQuestionResult.self, from: json)
+    return unfenced?.hasResponseFields == true ? unfenced : direct
 }
 
 private func normalizedNonEmpty(_ value: String?) -> String? {

@@ -1,3 +1,5 @@
+import Foundation
+import MCP
 @testable import RepoPromptApp
 import XCTest
 
@@ -167,6 +169,46 @@ final class ToolCardProjectionFenceTests: XCTestCase {
         XCTAssertEqual(first?.path, "one")
         XCTAssertEqual(second?.path, "two")
         XCTAssertEqual(cache.metricsSnapshot().missCount, 2)
+    }
+
+    func testAskUserCardDecodesRawAndProviderFormattedAnswers() throws {
+        let args = #"{"questions":[{"id":"scope","question":"Which files?"},{"id":"tests","question":"Run tests?"}]}"#
+        let response: Value = .object([
+            "answers": .object([
+                "scope": .object(["answers": .array([.string("Sources only")]), "skipped": .bool(false)])
+            ]),
+            "timed_out": .bool(true),
+            "skipped": .bool(false)
+        ])
+        let content = ToolOutputFormatter.buildContentBlocks(
+            toolName: "ask_user", args: [:], result: response, emitResources: false
+        )
+        guard case let .text(formattedText, _, _) = try XCTUnwrap(content.first) else {
+            return XCTFail("ask_user should be formatted as text")
+        }
+        let wireResult = CallTool.Result(content: content, isError: false)
+        let codexEnvelope = try JSONEncoder().encode(["Ok": wireResult])
+        let payloads = [
+            ToolOutputFormatter.rawJSONString(response),
+            formattedText,
+            String(decoding: codexEnvelope, as: UTF8.self)
+        ]
+
+        for payload in payloads {
+            let summary = parseAskUserQuestionSummaryRobust(args: args, result: payload)
+            XCTAssertEqual(summary.questions.map(\.question), ["Which files?", "Run tests?"])
+            XCTAssertEqual(summary.questions.map(\.answer), ["Sources only", "No response (timed out)"])
+            XCTAssertEqual(summary.statusText, "Timed out")
+        }
+    }
+
+    func testAskUserCardKeepsLegacyScalarRepliesLiteral() {
+        let args = #"{"question":"Which files?"}"#
+        let scalar = "```json\n{\"answer\":\"Sources only\"}\n```"
+        let summary = parseAskUserQuestionSummaryRobust(args: args, result: scalar)
+
+        XCTAssertEqual(summary.questions.first?.question, "Which files?")
+        XCTAssertEqual(summary.questions.first?.answer, scalar)
     }
 
     // MARK: - Status classification fence
