@@ -173,6 +173,12 @@ struct RepoPromptSwiftUIApp: App {
             UpdateMenu(sparkleManager: appDelegate.sparkleManager)
             CommandCenterCommands()
 
+            CommandGroup(before: .windowList) {
+                Button("MCP Connections…") {
+                    MCPBackgroundModeCoordinator.shared.showConnectionsDashboard()
+                }
+            }
+
             // Replace SwiftUI's automatic Cmd-N; otherwise it keeps reserving the key after a remap.
             MainWindowCommands(title: shortcutDisplay.title("New Workspace Window", for: .newWorkspaceWindow))
 
