@@ -360,7 +360,7 @@ final class MCPStateSubscriptionTests: XCTestCase {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         addTeardownBlock { defaults.removePersistentDomain(forName: suiteName) }
         let settings = GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: directory.appendingPathComponent("settings.json")))
-        var resources = MCPFileTreeReadResources(context: context, workspace: lease, settings: settings, lookupSource: { source })
+        var resources = MCPFileReadResources(context: context, workspace: lease, settings: settings, lookupSource: { source })
         if let gate { resources.beforeReplyValidationForTesting = { await gate.enter() } }
         var server: MCPServerViewModel? = makeServerViewModel(service: makeService(), validation: validation)
         let released = { @MainActor [weak server, weak prompt = server?.promptVM, weak manager = server?.workspaceManager] in
@@ -369,7 +369,7 @@ final class MCPStateSubscriptionTests: XCTestCase {
         let lifetimeStatus = { @MainActor [weak server, weak prompt = server?.promptVM, weak manager = server?.workspaceManager] in
             "released server=\(server == nil), prompt=\(prompt == nil), workspace=\(manager == nil)"
         }
-        let catalog = try XCTUnwrap(server).makeToolCatalog(route: route, fileTree: resources)
+        let catalog = try XCTUnwrap(server).makeToolCatalog(route: route, fileReads: resources)
         let physicalNames = try Set(XCTUnwrap(server).makeToolCatalog(route: server!.routeResources).materializeTools().map(\.name))
         _ = await route.ensureRegistered(workspaceID: workspace.id, contextID: tab.id, revision: 0)
         let connectionID = UUID()
@@ -428,7 +428,7 @@ final class MCPStateSubscriptionTests: XCTestCase {
                     _ = try await invokeTree(fixture, args: ["mode": .string("invalid")])
                     XCTFail("Preserve invalid-mode diagnostics")
                 } catch let error as MCPError { XCTAssertEqual(error, .invalidParams("invalid mode: invalid")) }
-                for name in ["read_file", "file_search", "get_code_structure", "file_actions", "apply_edits", "prompt"] {
+                for name in ["read_file", "file_search", "file_actions", "apply_edits", "prompt"] {
                     let resolved = await runtime.toolRegistry.resolve(toolName: name, scope: .window(id: fixture.route.identity.routeID))
                     let tool = try XCTUnwrap(resolved)
                     let request = ToolInvocationContext.trustedLocal(toolName: name, metadata: .init(connectionID: fixture.connectionID, clientName: nil, windowID: fixture.route.identity.routeID))
@@ -443,6 +443,72 @@ final class MCPStateSubscriptionTests: XCTestCase {
                 XCTAssertEqual(fixture.route.toolExecutionRuntime.activeExecutionCount, 0)
             }
             XCTAssertEqual(WindowState.windowCounter, count)
+        }
+    }
+
+    @MainActor
+    func testRegisteredCodeStructureReadsExactCanonicalSelectionAndBoundWorktreeWithoutVMs() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
+            let fixture = try await registeredTreeAfterServerRelease(runtime: runtime, worktree: true)
+            let name = MCPWindowToolName.getCodeStructure
+            let registered = await runtime.toolRegistry.resolve(toolName: name, scope: .window(id: fixture.route.identity.routeID))
+            let tool = try XCTUnwrap(registered)
+            let metadata = MCPRequestMetadata(connectionID: fixture.connectionID, clientName: nil, windowID: fixture.route.identity.routeID)
+            func invoke(paths: [String]? = nil) async throws -> Value {
+                var arguments: [String: Value] = ["signatures": .bool(false)]
+                if let paths { arguments["paths"] = .array(paths.map(Value.string)) }
+                let request = ToolInvocationContext.trustedLocal(toolName: name, metadata: metadata)
+                let input = arguments
+                return try await MCPInvocationContextBridge.withInvocation(request) { try await tool.binding(input) }
+            }
+            func seedPaths(_ value: Value) -> [String] {
+                (value.objectValue?["roots"]?.arrayValue ?? []).flatMap { root in
+                    (root.objectValue?["seeds"]?.arrayValue ?? []).compactMap { $0.objectValue?["path"]?.stringValue }
+                }
+            }
+
+            let selected = try await invoke()
+            XCTAssertEqual(seedPaths(selected), ["\(fixture.root.name)/Sources/Selected.swift"], String(describing: selected))
+            let explicit = try await invoke(paths: [fixture.root.fullPath + "/BoundOnly.swift"])
+            XCTAssertEqual(seedPaths(explicit), ["\(fixture.root.name)/BoundOnly.swift"], String(describing: explicit))
+            let missing = try await invoke(paths: [fixture.root.fullPath + "/BaseOnly.swift"])
+            XCTAssertTrue(seedPaths(missing).isEmpty)
+            XCTAssertEqual(missing.objectValue?["issues"]?.arrayValue?.first?.objectValue?["code"]?.stringValue, "path_not_found")
+            XCTAssertEqual(fixture.route.toolExecutionRuntime.activeExecutionCount, 0)
+        }
+    }
+
+    @MainActor
+    func testRegisteredCodeStructureRejectsContextReplacedBeforeReply() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
+            let replyGate = RouteInvocationGate()
+            let fixture = try await registeredTreeAfterServerRelease(runtime: runtime, gate: replyGate)
+            let name = MCPWindowToolName.getCodeStructure
+            let registered = await runtime.toolRegistry.resolve(toolName: name, scope: .window(id: fixture.route.identity.routeID))
+            let tool = try XCTUnwrap(registered)
+            let metadata = MCPRequestMetadata(connectionID: fixture.connectionID, clientName: nil, windowID: fixture.route.identity.routeID)
+            var changed = fixture.workspace
+            changed.composeTabs[0].selection = StoredSelection(selectedPaths: [fixture.root.fullPath + "/BaseOnly.swift"])
+            let document = try DomainWorkspaceAuthorityClient.document(for: changed, fileURL: fixture.documentURL)
+            let pending = Task {
+                let request = ToolInvocationContext.trustedLocal(toolName: name, metadata: metadata)
+                return try await MCPInvocationContextBridge.withInvocation(request) { try await tool.binding(["signatures": .bool(false)]) }
+            }
+            addTeardownBlock {
+                pending.cancel()
+                await replyGate.release()
+                _ = await pending.result
+            }
+            try await AsyncTestWait.waitUntil("code structure reply reached its final validation") { await replyGate.didEnter() }
+            _ = await runtime.workspaceStore.registerReadDocument(document)
+            await replyGate.release()
+            let reply = try await pending.value
+            XCTAssertEqual(reply.objectValue?["status"]?.stringValue, "unavailable")
+            XCTAssertEqual(reply.objectValue?["issues"]?.arrayValue?.first?.objectValue?["code"]?.stringValue, "workspace_authority_superseded")
+            XCTAssertEqual(reply.objectValue?["roots"]?.arrayValue, [])
+            XCTAssertEqual(fixture.route.toolExecutionRuntime.activeExecutionCount, 0)
         }
     }
 
@@ -519,7 +585,7 @@ final class MCPStateSubscriptionTests: XCTestCase {
             let fixture = try await registeredTreeAfterServerRelease(runtime: runtime)
             let metadata = MCPRequestMetadata(connectionID: fixture.connectionID, clientName: nil, windowID: fixture.route.identity.routeID)
             let context = DomainContextIdentity(workspaceID: fixture.workspace.id, contextID: fixture.workspace.composeTabs[0].id)
-            let handle = try await fixture.route.fileTreeReadHandle(metadata: metadata, context: context)
+            let handle = try await fixture.route.fileReadHandle(metadata: metadata, context: context)
             var changed = fixture.workspace
             changed.composeTabs[0].selection = StoredSelection(selectedPaths: [fixture.root.fullPath + "/BaseOnly.swift"])
             let document = try DomainWorkspaceDocument.decode(documentBytes: JSONEncoder().encode(changed), fileURL: fixture.documentURL)
