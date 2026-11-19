@@ -2221,6 +2221,7 @@ private struct DiffContentView: View {
                     }
                 }
             }
+            .semanticTextDirection(.dedicatedLeftToRight)
             .font(fontPreset.swiftUIFont(sizeAtNormal: 11, design: .monospaced))
             .padding(8)
             .background(Color(nsColor: .textBackgroundColor).opacity(0.5))
@@ -2232,42 +2233,48 @@ private struct DiffContentView: View {
         }
     }
 
-    @ViewBuilder
     private func diffLine(_ line: String) -> some View {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
-
-        HStack(spacing: 0) {
-            if trimmed.hasPrefix("+") && !trimmed.hasPrefix("+++") {
-                // Addition line
-                Text(line)
-                    .foregroundColor(Color.green)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.green.opacity(0.1))
-            } else if trimmed.hasPrefix("-") && !trimmed.hasPrefix("---") {
-                // Deletion line
-                Text(line)
-                    .foregroundColor(Color.red)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.red.opacity(0.1))
-            } else if trimmed.hasPrefix("@@") {
-                // Hunk header
-                Text(line)
-                    .foregroundColor(Color.cyan)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.cyan.opacity(0.1))
-            } else if trimmed.hasPrefix("---") || trimmed.hasPrefix("+++") {
-                // File header
-                Text(line)
-                    .foregroundColor(Color.secondary)
-                    .fontWeight(.medium)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            } else {
-                // Context line
-                Text(line)
-                    .foregroundColor(Color.primary.opacity(0.8))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
+        let foreground: Color
+        let background: Color
+        let weight: Font.Weight
+        if trimmed.hasPrefix("+") && !trimmed.hasPrefix("+++") {
+            foreground = .green
+            background = .green.opacity(0.1)
+            weight = .regular
+        } else if trimmed.hasPrefix("-") && !trimmed.hasPrefix("---") {
+            foreground = .red
+            background = .red.opacity(0.1)
+            weight = .regular
+        } else if trimmed.hasPrefix("@@") {
+            foreground = .cyan
+            background = .cyan.opacity(0.1)
+            weight = .regular
+        } else if trimmed.hasPrefix("---") || trimmed.hasPrefix("+++") {
+            foreground = .secondary
+            background = .clear
+            weight = .medium
+        } else {
+            foreground = .primary.opacity(0.8)
+            background = .clear
+            weight = .regular
         }
+
+        // SwiftUI's layout direction anchors the row, but its Text still resolves the
+        // first strong character. Give the diff marker its own column.
+        let hasMarker = line.first.map { "+- ".contains($0) } ?? false
+        return HStack(spacing: 0) {
+            if hasMarker {
+                Text(verbatim: String(line.prefix(1)))
+            }
+            Text(verbatim: String(line.dropFirst(hasMarker ? 1 : 0)))
+        }
+        .fontWeight(weight)
+        .foregroundStyle(foreground)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(background)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(verbatim: line))
     }
 }
 

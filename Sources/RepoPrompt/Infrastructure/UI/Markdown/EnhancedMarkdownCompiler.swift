@@ -180,6 +180,7 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
         let paragraphStyle = NSMutableParagraphStyle()
         paragraphStyle.paragraphSpacing = 0
         paragraphStyle.lineSpacing = 2
+        TextDirectionPolicy.apply(.markdownCodeBlock, to: paragraphStyle)
         // Horizontal insets so text isn't glued to the rounded border
         let horizontalInset: CGFloat = 8
         paragraphStyle.headIndent = horizontalInset
@@ -300,9 +301,9 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
         for child in blockQuote.children {
             let childString = visit(child).mutableCopy() as! NSMutableAttributedString
 
-            if child is Markdown.ListItemContainer || child is Markdown.Table {
-                // Lists and tables carry their own direction, indentation, tab stops and table
-                // blocks; indent them by the quote instead of replacing their styles.
+            if child is Markdown.ListItemContainer || child is Markdown.Table || child is Markdown.CodeBlock {
+                // Structured blocks carry their own paragraph styles, including direction and
+                // indents; compose the quote inset instead of replacing those styles.
                 composeQuoteIndentation(into: childString, quoteStyle: paragraphStyle)
             } else {
                 // Apply paragraph style to the entire child string

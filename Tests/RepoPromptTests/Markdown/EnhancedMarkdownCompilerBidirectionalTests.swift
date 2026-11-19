@@ -68,6 +68,81 @@ final class EnhancedMarkdownCompilerBidirectionalTests: XCTestCase {
         assertContainsNoBidiControls(attributed.string)
     }
 
+    func testFencedCodeKeepsLocalDirectionAndLogicalSelectionOnRecompile() {
+        let before = "פסקה בעברית"
+        let after = "فقرة بالعربية"
+        let firstLine = "עברית let path = \"Sources/App/main.swift\""
+        let secondLine = "العربية --flag 👩‍💻 e\u{301}"
+        let coordinator = MarkdownTextViewCoordinator()
+        let textView = CodeBlockTextView()
+
+        for code in [firstLine, firstLine + "\n" + secondLine] {
+            let rendered = compile("""
+            \(before)
+
+            ```swift
+            \(code)
+            ```
+
+            \(after) [link](https://example.com)
+            """)
+            XCTAssertEqual(rendered.string, "\(before)\n\n\(code)\n\n\(after) link")
+            AttributedTextView(attributedString: rendered, isEditable: false, allowsTextSelection: true)
+                .updateTextView(textView, coordinator: coordinator, presentationVisible: true)
+
+            let codeRange = range(of: code, in: rendered.string)
+            var sourceRange = NSRange()
+            XCTAssertEqual(
+                rendered.attribute(
+                    .codeBlockSource,
+                    at: codeRange.location,
+                    longestEffectiveRange: &sourceRange,
+                    in: NSRange(location: 0, length: rendered.length)
+                ) as? String,
+                code
+            )
+            XCTAssertEqual(sourceRange, codeRange)
+            for line in code.components(separatedBy: "\n") {
+                let index = range(of: line, in: rendered.string).location
+                let style = rendered.attribute(.paragraphStyle, at: index, effectiveRange: nil) as? NSParagraphStyle
+                XCTAssertEqual(style?.baseWritingDirection, .leftToRight)
+            }
+            for prose in [before, after] {
+                let index = range(of: prose, in: rendered.string).location
+                let style = rendered.attribute(.paragraphStyle, at: index, effectiveRange: nil) as? NSParagraphStyle
+                XCTAssertEqual(style?.baseWritingDirection ?? .natural, .natural)
+            }
+            let linkRange = range(of: "link", in: rendered.string)
+            var effectiveLinkRange = NSRange()
+            XCTAssertNotNil(rendered.attribute(.link, at: linkRange.location, effectiveRange: &effectiveLinkRange))
+            XCTAssertEqual(effectiveLinkRange, linkRange)
+            XCTAssertEqual(textView.string, rendered.string)
+
+            let firstLineRange = range(of: firstLine, in: rendered.string)
+            if code == firstLine { textView.setSelectedRange(firstLineRange) }
+            XCTAssertEqual(textView.selectedRange(), firstLineRange)
+            XCTAssertEqual((textView.string as NSString).substring(with: textView.selectedRange()), firstLine)
+        }
+    }
+
+    func testQuotedFenceKeepsItsOwnDirection() {
+        let code = "العربية --flag"
+        let rendered = compile("""
+        > פסקה בעברית
+        >
+        > ```
+        > \(code)
+        > ```
+        """)
+        let offset = range(of: code, in: rendered.string).location
+        let codeStyle = rendered.attribute(.paragraphStyle, at: offset, effectiveRange: nil) as? NSParagraphStyle
+        let proseStyle = rendered.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
+
+        XCTAssertEqual(codeStyle?.baseWritingDirection, .leftToRight)
+        XCTAssertEqual(proseStyle?.baseWritingDirection, .natural)
+        XCTAssertEqual(rendered.attribute(.codeBlockSource, at: offset, effectiveRange: nil) as? String, code)
+    }
+
     private func compile(_ markdown: String) -> NSAttributedString {
         let document = Markdown.Document(parsing: markdown)
         var compiler = EnhancedMarkdownCompiler()
@@ -446,7 +521,7 @@ final class EnhancedMarkdownCompilerStructureLayoutTests: XCTestCase {
 
         let code = paragraphStyle(at: range(of: "code line", in: attributed).location, in: attributed)
         XCTAssertEqual(code.headIndent, 8, "code block keeps its own inset style")
-        XCTAssertEqual(code.baseWritingDirection, .natural)
+        XCTAssertEqual(code.baseWritingDirection, .leftToRight)
 
         let last = paragraphStyle(at: range(of: "פסקה אחרונה", in: attributed).location, in: attributed)
         XCTAssertEqual(last.baseWritingDirection, .rightToLeft)
