@@ -1568,6 +1568,9 @@ extension MCPServerViewModel {
                 ) ?? latest.selectionRevision
             }
             refreshed.readFileAutoSelectionGeneration = latest.readFileAutoSelectionGeneration
+            // Preserve the live binding's proof even when the request predates writer capture.
+            refreshed.routeOwnerIdentity = latest.routeOwnerIdentity
+            refreshed.modelWriterAtBinding = latest.modelWriterAtBinding
             routeResources.runRouteBindings.tabContextByConnectionID[connectionID] = refreshed
         }
         return verification

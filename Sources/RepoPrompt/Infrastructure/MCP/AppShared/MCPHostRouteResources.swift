@@ -63,6 +63,19 @@ final class MCPHostRouteResources {
     private var ownerLifetime: MCPRunRouteBindings.OwnerLifetime?
     private(set) var isClosing = false
     var descriptor: DomainWindowDescriptor?
+    struct ModelEndpoint {
+        let endpoint: DomainAgentSessionLinkEndpointIdentity
+        let writer: AgentSessionRuntimeStore.WriterIdentity
+    }
+
+    private(set) var modelEndpointForTab: (@MainActor (UUID) -> ModelEndpoint?)?
+
+    func installModelEndpointResolver(_ resolve: @escaping @MainActor (UUID) -> ModelEndpoint?) {
+        precondition(identity.kind == .independent && modelEndpointForTab == nil && !isClosing)
+        precondition(!runRouteBindings.hasRetainedCleanupOwnership)
+        modelEndpointForTab = resolve
+    }
+
     private var connections: [UUID: RetainedConnection] = [:]
     private var registrationTask: Task<DomainWindowDescriptor?, Never>?
     private var closeTask: Task<Void, Never>?
@@ -161,6 +174,10 @@ final class MCPHostRouteResources {
         }
     }
 
+    var hasCurrentModelCatalogRoute: Bool {
+        !isClosing && catalogHandle != nil && AppDomainRuntimeComposition.shared.hasRecordedRouteResources(self, in: domainRuntime)
+    }
+
     var historyWorkspaceLocations: HistoryWorkspaceLocationResolver {
         .init(workspaceStore: { [domainRuntime] in domainRuntime.workspaceStore })
     }
@@ -220,7 +237,11 @@ final class MCPHostRouteResources {
     /// The tail serializes binding and release effects and is joined by route teardown.
     func publishBinding(connectionID: UUID, context: MCPTabContextSnapshot, cleanupReceipt: MCPRunRoutingCleanupReceipt? = nil) {
         let ownership = cleanupReceipt?.mappingOwnership ?? runRouteBindings.cleanupOwnership(for: connectionID)
-        guard let coordinator, !isClosing, ownership?.isConsumed != true else { return }
+        guard !isClosing, ownership?.isConsumed != true else { return }
+        if let cleanupReceipt {
+            recordModelWriterForBinding(cleanupReceipt, connectionID: connectionID, published: context)
+        }
+        guard let coordinator else { return }
         if presentationRevision < .max { presentationRevision += 1 }
         let revision = presentationRevision
         let binding: DomainBinding = if let workspaceID = context.workspaceID {
