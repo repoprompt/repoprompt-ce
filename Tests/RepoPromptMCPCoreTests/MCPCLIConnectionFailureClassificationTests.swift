@@ -171,7 +171,63 @@ final class MCPCLIConnectionFailureClassificationTests: XCTestCase {
         try await Self.assertHardValidationFailure(socketURL: socketURL, "world-writable socket")
     }
 
+    func testProxyStartupWithMissingSocketExitsWithActionableFailure() async throws {
+        let directory = try makePrivateDirectory()
+        await assertProxyStartupUnavailable(
+            socketURL: directory.appendingPathComponent("s.sock"), errno: ENOENT
+        )
+    }
+
+    func testProxyStartupWithStaleSocketExitsWithActionableFailure() async throws {
+        let directory = try makePrivateDirectory()
+        let socketURL = directory.appendingPathComponent("s.sock")
+        let listener = try Self.bindSocket(at: socketURL, listen: false)
+        Darwin.close(listener)
+        await assertProxyStartupUnavailable(socketURL: socketURL, errno: ECONNREFUSED)
+    }
+
+    func testMissingAndRefusedSocketsStayRetryableDuringAnEstablishedSession() {
+        for socketError in [
+            SocketProxyError.connectFailed(errno: ENOENT),
+            .connectFailed(errno: ECONNREFUSED),
+            .connectionRefused
+        ] {
+            let error = CLIRuntimeError.connectionFailed(underlying: socketError)
+            XCTAssertTrue(CLIProxyRuntimePolicy.shouldRetry(after: error))
+            XCTAssertNil(CLIProxyRuntimePolicy.initialBootstrapUnavailableErrno(
+                for: error, hasForwardedProtocolFrame: true
+            ))
+        }
+    }
+
     // MARK: - Helpers
+
+    private func assertProxyStartupUnavailable(socketURL: URL, errno expectedErrno: Int32) async {
+        let completed = expectation(description: "The proxy exits its startup retry loop")
+        let transport = Task {
+            defer { completed.fulfill() }
+            try await MCPService().runTransport(socketURL: socketURL)
+        }
+        await fulfillment(of: [completed], timeout: 10)
+        transport.cancel()
+
+        do {
+            try await transport.value
+            XCTFail("Expected an app-unavailable startup failure")
+        } catch let error as CLIRuntimeError {
+            guard case let .connectionFailed(underlying) = error,
+                  let socketError = underlying as? SocketProxyError,
+                  case let .appUnavailable(errno) = socketError
+            else { return XCTFail("Unexpected proxy failure: \(error)") }
+            XCTAssertEqual(errno, expectedErrno)
+            XCTAssertFalse(CLIProxyRuntimePolicy.shouldRetry(after: error))
+            XCTAssertEqual(CLIProxyRuntimePolicy.failureReason(for: error), "app_unavailable")
+            XCTAssertEqual(mcpCLIExitCode(for: error), .connectionFailed)
+            XCTAssertTrue(socketError.errorDescription?.contains("enable its MCP server") == true)
+        } catch {
+            XCTFail("Unexpected proxy failure: \(error)")
+        }
+    }
 
     private static func scratchDirectoryURL() -> URL {
         // Short /tmp paths keep socket paths within sockaddr_un.sun_path.
