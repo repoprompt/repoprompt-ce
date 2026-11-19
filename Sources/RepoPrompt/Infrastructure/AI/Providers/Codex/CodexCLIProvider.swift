@@ -365,7 +365,7 @@ final class CodexCLIProvider: AIProvider {
                     switch await authRecovery.refreshManagedAccount() {
                     case .recovered:
                         continue
-                    case let .requiresUserLogin(message):
+                    case let .requiresUserLogin(message), let .temporarilyUnavailable(message):
                         throw AIProviderError.invalidConfiguration(detail: message)
                     case let .executableUnavailable(message):
                         throw AIProviderError.invalidConfiguration(detail: message)
@@ -449,7 +449,7 @@ final class CodexCLIProvider: AIProvider {
                         switch await authRecovery.refreshManagedAccount() {
                         case .recovered:
                             continue
-                        case let .requiresUserLogin(message):
+                        case let .requiresUserLogin(message), let .temporarilyUnavailable(message):
                             throw AIProviderError.invalidConfiguration(detail: message)
                         case let .executableUnavailable(message):
                             throw AIProviderError.invalidConfiguration(detail: message)
@@ -499,7 +499,7 @@ final class CodexCLIProvider: AIProvider {
                     switch await authRecovery.refreshManagedAccount() {
                     case .recovered:
                         continue
-                    case let .requiresUserLogin(message):
+                    case let .requiresUserLogin(message), let .temporarilyUnavailable(message):
                         throw AIProviderError.invalidConfiguration(detail: message)
                     case let .executableUnavailable(message):
                         throw AIProviderError.invalidConfiguration(detail: message)

@@ -271,18 +271,15 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
 
     func testDefaultsMigrationFeedsIsolatedLaunchSnapshotForBundledAndExternalSelections() throws {
         let externalPath = temporaryDirectory.appendingPathComponent("legacy/codex").path
-        let cases: [(expected: CodexRuntimePreferences.Selection, legacyDomain: [String: Any])] = [
-            (
-                expected: .bundled,
-                legacyDomain: ["codexRuntimeSelectionMode": "bundled"]
-            ),
-            (
-                expected: .external(path: externalPath),
-                legacyDomain: [
-                    "codexRuntimeSelectionMode": "external",
-                    "codexRuntimeExecutablePath": externalPath
-                ]
-            )
+        let external: [String: Any] = [
+            "codexRuntimeSelectionMode": "external",
+            "codexRuntimeExecutablePath": externalPath
+        ]
+        let bundled = ["codexRuntimeSelectionMode": "bundled"]
+        let cases: [(expected: CodexRuntimePreferences.Selection, legacyDomain: [String: Any], successorDomain: [String: Any])] = [
+            (.bundled, bundled, [:]),
+            (.external(path: externalPath), external, [:]),
+            (.external(path: externalPath), bundled, external)
         ]
 
         for testCase in cases {
@@ -296,10 +293,10 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
             defaults.removePersistentDomain(forName: successorDomainName)
             defaults.removePersistentDomain(forName: legacyDomainName)
             defaults.setPersistentDomain(testCase.legacyDomain, forName: legacyDomainName)
+            defaults.setPersistentDomain(testCase.successorDomain, forName: successorDomainName)
 
             let report = BundleIdentityDefaultsMigration.migrateIfNeeded(
                 bundleIdentifier: RuntimeCodeSigningPolicy.successorDeveloperIDBundleIdentifier,
-                defaults: defaults,
                 legacyDomainName: legacyDomainName,
                 successorDomainName: successorDomainName
             )
