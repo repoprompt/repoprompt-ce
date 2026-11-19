@@ -2361,8 +2361,11 @@ struct AgentModeChatDetailView: View {
     }
 
     private func messagesStack() -> some View {
-        LazyVStack(alignment: .leading, spacing: 12) {
-            messageRowsContent
+        VStack(alignment: .leading, spacing: 12) {
+            LazyVStack(alignment: .leading, spacing: 12) {
+                messageRowsContent
+            }
+            liveTranscriptTail
         }
     }
 
@@ -2394,6 +2397,11 @@ struct AgentModeChatDetailView: View {
                     .foregroundColor(.secondary)
             }
         }
+    }
+
+    /// Keep the active interaction state and the live-bottom scroll target mounted while history is lazy.
+    @ViewBuilder
+    private var liveTranscriptTail: some View {
         runningIndicatorSlot
         DelegationApprovalSlot(
             windowID: windowID,
@@ -2615,6 +2623,9 @@ struct AgentModeChatDetailView: View {
             interactionBlockerVisible: isInteractionBlockerVisible
         )
         ForEach(transcriptSnapshot.renderEntries?.entries ?? []) { entry in
+            #if DEBUG
+                let _ = entry.isFirstInBlock ? AgentTranscriptTailRenderProbe.sink?(.block(entry.block.id)) : nil
+            #endif
             VStack(alignment: .leading, spacing: 0) {
                 if let item = entry.item {
                     let transcript = transcriptSnapshot
@@ -2648,9 +2659,6 @@ struct AgentModeChatDetailView: View {
     @ViewBuilder
     private func transcriptBlockView(entry: AgentTranscriptRenderEntries.Entry, renderContext: TranscriptRenderContext) -> some View {
         let block = entry.block
-        #if DEBUG
-            let _ = AgentTranscriptTailRenderProbe.sink?(.block(block.id))
-        #endif
         switch block.kind {
         case .activityCluster:
             expandableTranscriptBlock(block) { isExpanded in
@@ -3523,7 +3531,8 @@ struct AgentModeChatDetailView: View {
                 resolvePendingBottomScrollOutcomeOnSettled(for: settleReason)
             }
             recordRehydrateLayoutSampleAfterProgrammaticSettle()
-            if #unavailable(macOS 15.0), continueRehydrateRestoreIfNeeded(proxy: proxy, source: .settled) {
+            // Lazy history can revise the tail position after the first scroll settles.
+            if continueRehydrateRestoreIfNeeded(proxy: proxy, source: .settled) {
                 return
             }
             finishRehydrateRestoreIfSettled()
