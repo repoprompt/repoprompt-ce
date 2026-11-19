@@ -214,6 +214,75 @@ final class AppPlatformUtilityRecoveryTests: XCTestCase {
         XCTAssertEqual(AppDeepLinkRoute.parse(url: unsupportedAgentPath), .invalidScopedRoute)
     }
 
+    @MainActor
+    func testWorkspaceURLParsingAndSilentQueue() async throws {
+        let workspace = UUID()
+        let tab = UUID()
+        let session = UUID()
+        let base = "repoprompt-ce://workspace/open?workspace_id=\(workspace)"
+        let manager = WindowStatesManager.makeForTesting(windowSessionFileURL: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
+        let router = AppDeepLinkRouter(windowStatesManager: manager)
+        for (suffix, expectedTab, expectedSession) in [("", nil, nil), ("&tab_id=\(tab)", tab, nil), ("&tab_id=\(tab)&session_id=\(session)", tab, session)] {
+            let url = try XCTUnwrap(URL(string: base + suffix))
+            guard case let .route(.workspace(route)) = AppDeepLinkRoute.parse(url: url) else { return XCTFail("Expected workspace route") }
+            XCTAssertEqual(route.workspaceID, workspace)
+            XCTAssertEqual(route.tabID, expectedTab)
+            XCTAssertEqual(route.sessionID, expectedSession)
+        }
+        for suffix in ["&workspace_id=\(workspace)", "&tab_id", "&tab_id=bad", "&session_id=\(session)"] {
+            let url = try XCTUnwrap(URL(string: base + suffix))
+            XCTAssertEqual(AppDeepLinkRoute.parse(url: url), .invalidWorkspaceRoute)
+            await router.route(url: url)
+        }
+        XCTAssertTrue(manager.pendingURLs.isEmpty)
+        let url = try XCTUnwrap(URL(string: base))
+        await router.route(url: url)
+        XCTAssertEqual(manager.pendingURLs, [url])
+    }
+
+    @MainActor
+    func testWorkspaceLinkRoutingAtWindowAndChatScale() async {
+        struct Window {
+            let id: Int
+            let activeWorkspace: Int
+            let chats: [Int]
+        }
+        for existing in [false, true] {
+            let workspace = 100
+            let chats = Array(0 ..< 300)
+            var windows = (0 ..< 35).map { Window(id: $0, activeWorkspace: existing && $0 == 34 ? workspace : $0, chats: chats) }
+            var reads = 0
+            var inspections = 0
+            var opened = 0
+            var focused: [Int] = []
+            let clock = ContinuousClock()
+            let start = clock.now
+            await AppDeepLinkRouter.routeWorkspaceTarget(resolve: {
+                reads += 1
+                return workspace
+            }, matchingWindow: {
+                AppDeepLinkRouter.preferredWorkspaceWindow(windows) { window in
+                    inspections += 1
+                    return window.activeWorkspace == workspace ? (0, window.id, window.id) : nil
+                }
+            }, open: { id in
+                opened += 1
+                let window = Window(id: 35, activeWorkspace: id, chats: chats)
+                windows.append(window)
+                return window
+            }, show: { window in
+                XCTAssertEqual(window.activeWorkspace, workspace)
+                focused.append(window.id)
+            })
+            XCTAssertLessThanOrEqual(start.duration(to: clock.now), .seconds(1))
+            XCTAssertEqual(reads, 1)
+            XCTAssertEqual(inspections, 35)
+            XCTAssertEqual(opened, existing ? 0 : 1)
+            XCTAssertEqual(windows.count, existing ? 35 : 36)
+            XCTAssertEqual(focused, [existing ? 34 : 35])
+        }
+    }
+
     func testCanonicalAndLegacySchemesRouteOpeners() throws {
         XCTAssertTrue(AppDeepLinkURLScheme.isSupported("repoprompt-ce"))
         XCTAssertTrue(AppDeepLinkURLScheme.isSupported("REPOPROMPT-CE"))

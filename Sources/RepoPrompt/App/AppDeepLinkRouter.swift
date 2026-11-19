@@ -20,6 +20,7 @@ final class AppDeepLinkRouter {
     static let shared = AppDeepLinkRouter()
 
     private let windowStatesManager: WindowStatesManager
+    private var workspaceRoutesInFlight: Set<UUID> = []
 
     private init() {
         windowStatesManager = WindowStatesManager.shared
@@ -41,7 +42,9 @@ final class AppDeepLinkRouter {
             await routeAgentSession(route, sourceURL: url)
         case .invalidScopedRoute:
             NSApp.activate(ignoringOtherApps: true)
-        case .unsupported:
+        case let .route(.workspace(route)):
+            await routeWorkspace(route, sourceURL: url)
+        case .invalidWorkspaceRoute, .unsupported:
             return
         }
     }
@@ -55,6 +58,8 @@ final class AppDeepLinkRouter {
         switch route {
         case let .agentSession(agentRoute):
             await self.route(notificationRoute: agentRoute)
+        case .workspace:
+            return
         case .legacyURL:
             NSApp.activate(ignoringOtherApps: true)
         }
@@ -329,6 +334,102 @@ final class AppDeepLinkRouter {
             return liveWindows.first
         case .latest:
             return liveWindows.last
+        }
+    }
+
+    private func routeWorkspace(_ route: WorkspaceDeepLinkRoute, sourceURL: URL) async {
+        let id = route.workspaceID
+        guard !windowStatesManager.isTerminating, !Task.isCancelled else { return }
+        guard windowStatesManager.allWindows.contains(where: { !$0.isClosing }) else {
+            windowStatesManager.pendingURLs.append(sourceURL)
+            return
+        }
+        guard workspaceRoutesInFlight.insert(id).inserted else { return }
+        defer { workspaceRoutesInFlight.remove(id) }
+
+        func isShowing(_ window: WindowState) -> Bool {
+            !window.isClosing && window.workspaceManager.isInitialized && !window.workspaceManager.isSwitchingWorkspace
+                && window.workspaceManager.activeWorkspaceSwitch == nil && window.workspaceManager.activeWorkspaceID == id
+        }
+        func matchingWindow() -> WindowState? {
+            let ordered = NSApp?.orderedWindows ?? []
+            var positions: [ObjectIdentifier: Int] = [:]
+            for (index, window) in ordered.enumerated() {
+                let key = ObjectIdentifier(window.sheetParent ?? window)
+                if positions[key] == nil { positions[key] = index }
+            }
+            return Self.preferredWorkspaceWindow(windowStatesManager.allWindows) { window in
+                guard isShowing(window), let native = window.nsWindow else { return nil }
+                let displaysHint = route.tabID.map { tab in
+                    window.promptManager.activeComposeTabID == tab && (
+                        route.sessionID == nil
+                            || window.agentModeViewModel.isAgentSessionDisplayed(tabID: tab, sessionID: route.sessionID)
+                    )
+                } ?? false
+                return (displaysHint ? 0 : 1, positions[ObjectIdentifier(native)] ?? Int.max, window.windowID)
+            }
+        }
+
+        await Self.routeWorkspaceTarget(resolve: { () -> WorkspaceModel? in
+            let store = AppDomainRuntimeComposition.shared.runtime.workspaceStore
+            guard let snapshot = await store.canonicalWorkspaceSnapshot(id), snapshot.health.acceptsMutations,
+                  let workspace = try? WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
+                      documentBytes: snapshot.document.documentBytes, fileURL: snapshot.document.fileURL
+                  ), workspace.id == id, !workspace.isEphemeral, workspace.consolidatedIntoWorkspaceID == nil,
+                  !self.windowStatesManager.isTerminating, !Task.isCancelled else { return nil }
+            return workspace
+        }, matchingWindow: matchingWindow, open: { (workspace: WorkspaceModel) -> WindowState? in
+            guard let opened = try? await windowStatesManager.openNewMainWindow(deferringInitialAgentSystemWorkspaceRefresh: true) else { return nil }
+            defer { opened.agentModeViewModel.finishInitialSystemWorkspaceSessionListRefreshDeferral() }
+            await opened.workspaceManager.awaitInitialized()
+            guard !windowStatesManager.isTerminating, !Task.isCancelled, !opened.isClosing,
+                  windowStatesManager.allWindows.contains(where: { $0 === opened }) else { return nil }
+            if let existing = matchingWindow() { return existing }
+            if !isShowing(opened) {
+                if let current = opened.workspaceManager.activeWorkspace, !current.isSystemWorkspace || !current.repoPaths.isEmpty {
+                    return nil
+                }
+                guard await (opened.workspaceManager.requestWorkspaceSwitch(
+                    to: workspace, saveState: true, reason: "workspaceDeepLink", silent: true
+                )).didSwitch else { return nil }
+            }
+            return opened
+        }, show: { target in
+            guard isShowing(target), !windowStatesManager.isTerminating, !Task.isCancelled else { return }
+            if let tabID = route.tabID {
+                _ = await target.navigateAgentDeepLinkTab(tabID, sessionID: route.sessionID, workspaceID: id, workspaceLink: true)
+            }
+            guard isShowing(target), windowStatesManager.allWindows.contains(where: { $0 === target }),
+                  !windowStatesManager.isTerminating, !Task.isCancelled else { return }
+            if MCPBackgroundModeCoordinator.shared.backgroundedWindowID == target.windowID {
+                MCPBackgroundModeCoordinator.shared.restore()
+                return
+            }
+            if target.nsWindow?.isMiniaturized == true { target.nsWindow?.deminiaturize(nil) }
+            target.focusWindowIfPossible()
+        })
+    }
+
+    static func preferredWorkspaceWindow<Window>(
+        _ windows: [Window], rank: (Window) -> (Int, Int, Int)?
+    ) -> Window? {
+        var best: (Window, (Int, Int, Int))?
+        for window in windows {
+            guard let score = rank(window), best.map({ score < $0.1 }) ?? true else { continue }
+            best = (window, score)
+        }
+        return best?.0
+    }
+
+    static func routeWorkspaceTarget<Workspace, Window>(
+        resolve: () async -> Workspace?, matchingWindow: () -> Window?,
+        open: (Workspace) async -> Window?, show: (Window) async -> Void
+    ) async {
+        guard let workspace = await resolve(), !Task.isCancelled else { return }
+        if let existing = matchingWindow() {
+            await show(existing)
+        } else if let opened = await open(workspace), !Task.isCancelled {
+            await show(opened)
         }
     }
 

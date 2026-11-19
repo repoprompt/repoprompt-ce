@@ -6439,7 +6439,12 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     @MainActor
-    func requestWorkspaceSwitch(to newWorkspace: WorkspaceModel, saveState: Bool = true, reason: String = "userOrInternal") async -> WorkspaceSwitchResult {
+    func requestWorkspaceSwitch(
+        to newWorkspace: WorkspaceModel, saveState: Bool = true, reason: String = "userOrInternal", silent: Bool = false
+    ) async -> WorkspaceSwitchResult {
+        func userVisibleWorkspaceSwitchResult(_ result: WorkspaceSwitchResult, blockingOperationID: UUID? = nil) -> WorkspaceSwitchResult {
+            silent ? result : self.userVisibleWorkspaceSwitchResult(result, blockingOperationID: blockingOperationID)
+        }
         noteNonStartupWorkspaceActivationRequested()
         await joinAdmittedInitialDefaultActivationIfNeeded()
         if let cancellation = explicitActivationCancellation(for: newWorkspace) {
@@ -6533,7 +6538,8 @@ class WorkspaceManagerViewModel: ObservableObject {
             to: newWorkspace,
             saveState: saveState,
             reason: reason,
-            operationID: operationID
+            operationID: operationID,
+            silent: silent
         )
         let finalResult = await completeWorkspaceSwitchOperation(
             operationID,
@@ -6559,10 +6565,12 @@ class WorkspaceManagerViewModel: ObservableObject {
         to newWorkspace: WorkspaceModel,
         saveState: Bool,
         reason: String,
-        operationID: UUID
+        operationID: UUID,
+        silent: Bool
     ) async -> WorkspaceSwitchResult {
         let snapshot = activeSessionSnapshot()
         if snapshot.hasActiveSessions {
+            guard !silent else { return .blocked("Cannot switch workspaces while sessions are active.") }
             advanceWorkspaceSwitchOperation(operationID, to: .awaitingConfirmation)
             let confirmation = WorkspaceSwitchConfirmation(
                 targetWorkspaceName: newWorkspace.name,
