@@ -936,6 +936,20 @@ final class MCPStateSubscriptionTests: XCTestCase {
     }
 
     @MainActor
+    func testIndependentRouteCatalogIsReadyWithoutPresentationUntilClosed() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
+            try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+            let (route, _, _) = try await registeredHistoryAfterServerRelease(runtime: runtime, scanner: RouteHistoryScanner())
+            let ready = await MCPToolCatalogReadiness.shared.awaitReady(windowID: route.identity.routeID)
+            XCTAssertTrue(ready)
+            await route.close()
+            let closedIsReady = await MCPToolCatalogReadiness.shared.awaitReady(windowID: route.identity.routeID, timeout: 0.25)
+            XCTAssertFalse(closedIsReady)
+        }
+    }
+
+    @MainActor
     func testEnteredRouteMappingRetainsOnlyOriginalCleanupOwnerUntilConsumed() async throws {
         let runtime = try await makeHistoryRouteRuntime()
         try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
@@ -954,7 +968,7 @@ final class MCPStateSubscriptionTests: XCTestCase {
                 restrictedTools: [], runID: UUID(), purpose: .agentModeRun, routingOwner: route
             )
             let receipt = try XCTUnwrap(receiptValue)
-            let installed = route.installPendingPolicy(receipt, connectionID: UUID(), clientName: nil, tabID: nil)
+            let installed = await route.installPendingPolicy(receipt, connectionID: UUID(), clientName: nil, tabID: nil)
             XCTAssertNotNil(installed)
             server?.stopServiceObservation()
             server = nil

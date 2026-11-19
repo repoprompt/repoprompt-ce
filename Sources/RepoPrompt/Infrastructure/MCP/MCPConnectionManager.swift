@@ -9437,17 +9437,30 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             "Installing connection policy for client \(clientName) window=\(windowID) grants=\(grantDescription) restricted=\(restrictedDescription) oneShot=\(oneShot) ttl=\(ttl) reason=\(reason ?? "-") role=\(taskLabelKind?.rawValue ?? "-")"
         )
         if let runID {
+            let previousGeneration = runRoutingAuthorityGenerationByRunID[runID, default: 0]
+            let providerContextResolver: MCPHostRouteResources.ProviderContextResolver?
+            if let routingOwner {
+                let admission = await routingOwner.admitProviderContext(runID: runID, tabID: tabID)
+                guard runRoutingAuthorityGenerationByRunID[runID, default: 0] == previousGeneration else { return nil }
+                switch admission {
+                case .compatibility: providerContextResolver = nil
+                case .refused: return nil
+                case let .canonical(resolve): providerContextResolver = resolve
+                }
+            } else {
+                providerContextResolver = nil
+            }
             // A new attempt can reuse the already-admitted provider connection without
             // another tools/list. Retain only that exact live route's workspace; a cold,
             // revoked, pending or differently addressed route still requires admission.
             let committedConnectionID = purpose == .agentModeRun
                 ? lateCommittedRunRouteCandidate(runID: runID, windowID: windowID, tabID: tabID) : nil
             let committedWorkspaceID = committedConnectionID.flatMap { cachedModelRunRoute(connectionID: $0)?.workspaceID }
-            let previousGeneration = runRoutingAuthorityGenerationByRunID[runID, default: 0]
             let receipt = MCPRunRoutingCleanupReceipt(
                 managerIdentity: ObjectIdentifier(self), policyID: policy.id, runID: runID,
                 routeID: windowID, routingAuthorityGeneration: previousGeneration &+ 1,
-                routingWaitGeneration: routingWaitGeneration, routeOwner: routingOwner
+                routingWaitGeneration: routingWaitGeneration, routeOwner: routingOwner,
+                providerContextResolver: providerContextResolver
             )
             var transferredPIDOrigin: UUID?
             if purpose == .agentModeRun, let process = reusingProcess, let routingOwner,
@@ -13003,16 +13016,17 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             #endif
 
             let routeMappingToken = pendingPolicyRunIDMappingToken
-            let routeMappingIsCurrent = await MainActor.run {
-                routeMappingToken.map { token in
-                    if let receipt = policy.cleanupReceipt, let routeOwner = receipt.routeOwner {
-                        return !receipt.isConsumed && routeOwner.runRouteBindings.isCurrent(token)
-                    }
-                    guard let window = WindowStatesManager.shared.window(withID: policy.windowID) else {
-                        return false
-                    }
-                    return window.mcpServer.isCurrentPendingPolicyRunIDMapping(route: window.mcpServer.routeResources, token)
-                } ?? true
+            let routeMappingIsCurrent: Bool = if let token = routeMappingToken, let receipt = policy.cleanupReceipt, let routeOwner = receipt.routeOwner {
+                await routeOwner.canCommitPendingPolicy(receipt, token: token)
+            } else {
+                await MainActor.run {
+                    routeMappingToken.map { token in
+                        guard let window = WindowStatesManager.shared.window(withID: policy.windowID) else {
+                            return false
+                        }
+                        return window.mcpServer.isCurrentPendingPolicyRunIDMapping(route: window.mcpServer.routeResources, token)
+                    } ?? true
+                }
             }
             guard routeMappingIsCurrent,
                   (policy.cleanupReceipt.map { $0.routeOwner == nil || ownsRunRegistration($0) } ?? true),
@@ -13077,7 +13091,14 @@ actor ServerNetworkManager: MCPServerConnectionHost {
 
         // Catalog publication crosses actors after one-shot consumption. Revocation or a
         // successor install during that await must also fence this completion tail.
-        guard isPendingPolicyApplicationOwner(
+        let finalRouteIsCurrent: Bool = if let token = pendingPolicyRunIDMappingToken, token.validateProviderCarrier != nil,
+                                           let receipt = policy.cleanupReceipt, let routeOwner = receipt.routeOwner
+        {
+            await routeOwner.canCommitPendingPolicy(receipt, token: token)
+        } else {
+            true
+        }
+        guard finalRouteIsCurrent, isPendingPolicyApplicationOwner(
             pendingPolicyApplicationID,
             connectionID: connectionID,
             runID: policy.runID,

@@ -72,6 +72,11 @@ final class AgentSessionRuntimeHost {
             throw error
         }
         scope.attachments.configuration = attachments
+        if route.identity.kind == .independent {
+            route.installProviderContextSource { [weak self] runID, tabID in
+                self?.captureProviderContext(runID: runID, tabID: tabID)
+            }
+        }
         installCanonicalContinuationLauncher()
     }
 
