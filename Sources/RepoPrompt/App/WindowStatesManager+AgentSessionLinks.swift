@@ -916,16 +916,31 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         maxOutputBytes: Int,
         readerSessionID: UUID?
     ) async -> Result<AgentSessionLinkTranscriptPage, AgentSessionLinkReadUnavailableReason> {
-        guard let window = window(withID: candidate.windowID), !window.isClosing else {
-            return .failure(.endpointInvalidated)
+        guard !isTerminating,
+              case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
+                  sessionID: candidate.sessionID, expectedWorkspaceID: candidate.workspaceID
+              ), let runtime = writer.scope.linkExecution
+        else { return .failure(.endpointInvalidated) }
+        let sourceIsAvailable: @MainActor () -> Bool
+        if writer.scope.executableHost?.workspaceActivation?.isCurrent == true {
+            sourceIsAvailable = { [weak self] in self?.isTerminating == false }
+        } else {
+            guard let window = window(withID: candidate.windowID),
+                  window.agentModeViewModel.linkExecutionRuntime === runtime
+            else { return .failure(.endpointInvalidated) }
+            sourceIsAvailable = { [weak self, weak window] in
+                guard let self, let window else { return false }
+                return !isTerminating && !window.isClosing && self.window(withID: candidate.windowID) === window
+            }
         }
-        return await window.agentModeViewModel.agentSessionLinkTranscriptPage(
+        return await runtime.agentSessionLinkTranscriptPage(
             for: candidate,
             anchor: anchor,
             direction: direction,
             maxItems: maxItems,
             maxOutputBytes: maxOutputBytes,
-            readerSessionID: readerSessionID
+            readerSessionID: readerSessionID,
+            sourceIsAvailable: sourceIsAvailable
         )
     }
 
@@ -1051,8 +1066,8 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         )
     }
 
-    /// Routes one managed steer to the exact owning window, refusing during teardown before any
-    /// target state is touched. Nothing here focuses or activates the window.
+    /// Routes managed steering through the exact session writer. The liveness probe still
+    /// supplies the host's current presentation-close admission policy.
     func agentSessionLinkPerformSteer(
         to candidate: AgentSessionLinkEndpointCandidate,
         request: AgentSessionLinkSendRequest,
@@ -1060,10 +1075,10 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
     ) async -> AgentSessionLinkSendTransactionOutcome {
         guard !isTerminating else { return .blocked(.shuttingDown) }
-        guard let window = window(withID: candidate.windowID), !window.isClosing else {
+        guard let runtime = agentSessionLinkCommandRuntime(for: candidate) else {
             return .blocked(.endpointHost)
         }
-        return await window.agentModeViewModel.agentSessionLinkPerformSteer(
+        return await runtime.agentSessionLinkPerformSteer(
             to: candidate,
             request: request,
             liveness: liveness,

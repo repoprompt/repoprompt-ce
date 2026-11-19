@@ -842,6 +842,9 @@ struct AgentSessionRow: View {
 
     private var rowAccessibilityValue: String {
         var parts = [isSelected ? "Selected" : "Not selected"]
+        if let worktree {
+            parts.append(worktree.accessibilityText)
+        }
         // VoiceOver reads the same combined line the mark shows on hover.
         if oversightRole.hasMark {
             parts.append(oversightMarkTooltip())
@@ -1332,16 +1335,17 @@ struct AgentSessionRow: View {
     /// Compact bound-worktree marker overlaid on the status plate's
     /// bottom-right corner. Purely decorative for hit-testing so it never
     /// blocks the disclosure chevron, and layout-neutral so the title's
-    /// leading X stays a pure function of `threadDepth`. Its identity is
-    /// folded into `plateTooltip` / `plateAccessibilityLabel`.
+    /// leading X stays a pure function of `threadDepth`. The plate tooltip
+    /// and focusable row expose the worktree identity.
     @ViewBuilder
     private var worktreeMarker: some View {
         if let worktree {
-            worktreeMarkerShape(for: worktree)
-                .frame(width: 7, height: 7)
+            let marker = worktree.compactMarker
+            worktreeMarkerShape(marker, color: worktree.color)
+                .frame(width: marker.size.width, height: marker.size.height)
                 .padding(1.3)
                 .background(
-                    Circle().fill(Color(NSColor.controlBackgroundColor))
+                    Capsule().fill(Color(NSColor.controlBackgroundColor))
                 )
                 .offset(x: 2.5, y: 2.5)
                 .allowsHitTesting(false)
@@ -1349,25 +1353,23 @@ struct AgentSessionRow: View {
         }
     }
 
-    /// Marker geometry. Available worktrees use the persisted marker style
-    /// (filled dot for dot/capsule, hollow ring for ring); missing worktrees
-    /// always render a muted dashed ring so a stale binding reads as such.
     @ViewBuilder
-    private func worktreeMarkerShape(for worktree: AgentWorktreeIndicator) -> some View {
-        if !worktree.isAvailable {
+    private func worktreeMarkerShape(_ marker: AgentWorktreeIndicator.CompactMarker, color: Color) -> some View {
+        switch marker {
+        case .unavailable:
             Circle()
                 .strokeBorder(
-                    Color.secondary,
+                    Color.orange,
                     style: StrokeStyle(lineWidth: 1.3, dash: [1.6, 1.4])
                 )
-        } else if worktree.markerStyle == .ring {
+        case .ring:
             Circle()
-                .strokeBorder(worktree.color, lineWidth: 1.7)
-        } else {
-            Circle()
-                .fill(worktree.color)
+                .strokeBorder(color, lineWidth: 1.7)
+        case .dot, .capsule:
+            Capsule()
+                .fill(color)
                 .overlay(
-                    Circle().strokeBorder(Color.black.opacity(0.12), lineWidth: 0.5)
+                    Capsule().strokeBorder(Color.black.opacity(0.12), lineWidth: 0.5)
                 )
         }
     }
@@ -1541,14 +1543,9 @@ struct AgentSessionRow: View {
         }
     }
 
-    /// Accessibility companion to `plateTooltip`. Always returns a
-    /// non-empty label for MCP-controlled roots so VoiceOver still
-    /// announces the affordance after the rail was removed.
+    /// The focusable row announces worktree identity; the plate announces run status.
     private var plateAccessibilityLabel: String {
-        if let tip = plateTooltip {
-            return tip
-        }
-        return isMCPControlledRoot ? "MCP controlled" : ""
+        statusPlateTooltip ?? (isMCPControlledRoot ? "MCP controlled" : "")
     }
 
     private func commandProgressIndicator(

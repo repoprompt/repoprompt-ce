@@ -78,8 +78,14 @@ Claude run-event telemetry remains separate and cannot authorize usage collectio
 
 ## Agent Mode Re-prompt (model requests, not telemetry)
 
-Re-prompt v2 is off by default and enabled separately in each window. With consent, the first Send
-sends eligible local composer text, rewrite guidance and the names and kinds of files attached to the
+**Re-prompt This Draft** and its keyboard shortcut request one rewrite for review as soon as a supported
+model is connected. This explicit action sends the data described below without another confirmation.
+The Re-prompt menu and tooltip identify the recipient and the data sent. The optional workspace toggle
+makes ordinary Send request a rewrite. It applies to the authorized provider and chat-context setting,
+and is off by default. A different route or chat-context setting needs a deliberate toggle for ordinary
+Send. The one-draft action remains available directly.
+
+A rewrite sends eligible local composer text, rewrite guidance and the names and kinds of files attached to the
 draft (up to 20: attachment file names and tagged relative paths) to the resolved **Re-prompt model**,
 independently of the primary Oracle. No repository manifest is collected: workspace root names and untagged
 selected paths are not added to the request, though your text, the session title and tagged paths may contain such names. Default resolution

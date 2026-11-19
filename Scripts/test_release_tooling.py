@@ -9,6 +9,7 @@ import json
 import os
 import plistlib
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -235,6 +236,55 @@ class SparkleInstallerLauncherGuardTests(unittest.TestCase):
         staged = (SCRIPT_DIR / "validate_staged_release.sh").read_text(encoding="utf-8")
         self.assertIn('"$SCRIPT_DIR/validate_sparkle_installer_launcher.py"', staged)
         self.assertIn('--info-plist "$APP_BUNDLE/Contents/Info.plist"', staged)
+
+
+class PackagedSparkleLayoutTests(unittest.TestCase):
+    VALIDATOR = SCRIPT_DIR / "verify_sparkle_vendor.sh"
+    FRAMEWORK = ROOT_DIR / "Vendor/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
+
+    def validate(self, framework: Path) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", str(self.VALIDATOR), "--packaged-layout", str(framework)],
+            text=True, capture_output=True, timeout=30,
+        )
+
+    @unittest.skipUnless(shutil.which("ditto"), "requires macOS ZIP packaging")
+    def test_zip_roundtrip_preserves_sparkle_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "Sparkle.zip"
+            extracted = root / "extracted"
+            subprocess.run(["ditto", "-c", "-k", "--keepParent", str(self.FRAMEWORK), str(archive)],
+                           check=True, capture_output=True, timeout=30)
+            subprocess.run(["ditto", "-x", "-k", str(archive), str(extracted)],
+                           check=True, capture_output=True, timeout=30)
+            result = self.validate(extracted / self.FRAMEWORK.name)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_detects_changed_symlinks_and_exec_bits_after_packaging(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            framework = Path(directory) / self.FRAMEWORK.name
+            shutil.copytree(self.FRAMEWORK, framework, symlinks=True)
+            launcher = framework / "Versions/B/Autoupdate"
+            # Code signing updates executable bytes without changing their layout.
+            launcher.write_bytes(b"re-signed executable fixture")
+            baseline = self.validate(framework)
+            self.assertEqual(baseline.returncode, 0, baseline.stderr)
+
+            executable_mode = launcher.stat().st_mode
+            launcher.chmod(executable_mode & ~0o111)
+            bad_mode = self.validate(framework)
+            self.assertEqual(bad_mode.returncode, 1)
+            self.assertIn("Versions/B/Autoupdate", bad_mode.stderr)
+
+            launcher.chmod(executable_mode)
+            alias = framework / "Autoupdate"
+            alias.unlink()
+            shutil.copy2(launcher, alias)
+            bad_alias = self.validate(framework)
+            self.assertEqual(bad_alias.returncode, 1)
+            self.assertIn("Sparkle layout mismatch", bad_alias.stderr)
+            self.assertIn("Autoupdate", bad_alias.stderr)
 
 
 class ReleaseStagePhaseTests(unittest.TestCase):

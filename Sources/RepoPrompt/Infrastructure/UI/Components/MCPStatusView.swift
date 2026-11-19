@@ -12,6 +12,7 @@ import SwiftUI
 /// Shows connections, tool activity, and auto-approve management.
 struct MCPStatusView: View {
     @ObservedObject var server: MCPServerViewModel
+    let windowID: Int
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -60,10 +61,10 @@ struct MCPStatusView: View {
     private var headerSection: some View {
         HStack {
             VStack(alignment: .leading, spacing: 4) {
-                Text("MCP Server Status")
+                Text("MCP Connections")
                     .font(.title2.weight(.semibold))
 
-                Text("Monitor connections and manage client approvals")
+                Text("Monitor app connections and manage client approvals")
                     .font(.subheadline)
                     .foregroundColor(.secondary)
             }
@@ -83,7 +84,7 @@ struct MCPStatusView: View {
 
     private var serverStatusSection: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Label("Server Status", systemImage: "server.rack")
+            Label("App Listener", systemImage: "server.rack")
                 .font(.headline)
 
             VStack(spacing: 0) {
@@ -99,6 +100,10 @@ struct MCPStatusView: View {
                             .font(.subheadline.weight(.medium))
 
                         Text(server.diagnostics.listenerStateDescription)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+
+                        Text(server.windowToolsEnabled ? "Window \(windowID) tools registered" : "Window \(windowID) tools unavailable")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
@@ -222,7 +227,7 @@ struct MCPStatusView: View {
 
             Spacer()
 
-            if let windowID = conn.windowID {
+            if let windowID = conn.activeToolWindowID {
                 Text("Window \(windowID)")
                     .font(.caption)
                     .foregroundColor(.secondary)
@@ -250,7 +255,7 @@ struct MCPStatusView: View {
     private var connectionsSection: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack {
-                Label("Active Connections", systemImage: "link")
+                Label("All App Connections", systemImage: "link")
                     .font(.headline)
 
                 Spacer()
@@ -320,11 +325,9 @@ struct MCPStatusView: View {
 
             Spacer()
 
-            if let windowID = conn.windowID {
-                Text("W\(windowID)")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
+            Text(conn.windowID.map { "Assigned Window \($0)" } ?? "No window assignment")
+                .font(.caption)
+                .foregroundColor(.secondary)
 
             // Terminate button
             Button(action: { server.terminateConnection(conn.id, reason: .userBootFromDashboard) }) {
@@ -471,11 +474,4 @@ struct MCPStatusView: View {
                 )
         )
     }
-}
-
-// MARK: - MCP Status Window Coordinator
-
-/// Notification name for showing the MCP status window
-extension Notification.Name {
-    static let showMCPStatusWindow = Notification.Name("showMCPStatusWindow")
 }

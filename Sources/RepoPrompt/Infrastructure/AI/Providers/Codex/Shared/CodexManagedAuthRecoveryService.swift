@@ -142,6 +142,7 @@ struct CodexManagedAccountSettingsProjection: Equatable {
 enum CodexManagedAuthRefreshResult: Equatable {
     case recovered(account: CodexManagedAccount?)
     case requiresUserLogin(message: String)
+    case temporarilyUnavailable(message: String)
     case executableUnavailable(message: String)
 }
 
@@ -191,6 +192,8 @@ enum CodexManagedAuthRecoveryClassifier {
     static let deviceCodeActionTitle = "Use device code instead"
     static let separateSignInExplanation =
         "RepoPrompt CE uses a separate Codex sign-in from any ~/.codex CLI credentials; sign in once here."
+    static let temporaryVerificationFailureMessage =
+        "Codex authentication could not be checked. Try again when Codex is available."
     static let manualLoginGuidanceMessage =
         "Codex authentication could not be refreshed automatically. Use 'Login with ChatGPT' or 'Use device code instead', then retry. \(separateSignInExplanation)"
 
@@ -360,14 +363,20 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
                 )
                 if Self.isValidAccountReadResult(response) {
                     result = .recovered(account: Self.parseManagedAccount(from: response))
-                } else {
+                } else if response["account"] is NSNull,
+                          Self.boolValue(in: response, keys: ["requiresOpenaiAuth", "requires_openai_auth"]) == true
+                {
                     result = .requiresUserLogin(message: CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage)
+                } else {
+                    result = .temporarilyUnavailable(message: CodexManagedAuthRecoveryClassifier.temporaryVerificationFailureMessage)
                 }
             } catch {
                 if let message = Self.executableUnavailableMessage(from: error) {
                     result = .executableUnavailable(message: message)
-                } else {
+                } else if Self.isPermanentAccountReadRefreshRejection(error) {
                     result = .requiresUserLogin(message: CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage)
+                } else {
+                    result = .temporarilyUnavailable(message: CodexManagedAuthRecoveryClassifier.temporaryVerificationFailureMessage)
                 }
             }
             await client.stop()
@@ -441,9 +450,11 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
         case let .recovered(account):
             latestManagedAccount = account
             observeAuthenticated(accountID: account?.accountID, interactive: false)
-        case .requiresUserLogin, .executableUnavailable:
+        case .requiresUserLogin:
             latestManagedAccount = nil
             observeUnauthenticated()
+        case .temporarilyUnavailable, .executableUnavailable:
+            break
         }
     }
 
@@ -557,7 +568,7 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
                     latestManagedAccount = nil
                     observeAuthenticated(accountID: nil, interactive: false)
                     return .authenticatedWithoutManagedAccount
-                case .requiresUserLogin:
+                case .requiresUserLogin, .temporarilyUnavailable:
                     continue
                 case let .executableUnavailable(message):
                     latestManagedAccount = nil
@@ -897,6 +908,26 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
                 try await sleep(backoff)
             }
         }
+    }
+
+    private static func isPermanentAccountReadRefreshRejection(_ error: Error) -> Bool {
+        guard let clientError = error as? CodexAppServerClient.ClientError,
+              case let .requestFailed(failure) = clientError,
+              failure.method == "account/read", failure.code == -32603
+        else {
+            return false
+        }
+        // Codex 0.170 reports a permanent workspace-routing refresh rejection as
+        // an internal error with a fixed message and no structured reason. Other
+        // internal errors, including routing or network failures, remain inconclusive.
+        let lead = "Your access token could not be refreshed"
+        let guidance = ". Please log out and sign in again."
+        return [
+            "",
+            " because your refresh token has expired",
+            " because your refresh token was already used",
+            " because your refresh token was revoked"
+        ].contains { failure.message == lead + $0 + guidance }
     }
 
     private static func isClearlyTransientAccountReadFailure(_ error: Error) -> Bool {

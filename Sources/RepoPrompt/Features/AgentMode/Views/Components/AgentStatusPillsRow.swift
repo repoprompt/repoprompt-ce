@@ -109,10 +109,10 @@ struct AgentStatusPillsRow: View {
             if let agentModeVM, !subject.isDraft {
                 AgentRepromptPill(
                     props: snapshot.reprompt,
-                    store: agentModeVM.repromptUIStore,
                     viewModel: agentModeVM,
-                    setEnabled: { enabled, provider in
-                        if subject.isCurrent { agentModeVM.setRepromptEnabled(enabled, acknowledgingProviderID: provider) }
+                    canRepromptDraft: subject.isCurrent,
+                    setEnabled: { enabled in
+                        if subject.isCurrent { agentModeVM.setRepromptEnabled(enabled) }
                         else { openContextDrawerFiles() }
                     },
                     openSettings: {

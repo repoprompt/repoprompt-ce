@@ -5717,7 +5717,7 @@ import XCTest
                 try await acknowledgeOwnerSave()
                 try await assertCarrier(archived: false)
                 let archived = await organizer.archive([sessionID], isAuthorized: { _ in true })
-                XCTAssertEqual(archived, [sessionID])
+                XCTAssertEqual(archived.archived, [sessionID])
                 try await acknowledgeOwnerSave()
                 try await assertCarrier(archived: true)
 

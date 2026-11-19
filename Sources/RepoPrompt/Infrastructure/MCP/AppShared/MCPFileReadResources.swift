@@ -10,7 +10,9 @@ import RepoPromptWorkspaceCore
 /// Explicit resources for one independent route/context. This is not a workspace authority:
 /// all bytes, revisions, root lifetimes and binding projections come from existing owners.
 @MainActor
-struct MCPFileTreeReadResources {
+struct MCPFileReadResources {
+    static let toolNames: Set<String> = [MCPWindowToolName.getFileTree, MCPWindowToolName.getCodeStructure]
+
     let context: DomainContextIdentity
     let workspace: AgentHostWorkspaceResources.Lease
     let settings: GlobalSettingsStore
@@ -19,14 +21,14 @@ struct MCPFileTreeReadResources {
         var beforeReplyValidationForTesting: (@MainActor () async -> Void)?
     #endif
 
-    /// Only this binding uses the route runtime's coordinator; every other catalog binding keeps
-    /// its original physical provider and side-effect queue. Definitions remain single-sourced.
-    func binding(route: MCPHostRouteResources) -> MCPDomainToolBinding {
+    /// These bindings use the route's coordinator and the shared read tool definitions.
+    func binding(named name: String, route: MCPHostRouteResources) -> MCPDomainToolBinding? {
+        guard Self.toolNames.contains(name) else { return nil }
         let provider = MCPDomainReadToolProvider(
             resolveContext: { tool, _ in
                 let request = try MCPInvocationContextBridge.require(toolName: tool, expectedWindowID: route.identity.routeID)
                 return try await DomainReadInvocationContext(
-                    handle: route.fileTreeReadHandle(metadata: request.metadata, context: context), connectionID: request.connectionID
+                    handle: route.fileReadHandle(metadata: request.metadata, context: context), connectionID: request.connectionID
                 )
             },
             refreshContext: { handle in
@@ -37,35 +39,41 @@ struct MCPFileTreeReadResources {
                 guard let failure = error as? MCPFileToolAuthorityFailure else { return nil }
                 return try MCPFileToolProvider.authorityFailureValue(toolName: tool, args: args, failure: failure)
             },
-            backend: .init { _, invocation, args, _ in try await execute(route: route, invocation: invocation, args: args) },
+            backend: .init { tool, invocation, args, _ in try await execute(tool: tool, route: route, invocation: invocation, args: args) },
             sideEffects: route.readSideEffectCoordinator
         )
-        guard let binding = provider.binding(named: MCPWindowToolName.getFileTree) else {
-            preconditionFailure("The canonical read provider must define get_file_tree")
+        guard let binding = provider.binding(named: name) else {
+            preconditionFailure("Missing canonical read definition for \(name)")
         }
         return MCPDomainToolBinding(definition: binding.definition) { args in
             // Match the physical tool's finite prerequisite and parameter precedence. Drain before
             // handle capture; the shared provider then drains its own high-water and refreshes it.
-            if (args["type"]?.stringValue ?? "files") == "files",
-               args["mode"]?.stringValue?.lowercased() == "selected",
-               args["max_depth"] == nil || args["max_depth"]?.intValue != nil
-            {
-                let request = try MCPInvocationContextBridge.require(toolName: MCPWindowToolName.getFileTree, expectedWindowID: route.identity.routeID)
-                try await route.drainFileTreeSelection(metadata: request.metadata)
+            let readsSelection: Bool
+            if name == MCPWindowToolName.getCodeStructure {
+                _ = try MCPFileToolProvider.codeStructureRequest(args)
+                readsSelection = args["paths"] == nil
+            } else {
+                readsSelection = (args["type"]?.stringValue ?? "files") == "files"
+                    && args["mode"]?.stringValue?.lowercased() == "selected"
+                    && (args["max_depth"] == nil || args["max_depth"]?.intValue != nil)
+            }
+            if readsSelection {
+                let request = try MCPInvocationContextBridge.require(toolName: name, expectedWindowID: route.identity.routeID)
+                try await route.drainFileReadSelection(metadata: request.metadata)
             }
             return try await binding(args)
         }
     }
 
     func execute(
-        route: MCPHostRouteResources, invocation: DomainReadInvocationContext, args: [String: Value]
+        tool: String, route: MCPHostRouteResources, invocation: DomainReadInvocationContext, args: [String: Value]
     ) async throws -> Value {
         do {
             guard let handle = invocation.handle, handle.context == context else {
                 throw MCPFileToolAuthorityFailure.unavailable
             }
             let request = try MCPInvocationContextBridge.require(
-                toolName: MCPWindowToolName.getFileTree, expectedWindowID: route.identity.routeID
+                toolName: tool, expectedWindowID: route.identity.routeID
             )
             let lease = try await workspace.capture(context: context)
             guard let canonical = lease.snapshot.contexts.first(where: { $0.metadata.identity == context }) else {
@@ -102,7 +110,7 @@ struct MCPFileTreeReadResources {
             } else { lifetime = nil }
             let validate: @MainActor () async throws -> Void = {
                 try Task.checkCancellation()
-                let refreshed = try await route.fileTreeReadHandle(metadata: request.metadata, context: context)
+                let refreshed = try await route.fileReadHandle(metadata: request.metadata, context: context)
                 guard refreshed.runtimeID == handle.runtimeID, refreshed.runtimeGeneration == handle.runtimeGeneration,
                       refreshed.connectionGeneration == handle.connectionGeneration, refreshed.bindingKind == handle.bindingKind,
                       refreshed.workspaceRevision == handle.workspaceRevision, refreshed.contextRevision == handle.contextRevision,
@@ -120,21 +128,36 @@ struct MCPFileTreeReadResources {
                 }
             }
             // Selection is decoded from this exact canonical context, never the selected presenter.
-            let tab = try JSONDecoder().decode(ComposeTabState.self, from: canonical.metadata.documentBytes)
-            let display = FilePathDisplay(rawValue: settings.filePathDisplayOptionRaw()) ?? .full
-            let markers = !settings.globalCodeMapsDisabled()
-            let value = try await MCPFileToolProvider.executeDomainRead(args: args, tree: .init(
-                store: store, lookupContext: lookup, filePathDisplay: display,
-                isGenuinelyRootless: lease.snapshot.document.metadata.repoPaths.isEmpty,
-                validate: validate, drainSelection: nil,
-                build: { mode, depth, path, lookup in
-                    try await validate()
-                    return try await Self.build(
-                        store: store, selection: tab.selection, display: display, showCodeMapMarkers: markers,
-                        mode: mode, maxDepth: depth, startPath: path, lookupContext: lookup
-                    )
-                }
-            ))
+            let selection = try JSONDecoder().decode(ComposeTabState.self, from: canonical.metadata.documentBytes).selection
+            let value: Value
+            if tool == MCPWindowToolName.getCodeStructure {
+                let codeMapsDisabled = settings.globalCodeMapsDisabled()
+                value = try await MCPFileToolProvider.executeGetCodeStructure(args: args, authority: .init(
+                    store: store, lookupContext: lookup, validate: validate,
+                    resolveExplicit: { paths, rootScope, limit in
+                        try await MCPCodeStructureRead.resolveFiles(
+                            paths: paths, store: store, lookupRootScope: rootScope, maximumSeedCount: limit
+                        )
+                    },
+                    resolveSelected: { lookup, limit in
+                        try await MCPCodeStructureRead.resolveSelectedFiles(
+                            selection: selection, store: store, lookupContext: lookup, maximumSeedCount: limit
+                        )
+                    },
+                    buildReply: { files, request, includeMissing, requestedPaths, lookup in
+                        try await MCPCodeStructureRead.buildReply(
+                            fromRecords: files, request: request, includePathNotFoundIssue: includeMissing,
+                            requestedPaths: requestedPaths, lookupContext: lookup,
+                            store: store, codeMapsDisabled: codeMapsDisabled
+                        )
+                    }
+                ))
+            } else {
+                value = try await executeTree(
+                    args: args, store: store, lookup: lookup, selection: selection,
+                    isRootless: lease.snapshot.document.metadata.repoPaths.isEmpty, validate: validate
+                )
+            }
             #if DEBUG
                 await beforeReplyValidationForTesting?()
             #endif
@@ -143,12 +166,32 @@ struct MCPFileTreeReadResources {
         } catch is CancellationError {
             throw CancellationError()
         } catch let failure as MCPFileToolAuthorityFailure {
-            return try MCPFileToolProvider.authorityFailureValue(toolName: MCPWindowToolName.getFileTree, args: args, failure: failure)
+            return try MCPFileToolProvider.authorityFailureValue(toolName: tool, args: args, failure: failure)
         } catch is AgentHostWorkspaceResources.Failure {
-            return try MCPFileToolProvider.authorityFailureValue(toolName: MCPWindowToolName.getFileTree, args: args, failure: .superseded)
+            return try MCPFileToolProvider.authorityFailureValue(toolName: tool, args: args, failure: .superseded)
         } catch is AgentWorkspaceLookupContextResolutionError {
-            return try MCPFileToolProvider.authorityFailureValue(toolName: MCPWindowToolName.getFileTree, args: args, failure: .worktreeScopeUnavailable)
+            return try MCPFileToolProvider.authorityFailureValue(toolName: tool, args: args, failure: .worktreeScopeUnavailable)
         }
+    }
+
+    private func executeTree(
+        args: [String: Value], store: WorkspaceFileContextStore, lookup: WorkspaceLookupContext,
+        selection: StoredSelection, isRootless: Bool, validate: @escaping @MainActor () async throws -> Void
+    ) async throws -> Value {
+        let display = FilePathDisplay(rawValue: settings.filePathDisplayOptionRaw()) ?? .full
+        let markers = !settings.globalCodeMapsDisabled()
+        return try await MCPFileToolProvider.executeDomainRead(args: args, tree: .init(
+            store: store, lookupContext: lookup, filePathDisplay: display,
+            isGenuinelyRootless: isRootless,
+            validate: validate, drainSelection: nil,
+            build: { mode, depth, path, lookup in
+                try await validate()
+                return try await Self.build(
+                    store: store, selection: selection, display: display, showCodeMapMarkers: markers,
+                    mode: mode, maxDepth: depth, startPath: path, lookupContext: lookup
+                )
+            }
+        ))
     }
 
     /// Shared production builder, also used by the legacy physical adapter. No traversal or
