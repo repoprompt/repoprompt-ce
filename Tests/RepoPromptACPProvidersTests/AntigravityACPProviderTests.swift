@@ -46,6 +46,29 @@ final class AntigravityACPProviderTests: XCTestCase {
         XCTAssertEqual(session.mcpServers, [server])
     }
 
+    func testIsolatedChatUsesInstalledCLIWithoutStartingGoogleOAuthOrInjectingMCP() throws {
+        let profile = URL(fileURLWithPath: "/tmp/antigravity-chat-profile", isDirectory: true)
+        let provider = AntigravityACPAgentProvider(
+            executablePath: "/usr/bin/true",
+            harnessPath: nil,
+            installedRuntime: { ("/usr/bin/false", "/usr/bin/true") },
+            prepareSessionHome: { throw CocoaError(.fileWriteNoPermission) },
+            toolNames: toolNames,
+            installedCLI: { "/usr/bin/true" },
+            includeRepoPromptMCPServer: false,
+            isolatedProfile: profile,
+            customAgentName: "repoprompt-chat"
+        )
+        let request = ACPRunRequest(agentKind: .antigravity, modelString: "fixture-low", workspacePath: "/tmp", resumeSessionID: nil, attachments: [], taskLabelKind: nil)
+        let launch = try provider.makeLaunchConfiguration(for: request)
+        XCTAssertEqual(launch.command, "/usr/bin/true")
+        XCTAssertEqual(launch.arguments, ["acp", "--gemini-dir", profile.path, "--include-default-customizations=false", "--agent", "repoprompt-chat"])
+        XCTAssertTrue(launch.environment.isEmpty)
+        XCTAssertNil(provider.preferredAuthMethodID(context: .init(authMethodIDs: ["oauth-personal"], environment: [:])))
+        let session = try provider.makeSessionConfiguration(for: request, mcpServer: .init(command: "/usr/bin/true"))
+        XCTAssertTrue(session.mcpServers.isEmpty)
+    }
+
     func testHarnessDiagnosticsAreFilteredExceptFailures() {
         let provider = AntigravityACPAgentProvider(
             executablePath: "fallback", harnessPath: nil, installedRuntime: { nil },

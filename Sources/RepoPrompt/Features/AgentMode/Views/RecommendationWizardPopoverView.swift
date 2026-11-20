@@ -9,6 +9,7 @@ private func recommendationProviderStatusGrid(_ status: ProviderStatusSnapshot) 
             recommendationProviderStatusRow("Claude Code", status: status.claudeCodeCLI)
             recommendationProviderStatusRow("Codex CLI", status: status.codexCLI)
             recommendationProviderStatusRow("Cursor CLI", status: status.cursorCLI)
+            recommendationProviderStatusRow("Google Antigravity", status: status.antigravityCLI)
             recommendationProviderStatusRow("OpenAI API", status: status.openAI)
         }
     }
@@ -473,7 +474,7 @@ private struct IntroStepView: View {
                 recommendationProviderStatusGrid(status)
 
                 // Show upgrade hint if missing key providers
-                if status.codexCLI != .ready, status.openAI != .ready {
+                if status.codexCLI != .ready, status.openAI != .ready, status.antigravityCLI != .ready {
                     upgradeHintSection(status)
                 }
             }
@@ -788,6 +789,9 @@ private struct ChatModelStepView: View {
                     }
                     if rec.openAIOption != nil {
                         backendCard(.openAI, option: rec.openAIOption!)
+                    }
+                    if let option = rec.antigravityOption {
+                        backendCard(.antigravity, option: option)
                     }
                 }
                 .id("recommendationContent")

@@ -442,6 +442,8 @@ extension AIModel {
             return "cursor_custom_\(n)"
         case let .grokBuildCustom(n):
             return "grokbuild_custom_\(n)"
+        case let .antigravityCustom(n):
+            return "antigravity_custom_\(n)"
         case let .devinCustom(n):
             return "devin_custom_\(n)"
         case let .customProvider(_, _, model):
@@ -514,6 +516,9 @@ extension AIModel {
         if case let .grokBuildCustom(n) = self {
             return ACPAIModelCatalog.grokBuildModelOption(for: n)?.displayName ?? n
         }
+        if case let .antigravityCustom(n) = self {
+            return ACPAIModelCatalog.antigravityModelOption(for: n)?.displayName ?? n
+        }
         if case let .devinCustom(n) = self {
             return ACPAIModelCatalog.devinModelOption(for: n)?.displayName ?? n
         }
@@ -546,6 +551,7 @@ extension AIModel {
         case .openCode: OpenCodeCLIProvider.self
         case .cursor: CursorCLIProvider.self
         case .grokBuild: GrokBuildCLIProvider.self
+        case .antigravity: AntigravityChatProvider.self
         case .devin: DevinCLIProvider.self
         }
     }
@@ -576,6 +582,7 @@ extension AIModel {
         case .openCodeCustom: return .openCode
         case .cursorCustom: return .cursor
         case .grokBuildCustom: return .grokBuild
+        case .antigravityCustom: return .antigravity
         case .devinCustom: return .devin
         case .customProviderUser: return .customProvider
         // or, if you prefer the old modelGroups approach:
@@ -633,6 +640,7 @@ extension AIModel {
              let .openCodeCustom(n),
              let .cursorCustom(n),
              let .grokBuildCustom(n),
+             let .antigravityCustom(n),
              let .devinCustom(n):
             return n
         case let .customProviderUser(name):
@@ -1181,7 +1189,7 @@ extension AIModel {
             return SwiftOpenAI.Model.custom(modelName)
         case .anthropic:
             return SwiftAnthropic.Model.other(modelName)
-        case .azure, .openRouter, .customProvider, .claudeCode, .codex, .openCode, .cursor, .grokBuild, .devin:
+        case .azure, .openRouter, .customProvider, .claudeCode, .codex, .openCode, .cursor, .grokBuild, .antigravity, .devin:
             // For these providers, use the actual model name when available
             if let modelInfo = Self.modelDefinitions.first(where: { $0.model == self }),
                let actualName = modelInfo.actualName
@@ -1275,6 +1283,9 @@ extension AIModel {
         }
         if normalizedRawValue.hasPrefix("grokbuild_custom_") {
             return .grokBuildCustom(name: String(normalizedRawValue.dropFirst("grokbuild_custom_".count)))
+        }
+        if normalizedRawValue.hasPrefix("antigravity_custom_") {
+            return .antigravityCustom(name: String(normalizedRawValue.dropFirst("antigravity_custom_".count)))
         }
         if normalizedRawValue.hasPrefix("devin_custom_") {
             return .devinCustom(name: String(normalizedRawValue.dropFirst("devin_custom_".count)))
@@ -1393,6 +1404,8 @@ extension AIModel {
             models = ACPAIModelCatalog.cursorModelsFromStore()
         case .grokBuild:
             models = ACPAIModelCatalog.grokBuildModelsFromStore()
+        case .antigravity:
+            models = ACPAIModelCatalog.antigravityModelsFromStore()
         case .devin:
             models = ACPAIModelCatalog.devinModelsFromStore()
         }
@@ -1753,6 +1766,7 @@ extension AIModel {
                 models.append(contentsOf: group)
             }
         }
+        models.append(contentsOf: ACPAIModelCatalog.antigravityModelsFromStore())
         models.append(contentsOf: ACPAIModelCatalog.devinModelsFromStore())
         models.append(.ollama)
         // Filter out models that are not yet available based on their release date

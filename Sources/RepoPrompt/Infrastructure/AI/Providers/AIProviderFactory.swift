@@ -38,7 +38,7 @@ class AIProviderFactory {
         }
 
         // CLI providers don't need API keys - they leverage existing authentication
-        if providerType == .claudeCode || providerType == .codex || providerType == .openCode || providerType == .cursor || providerType == .grokBuild || providerType == .devin {
+        if providerType == .claudeCode || providerType == .codex || providerType == .openCode || providerType == .cursor || providerType == .grokBuild || providerType == .antigravity || providerType == .devin {
             return try await createProvider(
                 for: providerType,
                 key: "",
@@ -112,6 +112,8 @@ class AIProviderFactory {
             return CursorCLIProvider()
         case .grokBuild:
             return GrokBuildCLIProvider()
+        case .antigravity:
+            return AntigravityChatProvider()
         case .devin:
             return DevinCLIProvider()
         case .customProvider:
@@ -214,6 +216,7 @@ extension AIProviderType {
         case .openCode: "OpenCode"
         case .cursor: "Cursor CLI"
         case .grokBuild: "Grok Build"
+        case .antigravity: "Google Antigravity"
         case .devin: "Devin"
         }
     }

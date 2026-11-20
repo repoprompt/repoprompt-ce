@@ -368,6 +368,7 @@ package actor ACPAgentSessionController {
     /// True when the provider conforms to `ACPDirectSessionModelProvider` and the session
     /// advertised no modern `configOptions` model selector, so model application flows
     /// through the provider-owned direct RPC (e.g. Grok's `session/set_model`).
+    private var antigravityAdvertisedModels: [AgentModelOption] = []
     private var sessionModelDirectSelectionSupported = false
     /// True only when `discoveredSessionModels` was parsed from THIS session's live
     /// session/new|load response. Post-mutation state updates never promote warmed
@@ -1475,7 +1476,16 @@ package actor ACPAgentSessionController {
             }
             throw ControllerError.requestFailed("ACP runtime does not advertise a modern session mode configOptions selector.")
         }
-        let canonicalModeID = try canonicalSessionModeValue(trimmedModeID, in: snapshot)
+        let requestedMode = if provider.providerID == .antigravity,
+                               ["auto_edit", "yolo"].contains(trimmedModeID),
+                               !snapshot.availableValues.contains(trimmedModeID),
+                               snapshot.availableValues.contains("accept-edits")
+        {
+            "accept-edits"
+        } else {
+            trimmedModeID
+        }
+        let canonicalModeID = try canonicalSessionModeValue(requestedMode, in: snapshot)
         if snapshot.currentValue == canonicalModeID {
             return
         }
@@ -1877,6 +1887,7 @@ package actor ACPAgentSessionController {
         process = nil
         discoveredSessionModels = nil
         sessionModelConfigOptionID = nil
+        antigravityAdvertisedModels = []
         sessionModelDirectSelectionSupported = false
         sessionModelSnapshotHasLiveAuthority = false
         sessionModelFailureReason = nil
@@ -2987,6 +2998,7 @@ package actor ACPAgentSessionController {
         clearAdvertisedCommands()
         discoveredSessionModels = nil
         sessionModelConfigOptionID = nil
+        antigravityAdvertisedModels = []
         sessionModelDirectSelectionSupported = false
         sessionModelSnapshotHasLiveAuthority = false
         sessionModelFailureReason = nil
@@ -3368,6 +3380,12 @@ package actor ACPAgentSessionController {
     }
 
     private func applyDiscoveredSessionModels(from response: [String: Any], inboundSequence: UInt64) {
+        if provider.providerID == .antigravity,
+           let advertised = response["models"] as? [String: Any],
+           let options = advertised["availableModels"] as? [[String: Any]]
+        {
+            antigravityAdvertisedModels = mergeModelOptions(options.compactMap(parseDiscoveredConfigModelOption))
+        }
         // A config-only report may update current direct effort authority, but it never
         // replaces the live direct catalog or the provider-owned advertisement/wire mapping.
         if let directProvider = provider as? ACPDirectSessionModelProvider,
@@ -3480,6 +3498,12 @@ package actor ACPAgentSessionController {
             guard let currentModelRaw = canonicalAdvertisedValue(option.currentValue, in: availableValues) else {
                 return .malformed("model selector '\(option.id)' currentValue is not one of its advertised values")
             }
+            if provider.providerID == .antigravity, !antigravityAdvertisedModels.isEmpty {
+                return .valid(
+                    configID: option.id,
+                    models: antigravityModelSnapshot(baseModel: currentModelRaw, configOptions: configOptions)
+                )
+            }
             return .valid(
                 configID: option.id,
                 models: ACPDiscoveredSessionModels(
@@ -3492,6 +3516,24 @@ package actor ACPAgentSessionController {
                 )
             )
         }
+    }
+
+    private func antigravityModelSnapshot(
+        baseModel: String,
+        configOptions: [[String: Any]]
+    ) -> ACPDiscoveredSessionModels {
+        // agy advertises compound IDs in models.availableModels and accepts them on the
+        // model selector, but acknowledges selection as separate model and thought_level values.
+        let effortOption = configOptions.first { $0["id"] as? String == "thought_level" }
+        let effort = normalizedConfigValue(effortOption?["currentValue"] as? String)
+        let compoundModel = effort.map { "\(baseModel)-\($0)" }
+        let advertisedIDs = antigravityAdvertisedModels.map(\.rawValue)
+        let selectedModel = compoundModel.flatMap { canonicalAdvertisedValue($0, in: advertisedIDs) }
+            ?? canonicalAdvertisedValue(baseModel, in: advertisedIDs)
+        return ACPDiscoveredSessionModels(
+            options: antigravityAdvertisedModels,
+            currentModelRaw: selectedModel
+        )
     }
 
     private func parseModelParameterSets(
@@ -4078,12 +4120,12 @@ package actor ACPAgentSessionController {
     private func fullAccessAutoApprovalOptionID(for options: [PermissionOption]) -> String? {
         guard autoApproveAllToolPermissions else { return nil }
         switch provider.providerID {
-        case .cursor:
+        case .cursor, .antigravity:
             // Full access auto-approves each request once; it must not persist a grant.
             return host.permissionOneTimeAllow(
                 options: options.map { (optionID: $0.optionID, kind: $0.kind) }, providerID: provider.providerID
             )
-        case .openCode, .grokBuild, .antigravity, .devin:
+        case .openCode, .grokBuild, .devin:
             // Grok full access is provider-native (`grok agent --always-approve stdio`) and
             // Devin's is a launch-time `--permission-mode`; the controller never
             // auto-selects permission options for either.

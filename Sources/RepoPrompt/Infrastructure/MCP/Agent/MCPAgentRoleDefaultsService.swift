@@ -430,7 +430,13 @@ enum MCPAgentRoleDefaultsService {
     ) -> AgentModelCatalog.NormalizedAgentSelection? {
         // Recommendation filters pick the preferred default when possible, but they should not hide
         // role rows when the app still has selectable agents outside the filtered recommendation set.
-        AgentModelCatalog.resolveTaskLabelKind(role, availability: recommendedAvailability)
+        if let recommendation = AgentModelCatalog.resolveTaskLabelKind(role, availability: recommendedAvailability)
             ?? AgentModelCatalog.resolveTaskLabelKind(role, availability: fallbackAvailability)
+        {
+            return recommendation
+        }
+        let model = AgentModelCatalog.defaultModelRaw(for: .antigravity, availability: fallbackAvailability)
+        guard fallbackAvailability.antigravityAvailable, !model.isEmpty else { return nil }
+        return .init(agent: .antigravity, modelRaw: model)
     }
 }

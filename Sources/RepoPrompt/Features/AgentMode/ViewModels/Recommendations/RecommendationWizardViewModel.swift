@@ -325,9 +325,10 @@ final class RecommendationWizardViewModel: ObservableObject {
 
             // Startup verification changes effective readiness, but must never auto-apply a
             // transient fallback into persisted recommendation settings.
-            Publishers.Merge(
-                api.$isContextBuilderProviderValidationComplete.map { _ in () },
-                api.$contextBuilderVerifiedCLIProviders.map { _ in () }
+            Publishers.MergeMany(
+                api.$isContextBuilderProviderValidationComplete.map { _ in () }.eraseToAnyPublisher(),
+                api.$contextBuilderVerifiedCLIProviders.map { _ in () }.eraseToAnyPublisher(),
+                api.$isAntigravityConnected.map { _ in () }.eraseToAnyPublisher()
             )
             .debounce(for: .milliseconds(100), scheduler: RunLoop.main)
             .sink { [weak self] _ in

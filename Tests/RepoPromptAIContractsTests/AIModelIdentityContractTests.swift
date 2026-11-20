@@ -15,7 +15,7 @@ final class AIModelIdentityContractTests: XCTestCase {
             .geminiCustom(name: "same"), .deepseekCustom(name: "same"), .fireworksCustom(name: "same"),
             .azureCustom(name: "same"), .grokCustom(name: "same"), .groqCustom(name: "same"),
             .zaiCustom(name: "same"), .codexCustom(name: "same"), .openCodeCustom(name: "same"),
-            .cursorCustom(name: "same"), .grokBuildCustom(name: "same"), .devinCustom(name: "same"),
+            .cursorCustom(name: "same"), .grokBuildCustom(name: "same"), .antigravityCustom(name: "same"), .devinCustom(name: "same"),
             .customProvider(name: "same", provider: "provider", model: "model"),
             .customProvider(name: "different", provider: "provider", model: "model"),
             .customProvider(name: "same", provider: "different", model: "model"),

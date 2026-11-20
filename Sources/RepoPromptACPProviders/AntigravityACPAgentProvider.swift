@@ -1,16 +1,20 @@
 import Foundation
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
+import RepoPromptProcess
 
 /// Google Antigravity's official ACP runtime provider.
-/// The runtime is distributed as `agy_acp_server.par` together with
-/// `localharness_external`; both are installed by the Antigravity runtime manager.
+/// Uses the installed CLI or the managed runtime retained for existing profiles.
 package struct AntigravityACPAgentProvider: ACPAgentProvider {
     package let providerID: ACPProviderID = .antigravity
     package let executablePath: String
     package let harnessPath: String?
     private let installedRuntime: @Sendable () -> (command: String, harness: String)?
     private let prepareSessionHome: @Sendable () throws -> URL
+    private let installedCLI: @Sendable () -> String?
+    private let includeRepoPromptMCPServer: Bool
+    private let isolatedProfile: URL?
+    private let customAgentName: String?
     private let toolNames: ACPToolNameResolution
 
     package init(
@@ -18,16 +22,28 @@ package struct AntigravityACPAgentProvider: ACPAgentProvider {
         harnessPath: String?,
         installedRuntime: @escaping @Sendable () -> (command: String, harness: String)?,
         prepareSessionHome: @escaping @Sendable () throws -> URL,
-        toolNames: ACPToolNameResolution
+        toolNames: ACPToolNameResolution,
+        installedCLI: @escaping @Sendable () -> String? = { nil },
+        includeRepoPromptMCPServer: Bool = true,
+        isolatedProfile: URL? = nil,
+        customAgentName: String? = nil
     ) {
         self.executablePath = executablePath
         self.harnessPath = harnessPath
         self.installedRuntime = installedRuntime
         self.prepareSessionHome = prepareSessionHome
         self.toolNames = toolNames
+        self.installedCLI = installedCLI
+        self.includeRepoPromptMCPServer = includeRepoPromptMCPServer
+        self.isolatedProfile = isolatedProfile
+        self.customAgentName = customAgentName
     }
 
     package func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
+        if installedCLI() != nil { return .supported }
+        guard isolatedProfile == nil else {
+            throw AIProviderError.invalidConfiguration(detail: "Install the Antigravity CLI and sign in with agy to run this task.")
+        }
         let managed = installedRuntime()
         let candidates = [managed?.command, executablePath].compactMap(\.self) + ["/usr/local/bin/agy_acp_server.par", NSHomeDirectory() + "/.local/bin/agy_acp_server.par"]
         guard candidates.contains(where: { FileManager.default.isExecutableFile(atPath: $0) || FileManager.default.fileExists(atPath: $0) }) else {
@@ -38,6 +54,34 @@ package struct AntigravityACPAgentProvider: ACPAgentProvider {
 
     package func makeLaunchConfiguration(for request: ACPRunRequest) throws -> ACPLaunchConfiguration {
         let managed = installedRuntime()
+        // Existing managed profiles retain their original runtime and session storage.
+        // Isolated runs require the current CLI's explicit profile/customization controls.
+        if managed == nil || isolatedProfile != nil, let cli = installedCLI() {
+            let identity = try ExecutableFileIdentity.captureForTrustedPathLaunch(atPath: cli)
+            var arguments = ["acp"]
+            if let isolatedProfile {
+                arguments += ["--gemini-dir", isolatedProfile.path]
+            }
+            if isolatedProfile != nil || !includeRepoPromptMCPServer {
+                arguments.append("--include-default-customizations=false")
+            }
+            if let customAgentName {
+                arguments += ["--agent", customAgentName]
+            }
+            return ACPLaunchConfiguration(
+                providerID: providerID,
+                command: cli,
+                arguments: arguments,
+                environment: [:],
+                workingDirectory: request.workspacePath,
+                additionalPathHints: [],
+                enableDebugLogging: false,
+                expectedExecutableIdentity: identity
+            )
+        }
+        guard isolatedProfile == nil else {
+            throw AIProviderError.invalidConfiguration(detail: "The installed Antigravity CLI is unavailable.")
+        }
         let command = managed?.command ?? executablePath
         let resolvedHarness = harnessPath ?? managed?.harness
         let sessionHome = try prepareSessionHome()
@@ -59,11 +103,19 @@ package struct AntigravityACPAgentProvider: ACPAgentProvider {
         let mode: ACPSessionConfiguration.Mode = if let id = request.resumeSessionID, !id.isEmpty { .load(existingSessionID: id) } else { .new }
         // Keep the app-backed MCP contract. The controller injects the current
         // launch carrier before Antigravity starts its MCP child.
-        return try ACPSessionConfiguration(mode: mode, workingDirectory: request.workspacePath ?? FileManager.default.temporaryDirectory.path, mcpServers: [mcpServer])
+        return try ACPSessionConfiguration(mode: mode, workingDirectory: request.workspacePath ?? FileManager.default.temporaryDirectory.path, mcpServers: includeRepoPromptMCPServer ? [mcpServer] : [])
     }
 
     package func buildPromptBlocks(for message: AgentMessage, request: ACPRunRequest) throws -> [[String: Any]] {
-        try ACPPromptContentBuilder.blocks(text: message.userMessage, attachments: request.attachments)
+        let systemPrompt = message.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = request.resumeSessionID == nil && !systemPrompt.isEmpty
+            ? systemPrompt + "\n\n" + message.userMessage
+            : message.userMessage
+        return try ACPPromptContentBuilder.blocks(
+            text: text,
+            attachments: request.attachments,
+            oracleAttachments: message.attachments
+        )
     }
 
     package func normalizeSessionUpdate(_ payload: [String: Any], sessionID: String) -> [NormalizedAgentRuntimeEvent] {
@@ -71,7 +123,10 @@ package struct AntigravityACPAgentProvider: ACPAgentProvider {
     }
 
     package func preferredAuthMethodID(context: ACPAuthenticationContext) -> String? {
-        "oauth-personal"
+        if isolatedProfile != nil || (installedCLI() != nil && installedRuntime() == nil) {
+            return nil
+        }
+        return "oauth-personal"
     }
 
     package func shouldEmitStderrLine(_ line: String) -> Bool {

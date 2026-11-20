@@ -581,6 +581,8 @@ struct MCPOracleToolService {
                 return "Configure and enable \(descriptor.groupDisplayName) in Settings."
             }
             return "Connect Claude Code in Settings."
+        case .antigravity:
+            return "Sign in with agy and test Google Antigravity in Settings → CLI Providers."
         default:
             return "Please check that the \(model.providerType.displayName) API key is configured in Settings."
         }

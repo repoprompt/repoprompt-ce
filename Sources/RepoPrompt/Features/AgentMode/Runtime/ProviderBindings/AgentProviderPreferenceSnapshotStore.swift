@@ -146,6 +146,7 @@ final class AgentProviderPreferenceSnapshotStore {
             }
             return AgentProviderRuntimePermissionBinding(
                 acpSessionModeID: modeID,
+                autoApproveAllACPToolPermissions: level == .yolo,
                 acceptsPendingACPApprovalWhenActivated: level == .yolo
             )
         case .cursor:

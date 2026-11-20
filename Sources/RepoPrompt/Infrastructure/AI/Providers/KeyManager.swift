@@ -31,7 +31,7 @@ extension AIProviderType {
         case .cursor: .cursorCLIAPI
         case .grokBuild: .grokAPI
         case .zAI: .zAIAPI
-        case .devin: nil
+        case .antigravity, .devin: nil
         }
     }
 }
