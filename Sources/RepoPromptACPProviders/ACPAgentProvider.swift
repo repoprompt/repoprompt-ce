@@ -238,6 +238,21 @@ package enum ACPModelParameterSelectionError: LocalizedError, Equatable {
     }
 }
 
+/// A `session/prompt` error after which the provider still holds the session open: the turn failed,
+/// but the next user message can run in the same live session. This never authorizes resending the
+/// failed turn, which may already have run tools.
+package struct ACPSessionPreservingPromptFailure: LocalizedError, Equatable {
+    package let userMessage: String
+
+    package init(userMessage: String) {
+        self.userMessage = userMessage
+    }
+
+    package var errorDescription: String? {
+        userMessage
+    }
+}
+
 /// A provider-owned direct model-selection RPC (e.g. Grok's `session/set_model`).
 /// The controller stays unaware of provider method names and parameter keys.
 package struct ACPDirectModelSelectionRequest {
@@ -323,6 +338,12 @@ package protocol ACPAgentProvider: Sendable {
     /// This must be a protocol requirement so calls through an existential reach overrides.
     func recognizesUnmatchedResponseID(_ id: String) -> Bool
 
+    /// Classifies the JSON-RPC error object (`code`, `message`, `data`) of a failed `session/prompt`
+    /// the provider documents as leaving its session usable. `nil` keeps the ordinary failure, which
+    /// retires the session. Keep this synchronous and side-effect-free; it is a protocol requirement
+    /// so calls through an existential reach overrides.
+    func sessionPreservingPromptFailure(forResponseError error: [String: Any]) -> ACPSessionPreservingPromptFailure?
+
     /// Opts a provider into ACP's parameterized model picker capability and classifies
     /// provider-owned select options without changing their exact wire identity.
     var supportsParameterizedModelPicker: Bool { get }
@@ -337,6 +358,10 @@ package protocol ACPAgentProvider: Sendable {
 package extension ACPAgentProvider {
     func recognizesUnmatchedResponseID(_: String) -> Bool {
         false
+    }
+
+    func sessionPreservingPromptFailure(forResponseError _: [String: Any]) -> ACPSessionPreservingPromptFailure? {
+        nil
     }
 
     var supportsParameterizedModelPicker: Bool {
