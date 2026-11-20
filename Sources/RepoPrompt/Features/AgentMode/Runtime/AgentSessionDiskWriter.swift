@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import RepoPromptShared
 
@@ -11,6 +12,39 @@ actor AgentSessionDiskWriter {
     private struct Write {
         let sequence: UInt64
         let data: Data
+        let protectsSubscriptionBinding: Bool
+    }
+
+    private struct FileStamp: Equatable {
+        let inode: UInt64
+        let device: Int32
+        let modifiedSeconds: Int
+        let modifiedNanoseconds: Int
+        let changedSeconds: Int
+        let changedNanoseconds: Int
+        let size: Int64
+
+        static func read(_ url: URL) throws -> Self? {
+            var info = stat()
+            guard lstat(url.path, &info) == 0 else {
+                if errno == ENOENT { return nil }
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            return Self(
+                inode: info.st_ino, device: info.st_dev,
+                modifiedSeconds: info.st_mtimespec.tv_sec, modifiedNanoseconds: info.st_mtimespec.tv_nsec,
+                changedSeconds: info.st_ctimespec.tv_sec, changedNanoseconds: info.st_ctimespec.tv_nsec,
+                size: info.st_size
+            )
+        }
+    }
+
+    private struct BindingHeader: Decodable {
+        let subscriptionAccountBinding: AgentSessionSubscriptionBinding
+    }
+
+    enum ProtectedDestinationError: Error {
+        case subscriptionAccountBinding
     }
 
     private struct PendingWrite {
@@ -22,16 +56,17 @@ actor AgentSessionDiskWriter {
     private var pendingByURL: [URL: PendingWrite] = [:]
     private var idleWaitersByURL: [URL: [CheckedContinuation<Void, Never>]] = [:]
     private var sequence: UInt64 = 0
+    private var knownLegacyFileStamps: [URL: FileStamp] = [:]
 
     #if DEBUG
         private var beforeWriteHook: (@Sendable (URL) async -> Void)?
     #endif
 
     /// Only the last actually committed submission receives publication authority; coalesced callers get nil.
-    func enqueueAndWait(data: Data, url: URL) async throws -> Receipt? {
+    func enqueueAndWait(data: Data, url: URL, protectsSubscriptionBinding: Bool = false) async throws -> Receipt? {
         let url = url.standardizedFileURL
         sequence += 1
-        let write = Write(sequence: sequence, data: data)
+        let write = Write(sequence: sequence, data: data, protectsSubscriptionBinding: protectsSubscriptionBinding)
         return try await withCheckedThrowingContinuation { continuation in
             var pending = pendingByURL[url] ?? PendingWrite(
                 pendingWrite: nil,
@@ -153,21 +188,39 @@ actor AgentSessionDiskWriter {
                 }
             #endif
 
-            let writeResult: Result<Receipt, Error> = await Task.detached(priority: .utility) {
+            let cachedStamp = knownLegacyFileStamps[url]
+            let writeResult: Result<(Receipt, FileStamp?), Error> = await Task.detached(priority: .utility) {
                 do {
                     try AppProfileLocations.current.validateMetadataFile(url)
+                    if write.protectsSubscriptionBinding,
+                       let stamp = try FileStamp.read(url), stamp != cachedStamp
+                    {
+                        let existing = try Data(contentsOf: url, options: .mappedIfSafe)
+                        let header = try JSONDecoder().decode(BindingHeader.self, from: existing)
+                        guard !header.subscriptionAccountBinding.blocksProviderOperations else {
+                            throw ProtectedDestinationError.subscriptionAccountBinding
+                        }
+                    }
                     try write.data.write(to: url, options: .atomic)
-                    return .success(Self.receipt(sequence: write.sequence, data: write.data, url: url))
+                    let stamp = write.protectsSubscriptionBinding ? (try? FileStamp.read(url)) : nil
+                    return .success((Self.receipt(sequence: write.sequence, data: write.data, url: url), stamp))
                 } catch {
                     return .failure(error)
                 }
             }.value
 
             switch writeResult {
-            case let .success(receipt):
+            case let .success((receipt, stamp)):
                 lastError = nil
                 lastReceipt = receipt
+                // Exact metadata avoids reparsing the transcript after our own writes. Bounded;
+                // uncertainty or an external edit forces a fresh destination read.
+                if knownLegacyFileStamps.count >= 256, cachedStamp == nil {
+                    knownLegacyFileStamps.removeAll(keepingCapacity: true)
+                }
+                knownLegacyFileStamps[url] = stamp
             case let .failure(error):
+                knownLegacyFileStamps.removeValue(forKey: url)
                 lastError = error
             }
         }
