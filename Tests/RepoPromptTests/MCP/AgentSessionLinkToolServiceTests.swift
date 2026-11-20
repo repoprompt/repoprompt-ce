@@ -2312,7 +2312,10 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
     func testOmittedObserverSelectorReturnsBoundedSortedAmbiguityAndExplicitSelectorResolves() async throws {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
-        let secondObserver = makeCandidate(windowID: 3, displayName: "Review")
+        let secondObserver = makeCandidate(
+            windowID: 3,
+            displayName: "  Review\n\u{0007} \(String(repeating: "é", count: 80))"
+        )
         fixture.host.candidates.append(secondObserver)
         let secondLink = await fixture.bridge.addMonitorLink(
             observerSessionID: secondObserver.sessionID,
@@ -2347,6 +2350,12 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 .map(\.uuidString)
         )
         XCTAssertEqual(payload["omitted_candidate_count"]?.intValue, 0)
+        let names: [UUID: Value] = [
+            fixture.observer.sessionID: .string("Planning"),
+            secondObserver.sessionID: .string("Review \(String(repeating: "é", count: 56))")
+        ]
+        let sortedIDs = names.keys.sorted { $0.uuidString < $1.uuidString }
+        XCTAssertEqual(payload["candidate_observer_session_names"]?.arrayValue, sortedIDs.compactMap { names[$0] })
 
         let selected = try await targetService.execute(args: [
             "op": .string("request_attention"),
@@ -2364,6 +2373,43 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 .attentionRequests.isEmpty ?? false,
             "the selector may address only its exact inbound grant"
         )
+    }
+
+    func testAttentionAmbiguityDoesNotNameAnUnlinkedIncarnationOrEnumerateExplicitSelectors() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let secondObserver = makeCandidate(windowID: 3, displayName: "Review")
+        fixture.host.candidates.append(secondObserver)
+        guard case .added = await fixture.bridge.addMonitorLink(
+            observerSessionID: secondObserver.sessionID,
+            rawTargetSessionID: fixture.target.sessionID.uuidString
+        ) else { return XCTFail("expected a second inbound grant") }
+
+        let duplicate = makeCandidate(windowID: 4, displayName: "Unlinked", sessionID: secondObserver.sessionID)
+        fixture.host.candidates.append(duplicate)
+        let service = fixture.routedService(from: fixture.target.domainEndpoint)
+        let ambiguous = try await service.execute(args: ["op": .string("request_attention")])
+        let sortedIDs = [fixture.observer.sessionID, secondObserver.sessionID].sorted { $0.uuidString < $1.uuidString }
+        XCTAssertEqual(ambiguous.objectValue?["candidate_observer_session_ids"]?.arrayValue, sortedIDs.map { .string($0.uuidString) })
+        XCTAssertEqual(
+            ambiguous.objectValue?["candidate_observer_session_names"]?.arrayValue,
+            sortedIDs.map { $0 == secondObserver.sessionID ? .null : .string("Planning") }
+        )
+
+        guard case let .reserved(reservation, _) = await fixture.authority.reserveLink(
+            observer: duplicate.domainEndpoint,
+            target: fixture.target.domainEndpoint
+        ), case .activated = await fixture.authority.activateLink(
+            reservation: reservation,
+            initialSnapshot: fixture.host.agentSessionLinkObservationSnapshot(for: fixture.target),
+            sourcePublicationSequence: 1
+        ) else { return XCTFail("expected an exact grant for the other incarnation") }
+
+        let explicit = try await service.execute(args: [
+            "op": .string("request_attention"),
+            "observer_session_id": .string(secondObserver.sessionID.uuidString)
+        ])
+        XCTAssertEqual(explicit.objectValue, ["result": .string("ambiguous_observer")])
     }
 
     func testEveryHiddenInboundOnlyOperationUsesExistingLiveAuthorizerDenial() async throws {
@@ -4464,9 +4510,10 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
 
     private func makeCandidate(
         windowID: Int,
-        displayName: String
+        displayName: String,
+        sessionID: UUID = UUID()
     ) -> AgentSessionLinkEndpointCandidate {
-        let binding = AgentPersistentSessionBindingIdentity(tabID: UUID(), sessionID: UUID())
+        let binding = AgentPersistentSessionBindingIdentity(tabID: UUID(), sessionID: sessionID)
         let token = AgentSessionRestorationBindingToken(bindingIdentity: binding, bindingTransitionGeneration: 1)
         return AgentSessionLinkEndpointCandidate(
             windowID: windowID,

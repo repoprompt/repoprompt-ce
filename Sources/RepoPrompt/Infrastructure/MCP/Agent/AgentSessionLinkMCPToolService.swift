@@ -308,11 +308,14 @@ struct AgentSessionLinkMCPToolService {
                 "result": .string("attention_queue_full"),
                 "accepted": .bool(false)
             ])
-        case let .ambiguous(candidateObserverSessionIDs, omittedCandidateCount):
+        case let .ambiguous(candidates, omittedCandidateCount):
             var payload: [String: Value] = ["result": .string("ambiguous_observer")]
-            if let candidateObserverSessionIDs {
+            if let candidates {
                 payload["candidate_observer_session_ids"] = .array(
-                    candidateObserverSessionIDs.map { .string($0.uuidString) }
+                    candidates.map { .string($0.sessionID.uuidString) }
+                )
+                payload["candidate_observer_session_names"] = .array(
+                    candidates.map { AgentMCPToolHelpers.stringOrNull($0.displayName) }
                 )
                 payload["omitted_candidate_count"] = .int(omittedCandidateCount)
             }
