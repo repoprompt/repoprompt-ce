@@ -10,6 +10,8 @@ package enum ProviderQuotaReadError: Error, Equatable {
     case accountInvalidated(retryAt: Date?)
     case transport
     case cliUnavailable
+    case antigravityCLIUnavailable
+    case antigravityUsageNotReported
 
     package var message: String {
         switch self {
@@ -20,6 +22,8 @@ package enum ProviderQuotaReadError: Error, Equatable {
         case .invalidResponse: "The provider did not report readable usage limits."
         case .accountInvalidated: "Usage is not available for the current account. Refresh to try again."
         case .transport: "Usage limits are not available right now."
+        case .antigravityUsageNotReported: "agy did not report usage limits. Check its sign-in and /usage in Terminal, then refresh."
+        case .antigravityCLIUnavailable: "Install the Antigravity CLI (agy) and sign in there, then refresh. The managed ACP runtime does not report plan limits."
         case .cliUnavailable: "Claude Code is not ready to read usage. Check installation, sign-in, and helper-folder trust, then refresh."
         }
     }
@@ -44,6 +48,7 @@ package actor ProviderAccountQuotaService: ProviderQuotaObserving {
     private let automaticInterval: TimeInterval
     private let manualInterval: TimeInterval
     private let periodicReads: Bool
+    private let manualOnly: Bool
     private let cachedRead: (@Sendable () async -> ProviderQuotaSnapshot?)?
     private var hydration: Task<ProviderQuotaSnapshot?, Never>?
     private var automaticConsumed = false
@@ -64,6 +69,7 @@ package actor ProviderAccountQuotaService: ProviderQuotaObserving {
         automaticInterval: TimeInterval = 900,
         manualInterval: TimeInterval = 60,
         periodicReads: Bool = true,
+        manualOnly: Bool = false,
         cachedRead: (@Sendable () async -> ProviderQuotaSnapshot?)? = nil,
         now: @escaping @Sendable () -> Date = { Date() },
         read: @escaping Read
@@ -71,6 +77,7 @@ package actor ProviderAccountQuotaService: ProviderQuotaObserving {
         self.automaticInterval = automaticInterval
         self.manualInterval = manualInterval
         self.periodicReads = periodicReads
+        self.manualOnly = manualOnly
         self.cachedRead = cachedRead
         self.now = now
         self.read = read
@@ -143,11 +150,12 @@ package actor ProviderAccountQuotaService: ProviderQuotaObserving {
     }
 
     private func scheduleAutomaticRead() {
+        guard !manualOnly else { return }
         Task { await performRead(userInitiated: false) }
     }
 
     private func startCadenceIfNeeded() {
-        guard periodicReads, cadenceTask == nil, enabled, !observers.isEmpty else { return }
+        guard !manualOnly, periodicReads, cadenceTask == nil, enabled, !observers.isEmpty else { return }
         cadenceTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let delay = await self?.automaticReadDelay() else { return }
@@ -191,7 +199,7 @@ package actor ProviderAccountQuotaService: ProviderQuotaObserving {
     /// Activity-driven refresh, independent of the one-startup-read latch. Admission is
     /// durable and provided by the consumer; ordinary single-flight/backoff still wins.
     package func refreshForAdvisory(requestID: UUID = UUID(), admission: @Sendable () async -> Bool) async {
-        guard enabled, !observers.isEmpty, inFlight == nil, advisoryAdmissionPending == nil,
+        guard !manualOnly, enabled, !observers.isEmpty, inFlight == nil, advisoryAdmissionPending == nil,
               blockedUntil.map({ now() >= $0 }) ?? true,
               lastAttempt.map({ now().timeIntervalSince($0) >= automaticInterval }) ?? true else { return }
         let expected = generation
@@ -237,6 +245,7 @@ package actor ProviderAccountQuotaService: ProviderQuotaObserving {
         bypassStartupLatch: Bool = false,
         didStart: (@Sendable () async -> Void)? = nil
     ) async {
+        guard userInitiated || !manualOnly else { return }
         await hydrateIfNeeded()
         guard enabled, !observers.isEmpty, !Task.isCancelled else { return }
         if !userInitiated, advisoryRequestID == nil, !bypassStartupLatch, !periodicReads, automaticConsumed { return }
@@ -300,7 +309,8 @@ package actor ProviderAccountQuotaService: ProviderQuotaObserving {
         default: blockedUntil = fallback
         }
         switch error {
-        case .signInRequired, .insufficientScope, .needsConsent, .accountInvalidated:
+        case .signInRequired, .insufficientScope, .needsConsent, .accountInvalidated,
+             .antigravityCLIUnavailable, .antigravityUsageNotReported:
             snapshot = nil
         default: break
         }

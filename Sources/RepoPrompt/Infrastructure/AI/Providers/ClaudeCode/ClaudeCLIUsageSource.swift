@@ -95,15 +95,15 @@ actor ClaudeCLIUsageSource {
         let root = cache.root
         let workdir = root.appendingPathComponent("workdir", isDirectory: true)
         let setup = root.appendingPathComponent("setup", isDirectory: true)
-        try ClaudeCLIUsageFiles.createDirectory(root)
-        try ClaudeCLIUsageFiles.createDirectory(workdir)
-        try ClaudeCLIUsageFiles.createDirectory(setup)
+        try CLIUsagePrivateFiles.createDirectory(root)
+        try CLIUsagePrivateFiles.createDirectory(workdir)
+        try CLIUsagePrivateFiles.createDirectory(setup)
         let settings = setup.appendingPathComponent("settings.json")
         let mcp = setup.appendingPathComponent("mcp.json")
-        try ClaudeCLIUsageFiles.write(Data(#"{"hooks":{}}"#.utf8), to: settings)
-        try ClaudeCLIUsageFiles.write(Data(#"{"mcpServers":{}}"#.utf8), to: mcp)
+        try CLIUsagePrivateFiles.write(Data(#"{"hooks":{}}"#.utf8), to: settings)
+        try CLIUsagePrivateFiles.write(Data(#"{"mcpServers":{}}"#.utf8), to: mcp)
         let script = setup.appendingPathComponent("Set up Claude usage.command")
-        try ClaudeCLIUsageFiles.write(Data(Self.setupScript(command: command, profile: profile, workdir: workdir, settings: settings, mcp: mcp).utf8), to: script)
+        try CLIUsagePrivateFiles.write(Data(Self.setupScript(command: command, profile: profile, workdir: workdir, settings: settings, mcp: mcp).utf8), to: script)
         guard chmod(script.path, 0o700) == 0 else { throw ProviderQuotaReadError.transport }
         try await validate(profile, forSetup: true)
         return script
@@ -158,22 +158,22 @@ actor ClaudeCLIUsageSource {
         environment["DISABLE_AUTOUPDATER"] = "1"
         environment["TERM"] = "xterm-256color"
         environment["CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION"] = "false"
-        try ClaudeCLIUsageFiles.createDirectory(root)
+        try CLIUsagePrivateFiles.createDirectory(root)
         let workdir = root.appendingPathComponent("workdir", isDirectory: true)
         let runs = root.appendingPathComponent("runs", isDirectory: true)
-        try ClaudeCLIUsageFiles.createDirectory(workdir)
-        try ClaudeCLIUsageFiles.createDirectory(runs)
+        try CLIUsagePrivateFiles.createDirectory(workdir)
+        try CLIUsagePrivateFiles.createDirectory(runs)
         let run = runs.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try ClaudeCLIUsageFiles.createDirectory(run)
+        try CLIUsagePrivateFiles.createDirectory(run)
         defer { try? FileManager.default.removeItem(at: run) }
         func quote(_ value: String) -> String {
             "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
         }
         let settings = run.appendingPathComponent("settings.json")
         let collector = "\(quote(helper.path)) \(ClaudeCLIUsageCollector.flag) \(quote(run.path))"
-        try ClaudeCLIUsageFiles.write(Self.collectionSettings(collector: collector), to: settings)
+        try CLIUsagePrivateFiles.write(Self.collectionSettings(collector: collector), to: settings)
         let mcp = run.appendingPathComponent("mcp.json")
-        try ClaudeCLIUsageFiles.write(Data(#"{"mcpServers":{}}"#.utf8), to: mcp)
+        try CLIUsagePrivateFiles.write(Data(#"{"mcpServers":{}}"#.utf8), to: mcp)
         let child: SpawnedPTYProcess
         do {
             child = try ProcessLauncher.spawnPTY(
@@ -210,7 +210,7 @@ actor ClaudeCLIUsageSource {
                 for _ in 0 ..< 16 {
                     if Darwin.read(child.master, &buffer, buffer.count) <= 0 { break }
                 }
-                let record = ClaudeCLIUsageFiles.read(run.appendingPathComponent("latest.json"))
+                let record = CLIUsagePrivateFiles.read(run.appendingPathComponent("latest.json"))
                     .flatMap { try? JSONDecoder().decode(ClaudeCLIUsageRecord.self, from: $0) }
                 let duration = clock.now - started
                 let elapsed = Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18

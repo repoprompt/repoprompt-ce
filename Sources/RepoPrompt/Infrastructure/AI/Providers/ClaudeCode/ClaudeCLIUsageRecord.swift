@@ -1,5 +1,4 @@
 import CoreFoundation
-import Darwin
 import Foundation
 import RepoPromptProviderQuota
 
@@ -75,64 +74,16 @@ struct ClaudeCLIUsageRecord: Codable, Equatable {
     }
 }
 
-/// Private bounded files shared by the collector and acquisition source. No credential IO.
-enum ClaudeCLIUsageFiles {
-    static func isPrivateDirectory(_ url: URL) -> Bool {
-        var info = stat()
-        return lstat(url.path, &info) == 0 && info.st_uid == getuid() && info.st_mode & S_IFMT == S_IFDIR && info.st_mode & 0o777 == 0o700
-    }
-
-    static func createDirectory(_ url: URL) throws {
-        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        guard isPrivateDirectory(url) else { throw ProviderQuotaReadError.invalidResponse }
-    }
-
-    static func read(_ url: URL, limit: Int = 4096) -> Data? {
-        guard isPrivateDirectory(url.deletingLastPathComponent()) else { return nil }
-        let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
-        guard fd >= 0 else { return nil }
-        defer { close(fd) }
-        var info = stat()
-        guard fstat(fd, &info) == 0, info.st_uid == getuid(), info.st_mode & S_IFMT == S_IFREG,
-              info.st_mode & 0o777 == 0o600, info.st_size >= 0, info.st_size <= limit else { return nil }
-        return try? FileHandle(fileDescriptor: fd, closeOnDealloc: false).read(upToCount: limit + 1)
-    }
-
-    static func write(_ data: Data, to url: URL) throws {
-        guard data.count <= 65536, isPrivateDirectory(url.deletingLastPathComponent()) else { throw ProviderQuotaReadError.invalidResponse }
-        let temporary = url.deletingLastPathComponent().appendingPathComponent(UUID().uuidString)
-        let fd = open(temporary.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
-        guard fd >= 0 else { throw ProviderQuotaReadError.transport }
-        defer { close(fd)
-            unlink(temporary.path)
-        }
-        try FileHandle(fileDescriptor: fd, closeOnDealloc: false).write(contentsOf: data)
-        guard rename(temporary.path, url.path) == 0 else { throw ProviderQuotaReadError.transport }
-    }
-}
-
 /// Invoked as a child, before app bootstrap. Outputs nothing and has a hard input timeout.
 enum ClaudeCLIUsageCollector {
     static let flag = "--rpce-claude-usage-collector"
     static func runIfInvoked(arguments: [String]) -> Int32? {
         guard arguments.contains(flag) else { return nil }
         guard arguments.count == 3, arguments[1] == flag, arguments[2].hasPrefix("/") else { return 1 }
-        alarm(3)
-        defer { alarm(0) }
         let root = URL(fileURLWithPath: arguments[2], isDirectory: true)
-        guard ClaudeCLIUsageFiles.isPrivateDirectory(root) else { return 1 }
-        var data = Data()
-        var buffer = [UInt8](repeating: 0, count: 4096)
-        while data.count <= 65536 {
-            let count = Darwin.read(STDIN_FILENO, &buffer, buffer.count)
-            if count == 0 { break }
-            if count < 0 { if errno == EINTR { continue }
-                return 1
-            }
-            data.append(contentsOf: buffer.prefix(count))
-        }
-        guard let record = ClaudeCLIUsageRecord.extract(data), let output = try? JSONEncoder().encode(record) else { return 1 }
-        do { try ClaudeCLIUsageFiles.write(output, to: root.appendingPathComponent("latest.json"))
+        guard CLIUsagePrivateFiles.isPrivateDirectory(root), let data = CLIUsagePrivateFiles.readStatusLineInput(),
+              let record = ClaudeCLIUsageRecord.extract(data), let output = try? JSONEncoder().encode(record) else { return 1 }
+        do { try CLIUsagePrivateFiles.write(output, to: root.appendingPathComponent("latest.json"))
             return 0
         } catch { return 1 }
     }
@@ -145,7 +96,7 @@ struct ClaudeCLIUsageCache {
 
     let root: URL
     func load(profileID: String) -> ClaudeCLIUsageRecord? {
-        guard let data = ClaudeCLIUsageFiles.read(root.appendingPathComponent("cache.json")),
+        guard let data = CLIUsagePrivateFiles.read(root.appendingPathComponent("cache.json")),
               let value = try? JSONDecoder().decode(Envelope.self, from: data), value.profileID == profileID,
               value.record.isValid, !value.record.windows.isEmpty, value.record.receivedAt <= Date().addingTimeInterval(60)
         else { return nil }
@@ -154,8 +105,8 @@ struct ClaudeCLIUsageCache {
 
     func save(_ record: ClaudeCLIUsageRecord, profileID: String) throws {
         guard record.isValid, !record.windows.isEmpty else { throw ProviderQuotaReadError.invalidResponse }
-        try ClaudeCLIUsageFiles.createDirectory(root)
-        try ClaudeCLIUsageFiles.write(JSONEncoder().encode(Envelope(profileID: profileID, record: record)), to: root.appendingPathComponent("cache.json"))
+        try CLIUsagePrivateFiles.createDirectory(root)
+        try CLIUsagePrivateFiles.write(JSONEncoder().encode(Envelope(profileID: profileID, record: record)), to: root.appendingPathComponent("cache.json"))
     }
 
     func clear() {
