@@ -18324,6 +18324,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     @discardableResult
     func cleanupProviderConversationForDeletedAgentSession(_ session: TabSession) async -> ProviderConversationCleanupOutcome? {
+        guard !session.subscriptionAccountBinding.blocksProviderOperations else { return nil }
         let action = GlobalSettingsStore.shared.providerConversationCleanupAction()
         let handle = providerCleanupHandle(
             provider: session.selectedAgent.rawValue,

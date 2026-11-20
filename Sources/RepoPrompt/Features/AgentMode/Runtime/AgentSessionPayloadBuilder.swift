@@ -35,6 +35,7 @@ enum AgentSessionPayloadBuilder {
                 codexConversationID: session.codexConversationID,
                 codexRolloutPath: session.codexRolloutPath
             ),
+            subscriptionAccountBinding: session.subscriptionAccountBinding,
             autoEditEnabled: session.autoEditEnabled,
             autoWakeOnOversightUpdates: session.oversight.autoWakeOnUpdates,
             agentSessionLinkAutoWakeTargetSessionIDs: session.oversight.autoWakeTargetSessionIDs,

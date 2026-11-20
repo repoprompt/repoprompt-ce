@@ -158,6 +158,7 @@ actor AgentSessionDataService {
         let lastRunState: String?
         let providerSessionID: String?
         let providerCleanupHandle: ProviderConversationCleanupHandle?
+        let subscriptionAccountBinding: AgentSessionSubscriptionBinding
         let autoEditEnabled: Bool
         /// Optional because synthesized `Decodable` ignores property defaults: a pre-version-8 file
         /// carries no key at all, and a non-optional would fail the whole header decode.
@@ -425,7 +426,7 @@ actor AgentSessionDataService {
     }
 
     private func writeDataAtomically(_ data: Data, to fileURL: URL) async throws -> AgentSessionDiskWriter.Receipt? {
-        try await diskWriter.enqueueAndWait(data: data, url: fileURL.standardizedFileURL)
+        try await diskWriter.enqueueAndWait(data: data, url: fileURL.standardizedFileURL, protectsSubscriptionBinding: true)
     }
 
     private func finishMetadataPublication(for fileURL: URL) {
@@ -1291,6 +1292,7 @@ actor AgentSessionDataService {
 
     enum StrictSaveError: Error {
         case superseded
+        case accountBindingNotWritable
     }
 
     /// Strict success proves this submission received a writer receipt, not that its data
@@ -1303,6 +1305,9 @@ actor AgentSessionDataService {
         trustedCanonicalItemCount: Int? = nil,
         durability: SaveDurability = .allowCoalescing
     ) async throws -> URL {
+        guard !session.subscriptionAccountBinding.blocksProviderOperations else {
+            throw StrictSaveError.accountBindingNotWritable
+        }
         if durability == .requireOwnCommit { try Task.checkCancellation() }
         let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
 
@@ -1384,6 +1389,10 @@ actor AgentSessionDataService {
         let data = try validatedSessionData(from: fileURL)
         do {
             let session = try decoder.decode(AgentSession.self, from: data)
+            // Keep managed and unsupported envelopes byte-preserved while the adapter is dark.
+            if session.subscriptionAccountBinding.blocksProviderOperations {
+                return normalizeLoadedSession(session, fileURL: fileURL).runtimeSession
+            }
             if session.selfCompactPersistenceWarning {
                 try preserveMalformedSelfCompactRecord(data, from: fileURL)
             }
@@ -1460,7 +1469,7 @@ actor AgentSessionDataService {
                     }
                 }
                 count = recoveredProjectionCounts?.canonicalVisibleRowCount ?? count
-                if persistRecoveredMetadata,
+                if persistRecoveredMetadata, !header.subscriptionAccountBinding.blocksProviderOperations,
                    let persistedSession = normalized.persistedSessionToRewrite
                 {
                     do {
@@ -1497,6 +1506,7 @@ actor AgentSessionDataService {
                 lastRunState: AgentSessionRestoreSupport.coldRestoredLastRunStateRaw(header.lastRunState),
                 providerSessionID: header.providerSessionID,
                 providerCleanupHandle: header.providerCleanupHandle,
+                subscriptionAccountBinding: header.subscriptionAccountBinding,
                 autoEditEnabled: header.autoEditEnabled,
                 autoWakeOnOversightUpdates: header.autoWakeOnOversightUpdates ?? false,
                 agentSessionLinkAutoWakeTargetSessionIDs: header.agentSessionLinkAutoWakeTargetSessionIDs ?? [],

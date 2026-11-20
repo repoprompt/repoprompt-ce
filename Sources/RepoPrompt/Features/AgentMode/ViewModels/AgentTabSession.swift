@@ -1162,6 +1162,7 @@ final class AgentTabSession: ObservableObject {
     var providerSessionID: String?
 
     var providerCleanupHandle: ProviderConversationCleanupHandle?
+    var subscriptionAccountBinding: AgentSessionSubscriptionBinding = .legacy
     var providerTokenUsageByTurn: [AgentTokenUsagePersist] = []
     var automationTurnAudit: [AgentAutomationTurnAudit] = []
 
@@ -2038,6 +2039,7 @@ final class AgentTabSession: ObservableObject {
     /// Persisted handoff recovery remains its own blocker after payload restoration succeeds.
     var operationAdmissionFailureMessage: String? {
         if isAwaitingWorkspaceAdoption { return Self.loadingAdmissionFailureMessage }
+        if subscriptionAccountBinding.blocksProviderOperations { return AgentSessionSubscriptionBinding.notRunnableMessage }
         return restorationAdmissionFailureMessage ?? pendingHandoff.executionLocationFailure
     }
 
