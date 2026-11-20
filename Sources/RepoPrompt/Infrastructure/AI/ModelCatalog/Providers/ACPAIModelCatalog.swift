@@ -86,6 +86,15 @@ enum ACPAIModelCatalog {
         grokBuildModelOptionsFromStore().map { .grokBuildCustom(name: $0.rawValue) }
     }
 
+    static func antigravityModelsFromStore() -> [AIModel] {
+        let snapshot = AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: .antigravity)
+        return snapshot?.options.map { .antigravityCustom(name: $0.rawValue) } ?? []
+    }
+
+    static func antigravityModelOption(for rawValue: String) -> AgentModelOption? {
+        AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: .antigravity)?.option(matching: rawValue)
+    }
+
     static func devinModelOptionsFromStore() -> [AgentModelOption] {
         DevinModelCatalog.current.entries.map(\.option)
     }

@@ -223,10 +223,15 @@ final class AgentModeProviderBindingService {
                     let providerName = session.selectedAgent.displayName
                     if AgentRuntimeProviderService.enableDebugLogging { print("[ACP-Runner] tab=\(session.tabID) applying \(providerName) session mode=\(sessionModeID)") }
                     do {
-                        await controller.setAutoApproveAllToolPermissions(runtime.autoApproveAllACPToolPermissions)
+                        await controller.setAutoApproveAllToolPermissions(false)
                         try await controller.setSessionMode(sessionModeID)
+                        await controller.setAutoApproveAllToolPermissions(runtime.autoApproveAllACPToolPermissions)
                         if runtime.acceptsPendingACPApprovalWhenActivated, let pendingApproval = session.pendingApproval {
-                            await controller.respondToPermissionRequest(id: pendingApproval.requestID.displayValue, decision: .acceptForSession)
+                            if providerID == .antigravity {
+                                await controller.respondToPendingPermissionRequestForFullAccess(id: pendingApproval.requestID.displayValue)
+                            } else {
+                                await controller.respondToPermissionRequest(id: pendingApproval.requestID.displayValue, decision: .acceptForSession)
+                            }
                         }
                     } catch {
                         if AgentRuntimeProviderService.enableDebugLogging { print("[ACP-Runner] tab=\(session.tabID) failed to apply \(providerName) session mode=\(sessionModeID) error=\(error.localizedDescription)") }

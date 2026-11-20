@@ -201,6 +201,7 @@ public enum AIModel: Equatable, Hashable {
     case openCodeCustom(name: String)
     case cursorCustom(name: String)
     case grokBuildCustom(name: String)
+    case antigravityCustom(name: String)
     case devinCustom(name: String)
 
     // Custom Provider Models
@@ -262,6 +263,7 @@ public enum AIModel: Equatable, Hashable {
         case openCodeCustom(name: String)
         case cursorCustom(name: String)
         case grokBuildCustom(name: String)
+        case antigravityCustom(name: String)
         case devinCustom(name: String)
         case customProvider(name: String, provider: String, model: String)
         case customProviderUser(name: String)
@@ -490,6 +492,8 @@ public enum AIModel: Equatable, Hashable {
             .cursorCustom(name: name)
         case let .grokBuildCustom(name):
             .grokBuildCustom(name: name)
+        case let .antigravityCustom(name):
+            .antigravityCustom(name: name)
         case let .devinCustom(name):
             .devinCustom(name: name)
         case let .customProvider(name, provider, model):

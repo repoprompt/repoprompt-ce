@@ -607,9 +607,7 @@ struct AgentModeGeneralSettingsView: View {
     /// lights — one per CLI provider binding — so users can tell at a glance
     /// which providers are connected without opening the CLI Providers tab.
     ///
-    /// The lights are driven by `APISettingsViewModel.is*Connected`, the same
-    /// @Published booleans the full CLI Providers page uses. No async work, no
-    /// network — just UserDefaults-backed connection flags already in memory.
+    /// The lights use the same connection state as the full CLI Providers page.
     private var providersLinkRow: some View {
         Button {
             onNavigate?(.cliProviders)
@@ -647,6 +645,9 @@ struct AgentModeGeneralSettingsView: View {
         let connected = providers.filter(isProviderConnected).count
         let total = providers.count
         if connected == 0 {
+            if apiSettingsVM.antigravitySetupStatus == .installed {
+                return "Google Antigravity is installed. Open CLI Providers to check sign-in."
+            }
             return "Connect a CLI agent (Claude Code, Codex, OpenCode, Cursor) to run anything in Agent Mode."
         }
         return "\(connected) of \(total) CLI providers connected. Manage auth, installs, and models in CLI Providers."
@@ -669,6 +670,17 @@ struct AgentModeGeneralSettingsView: View {
     @ViewBuilder
     private func providerStatusChip(for provider: AgentProviderBindingID) -> some View {
         let connected = isProviderConnected(provider)
+        let installed = provider == .antigravity && apiSettingsVM.antigravitySetupStatus == .installed
+        let status = if provider == .antigravity {
+            apiSettingsVM.antigravitySetupStatus.rawValue.lowercased()
+        } else {
+            connected ? "connected" : "not connected"
+        }
+        let detail = if installed {
+            "Google Antigravity is installed. Open CLI Providers to check sign-in."
+        } else {
+            "\(provider.displayName) is \(status). Open CLI Providers to manage it."
+        }
         HStack(spacing: fontPreset.scaledClamped(5, max: 8)) {
             Circle()
                 .fill(connected ? Color.green : Color.secondary.opacity(0.4))
@@ -683,13 +695,9 @@ struct AgentModeGeneralSettingsView: View {
             Capsule()
                 .fill(connected ? Color.green.opacity(0.12) : Color.secondary.opacity(0.08))
         )
-        .hoverTooltip(
-            connected
-                ? "\(provider.displayName) is connected. Open CLI Providers to review auth, installs, or models."
-                : "\(provider.displayName) is not connected. Open CLI Providers to configure it."
-        )
+        .hoverTooltip(detail)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(Text("\(provider.displayName): \(connected ? "connected" : "not connected")"))
+        .accessibilityLabel(Text("\(provider.displayName): \(status)"))
     }
 
     private func isProviderConnected(_ provider: AgentProviderBindingID) -> Bool {
@@ -697,7 +705,7 @@ struct AgentModeGeneralSettingsView: View {
         case .claude: apiSettingsVM.isClaudeCodeConnected
         case .codex: apiSettingsVM.isCodexConnected
         case .openCode: apiSettingsVM.isOpenCodeConnected
-        case .antigravity: AntigravityRuntimeManager.installedRuntimeSync() != nil
+        case .antigravity: apiSettingsVM.antigravitySetupStatus == .connected
         case .cursor: apiSettingsVM.isCursorConnected
         case .grokBuild: apiSettingsVM.isGrokBuildConnected
         // Devin owns its own auth, so the installed CLI is the connection.

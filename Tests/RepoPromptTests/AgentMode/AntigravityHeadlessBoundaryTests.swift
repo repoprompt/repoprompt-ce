@@ -4,6 +4,7 @@ import MCP
 import RepoPromptACPProviders
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
@@ -89,6 +90,46 @@ final class AntigravityHeadlessBoundaryTests: XCTestCase {
         ))
     }
 
+    @MainActor
+    func testAntigravityOnlyAccountCanPinEachAgentRoleAndPersistOracleModel() throws {
+        let registry = AgentModelCatalogRuntime.shared.acpRegistry
+        registry.test_reset(providerID: .antigravity)
+        defer { registry.test_reset(providerID: .antigravity) }
+
+        let roleModels = AgentModelCatalog.TaskLabelKind.allCases.enumerated().map { index, role in
+            (role, "fixture-\(index)-low")
+        }
+        let options = roleModels.map { _, model in
+            AgentModelOption(rawValue: model, displayName: model, description: nil, isDefault: false)
+        }
+        let defaultModel = try XCTUnwrap(options.first).rawValue
+        _ = registry.updateDiscoveredModels(.init(options: options, currentModelRaw: defaultModel), for: .antigravity)
+        let availability = AgentModelCatalog.AvailabilityContext.none.assumingAvailable(.antigravity)
+        let settings = AgentModelsProfileRoleDefaultsStore(overrides: nil)
+        XCTAssertEqual(MCPAgentRoleDefaultsService.resolutions(availability: availability, settingsStore: settings).count, roleModels.count)
+
+        for (role, model) in roleModels {
+            MCPAgentRoleDefaultsService.setSelection(.init(agent: .antigravity, modelRaw: model), for: role, scope: .global, settingsStore: settings)
+            let resolution = MCPAgentRoleDefaultsService.effectiveSelection(for: role, availability: availability, settingsStore: settings)
+            XCTAssertEqual(resolution?.effective, .init(agent: .antigravity, modelRaw: model))
+            XCTAssertTrue(resolution?.hasStoredOverride == true)
+        }
+
+        let oracle = AIModel.antigravityCustom(name: defaultModel)
+        XCTAssertTrue(AIModel.modelsForProvider(.antigravity).contains(oracle))
+        XCTAssertEqual(AIModel.fromModelName(oracle.rawValue), oracle)
+        XCTAssertEqual(oracle.modelName, defaultModel)
+        XCTAssertEqual(oracle.attachmentRoute, .acp)
+        XCTAssertEqual(AppOracleGroupRouting.executionProfile(for: oracle)?.providerID, "antigravity")
+    }
+
+    func testOracleStreamKeepsAssistantContentAndDropsAntigravitySessionTitles() {
+        XCTAssertFalse(AntigravityChatProvider.forwardsChatEvent(.init(type: "status", text: "Generated session title")))
+        XCTAssertTrue(AntigravityChatProvider.forwardsChatEvent(.init(type: "content", text: "Oracle answer")))
+        XCTAssertTrue(AntigravityChatProvider.forwardsChatEvent(.init(type: "reasoning", text: nil, reasoning: "Reasoning")))
+        XCTAssertTrue(AntigravityChatProvider.forwardsChatEvent(.init(type: "message_stop", text: nil)))
+    }
+
     func testHeadlessFactoryRejectsAntigravity() {
         let provider = AgentRuntimeProviderService.shared.makeProvider(for: .antigravity, modelString: nil)
         XCTAssertTrue(provider is UnsupportedHeadlessAgentProvider)
@@ -171,7 +212,7 @@ final class AgentMCPSelectionResolverTests: XCTestCase {
                 settings.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: candidate)
                 settings.setWorkspaceAgentModelsInheritanceMode(workspaceID: workspaceID, mode: .useWorkspaceOverrides)
                 XCTAssertEqual(settings.globalAgentModelsProfile().mcpAgentRoleOverrides?["pair"], "openCode:\(globalModel)", label)
-                XCTAssertNil(MCPAgentRoleDefaultsService.effectiveSelection(for: .pair, availability: availability, workspaceID: workspaceID), label)
+                let effective = MCPAgentRoleDefaultsService.effectiveSelection(for: .pair, availability: availability, workspaceID: workspaceID)
                 let effectiveProfile = settings.effectiveAgentModelsProfile(workspaceID: workspaceID)
                 let pin = MCPAgentRoleDefaultsService.executableStoredSelection(
                     for: .pair, overrides: effectiveProfile.mcpAgentRoleOverrides,
@@ -179,11 +220,19 @@ final class AgentMCPSelectionResolverTests: XCTestCase {
                 )
                 if label == "interactive-only candidate" {
                     let executable = try XCTUnwrap(pin, label)
+                    XCTAssertEqual(effective?.effective, executable.selection)
                     XCTAssertEqual(executable.selection.agent, .antigravity)
                     XCTAssertFalse(surface.allows(executable.selection.agent))
-                } else {
-                    XCTAssertNil(pin, label)
+                    for modelID in [nil, "pair"] as [String?] {
+                        XCTAssertThrowsError(try AgentMCPSelectionResolver.resolve(
+                            modelID: modelID, defaultTaskLabel: .pair, availability: availability,
+                            workspaceID: workspaceID, surface: surface
+                        ), label)
+                    }
+                    continue
                 }
+                XCTAssertNil(effective, label)
+                XCTAssertNil(pin, label)
                 let omitted = try AgentMCPSelectionResolver.resolve(
                     modelID: nil, defaultTaskLabel: .pair, availability: availability,
                     workspaceID: workspaceID, surface: surface

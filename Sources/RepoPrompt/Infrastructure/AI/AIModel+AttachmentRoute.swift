@@ -16,7 +16,7 @@ extension AIModel {
         case .customProvider: .customOpenAI
         case .claudeCode: .claudeCodeStreamJSON
         case .codex: .codexAppServer
-        case .openCode, .cursor, .devin: .acp
+        case .openCode, .cursor, .antigravity, .devin: .acp
         case .grokBuild: .grokBuild
         }
     }

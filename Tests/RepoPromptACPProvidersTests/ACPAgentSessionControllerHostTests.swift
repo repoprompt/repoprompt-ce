@@ -37,6 +37,84 @@ final class ACPAgentSessionControllerHostTests: XCTestCase {
         }
     }
 
+    func testAntigravityVerifiesCompoundSelectionAndMapsTheAdvertisedEditMode() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("AntigravitySelection-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let script = directory.appendingPathComponent("agy-acp-fixture")
+        try #"""
+        #!/usr/bin/python3
+        import json, sys
+        base, level, mode = "gemini-pro", "high", "default"
+        def selector(key, current, allowed):
+            return {"id": key, "category": key, "type": "select", "currentValue": current,
+                    "options": [{"value": value, "name": value} for value in allowed]}
+        def configuration():
+            return {"configOptions": [
+                selector("model", base, ["gemini-pro", "gemini-flash"]),
+                selector("thought_level", level, ["low", "high", "xhigh"]),
+                selector("mode", mode, ["default", "accept-edits", "auto", "plan"])]}
+        for line in sys.stdin:
+            request = json.loads(line)
+            method = request.get("method")
+            if "id" not in request: continue
+            if method == "session/new":
+                result = {"sessionId": "antigravity-fixture", **configuration(),
+                          "models": {"availableModels": [
+                              {"modelId": "gemini-pro-high", "name": "Pro (High)"},
+                              {"modelId": "gemini-flash-low", "name": "Flash (Low)"},
+                              {"modelId": "gemini-flash-xhigh", "name": "Flash (XHigh)"}]}}
+            elif method == "session/set_config_option":
+                params = request["params"]
+                if params["configId"] == "model":
+                    base, level = "gemini-flash", "low"
+                elif params["configId"] == "mode":
+                    assert params["value"] == "accept-edits"
+                    mode = params["value"]
+                result = configuration()
+            else:
+                result = {}
+            print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+        """#.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
+
+        let provider = AntigravityACPAgentProvider(
+            executablePath: script.path,
+            harnessPath: nil,
+            installedRuntime: { nil },
+            prepareSessionHome: { directory },
+            toolNames: ACPToolNameResolution(
+                isRepoPromptServerIdentifier: { _ in false },
+                canonicalRepoPromptToolName: { _ in nil },
+                isRepoPromptToolNameWithServerPrefix: { _ in false }
+            ),
+            includeRepoPromptMCPServer: false
+        )
+        let request = ACPRunRequest(agentKind: .antigravity, modelString: nil, workspacePath: directory.path, resumeSessionID: nil, attachments: [], taskLabelKind: nil)
+        let controller = try ACPAgentSessionController(provider: provider, runRequest: request, host: RecordingHost(), allowsProviderProcessLaunchForTesting: true)
+        do {
+            _ = try await controller.bootstrap()
+            let initial = await controller.currentDiscoveredSessionModels()
+            XCTAssertEqual(initial?.currentModelRaw, "gemini-pro-high")
+            XCTAssertEqual(initial?.options.map(\.rawValue), ["gemini-pro-high", "gemini-flash-low", "gemini-flash-xhigh"])
+            try await controller.setSessionModel("gemini-flash-low")
+            try await controller.setSessionMode("auto_edit")
+            let selected = await controller.currentDiscoveredSessionModels()
+            XCTAssertEqual(selected?.currentModelRaw, "gemini-flash-low")
+
+            do {
+                try await controller.setSessionModel("gemini-flash-xhigh")
+                XCTFail("The base model alone must not confirm a reasoning-variant selection.")
+            } catch {
+                XCTAssertTrue(error.localizedDescription.contains("did not confirm"), error.localizedDescription)
+            }
+            await controller.shutdown()
+        } catch {
+            await controller.shutdown()
+            throw error
+        }
+    }
+
     func testRequiredHostRoutesLaunchAndReadsRegistryAtSelectionTime() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ACPHost-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
