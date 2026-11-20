@@ -139,6 +139,7 @@ final class AgentOnboardingWizardViewModel: ObservableObject {
                 api.$isCursorConnected.map { _ in () }.eraseToAnyPublisher(),
                 api.$isGrokBuildConnected.map { _ in () }.eraseToAnyPublisher(),
                 api.$isAntigravityConnected.map { _ in () }.eraseToAnyPublisher(),
+                api.$isAntigravityRuntimeInstalled.map { _ in () }.eraseToAnyPublisher(),
                 api.$isTestingAntigravity.map { _ in () }.eraseToAnyPublisher(),
                 api.$antigravityError.map { _ in () }.eraseToAnyPublisher(),
                 api.$isOpenAIKeyValid.map { _ in () }.eraseToAnyPublisher()
@@ -229,6 +230,12 @@ final class AgentOnboardingWizardViewModel: ObservableObject {
 
     var antigravityConnected: Bool {
         apiSettingsViewModel?.isAntigravityConnected ?? false
+    }
+
+    var antigravitySetupHint: String {
+        apiSettingsViewModel?.isAntigravityRuntimeInstalled == true
+            ? "Installed · check Google sign-in"
+            : "Install and sign in with agy"
     }
 
     var isTestingAntigravity: Bool {

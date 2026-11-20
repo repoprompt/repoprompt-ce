@@ -352,6 +352,18 @@ public class APISettingsViewModel: ObservableObject {
     @Published private(set) var isTestingAntigravity = false
     @Published private(set) var antigravityError: String?
     private var antigravityModelsTask: Task<Void, Never>?
+
+    enum AntigravitySetupStatus: String {
+        case notInstalled = "Not Installed"
+        case installed = "Installed"
+        case connected = "Connected"
+    }
+
+    var antigravitySetupStatus: AntigravitySetupStatus {
+        guard isAntigravityRuntimeInstalled else { return .notInstalled }
+        return isAntigravityConnected ? .connected : .installed
+    }
+
     @Published private(set) var isDevinRuntimeInstalled = false
     @Published private(set) var directConnectedCLIProviders: Set<AgentProviderKind> = []
 
@@ -1930,7 +1942,7 @@ public class APISettingsViewModel: ObservableObject {
         if discovered {
             startAntigravityModelsSubscriptionIfNeeded()
         } else {
-            antigravityError = "No models received. Update agy and confirm you are signed in with Google."
+            antigravityError = "No models received. Confirm your Google sign-in, then test again."
         }
         refreshDirectConnectedCLIProviders()
         await updateAvailableModels()

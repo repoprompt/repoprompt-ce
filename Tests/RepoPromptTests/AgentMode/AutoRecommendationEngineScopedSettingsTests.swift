@@ -9,6 +9,28 @@ import XCTest
 
 @MainActor
 final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
+    func testInstalledAntigravityIsAvailableBeforeConnectionVerification() {
+        let keyManager = KeyManager(secureService: SecureKeysService(secureStorage: TestSecureStorageBackend()))
+        var runtimeInstalled = true
+        let settings = APISettingsViewModel(
+            aiQueriesService: AIQueriesService(keyManager: keyManager),
+            keyManager: keyManager,
+            loadStoredDataOnInit: false,
+            antigravityRuntimeInstalledProvider: { runtimeInstalled }
+        )
+        defer { settings.prepareForWindowClose() }
+
+        XCTAssertEqual(settings.antigravitySetupStatus, .installed)
+        XCTAssertTrue(settings.agentModeAvailabilityContext.antigravityAvailable)
+        XCTAssertFalse(settings.directConnectedCLIProviders.contains(.antigravity))
+
+        runtimeInstalled = false
+        settings.refreshDirectCLIProviderConnectionState()
+
+        XCTAssertEqual(settings.antigravitySetupStatus, .notInstalled)
+        XCTAssertFalse(settings.agentModeAvailabilityContext.antigravityAvailable)
+    }
+
     func testOperationIdentityRejectsWorkspaceAndInheritanceChanges() {
         let workspaceID = UUID()
         let identity = AgentModelsOperationIdentity(

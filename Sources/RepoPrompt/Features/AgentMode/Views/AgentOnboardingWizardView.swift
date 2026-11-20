@@ -1149,7 +1149,7 @@ private struct ProvidersStepView: View {
                     isConnected: viewModel.antigravityConnected,
                     isLoading: viewModel.isTestingAntigravity,
                     errorText: viewModel.antigravityError,
-                    setupHint: "Install and sign in with agy",
+                    setupHint: viewModel.antigravitySetupHint,
                     isRecommended: false,
                     requiresPro: false,
                     onTest: { viewModel.testAntigravity() }

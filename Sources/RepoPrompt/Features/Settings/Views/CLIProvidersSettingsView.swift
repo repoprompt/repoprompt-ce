@@ -2271,14 +2271,15 @@ struct CLIProvidersSettingsView: View {
     private var antigravityCard: some View {
         providerCard(
             title: "Google Antigravity",
-            subtitle: "Uses the Antigravity CLI and your Google sign-in.",
+            subtitle: "Uses Google sign-in with the Antigravity CLI or managed runtime.",
             infoURL: "https://antigravity.google/docs/cli/acp",
-            isConnected: viewModel.directConnectedCLIProviders.contains(.antigravity),
+            isConnected: viewModel.antigravitySetupStatus == .connected,
+            disconnectedLabel: viewModel.antigravitySetupStatus.rawValue,
             isExpanded: $isAntigravityExpanded
         ) {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(spacing: 10) {
-                    if AntigravityCLILocator.installedCommand() == nil {
+                    if viewModel.antigravitySetupStatus == .notInstalled {
                         Button {
                             isLoadingAntigravity = true
                             Task {
@@ -2315,7 +2316,7 @@ struct CLIProvidersSettingsView: View {
                         if viewModel.isTestingAntigravity { ProgressView().scaleEffect(0.6).frame(height: 16) }
                         else { Label("Test Connection", systemImage: "antenna.radiowaves.left.and.right") }
                     }
-                    .disabled(viewModel.isTestingAntigravity)
+                    .disabled(viewModel.isTestingAntigravity || viewModel.antigravitySetupStatus == .notInstalled)
                     .buttonStyle(CustomButtonStyle())
                 }
 
@@ -2328,13 +2329,18 @@ struct CLIProvidersSettingsView: View {
                     Text("\(count) selectable models")
                         .font(.caption)
                         .foregroundColor(.secondary)
-                    if AntigravityCLILocator.installedCommand() == nil {
-                        Text("Install and sign in with agy to also use Antigravity in Oracle and Built-in Chat.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
+                } else if viewModel.antigravitySetupStatus == .installed {
+                    Text("Use Test Connection or start an Agent Mode session to complete Google sign-in if needed.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                 } else {
                     Text("Install the Antigravity CLI, run agy to sign in, then test the connection.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
+                if viewModel.isAntigravityRuntimeInstalled, AntigravityCLILocator.installedCommand() == nil {
+                    Text("Install and sign in with agy to also use Antigravity in Oracle and Built-in Chat.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
