@@ -1,4 +1,5 @@
 import RepoPromptACPProviders
+import RepoPromptPersistence
 import RepoPromptSettingsCore
 import RepoPromptShared
 
@@ -742,6 +743,12 @@ class WindowStatesManager: ObservableObject {
         let store = AgentSessionOversightIntentStore.production(mode: mode, restorePerfRecorder: AppWorkspaceRestorePerfRecorder())
         // Delegation scopes share the oversight persistence mode: suppressed launches touch no file.
         let scopeStore = DelegationScopeStore.production(mode: mode)
+        if mode != .suppressed {
+            let directory = OverseerContinuityRepository.production().databaseURL.deletingLastPathComponent()
+            AgentSessionLinkRuntimeBridge.shared.installActivityRecorder(
+                AgentSessionLinkActivityRecorder(databaseURL: directory.appendingPathComponent("link-activity.sqlite"))
+            )
+        }
         Task { @MainActor in
             await AgentSessionLinkRuntimeBridge.shared.bootstrapContinuity(scopeStore: scopeStore, intentStore: store)
             await AgentSessionLinkRuntimeBridge.shared.worktreeOwnership.bootstrapProduction(mode: mode)

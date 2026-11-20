@@ -786,6 +786,7 @@ struct AgentSessionLinkMCPToolService {
             targetSessionIDs: request.sessionIDs
         )
 
+        let startedAt = Date()
         await bridge.refreshLaneBoardCensus(for: targets)
 
         var states: [DomainAgentSessionLinkTargetState] = []
@@ -829,6 +830,7 @@ struct AgentSessionLinkMCPToolService {
         // `managed` comes from the same final whole-batch fence that released the prompt bodies, so
         // it always agrees with whether `pending_interaction` could appear for that target.
         let managed = Set(inspections.keys)
+        bridge.activityRecorder?.record(.watch, links: targets.map(\.lease.activityLink), at: startedAt)
 
         if request.isSingle, let state = states.first {
             var payload: [String: Value] = [
@@ -1070,6 +1072,7 @@ struct AgentSessionLinkMCPToolService {
             Self.parseInt(args["max_output_bytes"])
         )
 
+        let startedAt = Date()
         let page: AgentSessionLinkTranscriptPage
         switch await bridge.transcriptPage(
             for: target,
@@ -1138,6 +1141,7 @@ struct AgentSessionLinkMCPToolService {
         ) {
         case let .success(state):
             cursorState = state
+            bridge.activityRecorder?.record(.watch, links: [target.lease.activityLink], at: startedAt)
         case let .failure(error):
             // Same indistinguishable denial as an unlinked UUID, and the same shutdown wording every
             // other op uses. A revoked link and a link that never existed must read alike.
