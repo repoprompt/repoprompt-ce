@@ -305,13 +305,13 @@ extension MCPWorktreeToolProvider {
         let sessionID = explicitID ?? resolved.snapshot.activeAgentSessionID
         // Capture before authorization suspends, but reveal liveness/admission failures only after
         // the existing routed/plain-caller authorization and argument checks.
-        let captured = Result { () throws -> (AgentSessionRuntimeStore.Command, AgentSessionWorktreeRuntime.Admission?) in
+        let captured = Result { () throws -> (AgentSessionRuntimeStore.Command, ExecutionAdmission?) in
             guard let sessionID,
                   let command = try dependencies.execution.requireTargetWindow().agentModeViewModel.runtimeCommand(sessionID: sessionID)
             else {
                 throw MCPError.invalidParams("The requested agent session is not currently available.")
             }
-            return try (command, needsResources ? command.writer.scope.worktrees.admit(command) : nil)
+            return (command, needsResources ? ExecutionAdmission(command) : nil)
         }
         let isRoutedAgentMode = await (try? dependencies.execution.requireAgentModeConnection(MCPWindowToolName.manageWorktree)) != nil
         if let raw {
@@ -323,9 +323,9 @@ extension MCPWorktreeToolProvider {
             throw MCPError.invalidParams("session_id is required for plain MCP callers.")
         }
         guard let sessionID else { throw MCPError.invalidParams("Current MCP routing does not resolve an active Agent session.") }
-        let (command, admission) = try captured.get()
+        let (command, capturedAdmission) = try captured.get()
         guard command.isCurrent else { throw AgentSessionWorktreeRuntime.TransitionError.stale }
-        try admission?.requireCurrent()
+        let admission = try await capturedAdmission?.resolve()
         return SessionResolution(sessionID: sessionID, isRoutedAgentMode: isRoutedAgentMode, command: command, admission: admission)
     }
 

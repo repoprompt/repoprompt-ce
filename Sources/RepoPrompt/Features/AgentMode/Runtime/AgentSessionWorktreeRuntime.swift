@@ -256,8 +256,8 @@ final class AgentSessionWorktreeRuntime {
             }
         }
         func revalidate() async throws {
-            try await resources.validatePlacement?()
             try await revalidateAuthority?()
+            try await resources.validatePlacement?()
             try requireCurrent()
         }
         if let startupContext { WorktreeStartupInstrumentation.record(.bindingTransitionStarted, context: startupContext) }

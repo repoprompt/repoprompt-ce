@@ -1363,7 +1363,8 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             return nil
         }
         let command = try host.scope.admit(session: f.session)
-        let admission = try await host.scope.worktrees.admitForExecution(command)
+        let captured = MCPWorktreeToolProvider.ExecutionAdmission(command)
+        let admission = try await captured.resolve()
         XCTAssertEqual(admission.command.identity, command.identity)
         XCTAssertNotNil(admission.resources.store)
         try admission.requireCurrent()
@@ -1379,19 +1380,34 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         XCTAssertEqual(result.disposition, .applied)
         let validatePlacement = try XCTUnwrap(admission.resources.validatePlacement)
         try await validatePlacement()
+        let afterPromptEdit = try await captured.resolve()
+        XCTAssertEqual(afterPromptEdit.command.identity, command.identity)
 
         let latest = await authority.canonicalWorkspaceSnapshot(command.identity.workspaceID)
         let edited = try XCTUnwrap(latest)
         changed.composeTabs[index].activeAgentSessionID = UUID()
-        let displaced = try await authority.replaceWorkingFailClosed(
-            changed, fileURL: edited.document.fileURL, expectedWorkspaceRevision: edited.revisions.workingRevision
-        )
-        XCTAssertEqual(displaced.disposition, .applied)
-        XCTAssertTrue(command.isCurrent, "The old writer can still exist while canonical placement changes")
         do {
-            try await validatePlacement()
-            XCTFail("A captured worktree operation must refuse a successor carrier")
-        } catch AgentSessionWorktreeRuntime.TransitionError.stale {}
+            try await MCPWorktreeToolProvider.commitAfterBindingAuthorization(
+                validatePlacement: validatePlacement,
+                revalidateAuthority: {
+                    let displaced = try await authority.replaceWorkingFailClosed(
+                        changed, fileURL: edited.document.fileURL, expectedWorkspaceRevision: edited.revisions.workingRevision
+                    )
+                    XCTAssertEqual(displaced.disposition, .applied)
+                    XCTAssertTrue(command.isCurrent, "The old writer can still exist while canonical placement changes")
+                },
+                commit: { XCTFail("A captured worktree operation must not commit against a successor carrier") }
+            )
+            XCTFail("Expected placement to be refused before effects")
+        } catch let refusal as DomainMutationRefusedBeforeEffects {
+            guard case AgentSessionWorktreeRuntime.TransitionError.stale = refusal.underlying else {
+                return XCTFail("Unexpected refusal: \(refusal.underlying)")
+            }
+        }
+        do {
+            _ = try await captured.resolve()
+            XCTFail("An MCP admission captured before authorization must not follow a successor carrier")
+        } catch AgentHostWorkspaceResources.Failure.contextUnavailable {}
         XCTAssertTrue(f.session.worktreeBindings.isEmpty)
     }
 
