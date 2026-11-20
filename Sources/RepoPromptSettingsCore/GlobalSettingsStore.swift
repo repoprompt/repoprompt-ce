@@ -996,6 +996,16 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         }
     }
 
+    package func respectGitignore() -> Bool {
+        scalarPreferences.fileSystem?.respectGitignore ?? true
+    }
+
+    package func setRespectGitignore(_ enabled: Bool, commit: Bool = true) {
+        updateFileSystemScalar(commit: commit) { settings in
+            settings.respectGitignore = enabled
+        }
+    }
+
     package func respectRepoIgnore() -> Bool {
         scalarPreferences.fileSystem?.respectRepoIgnore ?? true
     }

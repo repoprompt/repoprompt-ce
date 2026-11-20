@@ -6,6 +6,72 @@ import RepoPromptVCS
 import XCTest
 
 final class WorkspaceGitignorePolicyIdentityTests: XCTestCase {
+    func testGitignorePreferenceControlsSharedAgentCatalogWithoutDisablingRepositoryExcludes() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: #function)
+        defer { fixture.cleanup() }
+        let url = try fixture.makeRepository(named: "ignore-preference", files: ["README.md": "fixture\n"])
+        let layout = try XCTUnwrap(GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: url))
+        try fixture.write("RootIgnored.swift\n", to: ".gitignore", at: url)
+        try fixture.write("NestedIgnored.swift\n", to: "Nested/.gitignore", at: url)
+        try fixture.write("Excluded.swift\n", to: "info/exclude", at: layout.commonDir)
+        let toggledPaths = ["RootIgnored.swift", "Nested/NestedIgnored.swift"]
+        for path in toggledPaths + ["Excluded.swift", "Kept.swift"] {
+            try fixture.write("struct Fixture {}\n", to: path, at: url)
+        }
+
+        for respectGitignore in [true, false] {
+            let manager = IgnoreRulesManager(
+                globalIgnoreProvider: { "" },
+                ignorePolicyResolver: { try IgnoreRulePolicy.resolvingLoadedRoot($0) },
+                repositoryRootValidator: { $0 == url.resolvingSymlinksInPath().standardizedFileURL },
+                repositoryExcludeURL: { _ in layout.commonDir.appendingPathComponent("info/exclude") },
+                respectGitignore: { respectGitignore }
+            )
+            let store = WorkspaceFileContextStore(
+                host: .app(ignoreRulesManager: manager),
+                codemapRuntimeProvider: { throw CancellationError() },
+                codemapGitEligibilityProbe: .production(),
+                nonGitCodeMapsEnabled: false
+            )
+            let root = try await store.loadRoot(path: url.path)
+            let tree = await store.makeCurrentSnapshotFileTreePresentation(
+                selection: StoredSelection(),
+                request: .init(mode: .full, filePathDisplay: .relative, onlyIncludeRootsWithSelectedFiles: false, includeLegend: false),
+                lookupContext: .visibleWorkspace,
+                profile: .mcpRead
+            )
+            let search = await store.searchCatalogSnapshot()
+            let requests = toggledPaths.map {
+                WorkspacePathLookupRequest(userPath: $0, profile: .mcpSelection, rootScope: .visibleWorkspace)
+            }
+            let selection = await store.lookupSelectionPaths(requests)
+            let reader = WorkspaceReadableFileService(store: store)
+            let codemapSeeds = try await MCPCodeStructureRead.resolveFiles(
+                paths: toggledPaths,
+                store: store,
+                lookupRootScope: .visibleWorkspace,
+                maximumSeedCount: 10
+            )
+            XCTAssertEqual(codemapSeeds.map(\.standardizedRelativePath), respectGitignore ? [] : toggledPaths)
+            for path in toggledPaths {
+                let name = URL(fileURLWithPath: path).lastPathComponent
+                XCTAssertEqual(tree.content.contains(name), !respectGitignore)
+                XCTAssertEqual(search.files.contains(where: { $0.name == name }), !respectGitignore)
+                XCTAssertEqual(selection[path]?.file != nil, !respectGitignore)
+                let read = try await reader.resolveReadFileRequest(path)
+                if case .workspace = read {
+                    XCTAssertFalse(respectGitignore, path)
+                } else {
+                    XCTAssertTrue(respectGitignore, path)
+                }
+            }
+            XCTAssertTrue(tree.content.contains("Kept.swift"))
+            XCTAssertFalse(tree.content.contains("Excluded.swift"))
+            XCTAssertFalse(tree.content.contains(".git\u{002F}"))
+            await store.unloadRoot(id: root.id)
+        }
+    }
+
     func testCurrentIdentityUsesGitIgnoreFloorV4() {
         XCTAssertEqual(WorkspaceGitignorePolicyIdentity.current, .gitIgnoreFloorV4)
         XCTAssertEqual(

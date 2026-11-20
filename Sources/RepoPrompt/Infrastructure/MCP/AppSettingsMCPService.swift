@@ -15,7 +15,8 @@ final class AppSettingsMCPService: Service {
     static let toolName = MCPGlobalToolName.appSettings
     private static let humanOnlySettingKeys: Set<String> = [
         "agent_mode.codex_hook_approval_strict_mode_enabled",
-        "agent_mode.codex_hook_approval_strict_mode_workspace_overrides"
+        "agent_mode.codex_hook_approval_strict_mode_workspace_overrides",
+        "file_system.respect_gitignore"
     ]
 
     let domainRegistrationID = MCPDomainToolRegistrationID()
@@ -130,7 +131,7 @@ final class AppSettingsMCPService: Service {
 
         let settings: [Value] = await MainActor.run {
             definitions.map { definition in
-                definition.catalogValue(readingFrom: store, detailed: detailed)
+                definition.catalogValue(value: definition.read(store), detailed: detailed, writable: !Self.humanOnlySettingKeys.contains(definition.key))
             }
         }
 
@@ -570,7 +571,7 @@ private struct AppSettingDefinition: @unchecked Sendable {
         self.defaultOptionsAgent = defaultOptionsAgent
     }
 
-    func catalogValue(value: Value? = nil, detailed: Bool = true) -> Value {
+    func catalogValue(value: Value? = nil, detailed: Bool = true, writable: Bool = true) -> Value {
         var object: [String: Value] = [
             "key": .string(key),
             "group": .string(group),
@@ -578,7 +579,7 @@ private struct AppSettingDefinition: @unchecked Sendable {
         ]
         if detailed {
             object["description"] = .string(description)
-            object["writable"] = .bool(true)
+            object["writable"] = .bool(writable)
             if let label, !label.isEmpty {
                 object["label"] = .string(label)
             }
@@ -599,11 +600,6 @@ private struct AppSettingDefinition: @unchecked Sendable {
             object["value"] = value
         }
         return .object(object)
-    }
-
-    @MainActor
-    func catalogValue(readingFrom store: GlobalSettingsStore, detailed: Bool = true) -> Value {
-        catalogValue(value: read(store), detailed: detailed)
     }
 }
 
@@ -976,6 +972,14 @@ private enum AppSettingsMCPRegistry {
 
         // File-system / ignore preferences. Local .repo_ignore file content remains
         // repository content; this group exposes app-wide scalar behavior only.
+        boolSetting(
+            key: "file_system.respect_gitignore",
+            group: "file_system",
+            description: "Whether to honor .gitignore rules. Only a human can change this in RepoPrompt Settings.",
+            read: { .bool($0.respectGitignore()) },
+            write: { try $0.setRespectGitignore(requiredBool(from: $1)) },
+            afterWrite: fileSystemPreferencesDidChangeHook(key: "file_system.respect_gitignore")
+        ),
         boolSetting(
             key: "file_system.respect_repo_ignore",
             group: "file_system",
