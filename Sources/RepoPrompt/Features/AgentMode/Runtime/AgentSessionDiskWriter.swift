@@ -30,6 +30,12 @@ actor AgentSessionDiskWriter {
                 if errno == ENOENT { return nil }
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
+            let kind = info.st_mode & mode_t(S_IFMT)
+            // Let the existing atomic writer report a destination directory as a write
+            // failure. It is not a session payload to inspect, and a failed successor
+            // must not change the earlier write's receipt or established error contract.
+            if kind == mode_t(S_IFDIR) { return nil }
+            guard kind == mode_t(S_IFREG) else { throw POSIXError(.EINVAL) }
             return Self(
                 inode: info.st_ino, device: info.st_dev,
                 modifiedSeconds: info.st_mtimespec.tv_sec, modifiedNanoseconds: info.st_mtimespec.tv_nsec,
