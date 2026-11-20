@@ -3348,7 +3348,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             render: AgentSessionLinkPrompts.rendered
         ))
         XCTAssertEqual(reOwed.laneGuidanceMode, .full)
-        XCTAssertTrue(reOwed.fragment.contains("Guidance revision 14 supersedes"))
+        XCTAssertTrue(reOwed.fragment.contains("Guidance revision 15 supersedes"))
         XCTAssertEqual(reOwed.inventoryGuidanceRevision, AgentSessionLinkPrompts.currentInventoryGuidanceRevision)
         XCTAssertTrue(reOwed.fragment.contains("`compact`"))
         XCTAssertTrue(reOwed.fragment.contains("`stop`"))
@@ -6336,6 +6336,29 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
 
     /// The cap is a per-operation remaining horizon, never a lifetime cap, and the origin follows the
     /// deadline rather than the caller.
+    func testLongAgentSnoozeAndUserDeadlineRemainExact() throws {
+        let fixture = try makeFixture()
+        let clock = installSnoozeClock(fixture)
+        try publishInventory(fixture, revision: 1)
+        fixture.session.oversight.autoWakeOnUpdates = true
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1, targetIndices: [], laneIndices: [0], selectedTargetIndices: [0])
+        let agent = try requireSnoozeSuccess(mutateSnooze(fixture, endpoint: endpoint, command: .set(durationSeconds: 18000), origin: .agent))
+        XCTAssertEqual(agent.projection?.remainingSeconds, 18000)
+        XCTAssertFalse(AgentSessionLinkAutoWakeSnooze.uiDurationSeconds.contains(18000))
+        clock.advanceWithoutFiring(seconds: 600)
+        let remaining = try requireSnoozeSuccess(fixture.viewModel.agentSessionLinkAutoWakeSnoozeProjection(endpoint: endpoint, targetSessionID: Self.targetID(0), expectedReference: Self.laneReference(0)))
+        XCTAssertEqual(remaining?.remainingSeconds, 17400)
+        let user = try requireSnoozeSuccess(mutateSnooze(fixture, endpoint: endpoint, command: .set(durationSeconds: 86400), origin: .user))
+        XCTAssertEqual(user.projection?.remainingSeconds, 86400)
+        let shorter = try requireSnoozeSuccess(mutateSnooze(fixture, endpoint: endpoint, command: .set(durationSeconds: 60), origin: .agent))
+        XCTAssertEqual(shorter.change, .alreadySnoozed)
+        XCTAssertEqual(shorter.projection?.remainingSeconds, 86400)
+        XCTAssertEqual(shorter.projection?.origin, .user)
+        clock.advanceWithoutFiring(seconds: 86400)
+        XCTAssertNil(try requireSnoozeSuccess(fixture.viewModel.agentSessionLinkAutoWakeSnoozeProjection(endpoint: endpoint, targetSessionID: Self.targetID(0), expectedReference: Self.laneReference(0))))
+    }
+
     func testEachOperationCapsTheHorizonWhileRepeatedOperationsExtendIndefinitely() throws {
         let fixture = try makeFixture()
         let clock = installSnoozeClock(fixture)
@@ -6356,7 +6379,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
 
         XCTAssertEqual(AgentSessionLinkAutoWakeSnooze.defaultDurationSeconds, 600)
         XCTAssertEqual(AgentSessionLinkAutoWakeSnooze.minimumDurationSeconds, 60)
-        XCTAssertEqual(AgentSessionLinkAutoWakeSnooze.maximumDurationSeconds, 3600)
+        XCTAssertEqual(AgentSessionLinkAutoWakeSnooze.maximumDurationSeconds, 86400)
 
         let first = try requireSnoozeSuccess(mutateSnooze(
             fixture,
@@ -6382,25 +6405,25 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         let extended = try requireSnoozeSuccess(mutateSnooze(
             fixture,
             endpoint: endpoint,
-            command: .set(durationSeconds: 3600),
+            command: .set(durationSeconds: 86400),
             origin: .agent
         ))
         XCTAssertEqual(extended.change, .extended)
-        XCTAssertEqual(extended.projection?.remainingSeconds, 3600)
+        XCTAssertEqual(extended.projection?.remainingSeconds, 86400)
         XCTAssertEqual(extended.projection?.origin, .agent, "moving the deadline takes over the origin")
 
         clock.advanceWithoutFiring(seconds: 300)
         let againExtended = try requireSnoozeSuccess(mutateSnooze(
             fixture,
             endpoint: endpoint,
-            command: .set(durationSeconds: 3600),
+            command: .set(durationSeconds: 86400),
             origin: .user
         ))
         XCTAssertEqual(againExtended.change, .extended)
         XCTAssertEqual(
             againExtended.projection?.remainingSeconds,
-            3600,
-            "no single operation ever leaves more than an hour on the clock"
+            86400,
+            "no single operation ever leaves more than 24 hours on the clock"
         )
         XCTAssertEqual(againExtended.projection?.origin, .user)
 
@@ -6419,7 +6442,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             laneIndex: 1,
             command: .set(durationSeconds: 100_000)
         ))
-        XCTAssertEqual(clampedHigh.projection?.remainingSeconds, 3600)
+        XCTAssertEqual(clampedHigh.projection?.remainingSeconds, 86400)
     }
 
     func testSnoozeMutationRefusesAStaleGenerationWrongTargetOrRetiredObserver() throws {

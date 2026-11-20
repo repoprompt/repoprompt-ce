@@ -679,18 +679,18 @@ enum AgentMonitorAutoWakeSnoozeCopy {
         return "Expires today at \(time)."
     }
 
-    static func minutes(forSeconds seconds: Int) -> Int {
-        max(1, seconds / 60)
+    static func durationLabel(seconds: Int) -> String {
+        AgentMonitorPeriodicWakeCopy.optionLabel(seconds: seconds)
     }
 
     static func setOptionLabel(seconds: Int) -> String {
-        "Snooze for \(minutes(forSeconds: seconds)) minutes"
+        "Snooze for \(durationLabel(seconds: seconds))"
     }
 
     /// `at least`, because the server keeps the later of the two deadlines: the horizon the user
     /// picks is a floor, never a replacement.
     static func extendOptionLabel(seconds: Int) -> String {
-        "Extend to at least \(minutes(forSeconds: seconds)) minutes from now"
+        "Extend to at least \(durationLabel(seconds: seconds)) from now"
     }
 
     /// The offers worth showing: everything when nothing is snoozed, and only the horizons that
@@ -711,8 +711,8 @@ enum AgentMonitorAutoWakeSnoozeCopy {
     ) -> String {
         isExtension
             ? "Extend status Auto-wake snooze for \(displayName) to at least "
-            + "\(minutes(forSeconds: seconds)) minutes from now"
-            : "Snooze status Auto-wake for \(displayName) for \(minutes(forSeconds: seconds)) minutes"
+            + "\(durationLabel(seconds: seconds)) from now"
+            : "Snooze status Auto-wake for \(displayName) for \(durationLabel(seconds: seconds))"
     }
 
     static func menuAccessibilityLabel(displayName: String) -> String {

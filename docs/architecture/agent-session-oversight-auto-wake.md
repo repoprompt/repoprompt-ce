@@ -1192,6 +1192,14 @@ A snooze is observer-local policy on one exact lane. It is keyed by
 owning `AgentTabSession`, and dies with that incarnation — a rebind, unlink/relink, or relaunch
 always starts unsnoozed.
 
+Both user and agent requests use a 60–86,400-second clamp, with a 600-second default.
+The user menu reuses the periodic idle interval choices and compact labels; agents may request any
+integer in the range, including durations absent from that menu. A set keeps the later of the active
+deadline and `now + duration`, so a shorter agent request preserves a longer user snooze and its
+origin. Poll reports the exact remaining seconds (rounded upward), not the nearest menu choice.
+Historical one-hour tool definitions pass through an outer schema migration; their exact-match
+anchors remain intact. Lane guidance revision 15 teaches the widened range.
+
 What it does: stops routine status and overflow on that lane from being reasons an automatic turn
 starts. One still-pending attention occurrence from that exact lane may bypass this snooze, master
 Auto-wake, and that lane's own toggle. It does not clear or shorten the snooze or change either
