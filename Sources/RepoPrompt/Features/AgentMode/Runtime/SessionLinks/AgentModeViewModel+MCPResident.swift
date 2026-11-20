@@ -107,6 +107,7 @@ extension AgentModeViewModel {
         guard mcpActivationTargetIsCurrent(target, ownership: ownership),
               agentSessionLinkPromptInventoryHoldsByEndpoint[target.endpoint] == nil
         else { throw MCPError.invalidParams(Self.mcpResidentTargetError) }
+        try Self.requireMCPSubscriptionAccountAdmission(target.session)
         let published = agentSessionLinkPromptInventoryBySessionID[target.endpoint.sessionID]
         let publishedLinks = published?.endpoint == target.endpoint && published?.inventory.isEmpty == false
         if authoritativeHasLinks || publishedLinks {
@@ -127,6 +128,14 @@ extension AgentModeViewModel {
         } else if Self.isMCPResidentAppOwned(session) {
             // A previously non-app-owned admission cannot silently capture its new owner.
             throw MCPError.invalidParams(Self.mcpResidentTargetError)
+        }
+    }
+
+    /// MCP authority permits targeting an exact session, not using its subscription account.
+    /// Do not add this check to status or transcript reads.
+    private static func requireMCPSubscriptionAccountAdmission(_ session: TabSession) throws {
+        guard !session.subscriptionAccountBinding.blocksProviderOperations else {
+            throw MCPError.invalidParams(AgentSessionSubscriptionBinding.notRunnableMessage)
         }
     }
 
@@ -207,6 +216,7 @@ extension AgentModeViewModel {
             throw MCPError.invalidParams(Self.mcpResidentTargetError)
         }
         let session = target.session
+        try Self.requireMCPSubscriptionAccountAdmission(session)
         let protectedPrompt = session.pendingApplyEditsReview != nil || session.pendingWorktreeMergeReview != nil
             || mcpRuntime.mcpPendingInteraction(for: session).map { $0.kind != .instruction } == true
         guard !protectedPrompt else { throw MCPError.invalidParams(Self.mcpResidentProtectedError) }
