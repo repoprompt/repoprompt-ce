@@ -273,3 +273,213 @@ final class ToolCardProjectionFenceTests: XCTestCase {
         }
     }
 }
+
+/// Saved transcripts drop tool args and reduce tool results to summaries. These tests pin that an
+/// `ask_user` card replayed from storage still shows the questions and answers, instead of the
+/// placeholder "Question / No response" a bare status summary produced.
+final class AgentAskUserTranscriptPersistenceTests: XCTestCase {
+    private let structuredArgs = """
+    {"title":"Phase 3 decisions","context":"Pricing and rollout depend on these.","questions":[\
+    {"id":"pricing","header":"Pricing","question":"Publish our own prices?","options":[{"label":"Yes","description":"Show them"},"No"]},\
+    {"id":"regions","question":"Which regions launch first?","allows_multiple":true},\
+    {"id":"later","question":"Anything else?"}]}
+    """
+
+    private let structuredResult = """
+    {"answers":{\
+    "pricing":{"answers":["Yes"],"selected_options":["Yes"],"custom_response":null,"skipped":false},\
+    "regions":{"answers":[],"selected_options":["JP","US"],"custom_response":"EU later","skipped":false},\
+    "later":{"answers":[],"selected_options":[],"custom_response":null,"skipped":true}},\
+    "timed_out":false,"skipped":false,"elapsed_seconds":42}
+    """
+
+    private func persistedResultJSON(args: String?, result: String) throws -> String {
+        let item = AgentChatItem.toolResult(name: "ask_user", argsJSON: args, resultJSON: result, isError: false, sequenceIndex: 1)
+        return try XCTUnwrap(AgentToolResultPersistencePolicy.persistedToolResultSummary(for: item)).resultJSON
+    }
+
+    func testPersistedSummaryKeepsQuestionsAndAnswersForTheSavedCard() throws {
+        let persisted = try persistedResultJSON(args: structuredArgs, result: structuredResult)
+        XCTAssertLessThanOrEqual(persisted.utf8.count, AgentToolResultPersistencePolicy.maxPersistedToolSummaryBytes)
+
+        // Saved transcripts carry no args, so the card must render from the persisted result alone.
+        let card = parseAskUserQuestionSummaryRobust(args: nil, result: persisted)
+        XCTAssertFalse(card.detailsUnavailable)
+        XCTAssertEqual(card.displayTitle, "Phase 3 decisions (3 questions)")
+        XCTAssertEqual(card.questions.map(\.header), ["Pricing", nil, nil])
+        XCTAssertEqual(
+            card.questions.map(\.question),
+            ["Publish our own prices?", "Which regions launch first?", "Anything else?"]
+        )
+        XCTAssertEqual(card.questions.map(\.answer), ["Yes", "JP, US, EU later", "Skipped"])
+        XCTAssertNil(card.statusText)
+    }
+
+    func testPersistedRecordIsAFixedPointUnderResanitization() throws {
+        let first = try persistedResultJSON(args: structuredArgs, result: structuredResult)
+        let second = try persistedResultJSON(args: nil, result: first)
+        XCTAssertEqual(second, first)
+    }
+
+    func testProviderFormattedAndEnvelopedResultsPersistTheSameRecord() throws {
+        let raw = try persistedResultJSON(args: structuredArgs, result: structuredResult)
+        let fenced = "```json\n\(structuredResult)\n```"
+        let response = try JSONDecoder().decode(Value.self, from: Data(structuredResult.utf8))
+        let content = ToolOutputFormatter.buildContentBlocks(
+            toolName: "ask_user", args: [:], result: response, emitResources: false
+        )
+        let envelope = try String(
+            decoding: JSONEncoder().encode(["Ok": CallTool.Result(content: content, isError: false)]),
+            as: UTF8.self
+        )
+
+        XCTAssertEqual(try persistedResultJSON(args: structuredArgs, result: fenced), raw)
+        XCTAssertEqual(try persistedResultJSON(args: structuredArgs, result: envelope), raw)
+    }
+
+    func testOversizedExchangeIsClippedWithinTheBudget() throws {
+        let longText = String(repeating: "long question text ", count: 60)
+        let questions = (1 ... 10).map { #"{"id":"q\#($0)","header":"\#(longText)","question":"\#(longText)"}"# }
+        let answers = (1 ... 10).map { #""q\#($0)":{"answers":["\#(longText)"],"skipped":false}"# }
+        let args = #"{"title":"\#(longText)","questions":[\#(questions.joined(separator: ","))]}"#
+        let result = #"{"answers":{\#(answers.joined(separator: ","))},"timed_out":false,"skipped":false}"#
+
+        let persisted = try persistedResultJSON(args: args, result: result)
+        XCTAssertLessThanOrEqual(persisted.utf8.count, AgentToolResultPersistencePolicy.maxPersistedToolSummaryBytes)
+        let card = parseAskUserQuestionSummaryRobust(args: nil, result: persisted)
+        XCTAssertEqual(card.questions.count, 10)
+        for question in card.questions {
+            XCTAssertTrue(question.question.hasSuffix("…"))
+            XCTAssertTrue(question.answer?.hasSuffix("…") == true)
+        }
+        XCTAssertEqual(try persistedResultJSON(args: nil, result: persisted), persisted)
+    }
+
+    func testLongIDsSharingAPrefixKeepTheirOwnAnswers() throws {
+        let prefix = String(repeating: "x", count: 63) + " "
+        let args = #"{"questions":[{"id":"\#(prefix)a","question":"First?"},{"id":"\#(prefix)b","question":"Second?"}]}"#
+        let result = #"{"answers":{"\#(prefix)a":{"answers":["one"]},"\#(prefix)b":{"answers":["two"]}},"timed_out":false,"skipped":false}"#
+
+        let persisted = try persistedResultJSON(args: args, result: result)
+        let card = parseAskUserQuestionSummaryRobust(args: nil, result: persisted)
+        XCTAssertEqual(card.questions.map(\.answer), ["one", "two"])
+        XCTAssertEqual(try persistedResultJSON(args: nil, result: persisted), persisted)
+    }
+
+    func testMultibyteHeavyExchangeKeepsEveryRowAcrossPasses() throws {
+        let emoji = String(repeating: "🧪", count: 48)
+        let questions = (1 ... 10).map { #"{"id":"q\#($0)","question":"\#(emoji)"}"# }
+        let answers = (1 ... 10).map { #""q\#($0)":{"answers":["\#(emoji)"]}"# }
+        let args = #"{"questions":[\#(questions.joined(separator: ","))]}"#
+        let result = #"{"answers":{\#(answers.joined(separator: ","))},"timed_out":false,"skipped":false}"#
+
+        let persisted = try persistedResultJSON(args: args, result: result)
+        XCTAssertLessThanOrEqual(persisted.utf8.count, AgentToolResultPersistencePolicy.maxPersistedToolSummaryBytes)
+        let card = parseAskUserQuestionSummaryRobust(args: nil, result: persisted)
+        XCTAssertEqual(card.questions.count, 10)
+        XCTAssertTrue(card.questions.allSatisfy { $0.answer?.hasPrefix("🧪") == true })
+        XCTAssertEqual(try persistedResultJSON(args: nil, result: persisted), persisted)
+    }
+
+    func testEnvelopePrefersStructuredContentOverConflictingText() throws {
+        let decoy = #"{"answers":{"pricing":{"answers":["decoy"]}},"timed_out":false,"skipped":false}"#
+        let canonical = #"{"answers":{"pricing":{"answers":["canonical"]}},"timed_out":false,"skipped":false}"#
+        let decoyText = try String(decoding: JSONEncoder().encode(decoy), as: UTF8.self)
+        let envelope = """
+        {"Ok":{"content":[{"type":"text","text":\(decoyText)}],\
+        "isError":false,"structuredContent":\(canonical)}}
+        """
+
+        let card = try parseAskUserQuestionSummaryRobust(args: nil, result: persistedResultJSON(args: structuredArgs, result: envelope))
+        XCTAssertEqual(card.questions.first?.answer, "canonical")
+    }
+
+    func testLegacyScalarExchangePersistsItsQuestionAndResponse() throws {
+        let args = #"{"question":"Which database?","options":["Postgres","SQLite"]}"#
+        let result = """
+        {"answers":{"response":{"answers":["Postgres"],"selected_options":["Postgres"],"custom_response":null,"skipped":false}},\
+        "response":"Postgres","timed_out":false,"skipped":false,"elapsed_seconds":3}
+        """
+
+        let card = try parseAskUserQuestionSummaryRobust(args: nil, result: persistedResultJSON(args: args, result: result))
+        XCTAssertEqual(card.questions.map(\.question), ["Which database?"])
+        XCTAssertEqual(card.questions.map(\.answer), ["Postgres"])
+    }
+
+    func testTimedOutExchangeKeepsItsStatus() throws {
+        let result = #"{"answers":{"pricing":{"answers":["No"],"skipped":false}},"timed_out":true,"skipped":false}"#
+        let card = try parseAskUserQuestionSummaryRobust(args: nil, result: persistedResultJSON(args: structuredArgs, result: result))
+        XCTAssertEqual(card.questions.map(\.answer), ["No", "No response (timed out)", "No response (timed out)"])
+        XCTAssertEqual(card.statusText, "Timed out")
+    }
+
+    func testSkippedInteractionKeepsItsStatus() throws {
+        let result = #"{"answers":{},"timed_out":false,"skipped":true}"#
+        let card = try parseAskUserQuestionSummaryRobust(args: nil, result: persistedResultJSON(args: structuredArgs, result: result))
+        XCTAssertEqual(card.questions.map(\.answer), ["Skipped", "Skipped", "Skipped"])
+        XCTAssertEqual(card.statusText, "Skipped")
+    }
+
+    func testLegacyStatusOnlyRecordRendersAnUnavailableStateInsteadOfAPlaceholderAnswer() {
+        let legacy = #"{"status":"success","summary_only":true,"summary_text":"ask_user • success"}"#
+        let card = parseAskUserQuestionSummaryRobust(args: nil, result: legacy)
+        XCTAssertTrue(card.detailsUnavailable)
+        XCTAssertTrue(card.questions.isEmpty)
+        XCTAssertEqual(card.displayTitle, "Question")
+    }
+
+    func testTranscriptPersistenceDropsArgsButKeepsTheExchange() throws {
+        let startedAt = Date(timeIntervalSince1970: 0)
+        let execution = AgentTranscriptToolExecution(
+            stableExecutionID: "exec-ask-user",
+            toolName: "mcp__RepoPrompt__ask_user",
+            invocationID: UUID(),
+            argsJSON: structuredArgs,
+            resultJSON: structuredResult,
+            toolIsError: false,
+            status: .success
+        )
+        let activity = AgentTranscriptActivity(
+            id: UUID(),
+            timestamp: startedAt,
+            sequenceIndex: 1,
+            role: .toolExecution,
+            itemKind: .toolResult,
+            text: structuredResult,
+            toolExecution: execution
+        )
+        let transcript = AgentTranscript(
+            turns: [
+                AgentTranscriptTurn(
+                    id: UUID(),
+                    request: AgentTranscriptRequestAnchor(from: AgentChatItem.user("request", sequenceIndex: 0)),
+                    responseSpans: [
+                        AgentTranscriptProviderResponseSpan(
+                            lifecycle: .completed,
+                            startedAt: startedAt,
+                            lastActivityAt: startedAt,
+                            completedAt: startedAt,
+                            activities: [activity]
+                        )
+                    ],
+                    retentionTier: .full,
+                    terminalState: .completed,
+                    startedAt: startedAt,
+                    lastActivityAt: startedAt,
+                    completedAt: startedAt
+                )
+            ],
+            nextSequenceIndex: 2
+        )
+
+        let persisted = AgentToolResultPersistencePolicy.sanitizeTranscriptForPersistence(transcript)
+        let persistedActivity = try XCTUnwrap(persisted.turns.first?.responseSpans.first?.activities.first)
+        let persistedExecution = try XCTUnwrap(persistedActivity.toolExecution)
+        XCTAssertNil(persistedExecution.argsJSON)
+
+        let row = persistedActivity.toItem()
+        let card = parseAskUserQuestionSummaryRobust(args: row.toolArgsJSON, result: row.toolResultJSON)
+        XCTAssertEqual(card.questions.map(\.answer), ["Yes", "JP, US, EU later", "Skipped"])
+        XCTAssertEqual(AgentToolResultPersistencePolicy.sanitizeTranscriptForPersistence(persisted), persisted)
+    }
+}
