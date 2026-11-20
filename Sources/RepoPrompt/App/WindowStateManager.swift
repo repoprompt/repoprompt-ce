@@ -692,6 +692,7 @@ class WindowStatesManager: ObservableObject {
         let id: UUID
         let excludeWindowIDs: Set<Int>
         let expectedInitialRefreshDeferralID: UUID?
+        let restoreWorkspaceID: UUID?
         let continuation: CheckedContinuation<WindowState, Error>
 
         var defersInitialAgentSystemWorkspaceRefresh: Bool {
@@ -714,6 +715,57 @@ class WindowStatesManager: ObservableObject {
     private var restoreQueue: [WindowSessionEntry] = []
     private var hasLoadedRestoreSession = false
     private var restorePersistenceGate = WindowSessionRestorePersistenceGate()
+    private struct WorkspaceLinkRestoreWaiter {
+        let workspaceID: UUID
+        let openedWindowID: Int?
+        let continuation: CheckedContinuation<Void, Never>
+    }
+
+    private var workspaceLinkRestoreWaiters: [UUID: WorkspaceLinkRestoreWaiter] = [:]
+
+    var isLoadingWindowRestoreSnapshot: Bool {
+        restorePersistenceGate.isRestoreSessionLoadPending
+    }
+
+    private func isWaitingForWindowRestore(workspaceID: UUID, openedWindowID: Int?) -> Bool {
+        if let openedWindowID {
+            return allWindows.contains { $0.windowID == openedWindowID && !$0.isClosing && $0.hasUnfinishedRestoreExecution }
+        }
+        // A legacy entry without a UUID can still resolve by name or path. Entries with another
+        // UUID cannot supply this workspace, so they need not hold the route through the grace.
+        return isLoadingWindowRestoreSnapshot || (
+            restorePersistenceGate.pendingRestoreEntryCount > 0 && restoreQueue.contains { $0.workspaceID == workspaceID || $0.workspaceID == nil }
+        ) || allWindows.contains { !$0.isClosing && $0.hasUnfinishedRestoreExecution }
+    }
+
+    /// Waits only if startup restore can still provide a window. Uses the same grace and failure
+    /// transitions as restore itself, so an entry whose window never registers does not block links.
+    @discardableResult
+    func waitForWindowRestoreBeforeWorkspaceLink(workspaceID: UUID, openedWindowID: Int? = nil) async -> Bool {
+        guard !isTerminating, !Task.isCancelled, isWaitingForWindowRestore(workspaceID: workspaceID, openedWindowID: openedWindowID) else { return false }
+        let id = UUID()
+        await withTaskCancellationHandler {
+            while !isTerminating, !Task.isCancelled, isWaitingForWindowRestore(workspaceID: workspaceID, openedWindowID: openedWindowID) {
+                await withCheckedContinuation { continuation in
+                    workspaceLinkRestoreWaiters[id] = WorkspaceLinkRestoreWaiter(
+                        workspaceID: workspaceID, openedWindowID: openedWindowID, continuation: continuation
+                    )
+                }
+            }
+        } onCancel: { [weak self] in
+            Task { @MainActor in
+                self?.workspaceLinkRestoreWaiters.removeValue(forKey: id)?.continuation.resume()
+            }
+        }
+        return true
+    }
+
+    private func resumeWorkspaceLinkRestoreWaitersIfReady() {
+        for (id, waiter) in workspaceLinkRestoreWaiters where isTerminating || !isWaitingForWindowRestore(workspaceID: waiter.workspaceID, openedWindowID: waiter.openedWindowID) {
+            workspaceLinkRestoreWaiters.removeValue(forKey: id)
+            waiter.continuation.resume()
+        }
+    }
 
     /// Why the restore gate became idle, published for automatic oversight restoration.
     ///
@@ -749,7 +801,8 @@ class WindowStatesManager: ObservableObject {
     }
 
     /// Recomputes and republishes the reason-aware topology state.
-    private func updateAgentSessionOversightTopologyState() {
+    private func updateWindowRestoreConsumers() {
+        resumeWorkspaceLinkRestoreWaitersIfReady()
         let state = computeAgentSessionOversightTopologyState()
         guard state != agentSessionOversightRestoreTopologyState else {
             notifyAgentSessionLinkTopologyChanged()
@@ -771,7 +824,7 @@ class WindowStatesManager: ObservableObject {
     }
 
     func windowRestoreExecutionDidChange() {
-        updateAgentSessionOversightTopologyState()
+        updateWindowRestoreConsumers()
     }
 
     func claimInitialRefreshDeferralForNewWindow() -> WindowInitialRefreshDeferral? {
@@ -821,7 +874,7 @@ class WindowStatesManager: ObservableObject {
             #if DEBUG
                 WorkspaceRestorePerfLog.log("restore.session skipped reason=autoRestoreDisabled registeredWindows=\(allWindows.count)")
             #endif
-            updateAgentSessionOversightTopologyState()
+            updateWindowRestoreConsumers()
             return
         }
 
@@ -856,7 +909,7 @@ class WindowStatesManager: ObservableObject {
                 }
                 self.flushDeferredWindowSessionPersistIfRestoreIdle()
                 self.scheduleLeftoverRestoreEntryGraceReleaseIfNeeded()
-                self.updateAgentSessionOversightTopologyState()
+                self.updateWindowRestoreConsumers()
                 #if DEBUG
                     if let applyStartMS {
                         WorkspaceRestorePerfLog.log(
@@ -908,7 +961,10 @@ class WindowStatesManager: ObservableObject {
     ///
     /// - Returns: The newly created `WindowState`
     /// - Throws: `WindowOpenError.openerUnavailable` if no opener is installed
-    func openNewMainWindow(deferringInitialAgentSystemWorkspaceRefresh: Bool = false) async throws -> WindowState {
+    func openNewMainWindow(
+        deferringInitialAgentSystemWorkspaceRefresh: Bool = false,
+        matchingRestoreWorkspaceID: UUID? = nil
+    ) async throws -> WindowState {
         // Capture existing window IDs to identify the new one
         let excludeWindowIDs = Set(allWindows.map(\.windowID))
         let waiterID = UUID()
@@ -927,6 +983,7 @@ class WindowStatesManager: ObservableObject {
                     id: waiterID,
                     excludeWindowIDs: excludeWindowIDs,
                     expectedInitialRefreshDeferralID: refreshDeferral?.id,
+                    restoreWorkspaceID: matchingRestoreWorkspaceID,
                     continuation: continuation
                 ))
 
@@ -986,14 +1043,15 @@ class WindowStatesManager: ObservableObject {
     }
 
     /// Notifies waiters when a new window is registered.
-    private func notifyWindowOpenWaiters(newState: WindowState) {
-        guard let index = windowOpenWaiterIndex(for: newState) else { return }
+    private func notifyWindowOpenWaiters(newState: WindowState) -> UUID? {
+        guard let index = windowOpenWaiterIndex(for: newState) else { return nil }
 
         let waiter = windowOpenWaiters.remove(at: index)
         if waiter.defersInitialAgentSystemWorkspaceRefresh {
             verifyInitialRefreshDeferralClaim(waiter: waiter, newState: newState)
         }
         waiter.continuation.resume(returning: newState)
+        return waiter.restoreWorkspaceID
     }
 
     private func windowOpenWaiterIndex(for newState: WindowState) -> Int? {
@@ -1056,9 +1114,16 @@ class WindowStatesManager: ObservableObject {
         state.agentModeViewModel.finishInitialSystemWorkspaceSessionListRefreshDeferral(refreshIfStillSystem: true)
     }
 
-    private func applyNextRestoreEntryIfAvailable(to state: WindowState) {
-        guard !restoreQueue.isEmpty else { return }
-        let entry = restoreQueue.removeFirst()
+    private func applyNextRestoreEntryIfAvailable(to state: WindowState, matching workspaceID: UUID? = nil) {
+        // A workspace link may open a new window after the startup grace period. It can satisfy
+        // an unclaimed entry for its own target without consuming another workspace's entry.
+        let index = if let workspaceID {
+            restoreQueue.firstIndex { $0.workspaceID == workspaceID }
+        } else {
+            restoreQueue.indices.first
+        }
+        guard let index else { return }
+        let entry = restoreQueue.remove(at: index)
         #if DEBUG
             WorkspaceRestorePerfLog.log(
                 "restore.entry assign windowID=\(state.windowID) workspaceID=\(WorkspaceRestorePerfLog.shortID(entry.workspaceID)) workspaceName=\(entry.workspaceName ?? "nil") isSystem=\(entry.isSystemWorkspace) remainingQueue=\(restoreQueue.count) registeredWindows=\(allWindows.count)"
@@ -1075,7 +1140,7 @@ class WindowStatesManager: ObservableObject {
             guard let self else { return }
             restorePersistenceGate.finishRestoringWindow(windowID)
             flushDeferredWindowSessionPersistIfRestoreIdle()
-            updateAgentSessionOversightTopologyState()
+            updateWindowRestoreConsumers()
         }
     }
 
@@ -1110,7 +1175,7 @@ class WindowStatesManager: ObservableObject {
         NotificationCenter.default.post(name: .windowCountDidChange, object: nil)
 
         // Notify any waiters for programmatic window creation
-        notifyWindowOpenWaiters(newState: state)
+        let restoreWorkspaceID = notifyWindowOpenWaiters(newState: state)
 
         // Listen for focus changes in the window state:
         state.onFocusChanged = { [weak self] isFocused in
@@ -1154,7 +1219,7 @@ class WindowStatesManager: ObservableObject {
             persistWindowSession(reason: "settledProjectedWorkspaceSelection")
         }
 
-        applyNextRestoreEntryIfAvailable(to: state)
+        applyNextRestoreEntryIfAvailable(to: state, matching: restoreWorkspaceID)
 
         // Assign an initial instance number if the workspace is already set
         if let ws = state.workspaceManager.activeWorkspace {
@@ -1183,7 +1248,7 @@ class WindowStatesManager: ObservableObject {
         // Bootstrapped after the bridge has a host, so the launch load's presentation and worklist
         // land on a manager that can already broadcast and enumerate.
         bootstrapAgentSessionOversightIntentStoreIfNeeded()
-        updateAgentSessionOversightTopologyState()
+        updateWindowRestoreConsumers()
         persistWindowSession(reason: "registerWindow")
         #if DEBUG
             if let registerStartMS {
@@ -1213,7 +1278,7 @@ class WindowStatesManager: ObservableObject {
 
         // Skip notifications and updates during termination to prevent observation crashes
         guard !isTerminating else { return }
-        updateAgentSessionOversightTopologyState()
+        updateWindowRestoreConsumers()
 
         // Notify that window count changed
         NotificationCenter.default.post(name: .windowCountDidChange, object: nil)
@@ -1304,7 +1369,7 @@ class WindowStatesManager: ObservableObject {
         abandonedRestoreEntryCount = max(abandonedRestoreEntryCount, restorePersistenceGate.pendingRestoreEntryCount)
         restorePersistenceGate.abandonPendingRestoreEntries()
         flushDeferredWindowSessionPersistIfRestoreIdle()
-        updateAgentSessionOversightTopologyState()
+        updateWindowRestoreConsumers()
     }
 
     /// Keep queued entries after the grace period releases persistence. Claiming an
@@ -1398,6 +1463,7 @@ class WindowStatesManager: ObservableObject {
                     self.closingWindowReferences.compactMap(\.value)
             )
             self.isTerminating = true
+            self.resumeWorkspaceLinkRestoreWaitersIfReady()
             // Before any async teardown: `stopAllServers()` clears each window's MCP tools request,
             // and the final session writes must still record the user's per-window switch (#143).
             for window in self.terminationWindowSnapshot {

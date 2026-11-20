@@ -352,6 +352,7 @@ final class AppDeepLinkRouter {
                 && window.workspaceManager.activeWorkspaceSwitch == nil && window.workspaceManager.activeWorkspaceID == id
         }
         func matchingWindow() -> WindowState? {
+            guard !windowStatesManager.isLoadingWindowRestoreSnapshot else { return nil }
             let ordered = NSApp?.orderedWindows ?? []
             var positions: [ObjectIdentifier: Int] = [:]
             for (index, window) in ordered.enumerated() {
@@ -359,7 +360,7 @@ final class AppDeepLinkRouter {
                 if positions[key] == nil { positions[key] = index }
             }
             return Self.preferredWorkspaceWindow(windowStatesManager.allWindows) { window in
-                guard isShowing(window), let native = window.nsWindow else { return nil }
+                guard isShowing(window), !window.hasUnfinishedRestoreExecution, let native = window.nsWindow else { return nil }
                 let displaysHint = route.tabID.map { tab in
                     window.promptManager.activeComposeTabID == tab && (
                         route.sessionID == nil
@@ -378,10 +379,15 @@ final class AppDeepLinkRouter {
                   ), workspace.id == id, !workspace.isEphemeral, workspace.consolidatedIntoWorkspaceID == nil,
                   !self.windowStatesManager.isTerminating, !Task.isCancelled else { return nil }
             return workspace
-        }, matchingWindow: matchingWindow, open: { (workspace: WorkspaceModel) -> WindowState? in
-            guard let opened = try? await windowStatesManager.openNewMainWindow(deferringInitialAgentSystemWorkspaceRefresh: true) else { return nil }
+        }, matchingWindow: matchingWindow, waitForRestore: {
+            await windowStatesManager.waitForWindowRestoreBeforeWorkspaceLink(workspaceID: id)
+        }, open: { (workspace: WorkspaceModel) -> WindowState? in
+            guard !windowStatesManager.isTerminating, let opened = try? await windowStatesManager.openNewMainWindow(
+                deferringInitialAgentSystemWorkspaceRefresh: true, matchingRestoreWorkspaceID: id
+            ) else { return nil }
             defer { opened.agentModeViewModel.finishInitialSystemWorkspaceSessionListRefreshDeferral() }
             await opened.workspaceManager.awaitInitialized()
+            await windowStatesManager.waitForWindowRestoreBeforeWorkspaceLink(workspaceID: id, openedWindowID: opened.windowID)
             guard !windowStatesManager.isTerminating, !Task.isCancelled, !opened.isClosing,
                   windowStatesManager.allWindows.contains(where: { $0 === opened }) else { return nil }
             if let existing = matchingWindow() { return existing }
@@ -423,10 +429,16 @@ final class AppDeepLinkRouter {
 
     static func routeWorkspaceTarget<Workspace, Window>(
         resolve: () async -> Workspace?, matchingWindow: () -> Window?,
+        waitForRestore: () async -> Bool = { false },
         open: (Workspace) async -> Window?, show: (Window) async -> Void
     ) async {
         guard let workspace = await resolve(), !Task.isCancelled else { return }
-        if let existing = matchingWindow() {
+        var existing = matchingWindow()
+        if existing == nil, await waitForRestore() {
+            existing = matchingWindow()
+        }
+        guard !Task.isCancelled else { return }
+        if let existing {
             await show(existing)
         } else if let opened = await open(workspace), !Task.isCancelled {
             await show(opened)

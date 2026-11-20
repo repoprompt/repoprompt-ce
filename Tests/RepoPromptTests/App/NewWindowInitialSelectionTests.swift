@@ -27,6 +27,56 @@ import XCTest
 
         // MARK: Workspace links
 
+        func testWorkspaceLinkWaitsForRestoringWindowBeforeOpeningAnother() async throws {
+            try await Fixture.run { f in
+                let window = f.makeWindow()
+                let workspaceManager = window.workspaceManager
+                let initialResolution = f.holdInitialResolution(workspaceManager)
+                await window.joinDomainWorkspaceBridgeForTesting()
+
+                let windowStates = WindowStatesManager.makeForTesting(
+                    windowSessionFileURL: FileManager.default.temporaryDirectory
+                        .appendingPathComponent("workspace-link-\(UUID()).json")
+                )
+                window.windowStatesManager = windowStates
+                windowStates.registerWindowState(window)
+                defer { windowStates.unregisterWindowState(window) }
+
+                let targetID = Fixture.requestedID
+                window.applyWindowRestoreEntry(f.restoreEntry(for: targetID, window: window))
+                let routeWaiting = Signal("workspace link waiting for restore")
+                let routeFinished = Signal("workspace link finished")
+                var opened = 0
+                var focused: [Int] = []
+                let route = Task {
+                    defer { routeFinished.fire() }
+                    await AppDeepLinkRouter.routeWorkspaceTarget(resolve: { targetID }, matchingWindow: {
+                        workspaceManager.activeWorkspaceID == targetID && !window.hasUnfinishedRestoreExecution
+                            ? window.windowID : nil
+                    }, waitForRestore: {
+                        routeWaiting.fire()
+                        return await windowStates.waitForWindowRestoreBeforeWorkspaceLink(workspaceID: targetID)
+                    }, open: { _ in
+                        opened += 1
+                        return nil
+                    }, show: { focused.append($0) })
+                }
+                defer { route.cancel() }
+                try await f.wait(routeWaiting)
+                XCTAssertEqual(opened, 0)
+                XCTAssertTrue(focused.isEmpty)
+                initialResolution.gate.release()
+                await workspaceManager.awaitInitialized()
+                window.restartDomainWorkspaceProjectionForTesting()
+                try await f.awaitCatalogProjection(window)
+                try await f.wait(routeFinished)
+                await route.value
+                XCTAssertEqual(workspaceManager.activeWorkspaceID, targetID)
+                XCTAssertEqual(opened, 0)
+                XCTAssertEqual(focused, [window.windowID])
+            }
+        }
+
         func testWorkspaceLinkSilentSwitchRestoresTabsAndIgnoresMissingSession() async throws {
             final class ActiveWork: WorkspaceSwitchSessionProvider {
                 var count = 1
