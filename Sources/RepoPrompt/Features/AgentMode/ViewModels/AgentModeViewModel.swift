@@ -2769,6 +2769,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
         installAdministrationComposition(runtimeSessionStore.administration)
         installWorktreeComposition(runtimeSessionStore.worktrees)
+        installLegacyLinkExecution()
         configureCodexRuntime(codexCoordinator)
         observeCodexComputerUseSetting()
         claudeCoordinator.installHostCapabilities(
@@ -2986,6 +2987,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
             installAdministrationComposition(runtimeSessionStore.administration)
             installWorktreeComposition(runtimeSessionStore.worktrees)
+            installLegacyLinkExecution()
             configureCodexRuntime(codexCoordinator)
             observeCodexComputerUseSetting()
             claudeCoordinator.installHostCapabilities(
@@ -3037,10 +3039,21 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         sessionListCacheGeneration &+= 1
     }
 
+    var linkExecutionRuntime: AgentSessionLinkExecutionRuntime {
+        guard let runtime = runtimeSessionStore.linkExecution else {
+            preconditionFailure("Link execution must be installed by host composition before presentation.")
+        }
+        return runtime
+    }
+
     /// Transitional app composition for the scope-owned link executor. Only the remaining
     /// canonical admission/start/switch commands depend on this adapter; inventories, claims,
     /// route proof, wake tasks, snoozes and physical settlement live in the runtime.
-    lazy var linkExecutionRuntime: AgentSessionLinkExecutionRuntime = {
+    private func installLegacyLinkExecution() {
+        _ = persistenceRuntime
+        _ = attachmentRuntime
+        _ = mcpRuntime
+        _ = draftRuntime
         let runtime = runtimeSessionStore.makeLinkExecution(routeID: windowID, commands: .init(
             isAvailable: { [weak self] in self != nil },
             modelAvailability: { [weak apiSettings = promptManager?.apiSettingsViewModel] in apiSettings?.agentAvailability },
@@ -3100,10 +3113,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         runtime.perfRecorder = perfRecorder
         runtime.displayProps = { [weak self] endpoint in self?.monitorPillPropsByEndpoint[endpoint] }
-        _ = mcpRuntime
-        _ = persistenceRuntime
-        return runtime
-    }()
+    }
 
     var interactionRuntime: AgentSessionInteractionRuntime {
         let runtime = runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore)
@@ -3490,10 +3500,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     /// Composition installs concrete execution services independently of the optional UI attachment.
     func configureCodexRuntime(_ coordinator: CodexAgentModeCoordinator) {
-        _ = persistenceRuntime
-        _ = attachmentRuntime
-        _ = mcpRuntime
-        _ = draftRuntime
         runtimeHost.installCodexRuntime(
             coordinator, routeID: windowID, approvalStore: applyEditsApprovalStore,
             links: linkExecutionRuntime, mcpServerEnabler: mcpServerEnabler,
