@@ -182,6 +182,10 @@ private final class ContractFileStore: GlobalSettingsFileStoring {
         fileSystem: .init(globalIgnoreDefaults: "")
     ))
 
+    func readSnapshot() throws -> GlobalSettingsDocument? {
+        document
+    }
+
     func load() throws -> GlobalSettingsDocument {
         document
     }
