@@ -2324,54 +2324,8 @@ class WindowState: ObservableObject {
             }
         }
 
-        guard let activeWorkspace = workspaceManager.activeWorkspace,
-              activeWorkspace.id == route.workspaceID
-        else {
-            return .workspaceUnavailable
-        }
-
-        let tabIsActive = activeWorkspace.composeTabs.contains(where: { $0.id == route.tabID })
-        let tabIsStashed = activeWorkspace.stashedTabs.contains(where: { $0.tab.id == route.tabID })
-        guard tabIsActive || tabIsStashed else {
-            return .tabUnavailable
-        }
-
-        if let sessionID = route.sessionID {
-            let activationResult = await agentModeViewModel.activateRoutedAgentSession(
-                tabID: route.tabID,
-                sessionID: sessionID,
-                workspace: activeWorkspace
-            )
-            guard activationResult == .ready else {
-                return agentSessionRouteResult(for: activationResult)
-            }
-        }
-
-        if tabIsStashed {
-            guard await promptManager.restoreStashedComposeTab(containingTabID: route.tabID) != nil else {
-                return .tabUnavailable
-            }
-        } else if promptManager.activeComposeTabID != route.tabID {
-            await promptManager.switchComposeTab(route.tabID)
-        }
-
-        guard promptManager.activeComposeTabID == route.tabID else {
-            return .tabUnavailable
-        }
-        guard let finalWorkspace = workspaceManager.activeWorkspace,
-              finalWorkspace.id == route.workspaceID
-        else {
-            return .workspaceUnavailable
-        }
-        let finalActivationResult = await agentModeViewModel.activateRoutedAgentSession(
-            tabID: route.tabID,
-            sessionID: route.sessionID,
-            workspace: finalWorkspace
-        )
-        guard finalActivationResult == .ready else {
-            return agentSessionRouteResult(for: finalActivationResult)
-        }
-
+        let result = await navigateAgentDeepLinkTab(route.tabID, sessionID: route.sessionID, workspaceID: route.workspaceID)
+        guard result == .routed else { return result }
         if let window = nsWindow {
             window.makeKeyAndOrderFront(nil)
         } else {
@@ -2379,6 +2333,62 @@ class WindowState: ObservableObject {
         }
         if route.interactionID != nil {
             agentModeViewModel.notificationAttention.revealRequests.send(route.tabID)
+        }
+        return .routed
+    }
+
+    func navigateAgentDeepLinkTab(_ tabID: UUID, sessionID: UUID?, workspaceID: UUID, workspaceLink: Bool = false) async -> AgentSessionRouteResult {
+        guard let activeWorkspace = workspaceManager.activeWorkspace,
+              activeWorkspace.id == workspaceID
+        else {
+            return .workspaceUnavailable
+        }
+
+        let tabIsActive = activeWorkspace.composeTabs.contains(where: { $0.id == tabID })
+        let tabIsStashed = activeWorkspace.stashedTabs.contains(where: { $0.tab.id == tabID })
+        guard tabIsActive || tabIsStashed else {
+            return .tabUnavailable
+        }
+
+        if let sessionID {
+            let activationResult = await agentModeViewModel.activateRoutedAgentSession(
+                tabID: tabID,
+                sessionID: sessionID,
+                workspace: activeWorkspace,
+                workspaceLink: workspaceLink
+            )
+            guard activationResult == .ready else {
+                return agentSessionRouteResult(for: activationResult)
+            }
+        }
+
+        if workspaceLink, isClosing || Task.isCancelled || workspaceManager.activeWorkspaceID != workspaceID || workspaceManager.isSwitchingWorkspace {
+            return .workspaceUnavailable
+        }
+        if tabIsStashed {
+            guard await promptManager.restoreStashedComposeTab(containingTabID: tabID) != nil else {
+                return .tabUnavailable
+            }
+        } else if promptManager.activeComposeTabID != tabID {
+            await promptManager.switchComposeTab(tabID)
+        }
+
+        guard promptManager.activeComposeTabID == tabID else {
+            return .tabUnavailable
+        }
+        guard let finalWorkspace = workspaceManager.activeWorkspace,
+              finalWorkspace.id == workspaceID
+        else {
+            return .workspaceUnavailable
+        }
+        if workspaceLink { return .routed }
+        let finalActivationResult = await agentModeViewModel.activateRoutedAgentSession(
+            tabID: tabID,
+            sessionID: sessionID,
+            workspace: finalWorkspace
+        )
+        guard finalActivationResult == .ready else {
+            return agentSessionRouteResult(for: finalActivationResult)
         }
         return .routed
     }
