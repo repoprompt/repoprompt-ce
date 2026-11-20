@@ -40,7 +40,8 @@ enum AgentRepromptModelPolicy {
 
     static func supportsSideCall(_ model: AIModel) -> Bool {
         switch model.providerType {
-        case .cursor, .openCode, .devin, .grokBuild: false
+        // OpenCode's AI adapter sets the managed no-tools mode before prompting.
+        case .cursor, .devin, .grokBuild: false
         default: true
         }
     }
