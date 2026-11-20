@@ -458,10 +458,10 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
             ))
             fixture.session.selfCompactState = state
             var commitCalls = 0
-            let outcome = await steer(fixture) {
+            let outcome = await steer(fixture, commit: {
                 commitCalls += 1
                 return .committed
-            }
+            })
             XCTAssertEqual(outcome, .blocked(.targetNotIdle), phase.rawValue)
             XCTAssertEqual(commitCalls, 0, phase.rawValue)
             XCTAssertEqual(fixture.session.selfCompactState, state, "A steer must not cancel or park \(phase)")
@@ -484,10 +484,10 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
         let state = AgentSelfCompactState(active: .init(
             idempotencyKey: "scheduled-at-fence", note: "Continue after compacting."
         ))
-        let outcome = await steer(fixture) {
+        let outcome = await steer(fixture, commit: {
             fixture.session.selfCompactState = state
             return .committed
-        }
+        })
         XCTAssertEqual(outcome, .blocked(.targetNotIdle))
         XCTAssertEqual(fixture.session.selfCompactState, state)
         XCTAssertTrue(fixture.session.items.isEmpty)
@@ -499,10 +499,10 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
         let fixture = try makeFixture()
         fixture.session.beginACPBackgroundCompactionSettle(duration: 90)
         var commitCalls = 0
-        let outcome = await steer(fixture) {
+        let outcome = await steer(fixture, commit: {
             commitCalls += 1
             return .committed
-        }
+        })
         XCTAssertEqual(outcome, .blocked(.targetNotIdle))
         XCTAssertEqual(commitCalls, 0)
         XCTAssertTrue(fixture.session.items.isEmpty)
