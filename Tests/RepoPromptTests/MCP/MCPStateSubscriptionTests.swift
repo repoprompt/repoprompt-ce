@@ -105,6 +105,93 @@ private actor RouteHistoryScanner: HistorySessionScanning {
 /// `unsubscribeFromStateUpdates` finishes only that subscriber's stream, and a
 /// view model can be deallocated once observation stops.
 final class MCPStateSubscriptionTests: XCTestCase {
+    @MainActor
+    func testModelEndpointRefusesWriterReacquisitionOnTheSameBinding() async throws {
+        let server = makeServerViewModel(service: makeService())
+        let manager = try XCTUnwrap(server.workspaceManager)
+        await manager.awaitInitialized()
+        let store = AgentSessionRuntimeStore()
+        let scope = store.makeScope()
+        let sessionID = UUID()
+        var tab = ComposeTabState()
+        tab.activeAgentSessionID = sessionID
+        let workspace = WorkspaceModel(
+            name: "Model route selection", repoPaths: [], ephemeralFlag: true, composeTabs: [tab]
+        )
+        manager.workspaces = [workspace]
+        let workspaceID = workspace.id
+        let tabID = tab.id
+        let runID = UUID()
+        let connectionID = UUID()
+        let route = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: nil)
+        let routeID = route.identity.routeID
+        let session = AgentTabSession(tabID: tabID)
+        session.installPersistentSessionBinding(.init(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID))
+        session.hasLoadedPersistedState = true
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        scope.replaceSessions([tabID: session])
+        let original = try scope.admit(session: session)
+        let endpoint = DomainAgentSessionLinkEndpointIdentity(
+            windowID: routeID, workspaceID: workspaceID, tabID: tabID, sessionID: sessionID,
+            persistentBindingGeneration: original.writer.binding.generation,
+            bindingTransitionGeneration: session.bindingTransitionGeneration
+        )
+        route.installModelEndpointResolver { [weak scope] requestedTabID in
+            guard requestedTabID == tabID, let scope, let session = scope.sessions[tabID],
+                  let command = try? scope.admit(session: session) else { return nil }
+            return .init(endpoint: endpoint, writer: command.identity)
+        }
+
+        let receipt = MCPRunRoutingCleanupReceipt(
+            managerIdentity: ObjectIdentifier(store), policyID: UUID(), runID: runID, routeID: routeID,
+            routingAuthorityGeneration: 1, routingWaitGeneration: nil, routeOwner: route
+        )
+        _ = try XCTUnwrap(route.runRouteBindings.beginPendingPolicy(
+            connectionID: connectionID, runID: runID, windowID: routeID, cleanupReceipt: receipt
+        ))
+        var context = MCPTabContextSnapshot(
+            tabID: tabID, windowID: routeID, workspaceID: workspaceID, promptText: "",
+            selection: .init(), selectedMetaPromptIDs: [], tabName: "Original",
+            runID: runID, activeAgentSessionID: sessionID, explicitlyBound: false
+        )
+        context.routeOwnerIdentity = ObjectIdentifier(route)
+        route.runRouteBindings.tabContextByConnectionID[connectionID] = context
+        route.publishBinding(connectionID: connectionID, context: context, cleanupReceipt: receipt)
+        XCTAssertEqual(route.modelObserverEndpoint(
+            registration: receipt, connectionID: connectionID, workspaceID: workspaceID, tabID: tabID
+        ), endpoint)
+        XCTAssertNil(route.modelObserverEndpoint(
+            registration: receipt, connectionID: connectionID, workspaceID: UUID(), tabID: tabID
+        ))
+
+        // A request snapshot can predate writer capture. Read the binding's current proof on writeback.
+        var mutation = context
+        mutation.selection = StoredSelection(selectedPaths: ["/workspace/Selection.swift"])
+        let verification = await server.persistResolvedTabContextSnapshot(
+            route: route,
+            .init(snapshot: mutation, source: .runInstall),
+            metadata: .init(connectionID: connectionID, clientName: nil, windowID: routeID),
+            mutated: true
+        )
+        XCTAssertEqual(verification?.canonicalSelection, mutation.selection)
+        let refreshed = try XCTUnwrap(route.runRouteBindings.tabContextByConnectionID[connectionID])
+        XCTAssertEqual(refreshed.selection, mutation.selection)
+        XCTAssertEqual(refreshed.routeOwnerIdentity, ObjectIdentifier(route))
+        XCTAssertEqual(route.modelObserverEndpoint(
+            registration: receipt, connectionID: connectionID, workspaceID: workspaceID, tabID: tabID
+        ), endpoint)
+
+        scope.replaceSessions([:])
+        scope.replaceSessions([tabID: session])
+        let reacquired = try scope.admit(session: session)
+        XCTAssertNotEqual(reacquired.identity, original.identity)
+        XCTAssertEqual(session.bindingTransitionGeneration, endpoint.bindingTransitionGeneration)
+        route.publishBinding(connectionID: connectionID, context: context, cleanupReceipt: receipt)
+        XCTAssertNil(route.modelObserverEndpoint(
+            registration: receipt, connectionID: connectionID, workspaceID: workspaceID, tabID: tabID
+        ))
+    }
+
     private func makeService() -> MCPService {
         MCPService(
             hostBootstrapOperation: {},
@@ -355,12 +442,11 @@ final class MCPStateSubscriptionTests: XCTestCase {
             worktreeID: identity.worktreeID, worktreeRootPath: physical.path,
             commonGitDir: identity.repository.commonGitDir, isMainWorktree: identity.isMain, source: "test"
         )] } ?? []
-        let source = AgentWorkspaceLookupContextSource(activeAgentSessionID: tab.activeAgentSessionID, worktreeBindings: bindings)
         let suiteName = "RouteTree.\(UUID())"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         addTeardownBlock { defaults.removePersistentDomain(forName: suiteName) }
         let settings = GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: directory.appendingPathComponent("settings.json")))
-        var resources = MCPFileReadResources(context: context, workspace: lease, settings: settings, lookupSource: { source })
+        var resources = MCPFileReadResources(workspace: lease, settings: settings)
         if let gate { resources.beforeReplyValidationForTesting = { await gate.enter() } }
         var server: MCPServerViewModel? = makeServerViewModel(service: makeService(), validation: validation)
         let released = { @MainActor [weak server, weak prompt = server?.promptVM, weak manager = server?.workspaceManager] in
@@ -480,6 +566,51 @@ final class MCPStateSubscriptionTests: XCTestCase {
     }
 
     @MainActor
+    func testRegisteredFileReadsKeepTwoConnectionsScopedToTheirOwnTabs() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
+            let fixture = try await registeredTreeAfterServerRelease(runtime: runtime)
+            var workspace = fixture.workspace
+            var secondTab = ComposeTabState()
+            secondTab.selection = StoredSelection(selectedPaths: [fixture.root.fullPath + "/BaseOnly.swift"])
+            workspace.composeTabs.append(secondTab)
+            let document = try DomainWorkspaceDocument.decode(documentBytes: JSONEncoder().encode(workspace), fileURL: fixture.documentURL)
+            _ = await runtime.workspaceStore.registerReadDocument(document)
+
+            let route = fixture.route
+            let secondConnectionID = UUID()
+            var second = MCPTabContextSnapshot(
+                tabID: secondTab.id, windowID: route.identity.routeID, workspaceID: workspace.id,
+                promptText: "", selection: .init(), selectedMetaPromptIDs: [], tabName: "Second", runID: nil, explicitlyBound: true
+            )
+            second.routeOwnerIdentity = ObjectIdentifier(route)
+            route.runRouteBindings.tabContextByConnectionID[secondConnectionID] = second
+            route.publishBinding(connectionID: secondConnectionID, context: second)
+            await route.settleRoutingPublications()
+            XCTAssertEqual(route.descriptor?.activeContextID, secondTab.id)
+
+            let codeStructure = await runtime.toolRegistry.resolve(toolName: MCPWindowToolName.getCodeStructure, scope: .window(id: route.identity.routeID))
+            let codeBinding = try XCTUnwrap(codeStructure).binding
+            let pairs = [(fixture.connectionID, "Selected.swift", "BaseOnly.swift"), (secondConnectionID, "BaseOnly.swift", "Selected.swift")]
+            for (id, expected, unexpected) in pairs {
+                let metadata = MCPRequestMetadata(connectionID: id, clientName: nil, windowID: route.identity.routeID)
+                let treeRequest = ToolInvocationContext.trustedLocal(toolName: MCPWindowToolName.getFileTree, metadata: metadata)
+                let reply = try await MCPInvocationContextBridge.withInvocation(treeRequest) { try await fixture.tree.binding(["mode": .string("selected")]) }
+                let tree = try XCTUnwrap(reply.objectValue?["tree"]?.stringValue)
+                XCTAssertTrue(tree.contains(expected), tree)
+                XCTAssertFalse(tree.contains(unexpected), tree)
+
+                let codeRequest = ToolInvocationContext.trustedLocal(toolName: MCPWindowToolName.getCodeStructure, metadata: metadata)
+                let code = try await MCPInvocationContextBridge.withInvocation(codeRequest) { try await codeBinding(["signatures": .bool(false)]) }
+                let seeds = (code.objectValue?["roots"]?.arrayValue ?? []).flatMap { root in
+                    (root.objectValue?["seeds"]?.arrayValue ?? []).compactMap { $0.objectValue?["path"]?.stringValue }
+                }
+                XCTAssertEqual(seeds.map { ($0 as NSString).lastPathComponent }, [expected], String(describing: code))
+            }
+        }
+    }
+
+    @MainActor
     func testRegisteredCodeStructureRejectsContextReplacedBeforeReply() async throws {
         let runtime = try await makeHistoryRouteRuntime()
         try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
@@ -584,8 +715,8 @@ final class MCPStateSubscriptionTests: XCTestCase {
         try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
             let fixture = try await registeredTreeAfterServerRelease(runtime: runtime)
             let metadata = MCPRequestMetadata(connectionID: fixture.connectionID, clientName: nil, windowID: fixture.route.identity.routeID)
-            let context = DomainContextIdentity(workspaceID: fixture.workspace.id, contextID: fixture.workspace.composeTabs[0].id)
-            let handle = try await fixture.route.fileReadHandle(metadata: metadata, context: context)
+            let connection = try fixture.route.fileReadConnection(metadata: metadata, workspaceID: fixture.workspace.id)
+            let handle = try await fixture.route.fileReadHandle(for: connection)
             var changed = fixture.workspace
             changed.composeTabs[0].selection = StoredSelection(selectedPaths: [fixture.root.fullPath + "/BaseOnly.swift"])
             let document = try DomainWorkspaceDocument.decode(documentBytes: JSONEncoder().encode(changed), fileURL: fixture.documentURL)
@@ -805,6 +936,20 @@ final class MCPStateSubscriptionTests: XCTestCase {
     }
 
     @MainActor
+    func testIndependentRouteCatalogIsReadyWithoutPresentationUntilClosed() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
+            try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+            let (route, _, _) = try await registeredHistoryAfterServerRelease(runtime: runtime, scanner: RouteHistoryScanner())
+            let ready = await MCPToolCatalogReadiness.shared.awaitReady(windowID: route.identity.routeID)
+            XCTAssertTrue(ready)
+            await route.close()
+            let closedIsReady = await MCPToolCatalogReadiness.shared.awaitReady(windowID: route.identity.routeID, timeout: 0.25)
+            XCTAssertFalse(closedIsReady)
+        }
+    }
+
+    @MainActor
     func testEnteredRouteMappingRetainsOnlyOriginalCleanupOwnerUntilConsumed() async throws {
         let runtime = try await makeHistoryRouteRuntime()
         try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
@@ -823,7 +968,7 @@ final class MCPStateSubscriptionTests: XCTestCase {
                 restrictedTools: [], runID: UUID(), purpose: .agentModeRun, routingOwner: route
             )
             let receipt = try XCTUnwrap(receiptValue)
-            let installed = route.installPendingPolicy(receipt, connectionID: UUID(), clientName: nil, tabID: nil)
+            let installed = await route.installPendingPolicy(receipt, connectionID: UUID(), clientName: nil, tabID: nil)
             XCTAssertNotNil(installed)
             server?.stopServiceObservation()
             server = nil

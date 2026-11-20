@@ -287,6 +287,10 @@ struct AgentTranscriptRow: View, @MainActor Equatable {
         .environment(\.markdownFileLinkOpener, MarkdownFileLinkOpener { target in
             await promptManager.fileManager.openFileForMarkdownLink(target)
         })
+        .environment(\.agentTranscriptDisclosureScope, .init(
+            store: agentModeVM.ui.transcript, workspaceID: inputs.workspaceID,
+            tabID: inputs.tabID, itemID: inputs.item.id
+        ))
         .environment(\.agentToolCardAutoExpandEnabled, inputs.autoExpandEnabled)
         .environment(\.agentLiveBashExecutionByItemID, inputs.liveBashExecution.map { [inputs.item.id: $0] } ?? [:])
         .environment(\.agentApprovalVisible, inputs.approvalVisible)
@@ -734,7 +738,7 @@ struct AgentMessageBubble: View {
 
                     // Arguments (if present and not already summarized inline)
                     if let args = item.toolArgsJSON, !args.isEmpty, shouldShowFullArgs(toolName: item.toolName) {
-                        CollapsibleCodeBlock(
+                        AgentTranscriptCodePreview(
                             content: formatJSON(args),
                             language: "json",
                             previewLineCount: 5
@@ -1836,7 +1840,7 @@ private struct CollapsibleAssistantTranscriptContent: View {
         fontScale.preset
     }
 
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("CollapsibleAssistantTranscriptContent") private var isExpanded = false
     private let previewLineCount = 10
 
     private var collapsedPreviewMaxHeight: CGFloat {
@@ -1902,10 +1906,10 @@ private struct CollapsibleAssistantTranscriptContent: View {
                 Button {
                     if isExpanded {
                         withAnimation(.easeInOut(duration: 0.2)) {
-                            isExpanded = false
+                            $isExpanded.wrappedValue = false
                         }
                     } else {
-                        isExpanded = true
+                        $isExpanded.wrappedValue = true
                     }
                 } label: {
                     HStack(spacing: 4) {
@@ -1973,6 +1977,24 @@ private struct AskUserQuestionResultView: View {
 
 // CollapsibleUserMessage is now in Common/CollapsibleUserMessage.swift
 
+private struct AgentTranscriptCodePreview: View {
+    let content: String
+    let language: String?
+    let previewLineCount: Int
+    var allowInteraction = true
+    @AgentTranscriptDisclosure("CodePreview") private var isExpanded = false
+
+    var body: some View {
+        CollapsibleCodeBlock(
+            content: content,
+            language: language,
+            previewLineCount: previewLineCount,
+            allowInteraction: allowInteraction,
+            expansion: $isExpanded
+        )
+    }
+}
+
 // MARK: - Tool Result Content View
 
 /// Renders tool result content with markdown support and collapsible preview
@@ -1981,7 +2003,7 @@ struct ToolResultContentView: View {
     let toolName: String?
     let previewLineCount: Int
 
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("ToolResultContentView") private var isExpanded = false
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
@@ -2043,7 +2065,7 @@ struct ToolResultContentView: View {
                 DiffContentView(content: displayContent)
             } else if isJSONContent {
                 // Render JSON with formatting
-                CollapsibleCodeBlock(
+                AgentTranscriptCodePreview(
                     content: prettyPrintJSON(displayContent),
                     language: "json",
                     previewLineCount: previewLineCount
@@ -2143,7 +2165,7 @@ private func messageExpansionButton(
 /// Renders diff content with proper syntax highlighting for additions/deletions
 private struct DiffContentView: View {
     let content: String
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("DiffContentView") private var isExpanded = false
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
@@ -2199,6 +2221,7 @@ private struct DiffContentView: View {
                     }
                 }
             }
+            .semanticTextDirection(.dedicatedLeftToRight)
             .font(fontPreset.swiftUIFont(sizeAtNormal: 11, design: .monospaced))
             .padding(8)
             .background(Color(nsColor: .textBackgroundColor).opacity(0.5))
@@ -2210,42 +2233,48 @@ private struct DiffContentView: View {
         }
     }
 
-    @ViewBuilder
     private func diffLine(_ line: String) -> some View {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
-
-        HStack(spacing: 0) {
-            if trimmed.hasPrefix("+") && !trimmed.hasPrefix("+++") {
-                // Addition line
-                Text(line)
-                    .foregroundColor(Color.green)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.green.opacity(0.1))
-            } else if trimmed.hasPrefix("-") && !trimmed.hasPrefix("---") {
-                // Deletion line
-                Text(line)
-                    .foregroundColor(Color.red)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.red.opacity(0.1))
-            } else if trimmed.hasPrefix("@@") {
-                // Hunk header
-                Text(line)
-                    .foregroundColor(Color.cyan)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.cyan.opacity(0.1))
-            } else if trimmed.hasPrefix("---") || trimmed.hasPrefix("+++") {
-                // File header
-                Text(line)
-                    .foregroundColor(Color.secondary)
-                    .fontWeight(.medium)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            } else {
-                // Context line
-                Text(line)
-                    .foregroundColor(Color.primary.opacity(0.8))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
+        let foreground: Color
+        let background: Color
+        let weight: Font.Weight
+        if trimmed.hasPrefix("+") && !trimmed.hasPrefix("+++") {
+            foreground = .green
+            background = .green.opacity(0.1)
+            weight = .regular
+        } else if trimmed.hasPrefix("-") && !trimmed.hasPrefix("---") {
+            foreground = .red
+            background = .red.opacity(0.1)
+            weight = .regular
+        } else if trimmed.hasPrefix("@@") {
+            foreground = .cyan
+            background = .cyan.opacity(0.1)
+            weight = .regular
+        } else if trimmed.hasPrefix("---") || trimmed.hasPrefix("+++") {
+            foreground = .secondary
+            background = .clear
+            weight = .medium
+        } else {
+            foreground = .primary.opacity(0.8)
+            background = .clear
+            weight = .regular
         }
+
+        // SwiftUI's layout direction anchors the row, but its Text still resolves the
+        // first strong character. Give the diff marker its own column.
+        let hasMarker = line.first.map { "+- ".contains($0) } ?? false
+        return HStack(spacing: 0) {
+            if hasMarker {
+                Text(verbatim: String(line.prefix(1)))
+            }
+            Text(verbatim: String(line.dropFirst(hasMarker ? 1 : 0)))
+        }
+        .fontWeight(weight)
+        .foregroundStyle(foreground)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(background)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(verbatim: line))
     }
 }
 

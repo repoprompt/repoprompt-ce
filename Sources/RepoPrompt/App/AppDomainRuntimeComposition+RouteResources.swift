@@ -30,6 +30,12 @@ extension AppDomainRuntimeComposition {
         if independentRouteOwners[key]?.isEmpty == true { independentRouteOwners.removeValue(forKey: key) }
     }
 
+    /// The synchronous owner fence used when checking a previously registered provider route.
+    @MainActor
+    func hasRecordedRouteResources(_ owner: MCPHostRouteResources, in runtime: MCPDomainRuntime) -> Bool {
+        independentRouteOwners[ObjectIdentifier(runtime)]?[owner.identity.routeID]?.owner === owner
+    }
+
     /// Resolve only an independently registered route. No window, writer, catalog or admission
     /// is manufactured by this index, and a stale owner cannot win against the domain generation.
     @MainActor

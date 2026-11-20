@@ -1,9 +1,14 @@
 import Foundation
 import RepoPromptInstrumentation
+import SwiftUI
 
 struct AgentTranscriptUISnapshot: Equatable {
     var currentTabID: UUID?
-    var presentation: AgentTranscriptPresentationSnapshot
+    var presentation: AgentTranscriptPresentationSnapshot {
+        didSet { renderEntries = nil }
+    }
+
+    var renderEntries: AgentTranscriptRenderEntries?
     var isHydrated: Bool
     var presentationRevision: Int
     var displayMaskRevision: UInt64 = 0
@@ -56,10 +61,101 @@ struct AgentTranscriptUISnapshot: Equatable {
     }
 }
 
+struct AgentTranscriptDisclosureScope {
+    let store: AgentTranscriptUIStore
+    let workspaceID: UUID?
+    let tabID: UUID?
+    let itemID: UUID
+
+    @MainActor
+    func binding(for control: String, fallback: Binding<Bool>, recordsChoice: Bool = true) -> Binding<Bool> {
+        let key = AgentTranscriptUIStore.DisclosureKey(workspaceID: workspaceID, tabID: tabID, itemID: itemID, control: control)
+        return Binding(
+            get: { store.disclosureChoice(for: key) ?? fallback.wrappedValue },
+            set: {
+                if recordsChoice {
+                    store.setDisclosureChoice($0, for: key)
+                } else if store.disclosureChoice(for: key) != nil {
+                    return
+                }
+                fallback.wrappedValue = $0
+            }
+        )
+    }
+
+    @MainActor
+    func hasChoice(for control: String) -> Bool {
+        store.disclosureChoice(for: .init(workspaceID: workspaceID, tabID: tabID, itemID: itemID, control: control)) != nil
+    }
+}
+
+extension EnvironmentValues {
+    @Entry var agentTranscriptDisclosureScope: AgentTranscriptDisclosureScope? = nil
+}
+
+/// The mounted row invalidates locally; only explicit interaction creates a retained choice.
+@MainActor
+@propertyWrapper
+struct AgentTranscriptDisclosure: DynamicProperty {
+    @Environment(\.agentTranscriptDisclosureScope) private var scope
+    @State private var initialValue: Bool
+    @State private var localChange: Bool?
+    private let control: String
+
+    init(wrappedValue: Bool, _ control: String) {
+        _initialValue = State(initialValue: wrappedValue)
+        self.control = control
+    }
+
+    var wrappedValue: Bool {
+        get { projectedValue.wrappedValue }
+        nonmutating set {
+            binding(recordsChoice: false).wrappedValue = newValue
+        }
+    }
+
+    var projectedValue: Binding<Bool> {
+        binding(recordsChoice: true)
+    }
+
+    var automaticBinding: Binding<Bool> {
+        binding(recordsChoice: false)
+    }
+
+    private func binding(recordsChoice: Bool) -> Binding<Bool> {
+        let fallback = Binding(get: { localChange ?? initialValue }, set: { localChange = $0 })
+        return scope?.binding(for: control, fallback: fallback, recordsChoice: recordsChoice) ?? fallback
+    }
+}
+
 @MainActor
 final class AgentTranscriptUIStore: ObservableObject {
     var perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     @Published private(set) var snapshot: AgentTranscriptUISnapshot = .empty
+
+    struct DisclosureKey: Hashable {
+        let workspaceID: UUID?
+        let tabID: UUID?
+        let itemID: UUID
+        let control: String
+    }
+
+    /// Only user-operated disclosures are recorded; reading a row does not populate this map.
+    private var disclosureChoices: [UUID: [DisclosureKey: Bool]] = [:]
+
+    func disclosureChoice(for key: DisclosureKey) -> Bool? {
+        guard let tabID = key.tabID else { return nil }
+        return disclosureChoices[tabID]?[key]
+    }
+
+    func setDisclosureChoice(_ value: Bool, for key: DisclosureKey) {
+        guard let tabID = key.tabID else { return }
+        disclosureChoices[tabID, default: [:]][key] = value
+    }
+
+    func clearDisclosureChoices(for tabID: UUID) {
+        disclosureChoices.removeValue(forKey: tabID)
+    }
 
     func update(_ snapshot: AgentTranscriptUISnapshot) {
         guard self.snapshot != snapshot else {
@@ -67,6 +163,10 @@ final class AgentTranscriptUIStore: ObservableObject {
                 perfRecorder.recordStoreUpdate("transcript", published: false)
             #endif
             return
+        }
+        var snapshot = snapshot
+        if snapshot.renderEntries == nil {
+            snapshot.renderEntries = .init(blocks: snapshot.presentation.visibleBlocks)
         }
         #if DEBUG
             perfRecorder.recordStoreUpdate(

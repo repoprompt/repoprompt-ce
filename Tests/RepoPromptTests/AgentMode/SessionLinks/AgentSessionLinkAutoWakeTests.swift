@@ -1084,6 +1084,81 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         }
     }
 
+    func testProviderPolicyRoutesOnlyTheCanonicalHostCarrierWithoutPresentation() async throws {
+        let (host, f, _, _, _, _, authority) = try await hostStartupFixture(
+            canonicalWorkspace: true, boundCanonicalCarrier: true, registersProviderRoute: true
+        )
+        let session = f.session
+        let route = host.route
+        let runID = try XCTUnwrap(session.runID)
+        let network = ServerNetworkManager.shared
+        let clientName = "canonical-provider-route-\(UUID())"
+        func installPolicy() async -> MCPRunRoutingCleanupReceipt? {
+            await network.installClientConnectionPolicy(
+                for: clientName, windowID: host.routeID, restrictedTools: [],
+                runID: runID, purpose: .agentModeRun, routingOwner: route
+            )
+        }
+        let withoutAttempt = await installPolicy()
+        XCTAssertNil(withoutAttempt, "A run identifier alone confers no provider authority")
+        session.beginRunAttempt(source: "provider.route.initial")
+        let originalValue = await installPolicy()
+        let original = try XCTUnwrap(originalValue)
+        addTeardownBlock { await network.cleanupRunRoutingState(ownedBy: original) }
+
+        session.beginRunAttempt(source: "provider.route.successor")
+        let stale = await route.installPendingPolicy(original, connectionID: UUID(), clientName: clientName, tabID: session.tabID)
+        XCTAssertNil(stale, "An older policy cannot reacquire the successor attempt under the same run ID")
+        let issued = await installPolicy()
+        let receipt = try XCTUnwrap(issued)
+        addTeardownBlock { await network.cleanupRunRoutingState(ownedBy: receipt) }
+        let wrongConnection = UUID()
+        let wrong = await route.installPendingPolicy(receipt, connectionID: wrongConnection, clientName: clientName, tabID: UUID())
+        XCTAssertNil(wrong)
+        XCTAssertNil(route.runRouteBindings.connectionID(forRunID: runID))
+
+        let connection = UUID()
+        let installation = await route.installPendingPolicy(receipt, connectionID: connection, clientName: clientName, tabID: nil)
+        let installed = try XCTUnwrap(installation)
+        XCTAssertEqual(installed.tabID, session.tabID)
+        XCTAssertEqual(installed.workspaceID, f.endpoint.workspaceID)
+        let bound = try XCTUnwrap(route.runRouteBindings.tabContextByConnectionID[connection])
+        XCTAssertEqual(bound.routeOwnerIdentity, ObjectIdentifier(route))
+        XCTAssertEqual(bound.promptText, "Exact canonical prompt")
+        XCTAssertEqual(bound.activeAgentSessionID, f.endpoint.sessionID)
+        let canCommit = await route.canCommitPendingPolicy(receipt, token: installed.token)
+        XCTAssertTrue(canCommit)
+        let coordinator = try XCTUnwrap(route.coordinator)
+        let routing = await coordinator.snapshot()
+        let registration = try XCTUnwrap(routing.connections.first { $0.registration.connectionID == connection }?.registration)
+        let routed = try await coordinator.resolveReadContext(connection: registration)
+        XCTAssertEqual(routed.context, DomainContextIdentity(workspaceID: f.endpoint.workspaceID, contextID: session.tabID))
+        XCTAssertEqual(routed.bindingKind, .runScoped(runID: runID))
+
+        let staleRollback = route.rollbackPendingPolicy(original, token: installed.token, clientName: clientName)
+        XCTAssertEqual(staleRollback, .supersededBySameConnection)
+        await network.cleanupRunRoutingState(ownedBy: original)
+        XCTAssertEqual(route.runRouteBindings.connectionID(forRunID: runID), connection)
+
+        let current = await authority.canonicalWorkspaceSnapshot(f.endpoint.workspaceID)
+        let snapshot = try XCTUnwrap(current)
+        var workspace = try JSONDecoder().decode(WorkspaceModel.self, from: snapshot.document.documentBytes)
+        let carrier = try XCTUnwrap(workspace.composeTabs.firstIndex(where: { $0.id == session.tabID }))
+        workspace.composeTabs[carrier].activeAgentSessionID = UUID()
+        let result = try await authority.replaceWorkingFailClosed(
+            workspace, fileURL: snapshot.document.fileURL, expectedWorkspaceRevision: snapshot.revisions.workingRevision
+        )
+        XCTAssertEqual(result.disposition, .applied)
+        let canCommitAfterReplacement = await route.canCommitPendingPolicy(receipt, token: installed.token)
+        XCTAssertFalse(canCommitAfterReplacement)
+        XCTAssertEqual(route.rollbackPendingPolicy(receipt, token: installed.token, clientName: nil), .restored)
+        XCTAssertNil(route.runRouteBindings.tabContextByConnectionID[connection])
+        XCTAssertNil(route.runRouteBindings.connectionID(forRunID: runID))
+        let replacement = await route.installPendingPolicy(receipt, connectionID: UUID(), clientName: clientName, tabID: session.tabID)
+        XCTAssertNil(replacement)
+        await network.cleanupRunRoutingState(ownedBy: receipt)
+    }
+
     func testHostInputCompositionRetainsCanonicalCaptureWithoutPresenterOrWriterRenewal() async throws {
         let (host, f, _, _, _, _, authority) = try await hostStartupFixture(
             canonicalWorkspace: true, boundCanonicalCarrier: true, canonicalInput: true
@@ -1389,7 +1464,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
     /// the external provider is scripted; startup is never intercepted or delegated to a VM.
     private func hostStartupFixture(
         canonicalWorkspace: Bool = false, boundCanonicalCarrier: Bool = false, canonicalInput: Bool = false,
-        commandWillExecute: (@Sendable (DomainWorkspaceCommandEnvelope) async -> Void)? = nil
+        registersProviderRoute: Bool = false, commandWillExecute: (@Sendable (DomainWorkspaceCommandEnvelope) async -> Void)? = nil
     ) async throws -> (
         AgentSessionRuntimeHost, Fixture, AgentSessionHostStartupResources,
         AgentSessionLinkCapturingACPProvider, AgentWorkspaceSessionIndexStore, @MainActor () async throws -> Void,
@@ -1408,7 +1483,12 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         }
         let script = try AgentSessionLinkACPServerScript.write(to: directory)
         let provider = AgentSessionLinkCapturingACPProvider(providerID: .openCode, commandPath: script.path)
-        let route = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: nil)
+        let routeIdentity = MCPRouteIdentityAllocator.allocateHost()
+        let route = if registersProviderRoute {
+            MCPHostRouteResources(identity: routeIdentity, coordinator: domain.routingCoordinator, runtime: domain)
+        } else {
+            MCPHostRouteResources(identity: routeIdentity, coordinator: nil)
+        }
         let policy: AgentRunExecutionContracts.ConnectionPolicyInstaller = { _, _, _, _, _, _, _, runID, _, _, _, _, _ in
             if let runID { await MCPRoutingWaiter.notifyRouted(runID: runID) }
         }
@@ -3819,6 +3899,77 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             [attention.occurrence],
             "failure suppression never discards natural-turn delivery"
         )
+    }
+
+    func testSettlingUnrelatedStatusDoesNotRearmFailedAttention() throws {
+        typealias Notices = AgentSessionLinkPassiveStatusNotices
+        let fixture = try makeFixture(fenceProviderLaunch: true)
+        let runtime = fixture.viewModel.linkExecutionRuntime
+        try publishInventory(fixture, revision: 1)
+        fixture.session.oversight.autoWakeOnUpdates = true
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+        var notices = Notices(observerEndpoint: endpoint, queueEpoch: Self.laneQueueEpoch)
+        func sample(_ index: Int, _ status: Notices.Status) -> Notices.Sample {
+            .init(
+                reference: Self.laneReference(index), targetEndpoint: Self.laneTargetEndpoint(index),
+                targetSessionID: Self.targetID(index), displayName: "Lane \(index)", status: status,
+                idleForSend: status == .idle
+            )
+        }
+        notices.enable(samples: [sample(0, .idle), sample(1, .running)], linkSetRevision: 1)
+        notices.setAutoWakeLanes((0 ..< 2).map { index in
+            .init(
+                reference: Self.laneReference(index), targetEndpoint: Self.laneTargetEndpoint(index),
+                targetSessionID: Self.targetID(index), isEffectivelySelected: true
+            )
+        })
+        notices.reconcile(samples: [sample(0, .idle), sample(1, .idle)], linkSetRevision: 1, deliverable: true)
+        XCTAssertEqual(notices.requestAttention(
+            reference: Self.laneReference(0), targetEndpoint: Self.laneTargetEndpoint(0),
+            targetSessionID: Self.targetID(0), linkSetRevision: 1
+        ), .accepted)
+        let initial = notices.snapshot
+        let attention = try XCTUnwrap(initial.attentionRequests.first)
+        XCTAssertEqual(initial.entries.map(\.reference), [Self.laneReference(1)])
+        runtime.agentSessionLinkPublishPassiveStatusNotices(initial, to: endpoint)
+
+        var wake = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        wake.task?.cancel()
+        let context = try XCTUnwrap(runtime.agentSessionLinkPromptContext(for: fixture.session))
+        let failedClaim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaimStore.claim(
+            dispatchID: .autoWake(wakeID: wake.wakeID),
+            epoch: context.epoch,
+            inventory: context.inventory,
+            passiveNotices: context.passiveNotices,
+            render: { _ in
+                AgentSessionLinkPromptRenderResult(
+                    fragment: "[attention only]",
+                    passiveBatch: .init(
+                        entries: [], attentionRequests: [attention],
+                        overflowProducedThrough: 0, includesUnattributedOverflow: false
+                    )
+                )
+            }
+        ))
+        wake.phase = .preparingDispatch
+        wake.task = nil
+        fixture.session.oversight.pendingAutoWake = wake
+        XCTAssertTrue(runtime.agentSessionLinkAcquirePhysicalDispatch(for: fixture.session, dispatchID: failedClaim.dispatchID))
+        runtime.agentSessionLinkRecordPhysicalDispatchFailure(for: fixture.session, dispatchID: failedClaim.dispatchID)
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+        let failed = try XCTUnwrap(fixture.session.oversight.suppressedWakeFingerprint)
+        XCTAssertEqual(failed.edges.map(\.reference), [Self.laneReference(1)])
+        XCTAssertEqual(failed.attentionOccurrences, [attention.occurrence])
+
+        // A natural turn accepted only the status row. Apply its partial receipt to the real reducer
+        // and publish the result, as the bridge does on acceptance.
+        notices.apply(.init(snapshot: initial, deliveredAttentionRequests: []))
+        XCTAssertTrue(notices.snapshot.entries.isEmpty)
+        XCTAssertEqual(notices.snapshot.attentionRequests.map(\.occurrence), [attention.occurrence])
+        runtime.agentSessionLinkPublishPassiveStatusNotices(notices.snapshot, to: endpoint)
+        defer { fixture.session.oversight.pendingAutoWake?.task?.cancel() }
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+        XCTAssertEqual(fixture.session.oversight.suppressedWakeFingerprint, failed)
     }
 
     func testNewAttentionRearmsFailedAttentionAndIsTheExactRequiredBasis() throws {

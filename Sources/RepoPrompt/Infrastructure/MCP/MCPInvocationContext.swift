@@ -20,6 +20,14 @@ extension MCPInvocationContextBridge {
 struct MCPTabContextSnapshot {
     /// Independent route incarnation; not a transport route ID or fresh admission proof.
     var routeOwnerIdentity: ObjectIdentifier?
+    enum ModelWriterAtBinding {
+        case unrecorded
+        case unavailable
+        case captured(AgentSessionRuntimeStore.WriterIdentity)
+    }
+
+    /// Writer incarnation witnessed when an independently owned policy first binds this context.
+    var modelWriterAtBinding: ModelWriterAtBinding = .unrecorded
     let tabID: UUID
     let windowID: Int
     let workspaceID: UUID?

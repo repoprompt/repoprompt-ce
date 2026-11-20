@@ -25,6 +25,9 @@ struct MCPRunRoutingCleanupReceipt: Equatable {
     let routingWaitGeneration: UUID?
     /// Retain the original resource owner. Cleanup must never resolve a current window/host by ID.
     let routeOwner: MCPHostRouteResources?
+    /// Captured when the policy is issued. A later connection may refresh canonical bytes
+    /// for this exact writer/startup, but cannot acquire a replacement under the old policy.
+    let providerContextResolver: MCPHostRouteResources.ProviderContextResolver?
     /// Metadata retained by the mapping owner must not retain that owner back through this receipt.
     struct MappingOwnership {
         let policyID: UUID
@@ -46,7 +49,8 @@ struct MCPRunRoutingCleanupReceipt: Equatable {
 
     init(
         managerIdentity: ObjectIdentifier, policyID: UUID, runID: UUID, routeID: Int,
-        routingAuthorityGeneration: UInt64, routingWaitGeneration: UUID?, routeOwner: MCPHostRouteResources?
+        routingAuthorityGeneration: UInt64, routingWaitGeneration: UUID?, routeOwner: MCPHostRouteResources?,
+        providerContextResolver: MCPHostRouteResources.ProviderContextResolver? = nil
     ) {
         self.managerIdentity = managerIdentity
         self.policyID = policyID
@@ -55,6 +59,7 @@ struct MCPRunRoutingCleanupReceipt: Equatable {
         self.routingAuthorityGeneration = routingAuthorityGeneration
         self.routingWaitGeneration = routingWaitGeneration
         self.routeOwner = routeOwner
+        self.providerContextResolver = providerContextResolver
         mappingOwnership = MappingOwnership(policyID: policyID)
     }
 

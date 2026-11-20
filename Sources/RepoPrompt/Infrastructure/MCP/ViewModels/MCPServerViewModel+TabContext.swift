@@ -178,11 +178,7 @@ extension MCPServerViewModel {
 
     typealias PendingPolicyRunIDMappingToken = MCPRunRouteBindings.PendingPolicyToken
 
-    enum PendingPolicyRunIDMappingRollbackResult: Equatable {
-        case restored
-        case supersededBySameConnection
-        case supersededByOtherConnection
-    }
+    typealias PendingPolicyRunIDMappingRollbackResult = MCPRunRouteBindings.PendingPolicyRollbackResult
 
     /// Value snapshot of a compose tab plus MCP routing metadata.
     ///
@@ -1055,7 +1051,7 @@ extension MCPServerViewModel {
             routeResources.runRouteBindings.presentationWindowByConnection[uuid] = context.windowID
             if let runID = context.runID {
                 if let pendingPolicyToken {
-                    installReadFileAutoSelectionHandoverLineage(route: routeResources, for: pendingPolicyToken)
+                    routeResources.runRouteBindings.installReadFileAutoSelectionHandoverLineage(for: pendingPolicyToken)
                 } else if deferRunIDReplacementForPendingPolicy {
                     pendingPolicyToken = registerPendingPolicyRunIDMapping(
                         route: routeResources,
@@ -1572,6 +1568,9 @@ extension MCPServerViewModel {
                 ) ?? latest.selectionRevision
             }
             refreshed.readFileAutoSelectionGeneration = latest.readFileAutoSelectionGeneration
+            // Preserve the live binding's proof even when the request predates writer capture.
+            refreshed.routeOwnerIdentity = latest.routeOwnerIdentity
+            refreshed.modelWriterAtBinding = latest.modelWriterAtBinding
             routeResources.runRouteBindings.tabContextByConnectionID[connectionID] = refreshed
         }
         return verification
@@ -4031,7 +4030,7 @@ extension MCPServerViewModel {
         } else {
             inheritDisplacedRunContextIfNeeded(route: routeResources, for: token, clientName: clientName)
         }
-        installReadFileAutoSelectionHandoverLineage(route: routeResources, for: token)
+        routeResources.runRouteBindings.installReadFileAutoSelectionHandoverLineage(for: token)
         tabContextLog("registerPendingPolicyRunIDMapping connectionID=\(connectionID) runID=\(runID) windowID=\(windowID)")
         return token
     }
@@ -4061,61 +4060,6 @@ extension MCPServerViewModel {
         if let clientName { recordLastContext(route: routeResources, clientName: clientName, context: inherited) }
         beginMirroringForConnection(route: routeResources, token.connectionID, context: inherited)
         tabContextLog("registerPendingPolicyRunIDMapping inherited run context runID=\(token.runID) \(displacedConnectionID) -> \(token.connectionID)")
-    }
-
-    @MainActor
-    private func installReadFileAutoSelectionHandoverLineage(
-        route routeResources: MCPHostRouteResources,
-        for token: PendingPolicyRunIDMappingToken
-    ) {
-        guard let successorContext = routeResources.runRouteBindings.tabContextByConnectionID[token.connectionID],
-              successorContext.runID == token.runID
-        else {
-            routeResources.runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: token.connectionID)
-            return
-        }
-        let successorKey = readFileAutoSelectionContextKey(
-            connectionID: token.connectionID,
-            context: successorContext
-        )
-
-        guard let displacedConnectionID = token.displacedConnectionID else {
-            let preservesCurrentSuccessor = token.displacedConnectionRunID == token.runID
-                && routeResources.runRouteBindings.connectionIDByRunID[token.runID] == token.connectionID
-                && routeResources.runRouteBindings.connectionIDToRunID[token.connectionID] == token.runID
-                && routeResources.runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID[token.connectionID]?.successorKey == successorKey
-            if !preservesCurrentSuccessor {
-                routeResources.runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: token.connectionID)
-            }
-            return
-        }
-
-        routeResources.runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: token.connectionID)
-        guard token.displacedConnectionRunID == token.runID,
-              let displacedContext = routeResources.runRouteBindings.tabContextByConnectionID[displacedConnectionID],
-              displacedContext.runID == token.runID,
-              successorContext.windowID == displacedContext.windowID,
-              successorContext.workspaceID == displacedContext.workspaceID,
-              successorContext.tabID == displacedContext.tabID
-        else { return }
-
-        let displacedKey = readFileAutoSelectionContextKey(
-            connectionID: displacedConnectionID,
-            context: displacedContext
-        )
-        var predecessorKeys: [MCPReadFileAutoSelectionCoordinator.ContextKey] = []
-        if let inherited = routeResources.runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID[displacedConnectionID],
-           inherited.successorKey == displacedKey
-        {
-            predecessorKeys.append(contentsOf: inherited.predecessorKeys)
-        }
-        if !predecessorKeys.contains(displacedKey) {
-            predecessorKeys.append(displacedKey)
-        }
-        routeResources.runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID[token.connectionID] = .init(
-            successorKey: successorKey,
-            predecessorKeys: predecessorKeys
-        )
     }
 
     @MainActor
