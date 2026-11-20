@@ -1863,6 +1863,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             // resolves still establishes history. Clearing never resets it.
             latchEstablishedWorkspaceSelectionIfValid()
             guard oldValue != activeWorkspaceID else { return }
+            if startupDefaultDeparture?.model.id != activeWorkspaceID { startupDefaultDeparture = nil }
             rootActivationDidChange()
             workspaceSearchReadinessFence.publish(nil)
             refreshSelectionMirrorContextRevision()
@@ -3480,6 +3481,10 @@ class WorkspaceManagerViewModel: ObservableObject {
     /// its task finishes cleanup, even after supersession.
     private var initialDefaultActivationAttempt: InitialDefaultActivationAttempt?
     private var initialDefaultActivationTask: Task<Void, Never>?
+    /// The clean authority-backed model at the first Default publication, retired on departure.
+    private var startupDefaultDeparture: (model: WorkspaceModel, digest: String)?
+    var isUnusedAutomaticChat: (@MainActor (UUID) -> Bool)?
+    static let agentDeepLinkSwitchReason = "agentDeepLink"
     /// Set as the first statement of `prepareForWindowClose`; never reset.
     private(set) var isPreparingForWindowClose = false
     /// Synchronous Window hook fired when a non-startup activation is requested, before any
@@ -3651,6 +3656,20 @@ class WorkspaceManagerViewModel: ObservableObject {
             return .cancelled("Initial workspace activation rejected a non-System candidate.")
         }
         attempt.didPublishSelection = true
+        if let model = workspace(withID: workspaceID), Self.isSyntheticFallbackWorkspace(model),
+           !model.normalizationRequiresSave, !model.composeTabsDecodeWasLossy,
+           model.composeTabs.count == 1, model.stashedTabs.isEmpty,
+           let tab = model.composeTabs.first, tab.id == model.activeComposeTabID,
+           tab.activeAgentSessionID == nil, tab.activeChatSessionID == nil,
+           model.currentPromptText?.isEmpty != false, tab.promptText.isEmpty,
+           tab.selection == .init(), tab.expandedFolders.isEmpty, tab.selectedMetaPromptIDs.isEmpty,
+           stateVersionByWorkspaceID[workspaceID, default: 0] == 0,
+           !hasUnsavedWorkingPublication(workspaceID: workspaceID),
+           let revisions = domainWorkspaceRevisionsByID[workspaceID], revisions.dirtyRevision == nil,
+           let digest = domainWorkspaceDigestsByID[workspaceID]
+        {
+            startupDefaultDeparture = (model, digest)
+        }
         return nil
     }
 
@@ -7336,7 +7355,10 @@ class WorkspaceManagerViewModel: ObservableObject {
                 let savedPromptIDs = promptViewModel.getSelectedPromptIDsSnapshot()
                 workspaces[index].selectedMetaPromptIDs = savedPromptIDs
             }
-            await pollAndSaveStateAsync(source: .workspaceSwitchSaveState)
+            _ = await pollAndSaveStateWithOutcomeAsync(
+                source: .workspaceSwitchSaveState,
+                skippingUnusedStartupDefault: reason == Self.agentDeepLinkSwitchReason
+            )
             if let cancellation = cancellationResult(
                 operationID: operationID,
                 targetWorkspace: newWorkspace,
@@ -11377,6 +11399,41 @@ class WorkspaceManagerViewModel: ObservableObject {
     // ─────────────────────────────────────────────────────────────
     // MARK: - State helpers
 
+    /// Only normalize the fields that the initial Default/Chat initialization can supply.
+    /// Any other difference, including a live draft not yet in the workspace model, requires saving.
+    private func departureHasOnlyStartupState(workspaceID: UUID) -> Bool {
+        guard let (startup, digest) = startupDefaultDeparture, startup.id == workspaceID,
+              activeWorkspaceID == workspaceID, domainWorkspaceDigestsByID[workspaceID] == digest,
+              let revisions = domainWorkspaceRevisionsByID[workspaceID], revisions.dirtyRevision == nil,
+              !hasUnsavedWorkingPublication(workspaceID: workspaceID),
+              var current = workspace(withID: workspaceID), current.composeTabs.count == 1,
+              !current.normalizationRequiresSave, !current.composeTabsDecodeWasLossy,
+              let tab = startup.composeTabs.first, promptViewModel.activeComposeTabID == tab.id,
+              !isSnapshotCommitSuspended(forTabID: tab.id),
+              promptViewModel.selectedCopyPresetID == (startup.copyPresetId ?? BuiltInCopyPresets.standard.id),
+              promptViewModel.selectedChatPresetID == (startup.chatPresetId ?? ChatPreset.BuiltIn.chat.id),
+              promptViewModel.workingCopyCustomizations == (startup.copyCustomizations ?? .init())
+        else { return false }
+        if let chatID = current.composeTabs[0].activeChatSessionID {
+            guard isUnusedAutomaticChat?(chatID) == true else { return false }
+        }
+        let (name, _) = activeComposeTabContext()
+        var live = collectComposeTabSnapshot(name: name, base: current.composeTabs[0])
+        if let canonical = selectionCoordinator?.activeSelectionSnapshot(flushPendingUI: false),
+           canonical.tabID == tab.id, canonical.selection != tab.selection
+        {
+            return false
+        }
+        live.activeChatSessionID = nil
+        live.lastModified = tab.lastModified
+        guard live == tab else { return false }
+        current.composeTabs[0].lastModified = tab.lastModified
+        current.composeTabs[0].activeChatSessionID = nil
+        current.dateModified = startup.dateModified
+        if current.currentPromptText == tab.promptText { current.currentPromptText = startup.currentPromptText }
+        return current == startup
+    }
+
     /// ─────────────────────────────────────────────────────────────
     private func updateWorkspaceState(
         _ workspace: inout WorkspaceModel,
@@ -13504,7 +13561,8 @@ class WorkspaceManagerViewModel: ObservableObject {
     func pollAndSaveStateWithOutcomeAsync(
         workspaceID requestedWorkspaceID: UUID? = nil,
         source: WorkspaceSaveSource = .pollAndSaveStateAsync,
-        allowRetainedAgentAdmissionRecoveryRetry: Bool = true
+        allowRetainedAgentAdmissionRecoveryRetry: Bool = true,
+        skippingUnusedStartupDefault: Bool = false
     ) async -> WorkspacePersistenceOutcome {
         guard !Task.isCancelled else {
             return .rejected(reason: "own_save_cancelled", category: .cancelled)
@@ -13561,7 +13619,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                 workspaceID: workspaceID,
                 source: source,
                 allowRetainedAgentAdmissionRecoveryRetry: false,
-                ownSaveFence: fence
+                ownSaveFence: fence,
+                skippingUnusedStartupDefault: skippingUnusedStartupDefault
             )
         } catch {
             return .rejected(reason: "own_save_cancelled", category: .cancelled)
@@ -13572,7 +13631,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         workspaceID requestedWorkspaceID: UUID? = nil,
         source: WorkspaceSaveSource,
         allowRetainedAgentAdmissionRecoveryRetry: Bool,
-        ownSaveFence: OwnSaveFence?
+        ownSaveFence: OwnSaveFence?,
+        skippingUnusedStartupDefault: Bool = false
     ) async -> WorkspacePersistenceOutcome {
         guard let wsID = requestedWorkspaceID ?? activeWorkspace?.id,
               let currentWorkspace = workspace(withID: wsID)
@@ -13648,6 +13708,14 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         guard let index = workspaceIndex(for: wsID) else {
             return .rejected(reason: "workspace_changed_before_capture")
+        }
+        // Test the proof after save notifications/listeners flush live edits and after joining
+        // save predecessors. The capture or refusal follows without an actor suspension.
+        if skippingUnusedStartupDefault, !Task.isCancelled, !isPreparingForWindowClose,
+           isOwnSaveFenceCurrent(ownSaveFence, workspaceID: wsID),
+           departureHasOnlyStartupState(workspaceID: wsID)
+        {
+            return .notRequired(workspaceID: wsID)
         }
         let snapshot = captureActiveTabSnapshotForWorkspaceIndex(index, source: source)
         guard let capturedWorkspace = workspace(withID: wsID) else {
