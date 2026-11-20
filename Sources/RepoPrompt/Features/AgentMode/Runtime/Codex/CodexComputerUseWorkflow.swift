@@ -138,7 +138,7 @@ enum CodexGoalSupport {
 
 enum CodexComputerUseWorkflow {
     static let commandName = "computer-use"
-    static let disabledMessage = "Computer Use is turned off. Enable Computer Use in Codex Direct Agent permissions, then submit /computer-use. macOS permissions must be granted manually."
+    static let disabledMessage = "Computer Use is turned off. Enable Computer Use in Codex Direct Agent permissions, then submit /computer-use. macOS Screen Recording and Accessibility are granted to Codex Computer Use, not RepoPrompt; once enabled, the Computer Use setting shows setup status and links to both privacy panes."
     static let unavailableMessage = "Computer Use requires the installed SkyComputerUseClient companion from Codex or ChatGPT. No companion is available; this turn cannot use computer-use tools."
     static let collisionMessage = "Computer Use cannot start because the RepoPrompt-owned Codex runtime already contains a reserved 'computer-use' MCP entry. Review and manually remove or rename that entry in the owned runtime configuration, then retry. RepoPrompt will not rewrite it or import personal Codex configuration."
     static let ineligibleMessage = "Computer Use requires a top-level native Codex session with its own tab, the feature enabled, and an available companion. Enable it locally in that tab."
@@ -166,8 +166,8 @@ enum CodexComputerUseWorkflow {
     }
 
     @MainActor
-    static func checkConfiguredRuntimeRequirement() async -> String? {
-        await admissionPreflight.check()
+    static func checkConfiguredRuntimeRequirement(forceRefresh: Bool = false) async -> String? {
+        await admissionPreflight.check(forceRefresh: forceRefresh)
     }
 
     @MainActor
@@ -193,7 +193,8 @@ enum CodexComputerUseWorkflow {
     }
 
     /// Cache successful admission for the immutable launch selection. Failed checks
-    /// retry only on explicit arming; synchronous UI reads never probe or hash files.
+    /// retry on arming or setup loading; explicit setup re-checks also refresh success.
+    /// Synchronous UI reads never probe or hash files.
     /// Spawn independently revalidates the executable even after cached admission.
     @MainActor
     final class RuntimeAdmissionPreflight {
@@ -215,8 +216,10 @@ enum CodexComputerUseWorkflow {
             _ = beginCheck()
         }
 
-        func check() async -> String? {
-            if hasResult, message == nil { return nil }
+        func check(forceRefresh: Bool = false) async -> String? {
+            // Join an active refresh before considering the previous successful result.
+            if let pending { return await pending.value }
+            if !forceRefresh, hasResult, message == nil { return nil }
             return await beginCheck().value
         }
 
