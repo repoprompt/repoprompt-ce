@@ -187,8 +187,23 @@ final class AutoRecommendationEngine {
             )
         }
 
+        let antigravityOption: ChatBackendOption? = if status.antigravityCLI == .ready,
+                                                       let raw = AgentModelCatalogRuntime.shared.acpRegistry
+                                                       .resolvedSnapshot(for: .antigravity)?.preferredModelRaw
+        {
+            ChatBackendOption(
+                kind: .antigravity,
+                displayName: "Google Antigravity",
+                modelString: AIModel.antigravityCustom(name: raw).rawValue,
+                description: AIModel.antigravityCustom(name: raw).displayName,
+                tradeoffs: ["Uses the Google account signed in to agy."]
+            )
+        } else {
+            nil
+        }
+
         // Determine default backend and upgrade hint
-        // Priority for CHAT: Codex CLI > OpenAI API > Claude Code
+        // Priority for CHAT: Codex CLI > OpenAI API > Claude Code > Google Antigravity
         let defaultBackend: ChatBackendKind
         var priorityPath: [String] = []
         var upgradeHint: String? = nil
@@ -204,6 +219,9 @@ final class AutoRecommendationEngine {
             defaultBackend = .claudeCode
             priorityPath = ["Claude Code"]
             upgradeHint = "For best chat experience, connect Codex CLI (requires OpenAI Plus/Pro) for \(codexPlanningLabel) – balances quality with usage limits."
+        } else if antigravityOption != nil {
+            defaultBackend = .antigravity
+            priorityPath = ["Google Antigravity"]
         } else {
             return nil
         }
@@ -214,7 +232,8 @@ final class AutoRecommendationEngine {
             openAIOption: openAIOption,
             claudeCodeOption: claudeCodeOption,
             priorityPath: priorityPath,
-            upgradeHint: upgradeHint
+            upgradeHint: upgradeHint,
+            antigravityOption: antigravityOption
         )
     }
 
@@ -654,6 +673,9 @@ final class AutoRecommendationEngine {
         case .openAI:
             rec.openAIOption?.modelString
                 ?? AIModel.gpt61SolHigh.rawValue
+        case .antigravity:
+            rec.antigravityOption?.modelString
+                ?? ""
         }
         let trimmedModel = modelString.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmedModel.isEmpty ? nil : trimmedModel

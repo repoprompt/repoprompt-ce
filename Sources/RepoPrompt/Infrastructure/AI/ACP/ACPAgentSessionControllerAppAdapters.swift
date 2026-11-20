@@ -7,10 +7,15 @@ import RepoPromptProcess
 import RepoPromptSettingsCore
 
 final class ACPAgentSessionAppHost: ACPAgentSessionHost, @unchecked Sendable {
+    private let allowsModelCatalogPublication: Bool
     private let routingLock = NSLock()
     private var routingCleanupReceipt: MCPRunRoutingCleanupReceipt?
     private var routingCleanupTail: Task<Void, Never>?
     private var resourceShutdownTask: Task<Void, Never>?
+
+    init(allowsModelCatalogPublication: Bool = true) {
+        self.allowsModelCatalogPublication = allowsModelCatalogPublication
+    }
 
     fileprivate func routingProcessRegistration(runID: UUID, pid: pid_t) -> MCPRunRoutingProcessRegistration? {
         routingLock.withLock {
@@ -163,6 +168,7 @@ final class ACPAgentSessionAppHost: ACPAgentSessionHost, @unchecked Sendable {
     }
 
     func publishDiscoveredModels(_ models: ACPDiscoveredSessionModels, for providerID: ACPProviderID) {
+        guard allowsModelCatalogPublication else { return }
         _ = AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels(models, for: providerID)
     }
 

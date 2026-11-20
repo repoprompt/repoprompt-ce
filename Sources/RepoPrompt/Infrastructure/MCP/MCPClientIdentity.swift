@@ -56,6 +56,9 @@ enum MCPClientIdentity {
         if normalized == "grok-shell" || normalized.hasPrefix("grok-shell-") {
             return "grok-shell"
         }
+        if normalized == "antigravity" || matchesFamily(normalized, tokens: ["antigravity", "client"]) {
+            return "antigravity-client"
+        }
         if matchesFamily(normalized, tokens: ["claude", "ai"]) { return "claude-ai" }
         if matchesFamily(normalized, tokens: ["repoprompt", "cli"]) { return "repoprompt-cli" }
         return nil

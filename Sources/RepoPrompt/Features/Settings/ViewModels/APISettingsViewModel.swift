@@ -348,6 +348,10 @@ public class APISettingsViewModel: ObservableObject {
     /// Installed-runtime inputs are refreshed when CLI Providers or Agent Decisions is shown.
     /// They intentionally remain separate from current-process Router verification.
     @Published private(set) var isAntigravityRuntimeInstalled = false
+    @Published private(set) var isAntigravityConnected = false
+    @Published private(set) var isTestingAntigravity = false
+    @Published private(set) var antigravityError: String?
+    private var antigravityModelsTask: Task<Void, Never>?
     @Published private(set) var isDevinRuntimeInstalled = false
     @Published private(set) var directConnectedCLIProviders: Set<AgentProviderKind> = []
 
@@ -468,6 +472,11 @@ public class APISettingsViewModel: ObservableObject {
         if isAntigravityRuntimeInstalled != antigravityInstalled {
             isAntigravityRuntimeInstalled = antigravityInstalled
         }
+        if !antigravityInstalled {
+            isAntigravityConnected = false
+            antigravityModelsTask?.cancel()
+            antigravityModelsTask = nil
+        }
         if isDevinRuntimeInstalled != devinInstalled {
             isDevinRuntimeInstalled = devinInstalled
         }
@@ -482,7 +491,7 @@ public class APISettingsViewModel: ObservableObject {
         if isOpenCodeConnected { providers.insert(.openCode) }
         if isCursorConnected { providers.insert(.cursor) }
         if isGrokBuildConnected { providers.insert(.grokBuild) }
-        if isAntigravityRuntimeInstalled { providers.insert(.antigravity) }
+        if isAntigravityConnected { providers.insert(.antigravity) }
         if isDevinRuntimeInstalled { providers.insert(.devin) }
         guard providers != directConnectedCLIProviders else { return }
         directConnectedCLIProviders = providers
@@ -500,6 +509,7 @@ public class APISettingsViewModel: ObservableObject {
             $isCursorConnected.map { _ in () }.eraseToAnyPublisher(),
             $isGrokBuildConnected.map { _ in () }.eraseToAnyPublisher(),
             $isAntigravityRuntimeInstalled.map { _ in () }.eraseToAnyPublisher(),
+            $isAntigravityConnected.map { _ in () }.eraseToAnyPublisher(),
             $isDevinRuntimeInstalled.map { _ in () }.eraseToAnyPublisher(),
             $claudeCodeCLIStatus.map { _ in () }.eraseToAnyPublisher(),
             $compatibleBackendConfigs.map { _ in () }.eraseToAnyPublisher(),
@@ -542,7 +552,9 @@ public class APISettingsViewModel: ObservableObject {
             codexCLI: recommendationAvailability(isConnected: isCodexConnected, provider: .codexExec),
             cursorCLI: recommendationAvailability(isConnected: isCursorConnected, provider: .cursor),
             grokBuildCLI: recommendationAvailability(isConnected: isGrokBuildConnected, provider: .grokBuild),
-            openAI: isOpenAIKeyValid ? .ready : (!openAIApiKey.isEmpty ? .configured : .notConfigured)
+            openAI: isOpenAIKeyValid ? .ready : (!openAIApiKey.isEmpty ? .configured : .notConfigured),
+            antigravityCLI: isAntigravityConnected && AntigravityCLILocator.installedCommand() != nil
+                ? .ready : (isAntigravityRuntimeInstalled ? .configured : .notConfigured)
         )
     }
 
@@ -1135,7 +1147,7 @@ public class APISettingsViewModel: ObservableObject {
         storedDataLoadBoundary: (@MainActor @Sendable () async -> Void)? = nil,
         contextBuilderProviderValidationWillBegin: (@MainActor @Sendable () async -> Void)? = nil,
         antigravityRuntimeInstalledProvider: @escaping @MainActor () -> Bool = {
-            AntigravityRuntimeManager.installedRuntimeSync() != nil
+            AntigravityCLILocator.isRuntimeInstalled()
         },
         devinRuntimeInstalledProvider: @escaping @MainActor () -> Bool = {
             DevinRuntimeLocator.isInstalledSync()
@@ -1197,6 +1209,8 @@ public class APISettingsViewModel: ObservableObject {
         hasPreparedForWindowClose = true
         initialLoadTask?.cancel()
         initialLoadTask = nil
+        antigravityModelsTask?.cancel()
+        antigravityModelsTask = nil
         devinModelsTask?.cancel()
         devinModelsTask = nil
         openAIModelsTask?.cancel()
@@ -1734,6 +1748,7 @@ public class APISettingsViewModel: ObservableObject {
         if isOpenCodeConnected { startOpenCodeModelsSubscriptionIfNeeded(workspacePath: nil) } else { stopOpenCodeModelsSubscription(clearModels: true) }
         if isCursorConnected { startCursorModelsSubscriptionIfNeeded(workspacePath: nil) } else { stopCursorModelsSubscription(clearModels: true) }
         if isGrokBuildConnected { startGrokBuildModelsSubscriptionIfNeeded(workspacePath: nil) } else { stopGrokBuildModelsSubscription(clearModels: true) }
+        startAntigravityModelsSubscriptionIfNeeded()
         if isOpenRouterKeyValid { openRouterModelsTask = Task { await self.fetchOpenRouterModels() } }
         if isCustomProviderValid { customModelsTask = Task { await self.fetchCustomModels() } }
 
@@ -1899,6 +1914,49 @@ public class APISettingsViewModel: ObservableObject {
         return host == "api.openai.com" || host.hasSuffix(".openai.com")
     }
 
+    func testAntigravityConnection() async {
+        guard !isTestingAntigravity else { return }
+        refreshDirectCLIProviderConnectionState()
+        guard isAntigravityRuntimeInstalled else {
+            antigravityError = "Install the Antigravity CLI, then run agy to sign in with Google."
+            return
+        }
+        isTestingAntigravity = true
+        defer { isTestingAntigravity = false }
+        antigravityError = nil
+        let discovered = await AntigravityACPModelPollingService.shared.refreshNow(workspacePath: nil)
+        guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
+        isAntigravityConnected = discovered
+        if discovered {
+            startAntigravityModelsSubscriptionIfNeeded()
+        } else {
+            antigravityError = "No models received. Update agy and confirm you are signed in with Google."
+        }
+        refreshDirectConnectedCLIProviders()
+        await updateAvailableModels()
+    }
+
+    private func startAntigravityModelsSubscriptionIfNeeded() {
+        // The managed legacy runtime can launch OAuth in a browser. Poll it only after
+        // the user connects or opens an Agent Mode session.
+        guard AntigravityCLILocator.installedCommand() != nil,
+              AntigravityRuntimeManager.installedRuntimeSync() == nil,
+              antigravityModelsTask == nil
+        else { return }
+        antigravityModelsTask = Task { [weak self] in
+            let snapshots = await AntigravityACPModelPollingService.shared.subscribe(workspacePath: nil)
+            for await snapshot in snapshots {
+                guard let self, !Task.isCancelled, !hasPreparedForWindowClose else { return }
+                if snapshot.isLiveDiscovery {
+                    isAntigravityConnected = true
+                    antigravityError = nil
+                    refreshDirectConnectedCLIProviders()
+                }
+                await updateAvailableModels()
+            }
+        }
+    }
+
     func refreshDevinModels(force: Bool = false) {
         guard devinModelsTask == nil else { return }
         isDiscoveringDevinModels = true
@@ -2046,6 +2104,10 @@ public class APISettingsViewModel: ObservableObject {
             modelSet.formUnion(AIModel.modelsForProvider(.grokBuild))
         }
 
+        if AntigravityCLILocator.installedCommand() != nil {
+            modelSet.formUnion(AIModel.modelsForProvider(.antigravity))
+        }
+
         if DevinRuntimeLocator.isInstalledSync() {
             modelSet.formUnion(AIModel.modelsForProvider(.devin))
         }
@@ -2119,6 +2181,7 @@ public class APISettingsViewModel: ObservableObject {
         case .claudeCode: "claude_code"
         case .codex: "codex"
         case .openCode: "opencode"
+        case .antigravity: "antigravity"
         case .devin: "devin"
         }
     }
@@ -2196,7 +2259,7 @@ public class APISettingsViewModel: ObservableObject {
                 break
             case .grokBuild:
                 break
-            case .devin:
+            case .antigravity, .devin:
                 break
             }
 
@@ -2260,7 +2323,7 @@ public class APISettingsViewModel: ObservableObject {
             break
         case .grokBuild:
             break
-        case .devin:
+        case .antigravity, .devin:
             break
         }
         await updateAvailableModels()

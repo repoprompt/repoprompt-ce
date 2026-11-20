@@ -6982,6 +6982,9 @@ class PromptViewModel: ObservableObject {
             return api.isCursorConnected
         case .grokBuild:
             return api.isGrokBuildConnected
+        case .antigravity:
+            return AntigravityCLILocator.installedCommand() != nil
+                && ACPAIModelCatalog.antigravityModelOption(for: model.modelName) != nil
         case .devin:
             return DevinRuntimeLocator.isInstalledSync()
         }
@@ -7007,7 +7010,7 @@ class PromptViewModel: ObservableObject {
                 return true
             }
             switch model.providerType {
-            case .claudeCode, .codex, .openCode, .cursor, .grokBuild:
+            case .claudeCode, .codex, .openCode, .cursor, .grokBuild, .antigravity:
                 return true
             default:
                 // Check if the model's provider has an API key configured

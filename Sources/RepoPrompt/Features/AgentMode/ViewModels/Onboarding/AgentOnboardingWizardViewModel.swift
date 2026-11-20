@@ -133,12 +133,15 @@ final class AgentOnboardingWizardViewModel: ObservableObject {
         // React to provider connection changes
         if let api = apiSettingsViewModel {
             Publishers.MergeMany(
-                api.$isClaudeCodeConnected.map { _ in () },
-                api.$isCodexConnected.map { _ in () },
-                api.$isOpenCodeConnected.map { _ in () },
-                api.$isCursorConnected.map { _ in () },
-                api.$isGrokBuildConnected.map { _ in () },
-                api.$isOpenAIKeyValid.map { _ in () }
+                api.$isClaudeCodeConnected.map { _ in () }.eraseToAnyPublisher(),
+                api.$isCodexConnected.map { _ in () }.eraseToAnyPublisher(),
+                api.$isOpenCodeConnected.map { _ in () }.eraseToAnyPublisher(),
+                api.$isCursorConnected.map { _ in () }.eraseToAnyPublisher(),
+                api.$isGrokBuildConnected.map { _ in () }.eraseToAnyPublisher(),
+                api.$isAntigravityConnected.map { _ in () }.eraseToAnyPublisher(),
+                api.$isTestingAntigravity.map { _ in () }.eraseToAnyPublisher(),
+                api.$antigravityError.map { _ in () }.eraseToAnyPublisher(),
+                api.$isOpenAIKeyValid.map { _ in () }.eraseToAnyPublisher()
             )
             .debounce(for: .milliseconds(300), scheduler: RunLoop.main)
             .sink { [weak self] _ in
@@ -222,6 +225,25 @@ final class AgentOnboardingWizardViewModel: ObservableObject {
 
     var grokBuildConnected: Bool {
         apiSettingsViewModel?.isGrokBuildConnected ?? false
+    }
+
+    var antigravityConnected: Bool {
+        apiSettingsViewModel?.isAntigravityConnected ?? false
+    }
+
+    var isTestingAntigravity: Bool {
+        apiSettingsViewModel?.isTestingAntigravity ?? false
+    }
+
+    var antigravityError: String? {
+        apiSettingsViewModel?.antigravityError
+    }
+
+    func testAntigravity() {
+        Task {
+            await apiSettingsViewModel?.testAntigravityConnection()
+            refreshProviderStatus()
+        }
     }
 
     var claudeCodeError: String? {

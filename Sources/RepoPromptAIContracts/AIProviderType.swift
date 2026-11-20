@@ -18,5 +18,6 @@ package enum AIProviderType: Codable, Equatable {
     case openCode // OpenCode CLI provider case
     case cursor // Cursor CLI provider case
     case grokBuild // Grok Build CLI provider case
+    case antigravity
     case devin
 }

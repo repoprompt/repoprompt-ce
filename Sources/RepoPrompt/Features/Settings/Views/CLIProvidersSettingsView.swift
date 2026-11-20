@@ -68,7 +68,6 @@ struct CLIProvidersSettingsView: View {
     @State private var isLoadingCursor = false
     @State private var isLoadingGrokBuild = false
     @State private var isLoadingAntigravity = false
-    @State private var isTestingAntigravity = false
     @State private var isAntigravityExpanded = false
     @State private var isLoadingZAI = false
     @State private var showClaudeCodeTraceDump = false
@@ -2272,73 +2271,70 @@ struct CLIProvidersSettingsView: View {
     private var antigravityCard: some View {
         providerCard(
             title: "Google Antigravity",
-            subtitle: "Managed official Antigravity ACP runtime with Google OAuth authentication.",
-            infoURL: "https://antigravity.google/",
+            subtitle: "Uses the Antigravity CLI and your Google sign-in.",
+            infoURL: "https://antigravity.google/docs/cli/acp",
             isConnected: viewModel.directConnectedCLIProviders.contains(.antigravity),
             isExpanded: $isAntigravityExpanded
         ) {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(spacing: 10) {
-                    Button {
-                        isLoadingAntigravity = true
-                        Task {
-                            do {
-                                _ = try await AntigravityRuntimeManager.shared.install()
-                                await MainActor.run {
-                                    viewModel.refreshDirectCLIProviderConnectionState()
-                                    isLoadingAntigravity = false
-                                    alertMessage = "Antigravity runtime installed. It will be authenticated when you start the first session."
-                                    showAlert = true
-                                }
-                            } catch {
-                                await MainActor.run {
-                                    isLoadingAntigravity = false
-                                    alertMessage = error.localizedDescription
-                                    showAlert = true
+                    if AntigravityCLILocator.installedCommand() == nil {
+                        Button {
+                            isLoadingAntigravity = true
+                            Task {
+                                do {
+                                    _ = try await AntigravityRuntimeManager.shared.install()
+                                    await MainActor.run {
+                                        viewModel.refreshDirectCLIProviderConnectionState()
+                                        isLoadingAntigravity = false
+                                        alertMessage = "Antigravity runtime installed. It will be authenticated when you start the first session."
+                                        showAlert = true
+                                    }
+                                } catch {
+                                    await MainActor.run {
+                                        isLoadingAntigravity = false
+                                        alertMessage = error.localizedDescription
+                                        showAlert = true
+                                    }
                                 }
                             }
+                        } label: {
+                            if isLoadingAntigravity {
+                                ProgressView().scaleEffect(0.6).frame(height: 16)
+                            } else {
+                                Label("Install Managed Runtime", systemImage: "arrow.down.circle")
+                            }
                         }
-                    } label: {
-                        if isLoadingAntigravity {
-                            ProgressView().scaleEffect(0.6).frame(height: 16)
-                        } else {
-                            Label(viewModel.isAntigravityRuntimeInstalled ? "Update Runtime" : "Install Runtime", systemImage: "arrow.down.circle")
-                        }
+                        .disabled(isLoadingAntigravity)
+                        .buttonStyle(CustomButtonStyle())
                     }
-                    .disabled(isLoadingAntigravity)
-                    .buttonStyle(CustomButtonStyle())
 
                     Button {
-                        isTestingAntigravity = true
-                        Task {
-                            do {
-                                let request = ACPRunRequest(agentKind: .antigravity, modelString: nil, workspacePath: nil, resumeSessionID: nil, attachments: [], taskLabelKind: nil)
-                                _ = try await AntigravityACPAgentProvider().support(for: request)
-                                let discovered = await AntigravityACPModelPollingService.shared.refreshNow(workspacePath: nil)
-                                let count = AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: .antigravity)?.options.count ?? 0
-                                await MainActor.run {
-                                    isTestingAntigravity = false
-                                    alertMessage = discovered && count > 0
-                                        ? "Antigravity ACP connected. \(count) models discovered."
-                                        : "Antigravity ACP is available, but it returned no selectable models."
-                                    showAlert = true
-                                }
-                            } catch {
-                                await MainActor.run {
-                                    isTestingAntigravity = false
-                                    alertMessage = error.localizedDescription
-                                    showAlert = true
-                                }
-                            }
-                        }
+                        Task { await viewModel.testAntigravityConnection() }
                     } label: {
-                        if isTestingAntigravity { ProgressView().scaleEffect(0.6).frame(height: 16) }
+                        if viewModel.isTestingAntigravity { ProgressView().scaleEffect(0.6).frame(height: 16) }
                         else { Label("Test Connection", systemImage: "antenna.radiowaves.left.and.right") }
                     }
-                    .disabled(isTestingAntigravity || !viewModel.isAntigravityRuntimeInstalled)
+                    .disabled(viewModel.isTestingAntigravity)
                     .buttonStyle(CustomButtonStyle())
+                }
 
-                    Text(viewModel.isAntigravityRuntimeInstalled ? "Runtime ready. Google login will be requested by ACP." : "Runtime not installed.")
+                if let error = viewModel.antigravityError {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundColor(.red)
+                } else if viewModel.isAntigravityConnected {
+                    let count = AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: .antigravity)?.options.count ?? 0
+                    Text("\(count) selectable models")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    if AntigravityCLILocator.installedCommand() == nil {
+                        Text("Install and sign in with agy to also use Antigravity in Oracle and Built-in Chat.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                } else {
+                    Text("Install the Antigravity CLI, run agy to sign in, then test the connection.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }

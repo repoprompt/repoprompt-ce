@@ -64,7 +64,7 @@ extension AgentProviderKind {
         case .grokBuild:
             Self.grokBuildMCPClientID
         case .antigravity:
-            "antigravity"
+            "antigravity-client"
         case .devin:
             Self.devinMCPClientID
         }
@@ -78,7 +78,7 @@ extension AgentProviderKind {
         case .codexExec:
             return "OpenAI's Codex CLI agent. Optimized for tool-driven engineering workflows. Supports configurable reasoning effort levels per model."
         case .antigravity:
-            return "Google Antigravity ACP agent. Supports interactive Agent Mode through the managed ACP bridge."
+            return "Google Antigravity ACP agent. Supports Agent Mode and delegated sessions through the Antigravity CLI."
         case .openCode:
             return "OpenCode ACP agent. Interactive Agent Mode uses RepoPrompt MCP tools; headless discovery/delegate runs use RepoPrompt's managed no-native-tools mode."
         case .cursor:

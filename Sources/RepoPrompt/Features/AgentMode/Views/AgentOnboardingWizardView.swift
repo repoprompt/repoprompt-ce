@@ -1141,6 +1141,19 @@ private struct ProvidersStepView: View {
                     requiresPro: false,
                     onTest: { viewModel.testGrokBuild() }
                 )
+
+                CompactProviderRow(
+                    name: "Google Antigravity",
+                    icon: "sparkles",
+                    description: "Use your Google sign-in for Agent Mode and Oracle.",
+                    isConnected: viewModel.antigravityConnected,
+                    isLoading: viewModel.isTestingAntigravity,
+                    errorText: viewModel.antigravityError,
+                    setupHint: "Install and sign in with agy",
+                    isRecommended: false,
+                    requiresPro: false,
+                    onTest: { viewModel.testAntigravity() }
+                )
             }
         }
     }
