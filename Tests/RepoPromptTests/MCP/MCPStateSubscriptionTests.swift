@@ -106,6 +106,38 @@ private actor RouteHistoryScanner: HistorySessionScanning {
 /// view model can be deallocated once observation stops.
 final class MCPStateSubscriptionTests: XCTestCase {
     @MainActor
+    func testPhysicalRouteDisposalWaitsForSuccessorEpochExecutionLease() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        let owner = MCPHostRouteResources.LeaseOwner(
+            identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: runtime.routingCoordinator, runtime: runtime
+        )
+        let route = owner.route
+        let presentation = try XCTUnwrap(owner.acquire(.presentation))
+        let predecessor = try XCTUnwrap(owner.acquire(.execution))
+        let registered = await route.ensureRegistered(workspaceID: nil, contextID: nil, revision: 0)
+        let descriptor = try XCTUnwrap(registered)
+        let successor = try XCTUnwrap(owner.acquire(.execution))
+
+        await predecessor.release()
+        XCTAssertFalse(route.isClosing)
+        await owner.requestTerminalDisposal()
+        XCTAssertNil(owner.acquire(.presentation))
+        XCTAssertNil(owner.acquire(.execution))
+        await presentation.release()
+        await predecessor.release()
+        XCTAssertFalse(route.isClosing)
+        let retained = await runtime.routingCoordinator.snapshot()
+        XCTAssertTrue(retained.windows.contains { $0.windowID == descriptor.windowID && $0.generation == descriptor.generation })
+
+        await successor.release()
+        XCTAssertTrue(route.isClosing)
+        XCTAssertNil(route.descriptor)
+        await owner.requestTerminalDisposal()
+        let closed = await runtime.routingCoordinator.snapshot()
+        XCTAssertFalse(closed.windows.contains { $0.windowID == descriptor.windowID })
+    }
+
+    @MainActor
     func testModelEndpointRefusesWriterReacquisitionOnTheSameBinding() async throws {
         let server = makeServerViewModel(service: makeService())
         let manager = try XCTUnwrap(server.workspaceManager)
