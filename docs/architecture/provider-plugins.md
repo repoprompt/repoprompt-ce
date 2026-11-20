@@ -386,6 +386,23 @@ The recommended pattern when adding (for example) a hypothetical `acmeAgent` fam
    - Package-level tests for pure logic in the new product.
    - Root app tests under `Tests/RepoPromptTests/` for: adapter-to-controller wiring, model catalog snapshots (option order, defaults, raw values), launch-environment resolution, and any new permission/binding rules.
 
+## Subscription account authority in MCP and delegation
+
+Provider and model roles, model parameters, workspace/worktree provenance and delegation
+grants do not authorize a subscription account. The dark rollout leaves ordinary legacy
+starts unchanged; no MCP operation enumerates or selects a saved subscription profile.
+Authorized status and transcript reads remain available for managed records. Input,
+control activation and provider execution on those records refuse while verification is
+closed; a missing or unreadable binding must not trigger an ambient retry.
+
+Before managed activation, same-provider child starts must carry the caller's verified
+admission, not the provider's Settings default. Cross-provider delegated starts must not
+select a managed default. App-backed external starts may use a managed default only after
+an explicit local opt-in on that already-authorized surface; headless hosts remain
+legacy-only. Steering or resuming an existing session must use the target's saved binding
+and exact existing grant, not the caller's account or the current default. These are
+activation requirements, not capabilities provided by the dark rollout.
+
 ## Validation
 
 Standard checks for changes that touch the seam:
