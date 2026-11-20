@@ -153,7 +153,7 @@ final class ACPPermissionScopeTests: XCTestCase {
             ["optionId": "allow_persistent", "kind": "allow_once"],
             ["optionId": "enable-always-approve", "kind": "allow_once"]
         ]
-        // Cursor's explicit user full-access setting is the remaining automatic path.
+        // Exercise automatic option selection with explicit Full Access.
         for option in invalidOptions {
             // Mixed fixtures use distinct wire IDs; the exact allow_once mislabel is
             // covered alone rather than treating duplicate option IDs as valid consent.
@@ -172,7 +172,7 @@ final class ACPPermissionScopeTests: XCTestCase {
         }
     }
 
-    func testPendingCursorFullAccessUsesOnlyGenuineOneTimeOptions() async throws {
+    func testPendingFullAccessUsesOnlyGenuineOneTimeOptions() async throws {
         let invalidOptions = [
             ["optionId": "allow_always", "kind": "allow_always"],
             ["optionId": "allow_once", "kind": "allow_always"],
@@ -186,13 +186,15 @@ final class ACPPermissionScopeTests: XCTestCase {
                 var options = [option]
                 if genuineOptionAvailable { options.append(["optionId": "opaque-once", "kind": "allow_once"]) }
                 options.append(["optionId": "reject_once", "kind": "reject_once"])
-                let result = try await autoApprovalOutcome(
-                    toolCallJSON: #"{"toolCallId":"tool-1","title":"Test tool","kind":"execute"}"#,
-                    providerID: .cursor, options: options, pendingFullAccess: true,
-                    expectedPendingAutoApproval: genuineOptionAvailable
-                )
-                XCTAssertTrue(result.approvalRequested, "The prompt must first surface with full access disabled")
-                XCTAssertEqual(result.outcome["optionId"], genuineOptionAvailable ? "opaque-once" : "reject_once", "\(option)")
+                for providerID: ACPProviderID in [.cursor, .antigravity] {
+                    let result = try await autoApprovalOutcome(
+                        toolCallJSON: #"{"toolCallId":"tool-1","title":"Test tool","kind":"execute"}"#,
+                        providerID: providerID, options: options, pendingFullAccess: true,
+                        expectedPendingAutoApproval: genuineOptionAvailable
+                    )
+                    XCTAssertTrue(result.approvalRequested, "The prompt must first surface with full access disabled")
+                    XCTAssertEqual(result.outcome["optionId"], genuineOptionAvailable ? "opaque-once" : "reject_once", "\(providerID): \(option)")
+                }
             }
         }
     }
@@ -213,9 +215,10 @@ final class ACPPermissionScopeTests: XCTestCase {
     }
 
     func testPendingFullAccessRequiresCurrentFlagAndSupportedProvider() async throws {
+        let supportedProviders: Set<ACPProviderID> = [.cursor, .antigravity]
         for providerID: ACPProviderID in [.openCode, .cursor, .antigravity, .grokBuild, .devin] {
             for enabled in [false, true] {
-                let expectedSelection = providerID == .cursor && enabled
+                let expectedSelection = supportedProviders.contains(providerID) && enabled
                 let result = try await autoApprovalOutcome(
                     toolCallJSON: #"{"toolCallId":"tool-1","title":"Test tool","kind":"execute"}"#,
                     providerID: providerID, pendingFullAccess: enabled, expectedPendingAutoApproval: expectedSelection
