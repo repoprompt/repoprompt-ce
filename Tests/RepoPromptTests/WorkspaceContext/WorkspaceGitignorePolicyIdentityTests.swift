@@ -59,11 +59,17 @@ final class WorkspaceGitignorePolicyIdentityTests: XCTestCase {
                 XCTAssertEqual(search.files.contains(where: { $0.name == name }), !respectGitignore)
                 XCTAssertEqual(selection[path]?.file != nil, !respectGitignore)
                 let read = try await reader.resolveReadFileRequest(path)
-                if case .workspace = read {
-                    XCTAssertFalse(respectGitignore, path)
-                } else {
-                    XCTAssertTrue(respectGitignore, path)
+                // Exact reads can materialize otherwise ignored files without making them discoverable.
+                guard case let .workspace(match) = read else {
+                    XCTFail("Expected exact read to resolve \(path)")
+                    continue
                 }
+                XCTAssertEqual(match.file.standardizedRelativePath, path)
+            }
+            let searchAfterReads = await store.searchCatalogSnapshot()
+            for path in toggledPaths {
+                let name = URL(fileURLWithPath: path).lastPathComponent
+                XCTAssertEqual(searchAfterReads.files.contains(where: { $0.name == name }), !respectGitignore)
             }
             XCTAssertTrue(tree.content.contains("Kept.swift"))
             XCTAssertFalse(tree.content.contains("Excluded.swift"))
