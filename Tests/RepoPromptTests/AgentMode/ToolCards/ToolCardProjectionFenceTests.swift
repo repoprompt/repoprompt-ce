@@ -273,3 +273,26 @@ final class ToolCardProjectionFenceTests: XCTestCase {
         }
     }
 }
+
+final class ToolResultMarkdownRendererTests: XCTestCase {
+    func testRepoPromptTransportRendersMarkdownInsteadOfEnvelope() {
+        let payload = ###"{"Ok":{"content":[{"type":"text","text":"## File Read\n\n```swift\nlet value = 1\n```"}]}}"###
+        let output = ToolResultMarkdownRenderer.render(toolName: "read_file", argsJSON: nil, resultPayload: payload)
+        XCTAssertEqual(output?.text, "## File Read\n\n```swift\nlet value = 1\n```")
+        XCTAssertEqual(output?.isMarkdown, true)
+        XCTAssertEqual(ToolResultMarkdownRenderer.readablePayload(payload), output?.text)
+    }
+
+    func testStructuredPayloadShowsReadableFieldsWithoutLosingNestedValues() {
+        let payload = #"{"items":[{"ok":true,"value":1},null],"text":"line one\nline two"}"#
+        XCTAssertEqual(
+            ToolResultMarkdownRenderer.readablePayload(payload),
+            "items:\n  1:\n    ok: true\n    value: 1\n  2: null\ntext:\n  line one\n  line two"
+        )
+    }
+
+    func testPlainPayloadKeptLiteralInRetainedContent() {
+        let payload = "  <tag>\n[not a link]  \n"
+        XCTAssertEqual(ToolResultMarkdownRenderer.readablePayload(payload), payload)
+    }
+}
