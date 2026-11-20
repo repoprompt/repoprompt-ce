@@ -4,6 +4,7 @@ import MCP
 import RepoPromptACPProviders
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
@@ -120,6 +121,13 @@ final class AntigravityHeadlessBoundaryTests: XCTestCase {
         XCTAssertEqual(oracle.modelName, defaultModel)
         XCTAssertEqual(oracle.attachmentRoute, .acp)
         XCTAssertEqual(AppOracleGroupRouting.executionProfile(for: oracle)?.providerID, "antigravity")
+    }
+
+    func testOracleStreamKeepsAssistantContentAndDropsAntigravitySessionTitles() {
+        XCTAssertFalse(AntigravityChatProvider.forwardsChatEvent(.init(type: "status", text: "Generated session title")))
+        XCTAssertTrue(AntigravityChatProvider.forwardsChatEvent(.init(type: "content", text: "Oracle answer")))
+        XCTAssertTrue(AntigravityChatProvider.forwardsChatEvent(.init(type: "reasoning", text: nil, reasoning: "Reasoning")))
+        XCTAssertTrue(AntigravityChatProvider.forwardsChatEvent(.init(type: "message_stop", text: nil)))
     }
 
     func testHeadlessFactoryRejectsAntigravity() {

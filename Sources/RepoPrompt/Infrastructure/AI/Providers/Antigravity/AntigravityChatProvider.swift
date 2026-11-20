@@ -145,7 +145,7 @@ final class AntigravityChatProvider: AIProvider {
         )
         do {
             let results = try await bridge.streamAgentMessage(message)
-            for try await result in results {
+            for try await result in results where Self.forwardsChatEvent(result) {
                 continuation.yield(result)
             }
             try Task.checkCancellation()
@@ -154,6 +154,15 @@ final class AntigravityChatProvider: AIProvider {
             throw error
         }
         await bridge.dispose()
+    }
+
+    /// ACP session titles and tool events belong to Agent Mode. AIQueriesService
+    /// treats any nonempty result.text as response content.
+    static func forwardsChatEvent(_ result: AIStreamResult) -> Bool {
+        switch result.type {
+        case "content", "final_content", "reasoning", "usage", "message_stop", "error": true
+        default: false
+        }
     }
 
     static func makeAgentMessage(from message: AIMessage) -> AgentMessage {
