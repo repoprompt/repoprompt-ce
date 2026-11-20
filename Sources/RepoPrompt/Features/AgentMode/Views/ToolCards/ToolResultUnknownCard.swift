@@ -4,7 +4,7 @@ import SwiftUI
 struct UnknownToolResultCard: View {
     let item: AgentChatItem
     let title: String
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("UnknownToolResultCard") private var isExpanded = false
 
     private var status: ToolCardStatus {
         ToolResultStatusResolver.resolve(toolIsError: item.toolIsError, raw: item.toolResultJSON, fallback: .neutral)
@@ -31,11 +31,8 @@ struct UnknownToolResultCard: View {
             title: title,
             subtitle: subtitle,
             status: status,
-            timestamp: item.timestamp,
-            isExpandable: toolResultHasPayload(item),
+            item: item,
             isExpanded: $isExpanded
-        ) {
-            ToolMarkdownExpandedContent(item: item)
-        }
+        )
     }
 }

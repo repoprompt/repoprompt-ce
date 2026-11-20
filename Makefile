@@ -205,6 +205,7 @@ release-portable-selftest:
 	python3 -B Scripts/test_tip_release_history_hooks.py
 	python3 -B Scripts/tip_history.py lint-fragments --root .
 	python3 Scripts/test_release_tooling.py
+	python3 -B Scripts/test_identity_rollout_capabilities.py
 	python3 Scripts/test_macos_runtime_symbols.py
 	python3 Scripts/test_macos_compatibility.py
 	python3 Scripts/test_publish_tip_release.py

@@ -2,17 +2,39 @@ import Foundation
 import RepoPromptFileSystem
 import SwiftUI
 
+private struct EditCardJSONCacheKey: Equatable {
+    let toolResultJSON: String?
+    let toolArgsJSON: String?
+}
+
+private extension View {
+    @MainActor
+    func updatingEditCardPresentation(key: some Equatable, isMostRecentEdit: Bool, isExpanded: Binding<Bool>, refresh: @escaping () -> Void) -> some View {
+        onAppear(perform: refresh)
+            .onChange(of: key) { _, _ in
+                refresh()
+            }
+            .onChange(of: isMostRecentEdit) { _, isMostRecent in
+                if !isMostRecent, isExpanded.wrappedValue {
+                    performAgentToolCardExpansionStateUpdateWithoutAnimation {
+                        isExpanded.wrappedValue = false
+                    }
+                }
+            }
+    }
+}
+
 struct ApplyEditsResultCard: View {
     let item: AgentChatItem
     let isMostRecentEdit: Bool
-    @State private var isExpanded: Bool
+    @AgentTranscriptDisclosure private var isExpanded: Bool
     @State private var cachedPresentation: Presentation?
     private static let legacySummaryDiffScanByteThreshold = 24000
 
     init(item: AgentChatItem, isMostRecentEdit: Bool = true) {
         self.item = item
         self.isMostRecentEdit = isMostRecentEdit
-        _isExpanded = State(initialValue: Self.shouldAutoExpandInitially(item: item, isMostRecentEdit: isMostRecentEdit))
+        _isExpanded = AgentTranscriptDisclosure(wrappedValue: Self.shouldAutoExpandInitially(item: item, isMostRecentEdit: isMostRecentEdit), "ApplyEditsResultCard")
         _cachedPresentation = State(initialValue: nil)
     }
 
@@ -41,13 +63,8 @@ struct ApplyEditsResultCard: View {
         let renderMode: AgentToolCardRenderMode
     }
 
-    private struct PresentationCacheKey: Equatable {
-        let toolResultJSON: String?
-        let toolArgsJSON: String?
-    }
-
-    private var presentationCacheKey: PresentationCacheKey {
-        PresentationCacheKey(toolResultJSON: item.toolResultJSON, toolArgsJSON: item.toolArgsJSON)
+    private var presentationCacheKey: EditCardJSONCacheKey {
+        EditCardJSONCacheKey(toolResultJSON: item.toolResultJSON, toolArgsJSON: item.toolArgsJSON)
     }
 
     private func buildPresentation() -> Presentation {
@@ -186,18 +203,8 @@ struct ApplyEditsResultCard: View {
                 ToolMarkdownExpandedContent(item: item)
             }
         }
-        .onAppear {
+        .updatingEditCardPresentation(key: presentationCacheKey, isMostRecentEdit: isMostRecentEdit, isExpanded: _isExpanded.automaticBinding) {
             cachedPresentation = buildPresentation()
-        }
-        .onChange(of: presentationCacheKey) { _, _ in
-            cachedPresentation = buildPresentation()
-        }
-        .onChange(of: isMostRecentEdit) { _, isMostRecent in
-            if !isMostRecent, isExpanded {
-                performAgentToolCardExpansionStateUpdateWithoutAnimation {
-                    isExpanded = false
-                }
-            }
         }
     }
 }
@@ -337,16 +344,16 @@ struct CursorNativeEditResultPresentation: Equatable {
 struct CursorNativeEditResultCard: View {
     let item: AgentChatItem
     let isMostRecentEdit: Bool
-    @State private var isExpanded: Bool
+    @AgentTranscriptDisclosure private var isExpanded: Bool
     @State private var cachedPresentation: CursorNativeEditResultPresentation?
 
     init(item: AgentChatItem, isMostRecentEdit: Bool = true) {
         self.item = item
         self.isMostRecentEdit = isMostRecentEdit
-        _isExpanded = State(initialValue: CursorNativeEditResultPresentation.shouldAutoExpandInitially(
+        _isExpanded = AgentTranscriptDisclosure(wrappedValue: CursorNativeEditResultPresentation.shouldAutoExpandInitially(
             item: item,
             isMostRecentEdit: isMostRecentEdit
-        ))
+        ), "CursorNativeEditResultCard")
         _cachedPresentation = State(initialValue: nil)
     }
 
@@ -402,18 +409,8 @@ struct CursorNativeEditResultCard: View {
                 }
             }
         }
-        .onAppear {
+        .updatingEditCardPresentation(key: presentationCacheKey, isMostRecentEdit: isMostRecentEdit, isExpanded: _isExpanded.automaticBinding) {
             cachedPresentation = CursorNativeEditResultPresentation.build(for: item)
-        }
-        .onChange(of: presentationCacheKey) { _, _ in
-            cachedPresentation = CursorNativeEditResultPresentation.build(for: item)
-        }
-        .onChange(of: isMostRecentEdit) { _, isMostRecent in
-            if !isMostRecent, isExpanded {
-                performAgentToolCardExpansionStateUpdateWithoutAnimation {
-                    isExpanded = false
-                }
-            }
         }
     }
 }
@@ -421,13 +418,13 @@ struct CursorNativeEditResultCard: View {
 struct ApplyPatchResultCard: View {
     let item: AgentChatItem
     let isMostRecentEdit: Bool
-    @State private var isExpanded: Bool
+    @AgentTranscriptDisclosure private var isExpanded: Bool
     @State private var cachedPresentation: Presentation?
 
     init(item: AgentChatItem, isMostRecentEdit: Bool = true) {
         self.item = item
         self.isMostRecentEdit = isMostRecentEdit
-        _isExpanded = State(initialValue: Self.shouldAutoExpandInitially(item: item, isMostRecentEdit: isMostRecentEdit))
+        _isExpanded = AgentTranscriptDisclosure(wrappedValue: Self.shouldAutoExpandInitially(item: item, isMostRecentEdit: isMostRecentEdit), "ApplyPatchResultCard")
         _cachedPresentation = State(initialValue: nil)
     }
 
@@ -447,13 +444,8 @@ struct ApplyPatchResultCard: View {
         let renderMode: AgentToolCardRenderMode
     }
 
-    private struct PresentationCacheKey: Equatable {
-        let toolResultJSON: String?
-        let toolArgsJSON: String?
-    }
-
-    private var presentationCacheKey: PresentationCacheKey {
-        PresentationCacheKey(toolResultJSON: item.toolResultJSON, toolArgsJSON: item.toolArgsJSON)
+    private var presentationCacheKey: EditCardJSONCacheKey {
+        EditCardJSONCacheKey(toolResultJSON: item.toolResultJSON, toolArgsJSON: item.toolArgsJSON)
     }
 
     private func buildPresentation() -> Presentation {
@@ -589,18 +581,8 @@ struct ApplyPatchResultCard: View {
                 ToolMarkdownExpandedContent(item: item)
             }
         }
-        .onAppear {
+        .updatingEditCardPresentation(key: presentationCacheKey, isMostRecentEdit: isMostRecentEdit, isExpanded: _isExpanded.automaticBinding) {
             cachedPresentation = buildPresentation()
-        }
-        .onChange(of: presentationCacheKey) { _, _ in
-            cachedPresentation = buildPresentation()
-        }
-        .onChange(of: isMostRecentEdit) { _, isMostRecent in
-            if !isMostRecent, isExpanded {
-                performAgentToolCardExpansionStateUpdateWithoutAnimation {
-                    isExpanded = false
-                }
-            }
         }
     }
 

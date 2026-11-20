@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import RepoPromptDomainRuntime
 
 /// Kind of the single top-priority interaction blocking an Agent Mode session.
 ///

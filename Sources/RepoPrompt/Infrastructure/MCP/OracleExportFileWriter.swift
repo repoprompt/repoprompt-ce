@@ -2,6 +2,7 @@ import Foundation
 import MCP
 import RepoPromptDomainRuntime
 import RepoPromptFileSystem
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 struct GeneratedOracleExportFileWriter {

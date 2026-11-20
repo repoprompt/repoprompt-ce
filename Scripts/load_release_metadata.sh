@@ -93,6 +93,12 @@ validate_stable_release_context() {
             "$ROLLOUT_CHANNEL" >&2
         return 1
     }
+    if [[ "$ROLLOUT_ROLE" == "transition" ]]; then
+        [[ "$ROLLOUT_INSTALLATION_TYPE" == "package" && -n "$EXPECTED_INSTALLER_IDENTITY" && "$EXPECTED_INSTALLER_TEAM_ID" == "$EXPECTED_APP_TEAM_ID" ]] || {
+            printf 'ERROR: Stable transition requires a package and matching Installer identity\n' >&2
+            return 1
+        }
+    else
     [[ "$ROLLOUT_INSTALLATION_TYPE" == "application" ]] || {
         printf 'ERROR: Stable release context must describe an application artifact\n' >&2
         return 1
@@ -101,8 +107,9 @@ validate_stable_release_context() {
         printf 'ERROR: Legacy/preparer Stable release context must not select an Installer identity\n' >&2
         return 1
     }
+    fi
     case "$ROLLOUT_ROLE:$ROLLOUT_IDENTITY:$actual_migration_phase" in
-        legacy:legacy:disabled)
+        legacy:legacy:disabled | transition:successor:disabled | successor:successor:disabled)
             [[ -z "$EXPECTED_MIGRATION_ANCHOR_BUNDLE_ID" && \
                -z "$EXPECTED_MIGRATION_ANCHOR_TEAM_ID" && \
                -z "$EXPECTED_MIGRATION_ANCHOR_REQUIREMENT" && \

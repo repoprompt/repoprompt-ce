@@ -4,8 +4,10 @@ import MCP
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptFileSystem
+@testable import RepoPromptMCPServer
 import RepoPromptSecureStorage
 import RepoPromptVCS
+@testable import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 import XCTest
 
@@ -3269,6 +3271,7 @@ final class MCPReadMutationPathContractTests: XCTestCase {
         )
         let connectionID = UUID()
         try server.bindTabForConnection(
+            route: server.routeResources,
             connectionID: connectionID,
             clientName: nil,
             tabID: XCTUnwrap(workspace.activeComposeTabID),

@@ -1,6 +1,33 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
+
+extension CodexServerRequestReceipt {
+    nonisolated static func fixture(_ requestID: CodexAppServerRequestID, generation: UInt64 = 1, clientID: UUID? = nil) -> Self {
+        .init(
+            clientInstanceID: clientID ?? UUID(uuidString: "F05339D5-F0BA-4C36-943C-028A4FBE89BA")!,
+            transportGeneration: generation,
+            requestID: requestID
+        )
+    }
+}
+
+/// Fixture installation still requires the real restored writer; a missing origin fails the test
+/// and releases its continuation rather than manufacturing a legacy bypass.
+@MainActor
+func installInstructionWaitForTest(
+    session: AgentTabSession, runtime: AgentSessionLinkExecutionRuntime,
+    continuation: CheckedContinuation<UserInstructionResponse, Error>, waitID: UUID = UUID(),
+    file: StaticString = #filePath, line: UInt = #line
+) {
+    do {
+        let command = try XCTUnwrap(runtime.instructionCommand(for: session), "Restored instruction writer", file: file, line: line)
+        runtime.test_installInstructionWait(command: command, waitID: waitID, continuation: continuation)
+    } catch {
+        continuation.resume(throwing: error)
+    }
+}
 
 private struct AgentSessionLinkAsyncWaitTimeout: Error, LocalizedError {
     let description: String
@@ -154,6 +181,10 @@ extension CodexSessionControllerTurnDispatchTestDefaults {
         CodexTurnInterruptReceipt(interruptedTurnID: expectedTurnID)
     }
 
+    func interruptUserTurn(expectedThreadID _: String, expectedTurnID: String, answering _: CodexServerRequestReceipt) async throws -> CodexTurnInterruptReceipt {
+        try await interruptUserTurn(expectedTurnID: expectedTurnID)
+    }
+
     func reconcileAndInterruptCurrentTurn() async throws -> CodexTurnInterruptReceipt {
         try await interruptUserTurn(expectedTurnID: "<test-turn>")
     }
@@ -256,7 +287,9 @@ extension CodexSessionControllerPassiveStubDefaults {
     }
 
     func cancelCurrentTurn() async {}
-    func respondToServerRequest(id _: CodexAppServerRequestID, result _: [String: Any]) async {}
+    func respondToServerRequest(receipt _: CodexServerRequestReceipt, result _: [String: Any]) async -> CodexServerResponseDelivery {
+        .written
+    }
 }
 
 final class LifecycleRecorder: @unchecked Sendable {
@@ -414,5 +447,7 @@ final class LifecycleNoopCodexController: CodexSessionControllerTurnDispatchTest
         recorder.record("codex:shutdown")
     }
 
-    func respondToServerRequest(id _: CodexAppServerRequestID, result _: [String: Any]) async {}
+    func respondToServerRequest(receipt _: CodexServerRequestReceipt, result _: [String: Any]) async -> CodexServerResponseDelivery {
+        .written
+    }
 }

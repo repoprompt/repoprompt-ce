@@ -85,6 +85,9 @@ enum WorkspaceSessionSidecarMigration {
         for workspace: WorkspaceModel,
         root: URL
     ) -> URL {
+        if workspace.isEphemeral {
+            return WorkspaceEphemeralStorage.directory(for: workspace.id)
+        }
         if let customStoragePath = workspace.customStoragePath {
             return customStoragePath.standardizedFileURL
         }

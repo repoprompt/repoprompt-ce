@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+"""Hermetic capability tests: fixture bytes are not runtime migration proof."""
+import argparse
+import copy
+import hashlib
+import json
+import os
+import shutil
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+
+import stable_rollout as rollout
+
+ROOT = Path(__file__).resolve().parent.parent
+POLICY = ROOT / 'Scripts/apple_identity_policy.json'
+
+
+class CapabilityTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.policy = rollout.load_policy(POLICY)
+        self.p = self.native('tip', 'preparer', '43.24.43', 'tip-1e1d9fe4bbc6')
+
+    def declaration(self, channel, role, predecessors=(), adoption=None):
+        d = dict(schemaVersion=2 if channel == 'stable' and (predecessors or adoption) else 1,
+                 channel=channel, currentRole=role, eligibilityProfile='fixture',
+                 expectedMigrationPhase=rollout.ROLE_MIGRATION_PHASE[role],
+                 expectedSigningIdentity=rollout.ROLE_IDENTITY[role], predecessors=[])
+        for manifest in predecessors:
+            m = json.loads(manifest.read_text())
+            entry = dict(role=m['currentRole'], tag=m['sourceTag'], rolloutManifestSha256=rollout.sha256_file(manifest))
+            if channel == 'stable':
+                entry['sourceChannel'] = m['channel']
+            d['predecessors'].append(entry)
+        if d['schemaVersion'] == 2:
+            d['runtimeMigrationProof'] = rollout.RUNTIME_PROOF_ACCEPTED_RISK
+        if adoption:
+            d['adoptedArtifact'] = adoption
+        return d
+
+    def write(self, path, value):
+        path.write_text(json.dumps(value, sort_keys=True, indent=2) + '\n')
+        return path
+
+    def native(self, channel, role, build, tag, predecessors=()):
+        directory = self.root / tag
+        directory.mkdir()
+        declaration = self.write(directory / 'declaration.json', self.declaration(channel, role, predecessors))
+        identity = self.policy['identities'][rollout.ROLE_IDENTITY[role]]
+        version = directory / 'version.env'
+        marketing = tag[1:] if channel == 'stable' else '1.9.1'
+        version.write_text(f'APP_NAME=RepoPrompt\nMARKETING_VERSION={marketing}\nBUILD_NUMBER={build}\nBUNDLE_ID={identity["bundleIdentifier"]}\nSIGNING_TEAM_ID={identity["teamIdentifier"]}\n')
+        artifact = self.write(directory / 'artifact.json', {'fixture': True})
+        enclosure = directory / rollout.expected_enclosure_name('RepoPrompt', marketing, build, role)
+        enclosure.write_bytes(b'fixture archive')
+        args = argparse.Namespace(policy=str(POLICY), declaration=str(declaration), version_env=str(version),
+                                  allowed_roles=None, release_tag=tag, release_commit='a'*40,
+                                  migration_phase=rollout.ROLE_MIGRATION_PHASE[role], enclosure=str(enclosure),
+                                  enclosure_basename=None, enclosure_signature='fixture-signature',
+                                  app_artifact_manifest=str(artifact), predecessor_manifest=list(map(str, predecessors)))
+        manifest, appcast = rollout.build_manifest(args)
+        path = self.write(directory / 'manifest.json', manifest)
+        (directory / 'appcast.xml').write_text(appcast)
+        return path
+
+    def adoption_args(self):
+        authority = dict(type=rollout.ADOPTION_TYPE, tag='tip-1e1d9fe4bbc6', buildNumber='43.24.43',
+                         rolloutManifestSha256=rollout.sha256_file(self.p))
+        declaration = self.write(self.root / 'adoption-declaration.json', self.declaration('stable', 'preparer', adoption=authority))
+        return argparse.Namespace(policy=str(POLICY), declaration=str(declaration), tip_manifest=str(self.p), tip_appcast=str(self.p.parent/'appcast.xml'))
+
+    def adoption(self):
+        m = rollout.build_adoption(self.adoption_args())
+        directory = self.root/'adoption'
+        directory.mkdir(exist_ok=True)
+        path = self.write(directory/'manifest.json', m)
+        (directory/'appcast.xml').write_text(rollout.render_appcast(m))
+        return path
+
+    def handoff(self, stable, tip):
+        rollout.run_validate_stable_tip_floor(argparse.Namespace(policy=str(POLICY), stable_manifest=str(stable),
+            stable_appcast=str(stable.parent/'appcast.xml'), tip_manifest=str(tip), tip_appcast=str(tip.parent/'appcast.xml')))
+
+    def progression(self, candidate, live):
+        rollout.run_validate_live_stable_progression(argparse.Namespace(policy=str(POLICY), candidate_manifest=str(candidate),
+            candidate_appcast=str(candidate.parent/'appcast.xml'), live_manifest=str(live), live_appcast=str(live.parent/'appcast.xml')))
+
+    def test_unchanged_adoption_retains_exact_origin_and_deterministic_bytes(self):
+        args = self.adoption_args()
+        manifest = rollout.build_adoption(args)
+        self.assertEqual(manifest, rollout.build_adoption(args))
+        p = json.loads(self.p.read_text())
+        item = manifest['appcastItems'][0]
+        origin = rollout.bind_live_item(p, rollout.sha256_file(self.p))
+        self.assertEqual(rollout.origin_item(item, self.policy), origin)
+        self.assertEqual(item, rollout.stable_preparer_delivery(origin, self.policy))
+        # The shipped client classifies channel from /releases/download/ URL.
+        self.assertTrue(item['url'].startswith('https://github.com/' + self.policy['sparkle']['updateRepository'] + '/releases/download/'))
+        self.assertEqual(item['url'], rollout.enclosure_url(self.policy['sparkle']['updateRepository'],
+            manifest['sourceTag'], origin['enclosureName']))
+        self.assertEqual({k:v for k,v in item.items() if k != 'url'},
+                         {k:v for k,v in origin.items() if k != 'url'})
+        for key in ('releaseCommit', 'marketingVersion', 'buildNumber', 'appArtifactManifest'):
+            self.assertEqual(manifest[key], p[key])
+        adopted = self.adoption()
+        rollout.validate_manifest_pair(self.policy, adopted, adopted.parent/'appcast.xml', 'fixture', 'stable')
+        self.handoff(adopted, self.p)
+
+    def test_same_build_delivery_repair_is_exact_one_way_and_immutable(self):
+        adopted = self.adoption()
+        original = json.loads(adopted.read_text())
+        original['sourceTag'] = 'stable-adopt-' + original['adoptedArtifact']['tag']
+        original['appcastItems'] = [rollout.origin_item(original['appcastItems'][0], self.policy)]
+        directory = self.root/'old-adoption'; directory.mkdir()
+        live = self.write(directory/'manifest.json', original)
+        (directory/'appcast.xml').write_text(rollout.render_appcast(original))
+        self.progression(adopted, live)
+        self.progression(adopted, adopted)
+        self.handoff(live, self.p)  # old immutable release remains readable
+        with self.assertRaises(rollout.RolloutError): self.progression(live, adopted)
+        base = json.loads(adopted.read_text())
+        for key,value in [('releaseCommit','b'*40), ('eligibilityProfile','rewritten')]:
+            bad = copy.deepcopy(base); bad[key] = value
+            self.write(adopted,bad)
+            with self.assertRaisesRegex(rollout.RolloutError,'every original'): self.progression(adopted,live)
+        for key,value in [('edSignature','changed'), ('enclosureSha256','0'*64), ('enclosureSize',123)]:
+            bad = copy.deepcopy(base); bad['appcastItems'][0][key] = value
+            self.write(adopted,bad); (adopted.parent/'appcast.xml').write_text(rollout.render_appcast(bad))
+            with self.assertRaisesRegex(rollout.RolloutError,'every original'): self.progression(adopted,live)
+        for url in [base['appcastItems'][0]['url'].replace('stable-delivery-v1','other'),
+                    base['appcastItems'][0]['url'].replace('repoprompt-ce-updates','other-repo'),
+                    original['appcastItems'][0]['url']]:
+            bad = copy.deepcopy(base); bad['appcastItems'][0]['url'] = url
+            self.write(adopted,bad); (adopted.parent/'appcast.xml').write_text(rollout.render_appcast(bad))
+            with self.assertRaises(rollout.RolloutError): self.progression(adopted,live)
+
+    def test_adoption_pins_and_risk_acknowledgement_fail_closed(self):
+        for key, value in [('tag','tip-000000000000'), ('buildNumber','43.24.44'), ('rolloutManifestSha256','0'*64)]:
+            with self.subTest(key=key):
+                args = self.adoption_args()
+                d = json.loads(Path(args.declaration).read_text())
+                d['adoptedArtifact'][key] = value
+                self.write(Path(args.declaration), d)
+                with self.assertRaises(rollout.RolloutError): rollout.build_adoption(args)
+        args = self.adoption_args()
+        d = json.loads(Path(args.declaration).read_text())
+        for proof in ('passed', None, ''):
+            d['runtimeMigrationProof'] = proof
+            self.write(Path(args.declaration), d)
+            with self.assertRaises(rollout.RolloutError): rollout.load_declaration(Path(args.declaration))
+
+    def test_stable_ladder_legacy_adoption_transition_successor(self):
+        legacy = self.native('stable','legacy','43','v1.9.1')
+        adopted = self.adoption()
+        self.progression(adopted, legacy)
+        t = self.native('stable','transition','44','v1.9.2',(self.p,))
+        self.progression(t, adopted)
+        s = self.native('stable','successor','45','v1.9.3',(t,self.p))
+        self.progression(s,t)
+        self.progression(s,s)
+        m = json.loads(s.read_text())
+        self.assertEqual(m['appcastItems'][-1], json.loads(adopted.read_text())['appcastItems'][0])
+        with self.assertRaises(rollout.RolloutError): self.progression(s,adopted)
+        with self.assertRaises(rollout.RolloutError): self.progression(adopted,t)
+
+    def test_native_stable_ladder_cannot_reintroduce_tip_delivery(self):
+        transition = self.native('stable','transition','44','v1.9.2',(self.p,))
+        m = json.loads(transition.read_text())
+        m['appcastItems'][-1] = rollout.origin_item(m['appcastItems'][-1], self.policy)
+        self.write(transition,m)
+        (transition.parent/'appcast.xml').write_text(rollout.render_appcast(m))
+        with self.assertRaisesRegex(rollout.RolloutError,'Stable-delivered'):
+            rollout.validate_manifest_pair(self.policy,transition,transition.parent/'appcast.xml','fixture','stable')
+
+    def test_handoff_admits_shared_bridge_but_requires_tip_to_lead(self):
+        adopted = self.adoption()
+        tip_t = self.native('tip','transition','43.24.44','tip-222222222222',(self.p,))
+        stable_t = self.native('stable','transition','44','v1.9.2',(self.p,))
+        self.handoff(adopted,tip_t)
+        self.handoff(stable_t,tip_t)
+        with self.assertRaisesRegex(rollout.RolloutError,'rehearse'): self.handoff(stable_t,self.p)
+        legacy = self.native('stable','legacy','44','v1.9.4')
+        with self.assertRaisesRegex(rollout.RolloutError,'Stable=44'): self.handoff(legacy,tip_t)
+        bad = json.loads(stable_t.read_text())
+        bad['appcastItems'][-1]['rolloutManifestSha256'] = '0'*64
+        self.write(stable_t,bad)
+        (stable_t.parent/'appcast.xml').write_text(rollout.render_appcast(bad))
+        with self.assertRaisesRegex(rollout.RolloutError,'same authenticated preparer'): self.handoff(stable_t,tip_t)
+
+    def test_retained_history_tampering_and_same_tag_rewrite_rejected(self):
+        adopted = self.adoption()
+        t = self.native('stable','transition','44','v1.9.2',(self.p,))
+        bad = json.loads(t.read_text())
+        bad['appcastItems'][-1]['edSignature'] = 'tampered'
+        self.write(t,bad); (t.parent/'appcast.xml').write_text(rollout.render_appcast(bad))
+        with self.assertRaisesRegex(rollout.RolloutError,'retained history'): self.progression(t,adopted)
+        duplicate = self.root/'duplicate'; duplicate.mkdir()
+        self.write(duplicate/'manifest.json',bad)
+        (duplicate/'appcast.xml').write_text(rollout.render_appcast(bad))
+        bad['releaseCommit'] = 'b'*40
+        self.write(t,bad)
+        with self.assertRaisesRegex(rollout.RolloutError,'different bytes'): self.progression(t,duplicate/'manifest.json')
+
+    def test_operation_matrix_keeps_legacy_and_adoption_paths_separate(self):
+        legacy = self.native('stable','legacy','43','v1.9.0')
+        args = self.adoption_args()
+        transition = self.native('stable','transition','44','v1.9.2',(self.p,))
+        for declaration, allowed in [(legacy.parent/'declaration.json',{'build','promote'}),
+                                     (Path(args.declaration),{'adopt'}),
+                                     (transition.parent/'declaration.json',{'build','promote'})]:
+            for operation in ('build','promote','adopt'):
+                a = argparse.Namespace(policy=str(POLICY),declaration=str(declaration),operation=operation)
+                if operation in allowed: rollout.run_workflow_guard(a)
+                else:
+                    with self.assertRaises(rollout.RolloutError): rollout.run_workflow_guard(a)
+        self.assertEqual(rollout.load_declaration(legacy.parent/'declaration.json')['currentRole'],'legacy')
+
+    def test_build_number_above_dotted_stable_and_bad_ranges(self):
+        stable = self.adoption()
+        for sequence, okay in ((2443,False),(2444,True),(10000,False),(0,False)):
+            args=argparse.Namespace(stable_appcast=str(stable.parent/'appcast.xml'),sequence=sequence)
+            if okay: rollout.run_tip_build_number(args)
+            else:
+                with self.assertRaises(rollout.RolloutError): rollout.run_tip_build_number(args)
+
+    def test_adopted_origin_cannot_be_a_transition_or_an_unbound_item(self):
+        m=rollout.build_adoption(self.adoption_args())
+        for key,value in [('role','transition'),('rolloutManifestSha256',None),('url','https://example.com/archive.zip')]:
+            item=copy.deepcopy(m['appcastItems'][0]); item[key]=value
+            with self.assertRaises(rollout.RolloutError): rollout.validate_item_shape(item,1,self.policy,'RepoPrompt','stable')
+
+
+class WorkflowBoundaryTests(unittest.TestCase):
+    def test_adoption_has_no_signing_or_notary_secrets(self):
+        workflow=(ROOT/'.github/workflows/release-adopt-tip-preparer.yml').read_text()
+        for forbidden in ('SPARKLE_PRIVATE_KEY','DEVELOPER_ID','NOTARYTOOL','release.sh publish-staged'):
+            self.assertNotIn(forbidden,workflow)
+        self.assertIn('environment: release',workflow)
+        self.assertIn('env -i',workflow)
+        for name in ('main-tip.yml','release-promote.yml','release-adopt-tip-preparer.yml'):
+            self.assertIn('group: rollout-publication',(ROOT/'.github/workflows'/name).read_text())
+
+    def test_adoption_rejected_before_download_when_not_activated(self):
+        # Use an inactive fixture, not today's checked-in declaration: a later
+        # reviewed activation must not require weakening a permanent test.
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); scripts=root/'Scripts'; scripts.mkdir()
+            for name in ('adopt_tip_preparer.sh','stable_rollout.py','release_observation.sh','apple_identity_policy.json'):
+                shutil.copy2(ROOT/'Scripts'/name,scripts/name)
+            (root/'release-rollout.json').write_text(json.dumps(CapabilityTests().declaration('stable','legacy')))
+            result=subprocess.run(['bash',str(scripts/'adopt_tip_preparer.sh'),'verify'],capture_output=True,text=True)
+            self.assertNotEqual(result.returncode,0)
+            self.assertIn('not activated',result.stderr)
+
+    def test_adoption_reconciliation_is_paginated_and_never_overwrites(self):
+        for scenario, okay, creates in [('absent',True,True),('matching',True,False),('different',False,False),('duplicate',False,False),('transport',False,False),('draftmissing',True,False),('draftempty',True,False),('draftdifferent',False,False),('publicmissing',False,False),('extra',False,False)]:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                d=Path(directory); feed=d/'feed'; feed.mkdir(); (feed/'appcast.xml').write_text('reviewed')
+                (feed/'preparer.zip').write_bytes(b'exact signed archive')
+                remote=d/'remote'; remote.mkdir()
+                if scenario not in ('absent','draftempty'):
+                    (remote/'appcast.xml').write_text('tampered' if scenario in ('different','draftdifferent') else 'reviewed')
+                if scenario not in ('absent','draftempty','draftmissing','draftdifferent','publicmissing'):
+                    shutil.copy2(feed/'preparer.zip',remote/'preparer.zip')
+                if scenario=='extra': (remote/'unexpected').write_text('unreviewed')
+                work=d/'work'; work.mkdir()
+                stub=d/'gh'
+                stub.write_text('''#!/usr/bin/env python3
+import json,os,pathlib,shutil,sys
+args=sys.argv[1:]; scenario=os.environ['SCENARIO']; root=pathlib.Path(os.environ['FIXTURE'])
+with (root/'calls').open('a') as f: f.write(json.dumps(args)+'\\n')
+if args[0]=='api':
+    if '--jq' in args:
+        if '/releases/tags/' in args[1] and scenario.startswith('draft'):
+            print('HTTP 404: drafts are not returned by tag',file=sys.stderr); sys.exit(44)
+        assert args[1]=='repos/owner/repo/releases/42'
+        query=args[args.index('--jq')+1]
+        print('true' if query=='.draft' and scenario.startswith('draft') else 'false' if query=='.draft' else len(list((root/'remote').iterdir())))
+    else:
+        assert '--paginate' in args and '--slurp' in args
+        if scenario=='transport': sys.exit(7)
+        r={'id':42,'tag_name':'stable-adopt-tip-111111111111','prerelease':False,'draft':scenario.startswith('draft')}
+        print(json.dumps([[],[] if scenario=='absent' else [r,r] if scenario=='duplicate' else [r]]))
+elif args[:2]==['release','download']:
+    output=pathlib.Path(args[args.index('--dir')+1])
+    for p in (root/'remote').iterdir(): shutil.copy2(p,output/p.name)
+elif args[:2]==['release','upload']:
+    assert scenario.startswith('draft') and '--clobber' not in args
+    p=pathlib.Path(args[3]); assert not (root/'remote'/p.name).exists()
+    shutil.copy2(p,root/'remote'/p.name)
+elif args[:2]==['release','create']: pass
+else: sys.exit(99)
+'''); stub.chmod(0o755)
+                command=['bash','-c','set -euo pipefail; source "$1"; update_gh(){ gh "$@"; }; prepare_adoption_release "$2" owner/repo stable-adopt-tip-111111111111 fixture "$3"','test',str(ROOT/'Scripts/release_observation.sh'),str(feed),str(work)]
+                result=subprocess.run(command,env={**os.environ,'PATH':str(d)+':'+os.environ['PATH'],'SCENARIO':scenario,'FIXTURE':str(d)},capture_output=True,text=True)
+                self.assertEqual(result.returncode==0,okay,result.stdout+result.stderr)
+                calls=[json.loads(line) for line in (d/'calls').read_text().splitlines()]
+                self.assertEqual(any(call[:2]==['release','create'] for call in calls),creates)
+                detail_calls=[call for call in calls if call[0]=='api' and '--jq' in call]
+                self.assertTrue(all(call[1]=='repos/owner/repo/releases/42' for call in detail_calls))
+                if scenario=='draftmissing':
+                    self.assertEqual([call[call.index('--jq')+1] for call in detail_calls],['.assets | length','.draft'])
+                if scenario=='draftempty':
+                    self.assertEqual([call[call.index('--jq')+1] for call in detail_calls],['.assets | length','.draft','.draft'])
+                self.assertFalse(any(call[:2]==['release','delete'] or '--clobber' in call for call in calls))
+                uploads=[call for call in calls if call[:2]==['release','upload']]
+                self.assertEqual(len(uploads),2 if scenario=='draftempty' else 1 if scenario=='draftmissing' else 0)
+
+    def test_tip_preflight_uses_approved_tip_authority_not_stable_adoption(self):
+        fixture=CapabilityTests(); fixture.setUp(); self.addCleanup(fixture.doCleanups)
+        tip_t=fixture.native('tip','transition','43.24.44','tip-222222222222',(fixture.p,))
+        tip_s=fixture.native('tip','successor','43.24.45','tip-333333333333',(tip_t,fixture.p))
+        approved=fixture.root/'approved'; approved.mkdir()
+        staged=fixture.root/'staged'; staged.mkdir()
+        for directory in (approved,staged): shutil.copy2(ROOT/'version.env',directory/'version.env')
+        shutil.copy2(fixture.adoption_args().declaration,approved/'release-rollout.json')
+        # The staged root is not the authorization root; a wrong-root lookup
+        # must fail rather than silently using this decoy.
+        (staged/'tip-rollout.json').write_text('{}')
+        env={**os.environ,'REPOPROMPT_RELEASE_SOURCE_ROOT':str(staged),
+             'REPOPROMPT_APPROVED_SOURCE_ROOT':str(approved),
+             'REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR':str(ROOT/'Scripts')}
+        command=['bash','-c','set -euo pipefail; source "$1"; run_source_preflight(){ printf "shared:%s:%s:%s\\n" "$ROLLOUT_CHANNEL" "$ROLLOUT_ROLE" "$EXPECTED_APP_BUNDLE_ID"; }; "$2"',
+                 'test',str(ROOT/'Scripts/release.sh')]
+        for manifest,role in ((fixture.p,'preparer'),(tip_t,'transition'),(tip_s,'successor')):
+            shutil.copy2(manifest.parent/'declaration.json',approved/'tip-rollout.json')
+            result=subprocess.run(command+['run_tip_preflight'],env=env,capture_output=True,text=True)
+            self.assertEqual(result.returncode,0,result.stderr)
+            identity=fixture.policy['identities'][rollout.ROLE_IDENTITY[role]]['bundleIdentifier']
+            self.assertIn('shared:tip:'+role+':'+identity,result.stdout)
+            stable=subprocess.run(command+['run_preflight'],env=env,capture_output=True,text=True)
+            self.assertNotEqual(stable.returncode,0)
+            self.assertIn('no-build adopt operation',stable.stderr)
+            self.assertNotIn('shared:',stable.stdout)
+        for invalid in ('missing','malformed','stable-channel','bad-version'):
+            shutil.copy2(fixture.p.parent/'declaration.json',approved/'tip-rollout.json')
+            shutil.copy2(ROOT/'version.env',approved/'version.env')
+            if invalid=='missing': (approved/'tip-rollout.json').unlink()
+            elif invalid=='malformed': (approved/'tip-rollout.json').write_text('{}')
+            elif invalid=='stable-channel':
+                (approved/'tip-rollout.json').write_text(json.dumps(fixture.declaration('stable','legacy')))
+            else: (approved/'version.env').write_text('BUILD_NUMBER=invalid\n')
+            result=subprocess.run(command+['run_tip_preflight'],env=env,capture_output=True,text=True)
+            self.assertNotEqual(result.returncode,0,invalid)
+            self.assertNotIn('shared:',result.stdout,invalid)
+        shutil.copy2(fixture.p.parent/'declaration.json',approved/'tip-rollout.json')
+        shutil.copy2(ROOT/'version.env',approved/'version.env')
+        failing=command.copy(); failing[2]=failing[2].replace('run_source_preflight(){ printf','run_source_preflight(){ false; printf')
+        result=subprocess.run(failing+['run_tip_preflight'],env=env,capture_output=True,text=True)
+        self.assertNotEqual(result.returncode,0)
+        self.assertNotIn('shared:',result.stdout)
+        self.assertIn('preflight-tip) run_tip_preflight ;;',(ROOT/'Scripts/release.sh').read_text())
+
+    def test_tip_staging_runs_tip_preflight_before_resolve_and_after_package(self):
+        fixture=CapabilityTests(); fixture.setUp(); self.addCleanup(fixture.doCleanups)
+        source=fixture.root/'source'; source.mkdir()
+        shutil.copy2(ROOT/'version.env',source/'version.env')
+        shutil.copy2(fixture.p.parent/'declaration.json',source/'tip-rollout.json')
+        shutil.copy2(fixture.adoption_args().declaration,source/'release-rollout.json')
+        scripts=fixture.root/'stubs'; scripts.mkdir(); receipt=fixture.root/'calls'
+        wrapper='''#!/bin/bash
+set -euo pipefail
+export REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR="$REAL_SCRIPTS"
+source "$REAL_SCRIPTS/release.sh"
+run_source_preflight(){
+    [[ "$ROOT_DIR" == "$EXPECTED_ROOT" && "$APPROVED_SOURCE_ROOT" == "$EXPECTED_ROOT" ]] || exit 89
+    printf 'shared:%s:%s\\n' "$ROLLOUT_CHANNEL" "$ROLLOUT_ROLE" >> "$RECEIPT"
+}
+case "$MODE" in
+preflight-tip) run_tip_preflight ;;
+preflight) run_preflight ;;
+*) exit 90 ;;
+esac
+'''
+        (scripts/'release.sh').write_text(wrapper); (scripts/'release.sh').chmod(0o755)
+        (scripts/'package_app.sh').write_text('#!/bin/bash\nprintf "package\\n" >> "$RECEIPT"\n')
+        (scripts/'package_app.sh').chmod(0o755)
+        body='''set -euo pipefail
+source "$REAL_SCRIPTS/main_tip_release.sh"
+unset REPOPROMPT_RELEASE_SOURCE_ROOT REPOPROMPT_APPROVED_SOURCE_ROOT REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR
+CONTROL_PLANE_SCRIPTS_DIR="$STUB_SCRIPTS"
+require_command(){ :; }
+resolve_without_lockfile_drift(){ printf 'resolve\\n' >> "$RECEIPT"; }
+prepare_dist(){ :; }
+validate_packaged_legal(){ printf 'packaged-validation\\n' >> "$RECEIPT"; exit 88; }
+stage_tip
+'''
+        env={**os.environ,'REPOPROMPT_RELEASE_SOURCE_ROOT':str(source),'REPOPROMPT_APPROVED_SOURCE_ROOT':str(source),
+             'REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR':str(ROOT/'Scripts'),'REAL_SCRIPTS':str(ROOT/'Scripts'),
+             'STUB_SCRIPTS':str(scripts),'EXPECTED_ROOT':str(source),'RECEIPT':str(receipt),'TIP_COMMIT':'a'*40,'TIP_BUILD_NUMBER':'43.24.44'}
+        result=subprocess.run(['bash','-c',body],env=env,capture_output=True,text=True)
+        self.assertEqual(result.returncode,88,result.stdout+result.stderr)
+        self.assertEqual(receipt.read_text().splitlines(),['shared:tip:preparer','resolve','package','shared:tip:preparer','packaged-validation'])
+
+    def test_stable_transition_package_build_and_promotion_branches(self):
+        fixture=CapabilityTests(); fixture.setUp(); self.addCleanup(fixture.doCleanups)
+        transition=fixture.native('stable','transition','44','v1.9.2',(fixture.p,))
+        d=fixture.root/'stub-scripts'; d.mkdir()
+        package=d/'build_identity_transition_pkg.sh'
+        package.write_text('#!/bin/bash\n[[ "$REPOPROMPT_ENABLE_IDENTITY_TRANSITION_PKG" == 1 ]] || exit 91\nprintf "%s\\n" "$*" >> "$RECEIPT"\n'); package.chmod(0o755)
+        receipt=fixture.root/'receipt'
+        build_script='''set -euo pipefail
+source "$1/Scripts/release.sh"
+CONTROL_PLANE_SCRIPTS_DIR="$2"
+APP_BUNDLE=fixture.app
+EXPECTED_INSTALLER_IDENTITY='Samuel Installer fixture'
+submit_notarization(){ printf 'notarize %s\\n' "$1" >> "$RECEIPT"; }
+build_notarized_stable_transition_package fixture.pkg
+'''
+        env={**os.environ,'RECEIPT':str(receipt)}
+        result=subprocess.run(['bash','-c',build_script,'test',str(ROOT),str(d)],env=env,capture_output=True,text=True)
+        self.assertEqual(result.returncode,0,result.stderr)
+        calls=receipt.read_text().splitlines()
+        self.assertEqual([line.split()[0] for line in calls],['build','notarize','staple','validate'])
+        self.assertIn('--installer-identity Samuel Installer fixture',calls[0])
+        receipt.write_text('')
+        promotion_script='''set -euo pipefail
+source "$1/Scripts/promote_release.sh"
+ROLLOUT_DECLARATION="$3"
+resolve_release_artifact_role
+[[ "$PRIMARY_ARTIFACT_NAME" == *.pkg ]]
+if release_role_ships_dmg; then exit 92; fi
+CONTROL_PLANE_SCRIPTS_DIR="$2"
+PRIMARY_ARTIFACT=fixture.pkg
+EXTRACT_DIR=fixture-extracted
+# A package must never enter the ZIP extractor.
+ditto(){ exit 93; }
+extract_reviewed_update
+'''
+        result=subprocess.run(['bash','-c',promotion_script,'test',str(ROOT),str(d),str(transition.parent/'declaration.json')],env=env,capture_output=True,text=True)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(receipt.read_text().strip(),'validate fixture.pkg --expanded-payload-dir fixture-extracted')
+
+    def test_stable_context_role_matrix(self):
+        fixture = CapabilityTests(); fixture.setUp(); self.addCleanup(fixture.doCleanups)
+        transition = fixture.native('stable','transition','44','v1.9.2',(fixture.p,))
+        successor = fixture.native('stable','successor','45','v1.9.3',(transition,fixture.p))
+        for manifest in (transition, successor):
+            declaration = manifest.parent/'declaration.json'
+            for corrupt in ('', 'installer', 'anchor', 'kind'):
+                with self.subTest(role=manifest.parent.name, corrupt=corrupt):
+                    script = '''set -euo pipefail
+source "$1/Scripts/load_release_metadata.sh"
+eval "$(python3 "$1/Scripts/stable_rollout.py" packaging-context --policy "$1/Scripts/apple_identity_policy.json" --declaration "$2" --version-env "$3")"
+case "$4" in
+installer) EXPECTED_INSTALLER_TEAM_ID=wrong; EXPECTED_INSTALLER_IDENTITY=wrong ;;
+anchor) EXPECTED_MIGRATION_ANCHOR_BUNDLE_ID=unexpected ;;
+kind) if [[ "$ROLLOUT_INSTALLATION_TYPE" == package ]]; then ROLLOUT_INSTALLATION_TYPE=application; else ROLLOUT_INSTALLATION_TYPE=package; fi ;;
+esac
+validate_stable_release_context "$BUNDLE_ID" "$SIGNING_TEAM_ID" "$REPOPROMPT_IDENTITY_MIGRATION_PHASE" "$EXPECTED_SIGN_IDENTITY"
+'''
+                    result=subprocess.run(['bash','-c',script,'test',str(ROOT),str(declaration),str(manifest.parent/'version.env'),corrupt],capture_output=True,text=True)
+                    self.assertEqual(result.returncode==0,not corrupt,result.stderr)
+
+    def test_observation_without_digest_uses_authenticated_asset_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            d=Path(directory); metadata=d/'metadata.json'; output=d/'output'
+            metadata.write_text(json.dumps(dict(tag_name='v1',assets=[dict(id=42,name='appcast.xml',state='uploaded',size=7,digest=None,
+                browser_download_url='https://github.com/owner/repo/releases/download/v1/appcast.xml')])))
+            gh=d/'gh'; gh.write_text('#!/bin/bash\n[[ "$GH_TOKEN" == fixture ]] || exit 91\n[[ "$*" == "api repos/owner/repo/releases/assets/42 -H Accept: application/octet-stream" ]] || exit 92\nprintf fixture\n'); gh.chmod(0o755)
+            curl=d/'curl'; curl.write_text('#!/bin/bash\nexit 93\n'); curl.chmod(0o755)
+            env={**os.environ,'PATH':str(d)+':'+os.environ['PATH'],'OBSERVATION_GH_TOKEN':'fixture'}
+            command=['bash','-c','source "$1"; fetch_observed_asset "$2" owner/repo appcast.xml "$3"','test',str(ROOT/'Scripts/release_observation.sh'),str(metadata),str(output)]
+            result=subprocess.run(command,env=env,capture_output=True,text=True)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertEqual(output.read_bytes(),b'fixture')
+
+    def test_observation_requires_matching_api_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            d=Path(directory); metadata=d/'metadata.json'; payload=d/'payload'
+            payload.write_bytes(b'fixture')
+            asset=dict(name='appcast.xml',state='uploaded',size=7,digest='sha256:'+hashlib.sha256(b'fixture').hexdigest(),
+                       browser_download_url='https://github.com/owner/repo/releases/download/v1/appcast.xml')
+            metadata.write_text(json.dumps(dict(tag_name='v1',assets=[asset])))
+            stub=d/'curl'; stub.write_text('#!/bin/bash\nexit 0\n'); stub.chmod(0o755)
+            command=['bash','-c','source "$1"; fetch_observed_asset "$2" owner/repo appcast.xml "$3"','test',str(ROOT/'Scripts/release_observation.sh'),str(metadata),str(payload)]
+            env={**os.environ,'PATH':str(d)+':'+os.environ['PATH']}
+            self.assertEqual(subprocess.run(command,env=env,capture_output=True).returncode,0)
+            asset['digest']='sha256:'+'0'*64
+            metadata.write_text(json.dumps(dict(tag_name='v1',assets=[asset])))
+            self.assertNotEqual(subprocess.run(command,env=env,capture_output=True).returncode,0)
+
+
+if __name__ == '__main__': unittest.main()

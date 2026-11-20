@@ -1,3 +1,5 @@
+import RepoPromptACPProviders
+import RepoPromptAIContracts
 import RepoPromptSettingsCore
 import XCTest
 @_spi(TestSupport) @testable import RepoPromptApp
@@ -7,16 +9,16 @@ final class CursorLocalModelCatalogTests: XCTestCase {
     override func setUp() {
         super.setUp()
         GlobalSettingsStore.installApplicationModelIdentityPolicy()
-        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .cursor)
     }
 
     override func tearDown() {
-        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .cursor)
         super.tearDown()
     }
 
     private func advertise(_ modelRaw: String, parameters: [ACPModelParameterDefinition] = []) {
-        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
+        _ = AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels(
             ACPDiscoveredSessionModels(
                 options: [.init(rawValue: modelRaw, displayName: modelRaw, description: nil, isDefault: false)],
                 currentModelRaw: modelRaw,
@@ -219,9 +221,9 @@ final class CursorLocalModelCatalogTests: XCTestCase {
     }
 
     func testAgentModelCatalogUsesDiscoveredCursorMembershipWithoutReleaseGating() {
-        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
-        defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
-        XCTAssertTrue(AgentACPModelRegistry.shared.updateDiscoveredModels(
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .cursor)
+        defer { AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .cursor) }
+        XCTAssertTrue(AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels(
             ACPDiscoveredSessionModels(
                 options: [.init(
                     rawValue: "future-cursor-model",

@@ -253,7 +253,7 @@ enum GitCardPresentationBuilder {
 
 struct GitResultCard: View {
     let item: AgentChatItem
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("GitResultCard") private var isExpanded = false
 
     private var dto: ToolResultDTOs.GitToolReplyDTO? {
         ToolJSON.decode(ToolResultDTOs.GitToolReplyDTO.self, from: item.toolResultJSON)
@@ -282,11 +282,8 @@ struct GitResultCard: View {
             detailText: nil,
             subtitle: inlineToolCardSummary(presentation.subtitle, presentation.detailText),
             status: presentation.status,
-            timestamp: item.timestamp,
-            isExpandable: toolResultHasPayload(item),
+            item: item,
             isExpanded: $isExpanded
-        ) {
-            ToolMarkdownExpandedContent(item: item)
-        }
+        )
     }
 }

@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptACPProviders
+import RepoPromptAIContracts
 import RepoPromptSettingsCore
 
 enum ACPModelParameterResolver {
@@ -65,7 +67,7 @@ enum ACPModelParameterResolver {
     ) -> ACPModelParameterSet? {
         switch providerID {
         case .cursor:
-            if let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor),
+            if let snapshot = AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: .cursor),
                snapshot.hasModelParameterMetadata
             {
                 if let exact = snapshot.modelParameterSets.first(where: { $0.baseModelRaw == selectedModelRaw }) {
@@ -127,7 +129,7 @@ enum ACPModelParameterResolver {
         var selections = persistedSelections
         if providerID == .cursor,
            let specifier = try? CursorAIModelCatalog.ModelSpecifier(raw: selectedModelRaw),
-           let encoded = try? specifier.selections(in: AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor), ignoringUnavailable: true)
+           let encoded = try? specifier.selections(in: AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: .cursor), ignoringUnavailable: true)
         {
             // A later explicit chip/session write supersedes the model-string's inherited pin.
             selections = ACPModelParameterSelection.normalized(encoded.map { ACPModelParameterSelection(providerID: .cursor, baseModelRaw: $0.baseModelRaw, kind: $0.kind, configID: $0.configID, valueRaw: $0.valueRaw) } + persistedSelections)

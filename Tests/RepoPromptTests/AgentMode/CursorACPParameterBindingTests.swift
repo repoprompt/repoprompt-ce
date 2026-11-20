@@ -1,4 +1,7 @@
 import Foundation
+import RepoPromptACPProviders
+import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
@@ -10,8 +13,8 @@ final class CursorACPParameterBindingTests: XCTestCase {
     }
 
     func testPersistedCursorOracleAndChatOverrideReachesRealHeadlessACPRequests() async throws {
-        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
-        defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .cursor)
+        defer { AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .cursor) }
         let fixture = try makeFixture(shape: "modern", extraEnvironment: ["ACP_INCLUDE_MODEL": "1", "ACP_INCLUDE_PARAMETERS": "1"], providerID: .cursor)
         let raw = AIModel.cursorCustom(name: "model-b[Cursor.Thought-Level=High,Cursor.Fast-Mode=true]").rawValue
         let saved = AgentModelsSettingsProfile(planningModelRaw: raw, additionalOracleModelRaws: [], preferredComposeModelRaw: raw, syncChatModelWithOracle: true)
@@ -89,8 +92,8 @@ final class CursorACPParameterBindingTests: XCTestCase {
     }
 
     func testCursorParameterizedModelPickerAdvertisesCapabilityAndAppliesExactIndependentValues() async throws {
-        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
-        defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .cursor)
+        defer { AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .cursor) }
         let fixture = try makeFixture(
             shape: "modern",
             extraEnvironment: [

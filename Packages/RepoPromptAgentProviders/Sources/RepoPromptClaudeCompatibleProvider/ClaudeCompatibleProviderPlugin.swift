@@ -251,6 +251,7 @@ public enum ClaudeCompatibleModelCatalog {
     private static let sonnetRaw = "sonnet"
     private static let opusRaw = "opus"
     private static let fableRaw = "fable"
+    private static let fable52Raw = "claude-fable-5-2"
     private static let fable51Raw = "claude-fable-5-1"
     private static let fable5Raw = "claude-fable-5"
     private static let mythos51Raw = "claude-mythos-5-1"
@@ -272,6 +273,12 @@ public enum ClaudeCompatibleModelCatalog {
             rawValue: fableRaw,
             displayName: "Fable Latest",
             description: "Latest Claude Fable model for demanding reasoning and long-horizon agentic work.",
+            supportsXHigh: true
+        ),
+        StaticModel(
+            rawValue: fable52Raw,
+            displayName: "Fable 5.2",
+            description: "Pinned Claude Fable 5.2 with 1M context for demanding reasoning and long-horizon agentic work.",
             supportsXHigh: true
         ),
         StaticModel(

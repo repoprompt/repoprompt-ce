@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 // MARK: - App-host run-attempt lifecycle facade
 

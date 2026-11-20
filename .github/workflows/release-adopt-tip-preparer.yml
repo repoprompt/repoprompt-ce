@@ -1,0 +1,112 @@
+name: Adopt Archived Tip Preparer into Stable
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: stable-adopt-preparer
+  queue: max
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-26
+    outputs:
+      artifact-name: ${{ steps.artifact.outputs.name }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Authenticate and inspect unchanged preparer
+        env:
+          OBSERVATION_GH_TOKEN: ${{ github.token }}
+          ADOPTION_OUTPUT_DIR: ${{ github.workspace }}/adoption-verified
+        run: bash Scripts/adopt_tip_preparer.sh verify
+      - name: Check real Stable 43 updater discovery and shipped channel rules
+        env:
+          OBSERVATION_GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          manifests=(adoption-verified/*-stable-rollout.json)
+          [[ "${#manifests[@]}" == 1 ]] || exit 1
+          bash Scripts/check_stable_preparer_update.sh candidate "${manifests[0]}" "$RUNNER_TEMP/stable-discovery"
+      - name: Retain updater discovery evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: stable-discovery-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/stable-discovery/updater-check.log
+            ${{ runner.temp }}/stable-discovery/receipt.json
+          if-no-files-found: warn
+      - name: Smoke verified helper without inherited secrets
+        run: |
+          env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$HOME" TMPDIR="$RUNNER_TEMP" USER="$USER" LOGNAME="$LOGNAME" \
+            bash Scripts/smoke_embedded_mcp_helper.sh 'adoption-verified/RepoPrompt CE.app' 'Archived preparer helper'
+          shopt -s nullglob
+          manifests=(adoption-verified/*-artifact-manifest.json)
+          [[ "${#manifests[@]}" == 1 ]] || { echo 'Expected one verified preparer artifact manifest' >&2; exit 1; }
+          env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$HOME" TMPDIR="$RUNNER_TEMP" USER="$USER" LOGNAME="$LOGNAME" \
+            REPOPROMPT_PACKAGED_SMOKE_TIMEOUT=240 REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT=60 \
+            bash Scripts/smoke_packaged_mcp_roundtrip.sh 'adoption-verified/RepoPrompt CE.app' 'Archived preparer' "${manifests[0]}"
+      - id: artifact
+        env:
+          NAME: archived-preparer-${{ github.run_id }}-${{ github.run_attempt }}
+        run: echo "name=$NAME" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          path: |
+            adoption-verified/*.zip
+            adoption-verified/*-artifact-manifest.json
+            adoption-verified/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+  compatibility:
+    needs: verify
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/macos-compatibility.yml
+    with:
+      artifact-name: ${{ needs.verify.outputs.artifact-name }}
+      tooling-ref: ${{ github.sha }}
+
+  adopt:
+    needs: [verify, compatibility]
+    if: github.ref == 'refs/heads/main'
+    environment: release
+    concurrency:
+      group: rollout-publication
+      queue: max
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require still-current protected-main authorization
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          current="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)"
+          [[ "$current" == "$GITHUB_SHA" ]] || { echo 'Protected main changed; dispatch a fresh adoption run' >&2; exit 1; }
+      - name: Reverify and publish unchanged preparer delivery
+        env:
+          OBSERVATION_GH_TOKEN: ${{ github.token }}
+          PUBLIC_UPDATE_GH_TOKEN: ${{ secrets.PUBLIC_UPDATE_REPOSITORY_TOKEN }}
+          ADOPTION_OUTPUT_DIR: ${{ github.workspace }}/adoption-publish
+        run: bash Scripts/adopt_tip_preparer.sh publish
+      - name: Retain public updater discovery evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: stable-public-discovery-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            adoption-publish/public-updater-check/updater-check.log
+            adoption-publish/public-updater-check/receipt.json
+          if-no-files-found: warn

@@ -1,8 +1,10 @@
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptMCPServer
 import RepoPromptSettingsCore
 import RepoPromptVCS
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 /// Explicit app-process physical capability adapters used by domain-owned tool bindings.
@@ -318,7 +320,7 @@ enum MCPAppPhysicalCapabilityAdapters {
     ) async -> String?
     typealias MakeSelectionHintError = @MainActor @Sendable (_ paths: [String], _ operation: String, _ lookupContext: WorkspaceLookupContext) async -> String
     typealias PerformFileAction = @MainActor @Sendable (_ action: String, _ path: String, _ content: String?, _ newPath: String?, _ ifExists: String?, _ operationID: String) async throws -> MCPFileActionMutationAcknowledgement
-    typealias BuildCodeStructureDTO = @MainActor @Sendable (_ files: [WorkspaceFileRecord], _ request: MCPServerViewModel.CodeStructureRequest, _ includePathNotFoundIssue: Bool, _ requestedPaths: [String], _ lookupContext: WorkspaceLookupContext) async throws -> ToolResultDTOs.CodeStructureReplyDTO
+    typealias BuildCodeStructureDTO = @MainActor @Sendable (_ files: [WorkspaceFileRecord], _ request: WorkspaceCodemapStructureRequest, _ includePathNotFoundIssue: Bool, _ requestedPaths: [String], _ lookupContext: WorkspaceLookupContext) async throws -> ToolResultDTOs.CodeStructureReplyDTO
     typealias ResolveFilesForCodeStructure = @MainActor @Sendable (_ paths: [String], _ lookupRootScope: WorkspaceLookupRootScope, _ maximumSeedCount: Int) async throws -> [WorkspaceFileRecord]
     typealias BuildStoreBackedFileTreeResult = @MainActor @Sendable (_ mode: String, _ maxDepth: Int?, _ startPath: String?, _ lookupContext: WorkspaceLookupContext) async throws -> (result: FileTreeResult, rootCount: Int, emptyReason: MCPStoreBackedFileTreeEmptyReason?)
     typealias ReadFile = @MainActor @Sendable (
@@ -414,9 +416,11 @@ enum MCPAppPhysicalCapabilityAdapters {
 
     struct Context {
         let windowID: Int
-        let promptVM: PromptViewModel
-        let workspaceManager: WorkspaceManagerViewModel?
-        let selectionCoordinator: WorkspaceSelectionCoordinator?
+        // A complete catalog may outlive its presentation. Physical dispatch still requires its
+        // original server; capability storage must not secretly extend the presentation lifetime.
+        weak var promptVM: PromptViewModel?
+        weak var workspaceManager: WorkspaceManagerViewModel?
+        weak var selectionCoordinator: WorkspaceSelectionCoordinator?
         let applyEditsApprovalStore: ApplyEditsApprovalStore
         let captureRequestMetadata: CaptureRequestMetadata
         let resolveImplicitContextBuilderGitTarget: ResolveImplicitContextBuilderGitTarget
@@ -433,6 +437,14 @@ enum MCPAppPhysicalCapabilityAdapters {
         let commitPrimaryGitDiffArtifactsToCurrentTab: CommitPrimaryGitDiffArtifactsToCurrentTab
         let replaceAdvertisedGitArtifactsForCurrentTab: ReplaceAdvertisedGitArtifactsForCurrentTab
         let invalidateAdvertisedGitArtifactsForCurrentTab: InvalidateAdvertisedGitArtifactsForCurrentTab
+
+        @MainActor
+        func requirePromptVM() throws -> PromptViewModel {
+            guard let promptVM else {
+                throw MCPError.internalError("Physical prompt capability is unavailable")
+            }
+            return promptVM
+        }
     }
 
     struct Selection {

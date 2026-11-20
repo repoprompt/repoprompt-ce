@@ -3,6 +3,7 @@ import Foundation
 import RepoPromptDomainRuntime
 import RepoPromptPersistence
 import RepoPromptSettingsCore
+import RepoPromptWorkspaceContext
 
 extension CodeMapArtifactRuntime {
     static let processWideProvider: CodeMapArtifactRuntimeProvider = {
@@ -45,6 +46,7 @@ final class CodeMapGlobalDisableObservation {
 
 @MainActor
 struct WindowStateComposition {
+    let workspaceResources: AgentHostWorkspaceResources
     let workspaceFileContextStore: WorkspaceFileContextStore
     let workspaceSearchService: WorkspaceSearchService
     let selectionCoordinator: WorkspaceSelectionCoordinator
@@ -102,25 +104,11 @@ enum WindowStateCompositionFactory {
         #endif
         let modelRouterRuntime = injectedModelRouterRuntime ?? WindowStatesManager.shared.modelRouterRuntime
         // 1) Workspace file context store + visible file-tree UI adapter
-        #if DEBUG
-            let defaultWorkspaceFileContextStore = WorkspaceFileContextStore(
-                startupFeatureFlags: .current(),
-                enableCatalogShardShadowValidation: false,
-                nonGitCodeMapsEnabled: settingsStore.nonGitCodeMapsEnabled,
-                codeMapsGloballyDisabled: settingsStore.globalCodeMapsDisabled(),
-                restorePerfRecorder: AppWorkspaceRestorePerfRecorder(),
-                perfRecorder: AppAgentModePerfRecorder()
-            )
-        #else
-            let defaultWorkspaceFileContextStore = WorkspaceFileContextStore(
-                startupFeatureFlags: .current(),
-                nonGitCodeMapsEnabled: settingsStore.nonGitCodeMapsEnabled,
-                codeMapsGloballyDisabled: settingsStore.globalCodeMapsDisabled(),
-                restorePerfRecorder: AppWorkspaceRestorePerfRecorder(),
-                perfRecorder: AppAgentModePerfRecorder()
-            )
-        #endif
-        let workspaceFileContextStore = injectedWorkspaceFileContextStore ?? defaultWorkspaceFileContextStore
+        let workspaceResources = AgentHostWorkspaceResources(
+            files: injectedWorkspaceFileContextStore ?? AgentHostWorkspaceResources.makeFiles(settingsStore: settingsStore),
+            contexts: domainRuntime?.contextStore
+        )
+        let workspaceFileContextStore = workspaceResources.files
         let workspaceSearchService = injectedWorkspaceSearchService ?? WorkspaceSearchService()
         let workspaceFilesViewModel = WorkspaceFilesViewModel(
             workspaceFileContextStore: workspaceFileContextStore,
@@ -215,6 +203,10 @@ enum WindowStateCompositionFactory {
 
         // 11) MCP server (one listener app-wide, this window may be owner)
         let applyEditsApprovalStore = ApplyEditsApprovalStore.shared
+        let routeResources = MCPHostRouteResources(
+            identity: .legacyWindow(windowID), coordinator: domainRuntime?.routingCoordinator,
+            runtime: domainRuntime ?? AppDomainRuntimeComposition.shared.runtime
+        )
         let mcpServer = MCPServerViewModel(
             service: sharedMCPService,
             perfRecorder: AppAgentModePerfRecorder(),
@@ -250,6 +242,7 @@ enum WindowStateCompositionFactory {
                 )
             },
             domainRoutingCoordinator: domainRuntime?.routingCoordinator,
+            routeResources: routeResources,
             domainWorkspaceAuthorityClient: domainWorkspaceClient,
             domainReadSideEffectCoordinator: domainRuntime?.readSideEffectCoordinator,
             domainReadRuntimeIdentity: domainRuntime?.identity,
@@ -270,23 +263,42 @@ enum WindowStateCompositionFactory {
             perfRecorder: AppAgentModePerfRecorder()
         )
 
-        // 13) Agent mode (for minimal agent UI)
-        let agentModeViewModel = agentModeViewModelFactory?(windowID, promptManager, workspaceManager, mcpServer) ?? AgentModeViewModel(
-            windowID: windowID,
-            promptManager: promptManager,
-            workspaceManager: workspaceManager,
-            mcpServer: mcpServer,
-            attachmentPersistenceIsSuppressed: { AppLaunchConfiguration.current.suppressesAgentSessionPersistence },
-            attachmentSweepViewModels: { WindowStatesManager.shared.allWindows.map(\.agentModeViewModel) },
-            oracleViewModel: oracleViewModel,
-            applyEditsApprovalStore: applyEditsApprovalStore,
-            modelRouterSettingsStore: settingsStore,
-            modelRouterRuntime: modelRouterRuntime,
-            usesProductionAgentDefaultsAndModelPolling: automaticProviderModelDiscoveryEnabled,
-            catalogDiagnosticsSink: AppAgentSessionLinkCatalogEventSink(),
-            restorePerfRecorder: AppWorkspaceRestorePerfRecorder(),
-            perfRecorder: AppAgentModePerfRecorder()
-        )
+        // 13) Allocate the executable owner before constructing its presentation or sessions.
+        // Route/activation migration is separate: this preserves the current legacy route until
+        // independent mapping and originating cleanup can be installed together.
+        let agentModeViewModel: AgentModeViewModel
+        if let agentModeViewModelFactory {
+            agentModeViewModel = agentModeViewModelFactory(windowID, promptManager, workspaceManager, mcpServer)
+        } else {
+            let paths = AgentSessionRuntimeHost.makeSessionWorkspaceProviders { [weak workspaceManager] in
+                workspaceManager?.activeWorkspace?.repoPaths.first
+            }
+            let runtimeHost = AgentSessionRuntimeHost(
+                route: routeResources,
+                workspacePath: paths.sessionWorkspacePath,
+                runtimeWorkspacePaths: paths.codexRuntimeWorkspacePaths,
+                connectionPolicyInstaller: AgentSessionRuntimeHost.defaultConnectionPolicyInstaller,
+                modelRouterSettingsStore: settingsStore,
+                catalogDiagnosticsSink: AppAgentSessionLinkCatalogEventSink(),
+                perfRecorder: AppAgentModePerfRecorder()
+            )
+            agentModeViewModel = AgentModeViewModel(
+                windowID: windowID,
+                runtimeHost: runtimeHost,
+                promptManager: promptManager,
+                workspaceManager: workspaceManager,
+                mcpServer: mcpServer,
+                attachmentPersistenceIsSuppressed: { AppLaunchConfiguration.current.suppressesAgentSessionPersistence },
+                oracleViewModel: oracleViewModel,
+                applyEditsApprovalStore: applyEditsApprovalStore,
+                modelRouterSettingsStore: settingsStore,
+                modelRouterRuntime: modelRouterRuntime,
+                usesProductionAgentDefaultsAndModelPolling: automaticProviderModelDiscoveryEnabled,
+                catalogDiagnosticsSink: AppAgentSessionLinkCatalogEventSink(),
+                restorePerfRecorder: AppWorkspaceRestorePerfRecorder(),
+                perfRecorder: AppAgentModePerfRecorder()
+            )
+        }
         agentModeViewModel.repromptService = .live(keyManager: keyManager)
         agentModeViewModel.preparedSessionRuntimes = WindowStatesManager.shared
         agentModeViewModel.providerSwitchExactOwnerProbe = { session in
@@ -340,6 +352,7 @@ enum WindowStateCompositionFactory {
 
         #if DEBUG
             return WindowStateComposition(
+                workspaceResources: workspaceResources,
                 workspaceFileContextStore: workspaceFileContextStore,
                 workspaceSearchService: workspaceSearchService,
                 selectionCoordinator: selectionCoordinator,
@@ -362,6 +375,7 @@ enum WindowStateCompositionFactory {
             )
         #else
             return WindowStateComposition(
+                workspaceResources: workspaceResources,
                 workspaceFileContextStore: workspaceFileContextStore,
                 workspaceSearchService: workspaceSearchService,
                 selectionCoordinator: selectionCoordinator,

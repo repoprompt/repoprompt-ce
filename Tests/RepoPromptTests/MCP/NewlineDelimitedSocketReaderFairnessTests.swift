@@ -3,6 +3,7 @@ import Dispatch
 import Foundation
 import Logging
 @testable import RepoPromptApp
+@testable import RepoPromptMCPServer
 import XCTest
 
 final class NewlineDelimitedSocketReaderFairnessTests: XCTestCase {

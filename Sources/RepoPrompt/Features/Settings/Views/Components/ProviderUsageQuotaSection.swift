@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import RepoPromptAIContracts
 import RepoPromptProviderQuota
 import RepoPromptSettingsCore
 import SwiftUI

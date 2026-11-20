@@ -2,10 +2,95 @@ import Darwin
 import Foundation
 import MCP
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
+@testable import RepoPromptMCPServer
 import RepoPromptProcess
 import RepoPromptSecureStorage
+import RepoPromptSettingsCore
 import RepoPromptShared
+import RepoPromptVCS
+@testable import RepoPromptWorkspaceContext
+import RepoPromptWorkspaceCore
 import XCTest
+
+private actor RouteInvocationGate {
+    private var entered = false
+    private var released = false
+    private var entries: [CheckedContinuation<Void, Never>] = []
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private(set) var validationCalls = 0
+
+    func recordValidation() -> Bool {
+        validationCalls += 1
+        return true
+    }
+
+    func enter() async {
+        entered = true
+        let pending = entries
+        entries.removeAll()
+        pending.forEach { $0.resume() }
+        if !released { await withCheckedContinuation { waiters.append($0) } }
+    }
+
+    func didEnter() -> Bool {
+        entered
+    }
+
+    func waitUntilEntered() async {
+        if !entered { await withCheckedContinuation { entries.append($0) } }
+    }
+
+    func release() {
+        released = true
+        let pending = waiters
+        waiters.removeAll()
+        pending.forEach { $0.resume() }
+    }
+}
+
+private actor RouteHistoryScanner: HistorySessionScanning {
+    enum Failure: Error { case scan }
+    private(set) var scans = 0
+    private var fails = false
+    private var gate: RouteInvocationGate?
+
+    func setFailure(_ value: Bool) {
+        fails = value
+    }
+
+    func block(on gate: RouteInvocationGate) {
+        fails = false
+        self.gate = gate
+    }
+
+    func scanAllWorkspaces() async throws -> [HistoryWorkspaceScanResult] {
+        scans += 1
+        if fails { throw Failure.scan }
+        await gate?.enter()
+        try Task.checkCancellation()
+        return []
+    }
+
+    func scanAllWorkspacesRefreshing() async throws -> [HistoryWorkspaceScanResult] {
+        try await scanAllWorkspaces()
+    }
+
+    nonisolated func sessionsMatchingFilters(
+        _: [HistoryWorkspaceScanResult], workspace _: String?, agentKind _: String?, model _: String?,
+        filePath _: String?, from _: Date?, to _: Date?
+    ) -> [HistoryFilteredSessionRecord] {
+        []
+    }
+
+    func loadTranscriptForSearch(sessionID _: UUID, workspaceDir _: URL) async throws -> AgentTranscript {
+        throw Failure.scan
+    }
+
+    func transcriptDerivedFieldsAreStale(for _: AgentSessionMetadataRecord, sessionID _: UUID, workspaceDir _: URL) async -> Bool {
+        false
+    }
+}
 
 /// Regression coverage for per-subscriber MCP state streams.
 ///
@@ -20,6 +105,93 @@ import XCTest
 /// `unsubscribeFromStateUpdates` finishes only that subscriber's stream, and a
 /// view model can be deallocated once observation stops.
 final class MCPStateSubscriptionTests: XCTestCase {
+    @MainActor
+    func testModelEndpointRefusesWriterReacquisitionOnTheSameBinding() async throws {
+        let server = makeServerViewModel(service: makeService())
+        let manager = try XCTUnwrap(server.workspaceManager)
+        await manager.awaitInitialized()
+        let store = AgentSessionRuntimeStore()
+        let scope = store.makeScope()
+        let sessionID = UUID()
+        var tab = ComposeTabState()
+        tab.activeAgentSessionID = sessionID
+        let workspace = WorkspaceModel(
+            name: "Model route selection", repoPaths: [], ephemeralFlag: true, composeTabs: [tab]
+        )
+        manager.workspaces = [workspace]
+        let workspaceID = workspace.id
+        let tabID = tab.id
+        let runID = UUID()
+        let connectionID = UUID()
+        let route = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: nil)
+        let routeID = route.identity.routeID
+        let session = AgentTabSession(tabID: tabID)
+        session.installPersistentSessionBinding(.init(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID))
+        session.hasLoadedPersistedState = true
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        scope.replaceSessions([tabID: session])
+        let original = try scope.admit(session: session)
+        let endpoint = DomainAgentSessionLinkEndpointIdentity(
+            windowID: routeID, workspaceID: workspaceID, tabID: tabID, sessionID: sessionID,
+            persistentBindingGeneration: original.writer.binding.generation,
+            bindingTransitionGeneration: session.bindingTransitionGeneration
+        )
+        route.installModelEndpointResolver { [weak scope] requestedTabID in
+            guard requestedTabID == tabID, let scope, let session = scope.sessions[tabID],
+                  let command = try? scope.admit(session: session) else { return nil }
+            return .init(endpoint: endpoint, writer: command.identity)
+        }
+
+        let receipt = MCPRunRoutingCleanupReceipt(
+            managerIdentity: ObjectIdentifier(store), policyID: UUID(), runID: runID, routeID: routeID,
+            routingAuthorityGeneration: 1, routingWaitGeneration: nil, routeOwner: route
+        )
+        _ = try XCTUnwrap(route.runRouteBindings.beginPendingPolicy(
+            connectionID: connectionID, runID: runID, windowID: routeID, cleanupReceipt: receipt
+        ))
+        var context = MCPTabContextSnapshot(
+            tabID: tabID, windowID: routeID, workspaceID: workspaceID, promptText: "",
+            selection: .init(), selectedMetaPromptIDs: [], tabName: "Original",
+            runID: runID, activeAgentSessionID: sessionID, explicitlyBound: false
+        )
+        context.routeOwnerIdentity = ObjectIdentifier(route)
+        route.runRouteBindings.tabContextByConnectionID[connectionID] = context
+        route.publishBinding(connectionID: connectionID, context: context, cleanupReceipt: receipt)
+        XCTAssertEqual(route.modelObserverEndpoint(
+            registration: receipt, connectionID: connectionID, workspaceID: workspaceID, tabID: tabID
+        ), endpoint)
+        XCTAssertNil(route.modelObserverEndpoint(
+            registration: receipt, connectionID: connectionID, workspaceID: UUID(), tabID: tabID
+        ))
+
+        // A request snapshot can predate writer capture. Read the binding's current proof on writeback.
+        var mutation = context
+        mutation.selection = StoredSelection(selectedPaths: ["/workspace/Selection.swift"])
+        let verification = await server.persistResolvedTabContextSnapshot(
+            route: route,
+            .init(snapshot: mutation, source: .runInstall),
+            metadata: .init(connectionID: connectionID, clientName: nil, windowID: routeID),
+            mutated: true
+        )
+        XCTAssertEqual(verification?.canonicalSelection, mutation.selection)
+        let refreshed = try XCTUnwrap(route.runRouteBindings.tabContextByConnectionID[connectionID])
+        XCTAssertEqual(refreshed.selection, mutation.selection)
+        XCTAssertEqual(refreshed.routeOwnerIdentity, ObjectIdentifier(route))
+        XCTAssertEqual(route.modelObserverEndpoint(
+            registration: receipt, connectionID: connectionID, workspaceID: workspaceID, tabID: tabID
+        ), endpoint)
+
+        scope.replaceSessions([:])
+        scope.replaceSessions([tabID: session])
+        let reacquired = try scope.admit(session: session)
+        XCTAssertNotEqual(reacquired.identity, original.identity)
+        XCTAssertEqual(session.bindingTransitionGeneration, endpoint.bindingTransitionGeneration)
+        route.publishBinding(connectionID: connectionID, context: context, cleanupReceipt: receipt)
+        XCTAssertNil(route.modelObserverEndpoint(
+            registration: receipt, connectionID: connectionID, workspaceID: workspaceID, tabID: tabID
+        ))
+    }
+
     private func makeService() -> MCPService {
         MCPService(
             hostBootstrapOperation: {},
@@ -144,7 +316,7 @@ final class MCPStateSubscriptionTests: XCTestCase {
     }
 
     @MainActor
-    private func makeServerViewModel(service: MCPService) -> MCPServerViewModel {
+    private func makeServerViewModel(service: MCPService, validation: MCPToolInvocationValidator? = nil) -> MCPServerViewModel {
         let store = WorkspaceFileContextStore()
         let fileManager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
         let keyManager = KeyManager(
@@ -186,8 +358,725 @@ final class MCPStateSubscriptionTests: XCTestCase {
             },
             ensureGitDataRootLoaded: { _, _ in
                 throw MCPError.internalError("git-data loading is not used by these tests")
+            },
+            validateInvocation: validation ?? { context, routeID, owner in
+                await ServerNetworkManager.shared.validateToolInvocationContext(
+                    context, expectedWindowID: routeID, expectedServerViewModelIdentity: owner
+                )
             }
         )
+    }
+
+    @MainActor
+    private func makeHistoryRouteRuntime() async throws -> MCPDomainRuntime {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("route-binding-\(UUID())")
+        let runtime = MCPDomainRuntime(configuration: .init(
+            mode: .app, profileIdentifier: UUID().uuidString, storageDirectory: directory,
+            workspaceStorageDirectory: directory.appendingPathComponent("workspaces"),
+            eventDirectory: directory.appendingPathComponent("events"),
+            temporaryDirectory: directory.appendingPathComponent("tmp"), externalReloadInterval: nil
+        ))
+        try await runtime.start()
+        addTeardownBlock {
+            _ = await runtime.shutdown()
+            try? FileManager.default.removeItem(at: directory)
+        }
+        return runtime
+    }
+
+    @MainActor
+    private struct TreeRouteFixture {
+        let route: MCPHostRouteResources
+        let tree: MCPDomainResolvedTool
+        let connectionID: UUID
+        let workspace: WorkspaceModel
+        let documentURL: URL
+        let files: WorkspaceFileContextStore
+        let root: WorkspaceRootRecord
+        let lease: AgentHostWorkspaceResources.Lease
+    }
+
+    @MainActor
+    private func registeredTreeAfterServerRelease(
+        runtime: MCPDomainRuntime, worktree: Bool = false, gate: RouteInvocationGate? = nil,
+        identity: MCPHostRouteIdentity? = nil, validation: MCPToolInvocationValidator? = nil
+    ) async throws -> TreeRouteFixture {
+        // Test repositories stay inside this admitted checkout, never in a /tmp worktree.
+        let repoRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let git = try ReviewGitRepositoryFixture(name: "RouteTree", parentDirectory: repoRoot.appendingPathComponent(".build/validation-artifacts/m9-tree"))
+        let directory = git.sandbox
+        let base = try git.makeRepository(named: "logical", files: ["BaseOnly.swift": "base", "Sources/Selected.swift": "selected"])
+        let physical = directory.appendingPathComponent("bound")
+        var worktreeIdentity: GitWorktreeIdentitySnapshot?
+        if worktree {
+            try git.runGit(["worktree", "add", "--detach", physical.path, "HEAD"], at: base)
+            try FileManager.default.removeItem(at: physical.appendingPathComponent("BaseOnly.swift"))
+            try git.write("bound", to: "BoundOnly.swift", at: physical)
+            try git.write("selected bound", to: "Sources/Selected.swift", at: physical)
+            worktreeIdentity = try XCTUnwrap(GitWorktreeIdentityResolver.resolve(atWorkTreeRoot: physical))
+            XCTAssertFalse(try XCTUnwrap(worktreeIdentity).isMain)
+        }
+        let files = WorkspaceFileContextStore(codemapGraphIndexBuildLaunchPolicyForTesting: .disabled)
+        let root = try await files.loadRoot(path: base.path)
+        var workspace = WorkspaceModel(name: "Canonical tree", repoPaths: [base.path])
+        var tab = ComposeTabState()
+        tab.selection = StoredSelection(selectedPaths: [base.appendingPathComponent("Sources/Selected.swift").path])
+        tab.activeAgentSessionID = worktree ? UUID() : nil
+        workspace.composeTabs = [tab]
+        workspace.activeComposeTabID = tab.id
+        let route = MCPHostRouteResources(identity: identity ?? MCPRouteIdentityAllocator.allocateHost(), coordinator: runtime.routingCoordinator, runtime: runtime)
+        let documentURL = runtime.configuration.workspaceStorageDirectory.appendingPathComponent("tree-\(workspace.id).json")
+        _ = try await DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: route.identity.routeID).create(workspace, fileURL: documentURL)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: documentURL.path), "Use actual canonical persistence")
+        let context = DomainContextIdentity(workspaceID: workspace.id, contextID: tab.id)
+        let lease = try await AgentHostWorkspaceResources(files: files, contexts: runtime.contextStore).acquire(context: context, rootIDs: [root.id])
+        addTeardownBlock {
+            await route.close()
+            await lease.release()
+            await files.unloadRoot(id: root.id)
+            git.cleanup()
+        }
+        let bindings: [AgentSessionWorktreeBinding] = worktreeIdentity.map { identity in [.init(
+            id: "tree-binding", repositoryID: identity.repository.repositoryID, repoKey: identity.repository.repoKey,
+            logicalRootPath: base.path, logicalRootName: base.lastPathComponent,
+            worktreeID: identity.worktreeID, worktreeRootPath: physical.path,
+            commonGitDir: identity.repository.commonGitDir, isMainWorktree: identity.isMain, source: "test"
+        )] } ?? []
+        let suiteName = "RouteTree.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        addTeardownBlock { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: directory.appendingPathComponent("settings.json")))
+        var resources = MCPFileReadResources(workspace: lease, settings: settings)
+        if let gate { resources.beforeReplyValidationForTesting = { await gate.enter() } }
+        var server: MCPServerViewModel? = makeServerViewModel(service: makeService(), validation: validation)
+        let released = { @MainActor [weak server, weak prompt = server?.promptVM, weak manager = server?.workspaceManager] in
+            server == nil && prompt == nil && manager == nil
+        }
+        let lifetimeStatus = { @MainActor [weak server, weak prompt = server?.promptVM, weak manager = server?.workspaceManager] in
+            "released server=\(server == nil), prompt=\(prompt == nil), workspace=\(manager == nil)"
+        }
+        let catalog = try XCTUnwrap(server).makeToolCatalog(route: route, fileReads: resources)
+        let physicalNames = try Set(XCTUnwrap(server).makeToolCatalog(route: server!.routeResources).materializeTools().map(\.name))
+        _ = await route.ensureRegistered(workspaceID: workspace.id, contextID: tab.id, revision: 0)
+        let connectionID = UUID()
+        var snapshot = MCPTabContextSnapshot(tabID: tab.id, windowID: route.identity.routeID, workspaceID: workspace.id, promptText: "", selection: .init(), selectedMetaPromptIDs: [], tabName: "Original", runID: nil, activeAgentSessionID: tab.activeAgentSessionID, worktreeBindings: bindings, explicitlyBound: true)
+        snapshot.routeOwnerIdentity = ObjectIdentifier(route)
+        route.runRouteBindings.tabContextByConnectionID[connectionID] = snapshot
+        route.publishBinding(connectionID: connectionID, context: snapshot)
+        await route.settleRoutingPublications()
+        server?.stopServiceObservation()
+        server?.promptVM.cancelInitialModelRefreshForWindowClose()
+        server?.promptVM.gitViewModel.prepareForWindowClose()
+        server?.workspaceManager?.prepareForWindowClose()
+        await server?.workspaceManager?.awaitInitialWorkspaceActivationCompletion()
+        await server?.workspaceManager?.awaitPostSwitchGitDataLoadShutdown()
+        await server?.promptVM.awaitInitialModelRefreshCompletion()
+        await server?.workspaceManager?.awaitRootReconciliationShutdown()
+        await server?.workspaceManager?.awaitOwnSavesForWindowClose()
+        await server?.promptVM.stopTokenCountUpdateTimer()
+        server = nil
+        await waitUntil { released() }
+        XCTAssertTrue(released(), "The complete catalog must retain no server, prompt or workspace VM: \(lifetimeStatus())")
+        // First materialization and authoritative registration happen only after all three VMs
+        // are gone. No pre-deallocation tool cache may conceal a physical dependency.
+        XCTAssertEqual(try Set(catalog.materializeTools().map(\.name)), physicalNames)
+        _ = try await route.registerCatalog(catalog)
+        let resolved = await runtime.toolRegistry.resolve(toolName: "get_file_tree", scope: .window(id: route.identity.routeID))
+        return try TreeRouteFixture(route: route, tree: XCTUnwrap(resolved), connectionID: connectionID, workspace: workspace, documentURL: documentURL, files: files, root: root, lease: lease)
+    }
+
+    @MainActor
+    private func invokeTree(_ fixture: TreeRouteFixture, args: [String: Value]) async throws -> Value {
+        let invocation = ToolInvocationContext.trustedLocal(toolName: "get_file_tree", metadata: .init(connectionID: fixture.connectionID, clientName: nil, windowID: fixture.route.identity.routeID))
+        return try await MCPInvocationContextBridge.withInvocation(invocation) { try await fixture.tree.binding(args) }
+    }
+
+    @MainActor
+    func testRegisteredFileTreeUsesCanonicalSelectionAndPhysicalBoundRootsWithoutVMs() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
+            let count = WindowState.windowCounter
+            for worktree in [false, true] {
+                let fixture = try await registeredTreeAfterServerRelease(runtime: runtime, worktree: worktree)
+                let full = try await invokeTree(fixture, args: ["mode": .string("full")])
+                let tree = try XCTUnwrap(full.objectValue?["tree"]?.stringValue)
+                XCTAssertTrue(tree.contains(worktree ? "BoundOnly.swift" : "BaseOnly.swift"), tree)
+                XCTAssertFalse(tree.contains(worktree ? "BaseOnly.swift" : "BoundOnly.swift"), tree)
+                let selected = try await invokeTree(fixture, args: ["mode": .string("selected")])
+                let selection = try XCTUnwrap(selected.objectValue?["tree"]?.stringValue)
+                XCTAssertTrue(selection.contains("Selected.swift"), selection)
+                XCTAssertFalse(selection.contains("Only.swift"), "Selection comes from canonical context bytes, not the intentionally empty route snapshot")
+                for args: [String: Value] in [["type": .string("roots")], ["mode": .string("folders")], ["mode": .string("auto"), "path": .string("Sources"), "max_depth": .int(1)]] {
+                    let value = try await invokeTree(fixture, args: args)
+                    XCTAssertNil(value.objectValue?["error_code"], String(describing: value))
+                }
+                do {
+                    _ = try await invokeTree(fixture, args: ["mode": .string("invalid")])
+                    XCTFail("Preserve invalid-mode diagnostics")
+                } catch let error as MCPError { XCTAssertEqual(error, .invalidParams("invalid mode: invalid")) }
+                for name in ["read_file", "file_search", "file_actions", "apply_edits", "prompt"] {
+                    let resolved = await runtime.toolRegistry.resolve(toolName: name, scope: .window(id: fixture.route.identity.routeID))
+                    let tool = try XCTUnwrap(resolved)
+                    let request = ToolInvocationContext.trustedLocal(toolName: name, metadata: .init(connectionID: fixture.connectionID, clientName: nil, windowID: fixture.route.identity.routeID))
+                    do {
+                        _ = try await MCPInvocationContextBridge.withInvocation(request) { try await tool.binding([:]) }
+                        XCTFail("Unmigrated \(name) must retain its physical-owner check")
+                    } catch let error as MCPError { XCTAssertEqual(error, .internalError("Window deallocated while executing \(name)"))
+                    } catch DomainMutationPolicyError.principalMissing {
+                        XCTAssertTrue(["file_actions", "apply_edits"].contains(name), "Protected mutation admission remains in front of physical dispatch")
+                    }
+                }
+                XCTAssertEqual(fixture.route.toolExecutionRuntime.activeExecutionCount, 0)
+            }
+            XCTAssertEqual(WindowState.windowCounter, count)
+        }
+    }
+
+    @MainActor
+    func testRegisteredCodeStructureReadsExactCanonicalSelectionAndBoundWorktreeWithoutVMs() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
+            let fixture = try await registeredTreeAfterServerRelease(runtime: runtime, worktree: true)
+            let name = MCPWindowToolName.getCodeStructure
+            let registered = await runtime.toolRegistry.resolve(toolName: name, scope: .window(id: fixture.route.identity.routeID))
+            let tool = try XCTUnwrap(registered)
+            let metadata = MCPRequestMetadata(connectionID: fixture.connectionID, clientName: nil, windowID: fixture.route.identity.routeID)
+            func invoke(paths: [String]? = nil) async throws -> Value {
+                var arguments: [String: Value] = ["signatures": .bool(false)]
+                if let paths { arguments["paths"] = .array(paths.map(Value.string)) }
+                let request = ToolInvocationContext.trustedLocal(toolName: name, metadata: metadata)
+                let input = arguments
+                return try await MCPInvocationContextBridge.withInvocation(request) { try await tool.binding(input) }
+            }
+            func seedPaths(_ value: Value) -> [String] {
+                (value.objectValue?["roots"]?.arrayValue ?? []).flatMap { root in
+                    (root.objectValue?["seeds"]?.arrayValue ?? []).compactMap { $0.objectValue?["path"]?.stringValue }
+                }
+            }
+
+            let selected = try await invoke()
+            XCTAssertEqual(seedPaths(selected), ["\(fixture.root.name)/Sources/Selected.swift"], String(describing: selected))
+            let explicit = try await invoke(paths: [fixture.root.fullPath + "/BoundOnly.swift"])
+            XCTAssertEqual(seedPaths(explicit), ["\(fixture.root.name)/BoundOnly.swift"], String(describing: explicit))
+            let missing = try await invoke(paths: [fixture.root.fullPath + "/BaseOnly.swift"])
+            XCTAssertTrue(seedPaths(missing).isEmpty)
+            XCTAssertEqual(missing.objectValue?["issues"]?.arrayValue?.first?.objectValue?["code"]?.stringValue, "path_not_found")
+            XCTAssertEqual(fixture.route.toolExecutionRuntime.activeExecutionCount, 0)
+        }
+    }
+
+    @MainActor
+    func testRegisteredFileReadsKeepTwoConnectionsScopedToTheirOwnTabs() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
+            let fixture = try await registeredTreeAfterServerRelease(runtime: runtime)
+            var workspace = fixture.workspace
+            var secondTab = ComposeTabState()
+            secondTab.selection = StoredSelection(selectedPaths: [fixture.root.fullPath + "/BaseOnly.swift"])
+            workspace.composeTabs.append(secondTab)
+            let document = try DomainWorkspaceDocument.decode(documentBytes: JSONEncoder().encode(workspace), fileURL: fixture.documentURL)
+            _ = await runtime.workspaceStore.registerReadDocument(document)
+
+            let route = fixture.route
+            let secondConnectionID = UUID()
+            var second = MCPTabContextSnapshot(
+                tabID: secondTab.id, windowID: route.identity.routeID, workspaceID: workspace.id,
+                promptText: "", selection: .init(), selectedMetaPromptIDs: [], tabName: "Second", runID: nil, explicitlyBound: true
+            )
+            second.routeOwnerIdentity = ObjectIdentifier(route)
+            route.runRouteBindings.tabContextByConnectionID[secondConnectionID] = second
+            route.publishBinding(connectionID: secondConnectionID, context: second)
+            await route.settleRoutingPublications()
+            XCTAssertEqual(route.descriptor?.activeContextID, secondTab.id)
+
+            let codeStructure = await runtime.toolRegistry.resolve(toolName: MCPWindowToolName.getCodeStructure, scope: .window(id: route.identity.routeID))
+            let codeBinding = try XCTUnwrap(codeStructure).binding
+            let pairs = [(fixture.connectionID, "Selected.swift", "BaseOnly.swift"), (secondConnectionID, "BaseOnly.swift", "Selected.swift")]
+            for (id, expected, unexpected) in pairs {
+                let metadata = MCPRequestMetadata(connectionID: id, clientName: nil, windowID: route.identity.routeID)
+                let treeRequest = ToolInvocationContext.trustedLocal(toolName: MCPWindowToolName.getFileTree, metadata: metadata)
+                let reply = try await MCPInvocationContextBridge.withInvocation(treeRequest) { try await fixture.tree.binding(["mode": .string("selected")]) }
+                let tree = try XCTUnwrap(reply.objectValue?["tree"]?.stringValue)
+                XCTAssertTrue(tree.contains(expected), tree)
+                XCTAssertFalse(tree.contains(unexpected), tree)
+
+                let codeRequest = ToolInvocationContext.trustedLocal(toolName: MCPWindowToolName.getCodeStructure, metadata: metadata)
+                let code = try await MCPInvocationContextBridge.withInvocation(codeRequest) { try await codeBinding(["signatures": .bool(false)]) }
+                let seeds = (code.objectValue?["roots"]?.arrayValue ?? []).flatMap { root in
+                    (root.objectValue?["seeds"]?.arrayValue ?? []).compactMap { $0.objectValue?["path"]?.stringValue }
+                }
+                XCTAssertEqual(seeds.map { ($0 as NSString).lastPathComponent }, [expected], String(describing: code))
+            }
+        }
+    }
+
+    @MainActor
+    func testRegisteredCodeStructureRejectsContextReplacedBeforeReply() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
+            let replyGate = RouteInvocationGate()
+            let fixture = try await registeredTreeAfterServerRelease(runtime: runtime, gate: replyGate)
+            let name = MCPWindowToolName.getCodeStructure
+            let registered = await runtime.toolRegistry.resolve(toolName: name, scope: .window(id: fixture.route.identity.routeID))
+            let tool = try XCTUnwrap(registered)
+            let metadata = MCPRequestMetadata(connectionID: fixture.connectionID, clientName: nil, windowID: fixture.route.identity.routeID)
+            var changed = fixture.workspace
+            changed.composeTabs[0].selection = StoredSelection(selectedPaths: [fixture.root.fullPath + "/BaseOnly.swift"])
+            let document = try DomainWorkspaceAuthorityClient.document(for: changed, fileURL: fixture.documentURL)
+            let pending = Task {
+                let request = ToolInvocationContext.trustedLocal(toolName: name, metadata: metadata)
+                return try await MCPInvocationContextBridge.withInvocation(request) { try await tool.binding(["signatures": .bool(false)]) }
+            }
+            addTeardownBlock {
+                pending.cancel()
+                await replyGate.release()
+                _ = await pending.result
+            }
+            try await AsyncTestWait.waitUntil("code structure reply reached its final validation") { await replyGate.didEnter() }
+            _ = await runtime.workspaceStore.registerReadDocument(document)
+            await replyGate.release()
+            let reply = try await pending.value
+            XCTAssertEqual(reply.objectValue?["status"]?.stringValue, "unavailable")
+            XCTAssertEqual(reply.objectValue?["issues"]?.arrayValue?.first?.objectValue?["code"]?.stringValue, "workspace_authority_superseded")
+            XCTAssertEqual(reply.objectValue?["roots"]?.arrayValue, [])
+            XCTAssertEqual(fixture.route.toolExecutionRuntime.activeExecutionCount, 0)
+        }
+    }
+
+    @MainActor
+    func testRegisteredFileTreeRejectsRevocationAcrossRealTreeAwaitButIgnoresUnrelatedPresenter() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
+            for change in ["context", "sameContext", "binding", "roots", "removed", "connection", "catalog", "close", "presentation", "cancel"] {
+                let gate = RouteInvocationGate()
+                let fixture = try await registeredTreeAfterServerRelease(runtime: runtime, worktree: true, gate: gate)
+                let pending = Task { try await self.invokeTree(fixture, args: ["mode": .string("selected")]) }
+                addTeardownBlock { pending.cancel()
+                    await gate.release()
+                    _ = await pending.result
+                }
+                try await AsyncTestWait.waitUntil("tree reply validation entered") { await gate.didEnter() }
+                switch change {
+                case "context":
+                    var replacement = fixture.workspace
+                    replacement.composeTabs[0].selection = StoredSelection()
+                    let document = try DomainWorkspaceDocument.decode(documentBytes: JSONEncoder().encode(replacement), fileURL: fixture.documentURL)
+                    _ = await runtime.workspaceStore.registerReadDocument(document)
+                case "sameContext":
+                    var removed = fixture.workspace
+                    removed.composeTabs = []
+                    removed.activeComposeTabID = nil
+                    _ = try await runtime.workspaceStore.registerReadDocument(DomainWorkspaceAuthorityClient.document(for: removed, fileURL: fixture.documentURL))
+                    var successor = fixture.workspace
+                    successor.composeTabs[0].name = "Same ID successor"
+                    successor.composeTabs[0].selection = StoredSelection()
+                    _ = try await runtime.workspaceStore.registerReadDocument(DomainWorkspaceAuthorityClient.document(for: successor, fileURL: fixture.documentURL))
+                case "binding":
+                    var successor = try XCTUnwrap(fixture.route.runRouteBindings.tabContextByConnectionID[fixture.connectionID])
+                    successor.readFileAutoSelectionGeneration += 1
+                    fixture.route.runRouteBindings.tabContextByConnectionID[fixture.connectionID] = successor
+                    fixture.route.publishBinding(connectionID: fixture.connectionID, context: successor)
+                    await fixture.route.settleRoutingPublications()
+                case "roots": try await fixture.files.replaceRootLifetimeForTesting(rootID: fixture.root.id)
+                case "removed":
+                    await fixture.files.unloadRoot(id: fixture.root.id)
+                    await fixture.lease.release()
+                case "connection":
+                    _ = await runtime.routingCoordinator.registerConnection(connectionID: fixture.connectionID, operationID: UUID())
+                case "catalog": try await fixture.route.unregisterCatalog(XCTUnwrap(fixture.route.catalogHandle))
+                case "close": fixture.route.closeDomainAdmission()
+                case "presentation":
+                    _ = await runtime.routingCoordinator.openWindow(windowID: 100_000, activeWorkspaceID: UUID(), activeContextID: UUID(), presentationRevision: 1, operationID: UUID())
+                case "cancel": pending.cancel()
+                default: XCTFail("Unknown case")
+                }
+                await gate.release()
+                do {
+                    let value = try await pending.value
+                    if change == "presentation" {
+                        XCTAssertTrue(value.objectValue?["tree"]?.stringValue?.contains("Selected.swift") == true)
+                    } else {
+                        XCTAssertNotNil(value.objectValue?["error_code"], "Must not return stale bytes after \(change): \(value)")
+                        XCTAssertFalse(value.objectValue?["tree"]?.stringValue?.contains("Selected.swift") == true)
+                    }
+                } catch is CancellationError { XCTAssertEqual(change, "cancel")
+                } catch is MCPToolExecutionCancelledError { XCTAssertEqual(change, "cancel")
+                } catch ServerNetworkManager.ToolDispatchAdmissionError.windowTerminal {
+                    XCTAssertTrue(["catalog", "close", "binding"].contains(change))
+                } catch is DomainReadContextResolutionError { XCTAssertEqual(change, "connection") }
+                XCTAssertEqual(fixture.route.toolExecutionRuntime.activeExecutionCount, 0)
+            }
+        }
+    }
+
+    @MainActor
+    func testRegisteredFileTreeDrainsCanonicalHighWaterOnlyForSelectedMode() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
+            let fixture = try await registeredTreeAfterServerRelease(runtime: runtime)
+            let metadata = MCPRequestMetadata(connectionID: fixture.connectionID, clientName: nil, windowID: fixture.route.identity.routeID)
+            let connection = try fixture.route.fileReadConnection(metadata: metadata, workspaceID: fixture.workspace.id)
+            let handle = try await fixture.route.fileReadHandle(for: connection)
+            var changed = fixture.workspace
+            changed.composeTabs[0].selection = StoredSelection(selectedPaths: [fixture.root.fullPath + "/BaseOnly.swift"])
+            let document = try DomainWorkspaceDocument.decode(documentBytes: JSONEncoder().encode(changed), fileURL: fixture.documentURL)
+            let gate = RouteInvocationGate()
+            addTeardownBlock { await gate.release() }
+            _ = try await runtime.readSideEffectCoordinator.submit(handle: handle, effectClass: .selection, operationID: UUID(), fingerprint: "tree-selection") {
+                await gate.enter()
+                _ = await runtime.workspaceStore.registerReadDocument(document)
+            }
+            try await AsyncTestWait.waitUntil("selection effect entered") { await gate.didEnter() }
+            var completed = false
+            let full = Task { @MainActor in
+                let value = try await self.invokeTree(fixture, args: ["mode": .string("full")])
+                completed = true
+                return value
+            }
+            addTeardownBlock { full.cancel()
+                await gate.release()
+                _ = await full.result
+            }
+            try await AsyncTestWait.waitUntil("non-selected tree must not drain selection") { await MainActor.run { completed } }
+            _ = try await full.value
+            let selected = Task { try await self.invokeTree(fixture, args: ["mode": .string("selected")]) }
+            addTeardownBlock { selected.cancel()
+                await gate.release()
+                _ = await selected.result
+            }
+            await gate.release()
+            let value = try await selected.value
+            let tree = try XCTUnwrap(value.objectValue?["tree"]?.stringValue)
+            XCTAssertNil(value.objectValue?["error_code"], tree)
+            XCTAssertTrue(tree.contains("BaseOnly.swift"), tree)
+            XCTAssertFalse(tree.contains("Selected.swift"), "Selection is captured after the real side-effect ACK and domain revision refresh")
+        }
+    }
+
+    @MainActor
+    func testRegisteredFileTreeRefusesExtraStoreRootAndSameIDSuccessor() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
+            let fixture = try await registeredTreeAfterServerRelease(runtime: runtime)
+            let extra = runtime.configuration.temporaryDirectory.appendingPathComponent("foreign")
+            try FileManager.default.createDirectory(at: extra, withIntermediateDirectories: true)
+            try "foreign".write(to: extra.appendingPathComponent("MustNotEscape.swift"), atomically: true, encoding: .utf8)
+            let root = try await fixture.files.loadRoot(path: extra.path)
+            addTeardownBlock { await fixture.files.unloadRoot(id: root.id) }
+            let denied = try await invokeTree(fixture, args: ["mode": .string("full")])
+            XCTAssertEqual(denied.objectValue?["error_code"], .string("workspace_authority_mismatch"))
+            XCTAssertFalse(denied.objectValue?["tree"]?.stringValue?.contains("MustNotEscape.swift") == true)
+            try await fixture.route.unregisterCatalog(XCTUnwrap(fixture.route.catalogHandle))
+            let successor = try await registeredTreeAfterServerRelease(runtime: runtime, identity: fixture.route.identity)
+            do {
+                _ = try await invokeTree(fixture, args: [:])
+                XCTFail("Original binding cannot borrow a same-ID successor")
+            } catch ServerNetworkManager.ToolDispatchAdmissionError.windowTerminal {}
+            await fixture.route.close()
+            let value = try await invokeTree(successor, args: ["mode": .string("full")])
+            XCTAssertNil(value.objectValue?["error_code"])
+        }
+    }
+
+    @MainActor
+    func testRegisteredFileTreeNetworkBindingRequiresOriginalCatalogOwnerProof() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
+            let recorder = RouteInvocationGate()
+            let fixture = try await registeredTreeAfterServerRelease(runtime: runtime, validation: { _, _, _ in await recorder.recordValidation() })
+            let route = fixture.route
+            let handle = try XCTUnwrap(route.catalogHandle)
+            let captured = await ServerNetworkManager.shared.captureWindowToolDispatchIdentity(windowID: route.identity.routeID, catalogRegistrationHandle: handle)
+            let original = try XCTUnwrap(captured)
+            let foreignOwner = NSObject()
+            for change in ["catalog", "owner", "missing", "none"] {
+                let dispatch = MCPWindowToolDispatchIdentity(windowID: original.windowID, windowStateIdentity: original.windowStateIdentity, serverViewModelIdentity: change == "owner" ? ObjectIdentifier(foreignOwner) : original.serverViewModelIdentity, catalogRegistrationHandle: change == "catalog" ? .init(registryID: handle.registryID, registrationID: .init(), generation: handle.generation) : handle)
+                let invocationID = UUID()
+                let invocation = ToolInvocationContext(origin: .network, invocationID: invocationID, requestID: nil, toolName: "get_file_tree", metadata: .init(connectionID: fixture.connectionID, clientName: nil, windowID: route.identity.routeID, invocationID: invocationID), dispatchAuthorization: change == "missing" ? nil : .init(connectionID: fixture.connectionID, connectionIdentity: ObjectIdentifier(foreignOwner), lifecycleGeneration: 1, windowIdentity: dispatch))
+                let before = await recorder.validationCalls
+                do {
+                    let value = try await MCPInvocationContextBridge.withInvocation(invocation) { try await fixture.tree.binding(["mode": .string("full")]) }
+                    XCTAssertEqual(change, "none")
+                    XCTAssertNil(value.objectValue?["error_code"])
+                } catch MCPInvocationContextFailure.missingAuthorization { XCTAssertEqual(change, "missing")
+                } catch ServerNetworkManager.ToolDispatchAdmissionError.windowTerminal { XCTAssertTrue(["catalog", "owner"].contains(change)) }
+                let after = await recorder.validationCalls
+                if change == "none" { XCTAssertGreaterThan(after, before) }
+                else { XCTAssertEqual(after, before) }
+            }
+        }
+    }
+
+    @MainActor
+    private func registeredHistoryAfterServerRelease(
+        runtime: MCPDomainRuntime, scanner: RouteHistoryScanner,
+        identity: MCPHostRouteIdentity? = nil, validation: MCPToolInvocationValidator? = nil
+    ) async throws -> (MCPHostRouteResources, MCPDomainResolvedTool, MCPDomainResolvedTool) {
+        let route = MCPHostRouteResources(
+            identity: identity ?? MCPRouteIdentityAllocator.allocateHost(), coordinator: runtime.routingCoordinator, runtime: runtime
+        )
+        addTeardownBlock { await route.close() }
+        let service = makeService()
+        var server: MCPServerViewModel? = makeServerViewModel(service: service, validation: validation)
+        let serverIsReleased = { @MainActor [weak server] in server == nil }
+        server?.historyScannerFactoryForTesting = { scanner }
+        let catalog = try XCTUnwrap(server).makeToolCatalog(route: route)
+        _ = await route.ensureRegistered(workspaceID: nil, contextID: nil, revision: 0)
+        let handle = try await route.registerCatalog(catalog)
+        let captured = await runtime.toolRegistry.resolve(toolName: "history", scope: .window(id: route.identity.routeID))
+        let history = try XCTUnwrap(captured)
+        XCTAssertEqual(history.handle, handle)
+        let other = await runtime.toolRegistry.resolve(toolName: "read_file", scope: .window(id: route.identity.routeID))
+        server?.stopServiceObservation()
+        server = nil
+        await waitUntil { serverIsReleased() }
+        XCTAssertTrue(serverIsReleased(), "The registered invocation binding must not retain its server VM")
+        return try (route, history, XCTUnwrap(other))
+    }
+
+    @MainActor
+    private func invokeRegistered(_ tool: MCPDomainResolvedTool, routeID: Int, connectionID: UUID? = nil) async throws -> Value {
+        let invocation = ToolInvocationContext.trustedLocal(
+            toolName: tool.binding.definition.name,
+            metadata: .init(connectionID: connectionID, clientName: nil, windowID: routeID)
+        )
+        return try await MCPInvocationContextBridge.withInvocation(invocation) {
+            try await tool.binding(["op": .string("list_sessions")])
+        }
+    }
+
+    @MainActor
+    func testRegisteredHistoryBindingOutlivesServerButNotOriginalRoute() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
+            let scanner = RouteHistoryScanner()
+            let (route, history, readFile) = try await registeredHistoryAfterServerRelease(runtime: runtime, scanner: scanner)
+            let workspace = WorkspaceModel(name: "Route-only history authority", repoPaths: [])
+            let authority = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: route.identity.routeID)
+            _ = try await authority.create(
+                workspace, fileURL: runtime.configuration.workspaceStorageDirectory.appendingPathComponent("route-only.json")
+            )
+            guard case let .matched(location) = await route.historyWorkspaceLocations.resolve(.id(workspace.id)) else {
+                return XCTFail("History must read the route runtime's store, not the absent server authority")
+            }
+            XCTAssertEqual(location.runtimeID, runtime.identity.runtimeID)
+            XCTAssertEqual(location.workspaceID, workspace.id)
+            let value = try await invokeRegistered(history, routeID: route.identity.routeID)
+            XCTAssertEqual(value.objectValue?["total_sessions"], .int(0))
+            let scans = await scanner.scans
+            XCTAssertEqual(scans, 1, "The actual registered catalog binding must reach the existing history backend")
+            XCTAssertEqual(route.toolExecutionRuntime.activeExecutionCount, 0)
+            do {
+                _ = try await invokeRegistered(readFile, routeID: route.identity.routeID)
+                XCTFail("Unmigrated file capabilities must still require their real physical owner")
+            } catch let error as MCPError {
+                XCTAssertEqual(error, .internalError("Window deallocated while executing read_file"))
+            }
+            route.closeDomainAdmission()
+            do {
+                _ = try await invokeRegistered(history, routeID: route.identity.routeID)
+                XCTFail("Closing the original route must refuse even with a retained binding")
+            } catch ServerNetworkManager.ToolDispatchAdmissionError.windowTerminal {}
+            let finalScans = await scanner.scans
+            XCTAssertEqual(finalScans, 1)
+        }
+    }
+
+    @MainActor
+    func testRegisteredHistoryNetworkInvocationRequiresExactOriginalDispatchProof() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
+            let recorder = RouteInvocationGate()
+            let scanner = RouteHistoryScanner()
+            let (route, history, _) = try await registeredHistoryAfterServerRelease(
+                runtime: runtime, scanner: scanner, validation: { _, _, _ in await recorder.recordValidation() }
+            )
+            let handle = try XCTUnwrap(route.catalogHandle)
+            let captured = await ServerNetworkManager.shared.captureWindowToolDispatchIdentity(
+                windowID: route.identity.routeID, catalogRegistrationHandle: handle
+            )
+            let original = try XCTUnwrap(captured)
+            let foreignOwner = NSObject()
+            let connectionID = UUID()
+            for change in ["catalog", "owner", "missing", "none"] {
+                let dispatch = MCPWindowToolDispatchIdentity(
+                    windowID: original.windowID, windowStateIdentity: original.windowStateIdentity,
+                    serverViewModelIdentity: change == "owner" ? ObjectIdentifier(foreignOwner) : original.serverViewModelIdentity,
+                    catalogRegistrationHandle: change == "catalog" ? .init(
+                        registryID: handle.registryID, registrationID: .init(), generation: handle.generation
+                    ) : handle
+                )
+                let invocationID = UUID()
+                let context = ToolInvocationContext(
+                    origin: .network, invocationID: invocationID, requestID: nil, toolName: "history",
+                    metadata: .init(connectionID: connectionID, clientName: nil, windowID: route.identity.routeID, invocationID: invocationID),
+                    dispatchAuthorization: change == "missing" ? nil : .init(
+                        connectionID: connectionID, connectionIdentity: ObjectIdentifier(foreignOwner), lifecycleGeneration: 1,
+                        windowIdentity: dispatch
+                    )
+                )
+                let before = await recorder.validationCalls
+                do {
+                    _ = try await MCPInvocationContextBridge.withInvocation(context) {
+                        try await history.binding(["op": .string("list_sessions")])
+                    }
+                    XCTAssertEqual(change, "none")
+                } catch MCPInvocationContextFailure.missingAuthorization {
+                    XCTAssertEqual(change, "missing")
+                } catch ServerNetworkManager.ToolDispatchAdmissionError.windowTerminal {
+                    XCTAssertTrue(change == "catalog" || change == "owner")
+                }
+                let after = await recorder.validationCalls
+                if change == "none" { XCTAssertGreaterThan(after, before) }
+                else { XCTAssertEqual(after, before, "Wrong original proof must refuse before the injected validator") }
+            }
+            let scans = await scanner.scans
+            XCTAssertEqual(scans, 1)
+        }
+    }
+
+    @MainActor
+    func testIndependentRouteCatalogIsReadyWithoutPresentationUntilClosed() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
+            try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+            let (route, _, _) = try await registeredHistoryAfterServerRelease(runtime: runtime, scanner: RouteHistoryScanner())
+            let ready = await MCPToolCatalogReadiness.shared.awaitReady(windowID: route.identity.routeID)
+            XCTAssertTrue(ready)
+            await route.close()
+            let closedIsReady = await MCPToolCatalogReadiness.shared.awaitReady(windowID: route.identity.routeID, timeout: 0.25)
+            XCTAssertFalse(closedIsReady)
+        }
+    }
+
+    @MainActor
+    func testEnteredRouteMappingRetainsOnlyOriginalCleanupOwnerUntilConsumed() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
+            let route = MCPHostRouteResources(
+                identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: runtime.routingCoordinator, runtime: runtime
+            )
+            addTeardownBlock { await route.close() }
+            var server: MCPServerViewModel? = makeServerViewModel(service: makeService())
+            let serverIsReleased = { @MainActor [weak server] in server == nil }
+            let catalog = try XCTUnwrap(server).makeToolCatalog(route: route)
+            _ = await route.ensureRegistered(workspaceID: nil, contextID: nil, revision: 0)
+            _ = try await route.registerCatalog(catalog)
+            let network = ServerNetworkManager.shared
+            let receiptValue = await network.installClientConnectionPolicy(
+                for: "binding-cleanup-\(UUID())", windowID: route.identity.routeID,
+                restrictedTools: [], runID: UUID(), purpose: .agentModeRun, routingOwner: route
+            )
+            let receipt = try XCTUnwrap(receiptValue)
+            let installed = await route.installPendingPolicy(receipt, connectionID: UUID(), clientName: nil, tabID: nil)
+            XCTAssertNotNil(installed)
+            server?.stopServiceObservation()
+            server = nil
+            XCTAssertFalse(serverIsReleased(), "An entered mapping retains its exact physical cleanup adapter")
+            await route.close()
+            XCTAssertFalse(serverIsReleased(), "Closing admission is not acknowledgement of mapping cleanup")
+            await network.cleanupRunRoutingState(ownedBy: receipt)
+            await waitUntil { serverIsReleased() }
+            XCTAssertTrue(serverIsReleased())
+        }
+    }
+
+    @MainActor
+    func testRegisteredHistoryRechecksCatalogRevocationAcrossInvocationAwait() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
+            let scanner = RouteHistoryScanner()
+            let gate = RouteInvocationGate()
+            let (route, history, _) = try await registeredHistoryAfterServerRelease(
+                runtime: runtime, scanner: scanner, validation: { _, _, _ in
+                    await gate.enter()
+                    return true
+                }
+            )
+            let pending = Task { try await self.invokeRegistered(history, routeID: route.identity.routeID) }
+            await gate.waitUntilEntered()
+            let original = try XCTUnwrap(route.catalogHandle)
+            await route.unregisterCatalog(original)
+            await gate.release()
+            do {
+                _ = try await pending.value
+                XCTFail("Catalog revocation during admission must prevent provider entry")
+            } catch ServerNetworkManager.ToolDispatchAdmissionError.windowTerminal {}
+            let scans = await scanner.scans
+            XCTAssertEqual(scans, 0)
+            XCTAssertEqual(route.toolExecutionRuntime.activeExecutionCount, 0)
+        }
+    }
+
+    @MainActor
+    func testRegisteredHistoryNeverFollowsSameIDReplacementOrLateCleanup() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
+            let originalScanner = RouteHistoryScanner()
+            let (original, history, _) = try await registeredHistoryAfterServerRelease(runtime: runtime, scanner: originalScanner)
+            let handle = try XCTUnwrap(original.catalogHandle)
+            let originalDescriptor = try XCTUnwrap(original.descriptor)
+            await original.unregisterCatalog(handle)
+            let successorScanner = RouteHistoryScanner()
+            let (successor, replacement, _) = try await registeredHistoryAfterServerRelease(
+                runtime: runtime, scanner: successorScanner, identity: original.identity
+            )
+            let successorDescriptor = try XCTUnwrap(successor.descriptor)
+            XCTAssertNotEqual(originalDescriptor.generation, successorDescriptor.generation)
+            do {
+                _ = try await invokeRegistered(history, routeID: original.identity.routeID)
+                XCTFail("The old binding must not borrow the successor's catalog or route proof")
+            } catch ServerNetworkManager.ToolDispatchAdmissionError.windowTerminal {}
+            await original.close()
+            let routing = await runtime.routingCoordinator.snapshot()
+            XCTAssertTrue(routing.windows.contains {
+                $0.windowID == successorDescriptor.windowID && $0.generation == successorDescriptor.generation && !$0.isClosing
+            }, "Late close must leave the successor domain descriptor registered")
+            let value = try await invokeRegistered(replacement, routeID: successor.identity.routeID)
+            XCTAssertEqual(value.objectValue?["total_sessions"], .int(0))
+            let oldScans = await originalScanner.scans
+            let newScans = await successorScanner.scans
+            XCTAssertEqual(oldScans, 0)
+            XCTAssertEqual(newScans, 1, "Original cleanup must leave the replacement route usable")
+        }
+    }
+
+    @MainActor
+    func testRegisteredHistoryPreservesProviderErrorCancellationAndEnteredWork() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
+            let scanner = RouteHistoryScanner()
+            let (route, history, _) = try await registeredHistoryAfterServerRelease(runtime: runtime, scanner: scanner)
+            await scanner.setFailure(true)
+            do {
+                _ = try await invokeRegistered(history, routeID: route.identity.routeID)
+                XCTFail("The original provider error must not become a route failure or retry")
+            } catch RouteHistoryScanner.Failure.scan {}
+            let gate = RouteInvocationGate()
+            await scanner.block(on: gate)
+            let connectionID = UUID(), runID = UUID()
+            let installed = await ServerNetworkManager.shared.installClientConnectionPolicy(
+                for: "history-index-\(UUID())", windowID: route.identity.routeID,
+                restrictedTools: [], runID: runID, purpose: .agentModeRun, routingOwner: route
+            )
+            let cleanup = try XCTUnwrap(installed)
+            XCTAssertEqual(route.runRouteBindings.register(
+                connectionID: connectionID, runID: runID, windowID: route.identity.routeID, cleanupReceipt: cleanup
+            ), .registered(displacedConnectionID: nil))
+            let pending = Task { try await self.invokeRegistered(history, routeID: route.identity.routeID, connectionID: connectionID) }
+            await gate.waitUntilEntered()
+            XCTAssertTrue(route.toolExecutionRuntime.hasActiveToolExecutions(runID: runID))
+            pending.cancel()
+            await gate.release()
+            do {
+                _ = try await pending.value
+                XCTFail("Cancellation must remain cancellation after provider entry")
+            } catch is MCPToolExecutionCancelledError {}
+            let scans = await scanner.scans
+            XCTAssertEqual(scans, 2, "Entered provider work is retained; no retry or effect rollback is fabricated")
+            XCTAssertEqual(route.toolExecutionRuntime.activeExecutionCount, 0)
+            await ServerNetworkManager.shared.cleanupRunRoutingState(ownedBy: cleanup)
+        }
     }
 
     /// Composition must leave old events untouched: pruning belongs to window

@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 
 struct AgentRunInteractionUISnapshot: Equatable {
@@ -76,7 +78,7 @@ struct AgentRunInteractionUISnapshot: Equatable {
             expectedRunID: activeRunID,
             expectedActiveAgentSessionID: activeAgentSessionID,
             expectedRunAttemptID: activeRunAttemptID,
-            expectedPendingUserInputRequestID: pendingUserInputRequest.requestID
+            expectedPendingUserInputReceipt: pendingUserInputRequest.receipt
         )
     }
 

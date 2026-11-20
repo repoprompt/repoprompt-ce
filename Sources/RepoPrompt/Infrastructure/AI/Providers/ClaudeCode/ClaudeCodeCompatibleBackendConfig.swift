@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptClaudeProvider
 import RepoPromptSecureStorage
 
 enum ClaudeCodeCompatibleBackendID: String, CaseIterable, Codable, Hashable {

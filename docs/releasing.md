@@ -43,11 +43,11 @@ the closed app's version history.
 
 ## Bundled Codex artifact
 
-Debug and release packaging include the complete official OpenAI Codex 0.164.0
+Debug and release packaging include the complete official OpenAI Codex 0.170.0
 standalone package. The authority is the repository-owned
 [`Vendor/Codex/manifest.json`](../Vendor/Codex/manifest.json), which pins the
-official [`rust-v0.164.0` release](https://github.com/openai/codex/releases/tag/rust-v0.164.0),
-the official [`codex-package_SHA256SUMS`](https://github.com/openai/codex/releases/download/rust-v0.164.0/codex-package_SHA256SUMS),
+official [`rust-v0.170.0` release](https://github.com/openai/codex/releases/tag/rust-v0.170.0),
+the official [`codex-package_SHA256SUMS`](https://github.com/openai/codex/releases/download/rust-v0.170.0/codex-package_SHA256SUMS),
 both macOS package assets, their complete extracted layouts, file hashes,
 architectures, and primary executable signing identities. The upstream release
 publishes SHA-256 sums but does not document a public GPG, minisign, or SLSA
@@ -79,12 +79,11 @@ contains only its selected target directory, while explicit
 contain both `aarch64-apple-darwin/` and `x86_64-apple-darwin/`. Runtime selection
 fails closed unless the package matching the running app architecture is present.
 Each target subtree preserves `codex-package.json`, `bin/codex`,
-`bin/codex-code-mode-host`, `codex-resources/`, `codex-path/`, and all additional
-package resources; the binaries inside remain thin and must match the directory's
-target architecture. Codex 0.156.0 adds `codex-resources/voice/`, including a
-voice host, native libraries/plugins, source provenance, and their licences. All
-30 macOS Mach-Os are Developer ID signed by `OpenAI OpCo, LLC` (team
-`2DC432GLL2`) with hardened runtime and timestamps in the official packages.
+`bin/codex-code-mode-host`, `bin/codex-exec-server`, `codex-resources/`,
+`codex-path/`, and all additional package resources. Every binary is thin and matches its target architecture. Codex 0.156.0 adds `codex-resources/voice/`, including a
+voice host, native libraries/plugins, source provenance, and their licences.
+Each architecture has 30 Mach-Os. The three executables under `bin/` are Developer ID signed by
+`OpenAI OpCo, LLC` (team `2DC432GLL2`) with hardened runtime and timestamps.
 
 Host-native debug packaging preserves those upstream signatures and exact bytes.
 Privileged release signing deliberately re-signs every manifest-owned Mach-O with
@@ -113,8 +112,8 @@ External version validation uses the captured launch environment, including its 
 search path.
 RepoPrompt rejects custom executables older than 0.149.0, the last proven external
 compatibility floor. This is intentionally distinct from the exact bundled and schema-gate
-pin at 0.164.0: the bounded app-server projection passes unchanged at 47 methods,
-217 parameter paths, and 125 response paths, and this bundle rotation adds no new
+pin at 0.170.0: the bounded app-server projection passes unchanged at 48 methods,
+230 parameter paths, and 143 response paths, and this bundle rotation adds no new
 outgoing request requirement. Bundled and external runtimes both use
 RepoPrompt-owned `CODEX_HOME` and `CODEX_SQLITE_HOME` directories under
 `~/Library/Application Support/RepoPrompt CE/Codex/{Debug,Release}/`, leaving
@@ -132,11 +131,10 @@ instead of guessing when the code-mode policy is ambiguous, uses dotted or inlin
 definitions that would redefine the owned table/keys, or uses
 `non_prefixed_mcp_tool_names`.
 
-The 0.164.0 standalone packages no longer contain bundled Zsh. The reviewed
-rotation removes its three layout entries, Mach-O/signing inventory entry, and
-obsolete licence. Both architectures retain the native voice runtime and its
-complete legal inventory. Future unreviewed layout drift still fails the guarded
-candidate tool.
+The 0.170.0 packages add `bin/codex-exec-server`. Both architectures pin the
+helper's OpenAI signature and assign it the empty release entitlement profile.
+The voice runtime's source inventory is refreshed for PCRE2 10.48. Future
+unreviewed layout drift still fails the guarded candidate tool.
 
 To diagnose acquisition independently of a build, run:
 
@@ -144,7 +142,7 @@ To diagnose acquisition independently of a build, run:
 python3 Scripts/codex_runtime_artifact.py acquire --arch all
 python3 Scripts/codex_runtime_artifact.py verify \
   --arch aarch64-apple-darwin \
-  --package .build/codex-runtime/0.164.0/aarch64-apple-darwin
+  --package .build/codex-runtime/0.170.0/aarch64-apple-darwin
 python3 Scripts/codex_runtime_artifact.py stage-bundle \
   --arch all \
   --cache-root .build/codex-runtime \
@@ -233,13 +231,10 @@ inventory/architecture, normalized-payload, and OpenAI signing-identity drift.
 The official output directory contains a proposed `candidate-manifest.json`,
 `candidate-provenance.json`, sanitized `release-metadata.json`, the upstream
 checksum file, self-checksums, and a deterministic `candidate-report.md`. The live
-0.164.0 pin remains authoritative
+0.170.0 pin remains authoritative
 until a maintainer reviews and deliberately applies a complete rotation change.
 
-The known-good rollback for the 0.164.0 rotation is Codex 0.159.0
-(`rust-v0.159.0`; arm64 package archive SHA-256
-`7748d07d7921a67b91d015e9d0f43177c675977e67f955b2f8fb96dc880dd5d7`, x86_64
-package archive SHA-256 `ab64d30288454124c7c15abd81672a9dfda7e3e723d76c4cfa6c0aba4b439017`).
+The previous bundle pin for the 0.170.0 rotation is Codex 0.164.0.
 After a reviewed rotation, roll back by reverting the complete rotation change and
 rebuilding from the restored manifest rather than mixing old and new authority files.
 
@@ -292,6 +287,84 @@ channel remains **Stable**. Returning from Tip Builds to Stable may not downgrad
 immediately; users may need to wait for a newer stable build or reinstall the
 stable app manually.
 
+### No-new-Eric activation runbook
+
+The capability PR does **not** activate publication. Both rollout declarations stay unchanged.
+End-to-end credential migration is **UNVERIFIED**. Artifact/contract/smoke checks are not evidence
+that the Keychain bridge succeeds. The following later activation PRs and protected workflow
+approvals put the transition into motion; merging capability code alone does not.
+
+1. **Stable adopts the existing P, with no new app release.** After capability code is on protected
+   main, review a separate `release-rollout.json` schema-2 activation:
+   ```json
+   {
+     "schemaVersion": 2,
+     "channel": "stable",
+     "currentRole": "preparer",
+     "eligibilityProfile": "stable-shared-tip-preparer-v1",
+     "expectedMigrationPhase": "legacy-preparer",
+     "expectedSigningIdentity": "legacy",
+     "predecessors": [],
+     "runtimeMigrationProof": "unverified-accepted-risk",
+     "adoptedArtifact": {
+       "type": "tip-preparer-adoption-v1",
+       "tag": "tip-1e1d9fe4bbc6",
+       "buildNumber": "43.24.43",
+       "rolloutManifestSha256": "03153738c5b09ecffa6a56841e5fc2f9113ebd54a4ed8306e48d6df171770de4"
+     }
+   }
+   ```
+   Reverify this historical pin against live artifacts before merging. Keep `version.env` and
+   `tip-rollout.json` unchanged. Dispatch **Adopt Archived Tip Preparer into Stable** from `main`
+   (no inputs). Approve its protected `release` job only after secret-free verification, helper
+   smokes, real Stable-43 updater discovery, and compatibility pass. It publishes a new immutable
+   `stable-adopt-tip-1e1d9fe4bbc6-stable-delivery-v1` release in the Stable updates repository,
+   mirroring P's **exact ZIP bytes** and artifact manifest. The enclosure must use the Stable
+   repository: the shipped client's channel rule classifies Tip-repository URLs as Tip, even in
+   a Stable feed. The original Tip tag, manifest pin, source commit, hash, size and signature remain
+   authoritative. Do not rebuild, resign, renotarize, change versions, or overwrite `v1.9.0` or the
+   historical metadata-only adoption release. No Eric credentials are required.
+   The only same-build repair admitted is historical adoption → this exact deterministic mirror,
+   with every non-transport field identical. Reverse repairs and other same-build changes fail.
+   Verification replays the pinned shipped channel classifier and runs the published Stable 43
+   bundle's actual embedded `SPUUpdater.checkForUpdates` against the candidate feed. After
+   publication, it checks the public mirrored ZIP's API hash/size and runs the updater against the
+   **normal public Stable URL**. Evidence is retained as workflow artifacts; failures after
+   publication mean PUBLIC-but-unverified, not permission to overwrite or advance the ladder.
+   The headless driver uses isolated preferences and dismisses without downloading/installing;
+   this is discovery evidence, not a visible-app UI, installation, or credential migration proof.
+   Verify Stable's public appcast and rollout manifest; observe the initial cohort. Launching and
+   successfully committing preparation, not merely downloading P, is the client prerequisite.
+2. **Tip T.** In a separate reviewed change, set Tip to transition/successor identity/disabled
+   phase, pin the published P manifest, and remove its old reset authority as required by schema 1.
+   Merging the declaration can trigger automatic publication after qualifying CI. A new Samuel
+   Application-signed app and Samuel Installer-signed/notarized PKG must have a build above P.
+3. **Stable T.** Only after Tip T is public, change Stable to schema 2, `transition`, `successor`
+   signing identity, phase `disabled`, and retain `runtimeMigrationProof: "unverified-accepted-risk"`.
+   Remove `adoptedArtifact`. Set `predecessors` to P's `{role, tag, rolloutManifestSha256,
+   sourceChannel: "tip"}`. Change `version.env` bundle/team to Samuel and use a new integer build
+   greater than `43.24.43` (e.g. 44, subject to current version reservation). Use the normal
+   **Publish Release → review signed draft SHA256SUMS → Promote Release** process. The artifact
+   is a PKG, not a ZIP/DMG pair. Configure Samuel's Application, Installer, profile and notary
+   `SUCCESSOR_*` secrets in the protected `release` environment first. No fallback to Eric is used.
+4. **Tip S, then Stable S.** Each activation pins T and P in newest-first order. Stable predecessors
+   carry `sourceChannel: "stable"` for T and `sourceChannel: "tip"` for the shared P. Publish normal
+   Samuel ZIP/DMG artifacts. Native Stable builds remain integers; Tip derives its epoch from the
+   first component of Stable's maximum build and must stay newer than it. Do not skip T.
+
+Every stage retains the exact P/T provenance and assets. All feed mutations share a publication
+lane, recheck live state, and fail closed if Tip does not lead Stable or their shared bridge differs.
+Never prune or edit the adopted Tip release, the original metadata-only Stable adoption, or the
+Stable `*-stable-delivery-v1` mirror: future Stable ladders retain that mirror URL. Interrupted
+**draft** uploads resume only missing assets after every existing asset matches byte-for-byte;
+public assets are never supplemented or overwritten. Conflicting bytes require operator review,
+not deletion or `--clobber`. Retain recovery assets and Eric's material for the rollback
+window. Samuel's current notarization access still needs a real accepted submission; historical
+notarization success is not that proof. If P itself needs a runtime correction, stop and reassess:
+release-tooling changes cannot retrofit the archived binary.
+
+### Separate channel feeds
+
 The app uses separate Sparkle feeds:
 
 ```text
@@ -314,7 +387,15 @@ phase, predecessor manifest digests, and any schema-2 reset authority. Every rol
 feed URL and `appcast.xml` asset, with retained top-level entries in that appcast; there are no
 transition/successor sibling feeds and no Sparkle-key change. Tip workflows must never write to
 `repoprompt-ce-updates` or use `v*` tags, and must not feed into `Promote Release`. Stable promotion
-remains the only path that updates the stable appcast.
+and the explicit archived-preparer adoption workflow are the only paths that update the Stable appcast.
+
+Tip source staging runs `Scripts/release.sh preflight-tip` before dependency resolution and again
+following packaging. It validates the approved source's `tip-rollout.json` and identity policy, then
+runs the same source/legal/vendor/installer-launcher/CLI checks as Stable. It must not consult
+Stable's adoption/build admission: Stable can adopt archived P while Tip prepares a later stage.
+Normal `preflight` and all Stable build/publish operations still enforce `release-rollout.json`;
+`preflight-tip` is read-only and does not authorize a Stable build or any publication. Passing it
+does not establish signing/notarization success or activate Tip T.
 
 `Publish Tip` runs automatically after successful main-push CI in the source repository. When an
 automatic run leaves the rolling queue, it considers the authenticated successful triggering
@@ -354,8 +435,9 @@ merging T; advance it again with T and P digests before merging S. Each publishe
 immutable `tip-<shortsha>` tag and the tip-only repository's latest release. Do not mark it as a
 prerelease, because GitHub excludes prereleases from `releases/latest`.
 
-Current checkpoint: Stable 1.4.0 is the official Stable epoch at build `36`. The authenticated live Tip
-is transition tag `tip-57b572038048`, build `35.15.39`, with rollout-manifest SHA-256
+Historical replacement-preparer checkpoint (superseded by the no-new-Eric runbook above):
+Stable 1.4.0 was the official Stable epoch at build `36`. The authenticated Tip at that checkpoint
+was transition tag `tip-57b572038048`, build `35.15.39`, with rollout-manifest SHA-256
 `c8d28103b5e95370fc0de7df19c34797552e99803228794754bfbfe292e3e421`; it retains preparer
 `tip-2f94412e6ab5` at build `35.15.18`, whose rollout-manifest SHA-256 is
 `3c69703fa7582105633b36e8874fe2a28e1832aabb776351e68dbf3367e122db`. That retained P is below
@@ -1061,6 +1143,27 @@ The helper reads the CE Sparkle private key from the local Sparkle Keychain
 account `repoprompt-ce`. It refuses to overwrite an existing public test tag
 and publishes that tag with `--latest=false`, so a private-source smoke run
 cannot replace the stable feed selected by `latest/download/appcast.xml`.
+
+## Verify a Stable update through Sparkle
+
+Packaged MCP smoke verifies the candidate's startup and helper. A Sparkle
+installation starts in the updater bundled with the previous app, so it requires
+a separate run. For an ordinary Stable update that keeps the signing identity,
+install the preceding public release in a disposable macOS VM. After promotion,
+use **Check for Updates…** in that app, install the offered update, and confirm
+that the relaunched app reports the promoted version and build and still opens
+the test workspace. Record both builds and the result. Before promotion, a
+tag-specific updater-smoke feed requires a predecessor configured for that feed.
+Signature, layout, and MCP smoke reports alone leave Sparkle installation
+unverified. Follow the [identity migration ladder](architecture/apple-identity-migration.md)
+for a signing-identity transition.
+
+The source and staging preflights reject the sandbox-only Sparkle installer
+launcher setting for an unsandboxed CE build. Promotion also checks the Sparkle
+symlinks and executable bits in the extracted ZIP and mounted DMG against the
+trusted framework. The updater installed with v1.0.0 retains its original
+launcher setting even when the feed offers a corrected version. For that
+specific failure, share the [v1.0.2 manual-install steps](../README.md#recover-an-early-sparkle-update-failure).
 
 ## Promote and verify
 

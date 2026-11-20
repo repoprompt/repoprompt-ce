@@ -247,11 +247,6 @@ jobs:
           curl --fail --location --silent --show-error \
             --connect-timeout 10 --max-time 30 \
             "$stable_feed_url" --output "$stable_appcast"
-          stable_build_number="$(python3 Scripts/stable_rollout.py max-build --appcast "$stable_appcast")"
-          [[ "$stable_build_number" =~ ^[0-9]{1,4}$ ]] || {
-            echo "Stable appcast maximum build must be one numeric component of at most four digits" >&2
-            exit 1
-          }
           if [[ "$ROLLOUT_ROLE" == "transition" || "$ROLLOUT_ROLE" == "successor" ]]; then
             live_tip_manifest="$RUNNER_TEMP/live-tip-identity-rollout.json"
             live_tip_appcast="$RUNNER_TEMP/live-tip-appcast.xml"
@@ -263,13 +258,17 @@ jobs:
               --connect-timeout 10 --max-time 30 \
               "https://github.com/$ROLLOUT_UPDATE_REPOSITORY/releases/latest/download/appcast.xml" \
               --output "$live_tip_appcast"
+            source Scripts/release_observation.sh
+            stable_repository="$(python3 -c 'import json; print(json.load(open("Scripts/apple_identity_policy.json"))["sparkle"]["updateRepository"])')"
+            OBSERVATION_GH_TOKEN="$GH_TOKEN" fetch_observed_rollout_pair "$stable_repository" latest stable "$RUNNER_TEMP/stable-observed"
             python3 Scripts/stable_rollout.py validate-stable-tip-floor \
+              --stable-manifest "$RUNNER_TEMP/stable-observed/manifest.json" \
               --policy Scripts/apple_identity_policy.json \
-              --stable-appcast "$stable_appcast" \
+              --stable-appcast "$RUNNER_TEMP/stable-observed/appcast.xml" \
               --tip-manifest "$live_tip_manifest" \
               --tip-appcast "$live_tip_appcast"
           fi
-          build_number="$stable_build_number.$((build_sequence / 100)).$((build_sequence % 100))"
+          build_number="$(python3 Scripts/stable_rollout.py tip-build-number --stable-appcast "$stable_appcast" --sequence "$build_sequence")"
           {
             echo "eligible=true"
             echo "outcome=qualified"
@@ -965,7 +964,7 @@ jobs:
     name: Publish Tip Appcast
     if: needs.setup.outputs.eligible == 'true'
     concurrency:
-      group: main-tip-publish
+      group: rollout-publication
       queue: max
     needs:
       - setup

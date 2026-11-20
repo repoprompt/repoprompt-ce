@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
@@ -24,7 +26,11 @@ enum AgentSessionDataError: Error {
 
 /// An actor that reads/writes AgentSessions from each workspace's "AgentSessions" folder.
 actor AgentSessionDataService {
-    static let shared = AgentSessionDataService()
+    /// The session file is the durable authority. Existing index rows may lag by one
+    /// fixed window; new membership and removals remain immediately discoverable.
+    static let shared = AgentSessionDataService(metadataIndexUpdateDelay: {
+        try await Task.sleep(nanoseconds: 5_000_000_000)
+    })
 
     private nonisolated let restorePerfRecorderSlot = WorkspaceRestorePerfRecorderBox()
     private nonisolated let perfRecorderSlot = AgentModePerfRecorderBox()
@@ -60,7 +66,21 @@ actor AgentSessionDataService {
         let delaySeconds: TimeInterval
     }
 
+    private let metadataIndexUpdateDelay: (@Sendable () async throws -> Void)?
+    private struct MetadataIndexUpdateTask {
+        let id: UUID
+        let task: Task<Void, Never>
+    }
+
+    private var metadataIndexUpdateTasksByFolder: [URL: MetadataIndexUpdateTask] = [:]
     private var metadataIndexCacheByFolder: [URL: AgentSessionMetadataIndex] = [:]
+
+    /// A nil delay retains synchronous index publication for standalone service consumers.
+    /// App composition supplies the bounded coalescing window; tests can gate that same path.
+    init(metadataIndexUpdateDelay: (@Sendable () async throws -> Void)? = nil) {
+        self.metadataIndexUpdateDelay = metadataIndexUpdateDelay
+    }
+
     private struct MetadataPublication {
         var activeCount = 0
         var latestSequence: UInt64 = 0
@@ -79,8 +99,10 @@ actor AgentSessionDataService {
     /// Overlapping reversible deletions share the local save fence; one failure cannot clear another.
     var deletionAttemptsByFileURL: [URL: DeletionAttempts] = [:]
     #if DEBUG
+        private var metadataIndexWriteCountsByFolder: [URL: Int] = [:]
         private var deletionTombstoneWaitersByURL: [URL: [CheckedContinuation<Void, Never>]] = [:]
         private var workspaceRootOverrideForTesting: URL?
+        private var testMetadataPublicationWaitersByURL: [URL: [CheckedContinuation<Void, Never>]] = [:]
         private var testWorktreeMergeReconciliationHooks: AgentSessionWorktreeMergeReconciliationHooks?
         private var testBeforeLoadRepairWriteHook: (@Sendable (URL) async -> Void)?
         private var testAfterSessionWriteHook: (@Sendable (URL) async -> Void)?
@@ -258,23 +280,7 @@ actor AgentSessionDataService {
         }
 
         switch preparation {
-        case .alreadyCanonicalTranscript:
-            if stored.transcript == nil {
-                let canonicalWorkingItems = workingItems()
-                if !canonicalWorkingItems.isEmpty {
-                    let nextSequenceIndex = max((canonicalWorkingItems.map(\.sequenceIndex).max() ?? -1) + 1, 0)
-                    stored.transcript = AgentTranscriptIO.buildTranscript(
-                        from: canonicalWorkingItems,
-                        terminalState: lastRunState,
-                        nextSequenceIndex: nextSequenceIndex,
-                        policy: .canonical
-                    )
-                }
-            }
-            if let transcript = stored.transcript {
-                stored.transcript = AgentTranscriptIO.persistedTranscript(transcript)
-            }
-        case .canonicalize:
+        case .alreadyCanonicalTranscript, .canonicalize:
             if stored.transcript == nil {
                 let canonicalWorkingItems = workingItems()
                 if !canonicalWorkingItems.isEmpty {
@@ -426,6 +432,11 @@ actor AgentSessionDataService {
         guard var publication = metadataPublicationsByURL[fileURL] else { return }
         publication.activeCount -= 1
         metadataPublicationsByURL[fileURL] = publication.activeCount == 0 ? nil : publication
+        #if DEBUG
+            if publication.activeCount == 0 {
+                testMetadataPublicationWaitersByURL.removeValue(forKey: fileURL)?.forEach { $0.resume() }
+            }
+        #endif
     }
 
     private func acceptMetadataReceipt(_ receipt: AgentSessionDiskWriter.Receipt, fileURL: URL) -> Bool {
@@ -607,6 +618,11 @@ actor AgentSessionDataService {
         )
     }
 
+    private func invalidateMetadataIndexCache(forFolderKey key: URL) {
+        metadataIndexUpdateTasksByFolder.removeValue(forKey: key)?.task.cancel()
+        metadataIndexCacheByFolder.removeValue(forKey: key)
+    }
+
     private func readMetadataIndexIfAvailable(folder: URL, preferCache: Bool = true) async -> AgentSessionMetadataIndex? {
         #if DEBUG
             let readStartMS = restorePerfRecorder.timestampMSIfEnabled()
@@ -614,7 +630,7 @@ actor AgentSessionDataService {
         let key = canonicalMetadataFolderKey(folder)
         if preferCache, let cached = metadataIndexCacheByFolder[key] {
             guard cached.schemaVersion == AgentSessionMetadataIndex.currentSchemaVersion else {
-                metadataIndexCacheByFolder.removeValue(forKey: key)
+                invalidateMetadataIndexCache(forFolderKey: key)
                 return nil
             }
             #if DEBUG
@@ -626,9 +642,17 @@ actor AgentSessionDataService {
             #endif
             return cached
         }
+        #if DEBUG
+            return readMetadataIndexFromDisk(folder: folder, key: key, readStartMS: readStartMS)
+        #else
+            return readMetadataIndexFromDisk(folder: folder, key: key)
+        #endif
+    }
+
+    private func readMetadataIndexFromDisk(folder: URL, key: URL, readStartMS: Double? = nil) -> AgentSessionMetadataIndex? {
         let fileURL = metadataIndexFileURL(forAgentSessionsFolder: folder)
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
-            metadataIndexCacheByFolder.removeValue(forKey: key)
+            invalidateMetadataIndexCache(forFolderKey: key)
             #if DEBUG
                 if let readStartMS {
                     restorePerfRecorder.log(
@@ -642,7 +666,7 @@ actor AgentSessionDataService {
             let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
             let index = try decoder.decode(AgentSessionMetadataIndex.self, from: data)
             guard index.schemaVersion == AgentSessionMetadataIndex.currentSchemaVersion else {
-                metadataIndexCacheByFolder.removeValue(forKey: key)
+                invalidateMetadataIndexCache(forFolderKey: key)
                 #if DEBUG
                     if let readStartMS {
                         restorePerfRecorder.log(
@@ -662,7 +686,7 @@ actor AgentSessionDataService {
             #endif
             return index
         } catch {
-            metadataIndexCacheByFolder.removeValue(forKey: key)
+            invalidateMetadataIndexCache(forFolderKey: key)
             #if DEBUG
                 if let readStartMS {
                     restorePerfRecorder.log(
@@ -674,11 +698,37 @@ actor AgentSessionDataService {
         }
     }
 
+    /// Do not reset the deadline when another session saves: a busy folder must still flush.
+    /// Capture only the folder and request identity, never a stale index or deleted record.
+    private func scheduleMetadataIndexUpdate(folder: URL) {
+        let key = canonicalMetadataFolderKey(folder)
+        guard metadataIndexUpdateTasksByFolder[key] == nil,
+              let delay = metadataIndexUpdateDelay else { return }
+        let id = UUID()
+        let task = Task(priority: .utility) { [weak self] in
+            do { try await delay() } catch { return }
+            guard !Task.isCancelled else { return }
+            await self?.flushMetadataIndexUpdate(folder: key, requestID: id)
+        }
+        metadataIndexUpdateTasksByFolder[key] = MetadataIndexUpdateTask(id: id, task: task)
+    }
+
+    private func flushMetadataIndexUpdate(folder: URL, requestID: UUID) async {
+        guard metadataIndexUpdateTasksByFolder[folder]?.id == requestID else { return }
+        metadataIndexUpdateTasksByFolder.removeValue(forKey: folder)
+        guard let index = metadataIndexCacheByFolder[folder] else { return }
+        // A failed derived-index write never invalidates the durable session file. A later
+        // update or first-process reconciliation retries it, without an unbounded retry loop.
+        try? await writeMetadataIndex(index, folder: folder)
+    }
+
     private func writeMetadataIndex(_ index: AgentSessionMetadataIndex, folder: URL) async throws {
         #if DEBUG
             let writeStartMS = perfRecorder.timestampMSIfEnabled()
         #endif
         let key = canonicalMetadataFolderKey(folder)
+        // Membership changes, deletion and reconciliation supersede a pending update.
+        metadataIndexUpdateTasksByFolder.removeValue(forKey: key)?.task.cancel()
         var normalized = index
         normalized.schemaVersion = AgentSessionMetadataIndex.currentSchemaVersion
         normalized.entries = normalized.entries.sortedForAgentSessionMetadataIndex()
@@ -688,10 +738,13 @@ actor AgentSessionDataService {
         metadataIndexCacheByFolder[key] = normalized
         try data.write(to: fileURL, options: .atomic)
         #if DEBUG
+            metadataIndexWriteCountsByFolder[key, default: 0] += 1
+            perfRecorder.increment("cleanup.metadata.writeIndex.bytes", by: data.count)
             perfRecorder.durationEvent(
                 "cleanup.metadata.writeIndex",
                 startMS: writeStartMS,
                 fields: [
+                    "bytes": String(data.count),
                     "entries": String(normalized.entries.count),
                     "quarantined": String(normalized.quarantinedFiles.count)
                 ]
@@ -713,13 +766,19 @@ actor AgentSessionDataService {
                 AgentSessionMetadataIndex()
             }
             guard acceptMetadataReceipt(receipt, fileURL: fileURL) else { return }
+            let existing = index.entries.first { $0.id == record.id && $0.filename == record.filename }
+            if existing?.matchesIndexedSessionMetadata(record) == true { return }
             index.entries.removeAll { existing in
                 existing.id == record.id || existing.filename == record.filename
             }
             index.entries.append(record)
             index.generatedAt = Date()
             metadataIndexCacheByFolder[key] = index
-            try await writeMetadataIndex(index, folder: folder)
+            if existing != nil, metadataIndexUpdateDelay != nil {
+                scheduleMetadataIndexUpdate(folder: folder)
+            } else {
+                try await writeMetadataIndex(index, folder: folder)
+            }
         } catch {
             // Session files remain authoritative; a later backfill/reconcile can repair the index.
         }
@@ -736,9 +795,8 @@ actor AgentSessionDataService {
             observedFileSize: receipt.observedFileSize,
             observedFileModificationDate: receipt.observedFileModificationDate
         )
-        if let existing = index.entries.first(where: { $0.id == record.id }),
-           existing.matchesIndexedSessionMetadata(record)
-        {
+        let existing = index.entries.first { $0.id == record.id && $0.filename == record.filename }
+        if existing?.matchesIndexedSessionMetadata(record) == true {
             return
         }
         index.entries.removeAll { existing in
@@ -746,7 +804,12 @@ actor AgentSessionDataService {
         }
         index.entries.append(record)
         index.generatedAt = Date()
-        try? await writeMetadataIndex(index, folder: folder)
+        metadataIndexCacheByFolder[canonicalMetadataFolderKey(folder)] = index
+        if existing != nil, metadataIndexUpdateDelay != nil {
+            scheduleMetadataIndexUpdate(folder: folder)
+        } else {
+            try? await writeMetadataIndex(index, folder: folder)
+        }
     }
 
     private func removeMetadataRecords(
@@ -1028,7 +1091,7 @@ actor AgentSessionDataService {
         for workspace: WorkspaceModel,
         mode: AgentSessionMetadataIndexLoadMode
     ) async throws -> AgentSessionMetadataIndex? {
-        let folder = try ensureAgentSessionsFolder(for: workspace)
+        guard let folder = try existingAgentSessionsFolder(for: workspace) else { return nil }
         switch mode {
         case .fast:
             return await readMetadataIndexIfAvailable(folder: folder)
@@ -1044,11 +1107,11 @@ actor AgentSessionDataService {
     }
 
     func fastMetadataRecordsIfAvailable(for workspace: WorkspaceModel) async throws -> FastMetadataRecordsResult? {
-        let folder = try ensureAgentSessionsFolder(for: workspace)
+        guard let folder = try existingAgentSessionsFolder(for: workspace) else { return nil }
         let key = canonicalMetadataFolderKey(folder)
         if let cached = metadataIndexCacheByFolder[key] {
             guard cached.schemaVersion == AgentSessionMetadataIndex.currentSchemaVersion else {
-                metadataIndexCacheByFolder.removeValue(forKey: key)
+                invalidateMetadataIndexCache(forFolderKey: key)
                 return nil
             }
             return FastMetadataRecordsResult(
@@ -1057,28 +1120,10 @@ actor AgentSessionDataService {
             )
         }
 
-        let fileURL = metadataIndexFileURL(forAgentSessionsFolder: folder)
-        guard FileManager.default.fileExists(atPath: fileURL.path) else {
-            metadataIndexCacheByFolder.removeValue(forKey: key)
-            return nil
-        }
-
-        do {
-            let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
-            let index = try decoder.decode(AgentSessionMetadataIndex.self, from: data)
-            guard index.schemaVersion == AgentSessionMetadataIndex.currentSchemaVersion else {
-                metadataIndexCacheByFolder.removeValue(forKey: key)
-                return nil
-            }
-            metadataIndexCacheByFolder[key] = index
-            return FastMetadataRecordsResult(
-                records: index.entries.sortedForAgentSessionMetadataIndex(),
-                source: .diskIndex
-            )
-        } catch {
-            metadataIndexCacheByFolder.removeValue(forKey: key)
-            return nil
-        }
+        guard let index = readMetadataIndexFromDisk(folder: folder, key: key) else { return nil }
+        return FastMetadataRecordsResult(
+            records: index.entries.sortedForAgentSessionMetadataIndex(), source: .diskIndex
+        )
     }
 
     func metadataRecordForSessionID(_ id: UUID, for workspace: WorkspaceModel) async throws -> AgentSessionMetadataRecord? {
@@ -1112,7 +1157,7 @@ actor AgentSessionDataService {
     }
 
     func sidebarStreamMetadataRecords(for workspace: WorkspaceModel) async throws -> [AgentSessionMetadataRecord] {
-        let folder = try ensureAgentSessionsFolder(for: workspace)
+        guard let folder = try existingAgentSessionsFolder(for: workspace) else { return [] }
         if let index = await readMetadataIndexIfAvailable(folder: folder) {
             scheduleMetadataIndexReconciliationIfNeeded(
                 folder: folder,
@@ -1284,15 +1329,43 @@ actor AgentSessionDataService {
         _ = try await saveAgentSession(session, for: workspace)
     }
 
-    /// Load an AgentSession from disk.
-    func loadAgentSession(from fileURL: URL) async throws -> AgentSession {
+    /// Filename refusal stays outside the load-failure wrapper; physical reads retain it.
+    private func validatedSessionData(from fileURL: URL) throws -> Data {
         let filename = fileURL.lastPathComponent
         guard filename.starts(with: "AgentSession-"), filename.hasSuffix(".json") else {
             throw AgentSessionDataError.invalidFilename(filename)
         }
-
         do {
-            let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
+            return try Data(contentsOf: fileURL, options: .mappedIfSafe)
+        } catch {
+            throw AgentSessionDataError.loadFailed(error)
+        }
+    }
+
+    /// Read-only history presentation. Unlike runtime restoration this must not repair the
+    /// payload/index, reconcile worktrees, allocate a writer, or create missing storage.
+    func readSavedConversation(id: UUID, workspaceID: UUID, directory: URL) throws -> AgentSession? {
+        try Task.checkCancellation()
+        let folder = directory.appendingPathComponent("AgentSessions")
+        let fileURL = folder.appendingPathComponent(agentSessionFilename(for: id)).standardizedFileURL
+        try AppProfileLocations.current.validateMetadataFile(fileURL)
+        guard !deletedSessionFileURLs.contains(fileURL) else { return nil }
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
+        guard canonicalAgentSessionFile(fileURL, in: folder)?.sessionID == id else {
+            throw AgentSessionDataError.invalidFilename(fileURL.lastPathComponent)
+        }
+        let session = try decoder.decode(AgentSession.self, from: validatedSessionData(from: fileURL))
+        guard session.id == id, session.workspaceID == nil || session.workspaceID == workspaceID else {
+            throw AgentSessionDataError.invalidFilename(fileURL.lastPathComponent)
+        }
+        try Task.checkCancellation()
+        return session
+    }
+
+    /// Load an AgentSession from disk.
+    func loadAgentSession(from fileURL: URL) async throws -> AgentSession {
+        let data = try validatedSessionData(from: fileURL)
+        do {
             let session = try decoder.decode(AgentSession.self, from: data)
             if session.selfCompactPersistenceWarning {
                 try preserveMalformedSelfCompactRecord(data, from: fileURL)
@@ -1337,13 +1410,8 @@ actor AgentSessionDataService {
         recoverMissingMetadata: Bool = false,
         persistRecoveredMetadata: Bool = false
     ) async throws -> AgentSession {
-        let filename = fileURL.lastPathComponent
-        guard filename.starts(with: "AgentSession-"), filename.hasSuffix(".json") else {
-            throw AgentSessionDataError.invalidFilename(filename)
-        }
-
+        let data = try validatedSessionData(from: fileURL)
         do {
-            let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
             let header = try decoder.decode(AgentSessionHeader.self, from: data)
             var recoveredLastUserMessageAt = header.lastUserMessageAt
             var recoveredProjectionCounts = header.transcriptProjectionCounts
@@ -1448,7 +1516,7 @@ actor AgentSessionDataService {
 
     /// Returns a list of AgentSession files in the workspace's AgentSessions folder, sorted by mod date desc.
     func listAgentSessions(for workspace: WorkspaceModel) async throws -> [URL] {
-        let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
+        guard let agentSessionsFolder = try existingAgentSessionsFolder(for: workspace) else { return [] }
 
         let contents = try FileManager.default.contentsOfDirectory(
             at: agentSessionsFolder,
@@ -1467,47 +1535,6 @@ actor AgentSessionDataService {
         return datedFiles.sorted { lhs, rhs in
             lhs.modificationDate > rhs.modificationDate
         }.map(\.url)
-    }
-
-    /// Get metadata for recent agent sessions without loading full content.
-    func recentSessions(for workspace: WorkspaceModel, limit: Int = 10) async throws -> [AgentSessionMeta] {
-        do {
-            return try await metadataRecords(for: workspace, limit: limit).map {
-                $0.agentSessionMeta()
-            }
-        } catch {
-            let files = try await listAgentSessions(for: workspace)
-            var metadataList: [AgentSessionMeta] = []
-
-            for fileURL in files.prefix(max(limit, 0)) {
-                do {
-                    let session = try await loadAgentSessionStub(from: fileURL, recoverMissingMetadata: false)
-                    let lastModified = (try? fileURL.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? session.savedAt
-
-                    let meta = AgentSessionMeta(
-                        id: session.id,
-                        composeTabID: session.composeTabID,
-                        name: session.name,
-                        lastModified: lastModified,
-                        itemCount: session.effectiveItemCount,
-                        agentKind: session.agentKind,
-                        agentModel: session.agentModel,
-                        lastRunState: session.lastRunState,
-                        acpModelParameterSelections: session.acpModelParameterSelections,
-                        parentSessionID: session.parentSessionID,
-                        createdByOverseerSessionID: session.createdByOverseerSessionID,
-                        isMCPOriginated: session.isMCPOriginated,
-                        worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,
-                        activeWorktreeMergeSummaries: session.worktreeMergeOperations.activeWorktreeMergeSummaries
-                    )
-                    metadataList.append(meta)
-                } catch {
-                    continue
-                }
-            }
-
-            return metadataList
-        }
     }
 
     /// Get lightweight metadata for agent sessions without loading full transcript content.
@@ -1587,23 +1614,9 @@ actor AgentSessionDataService {
         return try await loadAgentSession(id: sessionID, for: workspace)
     }
 
-    /// Find an agent session by its ID for a workspace.
-    func findAgentSession(id: UUID, for workspace: WorkspaceModel) async throws -> AgentSession? {
-        let files = try await listAgentSessions(for: workspace)
-
-        for fileURL in files {
-            let filename = fileURL.lastPathComponent
-            if filename == "AgentSession-\(id.uuidString).json" {
-                return try await loadAgentSession(from: fileURL)
-            }
-        }
-
-        return nil
-    }
-
     /// Load an agent session by ID without scanning the session directory.
     func loadAgentSession(id: UUID, for workspace: WorkspaceModel) async throws -> AgentSession? {
-        let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
+        guard let agentSessionsFolder = try existingAgentSessionsFolder(for: workspace) else { return nil }
         let filename = "AgentSession-\(id.uuidString).json"
         let fileURL = agentSessionsFolder.appendingPathComponent(filename)
 
@@ -1612,37 +1625,6 @@ actor AgentSessionDataService {
         }
 
         return try await loadAgentSession(from: fileURL)
-    }
-
-    /// Find an agent session by compose tab ID.
-    func findAgentSessionForTab(_ tabID: UUID, for workspace: WorkspaceModel) async throws -> AgentSession? {
-        if let records = try? await metadataRecords(for: workspace),
-           let best = records
-           .filter({ $0.composeTabID == tabID })
-           .sortedForAgentSessionMetadataIndex()
-           .first
-        {
-            if let session = try await loadAgentSession(id: best.id, for: workspace) {
-                return session
-            }
-            let folder = try ensureAgentSessionsFolder(for: workspace)
-            await removeMetadataRecords(matching: { $0.id == best.id }, folder: folder)
-        }
-
-        let files = try await listAgentSessions(for: workspace)
-
-        for fileURL in files {
-            do {
-                let stub = try await loadAgentSessionStub(from: fileURL, recoverMissingMetadata: false)
-                if stub.composeTabID == tabID {
-                    return try await loadAgentSession(from: fileURL)
-                }
-            } catch {
-                continue
-            }
-        }
-
-        return nil
     }
 
     /// Delete a particular agent session file.
@@ -1668,7 +1650,9 @@ actor AgentSessionDataService {
 
     /// Delete an agent session by ID.
     func deleteAgentSession(id: UUID, for workspace: WorkspaceModel) async throws {
-        let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
+        // An absent file still needs the durable deletion fence against a concurrent first save.
+        // Resolve its identity without creating a folder merely to admit that tombstone.
+        let agentSessionsFolder = resolvedWorkspaceFolderURL(for: workspace).appendingPathComponent("AgentSessions")
         let filename = agentSessionFilename(for: id)
         let fileURL = agentSessionsFolder.appendingPathComponent(filename).standardizedFileURL
 
@@ -1690,7 +1674,8 @@ actor AgentSessionDataService {
         guard !tabIDs.isEmpty else { return [:] }
         let agentSessionsFolder: URL
         do {
-            agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
+            guard let existingFolder = try existingAgentSessionsFolder(for: workspace) else { return [:] }
+            agentSessionsFolder = existingFolder
         } catch {
             return Dictionary(uniqueKeysWithValues: tabIDs.map { ($0, error) })
         }
@@ -1794,6 +1779,11 @@ actor AgentSessionDataService {
         }
         var fileRemoved = false
         do {
+            let oracleDrain = await MainActor.run {
+                OracleBackgroundInvocationRegistry.shared.closeAll(sessionID: sessionID)
+            }
+            await oracleDrain.value
+            try Task.checkCancellation()
             if let fence = Self.destructiveCommitFence.get(), await !fence() {
                 throw AgentSessionDestructiveCommitRefused()
             }
@@ -1811,6 +1801,7 @@ actor AgentSessionDataService {
         // withdrawn even while committed cleanup is suspended. A refused attempt never sets this.
         committedSessionDeletionFileURLs.insert(fileURL)
         await AgentSessionDurableDeletionReporter.didCommitDurableDeletion(attempt, fileRemoved: fileRemoved)
+        await MainActor.run { OracleBackgroundInvocationRegistry.shared.removeSettledSession(sessionID) }
         // Retained images belong to the committed session; a refused attempt never reaches here.
         AgentSessionAttachmentStore.removeSessionFolder(sessionID: sessionID, agentSessionsFolder: fileURL.deletingLastPathComponent())
         finishDeletionAttempt(for: fileURL, committed: true)
@@ -1889,12 +1880,50 @@ actor AgentSessionDataService {
             }
         }
 
+        /// Fixture producers must be retired first. Join complete session+metadata publications,
+        /// attachment retention and any already-running reconciliation before removing sidecars.
+        func test_drainWorkspaceSidecarIO(forAgentSessionsFolder folder: URL) async {
+            let key = canonicalMetadataFolderKey(folder)
+            if let reconciliation = metadataIndexReconciliationTasksByFolder.removeValue(forKey: key) {
+                reconciliation.task.cancel()
+                await reconciliation.task.value
+            }
+            let attachmentTasks = attachmentFileTasksByFileURL
+                .filter { $0.key.deletingLastPathComponent().standardizedFileURL == key }
+                .flatMap(\.value.values)
+            for task in attachmentTasks {
+                await task.value
+            }
+            let publications = metadataPublicationsByURL.keys.filter {
+                $0.deletingLastPathComponent().standardizedFileURL == key
+            }
+            for url in publications where metadataPublicationsByURL[url] != nil {
+                await withCheckedContinuation { continuation in
+                    testMetadataPublicationWaitersByURL[url, default: []].append(continuation)
+                }
+            }
+            test_clearMetadataIndexCache(forAgentSessionsFolder: folder)
+        }
+
         func test_clearMetadataIndexCache(forAgentSessionsFolder folder: URL) {
             let key = canonicalMetadataFolderKey(folder)
-            metadataIndexCacheByFolder.removeValue(forKey: key)
+            invalidateMetadataIndexCache(forFolderKey: key)
             metadataIndexReconciliationTasksByFolder[key]?.task.cancel()
             metadataIndexReconciliationTasksByFolder.removeValue(forKey: key)
             metadataIndexReconciledThisProcess.remove(key)
+        }
+
+        func test_metadataIndexWriteCount(forAgentSessionsFolder folder: URL) -> Int {
+            metadataIndexWriteCountsByFolder[canonicalMetadataFolderKey(folder), default: 0]
+        }
+
+        func test_waitForMetadataIndexReconciliation(forAgentSessionsFolder folder: URL) async {
+            let task = metadataIndexReconciliationTasksByFolder[canonicalMetadataFolderKey(folder)]?.task
+            await task?.value
+        }
+
+        func test_pendingMetadataIndexUpdate(forAgentSessionsFolder folder: URL) -> Task<Void, Never>? {
+            metadataIndexUpdateTasksByFolder[canonicalMetadataFolderKey(folder)]?.task
         }
 
         func test_markMetadataIndexReconciledThisProcess(forAgentSessionsFolder folder: URL) {
@@ -1912,7 +1941,14 @@ actor AgentSessionDataService {
 
     // MARK: - Folder Helpers
 
-    /// Creates (if needed) and returns the "AgentSessions" subfolder for the given workspace.
+    /// Reads and deletion of an absent history must not create folders or an empty index.
+    private func existingAgentSessionsFolder(for workspace: WorkspaceModel) throws -> URL? {
+        let folder = resolvedWorkspaceFolderURL(for: workspace).appendingPathComponent("AgentSessions")
+        try AppProfileLocations.current.validateMetadataFile(folder)
+        return FileManager.default.fileExists(atPath: folder.path) ? folder : nil
+    }
+
+    /// Creates (if needed) and returns the "AgentSessions" subfolder for an actual save.
     private func ensureAgentSessionsFolder(for workspace: WorkspaceModel) throws -> URL {
         let baseFolder = try workspaceFolderURL(for: workspace)
         let agentSessionsFolder = baseFolder.appendingPathComponent("AgentSessions")

@@ -1,45 +1,45 @@
 import Foundation
+import RepoPromptAgentProviderContracts
 import RepoPromptDomainRuntime
 
 @MainActor
 final class HeadlessAgentModeRunner {
-    private let headlessProviderFactory: AgentModeViewModel.HeadlessProviderFactory
     private let hooks: AgentModeRunService.Hooks
     private let terminalCommitBarrier: AgentRunTerminalCommitBarrier
 
     init(
-        headlessProviderFactory: @escaping AgentModeViewModel.HeadlessProviderFactory,
         hooks: AgentModeRunService.Hooks,
         terminalCommitBarrier: AgentRunTerminalCommitBarrier
     ) {
-        self.headlessProviderFactory = headlessProviderFactory
         self.hooks = hooks
         self.terminalCommitBarrier = terminalCommitBarrier
     }
 
-    func startRun(
+    func prepareRun(
         tabID: UUID,
         session: AgentTabSession,
+        providerLaunchInput: AgentProviderLaunchInput? = nil,
         initialUserMessage: String,
         initialMessageForRun: String,
         attachments: [AgentFileAttachment],
         makeLease: (_ runID: UUID) -> MCPBootstrapLease,
+        startOutcome: AgentRunStartOutcomeRecorder? = nil,
         stopFence: AgentRunStartStopFence? = nil,
         localComposerCandidate: UUID? = nil
-    ) async {
+    ) async -> AgentRunResourceRequest? {
         var candidateTransferred = false
         defer {
             if !candidateTransferred { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) }
         }
-        guard stopFence?.permitsStart(of: session) ?? true else { return }
-        let attachmentReservationID = hooks.attachments.reserveAttachmentsForTurn(attachments, session)
-
-        if initialMessageForRun != initialUserMessage,
-           !session.pendingNonCodexUserInputTokenQueue.isEmpty
-        {
-            session.pendingNonCodexUserInputTokenQueue[0] = hooks.usage.estimateRuntimeTokens(initialMessageForRun)
-        }
-        hooks.usage.startNonCodexTurnAccountingIfNeeded(session, initialMessageForRun)
+        guard stopFence?.permitsStart(of: session) ?? true,
+              await providerLaunchInput?.validate(for: session) ?? true,
+              stopFence?.permitsStart(of: session) ?? true,
+              providerLaunchInput?.isCurrent(for: session) != false
+        else { return nil }
+        let attachmentReservationID = hooks.prepareNonCodexTurnInputs(
+            session: session, attachments: attachments,
+            initialUserMessage: initialUserMessage, initialMessageForRun: initialMessageForRun
+        )
 
         let runID = AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
         let lease = makeLease(runID)
@@ -50,10 +50,10 @@ final class HeadlessAgentModeRunner {
 
         guard stopFence?.permitsStart(of: session) ?? true else {
             Task { await lease.cancelAndCleanup() }
-            return
+            return nil
         }
+        let binding = session.currentRestorationBindingToken
         let ownership = session.beginRunAttempt(source: "headless")
-        let runAttemptID = ownership.attemptID
         session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .preparingRuntime)
         session.runningStatusText = nil
         session.runningStatusSource = nil
@@ -80,15 +80,74 @@ final class HeadlessAgentModeRunner {
                     return nil
                 }
             ))
-            return
+            return nil
         }
 
-        let provider = headlessProviderFactory(
-            session.selectedAgent,
-            session.selectedModelRaw == AgentModel.defaultModel.rawValue
-                ? nil
-                : session.selectedModelRaw
+        let stillCurrent = {
+            session.currentRestorationBindingToken == binding && session.activeRunOwnership == ownership
+                && session.runID == runID && session.runState.isActive
+                && (stopFence?.permitsStart(of: session) ?? true)
+                && providerLaunchInput?.isCurrent(for: session) != false
+        }
+        let refuse: () async -> Void = { [self] in
+            session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained)
+            if session.currentRestorationBindingToken == binding,
+               session.activeRunOwnership == ownership, session.runID == runID, session.runState.isActive
+            {
+                await terminalCommitBarrier.commit(.init(
+                    binding: hooks.bindTerminalSession(session), ownership: ownership, expectedRunID: runID,
+                    terminalState: .cancelled, source: "headless.constructionRefused",
+                    attachmentReservationID: attachmentReservationID, attachmentDisposition: .deleteFiles,
+                    finalizeNonCodexUsage: true, supportsFollowUp: false, notifyTurnComplete: false,
+                    prepareProviderState: {
+                        session.clearRunID(ifCurrent: runID)
+                        return nil
+                    }
+                ))
+            }
+            await lease.cancelAndCleanup()
+        }
+        candidateTransferred = true
+        return .headless(
+            agent: session.selectedAgent,
+            model: session.selectedModelRaw == AgentModel.defaultModel.rawValue ? nil : session.selectedModelRaw,
+            preparation: AgentRunResourcePreparation(
+                isCurrent: stillCurrent,
+                refused: refuse,
+                receive: { [self] provider in
+                    guard stillCurrent() else {
+                        await provider.dispose()
+                        await refuse()
+                        return nil
+                    }
+                    installProvider(
+                        provider, session: session, runID: runID, ownership: ownership,
+                        initialMessageForRun: initialMessageForRun, attachments: attachments,
+                        attachmentReservationID: attachmentReservationID, lease: lease,
+                        providerLaunchInput: providerLaunchInput, startupIsCurrent: stillCurrent,
+                        localComposerCandidate: localComposerCandidate
+                    )
+                    startOutcome?.recordAccepted()
+                    return nil
+                }
+            )
         )
+    }
+
+    private func installProvider(
+        _ provider: HeadlessAgentProvider,
+        session: AgentTabSession,
+        runID: UUID,
+        ownership: AgentRunOwnership,
+        initialMessageForRun: String,
+        attachments: [AgentFileAttachment],
+        attachmentReservationID: UUID?,
+        lease: MCPBootstrapLease,
+        providerLaunchInput: AgentProviderLaunchInput?,
+        startupIsCurrent: @escaping @MainActor () -> Bool,
+        localComposerCandidate: UUID?
+    ) {
+        let runAttemptID = ownership.attemptID
         session.provider = provider
         session.installRunAttemptTerminalResources(ownership: ownership) { terminalState in
             session.provider = nil
@@ -103,6 +162,7 @@ final class HeadlessAgentModeRunner {
                     break
                 }
                 await provider.dispose()
+                await lease.finishOwnedProviderRouting()
             }
         }
 
@@ -111,14 +171,19 @@ final class HeadlessAgentModeRunner {
             defer { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) }
             guard let self else { return }
             await withTaskCancellationHandler {
-                let acquired = await lease.acquire()
+                var acquired = await lease.acquire()
+                if acquired, await providerLaunchInput?.validate(for: session) == false {
+                    await lease.cancelAndCleanup()
+                    acquired = false
+                }
                 guard acquired else {
                     await self.handleAcquireFailure(
                         session: session,
                         lease: lease,
                         runID: runID,
                         ownership: ownership,
-                        attachmentReservationID: attachmentReservationID
+                        attachmentReservationID: attachmentReservationID,
+                        providerLaunchInput: providerLaunchInput
                     )
                     return
                 }
@@ -142,11 +207,11 @@ final class HeadlessAgentModeRunner {
                     attachments: attachments,
                     attachmentReservationID: attachmentReservationID,
                     lease: lease,
+                    providerLaunchInput: providerLaunchInput, startupIsCurrent: startupIsCurrent,
                     localComposerCandidate: localComposerCandidate
                 )
             } onCancel: {}
         }
-        candidateTransferred = true
     }
 
     private func handleAcquireFailure(
@@ -154,28 +219,23 @@ final class HeadlessAgentModeRunner {
         lease: MCPBootstrapLease,
         runID: UUID,
         ownership: AgentRunOwnership,
-        attachmentReservationID: UUID?
+        attachmentReservationID: UUID?,
+        providerLaunchInput: AgentProviderLaunchInput?
     ) async {
         let outcome = await lease.acquireFailureOutcome
+        guard providerLaunchInput?.origin.writer.ownsPersistentClaim != false else { return }
         hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
-        await terminalCommitBarrier.commit(.init(
-            binding: hooks.bindTerminalSession(session),
-            ownership: ownership,
-            expectedRunID: runID,
-            terminalState: outcome.terminalState,
-            source: "headless.acquireFailure",
-            errorText: outcome.errorText,
+        await hooks.commitAcquireFailure(
+            session: session, outcome: outcome, runID: runID, ownership: ownership,
             attachmentReservationID: attachmentReservationID,
-            attachmentDisposition: .deleteFiles,
-            finalizeNonCodexUsage: true,
-            supportsFollowUp: false,
-            notifyTurnComplete: false,
+            source: "headless.acquireFailure", supportsFollowUp: false,
+            barrier: terminalCommitBarrier,
             prepareProviderState: {
                 session.provider = nil
                 session.clearRunID(ifCurrent: runID)
                 return nil
             }
-        ))
+        )
     }
 
     private func executeHeadlessRun(
@@ -188,6 +248,8 @@ final class HeadlessAgentModeRunner {
         attachments: [AgentFileAttachment],
         attachmentReservationID: UUID?,
         lease: MCPBootstrapLease,
+        providerLaunchInput: AgentProviderLaunchInput?,
+        startupIsCurrent: @escaping @MainActor () -> Bool,
         localComposerCandidate: UUID?
     ) async {
         let isPeriodic = session.oversight.pendingAutoWake?.isPeriodic == true
@@ -196,6 +258,8 @@ final class HeadlessAgentModeRunner {
             failureText: { "Agent failed: \($0.localizedDescription)" }
         ) {
             await lease.providerInitializationStarted(provider: session.selectedAgent.rawValue)
+            guard providerLaunchInput?.origin.writer.ownsPersistentClaim != false else { return .superseded }
+            guard startupIsCurrent() else { throw CancellationError() }
             // Composed here, after the lease hop and immediately before stream creation: that hop is
             // a suspension, so reading membership any earlier could dispatch inventory the user has
             // already changed. This is the last point before the provider sees the turn.
@@ -214,8 +278,19 @@ final class HeadlessAgentModeRunner {
                 )
                 throw CancellationError()
             }
+            let resourcesCurrent = await providerLaunchInput?.validate(for: session) ?? true
+            guard providerLaunchInput?.origin.writer.ownsPersistentClaim != false else { return .superseded }
+            guard resourcesCurrent, !Task.isCancelled, session.isCurrentRunAttempt(ownership, expectedRunID: runID),
+                  startupIsCurrent(), providerLaunchInput?.isCurrent(for: session) != false
+            else {
+                hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, .headlessRun(runID: runID))
+                throw CancellationError()
+            }
             let proof = await hooks.providerInput.proveAgentSessionLinkProviderInput(session, monitoring.claim)
-            guard !Task.isCancelled, session.isCurrentRunAttempt(ownership, expectedRunID: runID) else {
+            guard providerLaunchInput?.origin.writer.ownsPersistentClaim != false else { return .superseded }
+            guard !Task.isCancelled, session.isCurrentRunAttempt(ownership, expectedRunID: runID),
+                  startupIsCurrent(), providerLaunchInput?.isCurrent(for: session) != false
+            else {
                 hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, .headlessRun(runID: runID))
                 throw CancellationError()
             }
@@ -231,7 +306,11 @@ final class HeadlessAgentModeRunner {
             }
             let released = hooks.providerInput.handoffAgentSessionLinkProviderInput(session, .headlessRun(runID: runID), monitoring.claim, proof)
             guard !released.mustAbortDispatch else { throw CancellationError() }
-            let stream = try await provider.streamAgentMessage(released.message(initialMessage), runID: runID)
+            let oracle = session.oracleBackgroundAwareness.reserve(session: session, providerID: ObjectIdentifier(lease))
+            defer { session.oracleBackgroundAwareness.release(oracle) }
+            let outbound = released.message(initialMessage)
+            let stream = try await provider.streamAgentMessage(oracle?.decorating(outbound) ?? outbound, runID: runID)
+            session.oracleBackgroundAwareness.accept(oracle)
             // Successful stream creation is the acceptance signal for every headless provider,
             // including Claude headless. A throwing creation leaves the claim pending for the retry.
             hooks.providerInput.acceptAgentSessionLinkPrompt(session, monitoring.dispatchContext, released.claim)
@@ -263,7 +342,8 @@ final class HeadlessAgentModeRunner {
             return .completed(assistantText: nil)
         }
 
-        guard case let .terminal(outcome) = report.result else { return }
+        guard case let .terminal(outcome) = report.result,
+              providerLaunchInput?.origin.writer.ownsPersistentClaim != false else { return }
         if !providerInitializationCompleted {
             hooks.providerInput.recordAgentSessionLinkPhysicalDispatchFailure(
                 session,

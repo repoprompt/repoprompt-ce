@@ -2,6 +2,7 @@ import Foundation
 import MCP
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 @MainActor
@@ -74,7 +75,7 @@ final class MCPPromptContextToolProvider {
             try await dependencies.files.drainReadFileAutoSelection(metadata, .mirroredSelectionAndMetrics)
         }
         if includeArr.contains("files") {
-            _ = await dependencies.context.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
+            _ = try await (dependencies.context.requirePromptVM()).workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
         }
         let resolvedTabContext: MCPResolvedTabContextSnapshot = if let appContext {
             selectionRefreshedContext(appContext.resolvedTabContext)
@@ -180,7 +181,7 @@ final class MCPPromptContextToolProvider {
             }
             let preset = try await resolveRequiredPreset(args["preset"])
             try await MCPDomainMutationCommitContext.willCommit()
-            await MainActor.run { dependencies.context.promptVM.selectCopyPreset(preset.id) }
+            try await MainActor.run { try (dependencies.context.requirePromptVM()).selectCopyPreset(preset.id) }
             return try Value(ToolResultDTOs.PromptToolEnvelope.forSelectPreset(dependencies.prompt.copyPresetDescriptorDTO(preset)))
         case .snapshot, .listPresets, .unknown:
             throw MCPError.invalidParams("Unsupported op '\(operation.rawValue)' for prompt when tab context is active")
@@ -217,23 +218,23 @@ final class MCPPromptContextToolProvider {
     }
 
     private func activePromptReply(op: String) async throws -> Value {
-        let prompt = await dependencies.context.promptVM.promptText
+        let prompt = try await (dependencies.context.requirePromptVM()).promptText
         let lines = prompt.isEmpty ? 0 : prompt.components(separatedBy: "\n").count
-        let copyPreset = await dependencies.context.promptVM.currentCopyPreset()
-        let chatPreset = await dependencies.context.promptVM.currentChatPreset()
-        let resolved = await dependencies.context.promptVM.resolvePromptContext()
-        let effectiveTokens = await dependencies.context.promptVM.calculateTokensForChatContext()
-        let fullFilesTokens = await dependencies.context.promptVM.tokenCountingViewModel.totalTokenCountFilesOnly
+        let copyPreset = try await (dependencies.context.requirePromptVM()).currentCopyPreset()
+        let chatPreset = try await (dependencies.context.requirePromptVM()).currentChatPreset()
+        let resolved = try await (dependencies.context.requirePromptVM()).resolvePromptContext()
+        let effectiveTokens = try await (dependencies.context.requirePromptVM()).calculateTokensForChatContext()
+        let fullFilesTokens = try await (dependencies.context.requirePromptVM()).tokenCountingViewModel.totalTokenCountFilesOnly
         let includesCodemaps = resolved.codeMapUsage != .none
         let includesGitDiff = resolved.gitInclusion != .none
         let hasStoredPrompts = resolved.storedPromptIds?.isEmpty == false
-        let codeMapFileCount = includesCodemaps ? await dependencies.context.promptVM.codeMapFileCount : nil
-        let codeMapTokens = includesCodemaps ? await dependencies.context.promptVM.codeMapTokenCount : nil
+        let codeMapFileCount = try includesCodemaps ? await (dependencies.context.requirePromptVM()).codeMapFileCount : nil
+        let codeMapTokens = try includesCodemaps ? await (dependencies.context.requirePromptVM()).codeMapTokenCount : nil
         let codeMapFiles: [String]? = try await {
             guard includesCodemaps else { return nil }
             let collections = try await dependencies.prompt.selectionCollectionsForCurrentTabContext()
-            let roots = await dependencies.context.promptVM.workspaceFileContextStore.rootRefs(scope: .allLoaded)
-            let display = dependencies.context.promptVM.filePathDisplayOption
+            let roots = try await (dependencies.context.requirePromptVM()).workspaceFileContextStore.rootRefs(scope: .allLoaded)
+            let display = try (dependencies.context.requirePromptVM()).filePathDisplayOption
             return collections.codemap.map { entry in
                 if display == .full {
                     return entry.file.fullPath
@@ -278,11 +279,11 @@ final class MCPPromptContextToolProvider {
 
         let preset = try await withPromptExportPhase(.promptExportPresetResolution) {
             let overridePreset = try await resolveCopyPresetOverride(args["copy_preset"])
-            let activePreset = await dependencies.context.promptVM.currentCopyPreset()
+            let activePreset = try await (dependencies.context.requirePromptVM()).currentCopyPreset()
             let effectivePreset = overridePreset ?? activePreset
-            let cfg = dependencies.context.promptVM.resolvePromptContext(
+            let cfg = try (dependencies.context.requirePromptVM()).resolvePromptContext(
                 effectivePreset,
-                custom: dependencies.context.promptVM.workingCopyCustomizations
+                custom: (dependencies.context.requirePromptVM()).workingCopyCustomizations
             )
             return (effectivePreset: effectivePreset, cfg: cfg)
         }
@@ -291,15 +292,15 @@ final class MCPPromptContextToolProvider {
             if let tabContext {
                 await dependencies.prompt.buildTabClipboardContent(preset.cfg, tabContext)
             } else {
-                await dependencies.context.promptVM.buildClipboard(for: preset.cfg)
+                try await (dependencies.context.requirePromptVM()).buildClipboard(for: preset.cfg)
             }
             // Clipboard assembly is nonthrowing and app-adapter loss can yield an empty
             // compatibility result, so cancellation is revalidated before authorization.
         }
 
         let exportMetadata = try await withPromptExportPhase(.promptExportMetadataAssembly) {
-            let pathDisplay = dependencies.context.promptVM.filePathDisplayOption
-            let rootRefs = await dependencies.context.promptVM.workspaceFileContextStore.rootRefs(scope: .allLoaded)
+            let pathDisplay = try (dependencies.context.requirePromptVM()).filePathDisplayOption
+            let rootRefs = try await (dependencies.context.requirePromptVM()).workspaceFileContextStore.rootRefs(scope: .allLoaded)
             let effectiveContext = tabContext.map { MCPResolvedTabContextSnapshot(snapshot: $0) } ?? resolvedContext
             let files = try await dependencies.prompt.buildExportSelectedFileInfos(
                 effectiveContext,
@@ -319,8 +320,8 @@ final class MCPPromptContextToolProvider {
         let destination = try await withPromptExportPhase(.promptExportDestinationAuthorization) {
             let metadata = await dependencies.context.captureRequestMetadata()
             let lookupContext = await dependencies.selection.resolveFileToolLookupContext(metadata)
-            let mutationRootMappings = await lookupContext.domainMutationPhysicalRootMappings(
-                store: dependencies.context.promptVM.workspaceFileContextStore
+            let mutationRootMappings = try await lookupContext.domainMutationPhysicalRootMappings(
+                store: (dependencies.context.requirePromptVM()).workspaceFileContextStore
             )
             return (
                 physicalPath: lookupContext.translateInputPath(rawPath),
@@ -341,7 +342,7 @@ final class MCPPromptContextToolProvider {
         }
 
         try await withPromptExportPhase(.promptExportIngressWait) {
-            _ = await dependencies.context.promptVM.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
+            _ = try await (dependencies.context.requirePromptVM()).workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
                 userPath: resolvedPath,
                 fallbackScope: .allLoaded
             )

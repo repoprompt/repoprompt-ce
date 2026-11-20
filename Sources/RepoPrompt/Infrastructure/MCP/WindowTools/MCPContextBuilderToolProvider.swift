@@ -4,6 +4,8 @@ import MCP
 import Ontology
 import RepoPromptDomainRuntime
 import RepoPromptFoundation
+import RepoPromptMCPServer
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 /// An unsatisfied prerequisite rejects discovery without rolling back earlier selection or binding effects.
@@ -428,7 +430,7 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
 
         let targetWindow = try dependencies.execution.requireTargetWindow()
         #if DEBUG
-            let invokingBinding = connectionID.map { targetWindow.mcpServer.connectionBindingSnapshot(forConnection: $0) }
+            let invokingBinding = connectionID.map { targetWindow.mcpServer.connectionBindingSnapshot(route: targetWindow.mcpServer.routeResources, forConnection: $0) }
             let startupObservation = targetWindow.contextBuilderAgentViewModel.startupObservationForTesting(
                 workspaceID: invokingBinding?.workspaceID, tabID: invokingBinding?.tabID,
                 invokingRunID: invokingBinding?.runID
@@ -448,7 +450,7 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
         let workspaceContext = tabResolution.workspaceContext
         let lookupContext = workspaceContext?.lookupContext ?? tabResolution.lookupContext
         if workspaceContext == nil {
-            let scopedRoots = await dependencies.context.promptVM.workspaceFileContextStore.rootRefs(
+            let scopedRoots = try await (dependencies.context.requirePromptVM()).workspaceFileContextStore.rootRefs(
                 scope: lookupContext.rootScope
             )
             let scopedPaths = Set(scopedRoots.map(\.standardizedFullPath))
@@ -465,7 +467,7 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
             throw MCPError.internalError("Resolved Context Builder tab is unavailable in its workspace")
         }
         try await workspaceContext?.validateReviewTargetAvailability(
-            store: dependencies.context.promptVM.workspaceFileContextStore
+            store: (dependencies.context.requirePromptVM()).workspaceFileContextStore
         )
         let contextBuilderVM = targetWindow.contextBuilderAgentViewModel
 
@@ -517,6 +519,10 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                 workspaceContext: workspaceContext,
                 responseType: responseType?.rawValue,
                 oraclePreset: oraclePreset
+            )
+        } catch OracleExecutionResolutionError.missingConfiguredOracleModel {
+            throw MCPError.invalidParams(
+                "Context Builder requires an Oracle model for plan, question, or review responses. Select an Oracle model in Agent Models or use an exposed compatible Model Preset. To gather context and continue planning or review yourself, omit response_type, oracle_preset, and export_response."
             )
         } catch let error as OracleExecutionResolutionError {
             throw MCPError.invalidParams(error.localizedDescription)
@@ -811,7 +817,7 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                                     workspaceID: committedTab.identity.workspaceID,
                                     tabID: committedTab.identity.tabID,
                                     selectionRevision: committedTab.selectionRevision,
-                                    store: dependencies.context.promptVM.workspaceFileContextStore
+                                    store: (dependencies.context.requirePromptVM()).workspaceFileContextStore
                                 )
                                 await dependencies.execution.didFinalizeContextBuilderReview(authorization)
 

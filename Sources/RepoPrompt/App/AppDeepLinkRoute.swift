@@ -172,7 +172,27 @@ struct AgentSessionDeepLinkRoute: Equatable {
     }
 }
 
+struct WorkspaceDeepLinkRoute: Equatable {
+    let workspaceID: UUID
+    let tabID: UUID?
+    let sessionID: UUID?
+
+    init?(_ components: URLComponents) {
+        guard components.path == "/open" else { return nil }
+        var ids: [String: UUID] = [:]
+        for item in components.queryItems ?? [] where ["workspace_id", "tab_id", "session_id"].contains(item.name) {
+            guard ids[item.name] == nil, let value = item.value, let id = UUID(uuidString: value) else { return nil }
+            ids[item.name] = id
+        }
+        guard let workspaceID = ids["workspace_id"], ids["session_id"] == nil || ids["tab_id"] != nil else { return nil }
+        self.workspaceID = workspaceID
+        tabID = ids["tab_id"]
+        sessionID = ids["session_id"]
+    }
+}
+
 enum AppDeepLinkRoute: Equatable {
+    case workspace(WorkspaceDeepLinkRoute)
     case agentSession(AgentSessionDeepLinkRoute)
     case legacyURL(URL)
 
@@ -192,6 +212,10 @@ enum AppDeepLinkRoute: Equatable {
             return .route(.agentSession(route))
         }
 
+        if components.host?.lowercased() == "workspace" {
+            guard let route = WorkspaceDeepLinkRoute(components) else { return .invalidWorkspaceRoute }
+            return .route(.workspace(route))
+        }
         return .route(.legacyURL(url))
     }
 
@@ -276,6 +300,7 @@ struct NotificationUserInfoReader {
 enum AppDeepLinkURLParseResult: Equatable {
     case route(AppDeepLinkRoute)
     case invalidScopedRoute
+    case invalidWorkspaceRoute
     case unsupported
 }
 

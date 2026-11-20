@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptMCPServer
 
 /// Owned by one live source binding. The existing lifecycle facade remains the attempt authority;
 /// this value never looks up a session, repairs history, publishes, persists, or starts work.

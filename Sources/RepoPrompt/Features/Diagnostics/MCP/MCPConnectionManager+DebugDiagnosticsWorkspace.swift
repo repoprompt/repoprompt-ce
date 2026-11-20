@@ -3,6 +3,7 @@
 import Foundation
 import MCP
 import RepoPromptFoundation
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 #if DEBUG

@@ -2,6 +2,7 @@ import Combine
 import Foundation
 import os
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 /// Table-driven precedence for the pure Agent transcript pane classifier (§4.4).
@@ -1021,7 +1022,7 @@ private extension XCTestCase {
         } catch {
             firstError = firstError ?? error
         }
-        await viewModel.prepareForWindowClose()
+        await viewModel.test_retireAndCancelFixture()
         await viewModel.test_drainSessionPersistenceAfterWindowClose()
         // Reset only after every producer/index/activation path has drained.
         viewModel.test_setSuppressesAgentSessionPersistence(nil)
@@ -1140,7 +1141,7 @@ private extension XCTestCase {
         // This counts debounce handles only, not pending workspace-listener flush tasks.
         trace.pendingSaveDebounceCountBeforeClose = viewModel.sessions.values.compactMap(\.saveDebounceTask).count
         trace.phase = "close-agent-mode"
-        await viewModel.prepareForWindowClose()
+        await viewModel.test_retireAndCancelFixture()
         trace.phase = "drain-session-persistence"
         await viewModel.test_drainSessionPersistenceAfterWindowClose()
         viewModel.test_afterTabActivationContinuation = nil
@@ -1301,6 +1302,45 @@ final class AgentTranscriptRestorationLifecycleTests: XCTestCase {
             )
             XCTAssertEqual(session.items.map(\.id), [localItem.id], "local items kept; disk payload not applied")
             XCTAssertEqual(fixture.viewModel.ui.transcript.snapshot.panePresentation, .transcript)
+        }
+    }
+
+    func testHydrationDriftCannotSettleAReplacedPresentationAttempt() async throws {
+        for failsRead in [false, true] {
+            try await withSavedSelectedTab { fixture in
+                let workspace = try XCTUnwrap(fixture.manager.activeWorkspace)
+                _ = try await AgentSessionDataService.shared.saveAgentSession(
+                    AgentSession(id: fixture.sessionID, name: "Saved", savedAt: Date()), for: workspace
+                )
+                fixture.viewModel.setAgentModeActive(true)
+                let activationGeneration = fixture.viewModel.test_sessionActivationGeneration
+                await fixture.gate.waitUntilEntered()
+                let session = try XCTUnwrap(fixture.viewModel.sessions[fixture.tabID])
+                let loading = try XCTUnwrap(session.persistedLoadTask)
+                guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
+                    workspaceID: workspace.id, sessionID: fixture.sessionID
+                ) else { return XCTFail("Fixture must own its writer") }
+                let original = try XCTUnwrap(fixture.viewModel.persistedLoadAttemptByTabID[session.tabID])
+                session.setItemsSilently([.init(kind: .user, text: "Local replacement", sequenceIndex: 0)], reason: .persistedSessionHydration)
+                let replacement = try XCTUnwrap(fixture.viewModel.test_replacePersistedLoadPresentationAttempt(for: session))
+                XCTAssertNotEqual(replacement.attemptID, original.attemptID)
+                XCTAssertTrue(writer.isCurrent, "The presentation gate must be independent of writer loss")
+                if failsRead {
+                    await fixture.gate.fail(CocoaError(.fileReadCorruptFile))
+                } else {
+                    await fixture.gate.open()
+                }
+                await loading.value
+                await fixture.completions.wait(tabID: fixture.tabID, generation: activationGeneration)
+                XCTAssertFalse(session.hasLoadedPersistedState)
+                guard case .pending = session.qualifiedRestorationReadiness else { return XCTFail("Obsolete presentation cannot publish a proof") }
+                XCTAssertEqual(session.items.map(\.text), ["Local replacement"])
+                guard case let .loading(current)? = fixture.viewModel.transcriptPresentationRecordsByTabID[session.tabID]?.phase else {
+                    return XCTFail("Old producer settled the replacement presentation")
+                }
+                XCTAssertEqual(current, replacement)
+                XCTAssertTrue(writer.isCurrent)
+            }
         }
     }
 
@@ -1479,7 +1519,15 @@ extension AgentTranscriptRestorationLifecycleTests {
 
             // Real rebind to a new incarnation (new scope), then admit its load through the real entry.
             fixture.viewModel.cancelPersistedLoad(for: session)
-            session.testInstallPersistentSessionBinding(sessionID: fixture.sessionID)
+            let workspaceID = try XCTUnwrap(session.persistentSessionBindingIdentity?.workspaceID)
+            _ = session.beginPersistentBindingTransition()
+            session.installPersistentSessionBinding(.init(
+                tabID: session.tabID, sessionID: fixture.sessionID, workspaceID: workspaceID
+            ))
+            guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
+                workspaceID: workspaceID, sessionID: fixture.sessionID
+            ) else { return XCTFail("The successor must be a scoped hydration owner") }
+            XCTAssertTrue(writer.session === session)
             let successorCall = Task { await fixture.viewModel.ensureSessionReady(tabID: fixture.tabID) }
             await fixture.gate.waitUntilEntered(count: 2)
             let successorLoad = try XCTUnwrap(session.persistedLoadTask)
@@ -2223,7 +2271,7 @@ extension AgentTranscriptRestorationLifecycleTests {
         } catch {
             firstError = firstError ?? error
         }
-        await viewModel.prepareForWindowClose()
+        await viewModel.test_retireAndCancelFixture()
         viewModel.test_afterTabActivationContinuation = nil
         await dataService.test_setAfterHydrationPrepareHook(nil)
         await dataService.test_setWorkspaceRootOverride(nil)
@@ -2328,7 +2376,7 @@ extension AgentTranscriptRestorationLifecycleTests {
         } catch {
             firstError = firstError ?? error
         }
-        await viewModel.prepareForWindowClose()
+        await viewModel.test_retireAndCancelFixture()
         viewModel.test_afterTabActivationContinuation = nil
         await dataService.test_setAfterHydrationPrepareHook(nil)
         await dataService.test_setWorkspaceRootOverride(nil)
@@ -2493,7 +2541,7 @@ extension AgentTranscriptRestorationLifecycleTests {
                         let marker = root.appendingPathComponent("joined-session-write")
                         try Data("settled".utf8).write(to: marker)
                         wroteBeforeRemoval = true
-                        viewModel?.scheduleSave(for: session.tabID)
+                        viewModel?.persistenceRuntime.scheduleSave(for: session.tabID)
                         return marker
                     }
                     fixture.viewModel.test_beforeSessionPersistenceDrainWait = {
@@ -3828,23 +3876,30 @@ extension AgentTranscriptRestorationLifecycleTests {
             let binding = session.persistentSessionBindingIdentity
             let transition = session.bindingTransitionGeneration
             let approval = AgentApprovalRequest(
-                requestID: .codex(.int(7)), method: "item/commandExecution/requestApproval",
+                requestID: .codex(.fixture(.int(7))), method: "item/commandExecution/requestApproval",
                 kind: .commandExecution, threadID: "thread", turnID: "turn", itemID: "pending"
             )
-            session.pendingApproval = approval
-            vm.syncTranscriptUIState()
             let incomingID = UUID()
             var incoming = AgentSession(id: incomingID, name: "Incoming", savedAt: Date())
             incoming.composeTabID = fixture.tabID
             _ = try await AgentSessionDataService.shared.saveAgentSession(incoming, for: workspace)
             let rebindGate = PrepareGate()
+            let prepared = expectation(description: "Routed rebind reaches payload preparation")
             await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook { id in
-                if id == incomingID { try await rebindGate.hold() }
+                if id == incomingID {
+                    prepared.fulfill()
+                    try await rebindGate.hold()
+                }
             }
-            // Real MCP routed activation suspends at payload preparation. The run starts waiting
-            // while suspended, so the post-prepare rebind rejects ownership after advancing currency.
+            // Introduce the approval only after preparation is held. A pending approval before
+            // admission legitimately makes the run active when approval sync projects a snapshot,
+            // so that setup could refuse before the gate and leave this test waiting forever.
             let routed = Task { await vm.activateRoutedAgentSession(tabID: fixture.tabID, sessionID: incomingID, workspace: workspace) }
-            await rebindGate.waitUntilEntered()
+            // PrepareGate.open is sticky, including when this expectation resumes before
+            // the actor registers hold(); do not reintroduce an unbounded entry wait here.
+            await fulfillment(of: [prepared], timeout: 3)
+            session.pendingApproval = approval
+            vm.syncTranscriptUIState()
             session.runState = .waitingForApproval
             await rebindGate.open()
             let result = await routed.value

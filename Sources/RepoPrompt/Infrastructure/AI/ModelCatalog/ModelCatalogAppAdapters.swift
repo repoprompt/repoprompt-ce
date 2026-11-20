@@ -1,0 +1,134 @@
+import Foundation
+import RepoPromptACPProviders
+import RepoPromptAIContracts
+import RepoPromptCodexProvider
+
+extension DevinModelCatalog {
+    static var current: DevinModelCatalog {
+        AgentModelCatalogRuntime.shared.acpRegistry.currentDevinCatalog()
+    }
+}
+
+extension AgentACPModelRegistry.Dependencies {
+    /// Construct operations without touching the store or advertised catalog until invoked.
+    static func app(invalidate: @escaping (AgentProviderKind) -> Void) -> Self {
+        Self(
+            loadAll: { ACPDynamicModelStore.loadAll() },
+            load: { ACPDynamicModelStore.load(providerID: $0) },
+            save: { ACPDynamicModelStore.save($0, for: $1) },
+            remove: { ACPDynamicModelStore.remove(providerID: $0) },
+            invalidate: invalidate
+        )
+    }
+}
+
+extension CursorACPModelPollingService.Registry {
+    static var app: Self {
+        Self(
+            update: { AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels($0, for: .cursor) },
+            snapshot: { AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: .cursor) },
+            snapshotAfterWarm: { await AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshotAfterWarmingStandardStore(for: .cursor) }
+        )
+    }
+}
+
+extension CursorACPModelPollingService {
+    static let shared = CursorACPModelPollingService(
+        client: CursorACPControllerModelDiscoveryClient(), registry: .app
+    )
+}
+
+extension GrokBuildACPModelPollingService {
+    static let shared = GrokBuildACPModelPollingService(
+        client: GrokBuildACPControllerModelDiscoveryClient(),
+        registry: AgentModelCatalogRuntime.shared.acpRegistry,
+        logFailure: { message in
+            if AgentRuntimeProviderService.enableDebugLogging {
+                print("[GrokBuildACPModelPolling] refresh failed: \(message)")
+            }
+        }
+    )
+}
+
+extension OpenCodeACPModelPollingService.Registry {
+    static var app: Self {
+        Self(
+            update: { AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels($0, for: .openCode) },
+            snapshot: { AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: .openCode) },
+            snapshotAfterWarm: { await AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshotAfterWarmingStandardStore(for: .openCode) }
+        )
+    }
+}
+
+extension OpenCodeACPModelPollingService {
+    static let shared = OpenCodeACPModelPollingService(
+        client: OpenCodeACPControllerModelDiscoveryClient(), registry: .app
+    )
+}
+
+/// App convenience boundaries retain the existing lazy persisted-catalog lookup.
+/// The interpretation owners accept that lookup explicitly and never read app storage.
+extension CodexModelSpecifier {
+    init(raw: String?, discoveredRecords: @autoclosure () -> [CodexDynamicModelRecord] = CodexDynamicModelStore.load()) {
+        self.init(raw: raw, catalogRecords: discoveredRecords)
+    }
+
+    static func splitLegacyModelID(
+        _ raw: String?,
+        discoveredRecords: @autoclosure () -> [CodexDynamicModelRecord] = CodexDynamicModelStore.load()
+    ) -> (baseModel: String?, reasoningEffort: ReasoningEffort?, serviceTier: String?) {
+        splitLegacyModelID(raw, catalogRecords: discoveredRecords)
+    }
+}
+
+extension CodexServiceTierVariantCatalog {
+    static func isFastVariant(rawModel: String?) -> Bool {
+        isFastVariant(rawModel: rawModel, catalogRecords: { CodexDynamicModelStore.load() })
+    }
+
+    static func serviceTierAwareBaseID(for rawModel: String) -> String {
+        serviceTierAwareBaseID(for: rawModel, catalogRecords: { CodexDynamicModelStore.load() })
+    }
+
+    static func fastVariantID(
+        baseModelID: String,
+        reasoningEffort: CodexReasoningEffort?,
+        discoveredRecords: @autoclosure () -> [CodexDynamicModelRecord] = CodexDynamicModelStore.load()
+    ) -> String? {
+        fastVariantID(baseModelID: baseModelID, reasoningEffort: reasoningEffort, catalogRecords: discoveredRecords)
+    }
+}
+
+extension CodexDynamicModelMapper {
+    static func options(from remoteModels: [CodexAppServerClient.RemoteModel]) -> [CodexDynamicModelOption] {
+        let records = remoteModels.map { model in
+            CodexDynamicModelRecord(
+                id: model.id,
+                model: model.model,
+                displayName: model.displayName,
+                description: model.description,
+                isDefault: model.isDefault,
+                supportedReasoningEfforts: model.supportedReasoningEfforts.map {
+                    CodexDynamicReasoningRecord(reasoningEffort: $0.reasoningEffort, description: $0.description)
+                },
+                defaultReasoningEffort: model.defaultReasoningEffort,
+                serviceTiers: model.serviceTiers
+            )
+        }
+        return options(from: records)
+    }
+
+    static func options(from records: [CodexDynamicModelRecord]) -> [CodexDynamicModelOption] {
+        // The records being mapped are the catalog snapshot for the whole projection;
+        // nested parsing and labels must not consult persistence again.
+        options(from: records, catalogRecords: { records })
+    }
+
+    static func optionPrecedes(_ lhs: CodexDynamicModelOption, _ rhs: CodexDynamicModelOption) -> Bool {
+        optionPrecedes(lhs, rhs, catalogRecords: { [] })
+    }
+
+    static func displayName(forModelID id: String, records: [CodexDynamicModelRecord]) -> String? {
+        displayName(forModelID: id, records: records, catalogRecords: { records })
+    }
+}

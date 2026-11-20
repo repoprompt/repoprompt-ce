@@ -2,11 +2,17 @@ import Darwin
 import Foundation
 import JSONSchema
 import MCP
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
 @testable import RepoPromptApp
+import RepoPromptClaudeProvider
+import RepoPromptCodexProvider
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
+@testable import RepoPromptMCPServer
 import RepoPromptSettingsCore
 import RepoPromptShared
+@testable import RepoPromptWorkspaceContext
 import XCTest
 
 #if DEBUG
@@ -110,7 +116,7 @@ import XCTest
                 var terminalTask: Task<Void, Never>?
                 var requestTask: Task<PersistentMCPTestRPCResponse, Error>?
                 var siblingTask: Task<PersistentMCPTestRPCResponse, Error>?
-                var translator = ClaudeSDKNDJSONTranslator()
+                var translator = ClaudeSDKNDJSONTranslator(isRepoPromptToolName: { MCPIntegrationHelper.isRepoPromptToolName($0) })
                 var nativeObserverTask: Task<Void, Never>?
                 var nativeDelivery: XCTestExpectation?
                 var nativeLocalIDs: [UUID] = []
@@ -457,7 +463,7 @@ import XCTest
                 var owner = session.beginRunAttempt(source: "W0-candidate-native-metadata")
                 session.quietLedger.markRoutineWake(owner: owner, wakeID: UUID())
                 let handler = harness.host.test_claudeCoordinator.testToolTrackingHandler(for: session)
-                var translator = ClaudeSDKNDJSONTranslator()
+                var translator = ClaudeSDKNDJSONTranslator(isRepoPromptToolName: { MCPIntegrationHelper.isRepoPromptToolName($0) })
                 var contexts: [ToolInvocationContext] = []
                 let name = "mcp__\(MCPIntegrationHelper.repoPromptMCPServerName)__read_file"
                 let path = fixture.contextA.fileURL.path
@@ -576,6 +582,59 @@ import XCTest
                     server.setBeforeDomainReadContextResolutionForTesting(nil)
                     await manager.debugSetDomainPeerIdentityForTesting(connectionID: endpoint.connectionID, identity: nil)
                     await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
+        /// A cancelled connection lookup belongs to its registration, not a reused run ID.
+        func testCancelledConnectionWaiterCannotUnregisterSameRunSuccessorObserver() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease, domainRuntime: AppDomainRuntimeComposition.shared.runtime)
+                let endpoint = try fixture.endpointA()
+                let manager = fixture.networkManager
+                let tracker = AgentToolTracker()
+                let gate = TestReleaseFence(name: "predecessor connection lookup")
+                let runID = UUID()
+                var calls: [UUID] = []
+                var completions: [UUID] = []
+                var waiter: Task<Void, Never>?
+                @MainActor
+                func cleanup() async throws {
+                    gate.release()
+                    waiter?.cancel()
+                    await waiter?.value
+                    await tracker.stop()
+                    await manager.debugSetDomainPeerIdentityForTesting(connectionID: endpoint.connectionID, identity: nil)
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                }
+                do {
+                    try await Self.prepareCanonicalReadFixture(fixture, endpoint: endpoint, context: fixture.contextA)
+                    await manager.debugSeedConnectionRunRouting(connectionID: endpoint.connectionID, runID: runID, windowID: fixture.contextA.window.windowID)
+                    let predecessorToken = await tracker.registerEnhancedObserver(runID: runID, onCalled: { _, _, _ in }, onCompleted: { _, _, _, _, _ in })
+                    await tracker.setBeforeConnectionLookupForTesting { await gate.enterAndWait() }
+                    let predecessor = Task { await tracker.waitForConnectionAfterRegistration(runID: runID, observerToken: predecessorToken, clientNameHint: nil) }
+                    waiter = predecessor
+                    guard await gate.waitUntilEntered() else { throw CancellationError() }
+                    await tracker.stop(ifTracking: runID)
+                    await tracker.registerEnhancedObserver(runID: runID, onCalled: { invocation, _, _ in
+                        await MainActor.run { calls.append(invocation) }
+                    }, onCompleted: { invocation, _, _, _, _ in
+                        await MainActor.run { completions.append(invocation) }
+                    })
+                    // Reproduce the controller's same-run attempt replacement: the old cancelled
+                    // lookup settles only after the new observer has been registered.
+                    predecessor.cancel()
+                    await predecessor.value
+                    waiter = nil
+                    let response = try await endpoint.callTool(name: "read_file", arguments: ["path": fixture.contextA.fileURL.path])
+                    XCTAssertTrue(try Self.toolResultText(response).contains(fixture.contextA.sentinel))
+                    XCTAssertEqual(calls.count, 1, "Predecessor cancellation must not remove the successor observer")
+                    XCTAssertEqual(completions, calls)
+                    try await cleanup()
+                } catch {
+                    try? await cleanup()
                     throw error
                 }
             }
@@ -789,10 +848,10 @@ import XCTest
                     MCPLifecycleDiagnostics.shared.beginCapture(connectionID: endpointA.connectionID)
                     MCPLifecycleDiagnostics.shared.beginCapture(connectionID: sibling.connectionID)
                     let authorityA = try XCTUnwrap(
-                        fixture.contextA.window.mcpServer.tabContextByConnectionID[endpointA.connectionID]?.frozenFileToolAuthority
+                        fixture.contextA.window.mcpServer.runRouteBindings.tabContextByConnectionID[endpointA.connectionID]?.frozenFileToolAuthority
                     )
                     let authorityB = try XCTUnwrap(
-                        fixture.contextB.window.mcpServer.tabContextByConnectionID[sibling.connectionID]?.frozenFileToolAuthority
+                        fixture.contextB.window.mcpServer.runRouteBindings.tabContextByConnectionID[sibling.connectionID]?.frozenFileToolAuthority
                     )
                     let rootsA = await fixture.contextA.window.workspaceFileContextStore.rootRefs(scope: .visibleWorkspace)
                     let rootsB = await fixture.contextB.window.workspaceFileContextStore.rootRefs(scope: .visibleWorkspace)
@@ -908,13 +967,13 @@ import XCTest
             do {
                 let connectionID = try XCTUnwrap(packet.connectionID, file: file, line: line)
                 let bound = try XCTUnwrap(
-                    context.window.mcpServer.tabContextByConnectionID[connectionID]?.frozenFileToolAuthority,
+                    context.window.mcpServer.runRouteBindings.tabContextByConnectionID[connectionID]?.frozenFileToolAuthority,
                     file: file, line: line
                 )
                 XCTAssertTrue(bound.hasSameRoutingAuthority(as: expected), file: file, line: line)
                 // Exercise the existing frozen-authority consumer with the captured
                 // packet metadata; no cache-miss path or synthetic local scope.
-                let consumed = try await context.window.mcpServer.requiredFileToolLookupContext(from: packet.metadata)
+                let consumed = try await context.window.mcpServer.requiredFileToolLookupContext(route: context.window.mcpServer.routeResources, from: packet.metadata)
                 XCTAssertTrue(consumed.hasSameRoutingAuthority(as: expected), file: file, line: line)
                 XCTAssertEqual(consumed.rootCatalogSnapshot, expected.rootCatalogSnapshot, file: file, line: line)
                 XCTAssertEqual(consumed.canonicalRoots, expected.canonicalRoots, file: file, line: line)
@@ -1140,6 +1199,7 @@ import XCTest
             let runID: UUID
             let sessionID: UUID
             let originalName: String
+            let fileURL: URL
         }
 
         private func assertQueuedSessionAdminPolicy(
@@ -1179,6 +1239,9 @@ import XCTest
                         await manager.cleanupRunRoutingState(for: agent.runID, windowID: agent.context.window.windowID)
                     }
                     await fixture.cleanup()
+                    for agent in agents {
+                        try await AgentSessionDataService.shared.deleteAgentSessionFile(agent.fileURL)
+                    }
                     try await fixture.assertCleanedUp()
                 }
 
@@ -1298,7 +1361,7 @@ import XCTest
                         XCTAssertFalse(scopes.hasLiveScope(grantedTo: a.sessionID))
                     }
                     if change != .removed {
-                        XCTAssertEqual(a.context.window.mcpServer.connectionIDByRunID[a.runID], a.endpoint.connectionID)
+                        XCTAssertEqual(a.context.window.mcpServer.runRouteBindings.connectionIDByRunID[a.runID], a.endpoint.connectionID)
                         let current = await manager.debugRunPolicyState(for: a.runID)
                         XCTAssertEqual(try XCTUnwrap(current).purpose, .agentModeRun)
                     }
@@ -1354,7 +1417,7 @@ import XCTest
                             name: MCPWindowToolName.readFile, arguments: ["path": a.context.fileURL.path]
                         )
                         XCTAssertTrue(try Self.toolResultText(read).contains(a.context.sentinel), "Policy denial must preserve this connection's allowed reads")
-                        XCTAssertEqual(a.context.window.mcpServer.connectionIDByRunID[a.runID], a.endpoint.connectionID)
+                        XCTAssertEqual(a.context.window.mcpServer.runRouteBindings.connectionIDByRunID[a.runID], a.endpoint.connectionID)
                     }
                 } catch {
                     failure = error
@@ -1389,13 +1452,21 @@ import XCTest
             _ fixture: PersistentMCPTestFixture, context: PersistentMCPTestContext
         ) async throws -> QueuedSessionAdminAgent {
             try await fixture.registerDomainWorkspace(context)
-            try await activateWorkspace(for: context)
             let window = context.window
+            let configuredWorkspace = try XCTUnwrap(window.workspaceManager.workspaces.first { $0.id == context.workspaceID })
+            let configuredTab = try XCTUnwrap(configuredWorkspace.composeTabs.first { $0.id == context.tabID })
+            let sessionID = UUID()
+            // This is restored history, not a transient index injection. Workspace activation may
+            // finish its real index refresh after socket setup; it must find the same durable row.
+            let fileURL = try await AgentSessionDataService.shared.saveAgentSession(AgentSession(
+                id: sessionID, workspaceID: configuredWorkspace.id, composeTabID: context.tabID,
+                name: configuredTab.name, agentKind: AgentProviderKind.claudeCode.rawValue, autoEditEnabled: false
+            ), for: configuredWorkspace)
+            try await activateWorkspace(for: context)
             let vm = window.agentModeViewModel
             let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
             let tab = try XCTUnwrap(workspace.composeTabs.first { $0.id == context.tabID })
             let session = vm.session(for: context.tabID)
-            let sessionID = UUID()
             // Install runtime and carrier together. Prewriting the carrier would conflict
             // with a runtime already materialized by workspace activation.
             _ = try XCTUnwrap(vm.test_installPersistentSessionBinding(
@@ -1405,13 +1476,6 @@ import XCTest
             XCTAssertEqual(boundWorkspace.composeTabs.first { $0.id == context.tabID }?.activeAgentSessionID, sessionID)
             window.promptManager.loadComposeTabsFromWorkspace(boundWorkspace, syncPromptText: true)
             let name = tab.name
-            let entry = AgentSessionIndexEntry(
-                id: sessionID, tabID: context.tabID, name: name, savedAt: Date(timeIntervalSince1970: 0),
-                itemCount: 0, autoEditEnabled: false, hasUnknownConversationContent: false,
-                isMCPOriginated: false, worktreeBindingSummaries: [], activeWorktreeMergeSummaries: []
-            )
-            let owner = AgentModeViewModel.SessionIndexOwner(workspaceID: workspace.id, activationEpoch: 1)
-            vm.test_installSessionIndexSnapshot([sessionID: entry], owner: owner, latestOwner: owner, activeWorkspace: boundWorkspace)
             session.selectedAgent = .claudeCode
             session.hasLoadedPersistedState = true
             session.oversight.autoWakeOnUpdates = false
@@ -1434,10 +1498,15 @@ import XCTest
                 label: "queued-policy", networkManager: fixture.networkManager, clientName: clientName,
                 requiredToolNames: [MCPWindowToolName.sessionAdmin, MCPWindowToolName.readFile]
             )
-            XCTAssertEqual(window.mcpServer.connectionIDByRunID[runID], endpoint.connectionID)
+            XCTAssertEqual(window.mcpServer.runRouteBindings.connectionIDByRunID[runID], endpoint.connectionID)
             let resolved = try AgentSessionLinkEndpointTestSupport.endpoint(vm, tabID: context.tabID)
             XCTAssertEqual(resolved.sessionID, sessionID)
-            return QueuedSessionAdminAgent(context: context, endpoint: endpoint, runID: runID, sessionID: sessionID, originalName: name)
+            // Scope admission needs owner-valid placement, not the sidebar's UI restore join.
+            let placementReady = await waitUntil {
+                OpenWindowsDelegationProvenanceSource().placement(for: sessionID)?.workspaceID == context.workspaceID
+            }
+            XCTAssertTrue(placementReady, "Restored fixture placement must be published by the real workspace index")
+            return QueuedSessionAdminAgent(context: context, endpoint: endpoint, runID: runID, sessionID: sessionID, originalName: name, fileURL: fileURL)
         }
 
         func testExpiredClientEnvelopeRejectsBeforeProviderAndJournalForBothPublicTools() async throws {
@@ -2517,9 +2586,10 @@ import XCTest
                     )
                     XCTAssertFalse(bindResponse.rawJSON.contains("\"isError\":true"), bindResponse.rawJSON)
                     let authority = try XCTUnwrap(
-                        server.tabContextByConnectionID[createdEndpoint.connectionID]?.frozenFileToolAuthority
+                        server.runRouteBindings.tabContextByConnectionID[createdEndpoint.connectionID]?.frozenFileToolAuthority
                     )
                     try server.bindTabForConnection(
+                        route: server.routeResources,
                         connectionID: createdEndpoint.connectionID,
                         clientName: clientName,
                         tabID: fixture.contextA.tabID,
@@ -2752,7 +2822,7 @@ import XCTest
                     XCTAssertTrue(getText.contains(secondURL.lastPathComponent), getText)
 
                     let canonical = try XCTUnwrap(
-                        server.tabContextByConnectionID[createdEndpoint.connectionID]?.selection
+                        server.runRouteBindings.tabContextByConnectionID[createdEndpoint.connectionID]?.selection
                     )
                     XCTAssertEqual(
                         Set(canonical.selectedPaths),
@@ -4472,7 +4542,7 @@ import XCTest
             let object = try responseObject(from: bind)
             let result = try XCTUnwrap(object["result"] as? [String: Any])
             XCTAssertNotEqual(result["isError"] as? Bool, true)
-            await context.window.mcpServer.domainRoutingPublishTask?.value
+            await context.window.mcpServer.routeResources.settleRoutingPublications()
         }
 
         private static func prepareProtectedExportFixture(
@@ -4505,7 +4575,7 @@ import XCTest
             )
             let bindText = try toolResultText(bindResponse)
             XCTAssertFalse(bindText.contains("Error:"), bindText)
-            await context.window.mcpServer.domainRoutingPublishTask?.value
+            await context.window.mcpServer.routeResources.settleRoutingPublications()
         }
 
         private static func assertPromptExportDelayedWatchdogCompletion(
@@ -5231,14 +5301,17 @@ import XCTest
         let rootURL: URL
         let contextA: PersistentMCPTestContext
         let contextB: PersistentMCPTestContext
+        private let storage: WorkspaceFixtureStorage
         private var primaryPersistentMCPTestEndpoint: PersistentMCPTestEndpoint?
         private var cleanedUp = false
 
         private init(
             rootURL: URL,
             contextA: PersistentMCPTestContext,
-            contextB: PersistentMCPTestContext
+            contextB: PersistentMCPTestContext,
+            storage: WorkspaceFixtureStorage
         ) {
+            self.storage = storage
             self.rootURL = rootURL
             self.contextA = contextA
             self.contextB = contextB
@@ -5276,6 +5349,7 @@ import XCTest
             await windowA.workspaceManager.awaitInitialized()
             await windowB.workspaceManager.awaitInitialized()
 
+            let storage = WorkspaceFixtureStorage(root: rootURL)
             var contextA: PersistentMCPTestContext?
             var contextB: PersistentMCPTestContext?
             var constructedFixture: PersistentMCPTestFixture?
@@ -5286,6 +5360,7 @@ import XCTest
                     sentinel: "let distinctMCPConnectionSentinelA = \"sentinel-a\"",
                     tabID: UUID(),
                     window: windowA,
+                    storage: storage,
                     label: "A"
                 )
                 contextB = try await makeContext(
@@ -5294,6 +5369,7 @@ import XCTest
                     sentinel: "let distinctMCPConnectionSentinelB = \"sentinel-b\"",
                     tabID: UUID(),
                     window: windowB,
+                    storage: storage,
                     label: "B"
                 )
                 try await ensureRequiredCatalogAndEnableTransport(
@@ -5302,7 +5378,8 @@ import XCTest
                 let fixture = try PersistentMCPTestFixture(
                     rootURL: rootURL,
                     contextA: XCTUnwrap(contextA),
-                    contextB: XCTUnwrap(contextB)
+                    contextB: XCTUnwrap(contextB),
+                    storage: storage
                 )
                 constructedFixture = fixture
                 fixture.primaryPersistentMCPTestEndpoint = try await PersistentMCPTestEndpoint.make(
@@ -5314,10 +5391,14 @@ import XCTest
                 if let constructedFixture {
                     await constructedFixture.cleanup()
                 } else {
+                    // Even a partially constructed context can already own startup/save work.
+                    await windowB.tearDown()
+                    await windowA.tearDown()
                     if let contextB { await cleanupContext(contextB) }
                     if let contextA { await cleanupContext(contextA) }
                     WindowStatesManager.shared.unregisterWindowState(windowB)
                     WindowStatesManager.shared.unregisterWindowState(windowA)
+                    await storage.remove()
                     try? FileManager.default.removeItem(at: rootURL)
                 }
                 throw error
@@ -5338,12 +5419,14 @@ import XCTest
                 await networkManager.clearClientConnectionPolicy(for: endpoint.clientName)
                 await networkManager.debugClearPersistedRoutingState(for: endpoint.clientName)
                 contextA.window.mcpServer.removeTabContext(
+                    route: contextA.window.mcpServer.routeResources,
                     forConnectionID: endpoint.connectionID,
                     clientName: endpoint.clientName,
                     windowID: nil,
                     runID: nil
                 )
                 contextB.window.mcpServer.removeTabContext(
+                    route: contextB.window.mcpServer.routeResources,
                     forConnectionID: endpoint.connectionID,
                     clientName: endpoint.clientName,
                     windowID: nil,
@@ -5361,6 +5444,7 @@ import XCTest
             contextA.window.workspaceManager.workspaces.removeAll { $0.id == contextA.workspaceID }
             WindowStatesManager.shared.unregisterWindowState(contextB.window)
             WindowStatesManager.shared.unregisterWindowState(contextA.window)
+            await storage.remove()
             try? FileManager.default.removeItem(at: rootURL)
         }
 
@@ -5377,8 +5461,8 @@ import XCTest
                 XCTAssertNil(policy.windowID)
                 let pendingPolicies = await networkManager.debugPendingPolicySnapshot(for: endpoint.clientName)
                 XCTAssertTrue(pendingPolicies.isEmpty)
-                XCTAssertEqual(contextA.window.mcpServer.connectionBindingSnapshot(forConnection: endpoint.connectionID).bindingKind, .unbound)
-                XCTAssertEqual(contextB.window.mcpServer.connectionBindingSnapshot(forConnection: endpoint.connectionID).bindingKind, .unbound)
+                XCTAssertEqual(contextA.window.mcpServer.connectionBindingSnapshot(route: contextA.window.mcpServer.routeResources, forConnection: endpoint.connectionID).bindingKind, .unbound)
+                XCTAssertEqual(contextB.window.mcpServer.connectionBindingSnapshot(route: contextB.window.mcpServer.routeResources, forConnection: endpoint.connectionID).bindingKind, .unbound)
                 do {
                     _ = try await endpoint.client.request(method: "tools/list", params: [:])
                     XCTFail("closed socket unexpectedly accepted a request")
@@ -5396,6 +5480,7 @@ import XCTest
             sentinel: String,
             tabID: UUID,
             window: WindowState,
+            storage: WorkspaceFixtureStorage,
             label: String
         ) async throws -> PersistentMCPTestContext {
             let sourceDirectory = rootURL.appendingPathComponent("Sources", isDirectory: true)
@@ -5407,6 +5492,7 @@ import XCTest
                 repoPaths: [rootURL.path]
             )
             configuredWorkspace.isEphemeral = true
+            configuredWorkspace = storage.isolate(configuredWorkspace)
             configuredWorkspace.composeTabs = [
                 ComposeTabState(id: tabID, name: "Distinct MCP Connection \(label)")
             ]
@@ -5867,7 +5953,7 @@ import XCTest
         }
 
         private func readerLoop() {
-            var buffer = Data()
+            var buffer = MCPNewlineFrameBuffer()
             while true {
                 let activeFD = withStateLock { isClosed ? -1 : fd }
                 guard activeFD >= 0 else { return }
@@ -5896,9 +5982,7 @@ import XCTest
                 }
                 if readCount > 0 {
                     buffer.append(contentsOf: bytes.prefix(readCount))
-                    while let newline = buffer.firstIndex(of: 0x0A) {
-                        let line = Data(buffer[..<newline])
-                        buffer.removeSubrange(buffer.startIndex ... newline)
+                    while let line = buffer.nextFrame() {
                         guard handle(line) else { return }
                     }
                     continue

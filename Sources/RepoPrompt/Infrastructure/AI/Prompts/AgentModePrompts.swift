@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 
 // SEARCH-HELPER: agent mode prompt, explore prompt, engineer prompt, role-specific prompt, export delegation audience, oracle export guidance
 // Related:
@@ -75,6 +77,8 @@ enum AgentModePrompts {
         - Fast, concise, direct — front-load the most important findings
         - Answer the question asked, then stop
         - Use bullet points for multi-part findings
+
+        \(Fragments.worktreePlacementPolicy(readOnly: true))
 
         **Workflow**
 
@@ -164,7 +168,7 @@ enum AgentModePrompts {
         - `workspace_context` - Get workspace snapshot (prompt + selection + tokens)
         - `prompt` - Get or modify the shared prompt
         - `ask_oracle` - Consult a second AI for planning or review
-        - `oracle_chat_log` - Recover Oracle context after compaction (current Agent run's chats only)
+        - `oracle_chat_log` - Legacy reads recover Oracle context after compaction (current Agent run's chats only). \(OracleBackgroundContract.promptQualification)
 
         *Read-only Sub-agent Probes:*
         - `agent_explore` - Launch/control short read-only explore child agents (`start`, `poll`, `wait`, `cancel` only; pass `messages` to start several probes in one call)
@@ -174,6 +178,8 @@ enum AgentModePrompts {
 
         *User Interaction:*
         - `ask_user` - Ask the user a question when you need clarification\(toolSuffix)
+
+        \(Fragments.worktreePlacementPolicy())
 
         **Workflow Guidance**
 
@@ -332,6 +338,25 @@ enum AgentModePrompts {
             case .none:
                 ""
             }
+        }
+
+        /// Provider-independent policy: shell access and historical memory must not turn an
+        /// agent-chosen scratch location into user authorization for a Git checkout there.
+        static func worktreePlacementPolicy(readOnly: Bool = false) -> String {
+            let placement = """
+            **Worktree Placement**
+            - Never create a Git worktree or checkout in `/tmp`, `/private/tmp`, `/var/tmp`, `$TMPDIR`, macOS `/var/folders` temporary directories, or symlink aliases of temporary locations unless the user explicitly requests that location in the current conversation.
+            - A dirty checkout, a general request for isolation, sandbox-writable directories, previous sessions, memories, and examples do not authorize a temporary worktree location. Preserve unrelated user edits; do not create a worktree merely because the checkout is dirty.
+            - A worktree-tool refusal is not permission to bypass it with shell `git worktree add`, native tools, scripts, or an escalation. Report the refusal; do not retry the refused mutation through another execution surface.
+            """
+            if readOnly {
+                return placement + "\n- You are read-only: do not create worktrees or checkouts by any means."
+            }
+            return placement + """
+
+            - When an isolated worktree is needed and authorized, use `manage_worktree` with `op: \"create\"` and omit `path` to use the app-managed `.repoprompt-worktrees` container beside the repository. For delegated creation, omit `worktree_path` as well. Do not ask the user to choose a location for ordinary managed creation. If the required tool is unavailable, report that limitation rather than inventing a shell destination.
+            - Supply an explicit `path` or `worktree_path` only for a user-requested location. Setting `allow_external_path` or `allow_external_worktree_path` yourself is not evidence of user consent.
+            """
         }
 
         /// Provider-specific read policy guidance.

@@ -1,5 +1,7 @@
 import Foundation
+import RepoPromptAIContracts
 @testable import RepoPromptApp
+import RepoPromptCodexProvider
 import XCTest
 
 final class AgentCodexModelRegistryCacheTests: XCTestCase {
@@ -30,7 +32,7 @@ final class AgentCodexModelRegistryCacheTests: XCTestCase {
     }
 
     func testSpeedOnlyRefreshInvalidatesPickerAndPersistsCapabilities() {
-        let registry = AgentCodexModelRegistry()
+        let registry = AgentCodexModelRegistry(invalidate: { AgentModelCatalogRuntime.shared.invalidate(.codexExec) })
         let persistenceKey = "CodexDynamicModelRecords"
         let originalPersistence = UserDefaults.standard.object(forKey: persistenceKey)
         defer { UserDefaults.standard.set(originalPersistence, forKey: persistenceKey) }
@@ -61,33 +63,9 @@ final class AgentCodexModelRegistryCacheTests: XCTestCase {
         XCTAssertFalse(registry.resolvedOptions(staticOptions: []).contains { $0.rawValue.hasPrefix("future-model-ultrafast") })
     }
 
-    func testPreferredModelSnapshotsDoNotReuseAnotherCatalogsOptions() {
-        let registry = AgentCodexModelRegistry()
-        let first = remoteModel(id: "future-alpha", displayName: "Alpha", isDefault: true)
-        let second = remoteModel(id: "future-beta", displayName: "Beta", isDefault: false)
-        let changedFirst = remoteModel(id: "future-alpha", displayName: "Alpha Updated", isDefault: false)
-
-        let firstOptions = registry.resolvedOptions(staticOptions: [], preferredLiveModels: [first])
-        XCTAssertEqual(discoveredOptions(firstOptions).map(\.rawValue), ["future-alpha"])
-        XCTAssertEqual(discoveredOptions(firstOptions).map(\.displayName), ["Alpha"])
-        XCTAssertEqual(discoveredOptions(firstOptions).map(\.isProviderDefault), [true])
-
-        let secondOptions = registry.resolvedOptions(staticOptions: [], preferredLiveModels: [second])
-        XCTAssertEqual(discoveredOptions(secondOptions).map(\.rawValue), ["future-beta"])
-        XCTAssertEqual(discoveredOptions(secondOptions).map(\.displayName), ["Beta"])
-
-        let changedOptions = registry.resolvedOptions(staticOptions: [], preferredLiveModels: [changedFirst])
-        XCTAssertEqual(discoveredOptions(changedOptions).map(\.displayName), ["Alpha Updated"])
-        XCTAssertEqual(discoveredOptions(changedOptions).map(\.isProviderDefault), [false])
-
-        let repeatedOptions = registry.resolvedOptions(staticOptions: [], preferredLiveModels: [first])
-        XCTAssertEqual(discoveredOptions(repeatedOptions).map(\.displayName), ["Alpha"])
-        XCTAssertEqual(discoveredOptions(repeatedOptions).map(\.isProviderDefault), [true])
-    }
-
     func testInvalidationRejectsPausedProducerWithoutOverwritingNewCatalogue() async throws {
-        let registry = AgentCodexModelRegistry.shared
-        let catalogue = AgentAdvertisedModelCatalog.shared
+        let registry = AgentModelCatalogRuntime.shared.codexRegistry
+        let catalogue = AgentModelCatalogRuntime.shared
         let originalModels = registry.currentLiveModels()
         let persistenceKey = "CodexDynamicModelRecords"
         let originalPersistence = UserDefaults.standard.object(forKey: persistenceKey)
@@ -103,7 +81,7 @@ final class AgentCodexModelRegistryCacheTests: XCTestCase {
         let producer = Task.detached {
             // The generation must precede the source read, exactly as in options(for:).
             let generation = catalogue.productionGeneration(for: .codexExec)
-            let options = AgentCodexModelRegistry.shared.resolvedOptions(staticOptions: [])
+            let options = AgentModelCatalogRuntime.shared.codexRegistry.resolvedOptions(staticOptions: [])
             snapshotRead.fulfill()
             for await _ in resume.stream {
                 break
@@ -114,7 +92,7 @@ final class AgentCodexModelRegistryCacheTests: XCTestCase {
         registry.updateLiveModels([remoteModel(id: "current-new", displayName: "New", isDefault: true)])
         let availability = AgentModelCatalog.AvailabilityContext()
         XCTAssertThrowsError(try catalogue.selection("codexExec:paused-old", availability: availability)) { error in
-            XCTAssertEqual(error as? AgentAdvertisedModelCatalog.AdmissionError, .catalogueUnavailable)
+            XCTAssertEqual(error as? AgentModelCatalogRuntime.AdmissionError, .catalogueUnavailable)
         }
         _ = AgentModelCatalog.options(for: .codexExec, availability: availability)
         resume.continuation.yield(())
@@ -125,10 +103,6 @@ final class AgentCodexModelRegistryCacheTests: XCTestCase {
             try catalogue.selection("codexExec:current-new", availability: availability).storedModelRaw,
             "current-new"
         )
-    }
-
-    private func discoveredOptions(_ options: [AgentModelOption]) -> [AgentModelOption] {
-        options.filter { !$0.isPlaceholderDefault }
     }
 
     private func remoteModel(id: String, displayName: String, isDefault: Bool) -> CodexAppServerClient.RemoteModel {
@@ -193,7 +167,7 @@ final class CodexModelPollingServiceTests: XCTestCase {
 
     @MainActor
     func testRefreshReportsUpdatedUnchangedEmptyAndFailure() async {
-        let registry = AgentCodexModelRegistry.shared
+        let registry = AgentModelCatalogRuntime.shared.codexRegistry
         let previousModels = registry.currentLiveModels()
         let previousStoredRecords = CodexDynamicModelStore.load()
         let restoreModels = previousModels.isEmpty ? remoteModels(from: previousStoredRecords) : previousModels
@@ -223,7 +197,7 @@ final class CodexModelPollingServiceTests: XCTestCase {
 
     @MainActor
     func testCancelledRefreshReportsCancellationWithoutPublishing() async {
-        let previousModels = AgentCodexModelRegistry.shared.currentLiveModels()
+        let previousModels = AgentModelCatalogRuntime.shared.codexRegistry.currentLiveModels()
         let client = GatedClient(models: [remoteModel(id: "cancelled-codex", displayName: "Cancelled Codex")])
         let service = CodexModelPollingService(client: client)
         let refresh = Task { await service.refreshNow() }
@@ -234,13 +208,13 @@ final class CodexModelPollingServiceTests: XCTestCase {
 
         let outcome = await refresh.value
         XCTAssertEqual(outcome, .cancelled)
-        XCTAssertEqual(AgentCodexModelRegistry.shared.currentLiveModels(), previousModels)
+        XCTAssertEqual(AgentModelCatalogRuntime.shared.codexRegistry.currentLiveModels(), previousModels)
     }
 
     @MainActor
     func testLateRefreshReplyCannotPublishAfterManagedSignOutBegins() async {
         let fence = CodexManagedSessionFence.shared
-        let previousModels = AgentCodexModelRegistry.shared.currentLiveModels()
+        let previousModels = AgentModelCatalogRuntime.shared.codexRegistry.currentLiveModels()
         let resetToken = fence.beginLogout()
         fence.finishLogout(token: resetToken, succeeded: false)
         let client = GatedClient(models: [remoteModel(id: "late-codex", displayName: "Late Codex")])
@@ -254,7 +228,7 @@ final class CodexModelPollingServiceTests: XCTestCase {
         let outcome = await refresh.value
         XCTAssertEqual(outcome, .skipped)
         XCTAssertEqual(
-            AgentCodexModelRegistry.shared.currentLiveModels(),
+            AgentModelCatalogRuntime.shared.codexRegistry.currentLiveModels(),
             previousModels,
             "a model/list reply captured before sign-out must not repopulate the registry"
         )

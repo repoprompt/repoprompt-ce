@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptFileSystem
 import RepoPromptFoundation
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 struct MetaInstruction {

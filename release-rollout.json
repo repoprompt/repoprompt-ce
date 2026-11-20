@@ -1,9 +1,17 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "channel": "stable",
-  "currentRole": "legacy",
-  "eligibilityProfile": "stable-rollout-v1",
+  "currentRole": "transition",
+  "eligibilityProfile": "stable-shared-tip-preparer-v1",
   "expectedMigrationPhase": "disabled",
-  "expectedSigningIdentity": "legacy",
-  "predecessors": []
+  "expectedSigningIdentity": "successor",
+  "predecessors": [
+    {
+      "role": "preparer",
+      "tag": "tip-1e1d9fe4bbc6",
+      "rolloutManifestSha256": "03153738c5b09ecffa6a56841e5fc2f9113ebd54a4ed8306e48d6df171770de4",
+      "sourceChannel": "tip"
+    }
+  ],
+  "runtimeMigrationProof": "unverified-accepted-risk"
 }

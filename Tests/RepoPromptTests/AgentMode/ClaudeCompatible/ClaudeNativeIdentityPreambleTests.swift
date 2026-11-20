@@ -1,5 +1,7 @@
 import Foundation
+import RepoPromptAIContracts
 @testable import RepoPromptApp
+import RepoPromptClaudeProvider
 import XCTest
 
 /// Regression coverage for the GLM/z.ai identity-preamble fix (issue #295).
@@ -18,6 +20,7 @@ final class ClaudeNativeIdentityPreambleTests: XCTestCase {
         // buildArguments' append logic keys only on `runtimeVariant`; the other fields .agentMode
         // derives from UserDefaults do not affect the assertions below.
         ClaudeNativeProcessSessionController(
+            host: ClaudeNativeSessionAppHost(),
             runID: UUID(),
             tabID: UUID(),
             windowID: 1,

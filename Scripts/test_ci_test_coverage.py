@@ -161,6 +161,55 @@ class UnionTests(unittest.TestCase):
     def test_complete_partition_passes(self):
         coverage.verify_shards(self.tests, self.targets, self.receipts, 2)
 
+    def test_cost_plan_executor_receipts_and_verifier_agree_and_reject_legacy_partition(self):
+        heavy = ['RepoPromptTests.' + name for name in (
+            'AgentSidebarRowInvalidationTests', 'SessionAdminInventoryReadTests',
+            'SessionAdminWorktreeRecoveryTests', 'WorkspaceRootCatalogDeltaTests')]
+        cheap = [f'NewTarget.Cheap{i}' for i in range(4)]
+        suites = {s: tuple(f'{s}/test{i}' for i in range(1 if s in heavy else 3))
+                  for s in heavy + cheap}
+        tests = sorted(test for methods in suites.values() for test in methods)
+        targets = ['NewTarget', 'RepoPromptTests']
+        counts = {s: len(methods) for s, methods in suites.items()}
+        context = {'head': 'candidate', 'tree': 'tree', 'base': 'base', 'run_id': '42', 'attempt': '2'}
+        visited = []
+
+        def execute(command, *_):
+            suite = command[command.index('-XCTest') + 1]
+            visited.append(suite)
+            text = '\n'.join(f"Test Case '-[{suite} {test.split('/')[1]}]' passed (0.001 seconds)."
+                             for test in suites[suite])
+            return 0, text + (f"\nTest Suite 'Selected tests' passed at now.\n"
+                              f"Executed {len(suites[suite])} tests, with 0 failures\n")
+
+        receipts = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for index in range(1, 5):
+                selection = runner.select_shard(counts, shard_count=4, shard_index=index)
+                receipt = root / f'shard-{index}.json'
+                with mock.patch.object(runner, 'execute_logged', side_effect=execute), \
+                        mock.patch.object(runner, 'build_identity', return_value={'context': context}):
+                    status = runner.run_selected_suites(
+                        selection.suites, swift_binary='swift', cwd=root,
+                        bundle_selection=runner.BundleSelection(root / 'PackageTests.xctest', {}, ('xctest',)),
+                        sandbox_root=root / f'sandbox-{index}', suite_methods=suites,
+                        receipt_path=receipt, shard_count=4, shard_index=index, output=io.StringIO())
+                self.assertEqual(status, 0)
+                receipts.append(json.loads(receipt.read_text()))
+        self.assertEqual(sorted(visited), sorted(suites))
+        coverage.verify_shards(tests, targets, receipts, 4, context)
+        # Count-LPT would put each cheap 3-method suite, then each heavy 1-method
+        # suite, on the next shard. Its exact union still MUST NOT be accepted.
+        legacy = copy.deepcopy(receipts)
+        for receipt, low, high in zip(legacy, cheap, heavy):
+            assigned = sorted(suites[low] + suites[high])
+            receipt['assigned'] = receipt['executed'] = assigned
+        self.assertEqual(sorted(t for r in legacy for t in r['assigned']), tests)
+        self.assertNotEqual([r['assigned'] for r in legacy], [r['assigned'] for r in receipts])
+        with self.assertRaisesRegex(ValueError, 'deterministic assignment'):
+            coverage.verify_shards(tests, targets, legacy, 4, context)
+
     def test_hosted_cli_never_downgrades_null_context_to_local_mode(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

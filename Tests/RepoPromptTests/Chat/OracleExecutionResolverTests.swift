@@ -1,5 +1,6 @@
 import Foundation
 import JSONSchema
+import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore

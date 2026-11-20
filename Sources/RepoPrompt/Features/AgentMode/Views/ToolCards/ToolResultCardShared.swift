@@ -74,37 +74,13 @@ struct StoredToolCardPresentation: Equatable {
     }
 
     private static func legacyFallback(from object: [String: Any], raw: String?) -> StoredToolCardPresentation? {
-        if let summaryText = ToolRawJSON.string(object, key: "summary_text")?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !summaryText.isEmpty
-        {
-            return StoredToolCardPresentation(
-                title: nil,
-                subtitle: summaryText,
-                detailText: nil,
-                status: ToolResultStatusResolver.resolve(toolIsError: nil, raw: raw, fallback: .neutral)
-            )
-        }
-        if let summaryText = ToolRawJSON.string(object, key: "summaryText")?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !summaryText.isEmpty
-        {
-            return StoredToolCardPresentation(
-                title: nil,
-                subtitle: summaryText,
-                detailText: nil,
-                status: ToolResultStatusResolver.resolve(toolIsError: nil, raw: raw, fallback: .neutral)
-            )
-        }
-        if let status = ToolRawJSON.string(object, key: "status")?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !status.isEmpty
-        {
-            return StoredToolCardPresentation(
-                title: nil,
-                subtitle: status,
-                detailText: nil,
-                status: ToolResultStatusResolver.resolve(toolIsError: nil, raw: raw, fallback: .neutral)
-            )
-        }
-        return nil
+        guard let subtitle = legacyToolCardSummary(from: object) else { return nil }
+        return StoredToolCardPresentation(
+            title: nil,
+            subtitle: subtitle,
+            detailText: nil,
+            status: ToolResultStatusResolver.resolve(toolIsError: nil, raw: raw, fallback: .neutral)
+        )
     }
 }
 
@@ -134,22 +110,16 @@ func storageStatusSubtitle(for item: AgentChatItem) -> String? {
     if let inlineSubtitle = StoredToolCardPresentation.fromSummaryOnly(raw: item.toolResultJSON)?.inlineSubtitle {
         return inlineSubtitle
     }
-    if let summaryText = ToolRawJSON.string(object, key: "summary_text")?.trimmingCharacters(in: .whitespacesAndNewlines),
-       !summaryText.isEmpty
-    {
-        return summaryText
+    return legacyToolCardSummary(from: object)
+}
+
+private func legacyToolCardSummary(from object: [String: Any]) -> String? {
+    for key in ["summary_text", "summaryText", "status"] {
+        if let text = ToolRawJSON.string(object, key: key)?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty {
+            return text
+        }
     }
-    if let summaryText = ToolRawJSON.string(object, key: "summaryText")?.trimmingCharacters(in: .whitespacesAndNewlines),
-       !summaryText.isEmpty
-    {
-        return summaryText
-    }
-    guard let status = ToolRawJSON.string(object, key: "status")?.trimmingCharacters(in: .whitespacesAndNewlines),
-          !status.isEmpty
-    else {
-        return nil
-    }
-    return status
+    return nil
 }
 
 func nonEmptyToolCardSummary(_ summary: String?, fallbackStatusFor item: AgentChatItem) -> String? {

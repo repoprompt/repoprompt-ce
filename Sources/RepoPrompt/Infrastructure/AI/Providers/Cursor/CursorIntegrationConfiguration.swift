@@ -1,6 +1,9 @@
 import CryptoKit
 import Darwin
 import Foundation
+import RepoPromptACPProviders
+import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 import RepoPromptProcess
 
 /// Cursor-specific MCP integration helpers.

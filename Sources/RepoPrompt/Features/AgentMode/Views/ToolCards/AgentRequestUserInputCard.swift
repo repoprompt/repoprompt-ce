@@ -1,5 +1,46 @@
 import SwiftUI
 
+extension View {
+    func agentQuestionCardSurface() -> some View {
+        padding(12)
+            .background(Color.blue.opacity(0.08))
+            .cornerRadius(8)
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(Color.blue.opacity(0.3), lineWidth: 1)
+            )
+    }
+
+    func agentQuestionOptionSurface(isSelected: Bool, outlineOpacity: Double) -> some View {
+        padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(isSelected ? Color.blue.opacity(0.15) : Color.blue.opacity(0.05))
+            .cornerRadius(6)
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(isSelected ? Color.blue.opacity(outlineOpacity) : Color.clear, lineWidth: 1)
+            )
+    }
+}
+
+@MainActor
+func agentQuestionCardHeader(title: String, subtitle: String, @ViewBuilder trailing: () -> some View) -> some View {
+    HStack(alignment: .top, spacing: 8) {
+        Image(systemName: "questionmark.circle.fill")
+            .font(.title2)
+            .foregroundColor(.blue)
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.headline)
+            Text(subtitle)
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+        Spacer()
+        trailing()
+    }
+}
+
 struct AgentRequestUserInputCard: View {
     private static let otherOptionDescription = "Optionally, add details below."
 
@@ -41,13 +82,7 @@ struct AgentRequestUserInputCard: View {
 
             actionButtons
         }
-        .padding(12)
-        .background(Color.blue.opacity(0.08))
-        .cornerRadius(8)
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(Color.blue.opacity(0.3), lineWidth: 1)
-        )
+        .agentQuestionCardSurface()
         .agentPendingCardFocus(store: pendingFocusStore, tabID: pendingFocusTabID, focusTarget: focusFirstNote)
         .onChange(of: request.id) { _, _ in
             draftsByQuestionID = Self.makeDrafts(for: request)
@@ -66,18 +101,7 @@ struct AgentRequestUserInputCard: View {
     }
 
     private var headerSection: some View {
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: "questionmark.circle.fill")
-                .font(.title2)
-                .foregroundColor(.blue)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Agent Questions")
-                    .font(.headline)
-                Text("Codex is waiting for your answers.")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-            Spacer()
+        agentQuestionCardHeader(title: "Agent Questions", subtitle: "Codex is waiting for your answers.") {
             Text(DateFormatter.localizedString(from: request.askedAt, dateStyle: .none, timeStyle: .short))
                 .font(.caption)
                 .foregroundColor(.secondary)
@@ -157,14 +181,7 @@ struct AgentRequestUserInputCard: View {
                 }
                 Spacer()
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(isSelected ? Color.blue.opacity(0.15) : Color.blue.opacity(0.05))
-            .cornerRadius(6)
-            .overlay(
-                RoundedRectangle(cornerRadius: 6)
-                    .stroke(isSelected ? Color.blue.opacity(0.45) : Color.clear, lineWidth: 1)
-            )
+            .agentQuestionOptionSurface(isSelected: isSelected, outlineOpacity: 0.45)
         }
         .buttonStyle(.plain)
     }

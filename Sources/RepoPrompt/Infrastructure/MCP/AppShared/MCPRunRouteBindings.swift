@@ -1,0 +1,384 @@
+import Foundation
+import RepoPromptDomainRuntime
+import RepoPromptMCPServer
+
+/// The synchronous run/connection projection used by provider-input admission. This is
+/// shared storage, not a second routing authority: DomainRoutingCoordinator still owns
+/// domain bindings, and the transport's live-connection fence is checked separately.
+/// Runtime hosts can retain this owner without retaining an MCP presentation model.
+@MainActor
+final class MCPRunRouteBindings {
+    /// Availability of the composition that can retract/publish these mappings. This
+    /// is not domain admission: losing it only refuses dispatch. A runtime host owns
+    /// it independently of presentation; the legacy server owns it until host cutover.
+    final class OwnerLifetime {}
+
+    private weak var ownerLifetime: OwnerLifetime?
+
+    init(ownerLifetime: OwnerLifetime) {
+        self.ownerLifetime = ownerLifetime
+    }
+
+    struct PendingPolicyToken {
+        let id: UUID
+        let connectionID: UUID
+        let runID: UUID
+        let displacedConnectionID: UUID?
+        let displacedConnectionRunID: UUID?
+        let displacedPendingPolicyTokenID: UUID?
+        let previousRunID: UUID?
+        let previousRunPrimaryConnectionID: UUID?
+        let previousPendingPolicyTokenID: UUID?
+        let previousWindowID: Int?
+        let previousCleanupOwnership: MCPRunRoutingCleanupReceipt.MappingOwnership?
+        let displacedCleanupOwnership: MCPRunRoutingCleanupReceipt.MappingOwnership?
+        var promotedContext: MCPTabContextSnapshot?
+        var promotedContextClientName: String?
+        var promotedContextWindowID: Int?
+        var validateProviderCarrier: (@MainActor @Sendable () async -> Bool)?
+    }
+
+    enum PendingPolicyRollbackResult: Equatable {
+        case restored
+        case supersededBySameConnection
+        case supersededByOtherConnection
+    }
+
+    enum RegistrationResult: Equatable {
+        case registered(displacedConnectionID: UUID?)
+        case refusedBoundRun(UUID)
+        case refusedWindow(Int)
+        case refusedOwnerUnavailable
+    }
+
+    struct DetachedContextBuilderTabContext {
+        let connectionID: UUID
+        let context: MCPTabContextSnapshot
+    }
+
+    /// Immutable predecessor lanes retain the exact connection and selection generation.
+    struct ReadFileAutoSelectionHandoverLineage {
+        let successorKey: MCPReadFileAutoSelectionCoordinator.ContextKey
+        let predecessorKeys: [MCPReadFileAutoSelectionCoordinator.ContextKey]
+    }
+
+    var pendingRunScopedTabContexts = PendingRunScopedContextStore()
+    var lastContextByClientAndWindow: [String: [Int: MCPTabContextSnapshot]] = [:]
+    var readFileAutoSelectionHandoverLineageByConnectionID: [UUID: ReadFileAutoSelectionHandoverLineage] = [:]
+    var nextReadFileAutoSelectionBindingGeneration: UInt64 = 0
+    var detachedContextBuilderTabContextByRunID: [UUID: DetachedContextBuilderTabContext] = [:]
+    var tabContextByConnectionID: [UUID: MCPTabContextSnapshot] = [:]
+    var connectionIDByRunID: [UUID: UUID] = [:]
+    var connectionIDToRunID: [UUID: UUID] = [:]
+    var pendingPolicyTokenIDByRunID: [UUID: UUID] = [:]
+    /// Registration metadata in this existing mapping owner, not a session/run lifecycle table.
+    private var cleanupOwnershipByConnectionID: [UUID: MCPRunRoutingCleanupReceipt.MappingOwnership] = [:]
+    var presentationWindowByConnection: [UUID: Int] = [:]
+
+    func connectionID(forRunID runID: UUID) -> UUID? {
+        guard let connectionID = connectionIDByRunID[runID],
+              connectionIDToRunID[connectionID] == runID else { return nil }
+        return connectionID
+    }
+
+    /// Includes displaced reverse mappings so teardown finds only this run's connections.
+    func connectionIDs(forRunID runID: UUID) -> [UUID] {
+        var ids: [UUID] = []
+        if let primary = connectionIDByRunID[runID] { ids.append(primary) }
+        for (connectionID, mappedRun) in connectionIDToRunID where mappedRun == runID {
+            if !ids.contains(connectionID) { ids.append(connectionID) }
+        }
+        return ids
+    }
+
+    func liveRunIDsBound(toTabID tabID: UUID) -> [UUID] {
+        let runIDs = tabContextByConnectionID.values.compactMap { context -> UUID? in
+            guard context.tabID == tabID, let runID = context.runID else { return nil }
+            return connectionID(forRunID: runID) != nil ? runID : nil
+        }
+        return Array(Set(runIDs)).sorted { $0.uuidString < $1.uuidString }
+    }
+
+    /// Legacy callers have no originating policy receipt and cannot remove owned mappings,
+    /// even if a replacement appears during their cross-actor cleanup hop.
+    func allowsLegacyCleanup(runID: UUID, connectionID: UUID) -> Bool {
+        cleanupOwnershipByConnectionID[connectionID] == nil
+            && connectionIDByRunID[runID].flatMap { cleanupOwnershipByConnectionID[$0] } == nil
+    }
+
+    func hasCurrentMapping(runID: UUID, connectionID: UUID, expectedTabID: UUID? = nil) -> Bool {
+        guard ownerLifetime != nil,
+              cleanupOwnershipByConnectionID[connectionID]?.isConsumed != true,
+              connectionIDByRunID[runID] == connectionID,
+              connectionIDToRunID[connectionID] == runID
+        else { return false }
+        guard let expectedTabID else { return true }
+        guard let context = tabContextByConnectionID[connectionID] else { return false }
+        return context.runID == runID && context.tabID == expectedTabID
+    }
+
+    /// This is the final synchronous fence after actor-qualified dispatch, not a
+    /// replacement for domain admission or stable-input proof.
+    func hasCurrentCatalogRouteToken(_ token: AgentSessionLinkRunCatalogRouteToken, expectedTabID: UUID) -> Bool {
+        ownerLifetime != nil
+            && token.observerEndpoint.tabID == expectedTabID
+            && hasCurrentMapping(runID: token.runID, connectionID: token.connectionID, expectedTabID: expectedTabID)
+            && ServerNetworkManager.shared.hasLiveProviderInputConnection(token)
+    }
+
+    func register(
+        connectionID: UUID, runID: UUID, windowID: Int,
+        cleanupReceipt: MCPRunRoutingCleanupReceipt? = nil
+    ) -> RegistrationResult {
+        guard ownerLifetime != nil else { return .refusedOwnerUnavailable }
+        if let cleanupReceipt {
+            guard !cleanupReceipt.isConsumed, cleanupReceipt.runID == runID, cleanupReceipt.routeID == windowID,
+                  cleanupReceipt.routeOwner?.runRouteBindings === self
+            else { return .refusedOwnerUnavailable }
+        } else if cleanupOwnershipByConnectionID[connectionID] != nil
+            || connectionIDByRunID[runID].flatMap({ cleanupOwnershipByConnectionID[$0] }) != nil
+        {
+            // An unqualified legacy registration cannot supersede an independently owned route.
+            return .refusedOwnerUnavailable
+        }
+        if connectionIDByRunID[runID] == connectionID,
+           connectionIDToRunID[connectionID] == runID
+        {
+            pendingPolicyTokenIDByRunID.removeValue(forKey: runID)
+            presentationWindowByConnection[connectionID] = windowID
+            cleanupOwnershipByConnectionID[connectionID] = cleanupReceipt?.mappingOwnership
+            return .registered(displacedConnectionID: nil)
+        }
+        if let boundRun = tabContextByConnectionID[connectionID]?.runID, boundRun != runID {
+            return .refusedBoundRun(boundRun)
+        }
+        let displaced = connectionIDByRunID[runID].flatMap { $0 == connectionID ? nil : $0 }
+        if let displaced {
+            if let existingWindow = presentationWindowByConnection[displaced], existingWindow != windowID {
+                return .refusedWindow(existingWindow)
+            }
+            connectionIDToRunID.removeValue(forKey: displaced)
+        }
+        if let previous = connectionIDToRunID[connectionID], previous != runID {
+            connectionIDByRunID.removeValue(forKey: previous)
+        }
+        presentationWindowByConnection[connectionID] = windowID
+        connectionIDByRunID[runID] = connectionID
+        connectionIDToRunID[connectionID] = runID
+        pendingPolicyTokenIDByRunID.removeValue(forKey: runID)
+        cleanupOwnershipByConnectionID[connectionID] = cleanupReceipt?.mappingOwnership
+        return .registered(displacedConnectionID: displaced)
+    }
+
+    var hasRetainedCleanupOwnership: Bool {
+        !cleanupOwnershipByConnectionID.isEmpty
+    }
+
+    func cleanupOwnership(for connectionID: UUID) -> MCPRunRoutingCleanupReceipt.MappingOwnership? {
+        cleanupOwnershipByConnectionID[connectionID]
+    }
+
+    /// The original live process keeps the exact connection/context; only its cleanup owner changes.
+    func transferProcessConnection(_ connectionID: UUID, from origin: MCPRunRoutingCleanupReceipt, to successor: MCPRunRoutingCleanupReceipt) -> Bool {
+        guard ownerLifetime != nil, !origin.isConsumed, !successor.isConsumed,
+              origin.routeOwner?.runRouteBindings === self, successor.routeOwner === origin.routeOwner,
+              origin.runID == successor.runID, origin.routeID == successor.routeID,
+              cleanupOwnershipByConnectionID[connectionID]?.policyID == origin.policyID,
+              hasCurrentMapping(runID: origin.runID, connectionID: connectionID)
+        else { return false }
+        // Committed policy mappings retain a rollback token. The network actor proved there
+        // is no pending admission; retire A's rollback currency atomically with ownership.
+        pendingPolicyTokenIDByRunID.removeValue(forKey: origin.runID)
+        cleanupOwnershipByConnectionID[connectionID] = successor.mappingOwnership
+        return true
+    }
+
+    /// Retract only entries installed by this exact policy on this exact resource owner. Closing
+    /// admission does not revoke the original cleanup obligation; a reopened owner is different.
+    func consumeCleanup(_ receipt: MCPRunRoutingCleanupReceipt, removingContext: (UUID) -> Void = { _ in }) {
+        guard receipt.routeOwner?.runRouteBindings === self else { return }
+        receipt.markConsumed()
+        let connections = cleanupOwnershipByConnectionID.compactMap { $0.value.policyID == receipt.policyID ? $0.key : nil }
+        for connectionID in connections {
+            removingContext(connectionID)
+            cleanupOwnershipByConnectionID.removeValue(forKey: connectionID)
+            readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
+            if connectionIDByRunID[receipt.runID] == connectionID {
+                connectionIDByRunID.removeValue(forKey: receipt.runID)
+                pendingPolicyTokenIDByRunID.removeValue(forKey: receipt.runID)
+            }
+            if connectionIDToRunID[connectionID] == receipt.runID {
+                connectionIDToRunID.removeValue(forKey: connectionID)
+            }
+        }
+    }
+
+    func beginPendingPolicy(
+        connectionID: UUID, runID: UUID, windowID: Int,
+        cleanupReceipt: MCPRunRoutingCleanupReceipt? = nil
+    ) -> PendingPolicyToken? {
+        guard ownerLifetime != nil else { return nil }
+        if let cleanupReceipt {
+            guard !cleanupReceipt.isConsumed, cleanupReceipt.runID == runID, cleanupReceipt.routeID == windowID,
+                  cleanupReceipt.routeOwner?.runRouteBindings === self else { return nil }
+        } else if cleanupOwnershipByConnectionID[connectionID] != nil
+            || connectionIDByRunID[runID].flatMap({ cleanupOwnershipByConnectionID[$0] }) != nil
+        { return nil }
+        if let boundRun = tabContextByConnectionID[connectionID]?.runID, boundRun != runID { return nil }
+        let displacedConnectionID = connectionIDByRunID[runID]
+        if let displacedConnectionID, displacedConnectionID != connectionID,
+           let existingWindow = presentationWindowByConnection[displacedConnectionID], existingWindow != windowID
+        { return nil }
+        let previousRunID = connectionIDToRunID[connectionID]
+        let token = PendingPolicyToken(
+            id: UUID(), connectionID: connectionID, runID: runID,
+            displacedConnectionID: displacedConnectionID == connectionID ? nil : displacedConnectionID,
+            displacedConnectionRunID: displacedConnectionID.flatMap { connectionIDToRunID[$0] },
+            displacedPendingPolicyTokenID: pendingPolicyTokenIDByRunID[runID],
+            previousRunID: previousRunID,
+            previousRunPrimaryConnectionID: previousRunID.flatMap { connectionIDByRunID[$0] },
+            previousPendingPolicyTokenID: previousRunID.flatMap { pendingPolicyTokenIDByRunID[$0] },
+            previousWindowID: presentationWindowByConnection[connectionID],
+            previousCleanupOwnership: cleanupOwnershipByConnectionID[connectionID],
+            displacedCleanupOwnership: displacedConnectionID.flatMap { cleanupOwnershipByConnectionID[$0] }
+        )
+        if let displacedConnectionID = token.displacedConnectionID,
+           connectionIDToRunID[displacedConnectionID] == runID
+        { connectionIDToRunID.removeValue(forKey: displacedConnectionID) }
+        if let previousRunID, previousRunID != runID, connectionIDByRunID[previousRunID] == connectionID {
+            connectionIDByRunID.removeValue(forKey: previousRunID)
+            pendingPolicyTokenIDByRunID.removeValue(forKey: previousRunID)
+        }
+        presentationWindowByConnection[connectionID] = windowID
+        connectionIDByRunID[runID] = connectionID
+        connectionIDToRunID[connectionID] = runID
+        pendingPolicyTokenIDByRunID[runID] = token.id
+        cleanupOwnershipByConnectionID[connectionID] = cleanupReceipt?.mappingOwnership
+        return token
+    }
+
+    func isCurrent(_ token: PendingPolicyToken) -> Bool {
+        pendingPolicyTokenIDByRunID[token.runID] == token.id
+            && cleanupOwnershipByConnectionID[token.connectionID]?.isConsumed != true
+            && connectionIDByRunID[token.runID] == token.connectionID
+            && connectionIDToRunID[token.connectionID] == token.runID
+    }
+
+    /// Generation-fenced synchronous rollback. Context publication and selection
+    /// invalidation remain with their existing owners, and cannot suspend between
+    /// consuming this token and restoring its displaced mappings.
+    @discardableResult
+    func rollback(_ token: PendingPolicyToken, removingContext: () -> Void) -> Bool {
+        guard isCurrent(token) else { return false }
+        pendingPolicyTokenIDByRunID.removeValue(forKey: token.runID)
+        removingContext()
+        if connectionIDByRunID[token.runID] == token.connectionID {
+            connectionIDByRunID.removeValue(forKey: token.runID)
+        }
+        if connectionIDToRunID[token.connectionID] == token.runID {
+            connectionIDToRunID.removeValue(forKey: token.connectionID)
+        }
+        if let displacedConnectionID = token.displacedConnectionID,
+           token.displacedPendingPolicyTokenID == nil,
+           token.displacedConnectionRunID == token.runID,
+           token.displacedCleanupOwnership?.isConsumed != true,
+           connectionIDByRunID[token.runID] == nil,
+           connectionIDToRunID[displacedConnectionID] == nil
+        {
+            connectionIDByRunID[token.runID] = displacedConnectionID
+            connectionIDToRunID[displacedConnectionID] = token.runID
+            cleanupOwnershipByConnectionID[displacedConnectionID] = token.displacedCleanupOwnership
+        } else if token.displacedConnectionID == nil {
+            connectionIDByRunID.removeValue(forKey: token.runID)
+        }
+        cleanupOwnershipByConnectionID.removeValue(forKey: token.connectionID)
+        if let previousRunID = token.previousRunID, token.previousPendingPolicyTokenID == nil,
+           token.previousCleanupOwnership?.isConsumed != true
+        {
+            let currentPrimary = connectionIDByRunID[previousRunID]
+            let unchanged = currentPrimary == token.previousRunPrimaryConnectionID
+            let canRestore = token.previousRunPrimaryConnectionID == token.connectionID && currentPrimary == nil
+            if unchanged || canRestore {
+                connectionIDToRunID[token.connectionID] = previousRunID
+                cleanupOwnershipByConnectionID[token.connectionID] = token.previousCleanupOwnership
+                if canRestore { connectionIDByRunID[previousRunID] = token.connectionID }
+            }
+        } else {
+            connectionIDToRunID.removeValue(forKey: token.connectionID)
+        }
+        let restoredPreviousRun = token.previousRunID.map { connectionIDToRunID[token.connectionID] == $0 } ?? true
+        if restoredPreviousRun, let previousWindowID = token.previousWindowID {
+            presentationWindowByConnection[token.connectionID] = previousWindowID
+        } else {
+            presentationWindowByConnection.removeValue(forKey: token.connectionID)
+        }
+        return true
+    }
+
+    func readFileAutoSelectionContextKey(
+        connectionID: UUID,
+        context: MCPTabContextSnapshot
+    ) -> MCPReadFileAutoSelectionCoordinator.ContextKey {
+        MCPReadFileAutoSelectionCoordinator.ContextKey(
+            windowID: context.windowID,
+            workspaceID: context.workspaceID,
+            tabID: context.tabID,
+            route: .bound(connectionID: connectionID, runID: context.runID),
+            bindingGeneration: context.readFileAutoSelectionGeneration,
+            routeOwnerIdentity: context.routeOwnerIdentity
+        )
+    }
+
+    func installReadFileAutoSelectionHandoverLineage(
+        for token: PendingPolicyToken
+    ) {
+        guard let successorContext = tabContextByConnectionID[token.connectionID],
+              successorContext.runID == token.runID
+        else {
+            readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: token.connectionID)
+            return
+        }
+        let successorKey = readFileAutoSelectionContextKey(
+            connectionID: token.connectionID,
+            context: successorContext
+        )
+
+        guard let displacedConnectionID = token.displacedConnectionID else {
+            let preservesCurrentSuccessor = token.displacedConnectionRunID == token.runID
+                && connectionIDByRunID[token.runID] == token.connectionID
+                && connectionIDToRunID[token.connectionID] == token.runID
+                && readFileAutoSelectionHandoverLineageByConnectionID[token.connectionID]?.successorKey == successorKey
+            if !preservesCurrentSuccessor {
+                readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: token.connectionID)
+            }
+            return
+        }
+
+        readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: token.connectionID)
+        guard token.displacedConnectionRunID == token.runID,
+              let displacedContext = tabContextByConnectionID[displacedConnectionID],
+              displacedContext.runID == token.runID,
+              successorContext.windowID == displacedContext.windowID,
+              successorContext.workspaceID == displacedContext.workspaceID,
+              successorContext.tabID == displacedContext.tabID
+        else { return }
+
+        let displacedKey = readFileAutoSelectionContextKey(
+            connectionID: displacedConnectionID,
+            context: displacedContext
+        )
+        var predecessorKeys: [MCPReadFileAutoSelectionCoordinator.ContextKey] = []
+        if let inherited = readFileAutoSelectionHandoverLineageByConnectionID[displacedConnectionID],
+           inherited.successorKey == displacedKey
+        {
+            predecessorKeys.append(contentsOf: inherited.predecessorKeys)
+        }
+        if !predecessorKeys.contains(displacedKey) {
+            predecessorKeys.append(displacedKey)
+        }
+        readFileAutoSelectionHandoverLineageByConnectionID[token.connectionID] = .init(
+            successorKey: successorKey,
+            predecessorKeys: predecessorKeys
+        )
+    }
+}

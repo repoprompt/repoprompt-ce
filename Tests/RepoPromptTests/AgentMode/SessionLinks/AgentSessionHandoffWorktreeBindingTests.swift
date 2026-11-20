@@ -1,7 +1,9 @@
 import Foundation
 import MCP
+import RepoPromptAIContracts
 import RepoPromptSettingsCore
 import RepoPromptVCS
+@testable import RepoPromptWorkspaceContext
 import XCTest
 @_spi(TestSupport) @testable import RepoPromptApp
 
@@ -165,9 +167,15 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
     }
 
     func testHandoffRejectsStorageRootChangeDuringImageCopyWithoutRebindingTheChild() async throws {
-        try await withFixture(bindSource: false) { fixture in
+        // Only durable placement follows custom storage changes. Ephemeral placement is
+        // intentionally stable outside all profile/custom roots for the process lifetime.
+        try await withFixture(bindSource: false, ephemeral: false) { fixture in
             let (store, attachment, parentImage) = try await installHandoffImage(fixture)
             let manager = fixture.window.workspaceManager
+            XCTAssertFalse(try XCTUnwrap(manager.activeWorkspace).isEphemeral)
+            XCTAssertTrue(store.rootURL.resolvingSymlinksInPath().pathComponents.starts(
+                with: fixture.git.sandbox.resolvingSymlinksInPath().pathComponents
+            ))
             // Keep the test persistence override, but resolve it from the live workspace just as
             // production does. A custom storage update does not replace the session binding.
             fixture.viewModel.sessionAttachmentsRootOverride = { [weak manager] in
@@ -428,7 +436,7 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
                 // The background tab is visible: the existing initial-worktree gate blocks sends,
                 // and an explicit required flush cannot persist the unbound provisional record.
                 gatedDuringInstall = destination.isPreparingInitialWorktree
-                if case .failure = await fixture.viewModel.flushSaveRequired(
+                if case .failure = await fixture.viewModel.persistenceRuntime.flushSaveRequired(
                     for: destination.tabID,
                     workspaceID: workspaceID
                 ) {
@@ -688,7 +696,7 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
                     createdSessionID = sessionID
                     XCTAssertTrue(destination.qualifiedRestorationReadiness.isCreating)
                     XCTAssertNotNil(destination.operationAdmissionFailureMessage, "ordinary operations must be blocked before Oracle cloning suspends")
-                    if case .success = await fixture.viewModel.flushSaveRequired(
+                    if case .success = await fixture.viewModel.persistenceRuntime.flushSaveRequired(
                         for: destination.tabID, workspaceID: workspace.id
                     ) {
                         XCTFail("an external flush must not persist the unconfigured fork")
@@ -826,7 +834,7 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
             XCTAssertTrue(destination.qualifiedRestorationReadiness.isCreating)
             XCTAssertFalse(destination.qualifiedRestorationReadiness.isAuthoritative)
             try await assertRecoveryBlocksSubmission(fixture.viewModel, session: destination)
-            if case .success = await fixture.viewModel.flushSaveRequired(
+            if case .success = await fixture.viewModel.persistenceRuntime.flushSaveRequired(
                 for: destination.tabID, workspaceID: workspace.id
             ) {
                 XCTFail("ordinary persistence must not complete an unconfigured cancelled fork")
@@ -849,7 +857,7 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
             XCTAssertFalse(reopened.qualifiedRestorationReadiness.isCreating)
             XCTAssertEqual(reopened.qualifiedRestorationReadiness.terminalFailure, .missingPayload)
             try await assertRecoveryBlocksSubmission(fixture.viewModel, session: reopened)
-            if case .success = await fixture.viewModel.flushSaveRequired(
+            if case .success = await fixture.viewModel.persistenceRuntime.flushSaveRequired(
                 for: reopened.tabID, workspaceID: workspace.id
             ) {
                 XCTFail("reopening a missing partial fork must not make it saveable")
@@ -1085,7 +1093,7 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
                     let workspaceID = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace?.id)
                     XCTAssertTrue(sawBlockedSave, "the earlier recovery payload must remain the last acknowledged record")
                     let lastAcknowledged = try Data(contentsOf: destinationFile)
-                    let recovery = await fixture.viewModel.flushSaveRequired(for: destination.tabID, workspaceID: workspaceID)
+                    let recovery = await fixture.viewModel.persistenceRuntime.flushSaveRequired(for: destination.tabID, workspaceID: workspaceID)
                     if case .success = recovery { XCTFail("Ordinary flush must not complete or retry a failed creation.") }
                     XCTAssertEqual(try Data(contentsOf: destinationFile), lastAcknowledged)
                     XCTAssertTrue(destination.qualifiedRestorationReadiness.isCreating)
@@ -1131,10 +1139,13 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
         let sourceTabID: UUID
         let sourceSessionID: UUID
         let sourceSession: AgentModeViewModel.TabSession
+        let sidecarStorage: WorkspaceFixtureStorage
+        let ephemeral: Bool
+        let previousStoragePreference: Any?
     }
 
-    private func withFixture(bindSource: Bool, _ body: (Fixture) async throws -> Void) async throws {
-        let fixture = try await makeFixture(bindSource: bindSource)
+    private func withFixture(bindSource: Bool, ephemeral: Bool = true, _ body: (Fixture) async throws -> Void) async throws {
+        let fixture = try await makeFixture(bindSource: bindSource, ephemeral: ephemeral)
         do {
             try await body(fixture)
         } catch {
@@ -1144,13 +1155,19 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
         await cleanup(fixture)
     }
 
-    private func makeFixture(bindSource: Bool) async throws -> Fixture {
+    private func makeFixture(bindSource: Bool, ephemeral: Bool) async throws -> Fixture {
         let git = try ReviewGitRepositoryFixture(name: "AgentSessionHandoffWorktreeBindingTests")
         let logicalRootURL = try git.makeRepository(named: "logical", files: ["README.md": "fixture\n"])
         let linkedWorktreeURL = git.sandbox.appendingPathComponent("linked", isDirectory: true)
         try git.runGit(["worktree", "add", "--detach", linkedWorktreeURL.path, "HEAD"], at: logicalRootURL)
         let identity = try XCTUnwrap(GitWorktreeIdentityResolver.resolve(atWorkTreeRoot: linkedWorktreeURL))
 
+        let sidecarStorage = WorkspaceFixtureStorage(root: git.sandbox)
+        let previousStoragePreference = UserDefaults.standard.object(forKey: "GlobalCustomStorageURL")
+        if !ephemeral {
+            // Durable creation captures its document root: isolate it before building the manager.
+            UserDefaults.standard.set(git.sandbox.appendingPathComponent("workspace-storage").path, forKey: "GlobalCustomStorageURL")
+        }
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
         let window = WindowState()
@@ -1159,11 +1176,12 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
         await window.workspaceManager.awaitInitialized()
 
         do {
-            let workspace = window.workspaceManager.createWorkspace(
+            let created = window.workspaceManager.createWorkspace(
                 name: "Handoff worktree \(UUID().uuidString.prefix(8))",
                 repoPaths: [logicalRootURL.path],
-                ephemeral: true
+                ephemeral: ephemeral
             )
+            let workspace = ephemeral ? sidecarStorage.isolate(created, in: window.workspaceManager) : created
             await window.workspaceManager.switchWorkspace(
                 to: workspace,
                 saveState: false,
@@ -1177,6 +1195,7 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
                 window.workspaceManager.workspaces.firstIndex(where: { $0.id == activeWorkspace.id })
             )
             window.workspaceManager.workspaces[workspaceIndex].customStoragePath = git.sandbox.appendingPathComponent("sessions", isDirectory: true)
+            _ = sidecarStorage.track(window.workspaceManager.workspaces[workspaceIndex])
             let sourceBindings: [AgentSessionWorktreeBinding] = bindSource ? [AgentSessionWorktreeBinding(
                 id: "primary",
                 repositoryID: identity.repository.repositoryID,
@@ -1246,12 +1265,19 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
                 store: store,
                 sourceTabID: sourceTabID,
                 sourceSessionID: sourceSessionID,
-                sourceSession: sourceSession
+                sourceSession: sourceSession,
+                sidecarStorage: sidecarStorage,
+                ephemeral: ephemeral,
+                previousStoragePreference: previousStoragePreference
             )
         } catch {
             window.beginClose()
             await window.tearDown()
             WindowStatesManager.shared.unregisterWindowState(window)
+            await sidecarStorage.remove()
+            if !ephemeral {
+                await restoreStoragePreference(previousStoragePreference)
+            }
             git.cleanup()
             throw error
         }
@@ -1301,6 +1327,10 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
     ) async throws {
         XCTAssertNil(viewModel.makeComposerSubmitTarget(tabID: session.tabID, session: session), file: file, line: line)
         let sessionID = try XCTUnwrap(session.activeAgentSessionID, file: file, line: line)
+        guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: sessionID) else {
+            return XCTFail("The blocked payload must still have its exact runtime writer.", file: file, line: line)
+        }
+        XCTAssertTrue(writer.session === session, file: file, line: line)
         // The UI cannot mint a target while blocked. Model an already-captured, otherwise-current
         // target to prove the claim boundary independently rejects a delayed submission callback.
         let target = AgentComposerSubmitTarget(
@@ -1314,7 +1344,8 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
             expectedRunID: session.runID,
             expectedRunAttemptID: session.activeRunAttemptID,
             expectedSubmissionToken: session.composerSubmissionToken,
-            expectedInitialStartLocation: viewModel.initialStartLocationProps(tabID: session.tabID)?.selection
+            expectedInitialStartLocation: viewModel.initialStartLocationProps(tabID: session.tabID)?.selection,
+            expectedWriterIdentity: writer.identity
         )
         let attempt = AgentComposerSubmitAttempt(
             id: UUID(), target: target, inputRevision: 0, noticeRevision: 0,
@@ -1337,7 +1368,7 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
 
         // A completed payload retains the execution-location blocker. Incomplete creation and
         // failed restoration must additionally remain blocked when that presentation flag is off.
-        var readiness = AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(
+        var readiness = AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
             session: session, endpointMatchesGrant: true, isClosing: false
         )
         if session.qualifiedRestorationReadiness.isAuthoritative {
@@ -1411,6 +1442,19 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
         await fixture.window.tearDown()
         await drainFixtureSaves(fixture.viewModel)
         WindowStatesManager.shared.unregisterWindowState(fixture.window)
+        await fixture.sidecarStorage.remove()
+        if !fixture.ephemeral {
+            await restoreStoragePreference(fixture.previousStoragePreference)
+        }
         fixture.git.cleanup()
+    }
+
+    private func restoreStoragePreference(_ previous: Any?) async {
+        await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()
+        if let previous {
+            UserDefaults.standard.set(previous, forKey: "GlobalCustomStorageURL")
+        } else {
+            UserDefaults.standard.removeObject(forKey: "GlobalCustomStorageURL")
+        }
     }
 }

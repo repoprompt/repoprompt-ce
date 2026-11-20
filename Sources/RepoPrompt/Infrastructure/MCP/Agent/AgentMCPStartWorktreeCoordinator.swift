@@ -4,6 +4,7 @@ import RepoPromptInstrumentation
 import RepoPromptProcess
 import RepoPromptSettingsCore
 import RepoPromptVCS
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 @MainActor
@@ -355,6 +356,7 @@ struct AgentMCPStartWorktreeCoordinator {
                             desiredBindings,
                             forSessionID: targetSessionID,
                             intent: .initialSend,
+                            creationHandle: target.creationHandle,
                             startupContext: startupContext,
                             initializationHintsByBindingID: initializationHintsByBindingID
                         )
@@ -364,6 +366,7 @@ struct AgentMCPStartWorktreeCoordinator {
                         desiredBindings,
                         forSessionID: targetSessionID,
                         intent: .initialSend,
+                        creationHandle: target.creationHandle,
                         startupContext: startupContext,
                         initializationHintsByBindingID: initializationHintsByBindingID
                     )

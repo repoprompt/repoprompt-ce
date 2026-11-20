@@ -1,6 +1,9 @@
 import Foundation
 import MCP
+import RepoPromptAIContracts
 @testable import RepoPromptApp
+import RepoPromptClaudeProvider
+import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 import XCTest
 
@@ -53,7 +56,7 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
         session.selectedAgent = .customClaudeCompatible
         session.selectedModelRaw = "sonnet"
         let estimator = ClaudeContextUsageEstimator(tokenEstimator: { _ in 0 }, contextUsageBuilder: { usage, window in
-            AgentModeViewModel.contextUsageFromClaudeProviderTokens(usage, modelContextWindow: window)
+            AgentSessionUsageRuntime.contextUsageFromClaudeProviderTokens(usage, modelContextWindow: window)
         })
         _ = estimator.ingestUsageSignal(promptTokens: nil, completionTokens: nil, contextUsedTokens: 250_000, modelContextWindow: nil, session: session)
         XCTAssertEqual(session.codexContextUsage?.modelContextWindow, 262_144)
@@ -91,7 +94,7 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
             session.selectedAgent = .customClaudeCompatible
             session.selectedModelRaw = "sonnet"
             let estimator = ClaudeContextUsageEstimator(tokenEstimator: { _ in 0 }, contextUsageBuilder: { usage, window in
-                AgentModeViewModel.contextUsageFromClaudeProviderTokens(usage, modelContextWindow: window)
+                AgentSessionUsageRuntime.contextUsageFromClaudeProviderTokens(usage, modelContextWindow: window)
             })
             if hasPriorUsage {
                 _ = estimator.ingestUsageSignal(promptTokens: nil, completionTokens: nil, contextUsedTokens: 250_000, modelContextWindow: nil, session: session)
@@ -221,11 +224,21 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
                 for: agentKind,
                 modelString: "sonnet"
             )
-            let adapter = try XCTUnwrap(provider as? ClaudeCompatibleHeadlessProviderAdapter)
-            XCTAssertEqual(adapter.runtimeConfig.pluginID.rawValue, expectedPluginID)
-            XCTAssertEqual(adapter.runtimeConfig.mode.rawValue, "discovery")
-            XCTAssertEqual(adapter.runtimeConfig.commandName, "claude")
-            XCTAssertEqual(adapter.runtimeConfig.modelString, "sonnet")
+            let canonicalProvider = try XCTUnwrap(provider as? ClaudeCodeAgentProvider)
+            let actualConfig = canonicalProvider.configurationForTesting
+            let runtimeConfig = ClaudeCompatibleProviderRuntimeBridge.runtimeConfig(from: actualConfig, mode: .discovery)
+            XCTAssertEqual(runtimeConfig.pluginID.rawValue, expectedPluginID)
+            XCTAssertEqual(runtimeConfig.mode.rawValue, "discovery")
+            XCTAssertEqual(runtimeConfig.commandName, "claude")
+            XCTAssertEqual(runtimeConfig.modelString, "sonnet")
+            let context = HeadlessAgentContext(runID: UUID(), environment: [:])
+            XCTAssertEqual(
+                canonicalProvider.buildArguments(context: context),
+                ClaudeCompatibleProviderRuntimeBridge.buildHeadlessArguments(
+                    runtimeConfig: runtimeConfig, mcpConfigPath: nil, launchEnvironment: nil,
+                    resumeSessionID: nil, systemPromptOverride: nil
+                )
+            )
         }
         XCTAssertNil(ClaudeCompatiblePluginBridge.pluginID(for: .codexExec))
 
@@ -533,7 +546,7 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
                 let attemptID = UUID()
                 session.installRunID(runID)
                 session.beginRunAttempt(source: "compaction-replay", attemptID: attemptID)
-                var translator = ClaudeSDKNDJSONTranslator()
+                var translator = ClaudeSDKNDJSONTranslator(isRepoPromptToolName: { MCPIntegrationHelper.isRepoPromptToolName($0) })
                 let sidebar = AgentRuntimeSidebarViewModel()
                 func consume(_ line: String) async throws {
                     var envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])
@@ -629,11 +642,11 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
             let rows = try JSONDecoder().decode([AgentTokenUsagePersist].self, from: JSONEncoder().encode([old, fence, unmeasured]))
             XCTAssertEqual(rows, [old, fence, unmeasured])
             XCTAssertEqual(rows.map(\.providerTotalTokens).reduce(0, +), 150_057, "A compaction fence is not billable usage")
-            let pending = AgentModeViewModel.contextUsageFromClaudeProviderTokens(rows, modelContextWindow: nil)
+            let pending = AgentSessionUsageRuntime.contextUsageFromClaudeProviderTokens(rows, modelContextWindow: nil)
             XCTAssertNil(pending?.lastTotalTokens)
             XCTAssertEqual(pending?.awaitingPostCompactionUsage, true, "The fence works even without a known window")
             let fresh = AgentTokenUsagePersist(promptTokens: 1000, completionTokens: 10, contextUsedTokens: 10000)
-            let recovered = AgentModeViewModel.contextUsageFromClaudeProviderTokens(rows + [fresh, unmeasured], modelContextWindow: 200_000)
+            let recovered = AgentSessionUsageRuntime.contextUsageFromClaudeProviderTokens(rows + [fresh, unmeasured], modelContextWindow: 200_000)
             XCTAssertEqual(recovered?.lastTotalTokens, 10000)
             XCTAssertNotEqual(recovered?.awaitingPostCompactionUsage, true)
         }

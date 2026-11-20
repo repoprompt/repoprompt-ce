@@ -206,6 +206,7 @@ final class DelegationScopeRuntime: ObservableObject {
     private static let completedOverseeRetryWindow: TimeInterval = 30
     #if DEBUG
         var test_scopeDecision: ((UUID, String) -> Void)?
+        var test_decisionDeliveryAttempted: ((DelegationDecisionDeliveryOutcome) -> Void)?
         var test_decisionStartRetryDelay: Duration?
         var test_pendingDecisionCount: Int {
             decisions.count
@@ -992,7 +993,11 @@ final class DelegationScopeRuntime: ObservableObject {
         guard var request = requests[requestID], request.state == .pending else { return }
         request.state = .granted(scopeID: record.id)
         requests[requestID] = request
-        let continuation = overseeContinuations.removeValue(forKey: requestID)
+        notifyGranted(request: request, record: record)
+    }
+
+    private func notifyGranted(request: DelegationScopeRequest, record: DomainDelegationScopeRecord) {
+        let continuation = overseeContinuations.removeValue(forKey: request.id)
         if let continuation {
             startOverseeContinuation(request: request, record: record, continuation: continuation)
         }
@@ -1093,17 +1098,7 @@ final class DelegationScopeRuntime: ObservableObject {
             requests[requestID] = request
             if grantAllForSession { sessionWideApprovals.insert(request.requesterSessionID) }
             didChange(grantees: [record.grant.granteeSessionID], invalidated: [])
-            let continuation = overseeContinuations.removeValue(forKey: requestID)
-            if let continuation {
-                startOverseeContinuation(request: request, record: record, continuation: continuation)
-            }
-            enqueueDecision(
-                sessionID: request.requesterSessionID,
-                tabID: request.requesterTabID,
-                result: "granted",
-                identifier: record.id,
-                automaticContinuation: continuation != nil
-            )
+            notifyGranted(request: request, record: record)
         case let .failure(denial):
             overseeContinuations.removeValue(forKey: requestID)
             overseeInitialRequests.remove(requestID)
@@ -1327,16 +1322,21 @@ final class DelegationScopeRuntime: ObservableObject {
             decisions.removeValue(forKey: sessionID)
         }
         if decisions[sessionID] == nil {
-            let observation = session.objectWillChange.receive(on: DispatchQueue.main).sink { [weak self, weak session] _ in
-                MainActor.assumeIsolated {
-                    guard let self else { return }
-                    guard session?.activeAgentSessionID == sessionID else {
-                        self.decisions.removeValue(forKey: sessionID)
-                        return
+            // Runtime settlement (terminal barrier, composer claim, hydration and queued
+            // follow-up) is not an @Published UI edit. Observe its existing readiness channel
+            // as well, or a notice refused during publication can remain parked forever.
+            let observation = session.objectWillChange.map { _ in () }
+                .merge(with: session.monitorReadinessChangePublisher)
+                .receive(on: DispatchQueue.main).sink { [weak self, weak session] _ in
+                    MainActor.assumeIsolated {
+                        guard let self else { return }
+                        guard session?.activeAgentSessionID == sessionID else {
+                            self.decisions.removeValue(forKey: sessionID)
+                            return
+                        }
+                        self.drainDecisions(sessionID: sessionID)
                     }
-                    self.drainDecisions(sessionID: sessionID)
                 }
-            }
             decisions[sessionID] = DecisionDelivery(tabID: tabID, stopFence: AgentRunStartStopFence(session: session), messages: [], observation: observation)
         }
         decisions[sessionID]?.messages.append(text)
@@ -1371,6 +1371,9 @@ final class DelegationScopeRuntime: ObservableObject {
             )
             guard let self, var current = decisions[sessionID], current.stopFence == pending.stopFence else { return }
             current.isDelivering = false
+            #if DEBUG
+                test_decisionDeliveryAttempted?(outcome)
+            #endif
             switch outcome {
             case .submitted, .indeterminate:
                 current.pendingStart = nil

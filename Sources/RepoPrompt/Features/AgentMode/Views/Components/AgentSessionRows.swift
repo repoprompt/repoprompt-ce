@@ -1,6 +1,25 @@
 import AppKit
+import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import SwiftUI
+
+extension AgentWorktreeMergeAttention.Kind {
+    var presentationColor: Color {
+        switch self {
+        case .conflicted: .orange
+        case .awaitingApproval: .purple
+        case .awaitingCommit: .yellow
+        }
+    }
+
+    var presentationGlyph: String {
+        switch self {
+        case .conflicted: "exclamationmark.triangle.fill"
+        case .awaitingApproval: "arrow.triangle.merge"
+        case .awaitingCommit: "checkmark.circle"
+        }
+    }
+}
 
 // MARK: - Agent Session Row
 
@@ -823,6 +842,9 @@ struct AgentSessionRow: View {
 
     private var rowAccessibilityValue: String {
         var parts = [isSelected ? "Selected" : "Not selected"]
+        if let worktree {
+            parts.append(worktree.accessibilityText)
+        }
         // VoiceOver reads the same combined line the mark shows on hover.
         if oversightRole.hasMark {
             parts.append(oversightMarkTooltip())
@@ -844,17 +866,9 @@ struct AgentSessionRow: View {
         showDeleteConfirmation = true
     }
 
-    private var currentSelectionGesture: AgentSidebarSelectionGesture {
-        var modifiers: AgentSidebarSelectionModifiers = []
-        let flags = NSApp.currentEvent?.modifierFlags ?? []
-        if flags.contains(.command) { modifiers.insert(.command) }
-        if flags.contains(.shift) { modifiers.insert(.shift) }
-        return AgentSidebarSelectionGesture(modifiers: modifiers)
-    }
-
     private func handleRowTap() {
         guard isInteractionEnabled else { return }
-        if onSelectionGesture(currentSelectionGesture) == .activate {
+        if onSelectionGesture(.currentEvent) == .activate {
             onSelect()
         }
     }
@@ -970,17 +984,7 @@ struct AgentSessionRow: View {
         let sidebarOversightTargetEndpoint = resolveSidebarOversightTargetEndpoint?()
         HStack(spacing: rowSpacing) {
             if showsSelectionPresentation {
-                Button(action: toggleSelection) {
-                    Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                        .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
-                        .padding(6)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .padding(-6) // Keep the row layout unchanged around the larger hit target.
-                .disabled(!isInteractionEnabled)
-                .accessibilityLabel("\(isSelected ? "Deselect" : "Select") \(title)")
-                .accessibilityValue(isSelected ? "Selected" : "Not selected")
+                agentSidebarSelectionButton(isSelected: isSelected, isInteractionEnabled: isInteractionEnabled, title: title, action: toggleSelection)
             }
 
             if threadDepth > 0 {
@@ -1076,43 +1080,15 @@ struct AgentSessionRow: View {
                 }
 
                 if allowsDirectMutations {
-                    Button(action: onTogglePin) {
-                        Image(systemName: isPinned ? "pin.slash" : "pin")
-                            .font(.system(size: 11))
-                            .foregroundColor(isPinHovered ? .accentColor : .secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .onHover { isPinHovered = $0 }
-                    .hoverTooltip(pinActionLabel)
+                    agentSidebarRowActionButton(systemImage: isPinned ? "pin.slash" : "pin", isHovered: $isPinHovered, highlightColor: .accentColor, tooltip: pinActionLabel, action: onTogglePin)
 
-                    Button(action: beginRename) {
-                        Image(systemName: "pencil")
-                            .font(.system(size: 11))
-                            .foregroundColor(isRenameHovered ? .accentColor : .secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .onHover { isRenameHovered = $0 }
-                    .hoverTooltip(renameActionLabel)
+                    agentSidebarRowActionButton(systemImage: "pencil", isHovered: $isRenameHovered, highlightColor: .accentColor, tooltip: renameActionLabel, action: beginRename)
 
                     if let onStash {
-                        Button(action: onStash) {
-                            Image(systemName: "tray.and.arrow.down")
-                                .font(.system(size: 11))
-                                .foregroundColor(isStashHovered ? .accentColor : .secondary)
-                        }
-                        .buttonStyle(.plain)
-                        .onHover { isStashHovered = $0 }
-                        .hoverTooltip(stashActionLabel)
+                        agentSidebarRowActionButton(systemImage: "tray.and.arrow.down", isHovered: $isStashHovered, highlightColor: .accentColor, tooltip: stashActionLabel, action: onStash)
                     }
 
-                    Button(action: requestDeleteConfirmation) {
-                        Image(systemName: "trash")
-                            .font(.system(size: 11))
-                            .foregroundColor(isDeleteHovered ? .red : .secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .onHover { isDeleteHovered = $0 }
-                    .hoverTooltip(deleteActionLabel)
+                    agentSidebarRowActionButton(systemImage: "trash", isHovered: $isDeleteHovered, highlightColor: .red, tooltip: deleteActionLabel, action: requestDeleteConfirmation)
                 }
             }
             // Selected state is already signaled by the accent-tinted background +
@@ -1229,17 +1205,8 @@ struct AgentSessionRow: View {
     /// `conflicted`, or `awaiting_commit` state. Sized to match the existing
     /// pin glyph so layout does not jitter when attention attaches/detaches.
     private func mergeAttentionBadge(for attention: AgentWorktreeMergeAttention) -> some View {
-        let tint: Color = switch attention.kind {
-        case .conflicted: .orange
-        case .awaitingApproval: .purple
-        case .awaitingCommit: .yellow
-        }
-        let glyph = switch attention.kind {
-        case .conflicted: "exclamationmark.triangle.fill"
-        case .awaitingApproval: "arrow.triangle.merge"
-        case .awaitingCommit: "checkmark.circle"
-        }
-        return Image(systemName: glyph)
+        let tint = attention.kind.presentationColor
+        return Image(systemName: attention.kind.presentationGlyph)
             .font(.system(size: pinFontSize, weight: .semibold))
             .foregroundStyle(tint)
             .frame(width: pinFontSize + 2, height: pinFontSize + 2)
@@ -1368,16 +1335,17 @@ struct AgentSessionRow: View {
     /// Compact bound-worktree marker overlaid on the status plate's
     /// bottom-right corner. Purely decorative for hit-testing so it never
     /// blocks the disclosure chevron, and layout-neutral so the title's
-    /// leading X stays a pure function of `threadDepth`. Its identity is
-    /// folded into `plateTooltip` / `plateAccessibilityLabel`.
+    /// leading X stays a pure function of `threadDepth`. The plate tooltip
+    /// and focusable row expose the worktree identity.
     @ViewBuilder
     private var worktreeMarker: some View {
         if let worktree {
-            worktreeMarkerShape(for: worktree)
-                .frame(width: 7, height: 7)
+            let marker = worktree.compactMarker
+            worktreeMarkerShape(marker, color: worktree.color)
+                .frame(width: marker.size.width, height: marker.size.height)
                 .padding(1.3)
                 .background(
-                    Circle().fill(Color(NSColor.controlBackgroundColor))
+                    Capsule().fill(Color(NSColor.controlBackgroundColor))
                 )
                 .offset(x: 2.5, y: 2.5)
                 .allowsHitTesting(false)
@@ -1385,25 +1353,23 @@ struct AgentSessionRow: View {
         }
     }
 
-    /// Marker geometry. Available worktrees use the persisted marker style
-    /// (filled dot for dot/capsule, hollow ring for ring); missing worktrees
-    /// always render a muted dashed ring so a stale binding reads as such.
     @ViewBuilder
-    private func worktreeMarkerShape(for worktree: AgentWorktreeIndicator) -> some View {
-        if !worktree.isAvailable {
+    private func worktreeMarkerShape(_ marker: AgentWorktreeIndicator.CompactMarker, color: Color) -> some View {
+        switch marker {
+        case .unavailable:
             Circle()
                 .strokeBorder(
-                    Color.secondary,
+                    Color.orange,
                     style: StrokeStyle(lineWidth: 1.3, dash: [1.6, 1.4])
                 )
-        } else if worktree.markerStyle == .ring {
+        case .ring:
             Circle()
-                .strokeBorder(worktree.color, lineWidth: 1.7)
-        } else {
-            Circle()
-                .fill(worktree.color)
+                .strokeBorder(color, lineWidth: 1.7)
+        case .dot, .capsule:
+            Capsule()
+                .fill(color)
                 .overlay(
-                    Circle().strokeBorder(Color.black.opacity(0.12), lineWidth: 0.5)
+                    Capsule().strokeBorder(Color.black.opacity(0.12), lineWidth: 0.5)
                 )
         }
     }
@@ -1577,14 +1543,9 @@ struct AgentSessionRow: View {
         }
     }
 
-    /// Accessibility companion to `plateTooltip`. Always returns a
-    /// non-empty label for MCP-controlled roots so VoiceOver still
-    /// announces the affordance after the rail was removed.
+    /// The focusable row announces worktree identity; the plate announces run status.
     private var plateAccessibilityLabel: String {
-        if let tip = plateTooltip {
-            return tip
-        }
-        return isMCPControlledRoot ? "MCP controlled" : ""
+        statusPlateTooltip ?? (isMCPControlledRoot ? "MCP controlled" : "")
     }
 
     private func commandProgressIndicator(

@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
@@ -159,7 +160,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
             AgentModeViewModel.observationSnapshot(for: session, candidate: candidate, subagentCounts: (running: 0, finished: 0)).context
         }
         session.selectedAgent = .claudeCode
-        XCTAssertTrue(viewModel.ingestNonCodexUsageReport(
+        XCTAssertTrue(viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 180_000,
             modelContextWindow: 200_000, session: session
         ))
@@ -171,7 +172,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         XCTAssertNil(reported())
 
         // An output-only report carries Claude's 180k forward in the estimator.
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: 500, contextUsedTokens: nil,
             modelContextWindow: nil, session: session
         )
@@ -179,7 +180,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         XCTAssertNil(reported(), "Claude's count and window are never reported as Kimi's")
 
         // 250k exceeds Claude's 200k window, but that capacity is Claude's, so Kimi's own reading stands.
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 250_000,
             modelContextWindow: nil, session: session
         )
@@ -187,7 +188,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         XCTAssertNil(reported()?.windowTokens, "Claude's window is not Kimi's")
 
         // Kimi's own billed prompt count is Kimi's figure (labelled best effort), still without a window.
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: 240_000, completionTokens: nil, contextUsedTokens: nil,
             modelContextWindow: nil, session: session
         )
@@ -196,7 +197,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         XCTAssertNil(reported()?.windowTokens, "Claude's window is not Kimi's")
 
         // Kimi reports its own window.
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: 245_000, completionTokens: nil, contextUsedTokens: nil,
             modelContextWindow: 262_144, session: session
         )
@@ -216,7 +217,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
             AgentModeViewModel.observationSnapshot(for: session, candidate: candidate, subagentCounts: (running: 0, finished: 0)).context
         }
         session.selectedAgent = .claudeCode
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 190_000,
             modelContextWindow: 200_000, session: session
         )
@@ -227,13 +228,13 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         XCTAssertEqual(reported()?.windowTokens, 200_000, "The window is unchanged by a compaction")
 
         // Output-only usage carries no new count, so the carried-forward count stays unvouched.
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: 500, contextUsedTokens: nil,
             modelContextWindow: nil, session: session
         )
         XCTAssertNil(reported()?.usedTokens)
 
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 9000,
             modelContextWindow: nil, session: session
         )
@@ -257,13 +258,13 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
             AgentModeViewModel.observationSnapshot(for: session, candidate: candidate, subagentCounts: (running: 0, finished: 0)).context
         }
         session.selectedAgent = .claudeCode
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 180_000,
             modelContextWindow: 200_000, session: session
         )
         XCTAssertEqual(reported()?.usedTokens, 180_000)
 
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 250_000,
             modelContextWindow: nil, session: session
         )
@@ -271,7 +272,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         XCTAssertNil(reported()?.usedTokens, "A conflicting report withdraws the count")
         XCTAssertEqual(reported()?.windowTokens, 200_000)
 
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 150_000,
             modelContextWindow: nil, session: session
         )
@@ -296,7 +297,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         session.selectedAgent = .claudeCode
         session.activeNonCodexTurnTokenAccumulator = AgentModeViewModel.NonCodexTurnTokenAccumulator()
 
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: 3, completionTokens: nil, contextUsedTokens: 150_000,
             modelContextWindow: nil, session: session
         )
@@ -324,7 +325,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
             AgentModeViewModel.observationSnapshot(for: session, candidate: candidate, subagentCounts: (running: 0, finished: 0)).context
         }
         session.selectedAgent = .claudeCode
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: 150_000, completionTokens: nil, contextUsedTokens: nil,
             modelContextWindow: 200_000, session: session
         )
@@ -332,7 +333,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
 
         // Rejected against the window; the estimator keeps an identical snapshot, yet the
         // conflicting report still withdraws the count.
-        XCTAssertFalse(viewModel.ingestNonCodexUsageReport(
+        XCTAssertFalse(viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 250_000,
             modelContextWindow: nil, session: session
         ), "Precondition: the snapshot is unchanged")
@@ -341,14 +342,14 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         // An identical report from a newly selected provider vouches for its own figure.
         session.selectedAgent = .kimiCode
         XCTAssertNil(reported())
-        XCTAssertFalse(viewModel.ingestNonCodexUsageReport(
+        XCTAssertFalse(viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: 150_000, completionTokens: nil, contextUsedTokens: nil,
             modelContextWindow: nil, session: session
         ), "Precondition: the snapshot is unchanged")
         XCTAssertEqual(reported()?.usedTokens, 150_000)
 
         // Kimi reports its own window, which then bounds its readings.
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: 150_000, completionTokens: nil, contextUsedTokens: nil,
             modelContextWindow: 200_000, session: session
         )
@@ -356,7 +357,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
 
         // An over-window context count is rejected, and the estimator does not backfill it with the
         // input-only prompt count; the conflicting report still withdraws the count.
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: 2000, completionTokens: nil, contextUsedTokens: 250_000,
             modelContextWindow: nil, session: session
         )
@@ -373,7 +374,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
             AgentModeViewModel.observationSnapshot(for: session, candidate: candidate, subagentCounts: (running: 0, finished: 0)).context
         }
         session.selectedAgent = .claudeCode
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 120_000,
             modelContextWindow: 200_000, session: session
         )
@@ -381,7 +382,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         session.selectedModelRaw = session.selectedModelRaw + "-other"
         XCTAssertNil(reported(), "A different model can have a different window")
 
-        viewModel.applyCodexNativeContextUsage(
+        viewModel.usageRuntime.applyCodexNativeContextUsage(
             AgentContextUsage(modelContextWindow: 1_000_000, lastTotalTokens: 400_000, totalTotalTokens: 400_000),
             session: session
         )
@@ -394,25 +395,26 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let tabID = UUID()
         let session = AgentModeViewModel.TabSession(tabID: tabID)
         session.selectedAgent = .codexExec
+        session.codexContextWindowSelection = .tokens1M
         let candidate = makeCandidate(tabID: tabID)
 
-        viewModel.applyCodexNativeContextUsage(
-            AgentContextUsage(modelContextWindow: 1_000_000, lastTotalTokens: 400_000, totalTotalTokens: 900_000),
+        viewModel.usageRuntime.applyCodexNativeContextUsage(
+            AgentContextUsage(modelContextWindow: 500_000, lastTotalTokens: 400_000, totalTotalTokens: 900_000),
             session: session
         )
         let context = try XCTUnwrap(AgentModeViewModel.observationSnapshot(for: session, candidate: candidate, subagentCounts: (running: 0, finished: 0)).context)
         XCTAssertEqual(context.usedTokens, 400_000, "The last request's context, never the cumulative total")
-        XCTAssertEqual(context.windowTokens, 1_000_000)
-        XCTAssertEqual(context.usedPercent, 40.0)
+        XCTAssertEqual(context.windowTokens, 500_000, "The reported window, not the requested preset")
+        XCTAssertEqual(context.usedPercent, 80.0)
         XCTAssertEqual(context.confidence, .exact)
 
         // What `markCodexContextCompacted` does: stamp the compaction, then re-derive the snapshot
         // from the pre-compaction figures.
         session.contextCompactedAt = Date()
-        viewModel.refreshCodexContextUsageSnapshot(for: session)
+        viewModel.usageRuntime.refreshCodexContextUsageSnapshot(for: session)
         let compacted = AgentModeViewModel.observationSnapshot(for: session, candidate: candidate, subagentCounts: (running: 0, finished: 0)).context
         XCTAssertNil(compacted?.usedTokens)
-        XCTAssertEqual(compacted?.windowTokens, 1_000_000)
+        XCTAssertEqual(compacted?.windowTokens, 500_000)
     }
 
     /// A stored ACP figure is reported only while the current provider's own live report vouches
@@ -435,7 +437,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
             let session = AgentModeViewModel.TabSession(tabID: tabID)
             session.selectedAgent = agent
 
-            XCTAssertTrue(viewModel.ingestNonCodexUsageReport(
+            XCTAssertTrue(viewModel.usageRuntime.ingestNonCodexUsageReport(
                 promptTokens: nil, completionTokens: nil, contextUsedTokens: 90000,
                 modelContextWindow: 200_000, session: session
             ), "\(agent): the usage update should produce a snapshot")
@@ -460,7 +462,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: tabID)
         session.selectedAgent = .openCode
 
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: nil,
             modelContextWindow: 272_000, session: session
         )
@@ -511,7 +513,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         }
         session.selectedAgent = .devin
 
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 180_000,
             modelContextWindow: 200_000, session: session
         )
@@ -547,7 +549,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         }
         session.selectedAgent = .devin
 
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 180_000,
             modelContextWindow: 200_000, session: session
         )
@@ -576,7 +578,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         session.selectedAgent = .grokBuild
 
         // A window-only `usage_update` gives a bound without an occupancy claim.
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: nil,
             modelContextWindow: 200_000, session: session
         )
@@ -591,7 +593,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         XCTAssertNil(reported()?.confidence)
 
         // A size-only update carries the billed count forward without relabelling it.
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: nil,
             modelContextWindow: 200_000, session: session
         )
@@ -619,7 +621,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         }
         session.selectedAgent = .devin
 
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 180_000,
             modelContextWindow: 200_000, session: session
         )
@@ -651,7 +653,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         }
         session.selectedAgent = .devin
 
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 180_000,
             modelContextWindow: 200_000, session: session
         )
@@ -684,7 +686,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         }
         session.selectedAgent = .devin
 
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 150_000,
             modelContextWindow: 200_000, session: session
         )
@@ -711,11 +713,11 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         }
         session.selectedAgent = .devin
 
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 180_000,
             modelContextWindow: 200_000, session: session
         )
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: nil,
             modelContextWindow: 200_000, session: session
         )
@@ -741,7 +743,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         }
         session.selectedAgent = .devin
 
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 90000,
             modelContextWindow: 200_000, session: session
         )
@@ -768,11 +770,11 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         }
         session.selectedAgent = .devin
 
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 180_000,
             modelContextWindow: 200_000, session: session
         )
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 0,
             modelContextWindow: nil, session: session
         )
@@ -798,7 +800,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         }
         session.selectedAgent = .openCode
 
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 180_000,
             modelContextWindow: 200_000, session: session
         )
@@ -823,13 +825,13 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         }
         session.selectedAgent = .openCode
 
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 150_000,
             modelContextWindow: 200_000, session: session
         )
         XCTAssertEqual(reported()?.usedTokens, 150_000)
 
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: nil,
             modelContextWindow: 128_000, session: session
         )
@@ -866,7 +868,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
             AgentModeViewModel.observationSnapshot(for: session, candidate: candidate, subagentCounts: (running: 0, finished: 0)).context
         }
         session.selectedAgent = .claudeCode
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 180_000,
             modelContextWindow: 200_000, session: session
         )
@@ -877,7 +879,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
 
         // A window-only ACP report carries the foreign count forward in the store, but nothing
         // vouches it, so only the new window is exported.
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: nil,
             modelContextWindow: 256_000, session: session
         )
@@ -902,7 +904,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         XCTAssertNil(reported()?.usedTokens)
         XCTAssertNil(reported()?.confidence)
 
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 40000,
             modelContextWindow: 256_000, session: session
         )
@@ -919,7 +921,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: tabID)
         session.selectedAgent = .openCode
 
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 90000,
             modelContextWindow: 200_000, session: session
         )
@@ -943,7 +945,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         session.selectedAgent = .claudeCode
         session.activeNonCodexTurnTokenAccumulator = AgentModeViewModel.NonCodexTurnTokenAccumulator()
 
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: 3, completionTokens: nil, contextUsedTokens: 152_500,
             modelContextWindow: nil, session: session
         )
@@ -968,11 +970,11 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: tabID)
         session.selectedAgent = .openCode
 
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 180_000,
             modelContextWindow: 200_000, session: session
         )
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 0,
             modelContextWindow: 200_000, session: session
         )
@@ -987,12 +989,12 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         XCTAssertNil(context.confidence)
 
         // Also without a window in the same report.
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 150_000,
             modelContextWindow: nil, session: session
         )
         XCTAssertEqual(session.contextUsageSnapshot?.used, 150_000)
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 0,
             modelContextWindow: nil, session: session
         )
@@ -1009,14 +1011,14 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let subscription = session.monitorObservationSignal.sink { signals += 1 }
         defer { subscription.cancel() }
 
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 90000,
             modelContextWindow: nil, session: session
         )
         XCTAssertNotNil(session.vouchedContextCount)
         XCTAssertEqual(signals, 1, "Establishing a vouch republishes")
 
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 95000,
             modelContextWindow: nil, session: session
         )
@@ -1094,13 +1096,13 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let tabID = UUID()
         let session = AgentModeViewModel.TabSession(tabID: tabID)
         session.selectedAgent = .devin
-        viewModel.acpContextUsageEstimator.beginTurn(session: session, initialMessage: "turn")
+        viewModel.usageRuntime.acpContextUsageEstimator.beginTurn(session: session, initialMessage: "turn")
 
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 100_000,
             modelContextWindow: 200_000, session: session
         )
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: nil,
             modelContextWindow: 250_000, session: session
         )
@@ -1131,7 +1133,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let subscription = session.monitorObservationSignal.sink { signals += 1 }
         defer { subscription.cancel() }
 
-        viewModel.acpContextUsageEstimator.beginTurn(session: session, initialMessage: "one")
+        viewModel.usageRuntime.acpContextUsageEstimator.beginTurn(session: session, initialMessage: "one")
         viewModel.ingestNonCodexTurnFinalization(
             promptTokens: 95000, completionTokens: 400, contextUsedTokens: 95000,
             modelContextWindow: nil, session: session
@@ -1141,7 +1143,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         XCTAssertNil(reported()?.usedTokens)
         let afterBilled = signals
 
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 95000,
             modelContextWindow: nil, session: session
         )
@@ -1149,7 +1151,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         XCTAssertEqual(reported()?.confidence, .exact)
         XCTAssertEqual(signals, afterBilled + 1, "Occupancy confirming the same figure republishes")
 
-        viewModel.acpContextUsageEstimator.beginTurn(session: session, initialMessage: "two")
+        viewModel.usageRuntime.acpContextUsageEstimator.beginTurn(session: session, initialMessage: "two")
         viewModel.ingestNonCodexTurnFinalization(
             promptTokens: 95000, completionTokens: 400, contextUsedTokens: 95000,
             modelContextWindow: nil, session: session
@@ -1165,7 +1167,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let viewModel = makeViewModel()
         let first = AgentModeViewModel.TabSession(tabID: UUID())
         first.selectedAgent = .devin
-        _ = viewModel.ingestNonCodexUsageReport(
+        _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 120_000,
             modelContextWindow: 200_000, session: first
         )
@@ -1174,9 +1176,9 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let second = AgentModeViewModel.TabSession(tabID: UUID())
         second.selectedAgent = .devin
         XCTAssertNil(second.acpOccupancyReportThisTurn)
-        XCTAssertFalse(viewModel.acpContextUsageEstimator.hasOccupancyReportThisTurn(session: second))
+        XCTAssertFalse(viewModel.usageRuntime.acpContextUsageEstimator.hasOccupancyReportThisTurn(session: second))
 
-        viewModel.acpContextUsageEstimator.beginTurn(session: first, initialMessage: "next")
+        viewModel.usageRuntime.acpContextUsageEstimator.beginTurn(session: first, initialMessage: "next")
         XCTAssertNil(first.acpOccupancyReportThisTurn)
     }
 

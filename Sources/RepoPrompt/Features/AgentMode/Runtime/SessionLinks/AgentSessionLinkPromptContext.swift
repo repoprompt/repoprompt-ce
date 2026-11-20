@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 
 // The claim/receipt owner of the oversight subsystem.
@@ -676,6 +677,12 @@ struct AgentSessionLinkOutboundPromptClaim: Hashable {
         /// immutable — by acceptance time a rename, unlink, or rebind could rewrite what any live
         /// lookup would say the turn had delivered.
         let displayAttribution: AgentLaneUpdateDisplayAttribution?
+        var deliveredAttentionLinks: [DeliveredAttentionLink] = []
+    }
+
+    struct DeliveredAttentionLink: Hashable {
+        let reference: DomainAgentSessionLinkReference
+        let targetSessionID: UUID
     }
 
     let observerSessionID: UUID
@@ -1284,7 +1291,10 @@ final class AgentSessionLinkOutboundPromptClaimStore {
                     renderedEntries: renderedPassive.entries,
                     includesUnattributedOverflow: renderedPassive.includesUnattributedOverflow,
                     locationLabelsByReference: locationLabelsByReference
-                )
+                ),
+                deliveredAttentionLinks: renderedPassive.attentionRequests.map {
+                    .init(reference: $0.reference, targetSessionID: $0.targetSessionID)
+                }
             )
         }
 

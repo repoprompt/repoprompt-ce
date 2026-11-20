@@ -40,7 +40,7 @@ struct OpenAIDecisionsRoutingClient {
     ) async throws -> OpenAIDecisionsWireResponse {
         var request = URLRequest(url: Self.endpoint, cachePolicy: .reloadIgnoringLocalCacheData)
         request.httpMethod = "POST"
-        request.timeoutInterval = max(0.001, timeout.secondsValue)
+        request.timeoutInterval = max(0.001, timeout.routingTimeInterval)
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -285,12 +285,5 @@ private final class OpenAIDecisionsOwnedFirstResult<Value: Sendable>: @unchecked
         lock.unlock()
         tasks.forEach { $0.cancel() }
         continuation?.resume(with: result)
-    }
-}
-
-private extension Duration {
-    var secondsValue: TimeInterval {
-        let value = components
-        return TimeInterval(value.seconds) + TimeInterval(value.attoseconds) / 1_000_000_000_000_000_000
     }
 }

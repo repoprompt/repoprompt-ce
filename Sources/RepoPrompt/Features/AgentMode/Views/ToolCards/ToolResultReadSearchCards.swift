@@ -4,7 +4,7 @@ import SwiftUI
 
 struct ReadFileResultCard: View {
     let item: AgentChatItem
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("ReadFileResultCard") private var isExpanded = false
 
     private var dto: ToolResultDTOs.ReadFileReply? {
         ToolJSON.decode(ToolResultDTOs.ReadFileReply.self, from: item.toolResultJSON)
@@ -42,18 +42,15 @@ struct ReadFileResultCard: View {
             title: "Read File",
             subtitle: summary,
             status: status,
-            timestamp: item.timestamp,
-            isExpandable: toolResultHasPayload(item),
+            item: item,
             isExpanded: $isExpanded
-        ) {
-            ToolMarkdownExpandedContent(item: item)
-        }
+        )
     }
 }
 
 struct NativeReadResultCard: View {
     let item: AgentChatItem
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("NativeReadResultCard") private var isExpanded = false
 
     private var args: ToolArgsDTOs.NativeReadArgs? {
         ToolJSON.decodeArgs(ToolArgsDTOs.NativeReadArgs.self, from: item.toolArgsJSON)
@@ -75,18 +72,15 @@ struct NativeReadResultCard: View {
             title: "Read",
             subtitle: nonEmptyToolCardSummary(summary, fallbackStatusFor: item),
             status: status,
-            timestamp: item.timestamp,
-            isExpandable: toolResultHasPayload(item),
+            item: item,
             isExpanded: $isExpanded
-        ) {
-            ToolMarkdownExpandedContent(item: item)
-        }
+        )
     }
 }
 
 struct FileSearchResultCard: View {
     let item: AgentChatItem
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("FileSearchResultCard") private var isExpanded = false
 
     private var dto: ToolResultDTOs.SearchResultDTO? {
         ToolJSON.decode(ToolResultDTOs.SearchResultDTO.self, from: item.toolResultJSON)
@@ -131,19 +125,16 @@ struct FileSearchResultCard: View {
             title: "Search",
             subtitle: nonEmptyToolCardSummary(summary, fallbackStatusFor: item),
             status: status,
-            timestamp: item.timestamp,
-            isExpandable: toolResultHasPayload(item),
+            item: item,
             isExpanded: $isExpanded
-        ) {
-            ToolMarkdownExpandedContent(item: item)
-        }
+        )
     }
 }
 
 struct WebSearchResultCard: View {
     let item: AgentChatItem
     let normalizedToolName: String
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("WebSearchResultCard") private var isExpanded = false
 
     init(item: AgentChatItem, normalizedToolName: String = "search") {
         self.item = item
@@ -161,19 +152,16 @@ struct WebSearchResultCard: View {
             title: presentation?.title ?? toolDisplayName(for: normalizedToolName),
             subtitle: nonEmptyToolCardSummary(summary, fallbackStatusFor: item),
             status: status,
-            timestamp: item.timestamp,
-            isExpandable: toolResultHasPayload(item),
+            item: item,
             isExpanded: $isExpanded
-        ) {
-            ToolMarkdownExpandedContent(item: item)
-        }
+        )
     }
 }
 
 struct NativeToolResultCard: View {
     let item: AgentChatItem
     let normalizedToolName: String?
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("NativeToolResultCard") private var isExpanded = false
 
     var body: some View {
         let presentation = NativeToolCardPresentationBuilder.build(item: item, normalizedToolName: normalizedToolName)
@@ -184,12 +172,9 @@ struct NativeToolResultCard: View {
             subtitle: nonEmptyToolCardSummary(presentation?.inlineSummaryText, fallbackStatusFor: item),
             status: presentation.map { ToolCardStatus.fromRenderStatus($0.status) }
                 ?? ToolResultStatusResolver.resolve(toolIsError: item.toolIsError, raw: item.toolResultJSON, fallback: .neutral),
-            timestamp: item.timestamp,
-            isExpandable: toolResultHasPayload(item),
+            item: item,
             isExpanded: $isExpanded
-        ) {
-            ToolMarkdownExpandedContent(item: item)
-        }
+        )
     }
 }
 
@@ -247,7 +232,7 @@ enum NativeToolCardPresentationBuilder {
 
 struct FileActionResultCard: View {
     let item: AgentChatItem
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("FileActionResultCard") private var isExpanded = false
 
     private var dto: ToolResultDTOs.FileActionReply? {
         ToolJSON.decode(ToolResultDTOs.FileActionReply.self, from: item.toolResultJSON)
@@ -316,11 +301,8 @@ struct FileActionResultCard: View {
             title: "File Action",
             subtitle: summary,
             status: status,
-            timestamp: item.timestamp,
-            isExpandable: toolResultHasPayload(item),
+            item: item,
             isExpanded: $isExpanded
-        ) {
-            ToolMarkdownExpandedContent(item: item)
-        }
+        )
     }
 }

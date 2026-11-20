@@ -70,6 +70,8 @@ extension Notification.Name {
     /// Posted when the UI should open the MCP server toolbar popover.
     /// userInfo: ["windowID": Int]
     static let showMCPServerPopover = Notification.Name("showMCPServerPopover")
+    /// Present the MCP connections dashboard in the window named by `userInfo["windowID"]`.
+    static let showMCPStatusWindow = Notification.Name("showMCPStatusWindow")
     /// Posted when Agent Mode should open the Oracle pill popover.
     /// userInfo: ["windowID": Int, "workspaceID": UUID, "tabID": UUID, "chatID": String]
     /// Running Oracle tool calls may instead use ["route": "latest"] without chatID to open

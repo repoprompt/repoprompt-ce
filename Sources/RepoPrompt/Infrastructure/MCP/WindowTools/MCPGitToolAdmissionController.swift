@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 import RepoPromptVCS
 
 /// Tool-level Git admission keyed by canonical repository identity. The lower-level WI-9
@@ -17,7 +18,7 @@ final class MCPGitToolAdmissionController {
     }
 
     static let shared = MCPGitToolAdmissionController(
-        perRepositoryLimit: MCPToolAdmissionPolicy.gitReadPerRepositoryLimit
+        perRepositoryLimit: MCPDomainToolAdmissionLimits.gitReadPerRepository
     )
 
     let perRepositoryLimit: Int

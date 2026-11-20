@@ -1,9 +1,35 @@
 import Foundation
+import RepoPromptAIContracts
 @testable import RepoPromptApp
+import RepoPromptClaudeProvider
 import RepoPromptProcess
 import XCTest
 
 final class ClaudeCodeAgentProviderGracefulDisposalTests: XCTestCase {
+    func testResolverFailureReleasesCanonicalLeaseWithoutRemovingStableConfig() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let service = MCPConfigExportService(
+            identity: .repoPromptCE(.debug), configDirectoryURL: root,
+            renderServerConfig: { "{\"mcpServers\":{}}" }
+        )
+        let stable = try await service.prepareStableWrapperConfigFile()
+        let provider = ClaudeCodeAgentProvider(
+            runner: CLIProcessRunner(config: CLIProcessConfiguration(command: "/unused")),
+            config: .discovery(), environmentResolver: FailingHeadlessResolver(),
+            configService: service, serverReadiness: { true }
+        )
+        do {
+            _ = try await provider.prepare()
+            XCTFail("Expected resolver failure")
+        } catch let AIProviderError.invalidConfiguration(detail) {
+            XCTAssertEqual(detail, "resolver failed")
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: stable.path))
+        let launchFiles = try FileManager.default.contentsOfDirectory(at: root.appendingPathComponent("LaunchConfigs"), includingPropertiesForKeys: nil)
+        XCTAssertTrue(launchFiles.isEmpty)
+    }
+
     func testDisposeWaitsForExactStreamCleanupAndReleasesOnlyOwnedLease() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("ClaudeCodeAgentProviderGracefulDisposalTests-\(UUID().uuidString)", isDirectory: true)
@@ -83,6 +109,12 @@ final class ClaudeCodeAgentProviderGracefulDisposalTests: XCTestCase {
         let launchFilesAfterDispose = try FileManager.default.contentsOfDirectory(at: launchDirectory, includingPropertiesForKeys: nil)
         XCTAssertEqual(launchFilesAfterDispose.count, 1)
         XCTAssertEqual(launchFilesAfterDispose.first?.lastPathComponent, siblingLease.url.lastPathComponent)
+    }
+}
+
+private struct FailingHeadlessResolver: ClaudeCodeLaunchEnvironmentResolving {
+    func resolve(variant: ClaudeCodeRuntimeVariant, requestedModel: String?) async throws -> ClaudeCompatiblePluginLaunchEnvironment {
+        throw AIProviderError.invalidConfiguration(detail: "resolver failed")
     }
 }
 

@@ -3,7 +3,7 @@ import SwiftUI
 
 struct BashResultCard: View {
     let item: AgentChatItem
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("BashResultCard") private var isExpanded = false
 
     @Environment(\.agentLiveBashExecutionByItemID) private var liveBashExecutionByItemID
 

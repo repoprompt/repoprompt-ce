@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 
@@ -10,7 +11,7 @@ enum AppOracleGroupRouting {
     static func executionProfile(for model: AIModel) -> OracleExecutionProfile? {
         let effort: String?
         if model.providerType == .grokBuild {
-            let snapshot = AgentACPModelRegistry.shared.resolvedSnapshotIncludingStandardStore(for: .grokBuild)
+            let snapshot = AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshotIncludingStandardStore(for: .grokBuild)
             effort = GrokBuildModelSpecifier.decompose(
                 raw: model.modelName,
                 options: snapshot?.options ?? []
@@ -196,6 +197,7 @@ enum OracleExecutionResolutionError: LocalizedError, Equatable {
     case presetsUnavailable(String)
     case presetNotFound(String)
     case presetModeUnsupported(name: String, mode: String)
+    case missingConfiguredOracleModel
     case invalidRoster(String)
     case invalidModel(presetName: String?, laneIndex: Int, modelID: String)
     case unavailableModel(presetName: String?, laneIndex: Int, model: AIModel)
@@ -215,6 +217,8 @@ enum OracleExecutionResolutionError: LocalizedError, Equatable {
             "Model preset '\(choice)' was not found."
         case let .presetModeUnsupported(name, mode):
             "Model preset '\(name)' does not support \(mode.capitalized) mode."
+        case .missingConfiguredOracleModel:
+            "Choose an Oracle model before starting a conversation."
         case let .invalidRoster(message):
             message
         case let .invalidModel(presetName, laneIndex, modelID):
@@ -443,7 +447,7 @@ struct OracleExecutionResolver {
         additionalOracles: [String]?
     ) throws -> ResolvedOracleExecution {
         guard let primary = snapshot.agentModelsProfile.planningModelRaw else {
-            throw OracleExecutionResolutionError.invalidRoster("Choose an Oracle model before starting a conversation.")
+            throw OracleExecutionResolutionError.missingConfiguredOracleModel
         }
         return try makeExecution(
             modelStrings: [primary] + snapshot.agentModelsProfile.additionalOracleModelRaws,

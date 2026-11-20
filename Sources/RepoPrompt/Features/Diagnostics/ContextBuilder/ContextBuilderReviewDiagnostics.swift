@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptShared
+import RepoPromptWorkspaceContext
 
 struct ContextBuilderReviewDiagnosticEvent: Equatable, CustomStringConvertible {
     enum Phase: String {

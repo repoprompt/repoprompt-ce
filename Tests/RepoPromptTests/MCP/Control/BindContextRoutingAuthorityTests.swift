@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 import MCP
 @testable import RepoPromptApp
+@testable import RepoPromptMCPServer
 import RepoPromptSettingsCore
 import XCTest
 
@@ -454,6 +455,7 @@ final class BindContextRoutingAuthorityTests: XCTestCase {
             XCTAssertNotEqual(bindResult.isError, true, toolText(bindResult))
 
             let boundBeforeCall = targetWindow.mcpServer.connectionBindingSnapshot(
+                route: targetWindow.mcpServer.routeResources,
                 forConnection: connection.connectionID
             )
             XCTAssertEqual(boundBeforeCall.windowID, targetWindow.windowID)
@@ -502,6 +504,7 @@ final class BindContextRoutingAuthorityTests: XCTestCase {
             XCTAssertFalse(status.binding.runScoped)
 
             let boundAfterCall = targetWindow.mcpServer.connectionBindingSnapshot(
+                route: targetWindow.mcpServer.routeResources,
                 forConnection: connection.connectionID
             )
             XCTAssertEqual(boundAfterCall.windowID, boundBeforeCall.windowID)
@@ -597,7 +600,7 @@ final class BindContextRoutingAuthorityTests: XCTestCase {
             // Invoke the production materialized binding, not require() in isolation.
             // No network packet and no trusted-local scope may manufacture authority.
             await MCPInvocationContextBridge.currentTaskLocal.withValue(nil) {
-                await MCPInvocationContextBridge.$diagnosticSink.withValue({ diagnostics.record($0) }) {
+                await MCPInvocationContextBridge.withDiagnosticSink({ diagnostics.record($0) }) {
                     do {
                         _ = try await tool(["op": .string("snapshot")])
                         XCTFail("An unscoped window binding must not enter its provider")

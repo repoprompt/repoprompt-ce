@@ -185,6 +185,12 @@ actor ChatDataService {
             }
         }
 
+        nonisolated static func test_drainFileSaveQueue() async {
+            await withCheckedContinuation { continuation in
+                fileSaveQueue.async { continuation.resume() }
+            }
+        }
+
         nonisolated static func test_workspaceRootURL() -> URL {
             workspaceRootURL()
         }
@@ -380,6 +386,9 @@ actor ChatDataService {
                 let fileURL = files[index]
                 group.addTask {
                     do {
+                        let lease = try await HostResourceBudget.shared.acquire(.io)
+                        defer { lease.release() }
+                        try Task.checkCancellation()
                         let session = try Self.loadChatSessionStubFromDisk(from: fileURL)
                         return .success(index: index, session: session)
                     } catch {
@@ -471,7 +480,9 @@ actor ChatDataService {
 
     /// Returns a list of "ChatSession-xxx.json" files in the workspace’s Chats folder, sorted by mod date desc.
     func listChatSessions(for workspace: WorkspaceModel) async throws -> [URL] {
-        let chatsFolder = try ensureChatsFolder(for: workspace)
+        let chatsFolder = Self.resolvedWorkspaceFolderURL(for: workspace).appendingPathComponent("Chats")
+        try AppProfileLocations.current.validateMetadataFile(chatsFolder)
+        guard FileManager.default.fileExists(atPath: chatsFolder.path) else { return [] }
         let sortedFiles = try await Self.listChatSessionURLs(in: chatsFolder)
 
         // Apply the limit to logical conversations, not projection files. If any

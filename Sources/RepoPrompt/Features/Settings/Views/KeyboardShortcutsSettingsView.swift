@@ -20,6 +20,7 @@ enum KeyboardShortcutCatalog {
             blurb: "Clear or change New Workspace Window to free ⌘N for New Agent chat or New Agent session tab.",
             bindings: [
                 .init(id: "new-window", title: "New workspace window", detail: nil, name: .newWorkspaceWindow),
+                .init(id: "command-center", title: "Command Center", detail: nil, name: .showCommandCenter),
                 .init(id: "settings", title: "Settings", detail: nil, name: .showAppSettings),
                 .init(id: "close-window", title: "Close window", detail: nil, name: .closeAppWindow),
                 .init(id: "updates", title: "Check for updates / install available update", detail: nil, name: .checkForUpdates)
@@ -228,7 +229,9 @@ struct KeyboardShortcutsSettingsView: View {
 
                     SettingSection(title: section.title, description: section.blurb) {
                         VStack(alignment: .leading, spacing: 10) {
-                            ForEach(section.bindings) { binding in
+                            ForEach(section.bindings.filter {
+                                $0.name != .showCommandCenter || globalSettings.experimentalCommandCenter()
+                            }) { binding in
                                 ShortcutPreferenceRow(
                                     title: binding.title,
                                     subtitle: binding.detail,

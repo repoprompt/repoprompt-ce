@@ -91,6 +91,7 @@ final class AgentSessionReleaseOperationHandler: AgentSessionAdministrationOpera
         // or `skipped`. The reply then reports `committed_changes`, so the call's receipt is recorded
         // for idempotent replay and a same-key retry never re-runs work that already took effect.
         var committed = false
+        var localChanges = false
         let retiring = batch.request.operation == .adminRetire
         let backend = backend
         let holdsControl = holdsControl
@@ -99,6 +100,16 @@ final class AgentSessionReleaseOperationHandler: AgentSessionAdministrationOpera
         /// scope chain holds `control`. Re-read after every suspension, before each step.
         func runStateAllows(_ id: UUID) -> Bool {
             !retiring || backend.runState(of: id) == .idle || holdsControl(scope)
+        }
+
+        func releasePhaseRefusal(_ target: UUID, detail: [String: Value]) -> AgentSessionAdminItemResult? {
+            guard isCurrent(target) else {
+                return .init(sessionID: target, status: .failed, reason: "scope_no_longer_current", detail: detail)
+            }
+            guard runStateAllows(target) else {
+                return .init(sessionID: target, status: .skipped, reason: "requires_control", detail: detail)
+            }
+            return nil
         }
 
         for target in batch.admittedSessionIDs {
@@ -148,12 +159,8 @@ final class AgentSessionReleaseOperationHandler: AgentSessionAdministrationOpera
 
             // Fresh inventory per target: an earlier Stop may have retired shared links.
             let inventory = await links.oversightInventory()
-            guard isCurrent(target) else {
-                items.append(.init(sessionID: target, status: .failed, reason: "scope_no_longer_current", detail: detail))
-                continue
-            }
-            guard runStateAllows(target) else {
-                items.append(.init(sessionID: target, status: .skipped, reason: "requires_control", detail: detail))
+            if let refusal = releasePhaseRefusal(target, detail: detail) {
+                items.append(refusal)
                 continue
             }
             var unlinked = 0
@@ -216,12 +223,8 @@ final class AgentSessionReleaseOperationHandler: AgentSessionAdministrationOpera
             }
 
             if retiring {
-                guard isCurrent(target) else {
-                    items.append(.init(sessionID: target, status: .failed, reason: "scope_no_longer_current", detail: detail))
-                    continue
-                }
-                guard runStateAllows(target) else {
-                    items.append(.init(sessionID: target, status: .skipped, reason: "requires_control", detail: detail))
+                if let refusal = releasePhaseRefusal(target, detail: detail) {
+                    items.append(refusal)
                     continue
                 }
                 guard let beforeArchive = backend.state(of: target) else {
@@ -231,8 +234,8 @@ final class AgentSessionReleaseOperationHandler: AgentSessionAdministrationOpera
                 // An archived target can still have links to release. Check its archive requirement
                 // only after those steps, without counting an existing stash as our own effect.
                 let refusals = AgentSessionRunStateRefusals()
-                let archiveChanged = if beforeArchive.isArchived {
-                    false
+                let archive = if beforeArchive.isArchived {
+                    AgentSessionArchiveOutcome()
                 } else {
                     await backend.archive([target], isAuthorized: { id in
                         guard isCurrent(id) else {
@@ -240,9 +243,19 @@ final class AgentSessionReleaseOperationHandler: AgentSessionAdministrationOpera
                             return false
                         }
                         return refusals.admit(id, runStateAllows(id))
-                    }).contains(target)
+                    })
                 }
+                let archiveChanged = archive.archived.contains(target)
                 detail["archive_changed"] = .bool(archiveChanged)
+                if let failure = archive.failures[target] {
+                    localChanges = localChanges || failure.localChanges
+                    committed = committed || failure.persistenceConfirmed
+                    detail["archive_result"] = .string("rejected")
+                    detail["local_changes"] = .bool(failure.localChanges)
+                    detail["persistence_confirmed"] = .bool(failure.persistenceConfirmed)
+                    items.append(.init(sessionID: target, status: .failed, reason: failure.reason, detail: detail))
+                    continue
+                }
                 if archiveChanged {
                     committed = true
                     targetChanged = true
@@ -276,6 +289,7 @@ final class AgentSessionReleaseOperationHandler: AgentSessionAdministrationOpera
         }
         var extra: [String: Value] = ["unlinked_total": .int(totalUnlinked)]
         if committed { extra[AgentSessionAdminRendering.committedChangesKey] = .bool(true) }
+        if localChanges { extra["local_changes"] = .bool(true) }
         if items.contains(where: { $0.detail["dormant_intents"] != nil }) {
             extra["dormant_intents_detail"] = .string(
                 "Saved links whose sessions are not live were left in place; they are released when the user stops them or deletes a session."

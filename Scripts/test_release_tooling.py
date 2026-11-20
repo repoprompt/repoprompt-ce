@@ -9,6 +9,7 @@ import json
 import os
 import plistlib
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -89,7 +90,7 @@ class PromotionCurlConfigTests(unittest.TestCase):
                                PUBLIC_UPDATE_GH_TOKEN="fixture\ninvalid",
                                CONFIG_RECEIPT=str(receipt))
             result = subprocess.run(
-                ["bash", "-c", 'source "$1"; TMP_DIR="$(mktemp -d)"; verify_strictly_newer_build',
+                ["bash", "-c", 'source "$1"; TMP_DIR="$(mktemp -d)"; verify_tip_handoff(){ touch "$CONFIG_RECEIPT.handoff"; }; verify_strictly_newer_build',
                  "test", str(SCRIPT_DIR / "promote_release.sh")],
                 env=environment, text=True, capture_output=True, timeout=10,
             )
@@ -125,7 +126,7 @@ print("404", end="")
                                    CONFIG_RECEIPT=str(root / "receipt"),
                                    FAIL_TRANSPORT="1" if fail_transport else "0")
                 result = subprocess.run(
-                    ["bash", "-c", 'source "$1"; TMP_DIR="$(mktemp -d)"; verify_strictly_newer_build',
+                    ["bash", "-c", 'source "$1"; TMP_DIR="$(mktemp -d)"; verify_tip_handoff(){ touch "$CONFIG_RECEIPT.handoff"; }; verify_strictly_newer_build',
                      "test", str(SCRIPT_DIR / "promote_release.sh")],
                     env=environment, text=True, capture_output=True, timeout=10,
                 )
@@ -133,6 +134,7 @@ print("404", end="")
                 config = Path((root / "receipt").read_text())
                 self.assertFalse(config.exists())
                 self.assertFalse(config.parent.exists())
+                self.assertEqual((root / 'receipt.handoff').exists(), not fail_transport)
                 self.assertNotIn(environment["PUBLIC_UPDATE_GH_TOKEN"], result.stdout + result.stderr)
 
 
@@ -225,12 +227,64 @@ class SparkleInstallerLauncherGuardTests(unittest.TestCase):
 
     def test_release_preflight_and_staged_validation_run_the_guard(self) -> None:
         release = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
-        preflight = release.split("run_preflight() {", 1)[1].split("\n}", 1)[0]
+        for wrapper in ("run_preflight", "run_tip_preflight"):
+            body = release.split(f"{wrapper}() {{", 1)[1].split("\n}", 1)[0]
+            self.assertIn("run_source_preflight", body)
+        preflight = release.split("run_source_preflight() {", 1)[1].split("\n}", 1)[0]
         self.assertIn('"$CONTROL_PLANE_SCRIPTS_DIR/validate_sparkle_installer_launcher.py"', preflight)
         self.assertIn('--info-plist "$ROOT_DIR/AppBundle/Info.plist.template"', preflight)
         staged = (SCRIPT_DIR / "validate_staged_release.sh").read_text(encoding="utf-8")
         self.assertIn('"$SCRIPT_DIR/validate_sparkle_installer_launcher.py"', staged)
         self.assertIn('--info-plist "$APP_BUNDLE/Contents/Info.plist"', staged)
+
+
+class PackagedSparkleLayoutTests(unittest.TestCase):
+    VALIDATOR = SCRIPT_DIR / "verify_sparkle_vendor.sh"
+    FRAMEWORK = ROOT_DIR / "Vendor/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
+
+    def validate(self, framework: Path) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", str(self.VALIDATOR), "--packaged-layout", str(framework)],
+            text=True, capture_output=True, timeout=30,
+        )
+
+    @unittest.skipUnless(shutil.which("ditto"), "requires macOS ZIP packaging")
+    def test_zip_roundtrip_preserves_sparkle_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "Sparkle.zip"
+            extracted = root / "extracted"
+            subprocess.run(["ditto", "-c", "-k", "--keepParent", str(self.FRAMEWORK), str(archive)],
+                           check=True, capture_output=True, timeout=30)
+            subprocess.run(["ditto", "-x", "-k", str(archive), str(extracted)],
+                           check=True, capture_output=True, timeout=30)
+            result = self.validate(extracted / self.FRAMEWORK.name)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_detects_changed_symlinks_and_exec_bits_after_packaging(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            framework = Path(directory) / self.FRAMEWORK.name
+            shutil.copytree(self.FRAMEWORK, framework, symlinks=True)
+            launcher = framework / "Versions/B/Autoupdate"
+            # Code signing updates executable bytes without changing their layout.
+            launcher.write_bytes(b"re-signed executable fixture")
+            baseline = self.validate(framework)
+            self.assertEqual(baseline.returncode, 0, baseline.stderr)
+
+            executable_mode = launcher.stat().st_mode
+            launcher.chmod(executable_mode & ~0o111)
+            bad_mode = self.validate(framework)
+            self.assertEqual(bad_mode.returncode, 1)
+            self.assertIn("Versions/B/Autoupdate", bad_mode.stderr)
+
+            launcher.chmod(executable_mode)
+            alias = framework / "Autoupdate"
+            alias.unlink()
+            shutil.copy2(launcher, alias)
+            bad_alias = self.validate(framework)
+            self.assertEqual(bad_alias.returncode, 1)
+            self.assertIn("Sparkle layout mismatch", bad_alias.stderr)
+            self.assertIn("Autoupdate", bad_alias.stderr)
 
 
 class ReleaseStagePhaseTests(unittest.TestCase):

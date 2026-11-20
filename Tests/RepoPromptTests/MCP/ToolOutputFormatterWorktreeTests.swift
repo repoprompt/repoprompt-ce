@@ -772,7 +772,22 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
                 result: value, emitResources: false
             ))
             XCTAssertEqual(try JSONDecoder().decode(Value.self, from: Data(raw.utf8)), value, scenario.label)
+            XCTAssertEqual(String(text[jsonStart ..< jsonEnd]), raw, scenario.label)
         }
+    }
+
+    func testSessionAdminNonInventoryResponseUsesCompactJSON() throws {
+        let value: Value = .object([
+            "result": .string("denied"),
+            "reason": .string("Review \n /tmp/example"),
+            "capabilities": .array([.string("observe"), .string("organize")])
+        ])
+        let text = try Self.onlyText(ToolOutputFormatter.buildContentBlocks(
+            toolName: "session_admin", args: ["op": .string("scope_status")], result: value, emitResources: false
+        ))
+
+        XCTAssertEqual(try JSONDecoder().decode(Value.self, from: Data(text.utf8)), value)
+        XCTAssertFalse(text.contains("\n"))
     }
 
     func testIncompleteHistoryScansNeverImplyAnEmptyWorkspace() throws {

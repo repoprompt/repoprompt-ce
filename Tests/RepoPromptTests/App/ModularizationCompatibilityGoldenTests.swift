@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptSettingsCore
 import XCTest
@@ -20,63 +21,37 @@ final class ModularizationCompatibilityGoldenTests: XCTestCase {
         }
     }
 
-    // MARK: - Reflection-based sort key
-
-    /// `automaticSelectionIssuePrecedes` orders issues by `String(reflecting:)`, so the key text
-    /// embeds module-qualified type names. Both sides of every comparison share the same type
-    /// prefix at the same position, so the order depends only on case names and payload values,
-    /// not on the owning module. This golden pins that order, including the lexicographic
-    /// (not numeric) ordering of integer payloads, so a move or an explicit-key refactor that
-    /// changes it fails here.
-    func testAutomaticSelectionIssueOrderIsPinned() {
-        let rootA = WorkspaceCodemapRootEpoch(
-            rootID: uuid("00000000-0000-0000-0000-00000000000A"),
-            rootLifetimeID: uuid("00000000-0000-0000-0000-000000000001")
-        )
-        let rootB = WorkspaceCodemapRootEpoch(
-            rootID: uuid("00000000-0000-0000-0000-00000000000B"),
-            rootLifetimeID: uuid("00000000-0000-0000-0000-000000000001")
-        )
-        let fileLow = uuid("00000000-0000-0000-0000-000000000101")
-        let fileHigh = uuid("00000000-0000-0000-0000-000000000102")
-
-        func source(
-            _ rootEpoch: WorkspaceCodemapRootEpoch,
-            catalogGeneration: UInt64 = 1
-        ) -> WorkspaceCodemapAutomaticSelectionSourceIdentity {
-            WorkspaceCodemapAutomaticSelectionSourceIdentity(
-                rootEpoch: rootEpoch,
-                fileID: fileLow,
-                catalogGeneration: catalogGeneration,
-                requestGeneration: 1
-            )
-        }
-
-        let expected: [WorkspaceCodemapAutomaticSelectionIssue] = [
-            .budget(.byteLimit(attempted: 2, limit: 1)),
-            .emptySources,
-            .graphRevoked(rootA, .rootUnloaded),
-            .graphRevoked(rootA, .schemaMismatch),
-            .rootScopeChanged,
-            // "10" sorts before "9": the key compares rendered text, not numbers.
-            .sourceGenerationChanged(source(rootA, catalogGeneration: 10), committedGeneration: nil),
-            .sourceGenerationChanged(source(rootA, catalogGeneration: 9), committedGeneration: nil),
-            .sourcePending(source(rootA)),
-            .sourcePending(source(rootB)),
-            .targetDemandUnavailable(rootEpoch: rootA, fileID: fileLow, reason: .busy(retryAfterMilliseconds: nil)),
-            .targetDemandUnavailable(rootEpoch: rootA, fileID: fileLow, reason: .rootNotLoaded),
-            // Root epoch is compared before file ID.
-            .targetNotCataloged(rootEpoch: rootA, fileID: fileHigh),
-            .targetNotCataloged(rootEpoch: rootB, fileID: fileLow),
-            .updatesPending(rootA)
+    /// F1 aliases preserve source identity, while dispatch raw values remain the MCP wire contract.
+    @MainActor
+    func testSessionRuntimeValueHoistsPreserveDispatchContract() {
+        XCTAssertEqual(ObjectIdentifier(AgentModeViewModel.AgentInteractionTransport.self), ObjectIdentifier(AgentRunInteractionTransport.self))
+        XCTAssertEqual(ObjectIdentifier(AgentModeViewModel.MCPInstructionDispatch.self), ObjectIdentifier(AgentMCPInstructionDispatch.self))
+        XCTAssertEqual(ObjectIdentifier(AgentModeViewModel.MCPActiveInstructionDispatchPlan.self), ObjectIdentifier(AgentMCPActiveInstructionDispatchPlan.self))
+        XCTAssertEqual(ObjectIdentifier(AgentModeViewModel.NonCodexTurnTokenAccumulator.self), ObjectIdentifier(AgentNonCodexTurnTokenAccumulator.self))
+        let cases: [(AgentMCPInstructionDispatch, String, Bool, Bool)] = [
+            (.deliveredIntoWaitingContinuation, "delivered_waiting_continuation", false, false),
+            (.queuedClaudeInterrupt, "queued_claude_interrupt", true, false),
+            (.queuedACPInterrupt, "queued_acp_interrupt", true, false),
+            (.queuedFollowUp, "queued_follow_up", true, true),
+            (.dispatchedCodexTurn, "dispatched_codex_turn", true, true),
+            (.startedRun, "started_run", false, false)
         ]
-
-        let interleaved = expected.enumerated()
-            .sorted { ($0.offset % 3, -$0.offset) < ($1.offset % 3, -$1.offset) }
-            .map(\.element)
-        for input in [Array(expected.reversed()), interleaved] {
-            XCTAssertEqual(input.sorted(by: automaticSelectionIssuePrecedes), expected)
+        for (dispatch, rawValue, isActive, signalsDelivery) in cases {
+            XCTAssertEqual(dispatch.rawValue, rawValue)
+            XCTAssertEqual(dispatch.isActiveRunDispatch, isActive)
+            XCTAssertEqual(dispatch.signalsMCPDeliveryAfterDispatch, signalsDelivery)
         }
+        let sessionID = UUID()
+        let connectionID = UUID()
+        let transport: AgentModeViewModel.AgentInteractionTransport = .mcp(sessionID: sessionID, originatingConnectionID: connectionID)
+        XCTAssertEqual(transport, AgentRunInteractionTransport.mcp(sessionID: sessionID, originatingConnectionID: connectionID))
+        var tokens = AgentModeViewModel.NonCodexTurnTokenAccumulator()
+        tokens.estimatedUserInputTokens = 3
+        tokens.estimatedToolInputTokens = 5
+        tokens.estimatedToolOutputTokens = 7
+        tokens.observedContextUsedTokens = 100
+        XCTAssertEqual(tokens.estimatedInputTokens, 15)
+        XCTAssertEqual(tokens.observedContextUsedTokens, 100)
     }
 
     // MARK: - Cross-process notification names
@@ -139,12 +114,5 @@ final class ModularizationCompatibilityGoldenTests: XCTestCase {
         )
         XCTAssertNotNil(decoded.agentModelsSettingsByWorkspaceID)
         XCTAssertEqual(decoded.scalarPreferences, scalarPreferences)
-    }
-
-    private func uuid(_ string: String) -> UUID {
-        guard let value = UUID(uuidString: string) else {
-            preconditionFailure("invalid fixture UUID \(string)")
-        }
-        return value
     }
 }

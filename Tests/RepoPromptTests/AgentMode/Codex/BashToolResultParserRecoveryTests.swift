@@ -1,3 +1,4 @@
+import Foundation
 @testable import RepoPromptApp
 import XCTest
 
@@ -31,5 +32,82 @@ final class BashToolResultParserRecoveryTests: XCTestCase {
         XCTAssertEqual(terminalMetadata.isRunning, terminal.isRunning)
         XCTAssertEqual(terminalMetadata.statusWord, terminal.statusWord)
         XCTAssertEqual(terminalMetadata.isSummaryOnly, terminal.isSummaryOnly)
+    }
+}
+
+final class CodexCommandExecutionTranscriptProjectionTests: XCTestCase {
+    func testRunningUpdateTargetsExactInvocationWithoutChangingSibling() {
+        let invocationID = UUID()
+        let sibling = AgentChatItem(
+            kind: .toolResult,
+            text: "",
+            toolName: "bash",
+            toolInvocationID: UUID(),
+            toolResultJSON: #"{"type":"commandExecution","status":"inProgress","processId":"sibling","aggregatedOutput":"keep"}"#,
+            toolIsError: false
+        )
+        var items = [
+            AgentChatItem(kind: .toolCall, text: "", toolName: "bash", toolInvocationID: invocationID),
+            sibling
+        ]
+        let originalID = items[0].id
+        let update = CodexNativeSessionController.CommandExecutionRunningUpdate(
+            invocationID: invocationID,
+            processID: "target",
+            appendedOutput: "booting\n"
+        )
+
+        XCTAssertTrue(CodexNativeSessionController.applyCommandExecutionRunningUpdate(update, to: &items))
+
+        XCTAssertEqual(items[0].id, originalID)
+        XCTAssertEqual(items[0].kind, .toolResult)
+        XCTAssertEqual(items[0].toolIsError, false)
+        let result = BashToolResultParser.parse(raw: items[0].toolResultJSON, argsJSON: nil)
+        XCTAssertTrue(result.isRunning)
+        XCTAssertEqual(result.processID, "target")
+        XCTAssertEqual(result.output, "booting\n")
+        XCTAssertEqual(items[1], sibling)
+    }
+
+    func testLateRunningUpdateCannotReviveCompletedResult() {
+        let invocationID = UUID()
+        let completed = AgentChatItem(
+            kind: .toolResult,
+            text: "",
+            toolName: "bash",
+            toolInvocationID: invocationID,
+            toolResultJSON: #"{"type":"commandExecution","status":"completed","exitCode":0,"aggregatedOutput":"done"}"#,
+            toolIsError: false
+        )
+        var items = [completed]
+        let update = CodexNativeSessionController.CommandExecutionRunningUpdate(
+            invocationID: invocationID,
+            processID: "target",
+            appendedOutput: "late"
+        )
+
+        XCTAssertFalse(CodexNativeSessionController.applyCommandExecutionRunningUpdate(update, to: &items))
+        XCTAssertEqual(items, [completed])
+    }
+
+    func testUncorrelatedRunningUpdateDoesNotChooseBetweenTwoCommands() {
+        let items = ["one", "two"].map { processID in
+            AgentChatItem(
+                kind: .toolResult,
+                text: "",
+                toolName: "bash",
+                toolResultJSON: "{\"type\":\"commandExecution\",\"status\":\"inProgress\",\"processId\":\"\(processID)\"}",
+                toolIsError: false
+            )
+        }
+        var updated = items
+        let update = CodexNativeSessionController.CommandExecutionRunningUpdate(
+            invocationID: nil,
+            processID: nil,
+            appendedOutput: "unscoped"
+        )
+
+        XCTAssertFalse(CodexNativeSessionController.applyCommandExecutionRunningUpdate(update, to: &updated))
+        XCTAssertEqual(updated, items)
     }
 }

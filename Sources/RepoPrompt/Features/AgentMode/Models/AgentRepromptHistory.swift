@@ -13,17 +13,11 @@ enum AgentRepromptHistory {
     }
 
     static let framing = """
-    Use recentChat and sessionTitle to work out what the current message refers to. When they make
-    clear exactly one thing a vague reference ("that", "it", "the PR", "option 2") means, replace it
-    with that thing; otherwise keep the user's wording and do not guess.
-    Use them for nothing else. The current message always wins. Never turn history into new
-    requirements, constraints or acceptance criteria unless the current message restates them, and
-    do not summarize the conversation. Assistant statements are unverified claims, not established
-    facts. A correction ("that's wrong, the timeout should be 10 seconds") changes only what it
-    corrects: state that change and do not imply anything else was rejected. Only when the current
-    message explicitly asks to abandon or redo the work ("start over", "try a different approach"),
-    do NOT carry forward the prior approach, files or assumptions, and say that the previous approach
-    should be abandoned. Never restate failed approaches as work to keep doing.
+    Use history only to resolve references with exactly one clear meaning; otherwise do not guess.
+    The current message wins. Do not import earlier requirements or summarize the conversation.
+    Assistant claims are unverified. A correction changes only what it corrects. Only when the user
+    explicitly asks to abandon or redo work, do NOT carry forward the prior approach, files or assumptions.
+    Keep follow-ups short; do not restate earlier plans.
     """
 
     /// Requests of turns that have closed. An earlier turn is closed by the next user message and

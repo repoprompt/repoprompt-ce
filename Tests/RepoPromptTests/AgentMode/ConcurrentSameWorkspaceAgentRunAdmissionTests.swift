@@ -1,9 +1,11 @@
 import MCP
+import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
 import RepoPromptShared
+@testable import RepoPromptWorkspaceContext
 import XCTest
 
 #if DEBUG
@@ -1100,6 +1102,7 @@ import XCTest
             })
             peer.workspaceManager.workspaces[peerIndex] = publishedWorkspace
             peer.promptManager.loadComposeTabsFromWorkspace(publishedWorkspace)
+            let peerSessionBeforeResolution = peer.agentModeViewModel.sessions[pair.tabID]
 
             XCTAssertNil(
                 try peer.agentModeViewModel.mcpSettledLiveSessionForStop(sessionID: pair.sessionID),
@@ -1129,7 +1132,21 @@ import XCTest
             let firstAttemptCounts = await firstRecorder.attemptCounts()
             XCTAssertEqual(firstAttemptCounts[pair], 1)
 
-            let accepted = try await peer.agentModeViewModel.mcpResolveOrCreateSessionTarget(
+            // Publication settles the reservation, not the canonical writer's lifetime.
+            // A replica must not hydrate another payload owner or return a target for local mutation.
+            do {
+                _ = try await peer.agentModeViewModel.mcpResolveOrCreateSessionTarget(
+                    tabID: pair.tabID, sessionID: pair.sessionID, createIfNeeded: true,
+                    sessionName: nil, expectedWorkspaceID: fixture.workspaceID
+                )
+                XCTFail("A peer must not hydrate a second writer after acceptance.")
+            } catch {
+                XCTAssertTrue(error.localizedDescription.contains("owned by another window's runtime"), "\(error)")
+            }
+            XCTAssertTrue(peer.agentModeViewModel.sessions[pair.tabID] === peerSessionBeforeResolution)
+            XCTAssertNil(peer.agentModeViewModel.sessions[pair.tabID]?.activeAgentSessionID)
+            XCTAssertNil(try peer.agentModeViewModel.mcpSettledLiveSessionForStop(sessionID: pair.sessionID))
+            let accepted = try await fixture.window.agentModeViewModel.mcpResolveOrCreateSessionTarget(
                 tabID: pair.tabID,
                 sessionID: pair.sessionID,
                 createIfNeeded: true,
@@ -1140,9 +1157,15 @@ import XCTest
             XCTAssertEqual(accepted.sessionID, pair.sessionID)
             XCTAssertNil(accepted.recoveryClaim)
             let stoppable = try XCTUnwrap(
-                try peer.agentModeViewModel.mcpSettledLiveSessionForStop(sessionID: pair.sessionID)
+                try fixture.window.agentModeViewModel.mcpSettledLiveSessionForStop(sessionID: pair.sessionID)
             )
             XCTAssertEqual(stoppable.tabID, pair.tabID)
+            guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
+                sessionID: pair.sessionID, expectedWorkspaceID: fixture.workspaceID
+            ) else { return XCTFail("The published target must retain one canonical writer.") }
+            XCTAssertTrue(writer.session === stoppable)
+            let finalAttemptCounts = await firstRecorder.attemptCounts()
+            XCTAssertEqual(finalAttemptCounts[pair], 1)
         }
 
         func testAgentAdmissionsForDistinctDurableWorkspacesOverlap() async throws {

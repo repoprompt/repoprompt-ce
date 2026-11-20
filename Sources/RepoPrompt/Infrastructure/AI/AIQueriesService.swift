@@ -1,5 +1,7 @@
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptDomainRuntime
+import RepoPromptHTTPProviders
 
 /// Per-stream identifier for cancellation.
 public typealias ChatStreamID = UUID
@@ -595,6 +597,7 @@ public class AIQueriesService {
 
         // Build a one-off provider that uses the override + version
         let provider = OpenAIProvider(
+            host: OpenAIProviderAppHost(),
             apiKey: key,
             baseURL: base,
             configuredMaxTokens: nil,
@@ -707,13 +710,13 @@ public class AIQueriesService {
         } else {
             try await keyManager.getAPIKey(for: .zAI) ?? ""
         }
-        let provider = ZAIProvider(apiKey: key, endpoint: .codingPlan)
+        let provider = ZAIProvider(host: OpenAIProviderAppHost(), apiKey: key, endpoint: .codingPlan)
         let hasCodingPlanAccess = try await withTimeout(seconds: 30) { try await provider.testAPIKey(model: .zaiGLM47) }
         if hasCodingPlanAccess {
             return true
         }
 
-        let generalProvider = ZAIProvider(apiKey: key, endpoint: .generalAPI)
+        let generalProvider = ZAIProvider(host: OpenAIProviderAppHost(), apiKey: key, endpoint: .generalAPI)
         let hasGeneralAccess = try await withTimeout(seconds: 30) { try await generalProvider.testAPIKey() }
         if hasGeneralAccess {
             throw AIProviderError.invalidConfiguration(
@@ -777,6 +780,7 @@ extension OpenAIProvider {
 
         // ── 2. Spin-up a throw-away provider with optional overrideVersion ───
         let provider = OpenAIProvider(
+            host: OpenAIProviderAppHost(),
             apiKey: apiKey,
             baseURL: baseURL,
             configuredMaxTokens: 16, // keep the test cheap

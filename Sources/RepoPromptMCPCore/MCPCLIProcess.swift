@@ -255,6 +255,7 @@ enum CLIEventLogger {
                      let .bindFailed(errno),
                      let .listenFailed(errno),
                      let .acceptFailed(errno),
+                     let .appUnavailable(errno),
                      let .writeFailed(errno),
                      let .readFailed(errno),
                      let .pollFailed(errno):
@@ -416,6 +417,7 @@ enum SocketProxyError: Swift.Error, LocalizedError {
     case bootstrapResponseTimeout
     case connectionReset
     case connectionRefused // App busy or not accepting connections
+    case appUnavailable(errno: Int32)
     case writeFailed(errno: Int32)
     case readFailed(errno: Int32)
     case pollFailed(errno: Int32)
@@ -468,6 +470,9 @@ enum SocketProxyError: Swift.Error, LocalizedError {
             return "Connection reset"
         case .connectionRefused:
             return "Connection refused. RepoPrompt may be busy or restarting; try again."
+        case let .appUnavailable(errno):
+            let cause = String(cString: strerror(errno))
+            return "RepoPrompt CE's MCP socket is unavailable (\(cause)). Launch RepoPrompt CE, enable its MCP server, and reconnect your MCP client."
         case let .writeFailed(errno):
             return "Write failed: \(errno)"
         case let .readFailed(errno):
@@ -519,6 +524,29 @@ func validateCLIHostInputReadResult(
 }
 
 enum CLIProxyRuntimePolicy {
+    static let initialBootstrapUnavailableAttemptLimit = 5
+
+    /// Bound repeated missing/refused sockets before any MCP traffic has reached the
+    /// bridge. Once the session has traffic, replay safety controls reconnects.
+    static func initialBootstrapUnavailableErrno(
+        for error: CLIRuntimeError,
+        hasForwardedProtocolFrame: Bool
+    ) -> Int32? {
+        guard !hasForwardedProtocolFrame,
+              case let .connectionFailed(underlying) = error,
+              let socketError = underlying as? SocketProxyError
+        else { return nil }
+
+        switch socketError {
+        case .connectionRefused:
+            return ECONNREFUSED
+        case let .connectFailed(errno) where errno == ENOENT || errno == ECONNREFUSED:
+            return errno
+        default:
+            return nil
+        }
+    }
+
     static func shouldRetry(after error: CLIRuntimeError) -> Bool {
         switch error {
         case .approvalDenied,
@@ -537,6 +565,7 @@ enum CLIProxyRuntimePolicy {
             }
             switch socketError {
             case .approvalDenied,
+                 .appUnavailable,
                  .handshakeFailed,
                  .protocolVersionMismatch,
                  .socketCreationFailed,
@@ -609,6 +638,7 @@ enum CLIProxyRuntimePolicy {
                 case .bootstrapResponseTimeout: return "bootstrap_response_timeout"
                 case .connectionReset: return "app_socket_reset"
                 case .connectionRefused: return "app_socket_connection_refused"
+                case .appUnavailable: return "app_unavailable"
                 case .writeFailed: return "socket_write_failed"
                 case .readFailed: return "socket_read_failed"
                 case .pollFailed: return "socket_poll_failed"
@@ -755,6 +785,7 @@ enum CLIProxyRuntimePolicy {
              let .listenFailed(errno),
              let .acceptFailed(errno),
              let .connectFailed(errno),
+             let .appUnavailable(errno),
              let .writeFailed(errno),
              let .readFailed(errno),
              let .pollFailed(errno):
@@ -858,6 +889,7 @@ actor BootstrapSocketProxy {
     private var socketFD: Int32 = -1
 
     init(
+        socketURL: URL,
         sessionToken: String,
         clientName: String?,
         identityCache: ClientIdentityCache,
@@ -867,7 +899,7 @@ actor BootstrapSocketProxy {
         bridgeLedger: JSONRPCBridgeLedger,
         faultRule: JSONRPCBridgeFaultRule?
     ) {
-        socketURL = MCPFilesystemConstants.bootstrapSocketURL()
+        self.socketURL = socketURL
         self.sessionToken = sessionToken
         self.clientName = clientName
         self.identityCache = identityCache
@@ -2381,12 +2413,12 @@ package actor MCPService: Service {
     /// Runs the MCP transport with reconnection on transient failures.
     /// Exits on approvalDenied, terminatedByServer, hostDisconnected, or fatal transport errors.
     ///
-    /// Retry strategy:
-    /// - First 60 seconds: aggressive retries every 0.5s (app might just be restarting)
-    /// - After 60 seconds: exponential backoff from 1s up to 30s
-    private func runTransport() async throws {
+    /// A missing or refused bootstrap socket gets a short startup grace period.
+    /// Other transient failures and established sessions use the reconnect backoff.
+    func runTransport(socketURL: URL = MCPFilesystemConstants.bootstrapSocketURL()) async throws {
         var attempt = 0
         var firstFailureTime: Date?
+        var initialBootstrapUnavailableAttempts = 0
 
         // Phase 1: Aggressive retries (first 60 seconds)
         let aggressiveDelay = 0.5
@@ -2398,7 +2430,7 @@ package actor MCPService: Service {
 
         while !Task.isCancelled {
             do {
-                try await runSocketLoop()
+                try await runSocketLoop(socketURL: socketURL)
                 // If runSocketLoop() returns without throwing, treat as clean exit
                 return
             } catch let err as CLIRuntimeError {
@@ -2411,6 +2443,19 @@ package actor MCPService: Service {
                 )
                 guard !protocolActiveFailure, shouldRetry(after: err) else {
                     throw err
+                }
+                guard !Task.isCancelled else {
+                    throw CLIRuntimeError.hostDisconnected(.taskCancelled)
+                }
+
+                let hasForwardedProtocolFrame = await bridgeLedger.snapshot().hasForwardedProtocolFrame
+                if let errno = CLIProxyRuntimePolicy.initialBootstrapUnavailableErrno(
+                    for: err, hasForwardedProtocolFrame: hasForwardedProtocolFrame
+                ) {
+                    initialBootstrapUnavailableAttempts += 1
+                    if initialBootstrapUnavailableAttempts >= CLIProxyRuntimePolicy.initialBootstrapUnavailableAttemptLimit {
+                        throw CLIRuntimeError.connectionFailed(underlying: SocketProxyError.appUnavailable(errno: errno))
+                    }
                 }
 
                 attempt += 1
@@ -2453,7 +2498,7 @@ package actor MCPService: Service {
     }
 
     /// Single connection attempt to the bootstrap socket.
-    private func runSocketLoop() async throws {
+    private func runSocketLoop(socketURL: URL) async throws {
         let snapshotBeforeReconnect = await bridgeLedger.snapshot()
         let replayInitialization = snapshotBeforeReconnect.hasForwardedProtocolFrame
         if replayInitialization {
@@ -2481,6 +2526,7 @@ package actor MCPService: Service {
 
         // Use bootstrap socket proxy (CLI connects to app's socket server)
         let proxy = BootstrapSocketProxy(
+            socketURL: socketURL,
             sessionToken: sessionToken,
             clientName: displayName,
             identityCache: identityCache,
@@ -2564,8 +2610,9 @@ package func handleRuntimeError(_ err: CLIRuntimeError) -> Never {
 
     switch err {
     case let .connectionFailed(underlying):
-        log.error("Connection failed: \(underlying)")
-        fputs("RepoPrompt MCP: connection failed – \(underlying)\n", stderr)
+        let detail = (underlying as? LocalizedError)?.errorDescription ?? String(describing: underlying)
+        log.error("Connection failed: \(detail)")
+        fputs("RepoPrompt MCP: connection failed – \(detail)\n", stderr)
         exit(exitCode.rawValue)
     case .approvalDenied:
         fputs("RepoPrompt MCP: connection closed immediately. Approval was likely denied or the server is disabled. Check the RepoPrompt approval dialog or MCP settings.\n", stderr)

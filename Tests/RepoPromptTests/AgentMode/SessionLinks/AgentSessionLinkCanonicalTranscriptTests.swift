@@ -76,7 +76,7 @@ final class AgentSessionLinkCanonicalTranscriptTests: XCTestCase {
             turns: [makeArchivedTurn(index: 0), makeFullTurn(index: 1), makeFullTurn(index: 2)],
             nextSequenceIndex: 9
         )
-        let canonical = AgentModeViewModel.canonicalTranscript(from: transcript, sourceItemsRevision: 7)
+        let canonical = AgentSessionLinkExecutionRuntime.canonicalTranscript(from: transcript, sourceItemsRevision: 7)
 
         XCTAssertFalse(canonical.rows.isEmpty)
         XCTAssertEqual(canonical.sourceItemsRevision, 7)
@@ -93,7 +93,7 @@ final class AgentSessionLinkCanonicalTranscriptTests: XCTestCase {
     }
 
     func testEmptyTranscriptProducesAnEmptyCanonicalProjection() {
-        let canonical = AgentModeViewModel.canonicalTranscript(from: .empty, sourceItemsRevision: nil)
+        let canonical = AgentSessionLinkExecutionRuntime.canonicalTranscript(from: .empty, sourceItemsRevision: nil)
         XCTAssertTrue(canonical.rows.isEmpty)
         XCTAssertTrue(canonical.summaryRowIDs.isEmpty)
         XCTAssertNil(canonical.sourceItemsRevision)
@@ -101,7 +101,7 @@ final class AgentSessionLinkCanonicalTranscriptTests: XCTestCase {
 
     func testSanitizedPageOverTheCanonicalProjectionDropsThinkingAndKeepsNarrative() {
         let transcript = AgentTranscript(turns: [makeFullTurn(index: 0)], nextSequenceIndex: 3)
-        let canonical = AgentModeViewModel.canonicalTranscript(from: transcript, sourceItemsRevision: 1)
+        let canonical = AgentSessionLinkExecutionRuntime.canonicalTranscript(from: transcript, sourceItemsRevision: 1)
         let page = AgentSessionLinkTranscriptSanitizer.page(
             rows: canonical.rows,
             summaryRowIDs: canonical.summaryRowIDs,
@@ -136,7 +136,7 @@ final class AgentSessionLinkCanonicalTranscriptTests: XCTestCase {
         )
         let sessionID = try XCTUnwrap(f.session.activeAgentSessionID)
         func readers(_ transcript: AgentTranscript) throws -> [String] {
-            let canonical = AgentModeViewModel.canonicalTranscript(from: transcript, sourceItemsRevision: 7)
+            let canonical = AgentSessionLinkExecutionRuntime.canonicalTranscript(from: transcript, sourceItemsRevision: 7)
             let page = AgentSessionLinkTranscriptSanitizer.page(rows: canonical.rows, summaryRowIDs: canonical.summaryRowIDs, anchor: nil, direction: .start, maxItems: 100, maxOutputBytes: 20000)
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys]
@@ -154,7 +154,7 @@ final class AgentSessionLinkCanonicalTranscriptTests: XCTestCase {
             let canonical = AgentTranscriptCompactor.compact(seed)
             f.session.setItemsSilentlyForRetentionCompaction(AgentTranscriptIO.workingSourceItems(from: canonical))
             f.session.nextSequenceIndex = canonical.nextSequenceIndex
-            vm.applyTranscriptPresentation(canonical, to: f.session)
+            AgentSessionTranscriptRefreshRuntime.applyTranscriptPresentation(canonical, to: f.session)
             // Settle the ordinary multi-turn source import before freezing the canonical
             // input. Separate per-turn seeds still carry a completed terminalState on the
             // old turn; the normal source owner finalizes prior turns with nil state.
@@ -179,7 +179,7 @@ final class AgentSessionLinkCanonicalTranscriptTests: XCTestCase {
             XCTAssertTrue(before[2].contains("Canonical quiet closing output"))
             XCTAssertTrue(before[3].contains("Canonical quiet closing output"))
         }
-        await vm.prepareForWindowClose()
+        await vm.test_retireAndCancelFixture()
     }
 
     // MARK: - Role policy

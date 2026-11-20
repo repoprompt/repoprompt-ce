@@ -1,9 +1,11 @@
 import Foundation
 import MCP
+import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptFoundation
 import RepoPromptSettingsCore
+@testable import RepoPromptWorkspaceContext
 import XCTest
 
 @MainActor
@@ -907,6 +909,11 @@ final class OracleCancellationAuthorityTests: XCTestCase {
                 await deletionTask?.value
                 XCTAssertTrue(oracle.sessionOperationError?.contains("Workspace storage changed") == true)
                 for (index, projection) in projections.enumerated() {
+                    let predecessor = oracle.backgroundOracleQueryIdentity(sessionID: projection.id, queryID: oldQueries[index])
+                    XCTAssertFalse(oracle.backgroundOracleQueryIsCurrent(predecessor), "An exact predecessor query must not authorize cleanup of its successor")
+                    let (outcome, message) = await oracle.backgroundOracleQuerySnapshot(predecessor)
+                    XCTAssertNil(outcome)
+                    XCTAssertNil(message)
                     XCTAssertEqual(oracle.activeQueryId(for: projection.id), successorQueries[index])
                     XCTAssertTrue(oracle.isSessionStreaming(projection.id))
                     XCTAssertTrue(oracle.isSessionPinnedForTesting(projection.id))

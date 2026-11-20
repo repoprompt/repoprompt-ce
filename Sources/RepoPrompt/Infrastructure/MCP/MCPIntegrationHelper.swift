@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptShared

@@ -2,9 +2,47 @@ import Darwin
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptPersistence
+import RepoPromptShared
+@testable import RepoPromptWorkspaceContext
 import XCTest
 
 final class WorkspaceCodemapRootCapabilityServiceTests: XCTestCase {
+    func testProcessWideProviderDefersBindingServicesUntilFirstEngineAndRetainsIdentity() throws {
+        // Artifact stores reject symlink components; Foundation may retain the /var alias.
+        let fixtureRoot = try makeTemporaryRoot()
+        let physicalPath = try XCTUnwrap(fixtureRoot.path.withCString { pointer -> String? in
+            guard let resolved = realpath(pointer, nil) else { return nil }
+            defer { free(resolved) }
+            return String(cString: resolved)
+        })
+        let rootURL = URL(fileURLWithPath: physicalPath, isDirectory: true)
+        let suppliedSalts = CodemapLockedValues<Data>()
+        let salt = Data(repeating: 0x4D, count: GitBlobRepositoryNamespace.saltByteCount)
+        let capability = WorkspaceCodemapRootCapabilityService(namespaceSalt: salt)
+        let identity = GitBlobIdentityService()
+        let materialization = GitBlobSourceMaterializationService()
+        let provider = CodeMapArtifactRuntime.makeProcessWideProvider(
+            bindingServicesFactory: { suppliedSalt in
+                suppliedSalts.append(suppliedSalt)
+                return WorkspaceCodemapBindingEngineServices(
+                    capability: capability,
+                    identity: identity,
+                    materialization: materialization
+                )
+            },
+            identity: .repoPromptCE(.debug),
+            applicationSupportRootURL: rootURL,
+            namespaceSaltProvider: { _, _ in salt }
+        )
+        XCTAssertTrue(suppliedSalts.values.isEmpty)
+        let runtime = try provider.runtime()
+        XCTAssertTrue(suppliedSalts.values.isEmpty, "Artifact storage does not require Git binding services")
+        XCTAssertTrue(try provider.runtime() === runtime)
+        let engine = try runtime.bindingEngine()
+        XCTAssertTrue(try runtime.bindingEngine() === engine)
+        XCTAssertEqual(suppliedSalts.values, [salt])
+    }
+
     /// A release can arrive while a root epoch is between `invalidateForAuthorityReplacement` and
     /// its replacement registration. In that gap there is no record left to remove, so the release
     /// has to terminalize the epoch itself; otherwise the epoch keeps neither a tombstone nor its

@@ -518,3 +518,153 @@ private actor Issue863TestAsyncGate {
         continuation?.resume()
     }
 }
+
+final class AgentSessionMetadataIndexCoalescingTests: XCTestCase {
+    func testBurstUpdatesShareOneFixedWindowAndPublishLatestFileReceipts() async throws {
+        let fixture = Fixture()
+        defer { fixture.cleanUp() }
+        let service = fixture.service
+        var sessions = (0 ..< 3).map { fixture.session(name: "Initial \($0)") }
+        var urls: [URL] = []
+        for session in sessions {
+            try await urls.append(service.saveAgentSession(session, for: fixture.workspace))
+        }
+        let folder = try XCTUnwrap(urls.first?.deletingLastPathComponent())
+        let original = try fixture.index(in: folder)
+        let writesBefore = await service.test_metadataIndexWriteCount(forAgentSessionsFolder: folder)
+
+        var firstWindow: Task<Void, Never>?
+        for update in 0 ..< 20 {
+            for i in sessions.indices {
+                sessions[i].name = "Latest \(i) update \(update)"
+                _ = try await service.saveAgentSession(sessions[i], for: fixture.workspace)
+                if firstWindow == nil {
+                    firstWindow = await service.test_pendingMetadataIndexUpdate(forAgentSessionsFolder: folder)
+                }
+            }
+        }
+        XCTAssertEqual(try fixture.index(in: folder), original, "Existing-row updates must not rewrite the index per save")
+        let pending = await service.test_pendingMetadataIndexUpdate(forAgentSessionsFolder: folder)
+        let flush = try XCTUnwrap(pending)
+        XCTAssertEqual(pending, firstWindow, "Later updates must not reset a busy folder's deadline")
+        guard await fixture.gate.waitUntilEntered() else { return }
+        let memory = try await service.fastMetadataRecordsIfAvailable(for: fixture.workspace)
+        XCTAssertEqual(Set(memory?.records.map(\.name) ?? []), Set(sessions.map(\.name)))
+        fixture.gate.release()
+        await flush.value
+
+        let index = try fixture.index(in: folder)
+        XCTAssertEqual(Set(index.entries.map(\.name)), Set(sessions.map(\.name)))
+        for url in urls {
+            let record = try XCTUnwrap(index.entries.first { $0.filename == url.lastPathComponent })
+            let values = try url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+            XCTAssertEqual(record.observedFileSize, values.fileSize.map(Int64.init))
+            XCTAssertEqual(record.observedFileModificationDate, values.contentModificationDate)
+        }
+        let writesAfter = await service.test_metadataIndexWriteCount(forAgentSessionsFolder: folder)
+        XCTAssertEqual(writesAfter - writesBefore, 1, "Sixty saves in one folder/window must emit just one index write")
+        let remaining = await service.test_pendingMetadataIndexUpdate(forAgentSessionsFolder: folder)
+        XCTAssertNil(remaining)
+    }
+
+    func testFoldersHaveIndependentCoalescingWindows() async throws {
+        let fixture = Fixture()
+        defer { fixture.cleanUp() }
+        let other = WorkspaceModel(name: "Other folder", repoPaths: [], customStoragePath: fixture.root.appendingPathComponent("Other"))
+        var pending: [Task<Void, Never>] = []
+        var expected: [(URL, UUID, String)] = []
+        for workspace in [fixture.workspace, other] {
+            var session = AgentSession(id: UUID(), workspaceID: workspace.id, name: "Before", savedAt: Date(), itemCount: 0, autoEditEnabled: false)
+            let url = try await fixture.service.saveAgentSession(session, for: workspace)
+            let folder = url.deletingLastPathComponent()
+            for update in 0 ..< 5 {
+                session.name = "Latest \(workspace.name) \(update)"
+                _ = try await fixture.service.saveAgentSession(session, for: workspace)
+            }
+            let task = await fixture.service.test_pendingMetadataIndexUpdate(forAgentSessionsFolder: folder)
+            try pending.append(XCTUnwrap(task))
+            expected.append((folder, session.id, session.name))
+        }
+        fixture.gate.release()
+        for task in pending {
+            await task.value
+        }
+        for (folder, id, name) in expected {
+            let index = try fixture.index(in: folder)
+            XCTAssertEqual(index.entries.map(\.id), [id])
+            XCTAssertEqual(index.entries.map(\.name), [name])
+            let writes = await fixture.service.test_metadataIndexWriteCount(forAgentSessionsFolder: folder)
+            XCTAssertEqual(writes, 2, "Each folder has one insertion and one batched update")
+        }
+    }
+
+    func testNewMembershipFlushesPendingRowsAndCancelledTimerCannotOverwriteDeletion() async throws {
+        let fixture = Fixture()
+        defer { fixture.cleanUp() }
+        var first = fixture.session(name: "First")
+        let url = try await fixture.service.saveAgentSession(first, for: fixture.workspace)
+        let folder = url.deletingLastPathComponent()
+        first.name = "Updated first"
+        _ = try await fixture.service.saveAgentSession(first, for: fixture.workspace)
+        let pending = await fixture.service.test_pendingMetadataIndexUpdate(forAgentSessionsFolder: folder)
+        let obsoleteFlush = try XCTUnwrap(pending)
+        guard await fixture.gate.waitUntilEntered() else { return }
+        let second = fixture.session(name: "Second")
+        _ = try await fixture.service.saveAgentSession(second, for: fixture.workspace)
+        XCTAssertEqual(try Set(fixture.index(in: folder).entries.map(\.name)), [first.name, second.name])
+        first.name = "Deleted before flush"
+        _ = try await fixture.service.saveAgentSession(first, for: fixture.workspace)
+        let deletePending = await fixture.service.test_pendingMetadataIndexUpdate(forAgentSessionsFolder: folder)
+        let deletedFlush = try XCTUnwrap(deletePending)
+        try await fixture.service.deleteAgentSession(id: first.id, for: fixture.workspace)
+        fixture.gate.release()
+        await obsoleteFlush.value
+        await deletedFlush.value
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        XCTAssertEqual(try fixture.index(in: folder).entries.map(\.id), [second.id])
+    }
+
+    func testReconcileRepairsUnflushedUpdatesFromAuthoritativeSessionFiles() async throws {
+        let fixture = Fixture()
+        defer { fixture.cleanUp() }
+        var session = fixture.session(name: "Before interrupted window")
+        let url = try await fixture.service.saveAgentSession(session, for: fixture.workspace)
+        session.name = "Durable session, stale derived index"
+        _ = try await fixture.service.saveAgentSession(session, for: fixture.workspace)
+        let folder = url.deletingLastPathComponent()
+        // Simulate losing the pending timer/cache at process exit, not a graceful flush.
+        await fixture.service.test_clearMetadataIndexCache(forAgentSessionsFolder: folder)
+        let restarted = AgentSessionDataService()
+        _ = try await restarted.indexedAgentSessionMetadataRecords(for: fixture.workspace)
+        await restarted.test_waitForMetadataIndexReconciliation(forAgentSessionsFolder: folder)
+        let records = try await restarted.indexedAgentSessionMetadataRecords(for: fixture.workspace)
+        XCTAssertEqual(records.map(\.name), [session.name])
+        XCTAssertEqual(try fixture.index(in: folder).entries.map(\.name), [session.name])
+    }
+
+    private struct Fixture {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("IndexCoalescing-\(UUID())")
+        let gate = TestReleaseFence(name: "fixed metadata index window")
+        let workspace: WorkspaceModel
+        let service: AgentSessionDataService
+
+        init() {
+            workspace = WorkspaceModel(name: "Index coalescing", repoPaths: [], customStoragePath: root)
+            let gate = gate
+            service = AgentSessionDataService(metadataIndexUpdateDelay: { await gate.enterAndWait() })
+        }
+
+        func session(name: String) -> AgentSession {
+            AgentSession(id: UUID(), workspaceID: workspace.id, name: name, savedAt: Date(), itemCount: 0, autoEditEnabled: false)
+        }
+
+        func index(in folder: URL) throws -> AgentSessionMetadataIndex {
+            try JSONDecoder().decode(AgentSessionMetadataIndex.self, from: Data(contentsOf: folder.appendingPathComponent("AgentSessionIndex.json")))
+        }
+
+        func cleanUp() {
+            gate.release()
+            try? FileManager.default.removeItem(at: root)
+        }
+    }
+}

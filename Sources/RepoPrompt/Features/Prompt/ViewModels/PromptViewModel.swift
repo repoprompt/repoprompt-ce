@@ -1,10 +1,12 @@
 import Combine
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptCodeMapCore
 import RepoPromptFileSystem
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
 import RepoPromptVCS
+import RepoPromptWorkspaceContext
 import SwiftUI
 
 /// Errors that can occur when publishing git diff artifacts
@@ -210,6 +212,7 @@ class PromptViewModel: ObservableObject {
 
     struct ComposeTabMutationReport: Equatable {
         var removedComposeTabIDs: Set<UUID> = []
+        var stashIDsByComposeTabID: [UUID: UUID] = [:]
         var removedStashedTabIDs: Set<UUID> = []
         var noOpReasons: Set<ComposeTabRemovalReason> = []
         var rejections: [ComposeTabMutationRejection] = []
@@ -221,6 +224,7 @@ class PromptViewModel: ObservableObject {
 
         mutating func merge(_ other: Self) {
             removedComposeTabIDs.formUnion(other.removedComposeTabIDs)
+            stashIDsByComposeTabID.merge(other.stashIDsByComposeTabID) { _, newer in newer }
             removedStashedTabIDs.formUnion(other.removedStashedTabIDs)
             noOpReasons.formUnion(other.noOpReasons)
             rejections.append(contentsOf: other.rejections)
@@ -3040,6 +3044,21 @@ class PromptViewModel: ObservableObject {
         return manager.activeWorkspaceID == workspaceID
     }
 
+    /// A visible editor's preparation boundary, not a callback installed into execution. Once
+    /// this returns, the host independently captures canonical input for its original command.
+    @MainActor
+    func publishPendingComposeInput(workspaceID: UUID, tabID: UUID) async throws {
+        try Task.checkCancellation()
+        guard let manager = workspaceManager, activeComposeTabID == tabID,
+              flushActiveComposeTabBeforeWorkspaceMutation(workspaceID: workspaceID)
+        else { throw PromptError.composeInputContextChanged }
+        _ = try await manager.publishCanonicalComposeInput(workspaceID: workspaceID, tabID: tabID)
+        try Task.checkCancellation()
+        guard workspaceManager === manager, manager.activeWorkspaceID == workspaceID,
+              activeComposeTabID == tabID
+        else { throw PromptError.composeInputContextChanged }
+    }
+
     @MainActor
     private func withComposeTabSwitching<T>(
         targetTabID: UUID? = nil,
@@ -4439,11 +4458,13 @@ class PromptViewModel: ObservableObject {
             flushAndSnapshotActiveTab(in: manager, workspaceIndex: index)
         }
         var stashedTabs = manager.workspaces[index].stashedTabs
+        var newStashIDs: [UUID: UUID] = [:]
         if reason == .stash {
             let refreshedTabs = manager.workspaces[index].composeTabs
             for tabID in tabsBeingClosed {
                 guard let refreshedTab = refreshedTabs.first(where: { $0.id == tabID }) else { continue }
                 let stashedTab = StashedTab(tab: refreshedTab)
+                newStashIDs[tabID] = stashedTab.id
                 if let existingIndex = stashedTabs.firstIndex(where: { $0.tab.id == tabID }) {
                     stashedTabs[existingIndex] = stashedTab
                 } else {
@@ -4474,6 +4495,7 @@ class PromptViewModel: ObservableObject {
             return rejection(.mutationContextChanged, message: "The workspace changed before tab removal.")
         }
         report.removedComposeTabIDs.formUnion(tabsBeingClosed)
+        report.stashIDsByComposeTabID = newStashIDs
         dirtyTabIDs.subtract(resolvedIDs)
 
         func currentRemovalOwner() -> (index: Int, workspace: WorkspaceModel)? {
@@ -4594,7 +4616,7 @@ class PromptViewModel: ObservableObject {
         guard let windowState = WindowStatesManager.shared.allWindows.first(where: { $0.windowID == windowID }) else { return }
 
         for tabID in tabIDs {
-            windowState.mcpServer.purgeClosedTabContext(tabID: tabID)
+            windowState.mcpServer.purgeClosedTabContext(route: windowState.mcpServer.routeResources, tabID: tabID)
             await ServerNetworkManager.shared.cleanupRunRoutingState(forTabID: tabID, windowID: windowID)
         }
     }
@@ -7936,6 +7958,7 @@ extension Array {
 
 enum PromptError: Error {
     case aiServiceNotAvailable
+    case composeInputContextChanged
 }
 
 enum AIResponseError: Error {

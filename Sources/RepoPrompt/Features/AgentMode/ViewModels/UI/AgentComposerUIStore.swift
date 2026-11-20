@@ -8,6 +8,7 @@ final class AgentComposerUIStore: ObservableObject {
     @Published private(set) var props: AgentComposerProps
     @Published private(set) var revision: UInt64 = 0
     /// Presentation only: admission continues to belong to activeComposerSubmitAttempt.
+    @Published var isConfiguring = false
     @Published var pendingSubmissions: [UUID: AgentComposerPendingSubmission] = [:]
 
     init(props: AgentComposerProps = .empty) {

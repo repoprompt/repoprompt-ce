@@ -1,9 +1,46 @@
 import Combine
 import Foundation
+import RepoPromptDomainRuntime
+
+/// Library membership is a persisted choice, never inferred from a display name.
+protocol WorkspaceMenuItem {
+    var id: UUID { get }
+    var name: String { get }
+    var lastUsed: Date { get }
+    var isSystemWorkspace: Bool { get }
+    var isHiddenInMenus: Bool { get }
+    var isTemporaryWorkspace: Bool { get }
+}
+
+extension WorkspaceModel: WorkspaceMenuItem {}
+extension DomainWorkspaceMetadata: WorkspaceMenuItem {
+    var id: UUID {
+        workspaceID
+    }
+
+    var isTemporaryWorkspace: Bool {
+        WorkspaceLibraryClassification.isTemporary(isEphemeral: isEphemeral, isSavedWorkspace: isSavedWorkspace, repoPaths: repoPaths)
+    }
+}
+
+enum WorkspaceLibraryClassification {
+    static func isTemporary(isEphemeral: Bool, isSavedWorkspace: Bool?, repoPaths: [String]) -> Bool {
+        if isEphemeral { return true }
+        if let isSavedWorkspace { return !isSavedWorkspace }
+        return !repoPaths.isEmpty && repoPaths.allSatisfy { rawPath in
+            let path = URL(fileURLWithPath: (rawPath as NSString).expandingTildeInPath).standardizedFileURL.path
+            let components = URL(fileURLWithPath: path).pathComponents
+            return path.hasPrefix("/tmp/") || path.hasPrefix("/private/tmp/")
+                || path.hasPrefix(FileManager.default.temporaryDirectory.standardizedFileURL.path + "/")
+                || components.contains(".repoprompt-worktrees")
+                || zip(components, components.dropFirst()).contains { $0 == ".codex" && $1 == "worktrees" }
+        }
+    }
+}
 
 /// Shared by existing menu callers and the authority-backed chooser; ranking is unchanged.
 enum WorkspaceMenuPolicy {
-    static func items(in workspaces: [WorkspaceModel], query: WorkspaceMenuQuery = .init()) -> [WorkspaceModel] {
+    static func items<Item: WorkspaceMenuItem>(in workspaces: [Item], query: WorkspaceMenuQuery = .init()) -> [Item] {
         var items = workspaces
         if !query.includeSystem { items = items.filter { !$0.isSystemWorkspace } }
         if !query.includeHidden { items = items.filter { !$0.isHiddenInMenus } }
@@ -115,6 +152,7 @@ enum WorkspaceChooserPresentation: Equatable {
 }
 
 /// Stores full, current clearance witnesses without invalidating the chooser for witness-only reports.
+/// Healthy complete stamp-only updates still reach the subject, but do not invalidate the manager.
 /// Real changes retain @Published's synchronous preassignment delivery; newer reentrant writes win.
 @MainActor
 @propertyWrapper
@@ -160,7 +198,9 @@ final class WorkspaceChooserPublication {
             let generation = storage.writeGeneration
             // Compare to the announced value, which can lead the getter during synchronous delivery.
             if !storage.publications.value.hasEquivalentUI(to: newValue) {
-                owner.objectWillChange.send()
+                if !storage.publications.value.hasOnlyCompleteAuthorityStampChange(to: newValue) {
+                    owner.objectWillChange.send()
+                }
                 guard generation == storage.writeGeneration else { return }
                 storage.publications.send(newValue)
             }
@@ -171,6 +211,17 @@ final class WorkspaceChooserPublication {
 }
 
 private extension WorkspaceChooserPresentation {
+    /// This narrows only the broad manager notification, never subject delivery or authority storage.
+    func hasOnlyCompleteAuthorityStampChange(to other: Self) -> Bool {
+        guard case let .ready(lhs, .current) = self,
+              case let .ready(rhs, .current) = other,
+              case let .authority(lhsStamp) = lhs.source,
+              case let .authority(rhsStamp) = rhs.source,
+              lhsStamp.isComplete, rhsStamp.isComplete
+        else { return false }
+        return lhs.workspaces == rhs.workspaces && lhsStamp != rhsStamp
+    }
+
     func hasEquivalentUI(to other: Self) -> Bool {
         func equivalent(_ lhs: WorkspaceChooserFailure, _ rhs: WorkspaceChooserFailure) -> Bool {
             lhs.kind == rhs.kind && lhs.recovery == rhs.recovery

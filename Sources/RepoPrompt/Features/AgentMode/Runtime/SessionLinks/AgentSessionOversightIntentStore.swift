@@ -76,11 +76,6 @@ struct AgentSessionOversightIntentDocument: Codable {
     }
 }
 
-/// Just enough of the envelope to decide compatibility before decoding the body.
-private struct AgentSessionOversightIntentDocumentHeader: Decodable {
-    let version: Int
-}
-
 // MARK: - Launch policy
 
 /// How this launch is allowed to interact with the durable oversight file.

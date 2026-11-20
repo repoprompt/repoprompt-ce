@@ -1,71 +1,12 @@
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptClaudeCompatibleProvider
+import RepoPromptClaudeProvider
 import RepoPromptDomainRuntime
 import RepoPromptProviderQuota
 
-typealias ClaudeCompatiblePluginID = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleProviderPluginID
-typealias ClaudeCompatiblePluginBackendID = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleBackendID
-typealias ClaudeCompatiblePluginRuntimeMode = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleRuntimeMode
-typealias ClaudeCompatiblePluginToolContext = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleToolContext
-typealias ClaudeCompatibleBackendLimits = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleBackendLimits
-typealias ClaudeCompatiblePluginBackendConfig = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleBackendConfig
-typealias ClaudeCompatiblePluginBackendAuth = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleBackendAuth
-typealias ClaudeCompatiblePluginBackendModelBehavior = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleBackendModelBehavior
-typealias ClaudeCompatiblePluginSlotMapping = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleSlotMapping
-typealias ClaudeCompatiblePluginRuntimeConfig = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleRuntimeConfig
-typealias ClaudeCompatiblePluginLaunchEnvironment = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleLaunchEnvironment
-typealias ClaudeCompatiblePluginAvailability = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleProviderAvailability
-typealias ClaudeCompatiblePluginModelOption = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelOption
-typealias ClaudeCompatiblePluginModelCatalogSnapshot = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelCatalogSnapshot
-typealias ClaudeCompatiblePluginRateLimitInfo = RepoPromptClaudeCompatibleProvider.ClaudeProviderRateLimitInfo
-typealias ClaudeCompatiblePluginStreamResult = RepoPromptClaudeCompatibleProvider.ClaudeProviderStreamResult
-typealias ClaudeCompatiblePluginRuntimeVariant = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleRuntimeVariant
-typealias ClaudeCompatiblePluginProviderError = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleProviderError
-typealias ClaudeCompatiblePluginPromptDeliveryMode = RepoPromptClaudeCompatibleProvider.ClaudeCompatiblePromptDeliveryMode
-typealias ClaudeCompatiblePluginProtocolCodec = RepoPromptClaudeCompatibleProvider.ClaudeSDKProtocolCodec
-typealias ClaudeCompatiblePluginNDJSONTranslator = RepoPromptClaudeCompatibleProvider.ClaudeSDKNDJSONTranslator
-typealias ClaudeCompatiblePluginJSONValue = RepoPromptClaudeCompatibleProvider.ClaudeProviderJSONValue
-typealias ClaudeCompatiblePluginAutoCompactWindow = RepoPromptClaudeCompatibleProvider.ClaudeAutoCompactWindow
-
-/// Infrastructure-level facade for pure Claude-compatible provider package
-/// helpers. This keeps lower-level Claude provider code from depending upward on
-/// Agent Mode's feature bridge while preserving a single package import point.
-enum ClaudeCompatibleProviderRuntimeBridge {
-    static func quotaObservation(from info: ClaudeCompatiblePluginRateLimitInfo) -> ClaudeProviderQuotaObservation {
-        let status: ClaudeProviderQuotaObservation.Status = switch info.status {
-        case .allowed: .allowed
-        case .allowedWarning: .allowedWarning
-        case .rejected: .rejected
-        }
-        return ClaudeProviderQuotaObservation(status: status, resetsAt: info.resetsAt, rateLimitType: info.rateLimitType, utilization: info.utilization)
-    }
-
-    static func pluginRuntimeVariant(for runtimeVariant: ClaudeCodeRuntimeVariant) -> ClaudeCompatiblePluginRuntimeVariant {
-        switch runtimeVariant {
-        case .standard:
-            .standard
-        case .glm:
-            .glm
-        case .kimi:
-            .kimi
-        case .customCompatible:
-            .customCompatible
-        }
-    }
-
-    static func runtimeVariant(for pluginVariant: ClaudeCompatiblePluginRuntimeVariant) -> ClaudeCodeRuntimeVariant {
-        switch pluginVariant {
-        case .standard:
-            .standard
-        case .glm:
-            .glm
-        case .kimi:
-            .kimi
-        case .customCompatible:
-            .customCompatible
-        }
-    }
-
+/// App-only configuration adapters for the infrastructure bridge.
+extension ClaudeCompatibleProviderRuntimeBridge {
     static func pluginBackendID(for backendID: ClaudeCodeCompatibleBackendID) -> ClaudeCompatiblePluginBackendID {
         switch backendID {
         case .glmZAI:
@@ -130,44 +71,13 @@ enum ClaudeCompatibleProviderRuntimeBridge {
         )
     }
 
-    static func launchEnvironment(from environment: ClaudeCodeLaunchEnvironment) -> ClaudeCompatiblePluginLaunchEnvironment {
-        let backendID: ClaudeCompatiblePluginBackendID? = switch environment.backend {
-        case .defaultClaude:
-            nil
-        case let .compatible(id):
-            pluginBackendID(for: id)
-        }
-        return ClaudeCompatiblePluginLaunchEnvironment(
-            effectiveModel: environment.effectiveModel,
-            environmentOverrides: environment.environmentOverrides,
-            removedEnvironmentKeys: environment.removedEnvironmentKeys,
-            backendID: backendID,
-            suppressesEffortSettings: environment.suppressesEffortSettings
-        )
-    }
-
-    static func coreLaunchEnvironment(from environment: ClaudeCompatiblePluginLaunchEnvironment) -> ClaudeCodeLaunchEnvironment {
-        let backend: ClaudeCodeLaunchEnvironment.Backend = if let backendID = environment.backendID {
-            .compatible(coreBackendID(for: backendID))
-        } else {
-            .defaultClaude
-        }
-        return ClaudeCodeLaunchEnvironment(
-            effectiveModel: environment.effectiveModel,
-            environmentOverrides: environment.environmentOverrides,
-            removedEnvironmentKeys: environment.removedEnvironmentKeys,
-            backend: backend,
-            suppressesEffortSettings: environment.suppressesEffortSettings
-        )
-    }
-
     static func resolveLaunchEnvironment(
         variant: ClaudeCodeRuntimeVariant,
         requestedModel: String?,
         backendConfigProvider: @escaping @Sendable (ClaudeCodeCompatibleBackendID) -> ClaudeCodeCompatibleBackendConfig,
         zaiKeyProvider: @escaping @Sendable () async throws -> String?,
         backendSecretProvider: @escaping @Sendable (ClaudeCodeCompatibleBackendID) async throws -> String?
-    ) async throws -> ClaudeCodeLaunchEnvironment {
+    ) async throws -> ClaudeCompatiblePluginLaunchEnvironment {
         let resolver = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleLaunchEnvironmentResolver(
             backendConfigProvider: { backendID in
                 pluginBackendConfig(from: backendConfigProvider(coreBackendID(for: backendID)))
@@ -178,11 +88,10 @@ enum ClaudeCompatibleProviderRuntimeBridge {
             }
         )
         do {
-            let resolved = try await resolver.resolve(
+            return try await resolver.resolve(
                 variant: pluginRuntimeVariant(for: variant),
                 requestedModel: requestedModel
             )
-            return coreLaunchEnvironment(from: resolved)
         } catch let ClaudeCompatiblePluginProviderError.invalidConfiguration(detail) {
             throw AIProviderError.invalidConfiguration(detail: detail)
         }
@@ -203,13 +112,6 @@ enum ClaudeCompatibleProviderRuntimeBridge {
     static func removedBackendEnvironmentKeys(config: ClaudeCodeCompatibleBackendConfig) -> Set<String> {
         RepoPromptClaudeCompatibleProvider.ClaudeCompatibleBackendEnvironmentBuilder.removedEnvironmentKeys(
             config: pluginBackendConfig(from: config)
-        )
-    }
-
-    static func decoratedUserMessage(_ userMessage: String, instructions: String) -> String {
-        RepoPromptClaudeCompatibleProvider.ClaudeCompatiblePromptDelivery.decoratedUserMessage(
-            userMessage,
-            instructions: instructions
         )
     }
 
@@ -244,14 +146,12 @@ enum ClaudeCompatibleProviderRuntimeBridge {
         resumeSessionID: String? = nil,
         systemPromptOverride: String? = nil
     ) -> [String] {
-        RepoPromptClaudeCompatibleProvider.ClaudeCompatibleHeadlessRuntime.buildArguments(
-            RepoPromptClaudeCompatibleProvider.ClaudeCompatibleHeadlessArgumentsRequest(
-                runtimeConfig: runtimeConfig(from: config, mode: .discovery),
-                mcpConfigPath: context.configURL?.path,
-                launchEnvironment: context.launchEnvironment.map(launchEnvironment(from:)),
-                resumeSessionID: resumeSessionID,
-                systemPromptOverride: systemPromptOverride
-            )
+        buildHeadlessArguments(
+            runtimeConfig: runtimeConfig(from: config, mode: .discovery),
+            mcpConfigPath: context.configURL?.path,
+            launchEnvironment: context.launchEnvironment,
+            resumeSessionID: resumeSessionID,
+            systemPromptOverride: systemPromptOverride
         )
     }
 
@@ -265,58 +165,6 @@ enum ClaudeCompatibleProviderRuntimeBridge {
             backendConfig: backendConfig.map(pluginBackendConfig(from:)),
             includeEffortVariants: includeEffortVariants
         )
-    }
-
-    static func streamResult(from providerResult: ClaudeCompatiblePluginStreamResult) -> AIStreamResult {
-        AIStreamResult(
-            type: providerResult.type,
-            text: providerResult.text,
-            reasoning: providerResult.reasoning,
-            promptTokens: providerResult.promptTokens,
-            completionTokens: providerResult.completionTokens,
-            cost: providerResult.cost,
-            toolName: providerResult.toolName,
-            toolArgs: providerResult.toolArgs,
-            toolOutput: providerResult.toolOutput,
-            toolInvocationID: providerResult.toolInvocationID,
-            claudeToolUseID: providerResult.claudeToolUseID,
-            toolResultJSON: providerResult.toolResultJSON,
-            toolArgsJSON: providerResult.toolArgsJSON,
-            toolIsError: providerResult.toolIsError,
-            providerSessionID: providerResult.providerSessionID,
-            stopReason: providerResult.stopReason,
-            modelContextWindow: providerResult.modelContextWindow,
-            contextUsedTokens: providerResult.contextUsedTokens,
-            contentMessageID: providerResult.contentMessageID
-        )
-    }
-
-    static func providerStreamResult(from streamResult: AIStreamResult) -> ClaudeCompatiblePluginStreamResult {
-        ClaudeCompatiblePluginStreamResult(
-            type: streamResult.type,
-            text: streamResult.text,
-            reasoning: streamResult.reasoning,
-            promptTokens: streamResult.promptTokens,
-            completionTokens: streamResult.completionTokens,
-            cost: streamResult.cost,
-            toolName: streamResult.toolName,
-            toolArgs: streamResult.toolArgs,
-            toolOutput: streamResult.toolOutput,
-            toolInvocationID: streamResult.toolInvocationID,
-            claudeToolUseID: streamResult.claudeToolUseID,
-            toolResultJSON: streamResult.toolResultJSON,
-            toolArgsJSON: streamResult.toolArgsJSON,
-            toolIsError: streamResult.toolIsError,
-            providerSessionID: streamResult.providerSessionID,
-            stopReason: streamResult.stopReason,
-            modelContextWindow: streamResult.modelContextWindow,
-            contextUsedTokens: streamResult.contextUsedTokens,
-            contentMessageID: streamResult.contentMessageID
-        )
-    }
-
-    static func normalizedRequestedModel(_ rawModel: String?) -> String? {
-        RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.normalizedRequestedModel(rawModel)
     }
 
     static func isGLMModel(_ rawModel: String?, config: ClaudeCodeCompatibleBackendConfig) -> Bool {
@@ -347,56 +195,6 @@ enum ClaudeCompatibleProviderRuntimeBridge {
         RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.noModelRawValue(
             for: pluginBackendID(for: backendID)
         )
-    }
-
-    static func supportsGLMXHighEffort(backendModelID: String?) -> Bool {
-        RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.supportsXHighEffort(backendModelID)
-    }
-
-    static func contextWindowTokens(forGLMBackendModelID backendModelID: String?) -> Int? {
-        RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.contextWindowTokens(
-            forBackendModelID: backendModelID
-        )
-    }
-
-    static var glmDefaultModelRawValue: String {
-        RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.defaultModelRawValue
-    }
-
-    static var glmHaikuEquivalentModelRawValue: String {
-        RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.haikuEquivalentModelRawValue
-    }
-
-    static var glmOpusEquivalentModelRawValue: String {
-        RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.opusEquivalentModelRawValue
-    }
-
-    static var glmDefaultRequestedModelRawValue: String {
-        RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.defaultRequestedModelRawValue
-    }
-
-    static var glmHaikuRequestedModelRawValue: String {
-        RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.haikuRequestedModelRawValue
-    }
-
-    static var glmOpusRequestedModelRawValue: String {
-        RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.opusRequestedModelRawValue
-    }
-
-    static var glmSupportedModelRawValues: [String] {
-        RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.supportedModelRawValues
-    }
-
-    static var directSelectableGLMModelRawValues: [String] {
-        RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.directSelectableGLMModelRawValues
-    }
-
-    static func isDirectSelectableGLMModel(_ rawModel: String?) -> Bool {
-        RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.isDirectSelectableGLMModel(rawModel)
-    }
-
-    static func directSelectableGLMSlotRawValue(for rawModel: String?) -> String? {
-        RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.directSelectableGLMSlotRawValue(for: rawModel)
     }
 
     private static func pluginRuntimeMode(for toolContext: MCPIntegrationHelper.CLIToolContext) -> ClaudeCompatiblePluginRuntimeMode {

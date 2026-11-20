@@ -1,5 +1,7 @@
 import Combine
 import Foundation
+import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 
 struct AgentExecutionLocationProps: Equatable {
@@ -35,9 +37,8 @@ struct AgentRepromptPillProps: Equatable {
     var isAvailable = false
     var isPreparing = false
     var modelDisplayName: String?
-    var providerID: String?
-    var requiresDisclosure = false
     var unavailableReason: String?
+    var dataDisclosure: [String] = []
 }
 
 struct AgentStatusPillsSnapshot: Equatable {

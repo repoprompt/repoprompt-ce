@@ -1,0 +1,4 @@
+package typealias FileTreeSelectionSnapshot = WorkspaceFileTreePresentationSnapshot
+typealias FileTreeFolderSnapshot = WorkspaceFileTreeFolderPresentation
+typealias FileTreeFileSnapshot = WorkspaceFileTreeFilePresentation
+typealias FileTreeNodeSnapshot = WorkspaceFileTreeNodePresentation

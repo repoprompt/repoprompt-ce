@@ -5,8 +5,10 @@ import Ontology
 import RepoPromptDomainRuntime
 import RepoPromptFoundation
 import RepoPromptInstrumentation
+import RepoPromptMCPServer
 import RepoPromptShared
 import RepoPromptVCS
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 @MainActor
@@ -226,7 +228,7 @@ final class MCPGitToolProvider {
         dependencies = (context: context, selection: selection)
     }
 
-    private nonisolated static let maxConcurrentRepositories = 3
+    private nonisolated static let maxConcurrentRepositories = max(1, HostResourceCapacity.baseline.subprocess)
 
     nonisolated static func worktreeWarning(from worktree: ToolResultDTOs.GitToolReplyDTO.WorktreeDTO?) -> String? {
         guard let worktree, worktree.isWorktree else { return nil }
@@ -549,7 +551,7 @@ final class MCPGitToolProvider {
             runPurpose: metadata.runPurpose
         )
         let declaredRepoPaths = workspace.repoPaths
-        let visibleRoots = await dependencies.context.promptVM.workspaceFileContextStore.rootRefs(scope: lookupContext.rootScope)
+        let visibleRoots = try await (dependencies.context.requirePromptVM()).workspaceFileContextStore.rootRefs(scope: lookupContext.rootScope)
         let requestContext = MCPGitRequestContext(rootRefs: visibleRoots, vcsService: vcsService)
         let allRepos = await requestContext.allRepos()
         let explicitTokens = parseExplicitRepoRoots(from: args).map { tokens in
@@ -578,7 +580,7 @@ final class MCPGitToolProvider {
                 requestsArtifactPublication: requestsArtifactPublication,
                 operation: contextBuilderOperation,
                 allRepositories: allRepos,
-                store: dependencies.context.promptVM.workspaceFileContextStore
+                store: (dependencies.context.requirePromptVM()).workspaceFileContextStore
             )
         } catch let error as MCPContextBuilderGitReviewPolicyError {
             throw MCPError.invalidParams(error.localizedDescription)
@@ -770,7 +772,7 @@ final class MCPGitToolProvider {
                         publishedOutcomes,
                         publishedArtifactSetCount: publishedSets.count,
                         fence: publicationFence,
-                        store: dependencies.context.promptVM.workspaceFileContextStore
+                        store: (dependencies.context.requirePromptVM()).workspaceFileContextStore
                     )
                 } catch let error as MCPContextBuilderGitReviewPolicyError {
                     stagedAdvertisementsByInvocation[advertisementInvocationID] = MCPGitStagedAdvertisement(
@@ -782,7 +784,7 @@ final class MCPGitToolProvider {
             }
 
             try Task.checkCancellation()
-            let ingress = await dependencies.context.promptVM.workspaceFileContextStore.ingressPublishedGitArtifacts(
+            let ingress = try await (dependencies.context.requirePromptVM()).workspaceFileContextStore.ingressPublishedGitArtifacts(
                 WorkspacePublishedGitArtifactIngressRequest(
                     root: root,
                     artifacts: publishedSets.flatMap(\.orderedArtifacts)

@@ -30,18 +30,18 @@ enum AgentRunSessionStore {
         AppDomainRuntimeComposition.shared.runtime.agentSessionStore
     }
 
-    static func register(sessionID: UUID) async -> Registration {
-        await shared.register(sessionID: sessionID)
-    }
-
-    static func registerIfMissing(sessionID: UUID) async -> Registration? {
-        await shared.registerIfMissing(sessionID: sessionID)
+    static func register(
+        sessionID: UUID,
+        cancellationHandler: DomainAgentRunSessionStore.RegistrationCancellationHandler? = nil
+    ) async -> Registration {
+        await shared.register(sessionID: sessionID, cancellationHandler: cancellationHandler)
     }
 
     static func claimResumableSession(
-        sessionID: UUID
+        sessionID: UUID,
+        cancellationHandler: DomainAgentRunSessionStore.RegistrationCancellationHandler? = nil
     ) async -> DomainAgentSessionResumeClaimResult {
-        await shared.claimResumableSession(sessionID: sessionID)
+        await shared.claimResumableSession(sessionID: sessionID, cancellationHandler: cancellationHandler)
     }
 
     static func beginEpoch(

@@ -7,14 +7,19 @@ import RepoPromptDomainRuntime
 final class MCPHistoryToolProvider {
     private let scanner: any HistorySessionScanning
 
-    init(
+    convenience init(
         runtime _: MCPAppToolBinder,
         workspaceStore: DomainWorkspaceStore? = nil,
         scannerFactory: (@Sendable () -> any HistorySessionScanning)? = nil
     ) {
-        scanner = scannerFactory?() ?? HistorySessionScanner(
-            workspaceLocations: HistoryWorkspaceLocationResolver(workspaceStore: workspaceStore)
-        )
+        self.init(workspaceLocations: .init(workspaceStore: workspaceStore), scannerFactory: scannerFactory)
+    }
+
+    init(
+        workspaceLocations: HistoryWorkspaceLocationResolver,
+        scannerFactory: (@Sendable () -> any HistorySessionScanning)? = nil
+    ) {
+        scanner = scannerFactory?() ?? HistorySessionScanner(workspaceLocations: workspaceLocations)
     }
 
     func executeDomainRead(

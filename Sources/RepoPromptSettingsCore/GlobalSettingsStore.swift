@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptFoundation
 import RepoPromptShared
@@ -602,6 +603,17 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
 
     package func experimentalAttributedTextEditor() -> Bool {
         scalarPreferences.ui?.experimentalAttributedTextEditor ?? false
+    }
+
+    /// Opt-in presentation experiment. Missing preferences always leave Lookout disabled.
+    package func experimentalCommandCenter() -> Bool {
+        scalarPreferences.ui?.experimentalCommandCenter ?? false
+    }
+
+    package func setExperimentalCommandCenter(_ enabled: Bool, commit: Bool = true) {
+        updateUIScalar(commit: commit) { settings in
+            settings.experimentalCommandCenter = enabled
+        }
     }
 
     package func setExperimentalAttributedTextEditor(_ enabled: Bool, commit: Bool = true) {

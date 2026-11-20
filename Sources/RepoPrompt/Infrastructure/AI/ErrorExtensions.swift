@@ -6,6 +6,7 @@
 //
 import Foundation
 import RepoPromptFoundation
+import RepoPromptSecureStorage
 import SwiftAnthropic
 import SwiftOpenAI
 
@@ -42,6 +43,13 @@ extension Error {
         if let apiErr = self as? SwiftAnthropic.APIError {
             // You already have .displayDescription for each case
             return apiErr.displayDescription
+        }
+
+        // Secure-storage errors already provide sanitized, actionable messages.
+        if let keychainError = self as? KeychainService.KeychainError {
+            return [keychainError.errorDescription, keychainError.recoverySuggestion]
+                .compactMap(\.self)
+                .joined(separator: " ")
         }
 
         // 4. Fallback to NSError bridging:

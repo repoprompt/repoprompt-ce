@@ -14,6 +14,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+import stable_rollout
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -66,6 +67,16 @@ def form_fields():
 
 if not os.environ.get("GH_TOKEN"):
     raise SystemExit("missing GH_TOKEN")
+
+if args and args[0] == 'api' and args[1].startswith('repos/repoprompt/repoprompt-ce-updates/releases/assets/'):
+    release=json.loads(Path(os.environ['PUBLISHER_STABLE_RELEASE']).read_text())
+    asset=next(a for a in release['assets'] if str(a['id'])==args[1].rsplit('/',1)[-1])
+    sys.stdout.buffer.write((Path(os.environ['PUBLISHER_STABLE_ASSETS'])/asset['name']).read_bytes())
+    raise SystemExit(0)
+
+if args == ['api', 'repos/repoprompt/repoprompt-ce-updates/releases/latest']:
+    print(Path(os.environ['PUBLISHER_STABLE_RELEASE']).read_text())
+    raise SystemExit(0)
 
 if args[:2] == ["api", "--paginate"]:
     state["lookup_args"].append(args)
@@ -245,6 +256,8 @@ elif "/compare/" in url:
             json.dumps({"status": "ahead", "merge_base_commit": {"sha": os.environ["TIP_COMMIT"]}}),
             encoding="utf-8",
         )
+elif url.startswith('https://github.com/repoprompt/repoprompt-ce-updates/releases/download/'):
+    shutil.copyfile(Path(os.environ['PUBLISHER_STABLE_ASSETS']) / url.rsplit('/',1)[-1], output)
 elif url == os.environ["PUBLISHER_STABLE_FEED_URL"]:
     shutil.copyfile(os.environ["PUBLISHER_STABLE_APPCAST"], output)
 elif url.endswith("/releases/latest"):
@@ -297,6 +310,25 @@ class PublishTipReleaseTests(unittest.TestCase):
             "</rss>\n",
             encoding="utf-8",
         )
+
+        # Stable observation now authenticates both the manifest and appcast.
+        stable_dir = self.root / 'stable-assets'
+        stable_dir.mkdir()
+        stable = json.loads((self.asset_dir/'identity-rollout.json').read_text())
+        item = stable['appcastItems'][0]
+        item.update(role='legacy', tag='v1.4.0', marketingVersion='1.4.0', buildNumber='36',
+                    enclosureName='RepoPrompt-1.4.0-36.zip',
+                    url='https://github.com/repoprompt/repoprompt-ce-updates/releases/download/v1.4.0/RepoPrompt-1.4.0-36.zip')
+        stable.update(channel='stable',sourceTag='v1.4.0',currentRole='legacy',marketingVersion='1.4.0',buildNumber='36',
+                      migrationPhase='disabled',updateRepository='repoprompt/repoprompt-ce-updates')
+        (stable_dir/'RepoPrompt-1.4.0-36-stable-rollout.json').write_text(json.dumps(stable))
+        (stable_dir/'appcast.xml').write_text(stable_rollout.render_appcast(stable))
+        assets=[]
+        for p in stable_dir.iterdir():
+            assets.append(dict(id=len(assets)+1,name=p.name,state='uploaded',size=p.stat().st_size,
+                               digest='sha256:'+hashlib.sha256(p.read_bytes()).hexdigest(),
+                               browser_download_url='https://github.com/repoprompt/repoprompt-ce-updates/releases/download/v1.4.0/'+p.name))
+        (self.root/'stable-release.json').write_text(json.dumps(dict(tag_name='v1.4.0',draft=False,prerelease=False,assets=assets)))
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
@@ -377,6 +409,25 @@ class PublishTipReleaseTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return [artifact_manifest, appcast, rollout_manifest, enclosure], declaration
 
+    def test_historical_stable_assets_without_api_digests_publish_safely(self):
+        path=self.root/'stable-release.json'
+        metadata=json.loads(path.read_text())
+        for asset in metadata['assets']: asset['digest']=None
+        path.write_text(json.dumps(metadata))
+        result=self._run('normal',None)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('publish',json.loads(self.state_path.read_text())['mutations'])
+
+    def test_stable_observation_digest_mismatch_stops_before_mutation(self):
+        path=self.root/'stable-release.json'
+        metadata=json.loads(path.read_text())
+        metadata['assets'][0]['digest']='sha256:'+'0'*64
+        path.write_text(json.dumps(metadata))
+        result=self._run('normal',None)
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('digest mismatch',result.stderr)
+        self.assertEqual(json.loads(self.state_path.read_text())['mutations'],[])
+
     def _release(self, *, draft: bool = False) -> dict[str, object]:
         release: dict[str, object] = {
             "id": 101,
@@ -438,6 +489,8 @@ class PublishTipReleaseTests(unittest.TestCase):
                 "PUBLISHER_STUB_STATE": str(self.state_path),
                 "PUBLISHER_ASSET_DIR": str(self.asset_dir),
                 "PUBLISHER_STABLE_APPCAST": str(self.stable_appcast),
+                "PUBLISHER_STABLE_ASSETS": str(self.root/'stable-assets'),
+                "PUBLISHER_STABLE_RELEASE": str(self.root/'stable-release.json'),
                 "PUBLISHER_STABLE_FEED_URL": policy["sparkle"]["stableFeedURL"],
                 "TIP_GH_TOKEN": update_token,
                 "PUBLISHER_EXPECTED_SOURCE_TOKEN": 'fixture-source"-token\\',
@@ -756,8 +809,21 @@ print(Path(os.environ["ADMISSION_CI_RUNS"]).read_text())
         (self.source / "Scripts").mkdir()
         for path in (ROLLOUT_TOOL, POLICY, SCRIPT_DIR / "tip_ci_selection.py"):
             shutil.copyfile(path, self.source / "Scripts" / path.name)
-        for name in ("tip-rollout.json", "version.env"):
-            shutil.copyfile(ROOT_DIR / name, self.source / name)
+        shutil.copyfile(ROOT_DIR / "version.env", self.source / "version.env")
+        # Admission scenarios below model a preparer baseline. Do not inherit
+        # today's activation role and silently require unrelated T/S HTTP data.
+        (self.source / "tip-rollout.json").write_text(
+            json.dumps({
+                "schemaVersion": 1,
+                "channel": "tip",
+                "currentRole": "preparer",
+                "eligibilityProfile": "tip-identity-dress-rehearsal-v1",
+                "expectedMigrationPhase": "legacy-preparer",
+                "expectedSigningIdentity": "legacy",
+                "predecessors": [],
+            }) + "\n",
+            encoding="utf-8",
+        )
         self._git(self.source, "add", ".")
         self._git(self.source, "commit", "-qm", "tested candidate")
         self.candidate = self._git(self.source, "rev-parse", "HEAD")

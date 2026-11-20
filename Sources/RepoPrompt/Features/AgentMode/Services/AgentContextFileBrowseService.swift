@@ -1,5 +1,6 @@
 import Foundation
 import OSLog
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 struct AgentContextFileBrowseRoot: Equatable, Hashable {

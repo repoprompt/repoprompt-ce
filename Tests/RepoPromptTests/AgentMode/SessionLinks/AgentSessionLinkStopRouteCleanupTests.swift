@@ -103,7 +103,7 @@ final class AgentSessionLinkStopRouteCleanupTests: XCTestCase {
             windowID: 2, workspaceID: UUID(), tabID: UUID(), sessionID: UUID(),
             persistentBindingGeneration: UUID(), bindingTransitionGeneration: 1
         )
-        let outcome = await viewModel.agentSessionLinkPerformStop(
+        let outcome = await viewModel.linkExecutionRuntime.agentSessionLinkPerformStop(
             to: candidate,
             request: AgentSessionLinkStopRequest(
                 requestID: UUID(), linkID: UUID(), linkGeneration: 1,

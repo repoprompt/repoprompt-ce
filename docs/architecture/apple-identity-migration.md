@@ -48,7 +48,8 @@ rechecks protected `main`, validates the authenticated public Tip appcast/manife
 monotonic `P → T → S` state machine while allowing newer same-role builds with exact retained
 manifest bytes, and verifies retained enclosure size/SHA-256 from immutable release assets.
 For T and S, setup and publication also require the greatest Stable build to remain strictly below
-P's retained Tip build; otherwise an unprepared later Stable build could satisfy T's Sparkle floor.
+P's retained Tip build, unless Stable retains exactly the same authenticated P through the shared
+ladder described below; otherwise an unprepared later Stable build could satisfy T's Sparkle floor.
 Draft creation, asset upload, and publication are reconciled by observation after ambiguous network
 outcomes; existing bytes are never overwritten. A completed release is then audited anonymously,
 asset by asset, before it is accepted as the latest Tip release.
@@ -151,26 +152,81 @@ declaration with P's exact manifest digest before merging T. After T is verified
 declaration with both exact predecessor digests before merging S. Successful protected-main CI
 automatically publishes each reviewed role; no second dispatch approval is required.
 
-Stable 1.4.0 (build `36`) is now the official Stable epoch. The authenticated live Tip is
-transition tag `tip-57b572038048`, build `35.15.39`, with `identity-rollout.json` SHA-256
-`c8d28103b5e95370fc0de7df19c34797552e99803228794754bfbfe292e3e421`; it retains P
-`tip-2f94412e6ab5` at build `35.15.18`, whose manifest SHA-256 is
-`3c69703fa7582105633b36e8874fe2a28e1832aabb776351e68dbf3367e122db`. Because that retained P
-is below Stable 36, normal T -> P progression remains forbidden. The schema-2 checked-in Tip
-declaration contains the sole explicit `resetAuthority` for this exact live transition, retained P,
-and Stable epoch. The release tool matches every recorded tag, manifest digest, retained-P fact, and
-Stable epoch fact against the authenticated public files and rejects absent, mismatched, or tampered
-reset data; it does not add a generic progression bypass or silently discard authenticated history.
-The replacement P must be newer than both live Tip `35.15.39` and Stable `36` (the next Tip encoding
-begins at `36.0.x`). After publication, clear the reset authority and advance the declaration with P's
-exact manifest digest before merging T.
+### Tip transition activation (2026-11-16)
+
+The published replacement P is `tip-1e1d9fe4bbc6`, build `43.24.43`. Its original
+`identity-rollout.json` SHA-256 is
+`03153738c5b09ecffa6a56841e5fc2f9113ebd54a4ed8306e48d6df171770de4`.
+Stable also delivers these unchanged P bytes through
+`stable-adopt-tip-1e1d9fe4bbc6-stable-delivery-v1`. The Tip declaration now pins this P,
+removes the completed historical reset authority, and selects the normal schema-1 T chain.
+Stable's declaration and repository-wide `version.env` remain unchanged.
+
+This is an explicitly accepted-risk activation, **not a passed runtime migration proof**.
+Run `43814742800` passed staging and Eric signing but Apple rejected notarization with HTTP 403
+for a missing/expired agreement. T selects Samuel's Application, Installer, provisioning profile,
+and notarization credentials; it does not require another Eric build or submission. Existing P must
+remain available byte-for-byte. Phase `disabled` is the transition role's expected phase (successor identity), not
+permission to discard the committed bridge or skip P.
+
+Merging this declaration and completing qualifying protected-main CI can automatically publish T;
+there is no separate dispatch approval. Require Samuel's credential preflight, PKG signing,
+accepted notarization/stapling, packaged smoke, compatibility, and live-ladder gates to pass.
+Current Samuel notarization access and end-to-end credential continuity remain unproven until
+actually exercised. A skipped-P manual installation is not a supported shortcut: retain the P-first
+Sparkle ladder, and treat blocked credential access as a recovery case rather than a successful
+migration. Keep the original P and recovery assets; do not automatically advance S or Stable T.
 
 The workflow capability for T is explicit and deterministic: after a reviewed transition declaration
 reaches protected `main` and CI passes, GitHub selects and publishes that exact commit automatically.
-The declaration change must not merge until the runtime proof below is complete, including a reviewed
+The normal release gate is completion of the runtime proof below, including a reviewed
 recovery story for a lost committed P journal and a policy that distinguishes a fresh successor
 installation from a client that skipped the preparer/transition bridge. S also requires a later
 declaration change containing both T's and P's exact manifest digests.
+
+## Dormant Stable capability and archived-P handoff
+
+Capability code alone does not activate either channel. The checked-in channel declarations
+remain the activation authority. Stable schema 2 explicitly acknowledges
+`runtimeMigrationProof: "unverified-accepted-risk"`; it is an accepted-risk release lane, **not** a
+successful runtime-proof result. The normal proof requirements below remain outstanding. A maintainer
+must review that risk again in the activation PR, including recovery and fresh-install policy.
+
+The no-new-Eric path adopts the *unchanged* Tip preparer through Stable. It does not rebuild, resign,
+renotarize, relabel the binary, or overwrite Stable v1.9.0. Stable mirrors the exact ZIP bytes in
+`stable-adopt-tip-<sha>-stable-delivery-v1`. Delivery must use the Stable repository because the
+shipped client's update-result channel rule infers channel from the enclosure URL. The original
+metadata-only `stable-adopt-tip-<sha>` remains immutable and readable, but its Tip URL cannot be
+used for repaired Stable delivery. Only that historical → deterministic mirror same-build repair
+is admitted, with every origin field identical; no reverse move or arbitrary same-build rewrite.
+The Stable manifest carries the original Tip manifest SHA-256, tag, build, source commit,
+artifact-manifest binding, size and signature. Cross-channel guards compare the validated original
+bridge identity, not the transport URL. Native Stable T/S retain this Stable-delivered P projection.
+An adopted preparer cannot become a general-purpose cross-channel artifact import.
+Only the oldest P may originate in Tip; Stable T/S must be native Stable releases.
+
+`Scripts/stable_rollout.py` owns declaration admission, deterministic adoption generation/validation,
+Stable progression, and the cross-channel guard. The guard admits Stable at/above Tip's P only with an
+authenticated Stable manifest/appcast pair retaining **exactly the same P**. Tip must lead Stable's
+role (P before T before S); higher unprepared legacy Stable builds still fail closed. Both publishers
+reobserve the other feed before publication, and all three publication jobs share
+`rollout-publication` concurrency. Live observations require authenticated GitHub release metadata and
+size/SHA-256 agreement for each downloaded asset (historical assets without an API digest are fetched
+through their authenticated API asset identity and size-checked); anonymous mutable feed XML is not
+handoff authority.
+
+Stable adoption's workflow has no signing, notarization, or Sparkle-private-key secrets. It verifies
+P's original signature, stapled ticket, embedded Samuel anchor, binary metadata, and artifact-manifest
+binding, then runs helper/packaged smokes without inherited secrets and older-macOS compatibility.
+The publication job independently reverifies the pinned bytes and current ladder under the protected
+`release` environment. A draft with different bytes is not overwritten. These checks do **not** run
+the credential migration or prove its runtime success.
+
+Retention is now cross-channel: once Stable adopts P, **never prune or edit that Tip release, the
+historical Stable adoption, or the Stable delivery mirror and their assets**, even after Tip advances.
+Both channels' T/S retain the same Tip-origin P and its exact manifest digest; Stable delivery also
+depends on the immutable mirror URL. Keep P/T recovery assets and Eric's material for the supported rollback window.
+See [the activation runbook](../releasing.md#no-new-eric-activation-runbook).
 
 ## Required proof gate
 
@@ -200,3 +256,56 @@ Before the transition package is published, rollback is simply removal of the el
 item: clients remain on the legacy app, source Keychain items remain untouched, and a successfully
 prepared client can continue using the bridge. After the successor is published, keep the preparer
 and its signing material available until the supported migration window closes.
+
+## Credential deletion recovery (-25244)
+
+Older preparer builds used executable filenames (`RepoPrompt` and
+`RepoPromptIdentityAnchor`) as the descriptions of requirement-based trusted
+applications. Apple's classic `SecItemDelete` password guard compares those
+basenames with the caller's app name, independently of code-signing authorization.
+A migrated item can therefore pass the exact signing-requirement validation yet
+fail deletion with `errSecInvalidOwnerEdit` (-25244). See
+[issue #1663](https://github.com/repoprompt/repoprompt-ce/issues/1663) and
+[Apple's legacy deletion guard](https://github.com/apple-oss-distributions/Security/blob/main/OSX/libsecurity_keychain/lib/SecItem.cpp).
+
+New preparer ACLs describe the app bundle for both identities; the successor's
+embedded anchor remains its code-validation input. Neither designated requirement
+changes. Existing items are not rewritten. An **interactive** delete that fails
+with -25244 can recover by revalidating the exact held item's decrypt ACL and
+calling `SecKeychainItemDelete` on that reference. Keychain authorization still
+applies. The app then performs a reference-only absence check before reporting
+success. It never follows a replacement item with another delete, reads a secret,
+changes an ACL, or falls back to a different service/account.
+
+Noninteractive operations do **not** use this recovery API because it cannot
+suppress authentication UI per call. In particular, deletion during reconciliation
+of an unfinished migration can still fail with -25244 and leave migration paused.
+Renamed app bundles can also hit the name guard; authenticated interactive deletion
+uses the same bounded recovery path.
+
+If the current official CE app still cannot delete the credential:
+
+1. Open **Keychain Access** and inspect only the affected password item's metadata.
+   Match its **Account** and **Where** (service) fields. For Z.ai, the account is
+   `ZAIAPI`; the GLM compatible backend shares this credential. A committed bridge
+   service starts with `com.repoprompt.ce.identity-migration.keychain.v1.` followed
+   by its attempt UUID. Do not reveal or export the password.
+2. Delete only that credential in the active bridge, using normal macOS
+   authorization. If multiple attempts exist and you cannot identify the active
+   bridge, stop and contact support rather than guessing or deleting all matches.
+3. Return to CE and retry the provider's Delete action to refresh provider state.
+   Re-enter a replacement key only if wanted. Failure or cancellation does not
+   clear the app's provider settings.
+
+**Never** delete the bridge manifest account
+`RepoPromptIdentityMigrationBridgeManifestV2`, any item in the journal service
+`com.pvncher.repoprompt.ce.identity-migration.state.v2`, or unrelated credentials.
+Do not reset the login Keychain, add trusted applications, or choose “allow all
+applications.” Removing migration metadata can make the committed bridge
+unavailable and is not a credential-deletion repair.
+
+Fake-client tests cover the fallback gates, exact-reference targeting, ACL rejection,
+cancellation, replacement races, absence confirmation, and sanitized UI errors. They
+do not establish behavior under the official Developer ID identities on the
+reporter's macOS version; that signed-build check remains a release-validation
+boundary.

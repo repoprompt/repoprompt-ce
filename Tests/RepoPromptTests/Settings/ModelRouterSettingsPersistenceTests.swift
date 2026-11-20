@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptCodexProvider
 import RepoPromptProviderQuota
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore

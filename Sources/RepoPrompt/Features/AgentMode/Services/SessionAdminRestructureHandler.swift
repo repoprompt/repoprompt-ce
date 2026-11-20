@@ -191,11 +191,7 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
         var authorityLost = false
         for lease in batch.leases {
             let target = lease.targetSessionID
-            guard !authorityLost, context.scopes.isCurrent(lease) else {
-                authorityLost = true
-                items.append(.revoked(target))
-                continue
-            }
+            if context.appendRevocationIfNeeded(lease, authorityLost: &authorityLost, items: &items) { continue }
             guard target != observer else {
                 items.append(SessionAdminItemResult(sessionID: target, result: "not_applied", code: "self_link"))
                 continue
@@ -242,11 +238,7 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
         var authorityLost = false
         for lease in batch.leases {
             let target = lease.targetSessionID
-            guard !authorityLost, context.scopes.isCurrent(lease) else {
-                authorityLost = true
-                items.append(.revoked(target))
-                continue
-            }
+            if context.appendRevocationIfNeeded(lease, authorityLost: &authorityLost, items: &items) { continue }
             if batch.request.preview {
                 let linked = await host.activeLinkCapabilities(observer: observer, target: target) != nil
                 items.append(SessionAdminItemResult(sessionID: target, result: linked ? "would_unlink" : "not_linked"))
@@ -475,11 +467,7 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
         var authorityLost = false
         for lease in batch.leases {
             let source = lease.targetSessionID
-            guard !authorityLost, context.scopes.isCurrent(lease) else {
-                authorityLost = true
-                items.append(.revoked(source))
-                continue
-            }
+            if context.appendRevocationIfNeeded(lease, authorityLost: &authorityLost, items: &items) { continue }
             if batch.request.preview {
                 items.append(SessionAdminItemResult(
                     sessionID: source, result: "would_move",
@@ -487,8 +475,32 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
                 ))
                 continue
             }
-            // Placement and membership may have moved since preflight (earlier items, other
-            // callers); every write is decided against current state.
+            let preparation: SessionAdminPlacementPreparation
+            do {
+                preparation = try await host.prepareOrganizationalPlacement(sessionID: source) { [context] in
+                    context.scopes.isCurrent(lease)
+                }
+            } catch {
+                if !context.scopes.isCurrent(lease) {
+                    authorityLost = true
+                    items.append(.revoked(source))
+                } else {
+                    let code = if case let SessionAdminHostError.refused(code, _, _) = error { code } else { "source_unavailable" }
+                    items.append(SessionAdminItemResult(
+                        sessionID: source, result: "not_applied", code: code,
+                        fields: ["detail": .string(error.localizedDescription)]
+                    ))
+                }
+                continue
+            }
+            defer { preparation.release() }
+            guard context.scopes.isCurrent(lease) else {
+                authorityLost = true
+                items.append(.revoked(source))
+                continue
+            }
+            // Preparation may suspend. Re-derive every decision now; there is no suspension
+            // from here through reservation and the writer's in-memory placement commit.
             // A stamping adoption writes `batch.scope` onto the moved subtree, so its destination must be
             // placed in that scope (placement consistency); a re-parent only needs permission to reach it.
             let destinationOK = if let stampScope {
@@ -498,12 +510,6 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
             }
             guard destinationOK else {
                 items.append(SessionAdminItemResult(sessionID: source, result: "not_applied", code: "destination_unavailable"))
-                continue
-            }
-            // A preceding item's durable write may have suspended while a peer opened the
-            // source workspace. Read membership alone cannot authorize a replicated write.
-            if context.projector.pointResolutionState(for: source) == .replicated {
-                items.append(SessionAdminItemResult(sessionID: source, result: "not_applied", code: "source_unavailable"))
                 continue
             }
             // A re-parent source must still be a member at the write (an adoptee is not one yet).

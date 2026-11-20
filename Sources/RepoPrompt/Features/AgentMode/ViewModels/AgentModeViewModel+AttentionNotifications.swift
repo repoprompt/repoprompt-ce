@@ -91,11 +91,6 @@ extension AgentModeViewModel {
         return sessions[tabID]?.activeAgentSessionID == sessionID
     }
 
-    /// Asks the transcript for `tabID` to pin to its live bottom, where pending cards render.
-    func revealPendingNotificationInteraction(tabID: UUID) {
-        notificationAttention.revealRequests.send(tabID)
-    }
-
     private static func attentionChangePublisher(for session: TabSession) -> AnyPublisher<Void, Never> {
         Publishers.MergeMany([
             session.$runState.map { _ in () }.eraseToAnyPublisher(),

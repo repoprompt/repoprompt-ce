@@ -320,7 +320,7 @@ final class AgentSidebarRestoreCharacterizationTests: XCTestCase {
         XCTAssertEqual(firstFrame.map { label($0.id) }, ["1", "3"], "no expanded frame before the seeding task")
         XCTAssertEqual(firstFrame.map(\.isThreadCollapsed), [false, true])
         // The view's later seeding task only records the handled set; rows cannot move.
-        viewModel.seedDefaultCollapsedSidebarThreads(defaultKeys)
+        viewModel.ui.sessionSidebar.seedDefaultCollapsedThreads(eligibleKeys: defaultKeys)
         XCTAssertEqual(viewModel.filteredSidebarSessions(for: tabs, currentTabID: nil, searchText: ""), firstFrame)
         viewModel.ui.sessionSidebar.setThreadCollapsed(false, for: .session(id(103)))
         XCTAssertEqual(

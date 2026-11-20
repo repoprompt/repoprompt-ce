@@ -33,7 +33,7 @@ enum FileTreeCardPresentationBuilder {
         }
 
         let treeType = normalizedTreeType(dto: dto, args: args)
-        let mode = normalizedMode(args?.mode)
+        let mode = AgentToolCardRenderSummaryBuilder.normalizedTreeMode(args?.mode)
         let startPath = normalizedStartPath(args?.path)
         let isFallbackMessage = dto.note != nil
         let wasTruncated = dto.wasTruncated == true
@@ -82,34 +82,8 @@ enum FileTreeCardPresentationBuilder {
         return "roots"
     }
 
-    private static func normalizedMode(_ raw: String?) -> String {
-        switch raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "full":
-            "full"
-        case "folders":
-            "folders"
-        case "selected":
-            "selected"
-        default:
-            "auto"
-        }
-    }
-
-    private static func fileTreeModeTitle(_ mode: String) -> String {
-        switch mode {
-        case "full":
-            "Full"
-        case "folders":
-            "Folders"
-        case "selected":
-            "Selected"
-        default:
-            "Auto"
-        }
-    }
-
     private static func fileTreeFilesSubtitle(mode: String, startPath: String?, rootsCount: Int? = nil) -> String? {
-        var parts = [fileTreeModeTitle(mode)]
+        var parts = [AgentToolCardRenderSummaryBuilder.fileTreeModeTitle(mode)]
         if let startPath = normalizedStartPath(startPath) {
             parts.append(shortenPath(startPath))
         } else if let rootsCount {
@@ -124,7 +98,7 @@ enum FileTreeCardPresentationBuilder {
             return dto.map { rootCountText($0.rootsCount) } ?? "roots"
         }
         return fileTreeFilesSubtitle(
-            mode: normalizedMode(args?.mode),
+            mode: AgentToolCardRenderSummaryBuilder.normalizedTreeMode(args?.mode),
             startPath: args?.path,
             rootsCount: args?.path == nil ? dto?.rootsCount : nil
         ) ?? "File tree"
@@ -154,7 +128,7 @@ enum FileTreeCardPresentationBuilder {
 
 struct FileTreeResultCard: View {
     let item: AgentChatItem
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("FileTreeResultCard") private var isExpanded = false
 
     private var dto: ToolResultDTOs.FileTreeDTO? {
         ToolJSON.decode(ToolResultDTOs.FileTreeDTO.self, from: item.toolResultJSON)
@@ -176,18 +150,15 @@ struct FileTreeResultCard: View {
             detailText: nil,
             subtitle: inlineToolCardSummary(presentation.subtitle, presentation.detailText),
             status: presentation.status,
-            timestamp: item.timestamp,
-            isExpandable: toolResultHasPayload(item),
+            item: item,
             isExpanded: $isExpanded
-        ) {
-            ToolMarkdownExpandedContent(item: item)
-        }
+        )
     }
 }
 
 struct CodeStructureResultCard: View {
     let item: AgentChatItem
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("CodeStructureResultCard") private var isExpanded = false
 
     private var dto: ToolResultDTOs.CodeStructureReplyDTO? {
         ToolJSON.decode(ToolResultDTOs.CodeStructureReplyDTO.self, from: item.toolResultJSON)
@@ -254,18 +225,15 @@ struct CodeStructureResultCard: View {
             detailText: nil,
             subtitle: inlineToolCardSummary(summary, detailText),
             status: status,
-            timestamp: item.timestamp,
-            isExpandable: toolResultHasPayload(item),
+            item: item,
             isExpanded: $isExpanded
-        ) {
-            ToolMarkdownExpandedContent(item: item)
-        }
+        )
     }
 }
 
 struct ManageSelectionResultCard: View {
     let item: AgentChatItem
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("ManageSelectionResultCard") private var isExpanded = false
 
     private var dto: ToolResultDTOs.SelectionReply? {
         ToolJSON.decode(ToolResultDTOs.SelectionReply.self, from: item.toolResultJSON)
@@ -325,18 +293,15 @@ struct ManageSelectionResultCard: View {
             detailText: nil,
             subtitle: inlineToolCardSummary(summary, detailText),
             status: status,
-            timestamp: item.timestamp,
-            isExpandable: toolResultHasPayload(item),
+            item: item,
             isExpanded: $isExpanded
-        ) {
-            ToolMarkdownExpandedContent(item: item)
-        }
+        )
     }
 }
 
 struct WorkspaceContextResultCard: View {
     let item: AgentChatItem
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("WorkspaceContextResultCard") private var isExpanded = false
 
     private var dto: ToolResultDTOs.PromptContextDTO? {
         ToolJSON.decode(ToolResultDTOs.PromptContextDTO.self, from: item.toolResultJSON)
@@ -355,12 +320,7 @@ struct WorkspaceContextResultCard: View {
         if dto.fileBlocks?.isEmpty == false { sections.append("file blocks") }
         if dto.copyPreset != nil { sections.append("copy preset") }
         if dto.copyPresets?.isEmpty == false { sections.append("presets") }
-        guard !sections.isEmpty else { return nil }
-        let visible = Array(sections.prefix(3))
-        if sections.count > visible.count {
-            return visible.joined(separator: " • ") + " • +\(sections.count - visible.count) more"
-        }
-        return visible.joined(separator: " • ")
+        return AgentToolCardRenderSummaryBuilder.sectionSummary(sections)
     }
 
     private var summary: String {
@@ -395,11 +355,8 @@ struct WorkspaceContextResultCard: View {
             detailText: nil,
             subtitle: inlineToolCardSummary(summary, detailText),
             status: status,
-            timestamp: item.timestamp,
-            isExpandable: toolResultHasPayload(item),
+            item: item,
             isExpanded: $isExpanded
-        ) {
-            ToolMarkdownExpandedContent(item: item)
-        }
+        )
     }
 }

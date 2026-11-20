@@ -1,4 +1,7 @@
 import AppKit
+import RepoPromptACPProviders
+import RepoPromptAIContracts
+import RepoPromptClaudeProvider
 import RepoPromptProcess
 import SwiftUI
 
@@ -88,6 +91,7 @@ struct CLIProvidersSettingsView: View {
     @State private var codexMCPImportStatus: String?
     @State private var codexMCPPendingImport: String?
     @State private var isCodexRuntimeAdvancedExpanded: Bool = false
+    @State private var codexContextWindowSelection = CodexContextWindowPreferences.selection()
     @State private var codexRuntimePendingSelection = CodexRuntimePreferences.selection()
     @State private var codexRuntimePreflight: CodexProviderHelpers.CodexRuntimeSettingsPreflight?
     @State private var isLoadingCodexRuntimePreflight = false
@@ -449,7 +453,8 @@ struct CLIProvidersSettingsView: View {
             title: "Claude Code CLI",
             subtitle: "Uses your Claude Code CLI login for Anthropic models. Compatible backends below only need the `claude` binary and their own API keys.",
             infoURL: "https://docs.claude.com/en/docs/claude-code/setup",
-            isConnected: viewModel.directConnectedCLIProviders.contains(.claudeCode),
+            isConnected: viewModel.showsClaudeCodeConnectedBadge,
+            disconnectedLabel: viewModel.claudeCodeError == nil ? "Not Connected" : "Check Failed",
             isExpanded: $isClaudeCodeExpanded
         ) {
             VStack(alignment: .leading, spacing: 12) {
@@ -508,16 +513,7 @@ struct CLIProvidersSettingsView: View {
                         .disabled(isLoadingClaudeCode)
                         .buttonStyle(CustomButtonStyle())
 
-                        if let error = viewModel.claudeCodeError, !error.isEmpty {
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(error)
-                                    .foregroundColor(.red)
-                                Text("This only affects Anthropic Claude models. Compatible backends below use their own API keys when `claude` is installed.")
-                                    .foregroundColor(.secondary)
-                            }
-                            .font(.caption)
-                            .fixedSize(horizontal: false, vertical: true)
-                        } else {
+                        if viewModel.claudeCodeError == nil {
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(
                                     viewModel.claudeCodeCLIStatus.isKnownMissing
@@ -532,6 +528,17 @@ struct CLIProvidersSettingsView: View {
                             .fixedSize(horizontal: false, vertical: true)
                         }
                     }
+                }
+
+                if let error = viewModel.claudeCodeError {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(error)
+                            .foregroundColor(.red)
+                        Text("Compatible backends below use their own API keys when `claude` is installed.")
+                            .foregroundColor(.secondary)
+                    }
+                    .font(.caption)
+                    .fixedSize(horizontal: false, vertical: true)
                 }
             }
         }
@@ -1990,6 +1997,23 @@ struct CLIProvidersSettingsView: View {
 
                 Divider()
                 codexRuntimeSelectionControl
+                Divider()
+                VStack(alignment: .leading, spacing: 4) {
+                    Picker("Context window", selection: Binding(
+                        get: { codexContextWindowSelection },
+                        set: { selection in
+                            codexContextWindowSelection = selection
+                            CodexContextWindowPreferences.setSelection(selection)
+                        }
+                    )) {
+                        ForEach(CodexContextWindowPreferences.Selection.allCases, id: \.self) { selection in
+                            Text(selection.label).tag(selection)
+                        }
+                    }
+                    Text("Larger windows use more of your plan’s usage per turn. Applies to new sessions.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
 
                 if viewModel.isCodexConnected {
                     Divider()
@@ -2291,7 +2315,7 @@ struct CLIProvidersSettingsView: View {
                                 let request = ACPRunRequest(agentKind: .antigravity, modelString: nil, workspacePath: nil, resumeSessionID: nil, attachments: [], taskLabelKind: nil)
                                 _ = try await AntigravityACPAgentProvider().support(for: request)
                                 let discovered = await AntigravityACPModelPollingService.shared.refreshNow(workspacePath: nil)
-                                let count = AgentACPModelRegistry.shared.resolvedSnapshot(for: .antigravity)?.options.count ?? 0
+                                let count = AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: .antigravity)?.options.count ?? 0
                                 await MainActor.run {
                                     isTestingAntigravity = false
                                     alertMessage = discovered && count > 0
@@ -2716,7 +2740,7 @@ struct CLIProvidersSettingsView: View {
                         alertMessage = "Claude Code CLI is connected and ready to use!"
                         showClaudeCodeTraceDump = false
                     } else {
-                        alertMessage = "Claude Code CLI is not connected. Please run 'claude login' in your terminal."
+                        alertMessage = viewModel.claudeCodeError ?? "The Claude Code CLI connection check failed."
                         showClaudeCodeTraceDump = viewModel.hasClaudeCodeTrace()
                     }
                     showAlert = true
@@ -2724,7 +2748,7 @@ struct CLIProvidersSettingsView: View {
                 }
             } catch {
                 await MainActor.run {
-                    alertMessage = "Error connecting to Claude Code CLI: \(error.asFriendlyString())"
+                    alertMessage = viewModel.claudeCodeError ?? "Error connecting to Claude Code CLI: \(error.asFriendlyString())"
                     showClaudeCodeTraceDump = viewModel.hasClaudeCodeTrace()
                     showAlert = true
                     isLoadingClaudeCode = false

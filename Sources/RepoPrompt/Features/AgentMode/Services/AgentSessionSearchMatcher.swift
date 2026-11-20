@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 /// Shared, pure Agent-session search primitives used by the sidebar and Cmd-K HUD.
 ///

@@ -210,6 +210,9 @@ struct UnifiedDiffAttributedStringBuilder {
 
     private func makeParagraphStyle() -> NSParagraphStyle {
         let paragraphStyle = NSMutableParagraphStyle()
+        // Anchor the line numbers and diff marker. Source tokens still use normal bidi shaping.
+        TextDirectionPolicy.apply(.dedicatedLeftToRight, to: paragraphStyle)
+        paragraphStyle.alignment = .left
         paragraphStyle.lineBreakMode = .byClipping
         paragraphStyle.lineSpacing = lineSpacing
         paragraphStyle.minimumLineHeight = ceil(font.ascender - font.descender + font.leading)

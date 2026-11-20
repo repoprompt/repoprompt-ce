@@ -1,20 +1,28 @@
 import Foundation
 
 package enum MCPDomainToolAdmissionLimits {
+    /// Correctness ordering, independent of host capacity.
     package static let exclusiveConnection = 1
-    package static let controlConnection = 8
-    package static let smallReadConnection = 2
-    package static let smallReadPerWindow = 2
+    // Outer widths bound pending calls; physical work shares HostResourceBudget.
+    // Control waits must remain independent so cancel/stop can make progress.
+    // Preserve at least the existing wait/cancel headroom on small hosts: these
+    // permits often represent suspended control calls rather than CPU work.
+    package static let controlConnection = max(8, HostResourceCapacity.baseline.total)
+    package static let smallReadConnection = HostResourceCapacity.baseline.cpu
+    package static let smallReadPerWindow = HostResourceCapacity.baseline.cpu
     package static let fileReadConnection = ContentReadConcurrencyCapacity.maximumConcurrentReads
     package static let fileReadPerWindow = ContentReadConcurrencyCapacity.maximumConcurrentReads
-    package static let gitReadConnection = 2
-    package static let fileSearchConnection = 4
+    package static let gitReadConnection = max(1, HostResourceCapacity.baseline.subprocess)
+    package static let fileSearchConnection = HostResourceCapacity.baseline.cpu
+    /// Same-repository snapshot exclusion is not a host-utilization knob.
     package static let gitReadPerRepository = 1
 }
 
 /// Protocol-neutral, cancellation-safe admission keyed by the physical state resource.
 /// Connection lanes provide client ordering; this controller bounds cross-connection work.
 package final class MCPDomainToolResourceAdmissionController: @unchecked Sendable {
+    // Preserve the existing explicit package sendability contracts.
+    // swiftformat:disable redundantSendable
     package enum AdmissionError: Error, Equatable, Sendable {
         case closed
     }
@@ -31,11 +39,13 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
         case repository(String)
     }
 
+    // swiftformat:enable redundantSendable
+
     package final class Lease: @unchecked Sendable {
         private let lock = NSLock()
         private var releaseAction: (() -> Void)?
 
-        fileprivate init(releaseAction: @escaping () -> Void) {
+        init(releaseAction: @escaping () -> Void) {
             self.releaseAction = releaseAction
         }
 
@@ -54,17 +64,54 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
         }
     }
 
-    private struct Waiter {
-        let id: UUID
-        let continuation: CheckedContinuation<Lease, Error>
+    /// Indexed FIFO so handing off the head or cancelling any queued waiter
+    /// only touches that waiter and its neighbors under the controller lock.
+    private struct WaiterQueue {
+        struct Waiter {
+            let continuation: CheckedContinuation<Lease, Error>
+            var previousID: UUID?
+            var nextID: UUID?
+        }
+
+        private(set) var waiters: [UUID: Waiter] = [:]
+        private var firstID: UUID?
+        private var lastID: UUID?
+
+        mutating func append(_ id: UUID, continuation: CheckedContinuation<Lease, Error>) {
+            if let lastID {
+                waiters[lastID]?.nextID = id
+            } else {
+                firstID = id
+            }
+            waiters[id] = Waiter(continuation: continuation, previousID: lastID)
+            lastID = id
+        }
+
+        mutating func popFirst() -> CheckedContinuation<Lease, Error>? {
+            guard let firstID else { return nil }
+            return remove(firstID)
+        }
+
+        mutating func remove(_ id: UUID) -> CheckedContinuation<Lease, Error>? {
+            guard let waiter = waiters.removeValue(forKey: id) else { return nil }
+            if let previousID = waiter.previousID {
+                waiters[previousID]?.nextID = waiter.nextID
+            } else {
+                firstID = waiter.nextID
+            }
+            if let nextID = waiter.nextID {
+                waiters[nextID]?.previousID = waiter.previousID
+            } else {
+                lastID = waiter.previousID
+            }
+            return waiter.continuation
+        }
     }
 
     package let limit: Int
     private let lock = NSLock()
     private var activeCountByResource: [Resource: Int] = [:]
-    private var waitersByResource: [Resource: [Waiter]] = [:]
-    private var resourceByWaiterID: [UUID: Resource] = [:]
-    private var cancelledWaiterIDs: Set<UUID> = []
+    private var waitersByResource: [Resource: WaiterQueue] = [:]
     private var isClosed = false
 
     package init(limit: Int) {
@@ -113,16 +160,16 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
         let lease = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 let immediateResult: Result<Lease, Error>? = lock.withLock {
-                    if cancelledWaiterIDs.remove(waiterID) != nil || Task.isCancelled {
+                    // Cancellation before insertion is visible on the task;
+                    // after insertion the handler removes the waiter under the same lock.
+                    if Task.isCancelled {
                         return .failure(CancellationError())
                     }
                     guard !isClosed else {
                         return .failure(AdmissionError.closed)
                     }
-                    guard canAcquire(resource), waitersByResource[resource]?.isEmpty != false else {
-                        let waiter = Waiter(id: waiterID, continuation: continuation)
-                        waitersByResource[resource, default: []].append(waiter)
-                        resourceByWaiterID[waiterID] = resource
+                    guard canAcquire(resource), waitersByResource[resource] == nil else {
+                        waitersByResource[resource, default: WaiterQueue()].append(waiterID, continuation: continuation)
                         return nil
                     }
                     activate(resource)
@@ -133,14 +180,13 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
                 }
             }
         } onCancel: {
-            self.cancelWaiter(waiterID)
+            self.cancelWaiter(waiterID, for: resource)
         }
 
         do {
             try Task.checkCancellation()
             return lease
         } catch {
-            _ = lock.withLock { cancelledWaiterIDs.remove(waiterID) }
             lease.release()
             throw error
         }
@@ -151,14 +197,14 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
     }
 
     package func waiterCount(for resource: Resource) -> Int {
-        lock.withLock { waitersByResource[resource]?.count ?? 0 }
+        lock.withLock { waitersByResource[resource]?.waiters.count ?? 0 }
     }
 
     package func snapshot() -> Snapshot {
         lock.withLock {
             Snapshot(
                 activeLeaseCount: activeCountByResource.values.reduce(0, +),
-                waiterCount: resourceByWaiterID.count,
+                waiterCount: waitersByResource.values.reduce(0) { $0 + $1.waiters.count },
                 isClosed: isClosed
             )
         }
@@ -166,19 +212,21 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
 
     @discardableResult
     package func close() -> Int {
-        let waiters: [Waiter] = lock.withLock {
-            guard !isClosed else { return [] }
+        let queues: [Resource: WaiterQueue] = lock.withLock {
+            guard !isClosed else { return [:] }
             isClosed = true
-            let waiters = waitersByResource.values.flatMap(\.self)
-            waitersByResource.removeAll()
-            resourceByWaiterID.removeAll()
-            cancelledWaiterIDs.removeAll()
-            return waiters
+            let queues = waitersByResource
+            waitersByResource = [:]
+            return queues
         }
-        for waiter in waiters {
-            waiter.continuation.resume(throwing: AdmissionError.closed)
+        var cancelledCount = 0
+        for queue in queues.values {
+            for waiter in queue.waiters.values {
+                waiter.continuation.resume(throwing: AdmissionError.closed)
+                cancelledCount += 1
+            }
         }
-        return waiters.count
+        return cancelledCount
     }
 
     private func canAcquire(_ resource: Resource) -> Bool {
@@ -205,16 +253,10 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
             }
 
             var handoffs: [(CheckedContinuation<Lease, Error>, Lease)] = []
-            while !isClosed, canAcquire(resource), var waiters = waitersByResource[resource], !waiters.isEmpty {
-                let next = waiters.removeFirst()
-                resourceByWaiterID.removeValue(forKey: next.id)
-                if waiters.isEmpty {
-                    waitersByResource.removeValue(forKey: resource)
-                } else {
-                    waitersByResource[resource] = waiters
-                }
+            while !isClosed, canAcquire(resource), let next = waitersByResource[resource]?.popFirst() {
+                removeEmptyWaiterQueue(for: resource)
                 activate(resource)
-                handoffs.append((next.continuation, makeLease(for: resource)))
+                handoffs.append((next, makeLease(for: resource)))
             }
             return handoffs
         }
@@ -223,26 +265,18 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
         }
     }
 
-    private func cancelWaiter(_ waiterID: UUID) {
-        let continuation: CheckedContinuation<Lease, Error>? = lock.withLock {
-            guard let resource = resourceByWaiterID.removeValue(forKey: waiterID),
-                  var waiters = waitersByResource[resource],
-                  let index = waiters.firstIndex(where: { $0.id == waiterID })
-            else {
-                if !isClosed {
-                    cancelledWaiterIDs.insert(waiterID)
-                }
-                return nil
-            }
-
-            let waiter = waiters.remove(at: index)
-            if waiters.isEmpty {
-                waitersByResource.removeValue(forKey: resource)
-            } else {
-                waitersByResource[resource] = waiters
-            }
-            return waiter.continuation
+    private func cancelWaiter(_ waiterID: UUID, for resource: Resource) {
+        let continuation = lock.withLock {
+            let removed = waitersByResource[resource]?.remove(waiterID)
+            removeEmptyWaiterQueue(for: resource)
+            return removed
         }
         continuation?.resume(throwing: CancellationError())
+    }
+
+    private func removeEmptyWaiterQueue(for resource: Resource) {
+        if waitersByResource[resource]?.waiters.isEmpty == true {
+            waitersByResource.removeValue(forKey: resource)
+        }
     }
 }

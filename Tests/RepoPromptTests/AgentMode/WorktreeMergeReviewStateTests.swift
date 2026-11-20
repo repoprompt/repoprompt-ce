@@ -4,6 +4,161 @@ import RepoPromptWorkspaceCore
 import XCTest
 
 final class WorktreeMergeReviewStateTests: XCTestCase {
+    private enum FenceRefusal: Error { case refused }
+
+    private actor FenceCounter {
+        private(set) var calls = 0
+        func called() {
+            calls += 1
+        }
+    }
+
+    func testPhysicalApplyFenceRefusesWithoutEffectsAndRunsOnlyBeforeFirstMutation() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: #function)
+        let repo = try fixture.makeRepository(named: "main", files: ["base.txt": "base\n"])
+        let linked = fixture.sandbox.appendingPathComponent("linked")
+        try fixture.runGit(["worktree", "add", "-b", "source", linked.path], at: repo)
+        try fixture.write("source\n", to: "source.txt", at: linked)
+        try fixture.stage("source.txt", at: linked)
+        try fixture.commit("Source change", at: linked)
+        let service = GitService()
+        let descriptors = try await service.listWorktrees(at: repo)
+        let source = try GitWorktreeMergeEndpoint(descriptor: XCTUnwrap(descriptors.first { !$0.isMain }))
+        let target = try GitWorktreeMergeEndpoint(descriptor: XCTUnwrap(descriptors.first { $0.isMain }))
+        do {
+            _ = try await service.applyAndCommitWorktreeMerge(
+                sourceEndpoint: source, targetEndpoint: target, sourceHead: source.head,
+                message: "Merge", beforeCommit: { throw FenceRefusal.refused }
+            )
+            XCTFail("Refused final fence must not dispatch Git merge")
+        } catch FenceRefusal.refused {}
+        let refusedState = try await service.inspectMergeState(at: repo)
+        XCTAssertFalse(refusedState.inProgress)
+        XCTAssertEqual(try fixture.runGit(["rev-parse", "HEAD"], at: repo).trimmingCharacters(in: .whitespacesAndNewlines), target.head)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: repo.appendingPathComponent("source.txt").path))
+
+        let counter = FenceCounter()
+        let applied = try await service.applyAndCommitWorktreeMerge(
+            sourceEndpoint: source, targetEndpoint: target, sourceHead: source.head,
+            message: "Merge", beforeCommit: { await counter.called() }
+        )
+        XCTAssertNotNil(applied.commit)
+        let calls = await counter.calls
+        XCTAssertEqual(calls, 1, "The commit following an admitted merge must not repeat its first-effect fence")
+        XCTAssertEqual(try fixture.runGit(["rev-list", "--parents", "-n", "1", "HEAD"], at: repo).split(whereSeparator: \.isWhitespace).count, 3)
+    }
+
+    func testPhysicalContinueFenceRetainsMergeUntilAdmitted() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: #function)
+        let (repo, service, source, target) = try await makeConflictedPhysicalMerge(fixture)
+        try fixture.write("resolved\n", to: "conflict.txt", at: repo)
+        try fixture.stage("conflict.txt", at: repo)
+        do {
+            _ = try await VCSService.shared.continueGitWorktreeMerge(
+                .init(source: source, target: target, sourceHead: source.head, targetHeadBefore: target.head, commitMessage: "Resolve"),
+                beforeCommit: { throw FenceRefusal.refused }
+            )
+            XCTFail("Refused continue must leave the merge in progress")
+        } catch FenceRefusal.refused {}
+        let refusedState = try await service.inspectMergeState(at: repo)
+        XCTAssertTrue(refusedState.inProgress)
+        XCTAssertEqual(try fixture.runGit(["rev-parse", "HEAD"], at: repo).trimmingCharacters(in: .whitespacesAndNewlines), target.head)
+        let counter = FenceCounter()
+        _ = try await service.continueWorktreeMerge(
+            sourceEndpoint: source, targetEndpoint: target, message: "Resolve",
+            beforeCommit: { await counter.called() }
+        )
+        let calls = await counter.calls
+        XCTAssertEqual(calls, 1)
+        let completedState = try await service.inspectMergeState(at: repo)
+        XCTAssertFalse(completedState.inProgress)
+    }
+
+    func testPhysicalAbortFenceRetainsMergeUntilAdmitted() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: #function)
+        let (repo, service, _, target) = try await makeConflictedPhysicalMerge(fixture)
+        do {
+            _ = try await service.abortWorktreeMerge(targetEndpoint: target, beforeCommit: { throw FenceRefusal.refused })
+            XCTFail("Refused abort must leave the merge in progress")
+        } catch FenceRefusal.refused {}
+        let refusedState = try await service.inspectMergeState(at: repo)
+        XCTAssertTrue(refusedState.inProgress)
+        let counter = FenceCounter()
+        let aborted = try await service.abortWorktreeMerge(targetEndpoint: target, beforeCommit: { await counter.called() })
+        XCTAssertTrue(aborted)
+        let calls = await counter.calls
+        XCTAssertEqual(calls, 1)
+        let completedState = try await service.inspectMergeState(at: repo)
+        XCTAssertFalse(completedState.inProgress)
+        XCTAssertEqual(try fixture.runGit(["rev-parse", "HEAD"], at: repo).trimmingCharacters(in: .whitespacesAndNewlines), target.head)
+    }
+
+    func testPreviewArtifactFenceRejectsBeforeAnyWritesAndAdmitsCompleteArtifacts() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: #function)
+        let repo = try fixture.makeRepository(named: "main", files: ["base.txt": "base\n"])
+        let linked = fixture.sandbox.appendingPathComponent("linked")
+        try fixture.runGit(["worktree", "add", "-b", "source", linked.path], at: repo)
+        try fixture.write("source\n", to: "source.txt", at: linked)
+        try fixture.stage("source.txt", at: linked)
+        try fixture.commit("Source change", at: linked)
+        let descriptors = try await GitService().listWorktrees(at: repo)
+        let source = try GitWorktreeMergeEndpoint(descriptor: XCTUnwrap(descriptors.first { !$0.isMain }))
+        let target = try GitWorktreeMergeEndpoint(descriptor: XCTUnwrap(descriptors.first { $0.isMain }))
+        let storage = fixture.sandbox.appendingPathComponent("artifacts")
+        let request = GitWorktreeMergePreviewRequest(source: source, target: target, workspaceDirectory: storage, publishArtifacts: true)
+        do {
+            _ = try await VCSService.shared.previewGitWorktreeMerge(request, beforeWrite: { throw FenceRefusal.refused })
+            XCTFail("The final artifact fence must precede snapshot and current-pointer writes")
+        } catch FenceRefusal.refused {}
+        XCTAssertFalse(FileManager.default.fileExists(atPath: storage.path))
+        let counter = FenceCounter()
+        let preview = try await VCSService.shared.previewGitWorktreeMerge(request, beforeWrite: { await counter.called() })
+        let artifacts = try XCTUnwrap(preview.artifacts)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: artifacts.manifestPath))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: artifacts.sidecarPath))
+        let calls = await counter.calls
+        XCTAssertEqual(calls, 1)
+
+        let unavailableStorage = fixture.sandbox.appendingPathComponent("storage-is-file")
+        try Data("not a directory".utf8).write(to: unavailableStorage)
+        let failingRequest = GitWorktreeMergePreviewRequest(
+            source: source, target: target, workspaceDirectory: unavailableStorage, publishArtifacts: true
+        )
+        do {
+            _ = try await VCSService.shared.previewGitWorktreeMerge(failingRequest, beforeWrite: { await counter.called() })
+            XCTFail("A post-admission artifact failure must retain its directory receipt")
+        } catch let partial as GitDiffSnapshotPublisher.PartialPublication {
+            XCTAssertTrue(partial.snapshotDirectory.path.hasPrefix(unavailableStorage.path + "/"))
+            XCTAssertFalse(partial.snapshotWriteCompleted)
+            XCTAssertFalse(partial.currentPointerWriteCompleted)
+        }
+        let admittedAttempts = await counter.calls
+        XCTAssertEqual(admittedAttempts, 2)
+    }
+
+    private func makeConflictedPhysicalMerge(
+        _ fixture: ReviewGitRepositoryFixture
+    ) async throws -> (URL, GitService, GitWorktreeMergeEndpoint, GitWorktreeMergeEndpoint) {
+        let repo = try fixture.makeRepository(named: "main", files: ["conflict.txt": "base\n"])
+        let linked = fixture.sandbox.appendingPathComponent("linked")
+        try fixture.runGit(["worktree", "add", "-b", "source", linked.path], at: repo)
+        try fixture.write("source\n", to: "conflict.txt", at: linked)
+        try fixture.stage("conflict.txt", at: linked)
+        try fixture.commit("Source change", at: linked)
+        try fixture.write("target\n", to: "conflict.txt", at: repo)
+        try fixture.stage("conflict.txt", at: repo)
+        try fixture.commit("Target change", at: repo)
+        let service = GitService()
+        let descriptors = try await service.listWorktrees(at: repo)
+        let source = try GitWorktreeMergeEndpoint(descriptor: XCTUnwrap(descriptors.first { !$0.isMain }))
+        let target = try GitWorktreeMergeEndpoint(descriptor: XCTUnwrap(descriptors.first { $0.isMain }))
+        let applied = try await service.applyAndCommitWorktreeMerge(
+            sourceEndpoint: source, targetEndpoint: target, sourceHead: source.head, message: "Merge"
+        )
+        XCTAssertEqual(applied.state.conflictFiles, ["conflict.txt"])
+        return (repo, service, source, target)
+    }
+
     func testSourceBindingResolutionRequiresRepoRootWhenMultipleBindingsExist() throws {
         let first = makeBinding(logicalRootName: "App", logicalRootPath: "/repo/app", worktreeID: "wt_app")
         let second = makeBinding(logicalRootName: "Lib", logicalRootPath: "/repo/lib", worktreeID: "wt_lib")
@@ -242,6 +397,237 @@ final class WorktreeMergeReviewStateTests: XCTestCase {
         XCTAssertEqual(conflicted.conflictFiles, ["a.txt", "b.txt"])
         XCTAssertNil(conflicted.completedAt)
         XCTAssertEqual(conflicted.activeSummary?.conflictFileCount, 2)
+    }
+
+    @MainActor
+    func testRuntimeReviewResponsesAndReplacementOwnExactlyOneWait() async throws {
+        let fixture = try reviewRuntimeFixture()
+        let session = fixture.session
+        let runtime = fixture.runtime
+        var publications = 0
+        let installed = expectation(description: "first review installed")
+        let attachment = fixture.scope.presentation.attach(session, sink: .init(
+            activityChanged: { _, _ in }, refresh: { _, _, _ in }, turnComplete: { _ in }, turnFailed: { _, _ in },
+            binding: { session in
+                publications += 1
+                if session.pendingWorktreeMergeReview?.operationID == "first" {
+                    XCTAssertNotNil(session.worktreeMergeReviewWait, "Wait must precede publication")
+                    installed.fulfill()
+                }
+            }
+        ))
+        defer { fixture.scope.presentation.detach(attachment)
+            session.saveDebounceTask?.cancel()
+        }
+        let preview = makePreview(operationID: "first")
+        let first = Task { try await runtime.requestWorktreeMergeReview(command: fixture.command, preview: preview, timeoutSeconds: 0) }
+        await fulfillment(of: [installed], timeout: 3)
+        let firstID = try XCTUnwrap(session.pendingWorktreeMergeReview?.id)
+        XCTAssertNil(session.worktreeMergeReviewWait?.timeoutTask)
+        XCTAssertEqual(session.saveRequestGeneration, 1)
+        XCTAssertFalse(runtime.submitWorktreeMergeReviewDecision(command: fixture.command, reviewID: UUID(), decision: .accept))
+        XCTAssertFalse(runtime.submitWorktreeMergeReviewDecision(command: fixture.command, reviewID: firstID, decision: .timeout))
+        let foreign = AgentSessionRuntimeStore().makeScope().interactions(routeID: 43, approvalStore: ApplyEditsApprovalStore())
+        XCTAssertFalse(foreign.submitWorktreeMergeReviewDecision(command: fixture.command, reviewID: firstID, decision: .accept))
+
+        let replacementInstalled = expectation(description: "replacement review installed")
+        fixture.scope.presentation.detach(attachment)
+        let secondAttachment = fixture.scope.presentation.attach(session, sink: .init(
+            activityChanged: { _, _ in }, refresh: { _, _, _ in }, turnComplete: { _ in }, turnFailed: { _, _ in },
+            binding: { session in
+                publications += 1
+                if session.pendingWorktreeMergeReview?.operationID == "second" { replacementInstalled.fulfill() }
+            }
+        ))
+        defer { fixture.scope.presentation.detach(secondAttachment) }
+        let nextPreview = makePreview(operationID: "second")
+        let second = Task { try await runtime.requestWorktreeMergeReview(command: fixture.command, preview: nextPreview, timeoutSeconds: 0) }
+        await fulfillment(of: [replacementInstalled], timeout: 3)
+        let replaced = try await first.value
+        XCTAssertEqual(replaced, .cancelled(reason: "Replaced by newer worktree merge review"))
+        XCTAssertEqual(session.worktreeMergeOperations.first(where: { $0.id == "first" })?.status, .cancelled)
+        let secondID = try XCTUnwrap(session.pendingWorktreeMergeReview?.id)
+        let before = publications
+        runtime.expireWorktreeMergeReview(session: session, reviewID: firstID)
+        XCTAssertEqual(publications, before)
+        XCTAssertEqual(session.worktreeMergeReviewWait?.reviewID, secondID)
+        XCTAssertEqual(session.saveRequestGeneration, 3, "Install, exact replacement cleanup, next install")
+        XCTAssertTrue(runtime.submitWorktreeMergeReviewDecision(command: fixture.command, reviewID: secondID, decision: .accept))
+        XCTAssertFalse(runtime.submitWorktreeMergeReviewDecision(command: fixture.command, reviewID: secondID, decision: .accept))
+        let accepted = try await second.value
+        XCTAssertEqual(accepted, .accept)
+        XCTAssertNil(session.worktreeMergeReviewWait)
+        XCTAssertNil(session.pendingWorktreeMergeReview)
+        XCTAssertEqual(session.saveRequestGeneration, 3, "Accept alone does not persist an unchanged operation")
+        XCTAssertEqual(session.worktreeMergeOperations.first(where: { $0.id == "second" })?.status, .awaitingApproval)
+    }
+
+    @MainActor
+    func testRuntimeReviewCleanupSettlesOriginWithoutWritingLostOrReacquiredClaims() async throws {
+        for drift in ["none", "detached", "reacquired", "rebound", "conflicting"] {
+            let fixture = try reviewRuntimeFixture()
+            let session = fixture.session
+            // This case verifies resuming an existing run after its last blocker settles.
+            // Standalone idle admin reviews must instead return to their captured idle state.
+            session.runState = .running
+            let runtime = fixture.runtime
+            let installed = expectation(description: "review installed before \(drift)")
+            var publications = 0
+            let attachment = fixture.scope.presentation.attach(session, sink: .init(
+                activityChanged: { _, _ in }, refresh: { _, _, _ in }, turnComplete: { _ in }, turnFailed: { _, _ in },
+                binding: { session in
+                    publications += 1
+                    if session.pendingWorktreeMergeReview != nil { installed.fulfill() }
+                }
+            ))
+            defer { fixture.scope.presentation.detach(attachment)
+                session.saveDebounceTask?.cancel()
+            }
+            let preview = makePreview(operationID: "cleanup-\(drift)")
+            let task = Task { try await runtime.requestWorktreeMergeReview(command: fixture.command, preview: preview, timeoutSeconds: 0) }
+            await fulfillment(of: [installed], timeout: 3)
+            let reviewID = try XCTUnwrap(session.pendingWorktreeMergeReview?.id)
+            let other = fixture.store.makeScope()
+            switch drift {
+            case "detached": fixture.scope.replaceSessions([:])
+            case "reacquired":
+                fixture.scope.replaceSessions([:])
+                fixture.scope.replaceSessions([session.tabID: session])
+                let fresh = try reviewCommand(scope: fixture.scope, session: session)
+                XCTAssertNotEqual(fresh.identity, fixture.command.identity)
+                XCTAssertFalse(runtime.submitWorktreeMergeReviewDecision(command: fresh, reviewID: reviewID, decision: .accept))
+                XCTAssertThrowsError(try runtime.applyPendingInteractionResolution(
+                    .worktreeMerge(reviewID: reviewID, decision: .accept), command: fresh
+                ))
+            case "rebound":
+                session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: UUID(), workspaceID: fixture.command.identity.workspaceID))
+                session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            case "conflicting":
+                let copy = AgentTabSession(tabID: UUID())
+                other.replaceSessions([copy.tabID: copy])
+                copy.installPersistentSessionBinding(.init(tabID: copy.tabID, sessionID: fixture.command.identity.sessionID, workspaceID: fixture.command.identity.workspaceID))
+                guard case .conflicting = fixture.scope.resolveWriter(sessionID: fixture.command.identity.sessionID) else {
+                    return XCTFail("Fixture must install the raw conflicting claim")
+                }
+            default: break
+            }
+            let before = publications
+            let generation = session.saveRequestGeneration
+            let state = session.runState
+            session.isDirty = false
+            if drift != "none" {
+                XCTAssertFalse(runtime.submitWorktreeMergeReviewDecision(command: fixture.command, reviewID: reviewID, decision: .accept))
+                do {
+                    _ = try await runtime.requestWorktreeMergeReview(command: fixture.command, preview: preview, timeoutSeconds: 0.01)
+                    XCTFail("Stale admission must not replace the original wait")
+                } catch {}
+                XCTAssertEqual(session.worktreeMergeReviewWait?.reviewID, reviewID)
+            }
+            runtime.expireWorktreeMergeReview(session: session, reviewID: reviewID)
+            let result = try await task.value
+            XCTAssertEqual(result, .timeout)
+            XCTAssertNil(session.worktreeMergeReviewWait)
+            XCTAssertNil(session.pendingWorktreeMergeReview)
+            XCTAssertEqual(publications, before + (drift == "none" ? 1 : 0))
+            XCTAssertEqual(session.saveRequestGeneration, generation + (drift == "none" ? 1 : 0))
+            XCTAssertEqual(session.isDirty, drift == "none")
+            XCTAssertEqual(session.worktreeMergeOperations.first?.status, drift == "none" ? .cancelled : .awaitingApproval)
+            if drift == "rebound" {
+                XCTAssertEqual(session.runState, state, "Old cleanup must not reconcile a rebound binding")
+            } else {
+                XCTAssertEqual(session.runState, .running, "Removing the original run's last blocker must not leave it waiting")
+            }
+            runtime.cancelPendingWorktreeMergeReview(for: session, reason: "late hook")
+            XCTAssertEqual(session.saveRequestGeneration, generation + (drift == "none" ? 1 : 0))
+        }
+    }
+
+    @MainActor
+    func testReviewTimeoutAfterDetachCannotSettleReplacementOnSameTab() async throws {
+        let fixture = try reviewRuntimeFixture()
+        let original = fixture.session
+        let runtime = fixture.runtime
+        let installed = expectation(description: "original timer armed")
+        let attachment = fixture.scope.presentation.attach(original, sink: .init(
+            activityChanged: { _, _ in }, refresh: { _, _, _ in }, turnComplete: { _ in }, turnFailed: { _, _ in },
+            binding: { session in
+                if session.pendingWorktreeMergeReview != nil {
+                    XCTAssertNotNil(session.worktreeMergeReviewWait?.timeoutTask)
+                    fixture.scope.replaceSessions([:])
+                    installed.fulfill()
+                }
+            }
+        ))
+        defer { fixture.scope.presentation.detach(attachment)
+            original.saveDebounceTask?.cancel()
+        }
+        let preview = makePreview(operationID: "detached-timer")
+        let first = Task { try await runtime.requestWorktreeMergeReview(command: fixture.command, preview: preview, timeoutSeconds: 60) }
+        await fulfillment(of: [installed], timeout: 3)
+        let replacement = AgentTabSession(tabID: original.tabID)
+        replacement.installPersistentSessionBinding(.init(tabID: replacement.tabID, sessionID: UUID(), workspaceID: fixture.command.identity.workspaceID))
+        replacement.recordRestorationAuthoritative(.persistedPayloadApplied)
+        fixture.scope.replaceSessions([replacement.tabID: replacement])
+        let command = try reviewCommand(scope: fixture.scope, session: replacement)
+        let nextInstalled = expectation(description: "replacement waiting")
+        let nextAttachment = fixture.scope.presentation.attach(replacement, sink: .init(
+            activityChanged: { _, _ in }, refresh: { _, _, _ in }, turnComplete: { _ in }, turnFailed: { _, _ in },
+            binding: { session in if session.pendingWorktreeMergeReview != nil { nextInstalled.fulfill() } }
+        ))
+        defer { fixture.scope.presentation.detach(nextAttachment)
+            replacement.saveDebounceTask?.cancel()
+        }
+        let nextPreview = makePreview(operationID: "successor")
+        let next = Task { try await runtime.requestWorktreeMergeReview(command: command, preview: nextPreview, timeoutSeconds: 0) }
+        await fulfillment(of: [nextInstalled], timeout: 3)
+        let replacementID = try XCTUnwrap(replacement.pendingWorktreeMergeReview?.id)
+        try runtime.expireWorktreeMergeReview(session: original, reviewID: XCTUnwrap(original.worktreeMergeReviewWait?.reviewID))
+        let timedOut = try await first.value
+        XCTAssertEqual(timedOut, .timeout)
+        XCTAssertNil(original.worktreeMergeReviewWait)
+        XCTAssertEqual(original.worktreeMergeOperations.first?.status, .awaitingApproval)
+        XCTAssertEqual(original.saveRequestGeneration, 0, "Synchronous detachment during publication must fence even the initial save")
+        runtime.cancelPendingWorktreeMergeReview(for: original, reason: "late original hook")
+        XCTAssertEqual(replacement.worktreeMergeReviewWait?.reviewID, replacementID)
+        XCTAssertEqual(replacement.worktreeMergeOperations.first?.status, .awaitingApproval)
+        XCTAssertEqual(replacement.saveRequestGeneration, 1)
+        runtime.cancelPendingWorktreeMergeReview(for: replacement, reason: "Run cancelled")
+        let cancelled = try await next.value
+        XCTAssertEqual(cancelled, .cancelled(reason: "Run cancelled"))
+        XCTAssertEqual(replacement.worktreeMergeOperations.first?.status, .cancelled)
+        XCTAssertEqual(replacement.saveRequestGeneration, 2)
+        fixture.scope.presentation.detach(nextAttachment)
+        // Exercise the actual scheduled timer in addition to the deterministic old/new wait race.
+        let scheduled = try await runtime.requestWorktreeMergeReview(command: command, preview: nextPreview, timeoutSeconds: 0.001)
+        XCTAssertEqual(scheduled, .timeout)
+        XCTAssertNil(replacement.worktreeMergeReviewWait)
+    }
+
+    @MainActor
+    private func reviewRuntimeFixture() throws -> (
+        store: AgentSessionRuntimeStore, scope: AgentSessionRuntimeStore.Scope, session: AgentTabSession,
+        runtime: AgentSessionInteractionRuntime, command: AgentSessionRuntimeStore.Command
+    ) {
+        let store = AgentSessionRuntimeStore()
+        let scope = store.makeScope()
+        let session = AgentTabSession(tabID: UUID())
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: UUID(), workspaceID: UUID()))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        scope.replaceSessions([session.tabID: session])
+        scope.persistence.composition = .init(
+            workspace: { nil }, workspaceWithID: { _ in nil }, displayName: { _ in "Review runtime" },
+            isSuppressed: { false }, bypassesSuppression: { false }, isPreparedSavedHost: { true },
+            saveAdmission: { _ in nil }, creationIsCurrent: { _ in false }, admitBinding: { _ in nil }
+        )
+        return try (store, scope, session, scope.interactions(routeID: 42, approvalStore: ApplyEditsApprovalStore()), reviewCommand(scope: scope, session: session))
+    }
+
+    @MainActor
+    private func reviewCommand(scope: AgentSessionRuntimeStore.Scope, session: AgentTabSession) throws -> AgentSessionRuntimeStore.Command {
+        guard case let .unique(writer) = try scope.resolveWriter(sessionID: XCTUnwrap(session.activeAgentSessionID)), writer.session === session else {
+            throw NSError(domain: "Expected exact worktree review writer", code: 1)
+        }
+        return try writer.admitCommand().get()
     }
 
     private let tabID = UUID(uuidString: "00000000-0000-0000-0000-000000000301")!

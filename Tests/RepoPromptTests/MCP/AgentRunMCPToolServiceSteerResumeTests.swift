@@ -1,6 +1,11 @@
+import Combine
 import Foundation
 import MCP
+import RepoPromptAIContracts
+import RepoPromptDomainRuntime
+@testable import RepoPromptMCPServer
 import RepoPromptSettingsCore
+import RepoPromptWorkspaceContext
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
@@ -30,20 +35,76 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         XCTAssertTrue(session.items.isEmpty, "Approval must not interrupt the active turn")
         var deliveredText: String?
         let resumed = Task { @MainActor in
-            let response = try await withCheckedThrowingContinuation { session.instructionContinuation = $0 }
+            let response = try await withCheckedThrowingContinuation { continuation in
+                // Match awaitNextInstruction: install the wait identity before publishing the
+                // continuation/readiness, never rotate it while delivery is being prepared.
+
+                installInstructionWaitForTest(session: session, runtime: viewModel.linkExecutionRuntime, continuation: continuation)
+                session.runState = .waitingForUser
+            }
             deliveredText = response.text
         }
-        try await AsyncTestWait.waitUntil("decision instruction continuation") {
-            await MainActor.run { session.instructionContinuation != nil }
-        }
-        session.instructionWaitID = UUID()
-        session.runState = .waitingForUser
         try await AsyncTestWait.waitUntil("scope decision delivered") {
             await MainActor.run { deliveredText != nil }
         }
         try await resumed.value
         XCTAssertTrue(deliveredText?.contains("RepoPrompt delegation decision: granted") == true)
-        XCTAssertEqual(viewModel.retrieveDraftText(for: session.tabID), "Keep my draft")
+        XCTAssertEqual(viewModel.draftRuntime.text(for: session.tabID), "Keep my draft")
+        XCTAssertNil(session.mcpControlContext)
+    }
+
+    func testScopeDecisionResumesOnRuntimeTerminalSettlementWithoutUIChange() async throws {
+        let window = try await makeWindow()
+        let viewModel = window.agentModeViewModel
+        let sessionID = UUID()
+        let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
+        session.isMCPOriginated = false
+        session.selectedAgent = .codexExec
+        session.installRunID(UUID())
+        _ = session.beginRunAttempt(source: "scope-decision-terminal-settlement")
+        XCTAssertTrue(session.runLifecycle.beginTerminalCommit())
+        viewModel.storeDraftText(for: session.tabID, "Keep my draft")
+        var deliveredText: String?
+        let resumed = Task { @MainActor in
+            let response = try await withCheckedThrowingContinuation { continuation in
+                installInstructionWaitForTest(session: session, runtime: viewModel.linkExecutionRuntime, continuation: continuation)
+                session.runState = .waitingForUser
+            }
+            deliveredText = response.text
+        }
+        defer {
+            session.instructionContinuation?.resume(throwing: CancellationError())
+            session.instructionWait = nil
+            resumed.cancel()
+        }
+        try await AsyncTestWait.waitUntil("exact instruction waiter installed") { session.instructionContinuation != nil }
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, windows: { [window] }, notifyCatalogChanged: { _ in })
+        defer { withExtendedLifetime(runtime) {} }
+        runtime.test_suppressDecisionDelivery = false
+        let refusedDuringPublication = expectation(description: "decision waits for terminal publication")
+        refusedDuringPublication.assertForOverFulfill = false
+        runtime.test_decisionDeliveryAttempted = { result in
+            if result == .retry { refusedDuringPublication.fulfill() }
+        }
+        let request = try runtime.requestScope(
+            requesterSessionID: sessionID, requesterTabID: session.tabID,
+            kind: .tree(rootSessionID: sessionID), capabilities: [.observe],
+            guardrails: .init(), reason: nil, idempotencyKey: nil
+        ).get()
+        _ = try runtime.approve(requestID: request.id).get()
+        await fulfillment(of: [refusedDuringPublication], timeout: 3)
+        runtime.test_decisionDeliveryAttempted = nil
+        XCTAssertNil(deliveredText)
+        XCTAssertEqual(runtime.test_pendingDecisionCount, 1)
+        var uiChanges = 0
+        let observation = session.objectWillChange.sink { uiChanges += 1 }
+        session.runLifecycle.completeTerminalCommit()
+        XCTAssertEqual(uiChanges, 0, "Lifecycle settlement is not a presentation publication")
+        observation.cancel()
+        try await AsyncTestWait.waitUntil("settlement releases the queued decision") { deliveredText != nil }
+        try await resumed.value
+        XCTAssertTrue(deliveredText?.contains("RepoPrompt delegation decision: granted") == true)
+        XCTAssertEqual(viewModel.draftRuntime.text(for: session.tabID), "Keep my draft")
         XCTAssertNil(session.mcpControlContext)
     }
 
@@ -138,11 +199,15 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         session.selectedAgent = .codexExec
         session.installRunID(UUID())
         _ = session.beginRunAttempt(source: "resident-steer-fixture")
-        session.runState = .waitingForUser
-        session.instructionWaitID = UUID()
+
         viewModel.storeDraftText(for: session.tabID, "local draft")
         let resumed = Task { @MainActor in
-            try await withCheckedThrowingContinuation { session.instructionContinuation = $0 }
+            try await withCheckedThrowingContinuation {
+                installInstructionWaitForTest(session: session, runtime: viewModel.linkExecutionRuntime, continuation: $0)
+                // Match the production producer: publish waiting only after its continuation exists.
+                // Approval reconciliation must never observe a manufactured wait with no owner.
+                session.runState = .waitingForUser
+            }
         }
         try await AsyncTestWait.waitUntil("instruction continuation") {
             await MainActor.run { session.instructionContinuation != nil }
@@ -150,8 +215,8 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         let createdLaneTab = await window.promptManager.createBackgroundComposeTab(strategy: .blank)
         let laneTab = try XCTUnwrap(createdLaneTab)
         let lane = try await makeWorkspaceOwnedSession(in: window, sessionID: UUID(), tabID: laneTab.id)
-        let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: session.tabID))
-        let laneEndpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: lane.tabID))
+        let endpoint = try XCTUnwrap(viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: session.tabID))
+        let laneEndpoint = try XCTUnwrap(viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: lane.tabID))
         let bridge = AgentSessionLinkRuntimeBridge.shared
         guard case .added = await bridge.addMonitorLink(observerEndpoint: endpoint, targetEndpoint: laneEndpoint) else {
             return XCTFail("real oversight grant was not admitted")
@@ -175,7 +240,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         XCTAssertTrue(response.text?.contains(frame) == true)
         XCTAssertEqual(session.items.last { $0.kind == .user }?.text, frame)
         XCTAssertNil(session.items.last { $0.kind == .user }?.crossSessionAttribution)
-        XCTAssertEqual(viewModel.retrieveDraftText(for: session.tabID), "local draft")
+        XCTAssertEqual(viewModel.draftRuntime.text(for: session.tabID), "local draft")
         XCTAssertNil(session.mcpControlContext)
         XCTAssertFalse(session.isMCPOriginated)
         XCTAssertNil(value.objectValue?["overseer"], "rich state is poll-only")
@@ -192,6 +257,119 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         XCTAssertNil(session.mcpControlContext)
         let registered = await AgentRunSessionStore.hasActiveRegistration(sessionID: sessionID)
         XCTAssertFalse(registered)
+    }
+
+    func testPendingWorkspaceAdoptionRefusesSteerWithoutEffectsAndRetrySucceeds() async throws {
+        let adoption = ResidentSteerGate()
+        let completed = ResidentSteerGate()
+        defer { adoption.release() }
+        let window = try await makeWindow(
+            beforeAdoption: { await adoption.wait() },
+            afterAdoption: { completed.release() },
+            waitsForAdoption: false
+        )
+        let vm = window.agentModeViewModel
+        try await AsyncTestWait.waitUntil("destination adoption held") { adoption.isWaiting }
+        let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        let tabID = try XCTUnwrap(workspace.activeComposeTabID)
+        let sessionID = UUID()
+        let cold = vm.session(for: tabID)
+        _ = try XCTUnwrap(vm.test_installPersistentSessionBinding(
+            sessionID: sessionID, on: cold, compareAndSetInWorkspaceID: workspace.id
+        ))
+        cold.hasLoadedPersistedState = false
+        let session = await vm.ensureSessionReady(tabID: tabID)
+        XCTAssertTrue(session === cold)
+        XCTAssertFalse(session.hasLoadedPersistedState, "Readiness must not hydrate a payload the queued adoption will discard")
+        // Even an already restored payload cannot override the scope's lifecycle fence. Retain the
+        // proof, rather than clearing it or altering binding/run identity to manufacture a refusal.
+        session.hasLoadedPersistedState = true
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        session.markCurrentBindingHydrated()
+        XCTAssertTrue(session.qualifiedRestorationReadiness.isAuthoritative)
+        guard !session.permitsBoundOperationAndSave else {
+            XCTFail("A pending destructive adoption must never return a ready session")
+            adoption.release()
+            await completed.wait()
+            return
+        }
+        let admittedSave = try AgentSessionSaveCommitToken(
+            tabID: tabID, sessionIdentity: ObjectIdentifier(session), workspaceID: workspace.id,
+            workspaceDirectoryPath: "/unused/adoption-readiness",
+            binding: XCTUnwrap(session.persistentSessionBindingIdentity),
+            bindingTransitionGeneration: session.bindingTransitionGeneration,
+            sourceItemsRevision: session.sourceItemsRevision,
+            persistenceMutationGeneration: session.persistenceMutationGeneration,
+            saveRequestGeneration: session.saveRequestGeneration
+        )
+        XCTAssertTrue(admittedSave.matches(session), "Transient admission refusal must not invalidate originating persistence")
+        XCTAssertTrue(
+            vm.agentSessionLinkEligibilityInput(for: session, tabID: tabID).hasLoadedPersistedState,
+            "Transient admission refusal must not revoke durable link eligibility"
+        )
+        let originalItems = session.items
+        let originalTranscript = session.transcript
+        let originalRunID = session.runID
+        vm.storeDraftText(for: tabID, "untouched local draft")
+        let service = makeService(window: window)
+        do {
+            _ = try await service.execute(args: [
+                "op": .string("steer"), "session_id": .string(sessionID.uuidString),
+                "message": .string("retry after adoption"), "wait": .bool(false)
+            ])
+            XCTFail("Pending adoption must refuse before submitting input")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains(AgentModeViewModel.mcpResidentBusyError), "\(error)")
+        }
+        XCTAssertEqual(vm.linkExecutionRuntime.agentSessionLinkSteerAdmission(for: session, liveness: .init(
+            observerEndpointIsLive: true, targetEndpointIsLive: true, targetWindowIsClosing: false
+        )), .blocked(.targetLoading))
+        do {
+            _ = try await makeManageService(window: window).execute(args: [
+                "op": .string("resume_session"), "session_id": .string(sessionID.uuidString)
+            ])
+            XCTFail("Pending adoption must also refuse control activation")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains(AgentTabSession.loadingAdmissionFailureMessage), "\(error)")
+        }
+        XCTAssertTrue(vm.sessions[tabID] === session, "Refusal must not discard or replace the target")
+        XCTAssertEqual(session.items, originalItems)
+        XCTAssertEqual(session.transcript, originalTranscript)
+        XCTAssertEqual(session.runID, originalRunID)
+        XCTAssertNil(session.instructionContinuation)
+        XCTAssertNil(session.mcpControlContext)
+        XCTAssertEqual(vm.draftRuntime.text(for: tabID), "untouched local draft")
+        XCTAssertFalse(session.stopState.isStopping(binding: session.persistentSessionBindingIdentity))
+
+        adoption.release()
+        await completed.wait()
+        XCTAssertFalse(vm.isAwaitingWorkspaceAdoption)
+        let ready = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID, tabID: tabID)
+        XCTAssertTrue(ready.permitsBoundOperationAndSave)
+        ready.selectedAgent = .codexExec
+        ready.installRunID(UUID())
+        _ = ready.beginRunAttempt(source: "post-adoption-resident-steer")
+        vm.storeDraftText(for: tabID, "retry local draft")
+        let waiting = Task { @MainActor in
+            try await withCheckedThrowingContinuation {
+                installInstructionWaitForTest(session: ready, runtime: vm.linkExecutionRuntime, continuation: $0)
+                ready.runState = .waitingForUser
+            }
+        }
+        defer {
+            AgentSessionInteractionRuntime.cancelPendingInstruction(for: ready)
+            waiting.cancel()
+        }
+        try await AsyncTestWait.waitUntil("post-adoption instruction installed") { ready.instructionContinuation != nil }
+        let value = try await service.execute(args: [
+            "op": .string("steer"), "session_id": .string(sessionID.uuidString),
+            "message": .string("retry after adoption"), "wait": .bool(false)
+        ])
+        let response = try await waiting.value
+        XCTAssertEqual(value.objectValue?["_meta"]?.objectValue?["delivery"], .string("delivered_waiting_continuation"))
+        XCTAssertTrue(response.text?.contains(AgentModeViewModel.mcpResidentTaskFrame("retry after adoption")) == true)
+        XCTAssertEqual(vm.draftRuntime.text(for: tabID), "retry local draft")
+        XCTAssertNil(ready.mcpControlContext)
     }
 
     func testResidentMessageAndWaitRefusesBeforeSubmission() async throws {
@@ -329,7 +507,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         var service = makeService(window: window)
         service.testDispatchSteerInstruction = { dispatchedSessionID, _, _, agentModeVM in
             providerDispatchCount += 1
-            let session = try XCTUnwrap(agentModeVM.mcpControlledSession(sessionID: dispatchedSessionID))
+            let session = try XCTUnwrap(agentModeVM.mcpRuntime.controlledWriter(sessionID: dispatchedSessionID)?.session)
             XCTAssertTrue(session.qualifiedRestorationReadiness.isAuthoritative)
             XCTAssertTrue(session.items.contains { $0.kind == .assistant && $0.text == "saved response" })
             session.runState = .running
@@ -377,7 +555,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
 
         var service = makeService(window: window)
         service.testDispatchSteerInstruction = { _, _, _, agentModeVM in
-            let controlledSession = try XCTUnwrap(agentModeVM.mcpControlledSession(sessionID: sessionID))
+            let controlledSession = try XCTUnwrap(agentModeVM.mcpRuntime.controlledWriter(sessionID: sessionID)?.session)
             XCTAssertIdentical(controlledSession, session)
             XCTAssertTrue(controlledSession.mcpFollowUpRunPending)
             throw MCPError.internalError("synthetic steer dispatch failure")
@@ -414,7 +592,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         var replacementRegistration: AgentRunSessionStore.Registration?
         var service = makeService(window: window)
         service.testDispatchSteerInstruction = { _, _, _, agentModeVM in
-            let controlledSession = try XCTUnwrap(agentModeVM.mcpControlledSession(sessionID: sessionID))
+            let controlledSession = try XCTUnwrap(agentModeVM.mcpRuntime.controlledWriter(sessionID: sessionID)?.session)
             XCTAssertIdentical(controlledSession, session)
             let originalContext = try XCTUnwrap(controlledSession.mcpControlContext)
             XCTAssertTrue(controlledSession.mcpFollowUpRunPending)
@@ -483,7 +661,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
             XCTAssertTrue(String(describing: error).contains("was not found"), String(describing: error))
         }
 
-        XCTAssertNil(viewModel.mcpControlledSession(sessionID: unknownSessionID))
+        XCTAssertNil(viewModel.mcpRuntime.controlledWriter(sessionID: unknownSessionID)?.session)
         let hasActiveRegistration = await AgentRunSessionStore.hasActiveRegistration(sessionID: unknownSessionID)
         XCTAssertFalse(hasActiveRegistration)
     }
@@ -592,7 +770,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         XCTAssertTrue(session.claudeSupersedingProtectedTurnIDs.isEmpty)
         XCTAssertEqual(session.composerSubmissionToken, composerToken)
         XCTAssertFalse(session.isComposerSubmissionInFlight)
-        XCTAssertEqual(viewModel.retrieveDraftText(for: session.tabID), "local draft")
+        XCTAssertEqual(viewModel.draftRuntime.text(for: session.tabID), "local draft")
         XCTAssertTrue(viewModel.interviewFirst)
         XCTAssertEqual(session.mcpControlActivationGeneration, controlGeneration)
         XCTAssertNil(session.mcpControlContext)
@@ -741,6 +919,644 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         XCTAssertFalse(session.isMCPOriginated)
     }
 
+    func testCancellationIsInstalledBeforeControlVisibilityAndPendingCancellationRefusesPublication() async throws {
+        let window = try await makeWindow()
+        let viewModel = window.agentModeViewModel
+        let sessionID = UUID()
+        let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
+        var observedRegistration = false
+        viewModel.test_afterMCPControlRegistration = { _ in
+            observedRegistration = true
+            XCTAssertNil(session.mcpControlContext, "The registration boundary precedes observer visibility")
+            guard let registration = await AgentRunSessionStore.currentRegistration(for: sessionID) else {
+                return XCTFail("Expected pending registration")
+            }
+            let cancelled = await AgentRunSessionStore.shared.test_invokeCancellationHandler(registration: registration)
+            XCTAssertTrue(cancelled, "Cancellation must already be owned by the domain store")
+            XCTAssertNil(session.mcpControlContext)
+        }
+        defer { viewModel.test_afterMCPControlRegistration = nil }
+        do {
+            _ = try await viewModel.mcpActivateControlContext(
+                forTabID: session.tabID, sessionID: sessionID,
+                originatingConnectionID: nil, startPending: true
+            )
+            XCTFail("A cancelled pending activation cannot publish control")
+        } catch { XCTAssertTrue(error is MCPError) }
+        XCTAssertTrue(observedRegistration)
+        XCTAssertNil(session.mcpControlContext)
+        XCTAssertFalse(session.mcpFollowUpRunPending)
+        XCTAssertFalse(session.isMCPOriginated)
+        let remaining = await AgentRunSessionStore.currentRegistration(for: sessionID)
+        XCTAssertNil(remaining)
+    }
+
+    func testApprovalOverrideReceiptRejectsLateApplyAndDoesNotOverwriteNewerChoices() async {
+        let store = ApplyEditsApprovalStore()
+        let address = ApplyEditsApprovalScope(windowID: 1, tabID: UUID())
+        await store.setAutoEditEnabled(false, for: address, updateGlobalDefault: false)
+        let cancelled = await store.prepareAutoEditOverride(for: address)
+        await store.releaseAutoEditOverride(cancelled)
+        let cancelledApplied = await store.applyAutoEditOverride(cancelled)
+        XCTAssertFalse(cancelledApplied, "Cancellation before actor apply must invalidate the pending request")
+
+        let first = await store.prepareAutoEditOverride(for: address)
+        let firstApplied = await store.applyAutoEditOverride(first)
+        XCTAssertTrue(firstApplied)
+        let successor = await store.prepareAutoEditOverride(for: address)
+        let successorApplied = await store.applyAutoEditOverride(successor)
+        XCTAssertTrue(successorApplied)
+        await store.releaseAutoEditOverride(first)
+        let successorValue = await store.autoEditEnabled(for: address)
+        XCTAssertTrue(successorValue, "An old restore cannot overwrite the successor's override")
+        await store.setAutoEditEnabled(true, for: address, updateGlobalDefault: false)
+        await store.releaseAutoEditOverride(successor)
+        let manualValue = await store.autoEditEnabled(for: address)
+        XCTAssertTrue(manualValue, "Even a same-value ordinary write supersedes the override")
+
+        await store.setAutoEditEnabled(false, for: address, updateGlobalDefault: false)
+        let predecessor = await store.prepareAutoEditOverride(for: address)
+        let predecessorApplied = await store.applyAutoEditOverride(predecessor)
+        XCTAssertTrue(predecessorApplied)
+        let pending = await store.prepareAutoEditOverride(for: address)
+        await store.releaseAutoEditOverride(predecessor)
+        let pendingApplied = await store.applyAutoEditOverride(pending)
+        XCTAssertFalse(pendingApplied, "A release between prepare and apply refuses rather than retrying on new state")
+
+        let removed = await store.prepareAutoEditOverride(for: address)
+        await store.cleanupScope(address)
+        await store.setAutoEditEnabled(false, for: address, updateGlobalDefault: false)
+        let removedApplied = await store.applyAutoEditOverride(removed)
+        XCTAssertFalse(removedApplied, "Reusing a cleaned-up address must not recreate the old resource revision")
+        await store.releaseAutoEditOverride(removed)
+        let finalValue = await store.autoEditEnabled(for: address)
+        XCTAssertFalse(finalValue)
+        await store.cleanupScope(address)
+    }
+
+    func testControlOverridePreparationJoinsAdmittedReadinessSeed() async throws {
+        let window = try await makeWindow()
+        let viewModel = window.agentModeViewModel
+        let session = try await makeWorkspaceOwnedSession(in: window, sessionID: UUID())
+        let command = try XCTUnwrap(try viewModel.runtimeCommand(sessionID: XCTUnwrap(session.activeAgentSessionID)))
+        let scope = command.writer.scope
+        let interactions = try XCTUnwrap(scope.installedInteractions)
+        let runtime = scope.mcp
+        let approvals = viewModel.applyEditsApprovalStore
+        let address = viewModel.applyEditsScope(for: session.tabID)
+        session.autoEditEnabled = true
+        interactions.adoptReadyApprovalPayload(for: session)
+        await interactions.drainPendingEffects(for: session)
+        let originalValue = await approvals.autoEditEnabled(for: address)
+        XCTAssertTrue(originalValue)
+
+        let seedGate = TestReleaseFence(name: "readiness seed")
+        addTeardownBlock { @MainActor in
+            seedGate.release()
+            interactions.test_beforeApprovalSyncCommit = nil
+            interactions.test_onApprovalEffectEnqueued = nil
+            runtime.test_afterMCPControlSetupAwait = nil
+            await approvals.test_setAutoEditOverridePreparedHook(nil)
+            await interactions.drainPendingEffects(for: session)
+        }
+        interactions.test_beforeApprovalSyncCommit = { await seedGate.enterAndWait() }
+        session.autoEditEnabled = false
+        session.isDirty = false
+        interactions.adoptReadyApprovalPayload(for: session)
+        guard await seedGate.waitUntilEntered(timeout: 3) else { return }
+        let begin = try XCTUnwrap(session.applyEditsApprovalSubscriptionTask)
+        var trigger: String?
+        interactions.test_onApprovalEffectEnqueued = { candidate in
+            guard candidate === session else { return }
+            if trigger == nil { trigger = "queued" }
+            seedGate.release()
+        }
+        await approvals.test_setAutoEditOverridePreparedHook { candidate in
+            guard candidate == address else { return }
+            Task { @MainActor in
+                if trigger == nil { trigger = "store" }
+                seedGate.release()
+            }
+        }
+        // Old direct preparation opens the gate from the store, then must wait for the
+        // seed before apply. Ordered preparation opens it when queued behind that seed.
+        // Thus both implementations settle, but only the ordered one captures its revision.
+        runtime.test_afterMCPControlSetupAwait = { _ in await begin.value }
+        let resources = AgentSessionMCPRuntime.ControlActivationResources(
+            approvalStore: approvals, approvalScope: address,
+            providerBindings: viewModel.providerBindingService, perfRecorder: viewModel.perfRecorder
+        )
+        let finished = expectation(description: "Activation settled after readiness seed")
+        let task = Task { @MainActor () -> Result<AgentMCPControlContext, Error> in
+            defer { finished.fulfill() }
+            do {
+                return try await .success(runtime.activateControlContext(
+                    command: command, activationID: UUID(), originatingConnectionID: nil,
+                    taskLabelKind: nil, startPending: false, markSessionAsMCPOriginated: true,
+                    requireInactiveRunState: true, resources: resources, revalidateAdmission: { _ in }
+                ))
+            } catch { return .failure(error) }
+        }
+        addTeardownBlock { @MainActor in
+            seedGate.release()
+            task.cancel()
+            _ = await task.value
+            interactions.test_beforeApprovalSyncCommit = nil
+            interactions.test_onApprovalEffectEnqueued = nil
+            runtime.test_afterMCPControlSetupAwait = nil
+            await approvals.test_setAutoEditOverridePreparedHook(nil)
+            if let context = session.mcpControlContext {
+                _ = await runtime.deactivateControlContext(
+                    session: session, expectedContext: context, approvalStore: approvals, cleanupRegistration: true
+                )
+            }
+        }
+        await fulfillment(of: [finished], timeout: 5)
+        let context: AgentMCPControlContext
+        switch await task.value {
+        case let .success(value): context = value
+        case let .failure(error): return XCTFail("Readiness seed must settle before override preparation: \(error)")
+        }
+        XCTAssertEqual(trigger, "queued")
+        XCTAssertFalse(context.autoEditEnabledBeforeOverride)
+        let controlledValue = await approvals.autoEditEnabled(for: address)
+        XCTAssertTrue(controlledValue)
+        _ = await runtime.deactivateControlContext(
+            session: session, expectedContext: context, approvalStore: approvals, cleanupRegistration: true
+        )
+        let restoredValue = await approvals.autoEditEnabled(for: address)
+        XCTAssertFalse(restoredValue)
+        try await AsyncTestWait.waitUntil("underlying approval preference restored") {
+            await MainActor.run { !session.autoEditEnabled }
+        }
+    }
+
+    func testQueuedControlOverridePreparationRefusesReacquiredWriter() async throws {
+        let window = try await makeWindow()
+        let viewModel = window.agentModeViewModel
+        let sessionID = UUID()
+        let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
+        let command = try XCTUnwrap(viewModel.runtimeCommand(sessionID: sessionID))
+        let scope = command.writer.scope
+        let interactions = try XCTUnwrap(scope.installedInteractions)
+        let runtime = scope.mcp
+        let approvals = viewModel.applyEditsApprovalStore
+        let address = viewModel.applyEditsScope(for: session.tabID)
+        let originalValue = await approvals.autoEditEnabled(for: address)
+        let seedGate = TestReleaseFence(name: "readiness seed before writer reacquisition")
+        addTeardownBlock { @MainActor in
+            seedGate.release()
+            interactions.test_beforeApprovalSyncCommit = nil
+            interactions.test_onApprovalEffectEnqueued = nil
+            await approvals.test_setAutoEditOverridePreparedHook(nil)
+            await interactions.drainPendingEffects(for: session)
+        }
+        var reacquireAfterRelease = false
+        var reacquired = false
+        interactions.test_beforeApprovalSyncCommit = {
+            await seedGate.enterAndWait()
+            guard reacquireAfterRelease else { return }
+            // Invalidate while the predecessor resumes, not synchronously at enqueue.
+            // Only revalidation after joining that predecessor can catch this change.
+            reacquired = true
+            let sessions = scope.sessions
+            scope.replaceSessions(sessions.filter { $0.key != session.tabID })
+            scope.replaceSessions(sessions)
+            XCTAssertFalse(command.isCurrent)
+        }
+        interactions.adoptReadyApprovalPayload(for: session)
+        guard await seedGate.waitUntilEntered(timeout: 3) else { return }
+        interactions.test_onApprovalEffectEnqueued = { candidate in
+            guard candidate === session else { return }
+            reacquireAfterRelease = true
+            seedGate.release()
+        }
+        await approvals.test_setAutoEditOverridePreparedHook { candidate in
+            if candidate == address { XCTFail("The stale queued command must not prepare an override") }
+        }
+        let resources = AgentSessionMCPRuntime.ControlActivationResources(
+            approvalStore: approvals, approvalScope: address,
+            providerBindings: viewModel.providerBindingService, perfRecorder: viewModel.perfRecorder
+        )
+        let finished = expectation(description: "Reacquired writer refused before override preparation")
+        let task = Task { @MainActor in
+            defer { finished.fulfill() }
+            do {
+                _ = try await runtime.activateControlContext(
+                    command: command, activationID: UUID(), originatingConnectionID: nil,
+                    taskLabelKind: nil, startPending: false, markSessionAsMCPOriginated: true,
+                    requireInactiveRunState: true, resources: resources, revalidateAdmission: { _ in }
+                )
+                XCTFail("Activation must not transfer to the reacquired writer")
+            } catch let MCPError.invalidParams(message) {
+                XCTAssertEqual(message, "The requested agent session writer changed during MCP control activation.")
+            } catch { XCTFail("Unexpected refusal: \(error)") }
+        }
+        addTeardownBlock { @MainActor in
+            seedGate.release()
+            task.cancel()
+            await task.value
+        }
+        await fulfillment(of: [finished], timeout: 5)
+        await task.value
+        XCTAssertTrue(reacquired)
+        XCTAssertNil(session.mcpControlContext)
+        let registration = await AgentRunSessionStore.currentRegistration(for: sessionID)
+        XCTAssertNil(registration)
+        let value = await approvals.autoEditEnabled(for: address)
+        XCTAssertEqual(value, originalValue)
+    }
+
+    func testRuntimeControlDetachCannotRestoreOverSuccessorActivation() async throws {
+        let window = try await makeWindow()
+        let viewModel = window.agentModeViewModel
+        let sessionID = UUID()
+        let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
+        let command = try XCTUnwrap(viewModel.runtimeCommand(sessionID: sessionID))
+        let runtime = command.writer.scope.mcp
+        let approvals = viewModel.applyEditsApprovalStore
+        let address = viewModel.applyEditsScope(for: session.tabID)
+        try await AsyncTestWait.waitUntil("approval subscription ready") {
+            await MainActor.run { session.applyEditsApprovalSubscriptionID != nil }
+        }
+        await approvals.setAutoEditEnabled(false, for: address, updateGlobalDefault: false)
+        try await AsyncTestWait.waitUntil("initial approval disabled") {
+            await MainActor.run { !session.autoEditEnabled }
+        }
+        let resources = AgentSessionMCPRuntime.ControlActivationResources(
+            approvalStore: approvals, approvalScope: address,
+            providerBindings: viewModel.providerBindingService, perfRecorder: viewModel.perfRecorder
+        )
+        let original = try await runtime.activateControlContext(
+            command: command, activationID: UUID(), originatingConnectionID: nil,
+            taskLabelKind: nil, startPending: true, markSessionAsMCPOriginated: true,
+            requireInactiveRunState: true, resources: resources, revalidateAdmission: { _ in }
+        )
+        let scope = command.writer.scope
+        let originalSessions = scope.sessions
+        let copy = scope.makeSession(tabID: UUID())
+        copy.mcpControlContext = original
+        scope.replaceSessions(originalSessions.merging([copy.tabID: copy]) { _, new in new })
+        let detachedCopy = await runtime.deactivateControlContext(
+            session: copy, expectedContext: original, approvalStore: approvals, cleanupRegistration: true
+        )
+        XCTAssertFalse(detachedCopy, "The existing ambiguity veto must protect the shared registration and approval receipt")
+        XCTAssertEqual(session.mcpControlContext, original)
+        let retainedRegistration = await AgentRunSessionStore.currentRegistration(for: sessionID)
+        XCTAssertEqual(retainedRegistration, original.registration)
+        let retainedApproval = await approvals.autoEditEnabled(for: address)
+        XCTAssertTrue(retainedApproval)
+        scope.replaceSessions(originalSessions)
+        XCTAssertTrue(command.isCurrent)
+        var successor: AgentMCPControlContext?
+        runtime.test_afterMCPControlDetached = { exact in
+            XCTAssertTrue(exact === session)
+            XCTAssertNil(session.mcpControlContext)
+            XCTAssertFalse(viewModel.mcpControlledTabIDs.contains(session.tabID))
+            XCTAssertFalse(session.autoEditEnabled)
+            do {
+                successor = try await runtime.activateControlContext(
+                    command: command, activationID: UUID(), originatingConnectionID: nil,
+                    taskLabelKind: nil, startPending: true, markSessionAsMCPOriginated: true,
+                    requireInactiveRunState: true, resources: resources, revalidateAdmission: { _ in }
+                )
+            } catch { XCTFail("Successor activation failed: \(error)") }
+        }
+        defer { runtime.test_afterMCPControlDetached = nil }
+        let remainedDetached = await runtime.deactivateControlContext(
+            session: session, expectedContext: original, approvalStore: approvals, cleanupRegistration: true
+        )
+        runtime.test_afterMCPControlDetached = nil
+        let replacement = try XCTUnwrap(successor)
+        XCTAssertFalse(remainedDetached)
+        XCTAssertNotEqual(replacement.registration, original.registration)
+        XCTAssertEqual(session.mcpControlContext, replacement)
+        XCTAssertTrue(session.mcpFollowUpRunPending)
+        XCTAssertTrue(viewModel.mcpControlledTabIDs.contains(session.tabID))
+        let current = await AgentRunSessionStore.currentRegistration(for: sessionID)
+        XCTAssertEqual(current, replacement.registration)
+        let value = await approvals.autoEditEnabled(for: address)
+        XCTAssertTrue(value, "Old approval restore must not overwrite the new activation")
+        await runtime.deactivateControlContext(
+            session: session, expectedContext: replacement, approvalStore: approvals, cleanupRegistration: true
+        )
+        let restored = await approvals.autoEditEnabled(for: address)
+        XCTAssertFalse(restored)
+    }
+
+    func testSupersedingApprovalWriteSurvivesControlRollbackAndDeactivation() async throws {
+        for beforeApply in [true, false] {
+            let window = try await makeWindow()
+            let viewModel = window.agentModeViewModel
+            let sessionID = UUID()
+            let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
+            let command = try XCTUnwrap(viewModel.runtimeCommand(sessionID: sessionID))
+            let runtime = command.writer.scope.mcp
+            let approvals = viewModel.applyEditsApprovalStore
+            let address = viewModel.applyEditsScope(for: session.tabID)
+            try await AsyncTestWait.waitUntil("approval subscription ready") {
+                await MainActor.run { session.applyEditsApprovalSubscriptionID != nil }
+            }
+            await approvals.setAutoEditEnabled(false, for: address, updateGlobalDefault: false)
+            try await AsyncTestWait.waitUntil("initial disabled value projected") {
+                await MainActor.run { !session.autoEditEnabled }
+            }
+            var setupCount = 0
+            runtime.test_afterMCPControlSetupAwait = { _ in
+                setupCount += 1
+                if beforeApply, setupCount == 1 {
+                    await approvals.setAutoEditEnabled(true, for: address, updateGlobalDefault: false)
+                }
+            }
+            defer { runtime.test_afterMCPControlSetupAwait = nil }
+            do {
+                _ = try await runtime.activateControlContext(
+                    command: command, activationID: UUID(), originatingConnectionID: nil,
+                    taskLabelKind: nil, startPending: true, markSessionAsMCPOriginated: true,
+                    requireInactiveRunState: true,
+                    resources: .init(
+                        approvalStore: approvals, approvalScope: address,
+                        providerBindings: viewModel.providerBindingService, perfRecorder: viewModel.perfRecorder
+                    ), revalidateAdmission: { _ in }
+                )
+                XCTAssertFalse(beforeApply)
+                // A same-value ordinary write is still a newer choice, not owned by control.
+                await approvals.setAutoEditEnabled(true, for: address, updateGlobalDefault: false)
+                await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+            } catch {
+                XCTAssertTrue(beforeApply)
+                XCTAssertTrue(String(describing: error).contains("approval configuration changed"))
+            }
+            runtime.test_afterMCPControlSetupAwait = nil
+            XCTAssertNil(session.mcpControlContext)
+            let value = await approvals.autoEditEnabled(for: address)
+            XCTAssertTrue(value)
+            try await AsyncTestWait.waitUntil("superseding approval choice reprojected after release") {
+                await MainActor.run { session.autoEditEnabled }
+            }
+            XCTAssertTrue(session.autoEditEnabled)
+            let registration = await AgentRunSessionStore.currentRegistration(for: sessionID)
+            XCTAssertNil(registration)
+        }
+    }
+
+    func testRuntimeControlActivationOwnsPermissionsAndRollbackWithoutPresentation() async throws {
+        for (detachPresentation, revokeAfterApproval) in [(true, false), (true, true), (false, false), (false, true)] {
+            let window = try await makeWindow()
+            let viewModel = window.agentModeViewModel
+            let sessionID = UUID()
+            let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
+            let command = try XCTUnwrap(viewModel.runtimeCommand(sessionID: sessionID))
+            let runtime = command.writer.scope.mcp
+            let presentation = command.writer.scope.presentation
+            if detachPresentation {
+                // Replace the VM sink, then detach its exact token: activation has no UI recipient.
+                let attachment = presentation.attach(session, sink: .init(
+                    activityChanged: { _, _ in }, refresh: { _, _, _ in },
+                    turnComplete: { _ in }, turnFailed: { _, _ in }
+                ))
+                presentation.detach(attachment)
+            }
+            let approvals = viewModel.applyEditsApprovalStore
+            let approvalScope = viewModel.applyEditsScope(for: session.tabID)
+            // Use the installed resource, not an unrelated actor whose initial subscription
+            // snapshot could race this test's manually assigned session value.
+            try await AsyncTestWait.waitUntil("approval-store subscription initialized") {
+                await MainActor.run { session.applyEditsApprovalSubscriptionID != nil }
+            }
+            await approvals.setAutoEditEnabled(false, for: approvalScope, updateGlobalDefault: false)
+            try await AsyncTestWait.waitUntil("approval-store disabled state projected") {
+                await MainActor.run { !session.autoEditEnabled }
+            }
+            let priorOrigin = session.isMCPOriginated
+            let priorProfile = session.permissionProfile
+            var setupBoundaries = 0
+            var revoked = false
+            runtime.test_afterMCPControlSetupAwait = { _ in
+                setupBoundaries += 1
+                XCTAssertFalse(viewModel.mcpControlledTabIDs.contains(session.tabID), "Provisional setup is not a completed UI projection")
+                if setupBoundaries == 2 {
+                    let approval = await approvals.autoEditEnabled(for: approvalScope)
+                    XCTAssertTrue(approval, "The actual approval actor must have accepted the override")
+                    XCTAssertTrue(session.autoEditEnabled)
+                    revoked = revokeAfterApproval
+                }
+            }
+            defer { runtime.test_afterMCPControlSetupAwait = nil }
+            do {
+                let context = try await runtime.activateControlContext(
+                    command: command, activationID: UUID(), originatingConnectionID: nil,
+                    taskLabelKind: nil, startPending: true, markSessionAsMCPOriginated: true,
+                    requireInactiveRunState: true,
+                    resources: .init(
+                        approvalStore: approvals,
+                        approvalScope: approvalScope,
+                        providerBindings: viewModel.providerBindingService,
+                        perfRecorder: viewModel.perfRecorder
+                    ),
+                    revalidateAdmission: { ownership in
+                        if revoked { throw MCPError.invalidParams("Consent revoked after approval") }
+                        if case let .installed(context, generation) = ownership {
+                            XCTAssertEqual(session.mcpControlContext, context)
+                            XCTAssertEqual(session.mcpControlActivationGeneration, generation)
+                        }
+                    }
+                )
+                XCTAssertFalse(revokeAfterApproval)
+                XCTAssertEqual(session.mcpControlContext, context)
+                XCTAssertTrue(session.mcpFollowUpRunPending)
+                XCTAssertTrue(session.isMCPOriginated)
+                XCTAssertEqual(session.permissionProfile, viewModel.providerBindingService.permissionProfileForMCPActivation(
+                    isSubagent: true, provider: session.selectedAgent.providerBindingID
+                ))
+            } catch {
+                XCTAssertTrue(revokeAfterApproval)
+                XCTAssertTrue(String(describing: error).contains("Consent revoked after approval"))
+            }
+            XCTAssertEqual(setupBoundaries, 2)
+            XCTAssertTrue(command.isCurrent)
+            XCTAssertEqual(
+                viewModel.mcpControlledTabIDs.contains(session.tabID),
+                !detachPresentation && !revokeAfterApproval,
+                "Only an attached presentation projects completed control; rollback removes its projection"
+            )
+            let approval = await approvals.autoEditEnabled(for: approvalScope)
+            XCTAssertEqual(approval, !revokeAfterApproval)
+            if revokeAfterApproval {
+                XCTAssertNil(session.mcpControlContext)
+                XCTAssertFalse(session.mcpFollowUpRunPending)
+                XCTAssertEqual(session.isMCPOriginated, priorOrigin)
+                XCTAssertEqual(session.permissionProfile, priorProfile)
+                try await AsyncTestWait.waitUntil("approval-store rollback projected") {
+                    await MainActor.run { !session.autoEditEnabled }
+                }
+                XCTAssertFalse(session.autoEditEnabled)
+                let registration = await AgentRunSessionStore.currentRegistration(for: sessionID)
+                XCTAssertNil(registration)
+            }
+            runtime.test_afterMCPControlSetupAwait = nil
+            await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+        }
+    }
+
+    func testControlActivationCannotPublishOrRollBackAcrossWriterReacquisition() async throws {
+        for afterInstallation in [false, true] {
+            let window = try await makeWindow()
+            let viewModel = window.agentModeViewModel
+            let sessionID = UUID()
+            let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
+            let command = try XCTUnwrap(viewModel.runtimeCommand(sessionID: sessionID))
+            let scope = command.writer.scope
+            let binding = session.currentRestorationBindingToken
+            var reachedBoundary = false
+            var installed: AgentMCPControlContext?
+            @MainActor func reacquire() {
+                reachedBoundary = true
+                installed = session.mcpControlContext
+                let sessions = scope.sessions
+                scope.replaceSessions(sessions.filter { $0.key != session.tabID })
+                scope.replaceSessions(sessions)
+                XCTAssertEqual(session.currentRestorationBindingToken, binding)
+                XCTAssertFalse(command.isCurrent)
+                session.waitingPrompt = "Successor instruction"
+                session.mcpFollowUpRunPending = false
+            }
+            if afterInstallation {
+                viewModel.test_afterMCPControlSetupAwait = { _ in reacquire() }
+            } else {
+                viewModel.test_afterMCPControlRegistration = { _ in reacquire() }
+            }
+            do {
+                _ = try await viewModel.mcpActivateControlContext(
+                    forTabID: session.tabID, sessionID: sessionID, originatingConnectionID: nil, startPending: true
+                )
+                XCTFail("An admitted activation must not adopt a reacquired writer")
+            } catch { XCTAssertTrue(error is MCPError) }
+            viewModel.test_afterMCPControlRegistration = nil
+            viewModel.test_afterMCPControlSetupAwait = nil
+            XCTAssertTrue(reachedBoundary)
+            XCTAssertNil(session.mcpControlContext, "An unchanged provisional activation must not survive its failed installation")
+            XCTAssertFalse(session.mcpFollowUpRunPending, "Preserve the successor's changed pending value")
+            XCTAssertEqual(session.waitingPrompt, "Successor instruction")
+            let registration = await AgentRunSessionStore.currentRegistration(for: sessionID)
+            XCTAssertNil(registration, "The failed attempt's registration must not survive with an obsolete cancellation receipt")
+            if afterInstallation { XCTAssertNotNil(installed) } else { XCTAssertNil(installed) }
+            XCTAssertFalse(session.isMCPOriginated, "The uncommitted activation cannot finish permission/origin setup")
+            await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+        }
+    }
+
+    func testFailedActivationUnwindsExactReceiptButPreservesProgressedInstallation() async throws {
+        for drift in ["removed", "rebound", "copiedSlot", "recoveredRegistration", "successorActivation"] {
+            let window = try await makeWindow()
+            let viewModel = window.agentModeViewModel
+            let sessionID = UUID()
+            let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
+            let command = try XCTUnwrap(viewModel.runtimeCommand(sessionID: sessionID))
+            let scope = command.writer.scope
+            let runtime = scope.mcp
+            try await AsyncTestWait.waitUntil("approval subscription initialized before rollback witness") {
+                await MainActor.run { session.applyEditsApprovalSubscriptionID != nil }
+            }
+            // An isolated approval namespace lets this test witness the actual resource receipt
+            // without an unrelated UI subscription projecting its own store over the local object.
+            let approvals = ApplyEditsApprovalStore()
+            let address = viewModel.applyEditsScope(for: session.tabID)
+            await approvals.setAutoEditEnabled(false, for: address, updateGlobalDefault: false)
+            session.autoEditEnabled = false
+            let priorOrigin = session.isMCPOriginated
+            let priorProfile = session.permissionProfile
+            let resources = AgentSessionMCPRuntime.ControlActivationResources(
+                approvalStore: approvals, approvalScope: address,
+                providerBindings: viewModel.providerBindingService, perfRecorder: viewModel.perfRecorder
+            )
+            var setupCount = 0
+            var provisional: AgentMCPControlContext?
+            var replacement: AgentTabSession?
+            runtime.test_afterMCPControlSetupAwait = { current in
+                setupCount += 1
+                guard setupCount == 2, let context = current.mcpControlContext else { return }
+                provisional = context
+                let applied = await approvals.autoEditEnabled(for: address)
+                XCTAssertTrue(applied)
+                switch drift {
+                case "removed":
+                    scope.replaceSessions(scope.sessions.filter { $0.key != session.tabID })
+                case "rebound":
+                    current.beginPersistentBindingTransition()
+                    current.installPersistentSessionBinding(context.writerIdentity.restoration.bindingIdentity)
+                    XCTAssertNotEqual(current.currentRestorationBindingToken, context.writerIdentity.restoration)
+                    current.autoEditEnabled = true
+                    current.waitingPrompt = "Rebound payload"
+                case "copiedSlot":
+                    let copy = AgentTabSession(tabID: current.tabID)
+                    copy.installPersistentSessionBinding(context.writerIdentity.restoration.bindingIdentity)
+                    copy.mcpControlContext = context
+                    var sessions = scope.sessions
+                    sessions[current.tabID] = copy
+                    scope.replaceSessions(sessions)
+                    replacement = copy
+                case "recoveredRegistration":
+                    let recovered = await AgentRunSessionStore.register(sessionID: sessionID)
+                    current.mcpControlContext = context.replacingRegistration(recovered)
+                default:
+                    do {
+                        _ = try await runtime.activateControlContext(
+                            command: command, activationID: UUID(), originatingConnectionID: nil,
+                            taskLabelKind: nil, startPending: true, markSessionAsMCPOriginated: true,
+                            requireInactiveRunState: true, resources: resources, revalidateAdmission: { _ in }
+                        )
+                    } catch { XCTFail("Successor activation failed: \(error)") }
+                }
+            }
+            defer { runtime.test_afterMCPControlSetupAwait = nil }
+            do {
+                _ = try await runtime.activateControlContext(
+                    command: command, activationID: UUID(), originatingConnectionID: nil,
+                    taskLabelKind: nil, startPending: true, markSessionAsMCPOriginated: true,
+                    requireInactiveRunState: true, resources: resources, revalidateAdmission: { _ in }
+                )
+                XCTFail("Changed installation must refuse publication: \(drift)")
+            } catch { XCTAssertTrue(error is MCPError) }
+            runtime.test_afterMCPControlSetupAwait = nil
+            XCTAssertEqual(setupCount, drift == "successorActivation" ? 4 : 2)
+            let original = try XCTUnwrap(provisional)
+            let retainedOverride = await approvals.autoEditEnabled(for: address)
+            let registration = await AgentRunSessionStore.currentRegistration(for: sessionID)
+            if drift == "recoveredRegistration" || drift == "successorActivation" {
+                let progressed = try XCTUnwrap(session.mcpControlContext)
+                XCTAssertNotEqual(progressed.registration, original.registration)
+                XCTAssertEqual(registration, progressed.registration)
+                XCTAssertTrue(retainedOverride, "Failed setup cannot release a progressed installation's override")
+                await runtime.deactivateControlContext(
+                    session: session, expectedContext: progressed, approvalStore: approvals, cleanupRegistration: true
+                )
+                let restored = await approvals.autoEditEnabled(for: address)
+                XCTAssertFalse(restored)
+                let released = await AgentRunSessionStore.currentRegistration(for: sessionID)
+                XCTAssertNil(released)
+            } else {
+                XCTAssertNil(session.mcpControlContext, "The original object must not retain its failed provisional receipt")
+                XCTAssertFalse(session.mcpFollowUpRunPending)
+                XCTAssertNil(registration, "A copied tab occupant is not a registration holder")
+                XCTAssertFalse(retainedOverride)
+                if drift == "copiedSlot" {
+                    XCTAssertEqual(replacement?.mcpControlContext, original)
+                    XCTAssertFalse(try XCTUnwrap(replacement).isMCPOriginated)
+                    XCTAssertEqual(replacement?.permissionProfile, .userConfigured)
+                }
+                if drift == "rebound" {
+                    XCTAssertTrue(session.autoEditEnabled, "Rollback does not directly restore predecessor payload settings; approval projection is separate")
+                    XCTAssertEqual(session.waitingPrompt, "Rebound payload")
+                } else {
+                    XCTAssertEqual(session.isMCPOriginated, priorOrigin)
+                    XCTAssertEqual(session.permissionProfile, priorProfile)
+                    XCTAssertFalse(session.autoEditEnabled)
+                }
+            }
+        }
+    }
+
     func testLateRealGrantRefusesInstallationAndSurvivesEligibilityAudit() async throws {
         let window = try await makeWindow()
         let viewModel = window.agentModeViewModel
@@ -749,8 +1565,8 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         let createdLaneTab = await window.promptManager.createBackgroundComposeTab(strategy: .blank)
         let laneTab = try XCTUnwrap(createdLaneTab)
         let lane = try await makeWorkspaceOwnedSession(in: window, sessionID: UUID(), tabID: laneTab.id)
-        let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: session.tabID))
-        let laneEndpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: lane.tabID))
+        let endpoint = try XCTUnwrap(viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: session.tabID))
+        let laneEndpoint = try XCTUnwrap(viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: lane.tabID))
         let bridge = AgentSessionLinkRuntimeBridge.shared
         viewModel.test_afterMCPControlRegistration = { _ in
             guard case .added = await bridge.addMonitorLink(observerEndpoint: endpoint, targetEndpoint: laneEndpoint) else {
@@ -777,13 +1593,13 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         let viewModel = window.agentModeViewModel
         let sessionID = UUID()
         let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
-        let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: session.tabID))
-        let hold = viewModel.agentSessionLinkWithholdPromptInventory(for: endpoint)
+        let endpoint = try XCTUnwrap(viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: session.tabID))
+        let hold = viewModel.linkExecutionRuntime.agentSessionLinkWithholdPromptInventory(for: endpoint)
         do {
             _ = try await viewModel.mcpActivateControlContext(forTabID: session.tabID, sessionID: sessionID, originatingConnectionID: nil)
             XCTFail("membership hold must refuse")
         } catch { XCTAssertTrue(String(describing: error).contains(AgentModeViewModel.mcpResidentTargetError)) }
-        viewModel.agentSessionLinkReleasePromptInventoryHold(hold, for: endpoint, publishing: nil)
+        viewModel.linkExecutionRuntime.agentSessionLinkReleasePromptInventoryHold(hold, for: endpoint, publishing: nil)
         var transitionGeneration: UInt64 = 0
         viewModel.test_agentSessionLinkHasActiveOutboundLink = { _ in
             transitionGeneration = session.beginPersistentBindingTransition()
@@ -823,7 +1639,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
                 await MainActor.run { !session.autoEditEnabled }
             }
             let previousPermission = session.permissionProfile
-            let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: session.tabID))
+            let endpoint = try XCTUnwrap(viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: session.tabID))
             var hold: UInt64?
             var setupAwaitCount = 0
             var installedContext: AgentModeViewModel.AgentMCPControlContext?
@@ -850,7 +1666,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
                         XCTFail("Activation override was not projected: \(error)")
                     }
                     XCTAssertTrue(current.autoEditEnabled)
-                    hold = viewModel.agentSessionLinkWithholdPromptInventory(for: endpoint)
+                    hold = viewModel.linkExecutionRuntime.agentSessionLinkWithholdPromptInventory(for: endpoint)
                 case .successorEpoch:
                     var successor = context
                     successor.pendingEpochTransition = .init(token: UUID(), kind: .steering, expectedCurrentEpoch: nil)
@@ -893,7 +1709,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
                     await MainActor.run { !session.autoEditEnabled }
                 }
                 XCTAssertFalse(session.autoEditEnabled)
-                if let hold { viewModel.agentSessionLinkReleasePromptInventoryHold(hold, for: endpoint, publishing: nil) }
+                if let hold { viewModel.linkExecutionRuntime.agentSessionLinkReleasePromptInventoryHold(hold, for: endpoint, publishing: nil) }
             }
             await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
         }
@@ -946,7 +1762,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
             let runID = session.runID
             var heartbeatEntered = false
             var cancellationReached = false
-            viewModel.test_setBeforeCancellationCommit { _ in cancellationReached = true }
+            viewModel.runService.testBeforeCancellationCommit = { _ in cancellationReached = true }
             let service = makeService(
                 window: window, resolveCaller: { _, _ in callerID },
                 beforeHeartbeatOperation: { heartbeatEntered = true }
@@ -977,7 +1793,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
             let originalRunID = session.runID
             var heartbeatEntered = false
             var cancelledObjects: [ObjectIdentifier] = []
-            viewModel.test_setBeforeCancellationCommit { cancelledObjects.append(ObjectIdentifier($0)) }
+            viewModel.runService.testBeforeCancellationCommit = { cancelledObjects.append(ObjectIdentifier($0)) }
             let service = makeService(
                 window: window, resolveCaller: { _, _ in callerID },
                 beforeHeartbeatOperation: { heartbeatEntered = true }
@@ -1029,7 +1845,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
             var protectedContext = original.mcpControlContext
             var heartbeatEntered = false
             var cancellationReached = false
-            viewModel.test_setBeforeCancellationCommit { _ in cancellationReached = true }
+            viewModel.runService.testBeforeCancellationCommit = { _ in cancellationReached = true }
             let service = makeService(
                 window: window, resolveCaller: { _, _ in currentCallerID },
                 beforeHeartbeatOperation: {
@@ -1093,7 +1909,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
             viewModel.test_afterMCPControlSetupAwait = { current in
                 observedPendingActivation = true
                 XCTAssertTrue(current.mcpFollowUpRunPending, "Pending start must precede observable control setup")
-                guard let snapshot = viewModel.mcpSnapshot(for: current), let context = current.mcpControlContext else {
+                guard let snapshot = viewModel.mcpRuntime.mcpSnapshot(for: current), let context = current.mcpControlContext else {
                     return XCTFail("Control setup must expose its pending snapshot")
                 }
                 XCTAssertEqual(snapshot.status, .running)
@@ -1124,20 +1940,21 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
             var protectedProducerID = session.scheduledACPFollowUp?.id
             var heartbeatEntered = false
             var cancellationReached = false
-            viewModel.test_setBeforeCancellationCommit { _ in cancellationReached = true }
+            viewModel.runService.testBeforeCancellationCommit = { _ in cancellationReached = true }
             let service = makeService(
                 window: window, resolveCaller: { _, _ in callerID },
                 beforeHeartbeatOperation: {
                     heartbeatEntered = true
                     switch drift {
                     case .startedRun:
-                        viewModel.setMCPFollowUpRunPending(sessionID: sessionID, false)
+                        viewModel.mcpRuntime.setFollowUpRunPending(sessionID: sessionID, false)
                         session.installRunID(UUID())
                         _ = session.beginRunAttempt(source: "public-cancel-pending-started")
                         session.runState = .running
                     case .successorEpoch:
-                        let successor = try XCTUnwrap(viewModel.stageMCPRunEpochTransition(sessionID: sessionID, kind: .steering))
-                        XCTAssertNotEqual(successor, originalTransition)
+                        let command = try XCTUnwrap(viewModel.runtimeCommand(sessionID: sessionID))
+                        let successor = try XCTUnwrap(viewModel.mcpRuntime.stageEpochTransition(command: command, kind: .steering))
+                        XCTAssertNotEqual(successor.token, originalTransition)
                     case .pendingRevision:
                         session.mcpFollowUpRunPendingUpdatedAt = originalPendingRevision.addingTimeInterval(1)
                     case .scheduledProducer:
@@ -1171,7 +1988,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
     private func makeCancelWindow() async throws -> WindowState {
         let window = try await makeWindow()
         addTeardownBlock { @MainActor in
-            window.agentModeViewModel.test_setBeforeCancellationCommit(nil)
+            window.agentModeViewModel.runService.testBeforeCancellationCommit = nil
         }
         return window
     }
@@ -1189,9 +2006,10 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
             originatingConnectionID: nil, startPending: startPending
         )
         if startPending {
-            _ = try XCTUnwrap(window.agentModeViewModel.stageMCPRunEpochTransition(sessionID: sessionID, kind: .steering))
+            let command = try XCTUnwrap(window.agentModeViewModel.runtimeCommand(sessionID: sessionID))
+            _ = try XCTUnwrap(window.agentModeViewModel.mcpRuntime.stageEpochTransition(command: command, kind: .steering))
         } else {
-            await window.agentModeViewModel.prepareMCPWaitTrackingForRunStart(
+            await window.agentModeViewModel.mcpRuntime.prepareWaitTrackingForRunStart(
                 session: session, stopFence: .init(session: session)
             )
             let preparedEpoch = try XCTUnwrap(session.mcpControlContext?.preparedEpoch)
@@ -1210,7 +2028,9 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         var tab = try XCTUnwrap(window.workspaceManager.composeTab(with: session.tabID))
         tab.activeAgentSessionID = sessionID
         window.workspaceManager.updateComposeTab(tab, markDirty: false)
-        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID))
+        try session.installPersistentSessionBinding(.init(
+            tabID: session.tabID, sessionID: sessionID, workspaceID: XCTUnwrap(window.workspaceManager.activeWorkspaceID)
+        ))
     }
 
     private func installCancelIndex(sessionID: UUID, tabID: UUID, parentSessionID: UUID, in viewModel: AgentModeViewModel) {
@@ -1289,18 +2109,30 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         )
     }
 
-    private func makeWindow() async throws -> WindowState {
+    private func makeWindow(
+        beforeAdoption: (@MainActor () async -> Void)? = nil,
+        afterAdoption: (@MainActor () -> Void)? = nil,
+        waitsForAdoption: Bool = true
+    ) async throws -> WindowState {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let adoptionCompleted = ResidentSteerGate()
+        var adoptionQueued = false
         let window = WindowState()
         WindowStatesManager.shared.registerWindowState(window)
         addTeardownBlock { @MainActor in
+            // The owning test releases a held gate even when setup throws. Join its actual exit
+            // before closing the window, rather than racing adoption against window teardown.
+            if adoptionQueued { await adoptionCompleted.wait() }
             let viewModel = window.agentModeViewModel
             viewModel.test_afterMCPControlActivation = nil
             viewModel.test_afterMCPControlRegistration = nil
             viewModel.test_afterMCPControlSetupAwait = nil
             viewModel.test_agentSessionLinkHasActiveOutboundLink = nil
             viewModel.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = nil
+            viewModel.test_beforeWorkspaceSwitchAdoption = nil
+            viewModel.test_afterWorkspaceSwitchAdoptionQueued = nil
+            viewModel.test_afterWorkspaceSwitchAdoptionCompleted = nil
             await window.tearDown()
             WindowStatesManager.shared.unregisterWindowState(window)
         }
@@ -1312,11 +2144,26 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
             repoPaths: [],
             ephemeral: true
         )
+        window.agentModeViewModel.test_afterWorkspaceSwitchAdoptionQueued = { owner in
+            if owner.workspaceID == workspace.id { adoptionQueued = true }
+        }
+        window.agentModeViewModel.test_beforeWorkspaceSwitchAdoption = { owner in
+            if owner.workspaceID == workspace.id { await beforeAdoption?() }
+        }
+        window.agentModeViewModel.test_afterWorkspaceSwitchAdoptionCompleted = { owner in
+            guard owner.workspaceID == workspace.id else { return }
+            adoptionCompleted.release()
+            afterAdoption?()
+        }
         await window.workspaceManager.switchWorkspace(
             to: workspace,
             saveState: false,
             reason: "agentRunSteerResumeTests"
         )
+        // switchWorkspace commits and yields; it does not join feature-owner adoption. A normal
+        // fixture must finish that setup before it installs a fake active provider/instruction wait.
+        XCTAssertTrue(adoptionQueued, "The destination's real adoption must be queued")
+        if waitsForAdoption, adoptionQueued { await adoptionCompleted.wait() }
         let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
         window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
         return window
@@ -1337,6 +2184,12 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         _ = try XCTUnwrap(binding)
         if restored {
             establishRestoredFixture(session)
+            // This fixture installs its final binding after the original draft lookup. Renew
+            // production interaction composition, then join its seed before callers write.
+            XCTAssertTrue(window.agentModeViewModel.session(for: tabID) === session)
+            try await AsyncTestWait.waitUntil("approval sync renewed for fixture binding") {
+                await MainActor.run { session.applyEditsApprovalSubscriptionID != nil }
+            }
         } else {
             session.hasLoadedPersistedState = false
         }
@@ -1445,7 +2298,7 @@ final class AgentRunStartBudgetTests: XCTestCase {
         let cancellationReturned = expectation(description: "cancelled caller returns without joining")
         let task = Task {
             defer { cancellationReturned.fulfill() }
-            try await AgentRunStartBudget.run(expiry: .init(toolName: "agent_run", budgetSeconds: 60)) {
+            _ = try await AgentRunStartBudget.run(expiry: .init(toolName: "agent_run", budgetSeconds: 60)) {
                 cancellationStage.fulfill()
                 await cancelledGate.hold()
                 XCTAssertTrue(Task.isCancelled)
@@ -1507,7 +2360,7 @@ final class AgentRunStartBudgetTests: XCTestCase {
         await gate.release()
         await fulfillment(of: [workerDone], timeout: 3)
         XCTAssertEqual(dispatches, 0)
-        XCTAssertNil(vm.mcpRegistration(sessionID: fixture.sessionID))
+        XCTAssertNil(vm.mcpRuntime.registration(sessionID: fixture.sessionID))
 
         for mutationRace in 0 ..< 3 {
             let cancelled = try await makeFixture()
@@ -1572,11 +2425,101 @@ final class AgentRunStartBudgetTests: XCTestCase {
             XCTAssertEqual(cancelled.session.selectedReasoningEffortRaw, originalEffort)
             XCTAssertEqual(cancelledDispatches, 0)
             if mutationRace != 2 {
-                XCTAssertNil(owner.mcpRegistration(sessionID: cancelled.sessionID))
+                XCTAssertNil(owner.mcpRuntime.registration(sessionID: cancelled.sessionID))
             }
             cancelled.session.runState = .idle
             owner.test_afterMCPControlActivation = nil
             owner.test_beforeMCPSelectionCommit = nil
+        }
+    }
+
+    func testRuntimeEpochAcknowledgementDoesNotAuthorizeAStaleStart() async throws {
+        for change in ["stop", "retire", "reacquire"] {
+            let fixture = try await makeFixture()
+            let vm = fixture.window.agentModeViewModel
+            let session = fixture.session
+            let command = try XCTUnwrap(vm.runtimeCommand(sessionID: fixture.sessionID))
+            let registration = try XCTUnwrap(session.mcpControlContext?.registration)
+            let binding = session.currentRestorationBindingToken
+            vm.mcpRuntime.test_afterEpochBegan = {
+                if change == "stop" {
+                    session.stopState.invalidateScheduledStarts()
+                } else if change == "retire" {
+                    command.writer.scope.beginRetirement()
+                } else {
+                    let sessions = command.writer.scope.sessions
+                    command.writer.scope.replaceSessions([:])
+                    command.writer.scope.replaceSessions(sessions)
+                }
+            }
+            let permitted = await vm.mcpRuntime.prepareWaitTrackingForRunStart(session: session, stopFence: .init(session: session))
+            XCTAssertFalse(permitted, change)
+            XCTAssertEqual(session.currentRestorationBindingToken, binding)
+            let durableEpoch = await AgentRunSessionStore.currentEpoch(for: registration)
+            XCTAssertNotNil(durableEpoch, "The durable actor accepted the originating epoch")
+            XCTAssertEqual(session.mcpControlContext?.preparedEpoch, change == "reacquire" ? nil : durableEpoch)
+            XCTAssertNil(session.activeRunOwnership)
+            vm.mcpRuntime.test_afterEpochBegan = nil
+            await fixture.cleanup()
+        }
+    }
+
+    func testControlReadsDuringBindingPreparationDoNotExpireTheLiveHandle() async throws {
+        for conflict in [false, true] {
+            let fixture = try await makeFixture()
+            addTeardownBlock { @MainActor in await fixture.cleanup() }
+            let vm = fixture.window.agentModeViewModel
+            let session = fixture.session
+            let command = try XCTUnwrap(vm.runtimeCommand(sessionID: fixture.sessionID))
+            let prepared = await vm.mcpRuntime.prepareWaitTrackingForRunStart(session: session, stopFence: .init(session: session))
+            XCTAssertTrue(prepared)
+            let context = try XCTUnwrap(session.mcpControlContext)
+            session.runState = .completed
+            session.mcpFollowUpRunPending = true
+            session.mcpFollowUpRunPendingUpdatedAt = Date().addingTimeInterval(-60)
+            let conflictScope = AgentSessionRuntimeStore.shared.makeScope()
+            var generation: UInt64?
+            if conflict {
+                let replica = conflictScope.makeSession(tabID: UUID())
+                XCTAssertEqual(conflictScope.bindingRejection(fixture.sessionID, on: replica), .conflictingWriter)
+                // Legacy corruption only; normal admission above refuses the competing writer.
+                replica.installPersistentSessionBinding(.init(
+                    tabID: replica.tabID, sessionID: fixture.sessionID, workspaceID: command.identity.workspaceID
+                ))
+                replica.mcpControlContext = context
+                conflictScope.replaceSessions([replica.tabID: replica])
+            } else {
+                generation = session.beginPersistentBindingTransition()
+            }
+            defer {
+                if let generation { session.finishPersistentBindingTransition(generation: generation) }
+                conflictScope.replaceSessions([:])
+            }
+            XCTAssertFalse(command.isCurrent, "Unavailable or conflicting writers still refuse mutations")
+            XCTAssertEqual(vm.mcpRuntime.registration(sessionID: fixture.sessionID), context.registration)
+            XCTAssertEqual(vm.mcpRuntime.waitCursor(sessionID: fixture.sessionID)?.registration, context.registration)
+            XCTAssertEqual(vm.mcpSnapshot(sessionID: fixture.sessionID)?.status, .running)
+            XCTAssertNil(vm.mcpRuntime.mcpSnapshot(for: session), "Publication still needs the current exclusive writer")
+            XCTAssertNil(vm.mcpRuntime.waitPublication(sessionID: fixture.sessionID), "Waiter wakes must not publish a read-only snapshot")
+            for op in ["poll", "wait"] {
+                let result = try await fixture.service.execute(args: [
+                    "op": .string(op), "session_id": .string(fixture.sessionID.uuidString), "timeout": .double(0.01)
+                ])
+                XCTAssertEqual(result.objectValue?["status"], .string("running"), op)
+                XCTAssertFalse(result.objectValue?["status_text"]?.stringValue?.contains("expired") == true, op)
+            }
+            XCTAssertEqual(session.mcpControlContext, context)
+            XCTAssertTrue(session.mcpFollowUpRunPending, "A read must not clear stale masks without mutation currency")
+            XCTAssertNil(vm.mcpRuntime.stageEpochTransition(command: command, kind: .steering))
+            if let generation {
+                session.finishPersistentBindingTransition(generation: generation)
+                XCTAssertFalse(command.isCurrent, "A preparation generation never revives an old mutation capability")
+                XCTAssertEqual(
+                    vm.mcpRuntime.registration(sessionID: fixture.sessionID),
+                    context.registration,
+                    "Finishing preparation without installing a replacement does not expire the original claim"
+                )
+            }
         }
     }
 
@@ -1588,7 +2531,7 @@ final class AgentRunStartBudgetTests: XCTestCase {
         XCTAssertEqual(fixture.session.runState, .idle)
         fixture.session.mcpFollowUpRunPendingUpdatedAt = Date().addingTimeInterval(-60)
         XCTAssertNil(fixture.session.mcpControlContext?.currentEpoch)
-        let cursor = try XCTUnwrap(vm.mcpWaitCursor(sessionID: sessionID))
+        let cursor = try XCTUnwrap(vm.mcpRuntime.waitCursor(sessionID: sessionID))
         XCTAssertNotNil(vm.mcpSnapshot(cursor: cursor))
         let gate = Gate()
         addTeardownBlock { await gate.release() }
@@ -1629,7 +2572,7 @@ final class AgentRunStartBudgetTests: XCTestCase {
         let oldContext = fixture.session.mcpControlContext
         let oldStamp = Date().addingTimeInterval(-60)
         fixture.session.mcpFollowUpRunPendingUpdatedAt = oldStamp
-        await vm.prepareMCPWaitTrackingForRunStart(session: fixture.session, stopFence: AgentRunStartStopFence(session: fixture.session))
+        await vm.mcpRuntime.prepareWaitTrackingForRunStart(session: fixture.session, stopFence: AgentRunStartStopFence(session: fixture.session))
         XCTAssertNotNil(fixture.session.mcpControlContext?.currentEpoch)
         XCTAssertNotEqual(fixture.session.mcpControlContext, oldContext)
         XCTAssertGreaterThan(try XCTUnwrap(fixture.session.mcpFollowUpRunPendingUpdatedAt), oldStamp)
@@ -1670,7 +2613,7 @@ final class AgentRunStartBudgetTests: XCTestCase {
                     target: target, message: "dispatch then suspend", metadata: .init(connectionID: nil, clientName: nil, windowID: nil),
                     agentModeVM: vm, agentRaw: nil, modelRaw: nil, reasoningEffortRaw: nil,
                     dispatchInstruction: { _, _, _, _, _ in
-                        await vm.prepareMCPWaitTrackingForRunStart(session: session, stopFence: AgentRunStartStopFence(session: session))
+                        await vm.mcpRuntime.prepareWaitTrackingForRunStart(session: session, stopFence: AgentRunStartStopFence(session: session))
                         XCTAssertNotNil(session.mcpControlContext?.preparedEpoch)
                         XCTAssertNotNil(session.mcpControlContext?.currentEpoch)
                         let prepared = AgentRunMCPToolService.startExpirySnapshot(sessionID: fixture.sessionID, agentModeVM: vm)

@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import RepoPromptFoundation
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 #if DEBUG

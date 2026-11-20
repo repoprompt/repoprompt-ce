@@ -433,42 +433,54 @@ package struct DomainPersistenceCoordinator {
     private var settingsDirectory: URL { runtimeRoot.appendingPathComponent("settings", isDirectory: true) }
     private var rollbackRoot: URL { runtimeRoot.appendingPathComponent("rollback", isDirectory: true) }
     private var policyURL: URL { settingsDirectory.appendingPathComponent("runtime-policy.json") }
+
     private var protectedMutationPolicyURL: URL {
         settingsDirectory.appendingPathComponent("protected-mutations.json")
     }
+
     private var protectedMutationPolicyLockURL: URL {
         lockDirectory.appendingPathComponent("protected-mutations.lock")
     }
+
     private var protectedMutationJournalURL: URL {
         settingsDirectory.appendingPathComponent("protected-mutation-journal.json")
     }
+
     private var protectedMutationJournalLockURL: URL {
         lockDirectory.appendingPathComponent("protected-mutation-journal.lock")
     }
+
     private var agentSessionMetadataURL: URL {
         settingsDirectory.appendingPathComponent("agent-sessions.json")
     }
+
     private var agentSessionMetadataLockURL: URL {
         lockDirectory.appendingPathComponent("agent-sessions.lock")
     }
+
     private var directSettingsURL: URL {
         settingsDirectory.appendingPathComponent("direct-settings.json")
     }
+
     private var directSettingsLockURL: URL {
         lockDirectory.appendingPathComponent("direct-settings.lock")
     }
+
     private var agentWorktreeBindingsURL: URL {
         settingsDirectory.appendingPathComponent("agent-worktree-bindings.json")
     }
+
     private var agentWorktreeBindingsLockURL: URL {
         lockDirectory.appendingPathComponent("agent-worktree-bindings.lock")
     }
+
     private var legacyAgentSessionMetadataURL: URL {
         configuration.storageDirectory
             .appendingPathComponent("DomainRuntime", isDirectory: true)
             .appendingPathComponent("v1", isDirectory: true)
             .appendingPathComponent("agent-sessions.json")
     }
+
     private var catalogURL: URL { runtimeRoot.appendingPathComponent("workspace-catalog.json") }
     private var indexURL: URL { workspaceRoot.appendingPathComponent("workspacesIndex.json") }
 
@@ -1864,6 +1876,11 @@ package struct DomainPersistenceCoordinator {
                     artifactCleanupWarnings.append(warning)
                 }
                 artifactCleanupWarnings.append(contentsOf: finalizeDeletedWorkspaceArtifacts(document))
+                if let warning = pruneDeletedLegacyIndexEntries(
+                    deletedWorkspaceIDs: Set(deletions.map(\.workspaceID))
+                ) {
+                    artifactCleanupWarnings.append(warning)
+                }
 
                 var recordedTombstone = tombstone
                 if !artifactCleanupWarnings.isEmpty {
@@ -1920,6 +1937,29 @@ package struct DomainPersistenceCoordinator {
             ),
             deletedAt: tombstone.deletedAt
         )
+    }
+
+    /// The compatibility index still feeds legacy/bootstrap reads. The caller holds the catalog
+    /// lock and has already committed deletion authority; index repair is best-effort cleanup.
+    /// Preserve opaque fields on surviving rows rather than round-tripping the legacy DTO.
+    private func pruneDeletedLegacyIndexEntries(deletedWorkspaceIDs: Set<UUID>) -> String? {
+        guard !deletedWorkspaceIDs.isEmpty, fileManager.fileExists(atPath: indexURL.path) else { return nil }
+        do {
+            try validateMetadata(indexURL)
+            let bytes = try Data(contentsOf: indexURL)
+            guard let rows = try JSONSerialization.jsonObject(with: bytes) as? [[String: Any]] else {
+                return "legacy workspace index: unrecognized document shape"
+            }
+            let retained = rows.filter { row in
+                guard let rawID = row["id"] as? String, let id = UUID(uuidString: rawID) else { return true }
+                return !deletedWorkspaceIDs.contains(id)
+            }
+            guard retained.count != rows.count else { return nil }
+            try atomicWrite(JSONSerialization.data(withJSONObject: retained, options: [.sortedKeys]), to: indexURL)
+            return nil
+        } catch {
+            return "legacy workspace index: \(error.localizedDescription)"
+        }
     }
 
     private func finalizeDeletedWorkspaceArtifacts(_ document: DomainWorkspaceDocument) -> [String] {

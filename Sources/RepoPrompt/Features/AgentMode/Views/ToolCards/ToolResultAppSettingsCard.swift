@@ -259,7 +259,7 @@ enum AppSettingsCardPresentationBuilder {
 
 struct AppSettingsResultCard: View {
     let item: AgentChatItem
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("AppSettingsResultCard") private var isExpanded = false
 
     private var presentation: AppSettingsCardPresentation {
         AppSettingsCardPresentationBuilder.build(
@@ -277,11 +277,8 @@ struct AppSettingsResultCard: View {
             detailText: nil,
             subtitle: inlineToolCardSummary(presentation.subtitle, presentation.detailText),
             status: presentation.status,
-            timestamp: item.timestamp,
-            isExpandable: toolResultHasPayload(item),
+            item: item,
             isExpanded: $isExpanded
-        ) {
-            ToolMarkdownExpandedContent(item: item)
-        }
+        )
     }
 }

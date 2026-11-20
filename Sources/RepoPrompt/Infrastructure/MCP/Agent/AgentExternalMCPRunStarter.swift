@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptAIContracts
 
 @MainActor
 enum AgentExternalMCPRunStarter {
@@ -288,7 +289,7 @@ enum AgentExternalMCPRunStarter {
         sessionID: UUID,
         agentModeVM: AgentModeViewModel
     ) async -> AgentRunMCPSnapshot {
-        guard let registration = agentModeVM.mcpRegistration(sessionID: sessionID) else {
+        guard let registration = agentModeVM.mcpRuntime.registration(sessionID: sessionID) else {
             return .expired(sessionID: sessionID)
         }
         if let liveSnapshot = agentModeVM.mcpSnapshot(registration: registration) {

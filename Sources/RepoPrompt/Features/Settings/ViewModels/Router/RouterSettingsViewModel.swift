@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptSettingsCore
 
 @MainActor

@@ -684,8 +684,7 @@ package actor FileSystemService {
         nextFSEventStreamStartEventID = FSEventsGetCurrentEventId()
 
         // Configure parallelism caps based on available cores
-        let cores = ProcessInfo.processInfo.activeProcessorCount
-        maxParallelScansPerActor = max(2, min(4, cores / 2))
+        maxParallelScansPerActor = HostResourceCapacity.baseline.background
         maxFoldersPerBatch = 256
         maxRecoveryScanAttempts = 3
         recoveryScanRetryBaseNanoseconds = 50_000_000
@@ -841,8 +840,7 @@ package actor FileSystemService {
             nextFSEventStreamStartEventID = FSEventsGetCurrentEventId()
 
             // Configure parallelism caps (allow test overrides)
-            let cores = ProcessInfo.processInfo.activeProcessorCount
-            maxParallelScansPerActor = maxParallelScansOverride ?? max(2, min(4, cores / 2))
+            maxParallelScansPerActor = maxParallelScansOverride ?? HostResourceCapacity.baseline.background
             maxFoldersPerBatch = maxFoldersPerBatchOverride ?? 256
             maxRecoveryScanAttempts = max(1, maxRecoveryScanAttemptsOverride ?? 3)
             recoveryScanRetryBaseNanoseconds = recoveryScanRetryBaseNanosecondsOverride ?? 50_000_000

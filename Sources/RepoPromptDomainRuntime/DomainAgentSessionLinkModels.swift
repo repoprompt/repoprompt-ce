@@ -1189,11 +1189,14 @@ package struct DomainAgentSessionLinkAuthoritySnapshot: Equatable, Sendable {
 package struct AgentRunQuietFacts: Equatable, Hashable, Sendable {
     package let settledThrough: UInt64
     package let ordinaryThrough: UInt64
+    /// Supplemental live-wait evidence; nil is unknown, never a quiet-counter proof.
+    package let supplementalNeedsUser: Bool?
 
-    package init?(settledThrough: UInt64, ordinaryThrough: UInt64) {
+    package init?(settledThrough: UInt64, ordinaryThrough: UInt64, supplementalNeedsUser: Bool? = nil) {
         guard ordinaryThrough <= settledThrough else { return nil }
         self.settledThrough = settledThrough
         self.ordinaryThrough = ordinaryThrough
+        self.supplementalNeedsUser = supplementalNeedsUser
     }
 
     package static let zero = AgentRunQuietFacts(settledThrough: 0, ordinaryThrough: 0)!

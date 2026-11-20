@@ -431,16 +431,16 @@ PY
 
 audit_stable_tip_floor() {
     local phase="$1"
-    local stable_feed_url
+    local stable_repository stable_directory
     STABLE_AUDIT_INDEX=$((STABLE_AUDIT_INDEX + 1))
-    STABLE_APPCAST_PATH="$TMP_DIR/stable-floor-$STABLE_AUDIT_INDEX.xml"
-    stable_feed_url="$(python3 "$ROLLOUT_TOOL" feed-url \
-        --policy "$APPLE_IDENTITY_POLICY" --channel stable)"
-    curl --fail --location --silent --show-error \
-        --connect-timeout 10 --max-time 30 \
-        "$stable_feed_url" --output "$STABLE_APPCAST_PATH"
+    stable_directory="$TMP_DIR/stable-floor-$STABLE_AUDIT_INDEX"
+    source "$SCRIPT_DIR/release_observation.sh"
+    stable_repository="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sparkle"]["updateRepository"])' "$APPLE_IDENTITY_POLICY")"
+    OBSERVATION_GH_TOKEN="$TIP_GH_TOKEN" fetch_observed_rollout_pair "$stable_repository" latest stable "$stable_directory" || fail "$phase could not authenticate Stable release"
+    STABLE_APPCAST_PATH="$stable_directory/appcast.xml"
     python3 "$ROLLOUT_TOOL" validate-stable-tip-floor \
         --policy "$APPLE_IDENTITY_POLICY" \
+        --stable-manifest "$stable_directory/manifest.json" \
         --stable-appcast "$STABLE_APPCAST_PATH" \
         --tip-manifest "$CANDIDATE_MANIFEST" \
         --tip-appcast "$CANDIDATE_APPCAST" ||

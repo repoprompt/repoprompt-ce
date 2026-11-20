@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptInstrumentation
+import RepoPromptMCPServer
 import RepoPromptShared
 
 struct AppMCPToolExecutionHandlerPhaseRecorderFactory: MCPToolExecutionHandlerPhaseRecorderFactory {
@@ -52,124 +53,6 @@ final class MCPToolExecutionHandlerPhaseRecorder: MCPToolExecutionHandlerPhaseRe
         lock.lock()
         latest = snapshot
         lock.unlock()
-    }
-}
-
-struct MCPToolExecutionTraceEvent: Equatable, CustomStringConvertible {
-    typealias Phase = MCPToolExecutionDiagnosticEvent.Phase
-
-    let toolName: String
-    let operationIdentity: MCPToolOperationIdentity
-    let connectionID: UUID
-    let invocationID: UUID
-    let runID: UUID?
-    let requestIdentity: MCPRequestTimelineIdentity?
-    let contractKind: MCPToolExecutionContract.Kind
-    let executionDeadlineSeconds: Double?
-    let cleanupGraceSeconds: Double?
-    let cleanupDisposition: MCPToolExecutionCleanupDisposition?
-    let phase: Phase
-    let elapsedMilliseconds: Double
-    let cancellationRequested: Bool?
-    let cancellationOutcome: String?
-    let cancellationOrigin: MCPToolExecutionCancellationOrigin?
-    let settlement: String?
-    let graceOutcome: String?
-    let escalationReason: String?
-    let handlerPhase: MCPToolExecutionHandlerPhaseSnapshot?
-    let handlerPhaseAgeMilliseconds: Double?
-
-    init(
-        toolName: String,
-        operationIdentity: MCPToolOperationIdentity,
-        connectionID: UUID,
-        invocationID: UUID,
-        runID: UUID?,
-        requestIdentity: MCPRequestTimelineIdentity? = nil,
-        contractKind: MCPToolExecutionContract.Kind,
-        executionDeadlineSeconds: Double?,
-        cleanupGraceSeconds: Double?,
-        cleanupDisposition: MCPToolExecutionCleanupDisposition?,
-        phase: Phase,
-        elapsedMilliseconds: Double,
-        cancellationRequested: Bool?,
-        cancellationOutcome: String?,
-        cancellationOrigin: MCPToolExecutionCancellationOrigin?,
-        settlement: String?,
-        graceOutcome: String?,
-        escalationReason: String?,
-        handlerPhase: MCPToolExecutionHandlerPhaseSnapshot?,
-        handlerPhaseAgeMilliseconds: Double?
-    ) {
-        self.toolName = toolName
-        self.operationIdentity = operationIdentity
-        self.connectionID = connectionID
-        self.invocationID = invocationID
-        self.runID = runID
-        self.requestIdentity = requestIdentity
-        self.contractKind = contractKind
-        self.executionDeadlineSeconds = executionDeadlineSeconds
-        self.cleanupGraceSeconds = cleanupGraceSeconds
-        self.cleanupDisposition = cleanupDisposition
-        self.phase = phase
-        self.elapsedMilliseconds = elapsedMilliseconds
-        self.cancellationRequested = cancellationRequested
-        self.cancellationOutcome = cancellationOutcome
-        self.cancellationOrigin = cancellationOrigin
-        self.settlement = settlement
-        self.graceOutcome = graceOutcome
-        self.escalationReason = escalationReason
-        self.handlerPhase = handlerPhase
-        self.handlerPhaseAgeMilliseconds = handlerPhaseAgeMilliseconds
-    }
-
-    var isAlwaysEmitted: Bool {
-        phase.isAlwaysEmitted
-    }
-
-    var description: String {
-        var fields = [
-            "phase=\(phase.rawValue)",
-            "tool=\(toolName)",
-            "operation=\(operationIdentity.normalizedOperation)",
-            "connection_id=\(connectionID.uuidString)",
-            "invocation_id=\(invocationID.uuidString)",
-            "contract=\(contractKind.rawValue)",
-            "elapsed_ms=\(String(format: "%.3f", elapsedMilliseconds))"
-        ]
-        if let runID { fields.append("run_id=\(runID.uuidString)") }
-        if let requestIdentity {
-            if let requestID = requestIdentity.jsonRPCRequestID {
-                fields.append("request_id=\(requestID)")
-            }
-            if let requestConnectionID = requestIdentity.connectionID {
-                fields.append("request_connection_id=\(requestConnectionID)")
-            }
-            if let requestGeneration = requestIdentity.connectionGeneration {
-                fields.append("request_generation=\(requestGeneration)")
-            }
-            if let requestOrdinal = requestIdentity.requestOrdinal {
-                fields.append("request_ordinal=\(requestOrdinal)")
-            }
-        }
-        if let executionDeadlineSeconds { fields.append("deadline_s=\(executionDeadlineSeconds)") }
-        if let cleanupGraceSeconds { fields.append("grace_s=\(cleanupGraceSeconds)") }
-        if let cleanupDisposition { fields.append("cleanup_disposition=\(cleanupDisposition.rawValue)") }
-        if let cancellationRequested { fields.append("cancellation_requested=\(cancellationRequested)") }
-        if let cancellationOutcome { fields.append("cancellation_outcome=\(cancellationOutcome)") }
-        if let cancellationOrigin { fields.append("cancellation_origin=\(cancellationOrigin.rawValue)") }
-        if let settlement { fields.append("settlement=\(settlement)") }
-        if let graceOutcome { fields.append("grace_outcome=\(graceOutcome)") }
-        if let escalationReason { fields.append("escalation_reason=\(escalationReason)") }
-        if let handlerPhase {
-            fields.append("handler_phase=\(handlerPhase.phase.rawValue)")
-            fields.append("handler_phase_transition=\(handlerPhase.transition.rawValue)")
-            fields.append("handler_phase_elapsed_ms=\(String(format: "%.3f", handlerPhase.elapsedMilliseconds))")
-        }
-        if let handlerPhaseAgeMilliseconds {
-            fields.append("handler_phase_age_ms=\(String(format: "%.3f", handlerPhaseAgeMilliseconds))")
-        }
-        return fields.joined(separator: " ")
     }
 }
 

@@ -138,7 +138,15 @@ defect in this subsystem.
 | Link authority | Grants, capabilities (including default management), generations, cursors, revocation. Process-memory. | `DomainAgentSessionLinkAuthority` |
 | Passive reducer | The canonical observer-local queue: first-to-final coalescing of target status edges plus separate, non-lossy attention occurrences. Owns no authority and performs no delivery. | `AgentSessionLinkPassiveStatusNotices` |
 | Claim / receipt | The immutable rendered batch a provider was actually sent, including exact attention occurrence identities, and what that provider's acceptance therefore acknowledges. | `AgentSessionLinkPromptContext` |
-| Wake coordinator | Temporary admission policy: may this lane start an automatic turn *right now*? | `AgentModeViewModel+SessionLinkAutoWake` |
+| Wake coordinator | Temporary admission policy: may this lane start an automatic turn *right now*? | `AgentSessionLinkExecutionRuntime+Wake` |
+
+`AgentSessionRuntimeStore.Scope` retains the link executor and its actual inventory/hold/claim storage.
+The VM forwarding methods and `_modify` accessors refer to that same owner; they do not copy its maps.
+Auto-wake and periodic scheduling execute there too, preserving the four authorities above.
+Presentation labels and refreshes are optional. Canonical endpoint admission, run start, provider-switch
+commands, self-compaction settlement and composer claims remain required composition inputs. The
+legacy app adapter still supplies those inputs; this relocation alone does not make the saved-session
+execution host independent of windows.
 
 The lane board is derived data in the existing passive observation pipeline, not a fifth owner. The target view model combines its own run outcome, stamped failure reason, send-readiness blockers, and a current child-session census into the observation snapshot; the runtime bridge publishes that snapshot through link authority, and `poll`/`wait` render it. A board change can advance the existing `wait(until: "change")` cursor, but it creates no new status or attention edge for the passive reducer, changes no Auto-wake admission rule, and persists no board state.
 
@@ -533,7 +541,7 @@ configuration committed synchronously. A concurrent composer claim wins. Revocat
 that hop cannot substitute a new grant; later revocation does not undo an already admitted commit.
 Busy/loading/settling refusals are retryable, never queued. Even identical selections pass every gate.
 
-`AgentAdvertisedModelCatalog` indexes full compound IDs when ordinary catalogue producers run.
+`AgentModelCatalogRuntime` indexes full compound IDs when ordinary catalogue producers run.
 Admission performs bounded memory lookups only: no persistence warming, full catalogue flattening,
 provider discovery, or legacy resolver fallback. Registry/backend changes invalidate the index;
 a cold index tells the caller to refresh `agent_manage.list_agents` in the destination window.
@@ -700,6 +708,14 @@ applies the same rule only to the active compose tab, decorates a freshly resolv
 flows through `displayedWindowTitle` to native tabs, the Agent titlebar cluster, `NSWindow.title`,
 and Dock window lists.
 
+## Transcript reads use the session writer
+
+The link read captures a canonical transcript snapshot from the exact writer and materializes the
+sanitized page off the main actor. Before releasing it, the runtime compares the writer
+incarnation again. Removing and reacquiring the same session object invalidates an in-flight
+read even when its visible endpoint fields still match. The bridge revalidates both endpoints and
+mints the successor cursor under the current read grant before the tool returns the page.
+
 ## One post-storage invalidation seam, two consumer schedulers
 
 `agentSessionLinkMutateProjectionStorage` is the sole mutation boundary for the exact projection
@@ -838,8 +854,8 @@ operations and a retry replays the stored receipt.
 | Between states, idle but not yet send-ready, or settled during the fence | Refused; nothing staged and the key is released | `target_busy` |
 | A provider or state with no live steering | Refused before staging | `steer_unavailable` |
 
-The running routes go through the target's own `submitPreparedUserTurn`, so a steer reaches the
-provider exactly as a local composer message would. What they never touch is composer state: no
+The running routes use the target session writer's managed input runtime. The runtime captures
+the host's workspace resources before authorizing delivery. It leaves composer state untouched: no
 draft, attachment, tagged file, workflow, interview preference, or file-selection side effect is
 read, cleared, or restored, and every withdrawal path carries an empty restoration draft, so an
 overseer's words can never reappear in the target user's composer as the user's own. ACP uses a
@@ -850,8 +866,9 @@ original provider envelope in `pendingInstructions` for the follow-up, not in th
 An interrupted attributed ACP row replays its exact dispatched envelope from
 `dispatchedProviderText`; older attributed rows lacking that field are still dropped rather than
 reconstructed from raw transcript words. After the commit fence the transaction re-proves both
-endpoints, the workspace, and admission synchronously; a run that settled during the fence is
-refused as `target_busy` rather than started from a deferred path.
+endpoints, workspace, writer, attempt, and Stop generation synchronously. A settled or replaced
+attempt returns `target_busy`. Stop or caller cancellation before the row is staged leaves no row or
+provider input. Once the runtime accepts input, its originating provider producer settles the receipt.
 A provider path that withdraws the row reports `steer_not_accepted` (key released); one whose
 outcome cannot be observed reports `steer_unconfirmed` with `delivered_unknown: true` (key spent).
 ACP records the `session/prompt` pipe write independently of its end-of-turn response. If that
@@ -1090,6 +1107,32 @@ stale or out-of-order receipt cannot clear a successor occurrence, an unaccepted
 occurrence pending, and a target may request attention again after the previous occurrence is
 receipted.
 
+### Observed user waits use the same attention owner
+
+The reducer also offers an attention occurrence when an established lane enters a deterministic user
+wait. Its immutable reason is `needsUser`; explicit requests retain `requestedAttention`. Public
+`pendingInteractionKind` supplies pending approval, permission, review, question and input evidence,
+including on links without Manage. Hook review and a live instruction wait require one supplementary
+bit in the existing private `runFacts` publication. The instruction predicate requires the waiting run
+state, continuation and wait ID together. A waiting status or prompt string alone is insufficient.
+The reducer extracts that bit before processing counters-only quiet proof, so ordinary status
+coalescing, fingerprints and receipts keep their existing behavior. Unknown proof stays unknown.
+
+First observations, restored lanes and recovery of unknown supplementary evidence baseline silently.
+A public pending edge works even without private facts. Replacing one wait with another without a
+sampled gap does not create another occurrence. Each observer has its own occurrence under its exact
+link, admission gates and receipt. Each reason uses the existing exception to routine selection,
+exact-lane snooze and interval admission. These settings retain their saved values. Inspection and
+prompt responses require their existing capabilities and user instructions.
+
+The same first-wins slot and sixteen-occurrence capacity apply. A later explicit request coalesced
+behind `needsUser` does not convert its reason. Acceptance or an observed wait exit removes that item;
+a pending explicit request survives wait exit. Capacity misses are not retried when space opens, and
+unobserved exit/re-entry is not reconstructed. The renderer uses `<needs_user>` without `requested_at`
+and explains the wait at `observed_at`, rather than claiming the lane requested attention. A frozen
+claim may lag resolution until retirement is published. Physical acquisition checks the exact
+rendered occurrence against the published queue. Provider acceptance uses the existing receipt rules.
+
 `set_waiting_on` is related context, not part of the attention transaction. It is optional,
 self-scoped and session-global, shared with every linked observer, mutable, and published non-atomically
 through a separate state path. It is never a prerequisite for `request_attention`, is never auto-set or
@@ -1210,10 +1253,12 @@ target, so opening an observer cannot overlap or masquerade as revocation.
 ## The routine wake interval is admission spacing, not a schedule
 
 An observer may require a minimum interval between *routine* automatic wakes. It is durable
-observer-session configuration (`routineWakeIntervalEnabled`, `routineWakeIntervalSeconds`), default
-off, retained while off, and normalized to one of 60/300/600/900/1800/3600/10800 seconds by
+observer-session configuration (`routineWakeIntervalEnabled`, `routineWakeIntervalSeconds`), enabled
+at 300 seconds for new sessions, retained while off, and normalized to one of
+60/180/300/600/900/1800/3600/10800 seconds by
 `AgentSessionLinkRoutineWakeInterval.normalized` — the one helper every decode, restore, and write
-path shares.
+path shares. Saved choices are preserved; legacy payloads without these fields retain their disabled
+default. The picker uses `No delay` to disable spacing while retaining the saved duration.
 
 Timing is measured from the **transport boundary**, not from a clock: the first successful transition
 to `.dispatching` in `agentSessionLinkAcquirePhysicalDispatch` records an endpoint-qualified monotonic
@@ -1271,8 +1316,8 @@ omitted rather than shown as zero once elapsed. `agent_session_link` is unchange
 
 Periodic waking is a separate, default-off observer-session preference, not notification admission
 spacing. It applies only while the session has at least one live outbound oversight relationship.
-The compact `Wake periodically when idle` checkbox and adjacent picker offer 10/30/60/120/360 minutes
-(default 30). The existing routine-limit checkbox likewise keeps its picker on the same row. The entire
+The `Wake after being idle for:` checkbox and adjacent picker offer 10 or 30 minutes, or 1, 2, 3, 6, 12 or 24 hours
+(default 30). The separate routine-interval picker includes `No delay`. The entire
 wake-controls block is visible only with outbound oversight; inbound-only sessions do not show it.
 Hiding these controls does not clear the session's saved preferences.
 
@@ -1302,8 +1347,8 @@ clear the attempt. It converts it to `.cancelledBeforeDispatch` and leaves it in
 
 That tombstone looks like dead state and is not. Providers do not mint the wake's dispatch ID — they
 use their own (`codexNativeSend`, `claudeNativeSend`, `codexFallback`, and so on), and
-`agentSessionLinkEffectiveDispatchID` plus `AgentModeViewModel.dispatchRequiresLaneBatch` (both in
-`AgentModeViewModel+SessionLinkPrompt.swift`) rewrite that ID to the wake's **only while an attempt
+`agentSessionLinkEffectiveDispatchID` plus `AgentSessionLinkExecutionRuntime.dispatchRequiresLaneBatch` (both in
+`AgentSessionLinkExecutionRuntime+Prompt.swift`) rewrite that ID to the wake's **only while an attempt
 exists in `.preparingDispatch`, `.cancelledBeforeDispatch`, or `.dispatching`**.
 
 Clear the tombstone while a provider path is still preparing and the rewrite stops happening: the
@@ -1354,6 +1399,19 @@ budget. Otherwise the optional location is omitted and the full sanitized task l
 Labels are stripped of format and bidi scalars, and the sentence's own curly quote delimiters are
 folded to ASCII inside a label, so an untrusted name cannot close the
 quoted span the grammar opened around it. The transcript row's canonical raw text remains unchanged.
+
+## Link activity for local viewers
+
+`Overseer/link-activity.sqlite` is a disposable database beside `Overseer/continuity.sqlite` in the app's application-support directory. It stores only link and session UUIDs and the most recent timestamp of each kind. RepoPrompt never reads it for authorization, delivery, or restoration.
+
+Schema version 1 (`PRAGMA user_version`) has two tables:
+
+- `link_activity`: `link_id` (primary key), `observer_session_id`, `target_session_id`, `last_wake_at`, `last_instruction_at`, `last_watch_at`, `last_attention_at`. IDs are UUID text. Timestamps are fractional Unix seconds in UTC (`REAL`). A `NULL` timestamp means no recorded activity of that kind.
+- `activity_state`: `singleton` (always `1`) and `revision`, incremented in the same transaction as each successful flush. Recreating the database resets the revision. Read both tables in one read transaction if you need the revision and rows from the same snapshot.
+
+A **wake** records when a provider accepts a lane-update wake, including Wake now, for every link whose status or attention request was rendered. The recorder skips overflow that does not identify links, wakes started by an observer's timer, and passive content in ordinary user turns. An **instruction** records accepted send, steer, stop, respond, or compact work for that target, excluding idempotent replays. A **watch** uses the start time of a successful poll or read, or the admission time of a wait. An admitted wait counts even if it later times out or is cancelled. **Attention** records an accepted explicit `request_attention` from the target toward the observer, including requests that coalesce with an existing one. Automatic user-wait notices do not count.
+
+The recorder batches writes in the background at least five seconds apart. When a saved relationship is restored, the recorder carries the timestamps for its directed session pair forward to the new runtime link ID. A new relationship starts with empty history, even when the same sessions were linked before. Unlink cleanup is best effort. Removing a dormant relationship without a live grant can leave an orphaned row. A failed write or app exit can also leave stale rows or lose recent activity. Viewers should get current relationships from the live inventory or saved continuity and use this database only for timestamps. If SQLite reports corruption, the recorder attempts to rename the damaged database and its companion files aside before recreating the database. In SQLite's DELETE journal mode, each successful flush commits to the main file. Open the live file with `mode=ro` for SQLite locking without write access. SQLite's [`immutable=1`](https://sqlite.org/uri.html) skips locking and change detection, so results can be unreliable during a write. For best-effort display with that flag, reopen on each refresh.
 
 ## Bounded race fixes and known deferred work
 
@@ -1418,10 +1476,10 @@ parts that already existed:
 | --- | --- |
 | Mismatch and close predicates, cycle value | `AgentSessionLinkCodexCatalogRepair` (`isStuckProjection`, `projectionResolvesCycle`, `Cycle`) |
 | Cycle record | `AgentTabSession.codexSessionLinkCatalogRepairCycle` |
-| Opens/closes the cycle | `agentSessionLinkReconcileCodexCatalogRepair` in `AgentModeViewModel+SessionLinkPrompt` |
+| Opens/closes the cycle | `agentSessionLinkReconcileCodexCatalogRepair` in `AgentSessionLinkExecutionRuntime+Prompt` |
 | Spends the cycle | `codexRepairSessionLinkCatalogIfQuiescent` in `CodexAgentModeCoordinator` |
 | Quiescence gate | `isQuiescentForControllerReplacement` in `CodexAgentModeCoordinator`, reading `oversight.pendingAutoWakeOwnsTransportBoundary` |
-| Re-admits the queue | `agentSessionLinkRedriveCurrentPassiveSnapshot` in `AgentModeViewModel+SessionLinkAutoWake` |
+| Re-admits the queue | `agentSessionLinkRedriveCurrentPassiveSnapshot` in `AgentSessionLinkExecutionRuntime+Wake` |
 
 **The cycle records a controller generation, not a Boolean.** `nil` on the session is no cycle;
 `Cycle.state(currentControllerGeneration:)` answers `.pending` while the recorded generation still

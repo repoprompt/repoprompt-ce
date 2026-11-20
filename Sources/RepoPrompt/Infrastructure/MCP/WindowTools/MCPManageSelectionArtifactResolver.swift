@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptFoundation
 import RepoPromptVCS
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 enum MCPManageSelectionArtifactUse: Equatable {

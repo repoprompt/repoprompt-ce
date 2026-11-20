@@ -26,9 +26,17 @@ final class ChatWorkspaceSwitchSessionProvider: WorkspaceSwitchSessionProvider {
     }
 
     func cancelSwitchSessions(for deletionToken: WorkspaceDeletionCancellationToken?) async {
-        guard let workspaceManager, let oracleViewModel else { return }
-        guard activeChatCount() > 0 else { return }
+        guard deletionToken?.isActive ?? true, let workspaceManager, let oracleViewModel else { return }
         let expectedWorkspaceID = workspaceManager.activeWorkspaceID
+        if let deletionToken, let expectedWorkspaceID {
+            guard deletionToken.workspaceID == expectedWorkspaceID else { return }
+            let registry = OracleBackgroundInvocationRegistry.shared
+            let drain = registry.closeAll(workspaceID: expectedWorkspaceID)
+            // The deletion coordinator owns the deadline and cancels this token on timeout.
+            if !registry.isShuttingDown { await drain.value }
+            guard deletionToken.isActive, workspaceManager.activeWorkspaceID == expectedWorkspaceID else { return }
+        }
+        guard activeChatCount() > 0 else { return }
 
         await oracleViewModel.cancelAllActiveSessionStreams()
         guard deletionToken?.isActive ?? true,
@@ -98,8 +106,13 @@ final class AgentModeWorkspaceSwitchSessionProvider: WorkspaceSwitchSessionProvi
     }
 
     func cancelSwitchSessions(for deletionToken: WorkspaceDeletionCancellationToken?) async {
-        guard let agentModeViewModel else { return }
+        guard deletionToken?.isActive ?? true, let agentModeViewModel else { return }
         let expectedWorkspaceID = agentModeViewModel.workspaceManager?.activeWorkspaceID
+        if let deletionToken, deletionToken.workspaceID != expectedWorkspaceID { return }
+        await agentModeViewModel.joinOracleBackgroundWindowDrain()
+        guard deletionToken?.isActive ?? true,
+              agentModeViewModel.workspaceManager?.activeWorkspaceID == expectedWorkspaceID
+        else { return }
         let activeTabs = agentModeViewModel.tabsWithActiveAgentRun
         for tabID in activeTabs {
             await agentModeViewModel.cancelAgentRun(tabID: tabID, completion: .terminalPublished)

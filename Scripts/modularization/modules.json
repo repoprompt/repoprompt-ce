@@ -15,6 +15,12 @@
     "RepoPromptApp": {
       "source_root": "Sources/RepoPrompt",
       "allowed_dependencies": [
+        "RepoPromptClaudeProvider",
+        "RepoPromptAgentProviderContracts",
+        "RepoPromptHTTPProviders",
+        "RepoPromptACPProviders",
+        "RepoPromptCodexProvider",
+        "RepoPromptAIContracts",
         "CSwiftPCRE2",
         "RepoPromptC",
         "RepoPromptCodeMapCore",
@@ -31,7 +37,9 @@
         "RepoPromptProviderQuota",
         "RepoPromptShared",
         "RepoPromptWorkspaceCore",
-        "Sparkle"
+        "Sparkle",
+        "RepoPromptWorkspaceContext",
+        "RepoPromptMCPServer"
       ],
       "test_target": "RepoPromptTests"
     },
@@ -54,6 +62,66 @@
         "RepoPromptCodeMapCore"
       ]
     },
+    "RepoPromptClaudeProvider": {
+      "source_root": "Sources/RepoPromptClaudeProvider",
+      "allowed_dependencies": ["RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptFoundation", "RepoPromptProcess", "RepoPromptProviderQuota"],
+      "test_target": "RepoPromptClaudeProviderTests",
+      "app_free_tests": true
+    },
+    "RepoPromptClaudeProviderTests": {
+      "source_root": "Tests/RepoPromptClaudeProviderTests",
+      "allowed_dependencies": ["RepoPromptClaudeProvider", "RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptProcess"]
+    },
+    "RepoPromptAgentProviderContracts": {
+      "source_root": "Sources/RepoPromptAgentProviderContracts",
+      "allowed_dependencies": ["RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptProviderQuota"],
+      "test_target": "RepoPromptAgentProviderContractsTests",
+      "app_free_tests": true
+    },
+    "RepoPromptAgentProviderContractsTests": {
+      "source_root": "Tests/RepoPromptAgentProviderContractsTests",
+      "allowed_dependencies": ["RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime"]
+    },
+    "RepoPromptHTTPProviders": {
+      "source_root": "Sources/RepoPromptHTTPProviders",
+      "allowed_dependencies": ["RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptFoundation"],
+      "test_target": "RepoPromptHTTPProvidersTests",
+      "app_free_tests": true
+    },
+    "RepoPromptHTTPProvidersTests": {
+      "source_root": "Tests/RepoPromptHTTPProvidersTests",
+      "allowed_dependencies": ["RepoPromptHTTPProviders", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptFoundation"]
+    },
+    "RepoPromptCodexProvider": {
+      "source_root": "Sources/RepoPromptCodexProvider",
+      "allowed_dependencies": ["RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptMCPCore", "RepoPromptProcess", "RepoPromptProviderQuota", "RepoPromptShared", "RepoPromptAgentProviderContracts", "RepoPromptFoundation"],
+      "test_target": "RepoPromptCodexProviderTests",
+      "app_free_tests": true
+    },
+    "RepoPromptCodexProviderTests": {
+      "source_root": "Tests/RepoPromptCodexProviderTests",
+      "allowed_dependencies": ["RepoPromptCodexProvider", "RepoPromptAIContracts", "RepoPromptShared", "RepoPromptDomainRuntime", "RepoPromptProcess"]
+    },
+    "RepoPromptACPProviders": {
+      "source_root": "Sources/RepoPromptACPProviders",
+      "allowed_dependencies": ["RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptFoundation", "RepoPromptMCPCore", "RepoPromptProcess"],
+      "test_target": "RepoPromptACPProvidersTests",
+      "app_free_tests": true
+    },
+    "RepoPromptACPProvidersTests": {
+      "source_root": "Tests/RepoPromptACPProvidersTests",
+      "allowed_dependencies": ["RepoPromptACPProviders", "RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptFileSystem", "RepoPromptFoundation", "RepoPromptProcess"]
+    },
+    "RepoPromptAIContracts": {
+      "source_root": "Sources/RepoPromptAIContracts",
+      "allowed_dependencies": [],
+      "test_target": "RepoPromptAIContractsTests",
+      "app_free_tests": true
+    },
+    "RepoPromptAIContractsTests": {
+      "source_root": "Tests/RepoPromptAIContractsTests",
+      "allowed_dependencies": ["RepoPromptAIContracts"]
+    },
     "RepoPromptProviderQuota": {
       "source_root": "Sources/RepoPromptProviderQuota",
       "allowed_dependencies": [],
@@ -62,11 +130,14 @@
     },
     "RepoPromptProviderQuotaTests": {
       "source_root": "Tests/RepoPromptProviderQuotaTests",
-      "allowed_dependencies": ["RepoPromptProviderQuota"]
+      "allowed_dependencies": [
+        "RepoPromptProviderQuota"
+      ]
     },
     "RepoPromptDomainRuntime": {
       "source_root": "Sources/RepoPromptDomainRuntime",
       "allowed_dependencies": [
+        "RepoPromptAIContracts",
         "RepoPromptC",
         "RepoPromptCodeMapCore",
         "RepoPromptShared",
@@ -78,6 +149,7 @@
     "RepoPromptDomainRuntimeTests": {
       "source_root": "Tests/RepoPromptDomainRuntimeTests",
       "allowed_dependencies": [
+        "RepoPromptAIContracts",
         "RepoPromptDomainRuntime"
       ]
     },
@@ -221,6 +293,7 @@
     "RepoPromptSettingsCore": {
       "source_root": "Sources/RepoPromptSettingsCore",
       "allowed_dependencies": [
+        "RepoPromptAIContracts",
         "RepoPromptFoundation",
         "RepoPromptDomainRuntime",
         "RepoPromptProviderQuota",
@@ -253,6 +326,12 @@
     "RepoPromptTests": {
       "source_root": "Tests/RepoPromptTests",
       "allowed_dependencies": [
+        "RepoPromptClaudeProvider",
+        "RepoPromptAgentProviderContracts",
+        "RepoPromptHTTPProviders",
+        "RepoPromptACPProviders",
+        "RepoPromptCodexProvider",
+        "RepoPromptAIContracts",
         "RepoPromptApp",
         "RepoPromptCodeMapCore",
         "RepoPromptDomainRuntime",
@@ -268,7 +347,10 @@
         "RepoPromptProviderQuota",
         "RepoPromptShared",
         "RepoPromptTestSupport",
-        "RepoPromptWorkspaceCore"
+        "RepoPromptWorkspaceCore",
+        "RepoPromptWorkspaceContext",
+        "RepoPromptWorkspaceContextTestSupport",
+        "RepoPromptMCPServer"
       ]
     },
     "RepoPromptWorkspaceCore": {
@@ -309,9 +391,321 @@
         "RepoPromptSettingsCore",
         "RepoPromptProviderQuota"
       ]
+    },
+    "RepoPromptWorkspaceContext": {
+      "source_root": "Sources/RepoPromptWorkspaceContext",
+      "allowed_dependencies": [
+        "RepoPromptC",
+        "RepoPromptCodeMapCore",
+        "RepoPromptDomainRuntime",
+        "RepoPromptFileSystem",
+        "RepoPromptFoundation",
+        "RepoPromptInstrumentation",
+        "RepoPromptPersistence",
+        "RepoPromptRegexCore",
+        "RepoPromptSettingsCore",
+        "RepoPromptShared",
+        "RepoPromptVCS",
+        "RepoPromptWorkspaceCore"
+      ],
+      "test_target": "RepoPromptWorkspaceContextTests",
+      "app_free_tests": true
+    },
+    "RepoPromptWorkspaceContextTestSupport": {
+      "source_root": "Tests/RepoPromptWorkspaceContextTestSupport",
+      "allowed_dependencies": [
+        "RepoPromptWorkspaceContext",
+        "RepoPromptCodeMapCore",
+        "RepoPromptFileSystem",
+        "RepoPromptFoundation",
+        "RepoPromptPersistence",
+        "RepoPromptVCS"
+      ]
+    },
+    "RepoPromptWorkspaceContextTests": {
+      "source_root": "Tests/RepoPromptWorkspaceContextTests",
+      "allowed_dependencies": [
+        "RepoPromptWorkspaceContext",
+        "RepoPromptWorkspaceContextTestSupport",
+        "RepoPromptCodeMapCore",
+        "RepoPromptFileSystem",
+        "RepoPromptFoundation",
+        "RepoPromptPersistence",
+        "RepoPromptWorkspaceCore"
+      ]
+    },
+    "RepoPromptMCPServer": {
+      "source_root": "Sources/RepoPromptMCPServer",
+      "allowed_dependencies": [
+        "RepoPromptDomainRuntime",
+        "RepoPromptShared",
+        "RepoPromptInstrumentation"
+      ],
+      "test_target": "RepoPromptMCPServerTests",
+      "app_free_tests": true
+    },
+    "RepoPromptMCPServerTests": {
+      "source_root": "Tests/RepoPromptMCPServerTests",
+      "allowed_dependencies": [
+        "RepoPromptMCPServer",
+        "RepoPromptDomainRuntime",
+        "RepoPromptShared",
+        "RepoPromptInstrumentation"
+      ]
     }
   },
   "moved_families": {
+    "M8RetiredRepoPromptACPProviders": {
+      "owner": "RepoPromptACPProviders",
+      "former_app_files": [
+        "Sources/RepoPrompt/Features/AgentMode/Models/ModelSelection/AgentACPModelRegistry.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Antigravity/AntigravityACPAgentProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Antigravity/AntigravityACPModelPollingService.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Cursor/CursorACPAgentProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Cursor/CursorACPEventNormalizer.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Cursor/CursorACPHeadlessAgentProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Cursor/CursorACPLaunchResolver.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Cursor/CursorACPModelPollingService.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Cursor/CursorAgentConfig.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Cursor/CursorCLIProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Devin/DevinACPAgentProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Devin/DevinACPLaunchResolver.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Devin/DevinAgentConfig.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Devin/DevinModelCatalog.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/GrokBuild/GrokBuildACPAgentProvider+DirectModels.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/GrokBuild/GrokBuildACPAgentProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/GrokBuild/GrokBuildACPEventNormalizer.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/GrokBuild/GrokBuildACPLaunchResolver.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/GrokBuild/GrokBuildACPModelPollingService.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/GrokBuild/GrokBuildAgentConfig.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/GrokBuild/GrokBuildDirectEffortWireState.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/OpenCode/OpenCodeACPHeadlessAgentProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/OpenCode/OpenCodeACPLaunchResolver.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/OpenCode/OpenCodeACPModelPollingService.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/OpenCode/OpenCodeAgentConfig.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/OpenCode/OpenCodeCLIProvider.swift"
+      ]
+    },
+    "M8RetiredRepoPromptAIContracts": {
+      "owner": "RepoPromptAIContracts",
+      "former_app_files": [
+        "Sources/RepoPrompt/Features/AgentMode/Runtime/ProviderBindings/AgentProviderBindingID.swift"
+      ]
+    },
+    "M8RetiredRepoPromptAgentProviderContracts": {
+      "owner": "RepoPromptAgentProviderContracts",
+      "former_app_files": [
+        "Sources/RepoPrompt/Features/AgentMode/Providers/HeadlessAgentProvider.swift"
+      ]
+    },
+    "M8RetiredRepoPromptClaudeProvider": {
+      "owner": "RepoPromptClaudeProvider",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/ClaudeCLITextStreamDecoder.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCodeAgentProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCodeProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/ClaudeResultMessage.swift"
+      ]
+    },
+    "M8RetiredRepoPromptHTTPProviders": {
+      "owner": "RepoPromptHTTPProviders",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/OpenAIResponseModeParameters.swift"
+      ]
+    },
+    "GrokBuildAndDevinConsumerExecution": {
+      "owner": "RepoPromptACPProviders",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/GrokBuild/GrokBuildCLIProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/GrokBuild/GrokBuildACPHeadlessAgentProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/GrokBuild/GrokBuildOneShotHeadlessAgentProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Devin/DevinCLIProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Devin/DevinACPHeadlessAgentProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/GrokBuildDevinProviderHosts.swift"
+      ]
+    },
+    "ClaudeNativeSessionExecution": {
+      "owner": "RepoPromptClaudeProvider",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/SDK/ClaudeNativeProcessSessionController.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/SDK/ClaudeNativeSessionHost.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/SDK/ClaudeNativeTurnCorrelation.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/SDK/ClaudeSDKNDJSONTranslator.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/SDK/ClaudeSDKProtocolCodec.swift"
+      ]
+    },
+    "ClaudeNativeLaunchEnvironmentResolving": {
+      "owner": "RepoPromptClaudeProvider",
+      "former_app_files": ["Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/SDK/ClaudeNativeLaunchEnvironmentResolving.swift"]
+    },
+    "ClaudeCodeAgentConfigValue": {
+      "owner": "RepoPromptClaudeProvider",
+      "former_app_files": ["Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/ClaudeCodeAgentConfigValue.swift"]
+    },
+    "AgentCLIToolContext": {
+      "owner": "RepoPromptAIContracts",
+      "former_app_files": ["Sources/RepoPrompt/Infrastructure/AI/Providers/AgentCLIToolContext.swift"]
+    },
+    "ClaudeCompatibleInfrastructureBridge": {
+      "owner": "RepoPromptClaudeProvider",
+      "former_app_files": ["Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/ClaudeCompatibleProviderRuntimeBridgeCore.swift"]
+    },
+    "RemainingHTTPExecutionFamily": {
+      "owner": "RepoPromptHTTPProviders",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/AzureOpenAIProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/AnthropicProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/OpenRouterProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/CustomOpenai/CustomOpenAIProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/CustomOpenai/CustomOpenAIProviderError+FriendlyString.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/OpenRouterHTTPConfiguration.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/RemainingHTTPProviderHosts.swift"
+      ]
+    },
+    "OpenAIHTTPExecutionFamily": {
+      "owner": "RepoPromptHTTPProviders",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/OpenAIProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/DeepseekProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/FireworksProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/GeminiProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/GrokProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/GroqProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/ZAIProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/OllamaProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/OpenAIProviderHost.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/AIMessage+OpenAIEncoding.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/ResponsesJobProvider.swift"
+      ]
+    },
+    "ProviderTransportActivity": {
+      "owner": "RepoPromptDomainRuntime",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/ProviderTransportActivity.swift"
+      ]
+    },
+    "AIModelIdentityAndProviderVocabulary": {
+      "owner": "RepoPromptAIContracts",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/AI/AIModelIdentity.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/ClaudeModelIdentityNormalization.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/AIProviderType.swift"
+      ]
+    },
+    "AIProviderProtocol": {
+      "owner": "RepoPromptAgentProviderContracts",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/AIProvider.swift"
+      ]
+    },
+    "CodexControllerContentValues": {
+      "owner": "RepoPromptDomainRuntime",
+      "former_app_files": [
+        "Sources/RepoPrompt/Features/AgentMode/Models/AgentContextUsage.swift",
+        "Sources/RepoPrompt/Features/AgentMode/Models/CodexInteractionValues.swift"
+      ]
+    },
+    "CodexControllerPermissionValues": {
+      "owner": "RepoPromptAIContracts",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/Shared/CodexControllerPermissionValues.swift"
+      ]
+    },
+    "NativeAgentRuntimeContracts": {
+      "owner": "RepoPromptAgentProviderContracts",
+      "former_app_files": [
+        "Sources/RepoPrompt/Features/AgentMode/Runtime/Native/NativeAgentRuntimeContracts.swift",
+        "Sources/RepoPrompt/Features/AgentMode/Runtime/Native/NativeAgentRuntimeValues.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Models/NativeAgentRuntimeConfiguration.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/ClaudeCodeEffortLevel.swift"
+      ]
+    },
+    "ACPSessionControllerAndHeadlessBridge": {
+      "owner": "RepoPromptACPProviders",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/AI/ACP/ACPAgentSessionController.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/ACP/ACPAgentSessionHost.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/ACPHeadlessAgentProviderBridge.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/ACPHeadlessProviderLifecycle.swift"
+      ]
+    },
+    "CodexAppServerTransport": {
+      "owner": "RepoPromptCodexProvider",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/AppServer/CodexAppServerClient.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/AppServer/CodexProcessStderrCapture.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/AppServer/CodexAppServerLaunchHost.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/AppServer/CodexProviderRuntime.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/AppServer/CodexProcessConfiguration.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/Shared/CodexCapabilitySettings.swift"
+      ]
+    },
+    "CodexExecExecution": {
+      "owner": "RepoPromptCodexProvider",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/CodexExecAgentProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/CodexExecAgentConfig.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/CodexExecAgentHost.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/CodexExecServerEntry.swift",
+        "Sources/RepoPrompt/Features/AgentMode/Runtime/Codex/CodexExecDiagnosticNoiseFilter.swift"
+      ]
+    },
+    "DomainXMLDiffParser": {
+      "owner": "RepoPromptDomainRuntime",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/Diffing/DiffParser.swift",
+        "Sources/RepoPrompt/Infrastructure/Diffing/DiffParserFileSource.swift"
+      ]
+    },
+    "DomainToolResultRetention": {
+      "owner": "RepoPromptDomainRuntime",
+      "former_app_files": ["Sources/RepoPrompt/Features/AgentMode/Runtime/ToolTracking/AgentToolResultPayloadRetention.swift"]
+    },
+    "DomainMCPServerConfiguration": {
+      "owner": "RepoPromptDomainRuntime",
+      "former_app_files": ["Sources/RepoPrompt/Infrastructure/MCP/RepoPromptMCPServerConfiguration.swift"]
+    },
+    "AIProviderError": {
+      "owner": "RepoPromptAIContracts",
+      "former_app_files": ["Sources/RepoPrompt/Infrastructure/AI/Providers/AIProviderError.swift"]
+    },
+    "ACPProviderContractsAndOpenCode": {
+      "owner": "RepoPromptACPProviders",
+      "former_app_files": [
+        "Sources/RepoPrompt/Features/AgentMode/Providers/ACP/ACPAgentProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/ACP/ACPSessionUpdateNormalization.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/ACP/ACPToolNameResolution.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/OpenCode/OpenCodeACPAgentProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/OpenCode/OpenCodeACPEventNormalizer.swift"
+      ]
+    },
+    "DomainChangeApplication": {
+      "owner": "RepoPromptDomainRuntime",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/Diffing/FileChange.swift",
+        "Sources/RepoPrompt/Infrastructure/Diffing/ChangeManager.swift",
+        "Sources/RepoPrompt/Infrastructure/Diffing/ChangeApplier.swift",
+        "Sources/RepoPrompt/Infrastructure/Diffing/OptimalLineFinderUtility.swift"
+      ]
+    },
+    "AINeutralModelValues": {
+      "owner": "RepoPromptAIContracts",
+      "former_app_files": [
+        "Sources/RepoPromptSettingsCore/AgentModelSelectionID.swift",
+        "Sources/RepoPromptSettingsCore/AgentModelParameterValues.swift"
+      ]
+    },
+    "AIModelInterpretationKernel": {
+      "owner": "RepoPromptAIContracts",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/AI/ModelCatalog/ReasoningEffort.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/ModelCatalog/ModelCatalogValues.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/ModelCatalog/ModelCatalogMapper.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/ModelCatalog/ModelCatalogSemantics.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/AppOnly/CodexModelSpecifier.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/Shared/CodexServiceTierVariantCatalog.swift"
+      ]
+    },
     "DomainProviderContent": {
       "owner": "RepoPromptDomainRuntime",
       "former_app_files": [
@@ -481,6 +875,43 @@
       "former_app_files": [
         "Sources/RepoPrompt/Features/Settings/Models/GlobalSettingsDocument.swift",
         "Sources/RepoPrompt/Features/Settings/Models/GlobalSettingsFileStore.swift"
+      ]
+    },
+    "WorkspaceContext": {
+      "owner": "RepoPromptWorkspaceContext",
+      "former_app_roots": [
+        "Sources/RepoPrompt/Infrastructure/WorkspaceContext",
+        "Sources/RepoPrompt/Features/Search",
+        "Sources/RepoPrompt/Features/CodeMap"
+      ],
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemSeedPlan+AppIntegration.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitBlobIdentityService.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitBlobSourceMaterializationService.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitPrefixControlEvidenceManifest.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitTargetEvidenceManifestStore.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitTargetEvidenceManifests.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitTargetEvidenceStreamingParsers.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitWorkspaceMetadataMonitor.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitWorkspacePolicyCanonicalizationDiagnostics.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitWorkspaceStateAuthority.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitWorktreeInitializationModels.swift"
+      ]
+    },
+    "MCPServerTransport": {
+      "owner": "RepoPromptMCPServer",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/MCP/UnixSocketMCPTransport.swift",
+        "Sources/RepoPrompt/Infrastructure/MCP/MCPDiagnostics.swift",
+        "Sources/RepoPrompt/Infrastructure/MCP/AppShared/NewlineDelimitedSocketReader.swift",
+        "Sources/RepoPrompt/Infrastructure/MCP/MCPRequestTimelineRegistry.swift",
+        "Sources/RepoPrompt/Infrastructure/MCP/MCPLifecycleDiagnostics.swift",
+        "Sources/RepoPrompt/Infrastructure/MCP/MCPToolExecutionDiagnosticMapping.swift",
+        "Sources/RepoPrompt/Infrastructure/MCP/BootstrapSocketConnectionManager.swift",
+        "Sources/RepoPrompt/Infrastructure/MCP/BootstrapSocketServer.swift",
+        "Sources/RepoPrompt/Infrastructure/MCP/BootstrapSocketOwnership.swift",
+        "Sources/RepoPrompt/Infrastructure/MCP/AppShared/MCPBootstrapMessages.swift",
+        "Sources/RepoPrompt/Infrastructure/MCP/RepoPromptMCPInstructions.swift"
       ]
     }
   }

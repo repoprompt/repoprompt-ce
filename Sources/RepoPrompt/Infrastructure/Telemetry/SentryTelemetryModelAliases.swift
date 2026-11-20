@@ -1,3 +1,4 @@
+import RepoPromptAIContracts
 import RepoPromptInstrumentation
 
 extension SentryTelemetryBootstrap {

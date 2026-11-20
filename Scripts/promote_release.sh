@@ -77,27 +77,25 @@ PRIMARY_ARTIFACT_NAME=""
 PRIMARY_ARTIFACT=""
 ROLLOUT_MANIFEST=""
 
-# The reviewed release-rollout.json in the tagged source is the single role
-# authority. PR2 promotes legacy/preparer application releases only; the
-# transition and successor roles fail unconditionally until successor rollout
-# enablement, with no override.
+# The tagged declaration is the single activation authority; schema-2 T/S
+# explicitly retain the shared preparer. Adoption has a separate no-build path.
 resolve_release_artifact_role() {
     require_file "$ROLLOUT_DECLARATION"
     require_file "$APPLE_IDENTITY_POLICY"
     require_file "$STABLE_ROLLOUT_TOOL"
     RELEASE_ARTIFACT_ROLE="$(python3 "$STABLE_ROLLOUT_TOOL" current-role --declaration "$ROLLOUT_DECLARATION")"
     case "$RELEASE_ARTIFACT_ROLE" in
-    legacy | preparer)
+    legacy | preparer | successor)
         PRIMARY_ARTIFACT_NAME="$UPDATE_ZIP_NAME"
         ;;
-    transition | successor)
-        fail "Stable promotion for the $RELEASE_ARTIFACT_ROLE rollout role is dormant until successor rollout enablement"
+    transition)
+        PRIMARY_ARTIFACT_NAME="$PKG_NAME"
         ;;
     *)
         fail "Unsupported rollout role: $RELEASE_ARTIFACT_ROLE"
         ;;
     esac
-    python3 "$STABLE_ROLLOUT_TOOL" workflow-guard \
+    python3 "$STABLE_ROLLOUT_TOOL" workflow-guard --operation promote \
         --declaration "$ROLLOUT_DECLARATION" \
         --policy "$APPLE_IDENTITY_POLICY"
 }
@@ -461,6 +459,8 @@ validate_app_bundle() {
         --arch all \
         --bundle "$app_bundle/Contents/Resources/BundledRuntimes/Codex" \
         --signed-team-identifier "$SIGNING_TEAM_ID"
+    "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_vendor.sh" --packaged-layout \
+        "$app_bundle/Contents/Frameworks/Sparkle.framework"
     validate_embedded_mcp_helper_layout "$app_bundle" "Reviewed ZIP MCP helper layout"
     "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" \
         "$app_bundle" \
@@ -482,6 +482,8 @@ validate_dmg_matches_zip_app() {
     [[ -d "$dmg_app" ]] || fail "DMG does not contain $DISTRIBUTION_APP_BUNDLE_NAME at its root"
     diff -qr "$APP_BUNDLE" "$dmg_app" ||
         fail "DMG app contents do not match the verified update ZIP app"
+    "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_vendor.sh" --packaged-layout \
+        "$dmg_app/Contents/Frameworks/Sparkle.framework"
     validate_embedded_mcp_helper_layout "$dmg_app" "Mounted DMG MCP helper layout"
     python3 "$CONTROL_PLANE_SCRIPTS_DIR/codex_runtime_artifact.py" \
         --manifest "$ROOT_DIR/Vendor/Codex/manifest.json" verify-bundle \
@@ -503,14 +505,23 @@ validate_dmg_matches_zip_app() {
 
 validate_appcast() {
     require_resolved_role
+    local predecessor_args=(--declaration "$ROLLOUT_DECLARATION") predecessor_role predecessor_tag predecessor_digest predecessor_channel repository
+    source "$CONTROL_PLANE_SCRIPTS_DIR/release_observation.sh"
+    mkdir -p "$TMP_DIR/predecessors"
+    while IFS=$'\t' read -r predecessor_role predecessor_tag predecessor_digest predecessor_channel; do
+        [[ -n "$predecessor_tag" ]] || continue
+        repository="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sparkle"]["tipUpdateRepository" if sys.argv[2] == "tip" else "updateRepository"])' "$APPLE_IDENTITY_POLICY" "${predecessor_channel:-stable}")"
+        OBSERVATION_GH_TOKEN="$SOURCE_GH_TOKEN" fetch_observed_rollout_pair "$repository" "$predecessor_tag" "${predecessor_channel:-stable}" "$TMP_DIR/predecessors/$predecessor_role"
+        [[ "$(shasum -a 256 "$TMP_DIR/predecessors/$predecessor_role/manifest.json" | awk '{print $1}')" == "$predecessor_digest" ]] || fail "Predecessor manifest digest mismatch"
+        predecessor_args+=(--predecessor-manifest "$TMP_DIR/predecessors/$predecessor_role/manifest.json")
+    done < <(python3 "$STABLE_ROLLOUT_TOOL" predecessor-values --declaration "$ROLLOUT_DECLARATION")
     python3 "$STABLE_ROLLOUT_TOOL" validate \
-        --declaration "$ROLLOUT_DECLARATION" \
         --policy "$APPLE_IDENTITY_POLICY" \
         --version-env "$ROOT_DIR/version.env" \
         --release-tag "$RELEASE_TAG" \
         --release-commit "$RELEASE_COMMIT" \
         --migration-phase "$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['expectedMigrationPhase'])" "$ROLLOUT_DECLARATION")" \
-        --allowed-roles legacy,preparer \
+        "${predecessor_args[@]}" \
         --enclosure "$PRIMARY_ARTIFACT" \
         --app-artifact-manifest "$ARTIFACT_MANIFEST" \
         --appcast "$APPCAST" \
@@ -567,14 +578,20 @@ verify_sibling_enclosures() {
             fail "Sibling enclosure digest mismatch for $url"
         xcrun swift "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_signature.swift" \
             "$committed_public_key_file" "$signature" "$sibling_asset"
-        sibling_manifest="$sibling_dir/$position-$manifest_name"
-        curl_anonymous \
-            "https://github.com/$PUBLIC_UPDATE_REPOSITORY/releases/download/$tag/$manifest_name" \
-            --output "$sibling_manifest"
+        sibling_manifest="$TMP_DIR/predecessors/$role/manifest.json"
         actual_digest="$(shasum -a 256 "$sibling_manifest" | awk '{ print $1 }')"
         [[ "$actual_digest" == "$manifest_sha256" ]] ||
             fail "Sibling rollout manifest digest mismatch for tag $tag"
     done < "$sibling_values"
+}
+
+extract_reviewed_update() {
+    if [[ "$RELEASE_ARTIFACT_ROLE" == transition ]]; then
+        REPOPROMPT_ENABLE_IDENTITY_TRANSITION_PKG=1 \
+            "$CONTROL_PLANE_SCRIPTS_DIR/build_identity_transition_pkg.sh" validate "$PRIMARY_ARTIFACT" --expanded-payload-dir "$EXTRACT_DIR"
+    else
+        ditto -x -k "$UPDATE_ZIP" "$EXTRACT_DIR"
+    fi
 }
 
 verify_source_release() {
@@ -649,13 +666,15 @@ verify_source_release() {
     ROLLOUT_MANIFEST="$SOURCE_ASSETS_DIR/$ROLLOUT_MANIFEST_NAME"
     validate_checksum_manifest
 
-    ditto -x -k "$UPDATE_ZIP" "$EXTRACT_DIR"
+    extract_reviewed_update
     [[ -d "$EXTRACT_DIR/$DISTRIBUTION_APP_BUNDLE_NAME" ]] ||
         fail "Update ZIP must contain $DISTRIBUTION_APP_BUNDLE_NAME at its root"
     APP_BUNDLE="$EXTRACT_DIR/$DISTRIBUTION_APP_BUNDLE_NAME"
     validate_app_bundle "$APP_BUNDLE" "$ARTIFACT_MANIFEST"
-    xcrun stapler validate "$DMG"
-    validate_dmg_matches_zip_app
+    if release_role_ships_dmg; then
+        xcrun stapler validate "$DMG"
+        validate_dmg_matches_zip_app
+    fi
 
     local info_plist="$APP_BUNDLE/Contents/Info.plist"
     local bundle_identifier marketing_version build_number feed_url
@@ -690,9 +709,19 @@ recheck_source_assets() {
         fail "Source release assets changed after verification; rerun promotion from a fresh review"
 }
 
+verify_tip_handoff() {
+    source "$CONTROL_PLANE_SCRIPTS_DIR/release_observation.sh"
+    local tip_repository
+    tip_repository="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sparkle"]["tipUpdateRepository"])' "$APPLE_IDENTITY_POLICY")"
+    OBSERVATION_GH_TOKEN="$PUBLIC_UPDATE_GH_TOKEN" fetch_observed_rollout_pair "$tip_repository" latest tip "$TMP_DIR/live-tip"
+    python3 "$STABLE_ROLLOUT_TOOL" validate-stable-tip-floor --policy "$APPLE_IDENTITY_POLICY" \
+        --stable-appcast "$APPCAST" --stable-manifest "$ROLLOUT_MANIFEST" \
+        --tip-appcast "$TMP_DIR/live-tip/appcast.xml" --tip-manifest "$TMP_DIR/live-tip/manifest.json"
+}
+
 verify_strictly_newer_build() {
     local latest_json_file="$TMP_DIR/latest-release.json"
-    local latest_status latest_json latest_tag latest_appcast latest_build
+    local latest_status
     validate_release_download_bounds
     [[ -n "$TMP_DIR" ]] || fail "Updater API access requires verified promotion state"
     # Keep the bearer header out of process arguments. Tokens cannot inject config lines.
@@ -716,25 +745,18 @@ verify_strictly_newer_build() {
         fail "Unable to query the current stable updater release"
     fi
     if [[ "$latest_status" == "404" ]]; then
+        # Even the first Stable publication cannot bypass Tip's role/bridge gate.
+        verify_tip_handoff
         return
     fi
     [[ "$latest_status" == "200" ]] ||
         fail "Unable to query the current stable updater release: HTTP $latest_status"
-    latest_json="$(cat "$latest_json_file")"
-    latest_tag="$(jq -r .tag_name <<< "$latest_json")"
-    if [[ "$latest_tag" == "$RELEASE_TAG" ]]; then
-        return 0
-    fi
-
-    latest_appcast="$TMP_DIR/latest-appcast.xml"
-    curl_anonymous \
-        "https://github.com/$PUBLIC_UPDATE_REPOSITORY/releases/download/$latest_tag/$APPCAST_NAME" \
-        --output "$latest_appcast"
-    latest_build="$(python3 "$STABLE_ROLLOUT_TOOL" max-build --appcast "$latest_appcast")"
-    [[ "$BUILD_NUMBER" =~ ^[0-9]+$ && "$latest_build" =~ ^[0-9]+$ ]] ||
-        fail "Stable build numbers must be numeric: current=$BUILD_NUMBER latest=$latest_build"
-    (( BUILD_NUMBER > latest_build )) ||
-        fail "Stable promotion requires BUILD_NUMBER > $latest_build, got $BUILD_NUMBER"
+    source "$CONTROL_PLANE_SCRIPTS_DIR/release_observation.sh"
+    OBSERVATION_GH_TOKEN="$PUBLIC_UPDATE_GH_TOKEN" fetch_observed_rollout_pair "$PUBLIC_UPDATE_REPOSITORY" latest stable "$TMP_DIR/live-stable"
+    python3 "$STABLE_ROLLOUT_TOOL" validate-live-stable-progression \
+        --policy "$APPLE_IDENTITY_POLICY" --candidate-manifest "$ROLLOUT_MANIFEST" --candidate-appcast "$APPCAST" \
+        --live-manifest "$TMP_DIR/live-stable/manifest.json" --live-appcast "$TMP_DIR/live-stable/appcast.xml"
+    verify_tip_handoff
 }
 
 verify_existing_update_release() {
@@ -822,6 +844,7 @@ publish_reviewed_release() {
     recheck_source_assets
     recheck_update_assets
     verify_reviewed_checksums_digest
+    verify_strictly_newer_build
 
     update_gh release edit "$RELEASE_TAG" \
         --repo "$PUBLIC_UPDATE_REPOSITORY" \

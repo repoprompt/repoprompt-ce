@@ -1,82 +1,62 @@
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
 
 extension AgentModeViewModel {
+    /// Refresh only for registry lifecycle mutations, keeping process scans out of rendering.
+    func refreshOracleBackgroundCancelTarget(owner: OracleBackgroundInvocationRegistry.Owner) {
+        let tabID = owner.binding.tabID
+        let sessionOwnsWork = sessions[tabID].map { $0.oracleBackgroundOwner == owner && $0.persistentSessionBindingIdentity == owner.binding } ?? false
+        guard sessionOwnsWork || oracleBackgroundLiveEpochs[owner] != nil else { return }
+        let registry = oracleBackgroundRegistry
+        let epoch = !registry.admissionIsClosed(for: owner) && registry.hasLiveOwner(owner)
+            ? registry.awarenessVersion(for: owner).epoch : nil
+        guard oracleBackgroundLiveEpochs[owner] != epoch else { return }
+        oracleBackgroundLiveEpochs[owner] = epoch
+        if tabID == currentTabID { syncComposerUIState(tabID: tabID) }
+    }
+
+    func composerOracleBackgroundCancelTarget(tabID: UUID?) -> OracleBackgroundCancelTarget? {
+        guard let tabID, let session = sessions[tabID], !session.runState.isActive,
+              session.activeRunAttemptID == nil, !session.bindingTransitionInProgress,
+              freshTaskRoutingByTabID[tabID] == nil,
+              let owner = session.oracleBackgroundOwner,
+              session.persistentSessionBindingIdentity == owner.binding,
+              workspaceManager?.activeWorkspaceID == owner.workspaceID,
+              let epoch = oracleBackgroundLiveEpochs[owner],
+              !oracleBackgroundRegistry.admissionIsClosed(for: owner),
+              oracleBackgroundRegistry.awarenessVersion(for: owner).epoch == epoch
+        else { return nil }
+        return .init(owner: owner, epoch: epoch, session: session, parentTerminalCommitID: session.lastTerminalCommitRevision?.commitID)
+    }
+
+    @discardableResult
+    func cancelOracleBackground(target: OracleBackgroundCancelTarget) async -> Bool {
+        let tabID = target.owner.binding.tabID
+        guard composerOracleBackgroundCancelTarget(tabID: tabID) == target,
+              let session = sessions[tabID],
+              let drain = runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).closeOracleBackground(for: session)
+        else { return false }
+        _ = await OracleBackgroundInvocationRegistry.awaitDrain(drain, timeout: 30)
+        return true
+    }
+
     /// The guarded target behind the composer Stop button; `nil` when there is nothing to stop.
     func composerRunCancelTarget(tabID: UUID?) -> AgentRunCancelTarget? {
-        guard let tabID,
-              let session = sessions[tabID],
-              session.runState.isActive,
+        guard let tabID, let session = sessions[tabID] else { return nil }
+        if session.composerStartCancellation?.canWithdraw(on: session) == true {
+            return makeRunCancelTarget(tabID: tabID, session: session)
+        }
+        guard session.runState.isActive,
               session.runState != .waitingForUser,
               session.runID != nil
         else { return nil }
         return makeRunCancelTarget(tabID: tabID, session: session)
     }
 
-    func makeComposerProps(tabID explicitTabID: UUID? = nil) -> AgentComposerProps {
-        let tabID = explicitTabID ?? currentTabID
-        let session = tabID.flatMap { sessions[$0] }
-        let isMCPControlled = isMCPControlled(tabID: tabID)
-        let isCodexRunActive: Bool = {
-            guard selectedAgent == .codexExec, let tabID else { return false }
-            return isTabRunning(tabID)
-        }()
-        let cancelTarget = composerRunCancelTarget(tabID: tabID)
-        let submitTarget = makeComposerSubmitTarget(tabID: tabID, session: session)
-        let acpControls = acpModelParameterControls(session: session)
-        // Cursor's catalog can refresh while a run is active. Metadata disappearing must
-        // not unlock a model/configuration already captured by that run.
-        let acpRunLocksModelControls = session?.runState.isActive == true
-            && (selectedAgent == .cursor || !acpControls.isEmpty)
-        let routerControlsFreshTask = session.map(isGlobalModelRouterControllingFreshTask) ?? false
-        let selectedRouterServiceID = routerControlsFreshTask
-            ? modelRouterSettingsStore.modelRouterConfiguration().selectedBackendID : nil
-        let automaticRouterServiceName = selectedRouterServiceID.flatMap { modelRouterRuntime?.serviceDisplayNamesByID[$0] }
-        let autoEffortConfiguration = modelRouterSettingsStore.autoEffortConfiguration()
-        let autoEffortServiceName = autoEffortConfiguration.enabled
-            ? autoEffortConfiguration.selectedBackendID.flatMap { modelRouterRuntime?.serviceDisplayNamesByID[$0] } ?? "Unavailable service"
-            : nil
-        return AgentComposerProps(
-            computerUse: computerUseComposerProps(session: session),
-            imageAttachmentNotice: imageAttachmentNotice,
-            currentTabID: tabID,
-            submitTarget: submitTarget,
-            attachments: AgentAttachmentStripSnapshot(
-                scopeTabID: tabID,
-                attachments: pendingFileAttachments,
-                taggedFileAttachments: pendingTaggedFileAttachments
-            ),
-            runState: runState,
-            cancelTarget: cancelTarget,
-            isAgentBusy: isAgentBusy,
-            isWaitingForInstruction: isWaitingForInstruction,
-            canUseLinkedAgentSession: hasLinkedAgentSession(for: tabID),
-            isCurrentTabMCPControlled: isMCPControlled,
-            areModelControlsDisabled: isMCPControlled || acpRunLocksModelControls || routerControlsFreshTask,
-            providerControls: activeProviderControlsBinding,
-            isCodexRunActive: isCodexRunActive,
-            hasAvailableAgentProviders: hasAvailableAgentProviders,
-            canSendWithCurrentProvider: canSendWithCurrentProvider,
-            isRoutingFreshTask: tabID.map { freshTaskRoutingByTabID[$0] != nil } ?? false,
-            isGlobalModelRouterControllingFreshTask: routerControlsFreshTask,
-            automaticRouterServiceName: automaticRouterServiceName,
-            autoEffortServiceName: autoEffortServiceName,
-            unavailableSelectedAgentMessage: unavailableSelectedAgentMessage,
-            selectedAgent: selectedAgent,
-            selectedModelRaw: selectedModelRaw,
-            selectedModelDisplayName: selectedModelDisplayName,
-            selectedReasoningEffortRaw: selectedReasoningEffortRaw,
-            selectedReasoningEffortDisplayName: selectedReasoningEffortDisplayName,
-            acpModelParameterControls: acpControls,
-            availableAgents: availableAgents,
-            isProviderPickerLockedForCurrentTab: isProviderPickerLocked(tabID: tabID),
-            lockedAgentSelectionMessage: lockedAgentSelectionMessage(tabID: tabID),
-            autoEditEnabled: autoEditEnabled,
-            stagedSlashCommand: stagedSlashCommandProps(tabID: tabID),
-            draftRestorationEvent: draftRestorationEvent.map(AgentDraftRestorationProps.init),
-            fileTagLookupContextIdentity: agentWorkspaceLookupContextIdentity(tabID: tabID, session: session)
-        )
+    func makeComposerProps(tabID: UUID? = nil) -> AgentComposerProps {
+        AgentComposerProjection.props(vm: self, subject: .currentTab, tabID: tabID)
     }
 
     /// Pure presentation: no companion lookup, configuration IO, or permission probing.
@@ -91,7 +71,9 @@ extension AgentModeViewModel {
         )
     }
 
-    private func acpModelParameterControls(session: TabSession?) -> [AgentComposerModelParameterControlProps] {
+    func acpModelParameterControls(session: TabSession?, agent: AgentProviderKind? = nil, model: String? = nil, parameterSelections: [ACPModelParameterSelection]? = nil) -> [AgentComposerModelParameterControlProps] {
+        let selectedAgent = agent ?? selectedAgent
+        let selectedModelRaw = model ?? selectedModelRaw
         guard let providerID = selectedAgent.acpProviderID else { return [] }
         // Pure projection over the held demand-scoped observation (OpenCode) or the
         // runtime Cursor snapshot. Never invent choices or launch discovery here. While the OpenCode observation
@@ -117,7 +99,7 @@ extension AgentModeViewModel {
         let resolved = ACPModelParameterResolver.resolve(
             providerID: providerID,
             selectedModelRaw: selectedModelRaw,
-            persistedSelections: session?.acpModelParameterSelections ?? [],
+            persistedSelections: session?.acpModelParameterSelections ?? parameterSelections ?? [],
             workspacePath: workspacePath,
             openCodeParameters: providerID == .openCode ? openCodeModelParameterObservation : nil
         )
@@ -129,7 +111,7 @@ extension AgentModeViewModel {
                 configID: parameter.definition.configID,
                 displayName: parameter.definition.displayName,
                 selectedValueRaw: parameter.selectedChoice.rawValue,
-                savedValueRaw: ACPModelParameterResolver.effectiveSelections(providerID: providerID, selectedModelRaw: selectedModelRaw, persistedSelections: session?.acpModelParameterSelections ?? []).last {
+                savedValueRaw: ACPModelParameterResolver.effectiveSelections(providerID: providerID, selectedModelRaw: selectedModelRaw, persistedSelections: session?.acpModelParameterSelections ?? parameterSelections ?? []).last {
                     $0.identity == ACPModelParameterIdentity(providerID: providerID, baseModelRaw: parameter.baseModelRaw, kind: parameter.definition.kind)
                 }?.valueRaw,
                 selectedDisplayName: parameter.selectedChoice.displayName,
@@ -162,8 +144,12 @@ extension AgentModeViewModel {
         let expectedSourceAgentSessionID = composerSourceAgentSessionID(tabID: tabID, session: resolvedSession)
         let hasLinkedSession = hasLinkedAgentSession(for: tabID)
         let route: AgentComposerSubmitTarget.Route
+        let writerIdentity: AgentSessionRuntimeStore.WriterIdentity?
         if hasLinkedSession {
-            guard expectedSourceAgentSessionID != nil else { return nil }
+            guard let sessionID = expectedSourceAgentSessionID,
+                  let command = try? runtimeCommand(sessionID: sessionID),
+                  command.writer.session === resolvedSession else { return nil }
+            writerIdentity = command.identity
             route = .existingAgentSession
         } else {
             guard expectedSourceAgentSessionID == nil else { return nil }
@@ -171,6 +157,7 @@ extension AgentModeViewModel {
                   resolvedSession.runID == nil,
                   resolvedSession.activeRunAttemptID == nil
             else { return nil }
+            writerIdentity = nil
             route = .createAgentSessionFromSourceTab
         }
 
@@ -189,7 +176,8 @@ extension AgentModeViewModel {
             expectedRunID: expectedRunID,
             expectedRunAttemptID: expectedRunAttemptID,
             expectedSubmissionToken: resolvedSession.composerSubmissionToken,
-            expectedInitialStartLocation: expectedInitialStartLocation
+            expectedInitialStartLocation: expectedInitialStartLocation,
+            expectedWriterIdentity: writerIdentity
         )
     }
 
@@ -208,7 +196,7 @@ extension AgentModeViewModel {
             perfRecorder.event("ui.syncAllActiveUIState", tabID: tabID)
         #endif
         syncComposerUIState(tabID: tabID)
-        syncStatusPillsUIState()
+        ui.statusPills.update(makeStatusPillsSnapshot())
         syncRuntimeMetricsUIState()
         // Sidebar revision should publish only on sidebar-relevant changes (session
         // list, sort, search, visible count). `syncSidebarUIState()` still republishes
@@ -240,7 +228,7 @@ extension AgentModeViewModel {
             syncComposerUIState(tabID: tabID)
         }
         if invalidation.contains(.statusPills) {
-            syncStatusPillsUIState()
+            ui.statusPills.update(makeStatusPillsSnapshot())
         }
         if invalidation.contains(.runtimeMetrics) {
             syncRuntimeMetricsUIState()

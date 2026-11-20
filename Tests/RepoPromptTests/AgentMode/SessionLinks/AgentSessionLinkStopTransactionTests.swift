@@ -84,7 +84,7 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
             windowID: 2, workspaceID: UUID(), tabID: UUID(), sessionID: UUID(),
             persistentBindingGeneration: UUID(), bindingTransitionGeneration: 1
         )
-        return await fixture.viewModel.agentSessionLinkPerformStop(
+        return await fixture.viewModel.linkExecutionRuntime.agentSessionLinkPerformStop(
             to: fixture.candidate,
             request: AgentSessionLinkStopRequest(
                 requestID: UUID(), linkID: UUID(), linkGeneration: 1,
@@ -104,6 +104,63 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
             },
             beforeCleanupTask: beforeCleanupTask
         )
+    }
+
+    func testRetainedScopeOwnsExecutionWithoutRetainingItsPresenter() async throws {
+        var retainedScope: AgentSessionRuntimeStore.Scope?
+        weak var presenter: AgentModeViewModel?
+        weak var scope: AgentSessionRuntimeStore.Scope?
+        weak var execution: AgentModeRunService?
+        func prepareRetainedScope() async throws {
+            let fixture = try makeFixture()
+            guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: fixture.candidate.sessionID) else {
+                throw AgentSessionRuntimeStore.CommandRejection.staleWriter
+            }
+            scope = writer.scope
+            execution = writer.scope.execution
+            presenter = fixture.viewModel
+            await fixture.viewModel.prepareForWindowClose()
+            // Close cancels presentation, but its final persistence timer can still retain the
+            // originating scope. Join that exact task; cancellation alone is not a drain receipt.
+            let pendingSave = fixture.session.saveDebounceTask
+            pendingSave?.cancel()
+            await pendingSave?.value
+            fixture.session.saveDebounceTask = nil
+            retainedFixtures.removeAll()
+            retainedScope = writer.scope
+        }
+        try await prepareRetainedScope()
+        XCTAssertNil(presenter, "runtime execution must not retain its presentation adapter")
+        XCTAssertNotNil(execution)
+        XCTAssertTrue(retainedScope?.execution === execution)
+        retainedScope = nil
+        XCTAssertNil(scope)
+        XCTAssertNil(execution)
+    }
+
+    func testClaimedStopKeepsExactExecutionAndWriterThroughRetirement() async throws {
+        let fixture = try makeFixture()
+        guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: fixture.candidate.sessionID) else {
+            return XCTFail("Expected the exact runtime writer")
+        }
+        XCTAssertTrue(writer.scope.execution === fixture.viewModel.test_initializeRunService())
+        fixture.session.runState = .running
+        fixture.session.installRunID(UUID())
+        _ = fixture.session.beginRunAttempt(source: "retiring-stop-writer")
+        let outcome = await stop(fixture, beforeCleanupTask: {
+            writer.scope.beginRetirement()
+            XCTAssertTrue(writer.isCurrent)
+            XCTAssertEqual(writer.query()?.commandRejection, .retiring)
+            XCTAssertFalse(writer.scope.releaseWriterClaimsAfterDrain(), "claimed Stop still owns teardown and its audit")
+        })
+        guard case let .settled(receipt) = outcome else { return XCTFail("Expected a Stop receipt") }
+        XCTAssertEqual(receipt.result, .stopped)
+        XCTAssertEqual(receipt.auditStatus, .persisted)
+        XCTAssertEqual(fixture.session.runState, .cancelled)
+        XCTAssertTrue(fixture.viewModel.linkExecutionRuntime.pendingStopEffects.isEmpty)
+        XCTAssertTrue(writer.isCurrent)
+        XCTAssertTrue(writer.scope.releaseWriterClaimsAfterDrain())
+        XCTAssertFalse(writer.isCurrent)
     }
 
     func testIdleTargetRetainsNoopWithoutRowOrMutation() async throws {
@@ -218,7 +275,7 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         XCTAssertEqual(receipt.result, .notRunning)
         XCTAssertFalse(heldFence.permitsStart(of: fixture.session))
         XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.phase, .cancelledBeforeDispatch)
-        XCTAssertFalse(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(
+        XCTAssertFalse(fixture.viewModel.linkExecutionRuntime.agentSessionLinkAcquirePhysicalDispatch(
             for: fixture.session, dispatchID: .autoWake(wakeID: wakeID)
         ), "the held wake must never reach a provider call")
     }
@@ -248,6 +305,135 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         XCTAssertTrue(fixture.session.stopState.releaseManagedStop(id: stopID, binding: binding))
         XCTAssertTrue(snapshot().idleForSend)
         XCTAssertTrue(snapshot().board.sendBlockers.isEmpty)
+    }
+
+    func testCancellingPresentedSteerPreservesExistingRunAndRestoresOnlyOnce() async throws {
+        let fixture = try makeFixture()
+        let vm = fixture.viewModel
+        fixture.session.installRunID(UUID())
+        let ownership = fixture.session.beginRunAttempt(source: "existing-steer-target")
+        fixture.session.runState = .running
+        vm.storeDraftText(for: fixture.tabID, "unsent steer")
+        let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: fixture.tabID, session: fixture.session))
+        let attempt = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: "unsent steer")
+        guard case let .claimed(claim) = vm.claimComposerSubmitForImmediatePresentation(attempt) else { return XCTFail("Expected presented steer") }
+        let stopGeneration = fixture.session.stopState.cancellationGeneration
+        vm.storeDraftText(for: fixture.tabID, "new typing")
+        await vm.cancelPresentedComposerSubmission(id: attempt.id)
+        XCTAssertTrue(claim.cancellation.isWithdrawn)
+        XCTAssertEqual(fixture.session.stopState.cancellationGeneration, stopGeneration)
+        XCTAssertEqual(fixture.session.activeRunOwnership, ownership)
+        XCTAssertEqual(fixture.session.runState, .running)
+        XCTAssertEqual(fixture.session.draftText, "unsent steer\nnew typing")
+        guard case .blocked = await vm.executePresentedComposerSubmitAttempt(text: "unsent steer", claim: claim) else { return XCTFail("Cancelled steer dispatched") }
+        XCTAssertEqual(fixture.session.draftText, "unsent steer\nnew typing")
+        XCTAssertTrue(fixture.session.items.isEmpty)
+        fixture.session.runState = .cancelled
+    }
+
+    func testManagedStopWithdrawsPresentedComposerButWaitsForItsProducer() async throws {
+        let fixture = try makeFixture()
+        let vm = fixture.viewModel
+        vm.storeDraftText(for: fixture.tabID, "unsent draft")
+        let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: fixture.tabID, session: fixture.session))
+        let attempt = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: "unsent draft")
+        guard case let .claimed(claim) = vm.claimComposerSubmitForImmediatePresentation(attempt) else { return XCTFail("Expected presented claim") }
+        XCTAssertTrue(claim.cancellation.beginExecution())
+        XCTAssertEqual(vm.composerRunCancelTarget(tabID: fixture.tabID)?.expectedPendingComposerAttemptID, attempt.id)
+        vm.storeDraftText(for: fixture.tabID, "new typing")
+        let producerGate = AgentSessionLinkStopSignal<Void>()
+        let producer = Task {
+            await producerGate.value()
+            vm.releaseComposerSubmitClaim(claim)
+        }
+        let stopping = Task { await stop(fixture, teardownDeadlineSeconds: 60) }
+        try await AsyncTestWait.waitUntil("composer withdrawn by managed Stop") { claim.cancellation.isWithdrawn }
+        XCTAssertEqual(fixture.session.draftText, "unsent draft\nnew typing")
+        XCTAssertNil(vm.ui.composer.pendingSubmissions[attempt.id])
+        XCTAssertNil(fixture.session.activeRunOwnership)
+        XCTAssertNil(fixture.session.lastTerminalCommitRevision)
+        XCTAssertFalse(claim.cancellation.isFinalized)
+        XCTAssertFalse(vm.linkExecutionRuntime.pendingStopEffects.isEmpty)
+        producerGate.finish(())
+        await producer.value
+        guard case let .settled(receipt) = await stopping.value else { return XCTFail("Expected Stop receipt") }
+        XCTAssertEqual(receipt.result, .stopped)
+        XCTAssertEqual(receipt.teardownCompleted, true)
+        XCTAssertEqual(receipt.resultingRunState, "pending_start_withdrawn")
+        XCTAssertEqual(fixture.session.draftText, "unsent draft\nnew typing")
+        XCTAssertTrue(vm.linkExecutionRuntime.pendingStopEffects.isEmpty)
+    }
+
+    func testPendingComposerStopTimeoutDoesNotAcknowledgeProducerDrain() async throws {
+        let fixture = try makeFixture()
+        let vm = fixture.viewModel
+        let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: fixture.tabID, session: fixture.session))
+        let attempt = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: "")
+        guard case let .claimed(claim) = vm.claimComposerSubmitAttempt(attempt) else { return XCTFail("Expected claim") }
+        let deadline = AgentSessionLinkStopSignal<Void>()
+        let stopping = Task { await stop(fixture, deadlineSleep: { _ in await deadline.value() }) }
+        try await AsyncTestWait.waitUntil("composer withdrawn before deadline") { claim.cancellation.isWithdrawn }
+        deadline.finish(())
+        guard case let .settled(receipt) = await stopping.value else { return XCTFail("Expected timed-out receipt") }
+        XCTAssertEqual(receipt.result, .stopFailed)
+        XCTAssertEqual(receipt.teardownCompleted, false)
+        XCTAssertFalse(claim.cancellation.isFinalized)
+        XCTAssertFalse(vm.linkExecutionRuntime.pendingStopEffects.isEmpty)
+        let runtime = vm.linkExecutionRuntime
+        let sibling = AgentTabSession(tabID: UUID())
+        let siblingGate = TestReleaseFence(name: "sibling Stop effect")
+        let siblingEffectID = UUID()
+        let siblingEffect = Task { [sibling] in
+            await siblingGate.enterAndWait()
+            runtime.pendingStopEffects[siblingEffectID] = nil
+            withExtendedLifetime(sibling) {}
+        }
+        runtime.pendingStopEffects[siblingEffectID] = .init(sessionIdentity: ObjectIdentifier(sibling), task: siblingEffect)
+        addTeardownBlock { @MainActor in
+            siblingGate.release()
+            vm.releaseComposerSubmitClaim(claim)
+            await runtime.drainPendingStopEffects()
+        }
+        guard await siblingGate.waitUntilEntered() else { return }
+        let replacement = AgentTabSession(tabID: fixture.session.tabID)
+        try replacement.installPersistentSessionBinding(XCTUnwrap(fixture.session.persistentSessionBindingIdentity))
+        let replacementJoined = expectation(description: "replacement has no Stop producers")
+        var replacementFinished = false
+        let replacementWaiter = Task {
+            await runtime.drainPendingStopEffects(for: replacement)
+            replacementFinished = true
+            replacementJoined.fulfill()
+        }
+        await fulfillment(of: [replacementJoined], timeout: 3)
+        guard replacementFinished else {
+            siblingGate.release()
+            vm.releaseComposerSubmitClaim(claim)
+            await replacementWaiter.value
+            return
+        }
+        XCTAssertFalse(claim.cancellation.isFinalized, "A same-ID replacement must not join the original producer")
+        var drained = false
+        let entered = expectation(description: "exact Stop join entered")
+        let completed = expectation(description: "target Stop joined without sibling")
+        let waiter = Task {
+            entered.fulfill()
+            await runtime.drainPendingStopEffects(for: fixture.session)
+            drained = true
+            completed.fulfill()
+        }
+        waiter.cancel()
+        await fulfillment(of: [entered], timeout: 3)
+        XCTAssertFalse(drained, "Cancellation of the waiter cannot acknowledge producer drain")
+        vm.releaseComposerSubmitClaim(claim)
+        await fulfillment(of: [completed], timeout: 3)
+        if !drained { siblingGate.release() }
+        await waiter.value
+        XCTAssertTrue(drained)
+        XCTAssertEqual(Set(runtime.pendingStopEffects.keys), [siblingEffectID], "The target joins without waiting for its sibling")
+        XCTAssertNil(fixture.session.activeRunAttemptID)
+        siblingGate.release()
+        await runtime.drainPendingStopEffects()
+        XCTAssertTrue(runtime.pendingStopEffects.isEmpty)
     }
 
     func testPendingStartWithdrawsWithoutSyntheticTerminalRun() async throws {
@@ -292,8 +478,8 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         let outcome = await stop(fixture)
         guard case let .settled(receipt) = outcome else { return XCTFail("expected receipt") }
         XCTAssertEqual(receipt.result, .stopped)
-        XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.tabID), "the user's own draft")
-        XCTAssertFalse(fixture.viewModel.retrieveDraftText(for: fixture.tabID).contains("overseer-only"))
+        XCTAssertEqual(fixture.viewModel.draftRuntime.text(for: fixture.tabID), "the user's own draft")
+        XCTAssertFalse(fixture.viewModel.draftRuntime.text(for: fixture.tabID).contains("overseer-only"))
         XCTAssertTrue(fixture.session.pendingClaudeSteeringInstructions.isEmpty)
     }
 
@@ -318,7 +504,10 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         fixture.session.stopState.markCleanupStarted(id: oldStopID, binding: oldBinding)
         fixture.session.stopState.test_ageManagedStopClaim(by: 31)
         fixture.session.installPersistentSessionBinding(
-            AgentPersistentSessionBindingIdentity(tabID: fixture.tabID, sessionID: fixture.candidate.sessionID)
+            AgentPersistentSessionBindingIdentity(
+                tabID: fixture.tabID, sessionID: fixture.candidate.sessionID,
+                workspaceID: fixture.candidate.workspaceID
+            )
         )
         XCTAssertFalse(fixture.session.permitsBoundOperationAndSave, "The old binding's hydration must not transfer to its successor")
         fixture.session.recordRestorationAuthoritative(.persistedPayloadApplied)
@@ -521,7 +710,7 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
             expectedRunID: fixture.session.runID,
             expectedActiveAgentSessionID: fixture.session.activeAgentSessionID,
             expectedRunAttemptID: ownership.attemptID,
-            expectedPendingUserInputRequestID: nil
+            expectedPendingUserInputReceipt: nil
         )
         let entered = AgentSessionLinkStopSignal<Void>()
         let release = AgentSessionLinkStopSignal<Void>()
@@ -566,18 +755,38 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         XCTAssertFalse(fixture.session.stopState.isStopping(binding: binding), "late cleanup cannot reclaim the gate")
     }
 
+    func testParkedInputCancelRefusesReusedRequestIDFromReplacementTransport() async throws {
+        let fixture = try makeFixture()
+        fixture.session.runState = .waitingForUser
+        fixture.session.installRunID(UUID())
+        let ownership = fixture.session.beginRunAttempt(source: "parked-input-reconnect")
+        let original = CodexServerRequestReceipt.fixture(.int(42), generation: 1)
+        let successor = CodexServerRequestReceipt.fixture(.int(42), generation: 2)
+        fixture.session.pendingUserInputRequest = .init(
+            receipt: successor, method: "item/tool/requestUserInput", threadID: "thread", turnID: "turn", itemID: "item", questions: []
+        )
+        let target = AgentRunCancelTarget(
+            tabID: fixture.tabID, expectedRunID: fixture.session.runID,
+            expectedActiveAgentSessionID: fixture.session.activeAgentSessionID,
+            expectedRunAttemptID: ownership.attemptID, expectedPendingUserInputReceipt: original
+        )
+        let accepted = await fixture.viewModel.cancelAgentRun(target: target)
+        XCTAssertFalse(accepted, "A reused wire ID cannot authorize an old card to stop the successor")
+        XCTAssertEqual(fixture.session.pendingUserInputRequest?.receipt, successor)
+        XCTAssertEqual(fixture.session.activeRunAttemptID, ownership.attemptID)
+        XCTAssertEqual(fixture.session.runState, .waitingForUser)
+    }
+
     func testAuditRebindDuringSaveCannotClaimOriginalRowPersisted() async throws {
         let fixture = try makeFixture()
         fixture.session.runState = .running
         fixture.session.installRunID(UUID())
         _ = fixture.session.beginRunAttempt(source: "stop-audit-rebind")
-        let manager = try XCTUnwrap(fixture.viewModel.workspaceManager)
         fixture.viewModel.test_setAgentSessionSaver { agentSession, _, _ in
             if agentSession.toLiveItems().contains(where: { $0.text == AgentChatItem.overseerRunStoppedText }) {
-                _ = manager.compareAndSetActiveAgentSessionID(
-                    expected: fixture.candidate.sessionID, replacement: UUID(),
-                    forTabID: fixture.tabID, inWorkspaceID: fixture.candidate.workspaceID
-                )
+                XCTAssertNotNil(fixture.viewModel.test_installPersistentSessionBinding(
+                    sessionID: UUID(), on: fixture.session, updateWorkspaceMetadata: true
+                ))
             }
             return URL(fileURLWithPath: NSTemporaryDirectory())
                 .appendingPathComponent("\(UUID().uuidString).json")
@@ -677,7 +886,7 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         fixture.session.runState = .running
         fixture.session.installRunID(UUID())
         _ = fixture.session.beginRunAttempt(source: "completed-before-local-stop")
-        await fixture.viewModel.test_publishNaturalCompletion(fixture.session)
+        await fixture.viewModel.runService.test_publishNaturalCompletion(fixture.session)
         let revision = try XCTUnwrap(fixture.session.lastTerminalCommitRevision)
         XCTAssertEqual(revision.terminalState, .completed)
         fixture.session.pendingInstructions = ["queued local follow-up"]
@@ -702,10 +911,10 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         fixture.session.runState = .running
         fixture.session.installRunID(UUID())
         _ = fixture.session.beginRunAttempt(source: "natural-completion-after-admission")
-        fixture.viewModel.test_setBeforeCancellationCommit { session in
-            await fixture.viewModel.test_publishNaturalCompletion(session)
+        fixture.viewModel.runService.testBeforeCancellationCommit = { session in
+            await fixture.viewModel.runService.test_publishNaturalCompletion(session)
         }
-        defer { fixture.viewModel.test_setBeforeCancellationCommit(nil) }
+        defer { fixture.viewModel.runService.testBeforeCancellationCommit = nil }
         guard case let .settled(receipt) = await stop(fixture) else { return XCTFail("expected receipt") }
         XCTAssertEqual(receipt.result, .notRunning)
         XCTAssertEqual(receipt.stopRequested, true)
@@ -714,17 +923,38 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
     }
 
     func testClaimLostBeforeCancellationReportsTargetChanged() async throws {
-        let fixture = try makeFixture()
-        fixture.session.runState = .running
-        fixture.session.installRunID(UUID())
-        _ = fixture.session.beginRunAttempt(source: "target-changed-before-task-entry")
-        let outcome = await stop(fixture, beforeCleanupTask: {
+        for heldOracleDrain in [false, true] {
+            let fixture = try makeFixture()
+            fixture.session.runState = .running
             fixture.session.installRunID(UUID())
-        })
-        guard case let .settled(receipt) = outcome else { return XCTFail("expected receipt") }
-        XCTAssertEqual(receipt.result, .stopFailed)
-        XCTAssertEqual(receipt.failureReason, .targetChanged)
-        XCTAssertEqual(receipt.stopRequested, false)
+            _ = fixture.session.beginRunAttempt(source: "target-changed-before-task-entry")
+            let releaseOracle = AgentSessionLinkStopSignal<Void>()
+            let cleanupEntered = AgentSessionLinkStopSignal<Void>()
+            defer { releaseOracle.finish(()) }
+            if heldOracleDrain {
+                fixture.session.oracleBackgroundDrain = Task { await releaseOracle.value() }
+            }
+            let outcome = await stop(fixture, teardownDeadlineSeconds: heldOracleDrain ? 0 : 1, deadlineSleep: { _ in
+                // The deadline may win only after cleanup owns the claim; otherwise the
+                // never-started-task recovery could hide an unbounded Oracle join.
+                await cleanupEntered.value()
+            }, beforeCleanupTask: {
+                fixture.session.installRunID(UUID())
+                cleanupEntered.finish(())
+            })
+            guard case let .settled(receipt) = outcome else { return XCTFail("expected receipt") }
+            XCTAssertEqual(receipt.result, .stopFailed)
+            XCTAssertEqual(receipt.failureReason, .targetChanged)
+            XCTAssertEqual(receipt.stopRequested, false)
+            if heldOracleDrain {
+                try await AsyncTestWait.waitUntil("bounded Oracle waiter releases managed Stop claim", timeout: 1) {
+                    !fixture.session.stopState.isStopping(binding: fixture.session.persistentSessionBindingIdentity)
+                }
+                XCTAssertNotNil(fixture.session.oracleBackgroundDrain, "A timeout must retain the cleanup ticket")
+                releaseOracle.finish(())
+                await fixture.session.oracleBackgroundDrain?.value
+            }
+        }
     }
 
     func testTerminalReplacementBeforeCleanupCannotMasqueradeAsNaturalCompletion() async throws {
@@ -809,13 +1039,13 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         fixture.viewModel.storeDraftText(for: fixture.tabID, "replacement draft")
         releaseRestart.finish(())
         await finishedRestart.value()
-        XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.tabID), "replacement draft")
+        XCTAssertEqual(fixture.viewModel.draftRuntime.text(for: fixture.tabID), "replacement draft")
         XCTAssertNotEqual(fixture.session.runState, .running)
     }
 
     func testHydrationDeferredSubmissionNeverRestoresIntoReplacementSession() async throws {
         let fixture = try makeFixture()
-        let originalBinding = fixture.session.persistentSessionBindingIdentity
+        let originalWriter = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.candidate.sessionID)).writer
         let heldFence = AgentRunStartStopFence(session: fixture.session)
         let replacement = AgentTabSession(tabID: fixture.tabID)
         replacement.hasLoadedPersistedState = true
@@ -824,12 +1054,11 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         fixture.viewModel.storeDraftText(for: fixture.tabID, "replacement draft")
 
         await fixture.viewModel.submitUserTurnAfterHydration(
-            tabID: fixture.tabID, originalSession: fixture.session,
-            originalBinding: originalBinding, trimmedText: "old session draft",
+            tabID: fixture.tabID, originalWriter: originalWriter, trimmedText: "old session draft",
             attachmentsToSend: [], taggedFilesToSend: [], activeWorkflow: nil,
             stopFence: heldFence
         )
-        XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.tabID), "replacement draft")
+        XCTAssertEqual(fixture.viewModel.draftRuntime.text(for: fixture.tabID), "replacement draft")
         XCTAssertTrue(replacement.pendingFileAttachments.isEmpty)
         XCTAssertTrue(replacement.pendingTaggedFileAttachments.isEmpty)
     }

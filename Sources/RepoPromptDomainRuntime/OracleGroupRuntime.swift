@@ -23,6 +23,17 @@ package struct OracleGroupRuntime: Sendable {
         _ request: Request,
         callbacks: Callbacks
     ) async throws -> Completion {
+        if let background = request.backgroundExecution {
+            let owner: OracleConversationOwner = switch request.intent {
+            case let .start(start): start.owner
+            case let .continuation(continuation): continuation.owner
+            }
+            guard owner.kind == "app-tab",
+                  background.agentSessionID == request.agentSessionID,
+                  background.agentRunID == request.runID,
+                  background.invocationID == request.invocationID
+            else { throw OracleGroupContractError.invalidGroupResult }
+        }
         switch request.intent {
         case let .start(start):
             return try await executeStart(request, start: start, callbacks: callbacks)
@@ -39,19 +50,25 @@ package extension OracleGroupRuntime {
         package let claimID: UUID
         package let input: OracleInput
         package let intent: Intent
+        package let agentSessionID: UUID?
+        package let backgroundExecution: OracleBackgroundExecution?
 
         package init(
             invocationID: UUID,
             runID: UUID,
             claimID: UUID,
             input: OracleInput,
-            intent: Intent
+            intent: Intent,
+            agentSessionID: UUID? = nil,
+            backgroundExecution: OracleBackgroundExecution? = nil
         ) {
             self.invocationID = invocationID
             self.runID = runID
             self.claimID = claimID
             self.input = input
             self.intent = intent
+            self.agentSessionID = agentSessionID
+            self.backgroundExecution = backgroundExecution
         }
     }
 
@@ -183,7 +200,7 @@ extension OracleGroupRuntime {
             updatedAt: timestamp,
             roster: start.roster,
             members: start.members,
-            turns: [OracleTurnRecord(input: request.input, state: .prepared, startedAt: timestamp)]
+            turns: [OracleTurnRecord(input: request.input, state: .prepared, startedAt: timestamp, backgroundExecution: request.backgroundExecution)]
         )
         let claim = try await claimManager.acquire(
             group: prepared,
@@ -245,7 +262,7 @@ extension OracleGroupRuntime {
             updatedAt: max(current.updatedAt, timestamp),
             roster: current.roster,
             members: current.members,
-            turns: current.turns + [OracleTurnRecord(input: request.input, state: .prepared, startedAt: timestamp)]
+            turns: current.turns + [OracleTurnRecord(input: request.input, state: .prepared, startedAt: timestamp, backgroundExecution: request.backgroundExecution)]
         )
         try await store.save(prepared, expectedRevision: current.revision)
         return try await finishPrepared(prepared, callbacks: callbacks)

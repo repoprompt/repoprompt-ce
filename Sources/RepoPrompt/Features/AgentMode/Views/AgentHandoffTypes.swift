@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 
 /// Configuration for the handoff button in message footers.
 /// Provides the data and callbacks needed for the handoff popover.

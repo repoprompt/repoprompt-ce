@@ -1,7 +1,11 @@
 import Foundation
+import RepoPromptAgentProviderContracts
 import RepoPromptSecureStorage
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptInstrumentation
+import RepoPromptSettingsCore
+import RepoPromptWorkspaceContext
 import XCTest
 
 /// Live-view-model regressions for the managed cross-session `steer` transaction.
@@ -145,7 +149,7 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
         liveness: @escaping AgentSessionLinkSendLivenessProbe = { liveLiveness },
         commit: @escaping @MainActor () async -> AgentSessionLinkSendCommitOutcome = { .committed }
     ) async -> AgentSessionLinkSendTransactionOutcome {
-        await fixture.viewModel.agentSessionLinkPerformSteer(
+        await fixture.viewModel.linkExecutionRuntime.agentSessionLinkPerformSteer(
             to: fixture.candidate,
             request: request ?? makeRequest(),
             liveness: liveness,
@@ -184,7 +188,7 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
         XCTAssertEqual(fixture.session.selectedWorkflow, workflow, file: file, line: line)
         XCTAssertTrue(fixture.viewModel.interviewFirst, file: file, line: line)
         XCTAssertEqual(
-            fixture.viewModel.retrieveDraftText(for: fixture.tabID),
+            fixture.viewModel.draftRuntime.text(for: fixture.tabID),
             "the user's own half-typed draft",
             "an overseer's words must never enter or replace the target user's composer",
             file: file,
@@ -248,11 +252,11 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
         fixture.session.runState = .waitingForUser
         fixture.session.installRunID(UUID())
         _ = fixture.session.beginRunAttempt(source: "waiting-steer-test")
-        fixture.session.instructionWaitID = UUID()
+
         let session = fixture.session
         let resumed = Task { @MainActor in
             try await withCheckedThrowingContinuation { continuation in
-                session.instructionContinuation = continuation
+                installInstructionWaitForTest(session: session, runtime: fixture.viewModel.linkExecutionRuntime, continuation: continuation)
             }
         }
         try await AsyncTestWait.waitUntil("the run to wait for its next instruction") {
@@ -282,10 +286,10 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
         session.runState = .waitingForUser
         session.installRunID(UUID())
         _ = session.beginRunAttempt(source: "waiting-noncomposer-test")
-        session.instructionWaitID = UUID()
+
         let resumed = Task { @MainActor in
             try await withCheckedThrowingContinuation { continuation in
-                session.instructionContinuation = continuation
+                installInstructionWaitForTest(session: session, runtime: fixture.viewModel.linkExecutionRuntime, continuation: continuation)
             }
         }
         try await AsyncTestWait.waitUntil("the noncomposer instruction continuation") {
@@ -326,9 +330,9 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
                 let owner = session.beginRunAttempt(source: "waiting-quiet-race")
                 session.quietLedger.markRoutineWake(owner: owner, wakeID: UUID())
                 session.runState = .waitingForUser
-                session.instructionWaitID = UUID()
+
                 let resumed = Task { @MainActor in
-                    try await withCheckedThrowingContinuation { continuation in session.instructionContinuation = continuation }
+                    try await withCheckedThrowingContinuation { continuation in installInstructionWaitForTest(session: session, runtime: fixture.viewModel.linkExecutionRuntime, continuation: continuation) }
                 }
                 try await AsyncTestWait.waitUntil("waiting continuation") {
                     await MainActor.run { session.instructionContinuation != nil }
@@ -360,7 +364,7 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
                 XCTAssertNotNil(session.instructionContinuation, "Old prepared input did not resume even the same wait/controller")
                 if managed { _ = await sink.awaitOutcome(timeoutSeconds: 1) }
                 session.instructionContinuation?.resume(throwing: CancellationError())
-                session.instructionContinuation = nil
+                session.instructionWait = nil
                 _ = try? await resumed.value
                 XCTAssertEqual(session.quietLedger.facts?.ordinaryThrough, 1)
                 if replaceOwner {
@@ -408,9 +412,9 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
         XCTAssertEqual(counts.awaitingUser, 1)
         XCTAssertEqual(counts.unavailable, 1)
         XCTAssertThrowsError(try fixture.viewModel.mcpResidentLaneStateCounts(for: endpoint, hasOutboundLinks: false))
-        let hold = fixture.viewModel.agentSessionLinkWithholdPromptInventory(for: endpoint)
+        let hold = fixture.viewModel.linkExecutionRuntime.agentSessionLinkWithholdPromptInventory(for: endpoint)
         XCTAssertThrowsError(try fixture.viewModel.mcpResidentLaneStateCounts(for: endpoint, hasOutboundLinks: true))
-        fixture.viewModel.agentSessionLinkReleasePromptInventoryHold(hold, for: endpoint, publishing: nil)
+        fixture.viewModel.linkExecutionRuntime.agentSessionLinkReleasePromptInventoryHold(hold, for: endpoint, publishing: nil)
         fixture.viewModel.agentSessionLinkPromptInventoryBySessionID.removeValue(forKey: endpoint.sessionID)
         XCTAssertThrowsError(try fixture.viewModel.mcpResidentLaneStateCounts(for: endpoint, hasOutboundLinks: true))
         let zero = try fixture.viewModel.mcpResidentLaneStateCounts(for: endpoint, hasOutboundLinks: false)
@@ -424,7 +428,7 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
         makeRunning(fixture)
         fixture.session.runState = .waitingForApproval
         fixture.session.pendingApproval = AgentApprovalRequest(
-            requestID: .codex(.int(7)),
+            requestID: .codex(.fixture(.int(7))),
             method: "item/commandExecution/requestApproval",
             kind: .commandExecution,
             threadID: "thread",
@@ -484,6 +488,66 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
         XCTAssertTrue(fixture.session.items.isEmpty, "no row and no run for a steer past its classification")
         XCTAssertTrue(fixture.session.pendingClaudeSteeringInstructions.isEmpty)
         XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
+    }
+
+    func testSteerCannotFollowSuccessorAttemptOnSameWriterDuringAuthorization() async throws {
+        let fixture = try makeFixture()
+        makeRunning(fixture)
+        let session = fixture.session
+        let original = try XCTUnwrap(session.activeRunOwnership)
+
+        let outcome = await steer(fixture, commit: {
+            _ = session.beginRunAttempt(source: "successor-during-managed-steer")
+            return .committed
+        })
+
+        XCTAssertNotEqual(session.activeRunOwnership, original)
+        XCTAssertEqual(outcome, .blocked(.targetBusy))
+        XCTAssertTrue(session.items.isEmpty)
+        XCTAssertTrue(session.pendingClaudeSteeringInstructions.isEmpty)
+    }
+
+    func testStopFenceChangeDuringAuthorizationRefusesBeforePublication() async throws {
+        let fixture = try makeFixture()
+        makeRunning(fixture)
+
+        let outcome = await steer(fixture, commit: {
+            fixture.session.stopState.invalidateScheduledStarts()
+            return .committed
+        })
+
+        XCTAssertEqual(outcome, .blocked(.targetStopped))
+        XCTAssertTrue(fixture.session.items.isEmpty)
+        XCTAssertTrue(fixture.session.pendingClaudeSteeringInstructions.isEmpty)
+    }
+
+    func testCancelledAuthorizationWaitCannotStageManagedInput() async throws {
+        let fixture = try makeFixture()
+        makeRunning(fixture)
+        let gate = AgentSessionLinkStopSignal<Void>()
+        var enteredAuthorization = false
+        let operation = Task { @MainActor in
+            await steer(fixture, commit: {
+                enteredAuthorization = true
+                await gate.value()
+                return .committed
+            })
+        }
+        addTeardownBlock { @MainActor in
+            operation.cancel()
+            gate.finish(())
+            _ = await operation.value
+        }
+        try await AsyncTestWait.waitUntil("managed authorization suspended") {
+            await MainActor.run { enteredAuthorization }
+        }
+
+        operation.cancel()
+        gate.finish(())
+        let outcome = await operation.value
+        XCTAssertEqual(outcome, .blocked(.steerNotAccepted))
+        XCTAssertTrue(fixture.session.items.isEmpty)
+        XCTAssertTrue(fixture.session.pendingClaudeSteeringInstructions.isEmpty)
     }
 
     func testBetweenStatesRefusesAsBusy() async throws {
@@ -780,4 +844,494 @@ private actor SteerRecordingNativeController: NativeAgentRuntimeControlling {
     }
 
     func respondToPermissionRequest(id _: String, decision _: AgentApprovalDecision) {}
+}
+
+/// No AgentModeViewModel, WindowState, PromptViewModel or WorkspaceManager is constructed.
+@MainActor
+final class AgentSessionManagedInputRuntimeTests: XCTestCase {
+    private struct Fixture {
+        let scope: AgentSessionRuntimeStore.Scope
+        let session: AgentTabSession
+        let links: AgentSessionLinkExecutionRuntime
+        let candidate: AgentSessionLinkEndpointCandidate
+        let tools: MCPToolExecutionRuntime
+    }
+
+    private func fixture(
+        store: AgentSessionRuntimeStore? = nil,
+        inputResourcesAreCurrent: @escaping @MainActor () -> Bool = { true },
+        validateInputResources: (@MainActor (AgentSessionRuntimeStore.Command?) async -> Bool)? = nil,
+        inputWorkspace: @escaping @MainActor (AgentTabSession) async throws -> AgentSessionProviderInputRuntime.WorkspaceSource? = { _ in nil },
+        initialThreadInput: @escaping @MainActor (AgentTabSession) async throws -> AgentSessionProviderInputRuntime.InitialThreadInput? = { _ in
+            .init(workspace: .init(store: WorkspaceFileContextStore(), lookupSource: nil), selection: .init(selectedPaths: []), promptText: nil)
+        }
+    ) throws -> Fixture {
+        let scope = (store ?? AgentSessionRuntimeStore()).makeScope()
+        let session = scope.makeSession(tabID: UUID())
+        let workspaceID = UUID(), sessionID = UUID()
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID, workspaceID: workspaceID))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        session.hasLoadedPersistedState = true
+        session.selectedAgent = .claudeCode
+        scope.replaceSessions([session.tabID: session])
+        let tools = MCPToolExecutionRuntime()
+        let links = scope.makeLinkExecution(routeID: MCPRouteIdentityAllocator.allocateHost().routeID, commands: .init(
+            isAvailable: { true }, modelAvailability: { .init() }, workspaceID: { _ in workspaceID },
+            input: scope.providerInput(skillCatalog: AgentSkillCatalog(), perfRecorder: NoopAgentModePerfRecorder()),
+            workspacePaths: { [] }, inputWorkspace: { session, command in
+                XCTAssertTrue(command?.writer.session === session)
+                XCTAssertTrue(command?.isCurrent == true)
+                return try await inputWorkspace(session)
+            }, initialThreadInput: { session, command in
+                XCTAssertTrue(command?.writer.session === session)
+                XCTAssertTrue(command?.isCurrent == true)
+                return try await initialThreadInput(session)
+            },
+            modelDisplayName: { $0.selectedModelRaw },
+            start: { _, _, _, _, _ in XCTFail("Active managed input must not call the legacy start adapter")
+                return nil
+            },
+            settleSelfCompact: { _ in }, selfCompactBlocksWake: { _ in false }, selfCompactHoldsWakeAcquisition: { _ in false },
+            managedInputEnvironment: { _ in
+                .init(
+                    workspaceID: workspaceID,
+                    resourcesAreCurrent: inputResourcesAreCurrent,
+                    settings: .shared,
+                    tools: tools,
+                    validateResources: validateInputResources
+                )
+            }
+        ), diagnostics: NoopAgentSessionLinkCatalogEventSink())
+        let endpoint = try XCTUnwrap(links.agentSessionLinkObserverEndpoint(tabID: session.tabID))
+        let candidate = AgentSessionLinkEndpointCandidate(
+            windowID: endpoint.windowID, workspaceID: endpoint.workspaceID, tabID: endpoint.tabID,
+            sessionID: endpoint.sessionID, persistentBindingGeneration: endpoint.persistentBindingGeneration,
+            bindingTransitionGeneration: endpoint.bindingTransitionGeneration,
+            isTopLevel: true, hasLoadedPersistedState: true, bindingTransitionInProgress: false,
+            isClosing: false, isMCPControlled: false, isMCPOriginated: false,
+            roleAllowsOutboundMonitoring: true, displayName: "Runtime input", providerDisplayName: nil,
+            locationLabel: nil, restorationReadiness: session.qualifiedRestorationReadiness
+        )
+        return Fixture(scope: scope, session: session, links: links, candidate: candidate, tools: tools)
+    }
+
+    private func environment(
+        _ f: Fixture, isCurrent: @escaping @MainActor () -> Bool = { true }
+    ) -> AgentSessionLinkExecutionRuntime.ManagedInputEnvironment {
+        .init(workspaceID: f.candidate.workspaceID, resourcesAreCurrent: isCurrent, settings: .shared, tools: f.tools)
+    }
+
+    private func request() -> AgentSessionLinkSendRequest {
+        .init(linkID: UUID(), linkGeneration: 1, observerEndpoint: .init(
+            windowID: 402, workspaceID: UUID(), tabID: UUID(), sessionID: UUID(),
+            persistentBindingGeneration: UUID(), bindingTransitionGeneration: 1
+        ), observerDisplayName: "Manager", message: "Keep the exact runtime writer", workflow: nil)
+    }
+
+    private func waiting(_ f: Fixture) async throws -> Task<UserInstructionResponse, Error> {
+        f.session.runState = .waitingForUser
+        f.session.installRunID(UUID())
+        _ = f.session.beginRunAttempt(source: "managed-input-runtime")
+        let response = Task { @MainActor in
+            try await withCheckedThrowingContinuation { continuation in
+                installInstructionWaitForTest(session: f.session, runtime: f.links, continuation: continuation)
+            }
+        }
+        try await AsyncTestWait.waitUntil("runtime instruction wait") { await MainActor.run { f.session.instructionContinuation != nil } }
+        return response
+    }
+
+    private static let live = AgentSessionLinkSendLiveness(
+        observerEndpointIsLive: true, targetEndpointIsLive: true, targetWindowIsClosing: false
+    )
+
+    func testWaitingManagedInputExecutesWithoutPresentationAndKeepsAttribution() async throws {
+        let f = try fixture(store: .shared)
+        let response = try await waiting(f)
+        addTeardownBlock { @MainActor in
+            f.session.instructionContinuation?.resume(throwing: CancellationError())
+            f.session.instructionWait = nil
+            _ = try? await response.value
+        }
+        let request = request()
+        let host = WindowStatesManager.shared
+        XCTAssertNil(host.window(withID: f.candidate.windowID))
+        let outcome = await host.agentSessionLinkPerformSteer(
+            to: f.candidate, request: request, liveness: { Self.live }, commitAuthorization: { .committed }
+        )
+        guard case let .delivered(delivery) = outcome else { return XCTFail("Unexpected outcome: \(outcome)") }
+        let delivered = try await response.value
+        XCTAssertEqual(delivery.deliveryState, .deliveredToWaitingInstruction)
+        XCTAssertTrue(delivered.text?.contains(AgentSessionLinkMessageEnvelope.managementDelegation) == true)
+        XCTAssertTrue(delivered.text?.contains(request.message) == true)
+        let row = try XCTUnwrap(f.session.items.first { $0.id == delivery.targetItemID })
+        XCTAssertEqual(row.text, request.message)
+        XCTAssertEqual(row.crossSessionAttribution, request.attribution)
+        await f.links.drainPendingManagedInputEffects(for: f.session)
+        XCTAssertTrue(f.links.pendingManagedInputEffects.isEmpty)
+    }
+
+    func testResourceRevocationAtLastSecurityAwaitLeavesNoRowOrProviderEffect() async throws {
+        var current = true
+        let f = try fixture(inputResourcesAreCurrent: { current })
+        let response = try await waiting(f)
+        let outcome = await f.links.agentSessionLinkPerformSteer(
+            to: f.candidate, request: request(), liveness: { Self.live },
+            commitAuthorization: { current = false
+                return .committed
+            }
+        )
+        XCTAssertEqual(outcome, .blocked(.endpointReadiness))
+        XCTAssertTrue(f.session.items.isEmpty)
+        XCTAssertTrue(f.links.pendingManagedInputEffects.isEmpty)
+        XCTAssertNotNil(f.session.instructionContinuation)
+        f.session.instructionContinuation?.resume(throwing: CancellationError())
+        f.session.instructionWait = nil
+        _ = try? await response.value
+    }
+
+    func testSameObjectReacquisitionDuringFenceCannotAdoptANewWriter() async throws {
+        let f = try fixture()
+        let response = try await waiting(f)
+        let outcome = await f.links.agentSessionLinkPerformSteer(
+            to: f.candidate, request: request(), liveness: { Self.live }, commitAuthorization: {
+                f.scope.replaceSessions([:])
+                f.scope.replaceSessions([f.session.tabID: f.session])
+                return .committed
+            }
+        )
+        XCTAssertEqual(outcome, .blocked(.endpointReadiness))
+        XCTAssertTrue(f.session.items.isEmpty)
+        XCTAssertNotNil(f.session.instructionContinuation)
+        f.session.instructionContinuation?.resume(throwing: CancellationError())
+        f.session.instructionWait = nil
+        _ = try? await response.value
+    }
+
+    func testManagedInputDrainAdapterKeepsExactSiblingAndRemovedObjectReceipts() async throws {
+        let f = try fixture()
+        var sibling: AgentTabSession? = f.scope.makeSession(tabID: UUID())
+        let retainedSibling = { [weak sibling] in sibling }
+        let join = AgentSessionHostDrainRuntime.EffectJoin.managedInput(f.links)
+        let firstGate = AgentSessionLinkStopSignal<Void>()
+        let siblingGate = AgentSessionLinkStopSignal<Void>()
+        f.links.retainManagedInputEffect(session: f.session, owner: f.scope) { await firstGate.value() }
+        try f.links.retainManagedInputEffect(session: XCTUnwrap(sibling), owner: f.scope) { await siblingGate.value() }
+        XCTAssertTrue(join.hasPending(f.session))
+        XCTAssertTrue(try join.hasPending(XCTUnwrap(sibling)))
+        XCTAssertTrue(join.hasPendingInScope())
+        firstGate.finish(())
+        await join.drain(f.session)
+        XCTAssertFalse(join.hasPending(f.session))
+        XCTAssertTrue(try join.hasPending(XCTUnwrap(sibling)), "One exact join cannot acknowledge its sibling")
+        f.scope.replaceSessions([:])
+        sibling = nil
+        XCTAssertNotNil(retainedSibling(), "The actual producer must retain its exact object, not only its address")
+        let drain = AgentSessionHostDrainRuntime.begin(scope: f.scope, owner: NSObject(), adapters: .init(
+            managedInput: join, selfCompact: AgentSessionHostDrainTestEffects.empty,
+            finishProvider: { _ in XCTFail("Removed objects are not current provider participants") },
+            probe: { _, _ in XCTFail("No census cannot prove orphan producer exit")
+                return true
+            }
+        ))
+        drain.attemptRecovery()
+        let pending = await drain.wait(until: .now)
+        XCTAssertEqual(pending, .timedOut)
+        XCTAssertFalse(f.scope.releaseWriterClaimsAfterHostDrain())
+        siblingGate.finish(())
+        let result = await drain.wait(until: .now.advanced(by: .seconds(5)))
+        XCTAssertEqual(result, .released)
+        XCTAssertFalse(join.hasPendingInScope(), "Aggregate join must read the receipt table, not the live census")
+        XCTAssertNil(retainedSibling(), "The completed producer must release its originating object")
+    }
+
+    func testObserverCancellationDoesNotCancelTheAdmittedProviderProducer() async throws {
+        let f = try fixture()
+        let response = try await waiting(f)
+        let ticket = f.session.codexDispatchSerialGate.issueTicket()
+        let ownsGate = await f.session.codexDispatchSerialGate.awaitTurn(ticket)
+        XCTAssertTrue(ownsGate)
+        let request = request()
+        let observer = Task { @MainActor in
+            await f.links.agentSessionLinkPerformSteer(
+                to: f.candidate, request: request, liveness: { Self.live }, commitAuthorization: { .committed }
+            )
+        }
+        try await AsyncTestWait.waitUntil("managed row before provider gate") { await MainActor.run { f.session.items.contains { $0.kind == .user } } }
+        observer.cancel()
+        let join = AgentSessionHostDrainRuntime.EffectJoin.managedInput(f.links)
+        XCTAssertTrue(join.hasPending(f.session))
+        let (observationID, changes) = f.scope.observeSettlement()
+        defer { f.scope.removeSettlementObserver(observationID) }
+        let producerExited = expectation(description: "post-removal managed-input settlement wake")
+        let wake = Task { @MainActor in
+            for await _ in changes {
+                if !join.hasPending(f.session) {
+                    producerExited.fulfill()
+                    return
+                }
+            }
+        }
+        defer { wake.cancel() }
+        f.session.codexDispatchSerialGate.finish(ticket)
+        let delivered = try await response.value
+        let outcome = await observer.value
+        guard case .delivered = outcome else { return XCTFail("Cancellation rewrote a committed effect: \(outcome)") }
+        XCTAssertTrue(delivered.text?.contains(request.message) == true)
+        XCTAssertEqual(f.session.items.count(where: { $0.kind == .user }), 1)
+        await join.drain(f.session)
+        await fulfillment(of: [producerExited], timeout: 5)
+        XCTAssertFalse(join.hasPendingInScope())
+    }
+
+    func testResourceRevocationAfterRowAcceptanceWithdrawsOnlyTheUndispatchedInput() async throws {
+        var current = true
+        let f = try fixture(inputResourcesAreCurrent: { current })
+        let response = try await waiting(f)
+        let ticket = f.session.codexDispatchSerialGate.issueTicket()
+        let ownsGate = await f.session.codexDispatchSerialGate.awaitTurn(ticket)
+        XCTAssertTrue(ownsGate)
+        let request = request()
+        let observer = Task { @MainActor in
+            await f.links.agentSessionLinkPerformSteer(
+                to: f.candidate, request: request, liveness: { Self.live }, commitAuthorization: { .committed }
+            )
+        }
+        try await AsyncTestWait.waitUntil("accepted row before resource loss") { await MainActor.run { f.session.items.contains { $0.kind == .user } } }
+        current = false
+        f.session.codexDispatchSerialGate.finish(ticket)
+        let outcome = await observer.value
+        XCTAssertEqual(outcome, .blocked(.steerNotAccepted))
+        await f.links.drainPendingManagedInputEffects(for: f.session)
+        XCTAssertTrue(f.session.items.isEmpty)
+        XCTAssertNotNil(f.session.instructionContinuation, "Stale prepared input must not consume the provider wait")
+        f.session.instructionContinuation?.resume(throwing: CancellationError())
+        f.session.instructionWait = nil
+        _ = try? await response.value
+    }
+
+    func testAsyncResourceValidationRechecksTheAcceptedWaitingInstruction() async throws {
+        let gate = AgentSessionLinkStopSignal<Void>()
+        var validations = 0
+        var validationEntered = false
+        var current = true
+        weak var expectedSession: AgentTabSession?
+        let f = try fixture(
+            inputResourcesAreCurrent: { current },
+            validateInputResources: { command in
+                XCTAssertTrue(command?.writer.session === expectedSession)
+                XCTAssertTrue(command?.isCurrent == true)
+                validations += 1
+                guard validations == 2 else { return true }
+                validationEntered = true
+                await gate.value()
+                return true // Resource success cannot renew the original synchronous admission.
+            }
+        )
+        expectedSession = f.session
+        let response = try await waiting(f)
+        let request = request()
+        let observer = Task { @MainActor in
+            await f.links.agentSessionLinkPerformSteer(
+                to: f.candidate, request: request, liveness: { Self.live }, commitAuthorization: { .committed }
+            )
+        }
+        addTeardownBlock { @MainActor in
+            gate.finish(())
+            f.session.instructionContinuation?.resume(throwing: CancellationError())
+            f.session.instructionWait = nil
+            _ = await observer.value
+            _ = try? await response.value
+        }
+        try await AsyncTestWait.waitUntil("exact resource validation suspended") { await MainActor.run { validationEntered } }
+        XCTAssertEqual(f.session.items.count(where: { $0.kind == .user }), 1)
+        current = false
+        gate.finish(())
+        let outcome = await observer.value
+        XCTAssertEqual(outcome, .blocked(.steerNotAccepted))
+        await f.links.drainPendingManagedInputEffects(for: f.session)
+        XCTAssertTrue(f.session.items.isEmpty)
+        XCTAssertNotNil(f.session.instructionContinuation, "An async resource receipt must not consume a revoked instruction wait")
+    }
+
+    func testResumeRecoveryBuildsTheTranscriptWithoutPresentationAndRefusesStaleResources() async throws {
+        let f = try fixture()
+        f.session.appendItem(.user("Keep this recovery witness", sequenceIndex: f.session.nextSequenceIndex))
+        let outcome = await f.links.prepareResumeRecoveryHandoff(
+            for: f.session, sourceTitle: "Runtime owner", environment: environment(f)
+        )
+        guard case let .staged(handoff) = outcome else { return XCTFail("Runtime recovery was not staged") }
+        XCTAssertTrue(handoff.payload?.contains("Keep this recovery witness") == true)
+        XCTAssertTrue(handoff.payload?.contains("Runtime owner") == true)
+        XCTAssertEqual(f.session.pendingHandoff, handoff)
+        let stale = try fixture()
+        stale.session.appendItem(.user("Do not stage", sequenceIndex: stale.session.nextSequenceIndex))
+        let refused = await stale.links.prepareResumeRecoveryHandoff(
+            for: stale.session, sourceTitle: "Stale", environment: environment(stale, isCurrent: { false })
+        )
+        guard case .refused = refused else { return XCTFail("Stale resources staged recovery") }
+        XCTAssertNil(stale.session.pendingHandoff.payload)
+        XCTAssertEqual(stale.session.items.count(where: { $0.kind == .user }), 1)
+        let missing = try fixture(initialThreadInput: { _ in nil })
+        let unavailable = await missing.links.prepareResumeRecoveryHandoff(
+            for: missing.session, sourceTitle: "Unavailable context", environment: environment(missing)
+        )
+        guard case .refused = unavailable else { return XCTFail("Missing bound context is not a valid empty snapshot") }
+        XCTAssertNil(missing.session.pendingHandoff.payload)
+    }
+
+    func testStartupRefusesAnOriginatingCommandAfterSameObjectWriterReacquisition() async throws {
+        let f = try fixture()
+        let origin = try f.scope.admit(session: f.session)
+        f.scope.replaceSessions([:])
+        f.scope.replaceSessions([f.session.tabID: f.session])
+        XCTAssertFalse(origin.isCurrent)
+        XCTAssertTrue(try f.scope.admit(session: f.session).isCurrent)
+        let outcome = AgentRunStartOutcomeRecorder()
+        let result = await f.links.startAgentRun(
+            command: origin, initialMessage: "must not follow the new writer",
+            directStartOptions: .init(), startOutcome: outcome, providerSwitchPreparation: nil
+        )
+        guard case .some(.failed) = result else { return XCTFail("Stale startup must refuse before its provider callback") }
+        XCTAssertFalse(outcome.outcome.didStart)
+        XCTAssertTrue(f.session.items.isEmpty)
+    }
+
+    func testRecoveryRequiresTheOriginalExplicitCreationCommandWithoutRestorationBypass() async throws {
+        for variant in ["current", "missing-command", "reacquired", "reacquired-at-context", "cancelled-before-entry", "missing-resources"] {
+            var capture: (@MainActor (AgentTabSession) -> Void)?
+            let f = try fixture(initialThreadInput: { session in
+                capture?(session)
+                return .init(
+                    workspace: .init(store: WorkspaceFileContextStore(), lookupSource: nil),
+                    selection: .init(selectedPaths: []), promptText: nil
+                )
+            })
+            let session = f.scope.makeSession(tabID: UUID())
+            let claim = AgentSessionCreationClaim(workspaceID: f.candidate.workspaceID)
+            session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: claim.sessionID, workspaceID: claim.workspaceID))
+            let creation = try XCTUnwrap(session.acceptFreshCreation(claim, workspaceID: claim.workspaceID))
+            session.appendItem(.user("Preserve the creation context", sequenceIndex: session.nextSequenceIndex))
+            f.scope.replaceSessions([session.tabID: session])
+            let command = try f.scope.admit(session: session, requirement: .creation(creation))
+            XCTAssertThrowsError(try f.scope.admit(session: session), "\(variant): ordinary restored admission must remain closed")
+            let before = session.pendingHandoff
+            if variant == "reacquired" {
+                f.scope.replaceSessions([:])
+                f.scope.replaceSessions([session.tabID: session])
+            } else if variant == "reacquired-at-context" {
+                // Reentrant resource capture cannot turn the old receipt into today's writer.
+                // The final staging fence must still validate the originally supplied command.
+                capture = { [weak scope = f.scope] session in
+                    guard let scope else { return XCTFail("The originating test scope was released") }
+                    scope.replaceSessions([:])
+                    scope.replaceSessions([session.tabID: session])
+                }
+            }
+            let environment = environment(f, isCurrent: { variant != "missing-resources" })
+            let supplied = variant == "missing-command" ? nil : command
+            let result: AgentSessionHandoffRuntime.RecoveryResult
+            if variant == "cancelled-before-entry" {
+                let task = Task { @MainActor in
+                    await f.links.prepareResumeRecoveryHandoff(
+                        for: session, sourceTitle: "Creation owner", environment: environment, command: supplied
+                    )
+                }
+                task.cancel()
+                result = await task.value
+            } else {
+                result = await f.links.prepareResumeRecoveryHandoff(
+                    for: session, sourceTitle: "Creation owner", environment: environment, command: supplied
+                )
+            }
+            if variant == "current" {
+                guard case let .staged(handoff) = result else {
+                    XCTFail("\(variant): the actual creation capability must permit recovery")
+                    continue
+                }
+                XCTAssertTrue(handoff.payload?.contains("Preserve the creation context") == true)
+                XCTAssertEqual(session.pendingHandoff, handoff)
+                XCTAssertTrue(command.isCurrent, variant)
+            } else {
+                guard case .refused = result else {
+                    XCTFail("\(variant): recovery must not infer or reacquire creation admission")
+                    continue
+                }
+                XCTAssertEqual(session.pendingHandoff, before, variant)
+            }
+            XCTAssertTrue(session.creationHandleIsCurrent(creation), variant)
+            XCTAssertThrowsError(try f.scope.admit(session: session), "\(variant): staging is not configured first-save acknowledgement")
+            if variant.hasPrefix("reacquired") {
+                let successor = try f.scope.admit(session: session, requirement: .creation(creation))
+                XCTAssertNotEqual(successor.identity, command.identity, variant)
+                XCTAssertTrue(successor.isCurrent, variant)
+                XCTAssertFalse(command.isCurrent, variant)
+            }
+        }
+    }
+
+    func testProviderInputRevalidatesItsCapturedContextInsteadOfReadingASuccessor() async throws {
+        let gate = AgentSessionLinkStopSignal<Void>()
+        var entered = false
+        var generation = 1
+        var captures = 0
+        let f = try fixture(inputWorkspace: { _ in
+            captures += 1
+            let captured = generation
+            return .init(store: WorkspaceFileContextStore(), lookupSource: nil, workspacePaths: [], validate: {
+                entered = true
+                await gate.value()
+                return captured == generation
+            })
+        })
+        let environment = environment(f)
+        let pending = Task { @MainActor in
+            await f.links.prepareProviderMessage(
+                "Exact original input", session: f.session, attachments: [], taggedFiles: [],
+                skipsSlashExpansion: true, environment: environment, isCurrent: { true }
+            )
+        }
+        addTeardownBlock { @MainActor in gate.finish(())
+            _ = await pending.value
+        }
+        try await AsyncTestWait.waitUntil("captured context validation") { await MainActor.run { entered } }
+        generation += 1
+        gate.finish(())
+        let refused = await pending.value
+        XCTAssertFalse(refused.dispatchIsCurrent())
+        XCTAssertEqual(captures, 1, "A later resource check must not capture replacement context")
+        let fresh = await f.links.prepareProviderMessage(
+            "New explicit request", session: f.session, attachments: [], taggedFiles: [],
+            skipsSlashExpansion: true, environment: environment, isCurrent: { true }
+        )
+        XCTAssertTrue(fresh.dispatchIsCurrent())
+        XCTAssertEqual(captures, 2)
+        generation += 1
+        let dispatchAllowed = await fresh.validateResources?()
+        XCTAssertEqual(dispatchAllowed, false, "The physical dispatch validator retains the original rendered context")
+        XCTAssertEqual(captures, 2)
+        XCTAssertTrue(f.session.items.isEmpty)
+    }
+
+    func testProviderInputProofDoesNotFollowAChangedResourceGeneration() async throws {
+        let f = try fixture()
+        var current = true
+        let environment = AgentSessionLinkExecutionRuntime.ManagedInputEnvironment(
+            workspaceID: f.candidate.workspaceID, resourcesAreCurrent: { current }, settings: .shared, tools: f.tools,
+            captureProviderLaunchInput: { command in
+                try .init(origin: command, workspace: .init(fallbackWorkspacePath: nil), bindings: [], resourcesAreCurrent: { current })
+            }
+        )
+        let prepared = await f.links.prepareProviderMessage(
+            "ordinary provider text", session: f.session, attachments: [], taggedFiles: [], skipsSlashExpansion: true,
+            environment: environment, isCurrent: { true }
+        )
+        XCTAssertEqual(prepared.text, "ordinary provider text")
+        XCTAssertTrue(prepared.dispatchIsCurrent())
+        XCTAssertTrue(try XCTUnwrap(prepared.providerLaunchInput).isCurrent(for: f.session))
+        current = false
+        XCTAssertFalse(prepared.dispatchIsCurrent(), "The prepared bytes do not authorize dispatch on successor resources")
+        XCTAssertFalse(try XCTUnwrap(prepared.providerLaunchInput).isCurrent(for: f.session))
+        XCTAssertTrue(f.session.items.isEmpty)
+    }
 }

@@ -9,12 +9,14 @@ extension AppDomainRuntimeComposition {
     @MainActor
     @discardableResult
     func register(
-        _ service: MCPAppToolCatalogRegistration
+        _ service: MCPAppToolCatalogRegistration,
+        in domainRuntime: MCPDomainRuntime? = nil
     ) async throws -> MCPDomainToolRegistrationResult {
         try await register(
             service: service,
             tools: service.materializeTools(),
-            interactionAdapter: service.longRunningInteractionAdapter
+            interactionAdapter: service.longRunningInteractionAdapter,
+            domainRuntime: domainRuntime ?? runtime
         )
     }
 
@@ -35,14 +37,15 @@ extension AppDomainRuntimeComposition {
                 serviceToolsAwaitState
             )
         #endif
-        return try await register(service: service, tools: tools, interactionAdapter: nil)
+        return try await register(service: service, tools: tools, interactionAdapter: nil, domainRuntime: runtime)
     }
 
     @MainActor
     private func register(
         service: any Service,
         tools: [Tool],
-        interactionAdapter: DomainLongRunningInteractionAdapter?
+        interactionAdapter: DomainLongRunningInteractionAdapter?,
+        domainRuntime: MCPDomainRuntime
     ) async throws -> MCPDomainToolRegistrationResult {
         #if DEBUG || EDIT_FLOW_PERF
             let definitionScanState = EditFlowPerf.begin(
@@ -51,7 +54,6 @@ extension AppDomainRuntimeComposition {
         #endif
         let bindings: [MCPDomainToolBinding]
         do {
-            let domainRuntime = runtime
             bindings = try tools.map {
                 let domainBinding = try $0.domainBinding()
                 let longRunningBinding = domainRuntime.longRunningToolProvider.wrapping(
@@ -82,7 +84,7 @@ extension AppDomainRuntimeComposition {
         #endif
 
         do {
-            let result = try await runtime.toolRegistry.registerWithResult(
+            let result = try await domainRuntime.toolRegistry.registerWithResult(
                 registrationID: service.domainRegistrationID,
                 scope: registrationScope(for: service),
                 bindings: bindings
@@ -121,8 +123,8 @@ extension AppDomainRuntimeComposition {
         }
     }
 
-    func unregister(_ handle: MCPDomainToolRegistrationHandle) async {
-        let removal = await runtime.toolRegistry.unregister(handle)
+    func unregister(_ handle: MCPDomainToolRegistrationHandle, in domainRuntime: MCPDomainRuntime? = nil) async {
+        let removal = await (domainRuntime ?? runtime).toolRegistry.unregister(handle)
         if removal == .removed {
             await ServerNetworkManager.shared.broadcastToolListChanged()
         }

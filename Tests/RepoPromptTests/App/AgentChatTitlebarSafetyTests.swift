@@ -4,10 +4,13 @@ import Combine
 import Foundation
 import KeyboardShortcuts
 import MCP
+import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+@testable import RepoPromptMCPServer
 import RepoPromptPersistence
 import RepoPromptSettingsCore
+@testable import RepoPromptWorkspaceContext
 import SwiftUI
 import XCTest
 
@@ -621,6 +624,154 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
         }
     }
 
+    func testCleanUnownedTabsCloseWithoutSavingButDirtyTabsStillRefuse() async throws {
+        enum Ownership: CaseIterable { case conflicting, unscoped, wrongWorkspace }
+        for ownership in Ownership.allCases {
+            for dirty in [false, true] {
+                try await withFixture { fixture in
+                    // Finish the surviving tab's activation and its provider-control save before
+                    // measuring removal writes; its delayed UI refresh is not a close of Alpha.
+                    await fixture.window.promptManager.awaitInitialModelRefreshCompletion()
+                    fixture.viewModel.test_setCurrentTabIDOverride(nil)
+                    await fixture.window.promptManager.switchComposeTab(fixture.tabBID)
+                    XCTAssertEqual(fixture.window.promptManager.activeComposeTabID, fixture.tabBID)
+                    let survivingSession = try XCTUnwrap(fixture.viewModel.sessions[fixture.tabBID])
+                    _ = fixture.viewModel.updatePermissionBindingState(from: survivingSession, syncUI: false)
+                    fixture.viewModel.test_flushPendingUIRefresh()
+                    let activationSave = await fixture.viewModel.persistenceRuntime.flushSaveRequired(
+                        for: fixture.tabBID, workspaceID: fixture.workspaceID
+                    )
+                    if case let .failure(failure) = activationSave { XCTFail("\(failure)") }
+                    XCTAssertNil(survivingSession.saveDebounceTask)
+                    XCTAssertFalse(try fixture.viewModel.persistenceRuntime.queue.hasPendingSave(sessionID: XCTUnwrap(survivingSession.activeAgentSessionID)))
+                    let session = fixture.sessionA
+                    let peerScope = AgentSessionRuntimeStore.shared.makeScope()
+                    defer { peerScope.replaceSessions([:]) }
+                    switch ownership {
+                    case .conflicting:
+                        let replica = AgentTabSession(tabID: UUID())
+                        try replica.installPersistentSessionBinding(.init(
+                            tabID: replica.tabID, sessionID: fixture.sessionAID, workspaceID: fixture.workspaceID
+                        ))
+                        replica.recordRestorationAuthoritative(.persistedPayloadApplied)
+                        peerScope.replaceSessions([replica.tabID: replica])
+                    case .unscoped, .wrongWorkspace:
+                        try session.installPersistentSessionBinding(.init(
+                            tabID: session.tabID, sessionID: fixture.sessionAID,
+                            workspaceID: ownership == .unscoped ? nil : UUID()
+                        ))
+                        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+                    }
+                    session.saveDebounceTask?.cancel()
+                    session.saveDebounceTask = nil
+                    session.saveDebounceRequestID = nil
+                    session.isDirty = dirty
+                    XCTAssertNil(session.persistedLoadTask)
+                    XCTAssertFalse(fixture.viewModel.persistenceRuntime.queue.hasPendingSave(sessionID: fixture.sessionAID))
+                    var writes = 0
+                    fixture.viewModel.test_setAgentSessionSaver { [root = fixture.rootURL] _, _, _ in
+                        writes += 1
+                        return root
+                    }
+
+                    let report = await fixture.window.promptManager.closeComposeTabs(withIDs: [fixture.tabAID])
+                    withExtendedLifetime(peerScope) {}
+                    XCTAssertEqual(writes, 0, "\(ownership), dirty=\(dirty)")
+                    if dirty {
+                        XCTAssertNotNil(fixture.tab(fixture.tabAID))
+                        XCTAssertTrue(fixture.viewModel.sessions[fixture.tabAID] === session)
+                        XCTAssertTrue(session.isDirty)
+                        XCTAssertEqual(report.rejections.first?.message, "The session does not have a unique runtime writer for this workspace.")
+                    } else {
+                        XCTAssertTrue(report.rejections.isEmpty, "\(report.rejections)")
+                        XCTAssertNil(fixture.tab(fixture.tabAID))
+                        XCTAssertNil(fixture.viewModel.sessions[fixture.tabAID])
+                    }
+                    XCTAssertNotNil(fixture.tab(fixture.tabBID))
+                }
+            }
+        }
+    }
+
+    func testCleanUnownedRemovalStillRefusesPendingPersistence() async throws {
+        enum Pending: CaseIterable { case debounce, inFlight, followUp }
+        for pending in Pending.allCases {
+            try await withFixture { fixture in
+                let session = fixture.sessionA
+                let runtime = fixture.viewModel.persistenceRuntime
+                try session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: fixture.sessionAID))
+                session.recordRestorationAuthoritative(.persistedPayloadApplied)
+                session.saveDebounceTask?.cancel()
+                session.saveDebounceTask = nil
+                session.saveDebounceRequestID = nil
+                session.isDirty = false
+                switch pending {
+                case .debounce: session.saveDebounceRequestID = UUID()
+                case .inFlight: XCTAssertTrue(runtime.queue.begin(sessionID: fixture.sessionAID))
+                case .followUp: runtime.queue.requestFollowUp(sessionID: fixture.sessionAID)
+                }
+                defer {
+                    session.saveDebounceRequestID = nil
+                    if runtime.queue.inFlightSessionIDs.contains(fixture.sessionAID) {
+                        _ = runtime.queue.finish(sessionID: fixture.sessionAID)
+                    }
+                    runtime.queue.discardFollowUp(sessionID: fixture.sessionAID)
+                }
+                var writes = 0
+                fixture.viewModel.test_setAgentSessionSaver { [root = fixture.rootURL] _, _, _ in
+                    writes += 1
+                    return root
+                }
+                let decision = await fixture.viewModel.preflightComposeTabsRemoval(
+                    [fixture.tabAID], reason: .close, workspaceID: fixture.workspaceID
+                )
+                guard case let .abort(failure) = decision else { return XCTFail("Pending \(pending) must not bypass persistence") }
+                XCTAssertEqual(failure.message, "The session does not have a unique runtime writer for this workspace.")
+                XCTAssertEqual(writes, 0)
+                XCTAssertNotNil(fixture.tab(fixture.tabAID))
+            }
+        }
+    }
+
+    func testNoWriteRemovalClaimIsRecheckedAfterAnotherTabFlushes() async throws {
+        for pendingSave in [false, true] {
+            try await withFixture { fixture in
+                let ordered = [fixture.tabAID, fixture.tabBID].sorted { $0.uuidString < $1.uuidString }
+                let first = try XCTUnwrap(fixture.viewModel.sessions[ordered[0]])
+                let second = try XCTUnwrap(fixture.viewModel.sessions[ordered[1]])
+                let firstID = try XCTUnwrap(first.activeAgentSessionID)
+                for session in [first, second] {
+                    session.saveDebounceTask?.cancel()
+                    session.saveDebounceTask = nil
+                    session.saveDebounceRequestID = nil
+                }
+                try first.installPersistentSessionBinding(.init(tabID: first.tabID, sessionID: firstID))
+                first.recordRestorationAuthoritative(.persistedPayloadApplied)
+                first.isDirty = false
+                second.isDirty = true
+                defer { first.saveDebounceRequestID = nil }
+                var savedIDs: [UUID] = []
+                fixture.viewModel.test_setAgentSessionSaver { [root = fixture.rootURL] payload, _, _ in
+                    savedIDs.append(payload.id)
+                    if pendingSave {
+                        first.saveDebounceRequestID = UUID()
+                    } else {
+                        first.isDirty = true
+                    }
+                    return root
+                }
+                let decision = await fixture.viewModel.preflightComposeTabsRemoval(
+                    Set(ordered), reason: .close, workspaceID: fixture.workspaceID
+                )
+                guard case let .abort(failure) = decision else { return XCTFail("The no-write removal claim became stale") }
+                XCTAssertEqual(failure.message, "A target session changed after required persistence completed.")
+                XCTAssertEqual(savedIDs, [second.activeAgentSessionID].compactMap(\.self))
+                XCTAssertNotNil(fixture.tab(first.tabID))
+                XCTAssertNotNil(fixture.tab(second.tabID))
+            }
+        }
+    }
+
     func testGuardedCloseAndStashRejectStaleMutationContext() async throws {
         try await withFixture { fixture in
             await fixture.window.promptManager.closeComposeTab(
@@ -730,9 +881,9 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
                     if entry == "agent_close" {
                         await ServerNetworkManager.shared.setRunPurpose(.agentModeRun, for: connection)
                         actor = fixture.viewModel.sessions[fixture.tabBID]?.activeAgentSessionID
-                        fixture.window.mcpServer.tabContextByConnectionID[connection] = .init(tabID: fixture.tabBID, windowID: fixture.window.windowID, workspaceID: fixture.workspaceID, promptText: "", selection: StoredSelection(), selectedMetaPromptIDs: [], tabName: "Beta", runID: UUID(), explicitlyBound: false)
+                        fixture.window.mcpServer.runRouteBindings.tabContextByConnectionID[connection] = .init(tabID: fixture.tabBID, windowID: fixture.window.windowID, workspaceID: fixture.workspaceID, promptText: "", selection: StoredSelection(), selectedMetaPromptIDs: [], tabName: "Beta", runID: UUID(), explicitlyBound: false)
                     }
-                    defer { fixture.window.mcpServer.tabContextByConnectionID.removeValue(forKey: connection) }
+                    defer { fixture.window.mcpServer.runRouteBindings.tabContextByConnectionID.removeValue(forKey: connection) }
                     let service = WindowRoutingService(windowStates: .shared, networkMgr: .shared)
                     await service.prepareDomainTools()
                     let tools = await service.tools
@@ -810,12 +961,13 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
         GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
         await window.workspaceManager.awaitInitialized()
 
+        let storage = WorkspaceFixtureStorage(root: rootURL)
         do {
-            let workspace = window.workspaceManager.createWorkspace(
+            let workspace = storage.isolate(window.workspaceManager.createWorkspace(
                 name: "Titlebar Safety",
                 repoPaths: [rootURL.path],
                 ephemeral: true
-            )
+            ), in: window.workspaceManager)
             await window.workspaceManager.switchWorkspace(
                 to: workspace,
                 saveState: false,
@@ -864,6 +1016,7 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
             return Fixture(
                 window: window,
                 rootURL: rootURL,
+                storage: storage,
                 workspaceID: workspace.id,
                 viewModel: viewModel,
                 tabAID: tabAID,
@@ -875,6 +1028,7 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
             window.beginClose()
             await window.tearDown()
             WindowStatesManager.shared.unregisterWindowState(window)
+            await storage.remove()
             try? FileManager.default.removeItem(at: rootURL)
             throw error
         }
@@ -886,6 +1040,7 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
         fixture.window.beginClose()
         await fixture.window.tearDown()
         WindowStatesManager.shared.unregisterWindowState(fixture.window)
+        await fixture.storage.remove()
         try? FileManager.default.removeItem(at: fixture.rootURL)
     }
 
@@ -900,6 +1055,7 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
     private struct Fixture {
         let window: WindowState
         let rootURL: URL
+        let storage: WorkspaceFixtureStorage
         let workspaceID: UUID
         let viewModel: AgentModeViewModel
         let tabAID: UUID
@@ -1393,7 +1549,7 @@ final class WorkspaceRestorationTitleTests: XCTestCase {
             (
                 viewModel.agentSessionLinkIsOverseer(tabID: observerTab.id),
                 viewModel.currentPaneOwner?.workspaceID,
-                viewModel.agentSessionLinkObserverEndpoint(tabID: observerTab.id)?.workspaceID
+                viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: observerTab.id)?.workspaceID
             )
         }
 

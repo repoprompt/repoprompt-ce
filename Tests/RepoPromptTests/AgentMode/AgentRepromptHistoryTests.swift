@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 @testable import RepoPromptApp
 import XCTest
 
@@ -213,6 +214,31 @@ final class AgentRepromptModelPolicyTests: XCTestCase {
         XCTAssertNil(AgentRepromptModelPolicy.resolve(selection: "unknown-future-model", currentProvider: .codexExec, configured: [codex]))
         XCTAssertNil(AgentRepromptModelPolicy.resolve(selection: AIModel.gpt61SolLow.rawValue, currentProvider: .codexExec, configured: [codex]))
         XCTAssertEqual(AgentRepromptModelPolicy.resolve(selection: AIModel.gpt61SolLow.rawValue, currentProvider: .codexExec, configured: [codex, .gpt61SolLow]), .gpt61SolLow)
+    }
+
+    func testMenuSharesOneAvailabilityPassAndActionsResolveFreshPinnedDefault() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        let vm = fixture.viewModel
+        let claude = AgentRepromptModelPolicy.preferredClaude
+        var checks: [AIModel: Int] = [:]
+        vm.repromptAvailability = { model in
+            checks[model, default: 0] += 1
+            return model == claude || model == .gpt61SolLow
+        }
+        let menu = vm.repromptMenuModels()
+        XCTAssertEqual(menu.resolved, claude)
+        XCTAssertTrue(menu.configured.contains(claude))
+        XCTAssertFalse(checks.isEmpty)
+        XCTAssertTrue(checks.values.allSatisfy { $0 == 1 }, "Menu resolution must reuse its filtered list")
+        XCTAssertNil(vm.repromptDefaultModel, "An off menu must not pin a billing route")
+
+        vm.repromptEnabled = true
+        XCTAssertEqual(vm.repromptMenuModels().resolved, claude)
+        XCTAssertEqual(vm.repromptDefaultModel?.model, claude)
+        vm.repromptAvailability = { $0 == .gpt61SolLow }
+        XCTAssertNil(vm.resolvedRepromptModel(), "Actions must not reuse the earlier menu's availability")
+        XCTAssertNil(vm.repromptMenuModels().resolved, "Losing a pinned route must not silently switch billing")
     }
 
     func testResolvedDefaultDisappearingRequiresChoiceRatherThanBillingRouteSwitch() async throws {

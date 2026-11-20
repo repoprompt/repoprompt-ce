@@ -1,4 +1,7 @@
 import Foundation
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
+import RepoPromptClaudeProvider
 
 /// Model-catalog seam for the Claude-compatible plugin path.
 ///
@@ -78,17 +81,6 @@ enum ClaudeCompatibleModelCatalogAdapter {
         for agentKind: AgentProviderKind
     ) -> [AgentModelOption] {
         pluginOptions.map { modelOption(from: $0, for: agentKind) }
-    }
-
-    static func pluginModelOption(from option: AgentModelOption) -> ClaudeCompatiblePluginModelOption {
-        ClaudeCompatiblePluginModelOption(
-            rawValue: option.rawValue,
-            displayName: option.displayName,
-            description: option.description,
-            isPlaceholderDefault: option.isPlaceholderDefault,
-            isProviderDefault: option.isProviderDefault,
-            supportedEffortLevels: []
-        )
     }
 
     static func compatibleBackendModelBehavior(
@@ -383,7 +375,7 @@ enum ClaudeCompatibleModelCatalogAdapter {
         }
     }
 
-    private static func compatibleBackendID(for agentKind: AgentProviderKind) -> ClaudeCodeCompatibleBackendID? {
+    static func compatibleBackendID(for agentKind: AgentProviderKind) -> ClaudeCodeCompatibleBackendID? {
         switch agentKind {
         case .claudeCodeGLM:
             .glmZAI
@@ -404,7 +396,7 @@ enum ClaudeCompatibleModelCatalogAdapter {
         ClaudeCompatibleProviderRuntimeBridge.noModelRawValue(for: id)
     }
 
-    private static func normalizedRawModel(_ rawValue: String?) -> String? {
+    static func normalizedRawModel(_ rawValue: String?) -> String? {
         guard let rawValue else { return nil }
         let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
@@ -414,6 +406,7 @@ enum ClaudeCompatibleModelCatalogAdapter {
     /// Base model raw values (lowercased) that support the XHigh effort tier.
     private static let claudeXHighEligibleBaseRaws: Set<String> = [
         AgentModel.claudeFable.rawValue.lowercased(),
+        AgentModel.claudeFable52.rawValue.lowercased(),
         AgentModel.claudeFable51.rawValue.lowercased(),
         AgentModel.claudeFable5.rawValue.lowercased(),
         AgentModel.claudeMythos51.rawValue.lowercased(),

@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptCodexProvider
 import RepoPromptInstrumentation
 import RepoPromptProcess
 import RepoPromptSecureStorage
@@ -130,6 +131,21 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
         )
     }
 
+    func testBundledRuntimeRequiresExecutableExecServer() throws {
+        let resources = temporaryDirectory.appendingPathComponent("Resources", isDirectory: true)
+        let target = "aarch64-apple-darwin"
+        let executable = try makePackage(in: resources, target: target)
+        try FileManager.default.removeItem(at: executable.deletingLastPathComponent().appendingPathComponent("codex-exec-server"))
+
+        let result = CodexRuntimeAuthority.resolve(
+            resourcesURL: resources,
+            architectureTarget: target,
+            applicationSupportURL: temporaryDirectory
+        )
+
+        XCTAssertEqual(failure(from: result), .bundledLayoutIncomplete(target: target, missingComponent: "bin/codex-exec-server"))
+    }
+
     func testVersionParserRejectsMalformedTokensAndInvalidNumericPrereleaseIdentifiers() {
         XCTAssertNil(CodexRuntimeAuthority.Version.parse("codex-cli 0.156.0.1"))
         XCTAssertNil(CodexRuntimeAuthority.Version.parse("codex-cli 0.156.0-rc.01"))
@@ -255,18 +271,15 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
 
     func testDefaultsMigrationFeedsIsolatedLaunchSnapshotForBundledAndExternalSelections() throws {
         let externalPath = temporaryDirectory.appendingPathComponent("legacy/codex").path
-        let cases: [(expected: CodexRuntimePreferences.Selection, legacyDomain: [String: Any])] = [
-            (
-                expected: .bundled,
-                legacyDomain: ["codexRuntimeSelectionMode": "bundled"]
-            ),
-            (
-                expected: .external(path: externalPath),
-                legacyDomain: [
-                    "codexRuntimeSelectionMode": "external",
-                    "codexRuntimeExecutablePath": externalPath
-                ]
-            )
+        let external: [String: Any] = [
+            "codexRuntimeSelectionMode": "external",
+            "codexRuntimeExecutablePath": externalPath
+        ]
+        let bundled = ["codexRuntimeSelectionMode": "bundled"]
+        let cases: [(expected: CodexRuntimePreferences.Selection, legacyDomain: [String: Any], successorDomain: [String: Any])] = [
+            (.bundled, bundled, [:]),
+            (.external(path: externalPath), external, [:]),
+            (.external(path: externalPath), bundled, external)
         ]
 
         for testCase in cases {
@@ -280,10 +293,10 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
             defaults.removePersistentDomain(forName: successorDomainName)
             defaults.removePersistentDomain(forName: legacyDomainName)
             defaults.setPersistentDomain(testCase.legacyDomain, forName: legacyDomainName)
+            defaults.setPersistentDomain(testCase.successorDomain, forName: successorDomainName)
 
             let report = BundleIdentityDefaultsMigration.migrateIfNeeded(
                 bundleIdentifier: RuntimeCodeSigningPolicy.successorDeveloperIDBundleIdentifier,
-                defaults: defaults,
                 legacyDomainName: legacyDomainName,
                 successorDomainName: successorDomainName
             )
@@ -639,6 +652,7 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
         let executable = root.appendingPathComponent("bin/codex")
         try makeExecutable(at: executable)
         try makeExecutable(at: root.appendingPathComponent("bin/codex-code-mode-host"))
+        try makeExecutable(at: root.appendingPathComponent("bin/codex-exec-server"))
         try FileManager.default.createDirectory(
             at: root.appendingPathComponent("codex-resources", isDirectory: true),
             withIntermediateDirectories: true
@@ -653,6 +667,7 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
             "target": target,
             "variant": "codex",
             "entrypoint": "bin/codex",
+            "execServer": "bin/codex-exec-server",
             "resourcesDir": "codex-resources",
             "pathDir": "codex-path"
         ]

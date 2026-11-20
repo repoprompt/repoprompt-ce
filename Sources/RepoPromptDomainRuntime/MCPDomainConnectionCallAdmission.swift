@@ -94,6 +94,27 @@ package enum MCPDomainConnectionCallLane: String, CaseIterable, Sendable {
     case fileSearch = "file_search"
 }
 
+package extension MCPToolAdmissionClass {
+    /// The canonical classification selects the physical connection lane for every adapter.
+    /// `ordinary` is the transport's historical name for the exclusive class.
+    var connectionLane: MCPDomainConnectionCallLane {
+        switch self {
+        case .exclusive:
+            .ordinary
+        case .control:
+            .control
+        case .smallRead:
+            .smallRead
+        case .fileRead:
+            .fileRead
+        case .gitRead:
+            .gitRead
+        case .fileSearch:
+            .fileSearch
+        }
+    }
+}
+
 package struct MCPDomainConnectionCallLimiterWatchdogDiagnostics: Sendable {
     package let admittedCallCount: Int
 }
@@ -125,12 +146,12 @@ package actor MCPDomainConnectionCallLimiters {
 
     #if DEBUG
         package init(
-            limit: Int,
-            controlLimit: Int,
-            smallReadLimit: Int,
-            fileReadLimit: Int,
-            gitReadLimit: Int,
-            fileSearchLimit: Int,
+            limit: Int = MCPDomainToolAdmissionLimits.exclusiveConnection,
+            controlLimit: Int = MCPDomainToolAdmissionLimits.controlConnection,
+            smallReadLimit: Int = MCPDomainToolAdmissionLimits.smallReadConnection,
+            fileReadLimit: Int = MCPDomainToolAdmissionLimits.fileReadConnection,
+            gitReadLimit: Int = MCPDomainToolAdmissionLimits.gitReadConnection,
+            fileSearchLimit: Int = MCPDomainToolAdmissionLimits.fileSearchConnection,
             idleWaitSleep: @escaping @Sendable (Duration) async throws -> Void = { duration in
                 try await Task.sleep(for: duration)
             }
@@ -143,7 +164,14 @@ package actor MCPDomainConnectionCallLimiters {
             fileSearch = MCPDomainAsyncLimiter(limit: fileSearchLimit, idleWaitSleep: idleWaitSleep)
         }
     #else
-        package init(limit: Int, controlLimit: Int, smallReadLimit: Int, fileReadLimit: Int, gitReadLimit: Int, fileSearchLimit: Int) {
+        package init(
+            limit: Int = MCPDomainToolAdmissionLimits.exclusiveConnection,
+            controlLimit: Int = MCPDomainToolAdmissionLimits.controlConnection,
+            smallReadLimit: Int = MCPDomainToolAdmissionLimits.smallReadConnection,
+            fileReadLimit: Int = MCPDomainToolAdmissionLimits.fileReadConnection,
+            gitReadLimit: Int = MCPDomainToolAdmissionLimits.gitReadConnection,
+            fileSearchLimit: Int = MCPDomainToolAdmissionLimits.fileSearchConnection
+        ) {
             ordinary = MCPDomainAsyncLimiter(limit: limit)
             control = MCPDomainAsyncLimiter(limit: controlLimit)
             smallRead = MCPDomainAsyncLimiter(limit: smallReadLimit)

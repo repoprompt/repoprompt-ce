@@ -169,11 +169,7 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
         let unknownGroups = !order.isEmpty && !entries.contains { named.contains($0.group) }
         let affected = entries.filter { unknownGroups || named.contains($0.group) }.map(\.sessionID)
         guard Set(affected).isSubset(of: Set(batch.admittedSessionIDs)) else {
-            return .object(SessionAdminReply.diagnostic(code: "groups_outside_scope", fields: [
-                "result": .string("groups_outside_scope"),
-                "affected": .object(["workspace_id": .string(workspaceID.uuidString)]),
-                "detail": .string("Every session in the reordered groups must be in your scope; reorder only groups you fully cover, or ask the user for authority covering the workspace.")
-            ]))
+            return groupsOutsideScope(workspaceID: workspaceID)
         }
         let current = DomainAgentSessionSidebarGroup.orderedGroups(entries.map { ($0.group, $0.order) })
         if unknownGroups {
@@ -193,6 +189,14 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
             return Self.orderingFailure(error, operation: request.operation.adminOperationName, arguments: request.arguments, scopeID: batch.scope.id)
         }
         return recovery(request, workspaceID: workspaceID, order: order, expected: expected, code: "order_required")
+    }
+
+    private func groupsOutsideScope(workspaceID: UUID) -> Value {
+        .object(SessionAdminReply.diagnostic(code: "groups_outside_scope", fields: [
+            "result": .string("groups_outside_scope"),
+            "affected": .object(["workspace_id": .string(workspaceID.uuidString)]),
+            "detail": .string("Every session in the reordered groups must be in your scope; reorder only groups you fully cover, or ask the user for authority covering the workspace.")
+        ]))
     }
 
     private func recovery(
@@ -505,11 +509,7 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
         // mirrored on each of them.
         let affected = entries.filter { Set(order).contains($0.group) }.map(\.sessionID)
         guard Set(affected).isSubset(of: Set(context.targets)) else {
-            return .object(SessionAdminReply.diagnostic(code: "groups_outside_scope", fields: [
-                "result": .string("groups_outside_scope"),
-                "affected": .object(["workspace_id": .string(workspaceID.uuidString)]),
-                "detail": .string("Every session in the reordered groups must be in your scope; reorder only groups you fully cover, or ask the user for authority covering the workspace.")
-            ]))
+            return groupsOutsideScope(workspaceID: workspaceID)
         }
         let current = DomainAgentSessionSidebarGroup.orderedGroups(entries.map { ($0.group, $0.order) })
         if case let .failure(error) = DomainAgentSessionOrdering.permute(
@@ -610,20 +610,23 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
         let backend = backend
         let holdsControl = holdsControl
         let scope = context.batch.scope
-        let archived = await backend.archive(ids, isAuthorized: { id in
+        var outcome = await backend.archive(ids, isAuthorized: { id in
             guard context.isCurrent(id) else {
                 refusals.clear(id)
                 return false
             }
             return refusals.admit(id, backend.runState(of: id) == .idle || holdsControl(scope))
         })
-        return AgentSessionArchiveOutcome(archived: archived, requiresControl: refusals.refused.subtracting(archived))
+        outcome.requiresControl = refusals.refused.subtracting(outcome.archived)
+        return outcome
     }
 
     private func recordArchive(_ context: Context, attempted: [UUID], outcome: AgentSessionArchiveOutcome) {
         for id in attempted {
             if outcome.archived.contains(id) {
                 context.add(id, .changed)
+            } else if let failure = outcome.failures[id] {
+                recordStashFailure(failure, id: id, context: context)
             } else if outcome.requiresControl.contains(id) {
                 context.add(id, .skipped, "requires_control")
             } else {
@@ -645,20 +648,24 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
             if outcome.restored.contains(id) {
                 context.add(id, .changed)
             } else if let failure = outcome.failures[id] {
-                context.items.append(AgentSessionAdminItemResult(
-                    sessionID: id, status: .failed, reason: failure.reason,
-                    detail: [
-                        "local_changes": .bool(failure.localChanges),
-                        "persistence_confirmed": .bool(failure.persistenceConfirmed)
-                    ]
-                ))
-                if failure.localChanges { context.extra["local_changes"] = .bool(true) }
-                if failure.persistenceConfirmed {
-                    context.extra[AgentSessionAdminRendering.committedChangesKey] = .bool(true)
-                }
+                recordStashFailure(failure, id: id, context: context)
             } else {
                 context.add(id, .skipped, "not_restorable")
             }
+        }
+    }
+
+    private func recordStashFailure(_ failure: AgentSessionStashFailure, id: UUID, context: Context) {
+        context.items.append(AgentSessionAdminItemResult(
+            sessionID: id, status: .failed, reason: failure.reason,
+            detail: [
+                "local_changes": .bool(failure.localChanges),
+                "persistence_confirmed": .bool(failure.persistenceConfirmed)
+            ]
+        ))
+        if failure.localChanges { context.extra["local_changes"] = .bool(true) }
+        if failure.persistenceConfirmed {
+            context.extra[AgentSessionAdminRendering.committedChangesKey] = .bool(true)
         }
     }
 

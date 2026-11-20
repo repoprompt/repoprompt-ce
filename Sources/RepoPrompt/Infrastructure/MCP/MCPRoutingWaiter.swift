@@ -110,11 +110,20 @@ actor MCPRoutingWaiter {
 
     // MARK: - Public API
 
-    func register(runID: UUID) {
-        if waitersByRunID[runID] == nil {
-            waitersByRunID[runID] = WaitState()
-            log.debug("register: runID=\(runID.uuidString)")
-        }
+    @discardableResult
+    func register(runID: UUID) -> UUID {
+        if let state = waitersByRunID[runID] { return state.generation }
+        let state = WaitState()
+        waitersByRunID[runID] = state
+        log.debug("register: runID=\(runID.uuidString)")
+        return state.generation
+    }
+
+    /// Starts a distinct bootstrap registration. Unlike legacy register, a successor must not
+    /// inherit its predecessor's waiter generation merely because it reuses the run ID.
+    func registerOwned(runID: UUID) -> UUID {
+        cleanup(runID: runID)
+        return register(runID: runID)
     }
 
     /// Ownership token for signals that may outlive cleanup and re-registration of a run.
@@ -122,8 +131,10 @@ actor MCPRoutingWaiter {
         waitersByRunID[runID]?.generation
     }
 
-    func currentTerminalOutcome(runID: UUID) -> MCPRoutingWaitOutcome? {
-        waitersByRunID[runID]?.terminalOutcome
+    func currentTerminalOutcome(runID: UUID, expectedGeneration: UUID? = nil) -> MCPRoutingWaitOutcome? {
+        guard let state = waitersByRunID[runID] else { return expectedGeneration == nil ? nil : .failed(.cleanedUp) }
+        guard expectedGeneration == nil || state.generation == expectedGeneration else { return .failed(.cleanedUp) }
+        return state.terminalOutcome
     }
 
     /// Legacy compatibility API. Observation deliberately does not extend this absolute deadline.
@@ -136,7 +147,8 @@ actor MCPRoutingWaiter {
     func waitForRoutingOutcome(
         runID: UUID,
         timeoutSeconds: TimeInterval,
-        progressLifecycle: MCPBootstrapRoutingProgressLifecycle? = nil
+        progressLifecycle: MCPBootstrapRoutingProgressLifecycle? = nil,
+        expectedGeneration: UUID? = nil
     ) async -> MCPRoutingWaitOutcome {
         let duration: Duration? = if timeoutSeconds > 0 {
             .milliseconds(Int64((timeoutSeconds * 1000).rounded()))
@@ -148,7 +160,8 @@ actor MCPRoutingWaiter {
             initialTimeout: duration,
             adaptiveGrace: nil,
             initialPhase: .absolute,
-            progressLifecycle: progressLifecycle
+            progressLifecycle: progressLifecycle,
+            expectedGeneration: expectedGeneration
         )
     }
 
@@ -157,14 +170,16 @@ actor MCPRoutingWaiter {
     func waitForRoutingOutcome(
         runID: UUID,
         policy: MCPRoutingWaitPolicy,
-        progressLifecycle: MCPBootstrapRoutingProgressLifecycle? = nil
+        progressLifecycle: MCPBootstrapRoutingProgressLifecycle? = nil,
+        expectedGeneration: UUID? = nil
     ) async -> MCPRoutingWaitOutcome {
         await waitForRoutingOutcome(
             runID: runID,
             initialTimeout: policy.noConnectionTimeout,
             adaptiveGrace: policy.observedConnectionGrace,
             initialPhase: .beforeConnection,
-            progressLifecycle: progressLifecycle
+            progressLifecycle: progressLifecycle,
+            expectedGeneration: expectedGeneration
         )
     }
 
@@ -173,7 +188,8 @@ actor MCPRoutingWaiter {
         initialTimeout: Duration?,
         adaptiveGrace: Duration?,
         initialPhase: DeadlinePhase,
-        progressLifecycle: MCPBootstrapRoutingProgressLifecycle?
+        progressLifecycle: MCPBootstrapRoutingProgressLifecycle?,
+        expectedGeneration: UUID?
     ) async -> MCPRoutingWaitOutcome {
         if Task.isCancelled {
             await progressLifecycle?.fenceAfterWaitOutcome(.cancelled)
@@ -182,6 +198,10 @@ actor MCPRoutingWaiter {
 
         var didBackfillObservedConnection = false
         while let state = waitersByRunID[runID] {
+            guard expectedGeneration == nil || state.generation == expectedGeneration else {
+                await progressLifecycle?.fenceAfterWaitOutcome(.failed(.cleanedUp))
+                return .failed(.cleanedUp)
+            }
             if let outcome = state.terminalOutcome {
                 if state.firstConnectionObservation != nil {
                     await progressLifecycle?.recordChildConnectionObserved()
@@ -212,7 +232,9 @@ actor MCPRoutingWaiter {
                     continuation.resume(returning: .cancelled)
                     return
                 }
-                guard var current = waitersByRunID[runID] else {
+                guard var current = waitersByRunID[runID],
+                      expectedGeneration == nil || current.generation == expectedGeneration
+                else {
                     continuation.resume(returning: .failed(.cleanedUp))
                     return
                 }
@@ -480,6 +502,11 @@ actor MCPRoutingWaiter {
         waitersByRunID.removeValue(forKey: runID)
     }
 
+    func cleanup(runID: UUID, generation: UUID) {
+        guard waitersByRunID[runID]?.generation == generation else { return }
+        cleanup(runID: runID)
+    }
+
     func cleanup(runID: UUID) {
         guard let state = waitersByRunID.removeValue(forKey: runID) else { return }
         state.expiryTask?.cancel()
@@ -502,12 +529,17 @@ actor MCPRoutingWaiter {
 // MARK: - Static Async Methods
 
 extension MCPRoutingWaiter {
-    static func register(runID: UUID) async {
+    @discardableResult
+    static func register(runID: UUID) async -> UUID {
         await shared.register(runID: runID)
     }
 
-    static func currentTerminalOutcome(runID: UUID) async -> MCPRoutingWaitOutcome? {
-        await shared.currentTerminalOutcome(runID: runID)
+    static func registerOwned(runID: UUID) async -> UUID {
+        await shared.registerOwned(runID: runID)
+    }
+
+    static func currentTerminalOutcome(runID: UUID, expectedGeneration: UUID? = nil) async -> MCPRoutingWaitOutcome? {
+        await shared.currentTerminalOutcome(runID: runID, expectedGeneration: expectedGeneration)
     }
 
     static func waitUntilRouted(runID: UUID, timeoutSeconds: TimeInterval) async -> Bool {
@@ -517,24 +549,28 @@ extension MCPRoutingWaiter {
     static func waitForRoutingOutcome(
         runID: UUID,
         timeoutSeconds: TimeInterval,
-        progressLifecycle: MCPBootstrapRoutingProgressLifecycle? = nil
+        progressLifecycle: MCPBootstrapRoutingProgressLifecycle? = nil,
+        expectedGeneration: UUID? = nil
     ) async -> MCPRoutingWaitOutcome {
         await shared.waitForRoutingOutcome(
             runID: runID,
             timeoutSeconds: timeoutSeconds,
-            progressLifecycle: progressLifecycle
+            progressLifecycle: progressLifecycle,
+            expectedGeneration: expectedGeneration
         )
     }
 
     static func waitForRoutingOutcome(
         runID: UUID,
         policy: MCPRoutingWaitPolicy,
-        progressLifecycle: MCPBootstrapRoutingProgressLifecycle? = nil
+        progressLifecycle: MCPBootstrapRoutingProgressLifecycle? = nil,
+        expectedGeneration: UUID? = nil
     ) async -> MCPRoutingWaitOutcome {
         await shared.waitForRoutingOutcome(
             runID: runID,
             policy: policy,
-            progressLifecycle: progressLifecycle
+            progressLifecycle: progressLifecycle,
+            expectedGeneration: expectedGeneration
         )
     }
 
@@ -561,6 +597,10 @@ extension MCPRoutingWaiter {
 
     static func notifyFailed(runID: UUID, generation: UUID? = nil) async {
         await shared.notifyFailed(runID: runID, generation: generation)
+    }
+
+    static func cleanup(runID: UUID, generation: UUID) async {
+        await shared.cleanup(runID: runID, generation: generation)
     }
 
     static func cleanup(runID: UUID) async {

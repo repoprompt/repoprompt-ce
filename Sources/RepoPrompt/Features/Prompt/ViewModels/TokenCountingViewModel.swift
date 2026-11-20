@@ -4,6 +4,7 @@ import RepoPromptCodeMapCore
 import RepoPromptFileSystem
 import RepoPromptFoundation
 import RepoPromptSettingsCore
+import RepoPromptWorkspaceContext
 import SwiftUI
 
 @MainActor

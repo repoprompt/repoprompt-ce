@@ -2,6 +2,8 @@ import Foundation
 import JSONSchema
 import MCP
 import Ontology
+import RepoPromptMCPServer
+import RepoPromptWorkspaceContext
 
 enum MCPToolFreshnessPolicy {
     case none
@@ -43,11 +45,10 @@ final class MCPAppToolBinder {
             inputSchema: inputSchema,
             annotations: annotations,
             isEnabledByDefault: isEnabledByDefault,
-            returnsValue: { [weak self] args in
-                guard let self else {
-                    throw MCPError.internalError("Window tool runtime deallocated while executing \(name)")
-                }
-                return try await executeTool(name, freshnessPolicy, args, implementation)
+            // A captured registration retains its exact invocation executor, not the catalog
+            // wrapper's liveness. The executor still validates its original route at dispatch.
+            returnsValue: { [executeTool] args in
+                try await executeTool(name, freshnessPolicy, args, implementation)
             }
         )
     }

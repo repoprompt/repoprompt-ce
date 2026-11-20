@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptShared
+import RepoPromptWorkspaceContext
 
 // MARK: - MCP Debug Logging
 
@@ -12,58 +13,6 @@ import RepoPromptShared
 #else
     private func mcpFilesystemConstantsDebugLog(_ message: @autoclosure () -> String) {}
 #endif
-
-/// Centralized debug logging control for MCP transport layer.
-/// Set flags to false to reduce console spam.
-enum MCPDebugLogging {
-    private static var envDebugEnabled: Bool {
-        ProcessInfo.processInfo.environment["REPOPROMPT_MCP_DEBUG"] == "1"
-    }
-
-    /// Log transport-level details (send/receive byte counts, message previews)
-    static var transportVerbose = envDebugEnabled
-
-    /// Log connection lifecycle events (connect, disconnect, EOF)
-    static var connectionLifecycle = envDebugEnabled
-
-    /// Log routing decisions and tab context binding
-    static var routing = envDebugEnabled
-
-    /// Log all debug messages (master switch - overrides individual flags when false)
-    static var enabled = envDebugEnabled
-}
-
-/// Logs MCP transport-level debug messages when enabled.
-@inline(__always)
-func mcpTransportLog(_ message: @autoclosure () -> String) {
-    #if DEBUG
-        if MCPDebugLogging.enabled, MCPDebugLogging.transportVerbose {
-            print("[MCPTransport] \(message())")
-            fflush(stdout)
-        }
-    #endif
-}
-
-/// Logs MCP connection lifecycle debug messages when enabled.
-@inline(__always)
-func mcpConnectionLog(_ message: @autoclosure () -> String) {
-    #if DEBUG
-        if MCPDebugLogging.enabled, MCPDebugLogging.connectionLifecycle {
-            print("[MCPConnection] \(message())")
-            fflush(stdout)
-        }
-    #endif
-}
-
-/// Logs MCP routing debug messages when enabled.
-@inline(__always)
-func mcpRoutingDebugLog(_ message: @autoclosure () -> String) {
-    #if DEBUG
-        if MCPDebugLogging.enabled, MCPDebugLogging.routing {
-            print("[MCPRouting] \(message())")
-        }
-    #endif
-}
 
 enum MCPFilesystemConstants {
     static let identity = WorkspaceContextFilesystemIdentity.identity

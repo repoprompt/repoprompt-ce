@@ -1,6 +1,7 @@
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+@testable import RepoPromptWorkspaceContext
 import XCTest
 
 final class ContextBuilderFrozenPackTests: XCTestCase {

@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptACPProviders
+import RepoPromptAIContracts
 import RepoPromptProcess
 import RepoPromptSettingsCore
 

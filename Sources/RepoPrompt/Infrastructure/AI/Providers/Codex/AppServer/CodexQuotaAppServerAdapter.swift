@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCodexProvider
 import RepoPromptProviderQuota
 
 /// App-owned process adapter for the app-free quota transport port. This client is

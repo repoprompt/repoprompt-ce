@@ -1,5 +1,50 @@
 import SwiftUI
 
+@MainActor
+private func recommendationProviderStatusGrid(_ status: ProviderStatusSnapshot) -> some View {
+    VStack(alignment: .leading, spacing: 8) {
+        Text("Provider Status")
+            .font(.subheadline.bold())
+        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+            recommendationProviderStatusRow("Claude Code", status: status.claudeCodeCLI)
+            recommendationProviderStatusRow("Codex CLI", status: status.codexCLI)
+            recommendationProviderStatusRow("Cursor CLI", status: status.cursorCLI)
+            recommendationProviderStatusRow("OpenAI API", status: status.openAI)
+        }
+    }
+}
+
+@MainActor
+private func recommendationProviderStatusRow(_ name: String, status: ProviderStatusSnapshot.Availability) -> some View {
+    HStack(spacing: 6) {
+        Circle()
+            .fill(status == .ready ? Color.green : (status == .configured ? Color.orange : Color.gray.opacity(0.5)))
+            .frame(width: 8, height: 8)
+        Text(name)
+            .font(.caption)
+        Spacer()
+    }
+}
+
+@MainActor
+private func recommendationUpgradeHint(title: Text, hint: String) -> some View {
+    HStack(alignment: .top, spacing: 8) {
+        Image(systemName: "arrow.up.circle.fill")
+            .foregroundColor(.orange)
+        VStack(alignment: .leading, spacing: 4) {
+            title
+                .font(.caption.bold())
+            Text(hint)
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+    }
+    .padding(10)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .background(Color.orange.opacity(0.08))
+    .cornerRadius(8)
+}
+
 // MARK: - Recommendation Wizard Popover View
 
 /// Main popover container for the recommendation wizard.
@@ -44,7 +89,7 @@ struct RecommendationWizardPopoverView: View {
                 VStack(alignment: .leading, spacing: 16) {
                     // Provider status summary
                     if let status = viewModel.providerStatus {
-                        providerStatusGrid(status)
+                        recommendationProviderStatusGrid(status)
                     }
 
                     // Best models reference table
@@ -157,7 +202,7 @@ struct RecommendationWizardPopoverView: View {
     }
 
     private func simpleHeader(title: String, icon: String) -> some View {
-        HStack {
+        headerContent {
             Image(systemName: icon)
                 .font(.title2)
                 .foregroundColor(.accentColor)
@@ -171,49 +216,13 @@ struct RecommendationWizardPopoverView: View {
                         .foregroundColor(.secondary)
                 }
             }
-
-            Spacer()
-
-            RecommendationProviderFilterMenu(viewModel: viewModel)
-
-            Button(action: { onDismiss?() }) {
-                Image(systemName: "xmark.circle.fill")
-                    .foregroundColor(.secondary)
-            }
-            .buttonStyle(.plain)
-        }
-        .padding(.bottom, 8)
-    }
-
-    private func providerStatusGrid(_ status: ProviderStatusSnapshot) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Provider Status")
-                .font(.subheadline.bold())
-
-            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
-                providerRow("Claude Code", status: status.claudeCodeCLI)
-                providerRow("Codex CLI", status: status.codexCLI)
-                providerRow("Cursor CLI", status: status.cursorCLI)
-                providerRow("OpenAI API", status: status.openAI)
-            }
-        }
-    }
-
-    private func providerRow(_ name: String, status: ProviderStatusSnapshot.Availability) -> some View {
-        HStack(spacing: 6) {
-            Circle()
-                .fill(status == .ready ? Color.green : (status == .configured ? Color.orange : Color.gray.opacity(0.5)))
-                .frame(width: 8, height: 8)
-            Text(name)
-                .font(.caption)
-            Spacer()
         }
     }
 
     // MARK: - Header
 
     private var wizardHeader: some View {
-        HStack {
+        headerContent {
             if let step = viewModel.currentStep {
                 Image(systemName: step.systemImage)
                     .font(.title2)
@@ -232,11 +241,14 @@ struct RecommendationWizardPopoverView: View {
                     }
                 }
             }
+        }
+    }
 
+    private func headerContent(@ViewBuilder content: () -> some View) -> some View {
+        HStack {
+            content()
             Spacer()
-
             RecommendationProviderFilterMenu(viewModel: viewModel)
-
             Button(action: { onDismiss?() }) {
                 Image(systemName: "xmark.circle.fill")
                     .foregroundColor(.secondary)
@@ -458,7 +470,7 @@ private struct IntroStepView: View {
 
             // Provider status summary
             if let status = viewModel.providerStatus {
-                providerStatusSection(status)
+                recommendationProviderStatusGrid(status)
 
                 // Show upgrade hint if missing key providers
                 if status.codexCLI != .ready, status.openAI != .ready {
@@ -572,39 +584,6 @@ private struct IntroStepView: View {
             }
         }
         .opacity(isMuted ? 0.7 : 1)
-    }
-
-    private func providerStatusSection(_ status: ProviderStatusSnapshot) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Provider Status")
-                .font(.subheadline.bold())
-
-            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
-                providerStatusRow("Claude Code", status: status.claudeCodeCLI)
-                providerStatusRow("Codex CLI", status: status.codexCLI)
-                providerStatusRow("Cursor CLI", status: status.cursorCLI)
-                providerStatusRow("OpenAI API", status: status.openAI)
-            }
-        }
-    }
-
-    private func providerStatusRow(_ name: String, status: ProviderStatusSnapshot.Availability) -> some View {
-        HStack(spacing: 6) {
-            Circle()
-                .fill(statusColor(status))
-                .frame(width: 8, height: 8)
-            Text(name)
-                .font(.caption)
-            Spacer()
-        }
-    }
-
-    private func statusColor(_ status: ProviderStatusSnapshot.Availability) -> Color {
-        switch status {
-        case .ready: .green
-        case .configured: .orange
-        case .notConfigured: .gray.opacity(0.5)
-        }
     }
 
     private func upgradeHintSection(_ status: ProviderStatusSnapshot) -> some View {
@@ -820,28 +799,10 @@ private struct ChatModelStepView: View {
 
                 // Upgrade hint if not using the best option
                 if let hint = rec.upgradeHint {
-                    upgradeHintSection(hint)
+                    recommendationUpgradeHint(title: Text("Want better results?"), hint: hint)
                 }
             }
         }
-    }
-
-    private func upgradeHintSection(_ hint: String) -> some View {
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: "arrow.up.circle.fill")
-                .foregroundColor(.orange)
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Want better results?")
-                    .font(.caption.bold())
-                Text(hint)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-        }
-        .padding(10)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.orange.opacity(0.08))
-        .cornerRadius(8)
     }
 
     private func backendCard(_ backend: ChatBackendKind, option: ChatBackendOption) -> some View {
@@ -955,21 +916,7 @@ private struct ContextBuilderStepView: View {
 
                     // Upgrade hint if not using the best option
                     if let hint = rec.upgradeHint {
-                        HStack(alignment: .top, spacing: 8) {
-                            Image(systemName: "arrow.up.circle.fill")
-                                .foregroundColor(.orange)
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text("Want better results?")
-                                    .font(.caption.bold())
-                                Text(hint)
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                            }
-                        }
-                        .padding(10)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color.orange.opacity(0.08))
-                        .cornerRadius(8)
+                        recommendationUpgradeHint(title: Text("Want better results?"), hint: hint)
                     }
                 }
                 .id("recommendationContent")
@@ -1044,21 +991,7 @@ private struct MCPAgentDefaultsStepView: View {
                 .id("recommendationContent")
 
                 if let hint = rec.upgradeHint {
-                    HStack(alignment: .top, spacing: 8) {
-                        Image(systemName: "arrow.up.circle.fill")
-                            .foregroundColor(.orange)
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Want better defaults?")
-                                .font(.caption.bold())
-                            Text(hint)
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                    }
-                    .padding(10)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.orange.opacity(0.08))
-                    .cornerRadius(8)
+                    recommendationUpgradeHint(title: Text("Want better defaults?"), hint: hint)
                 }
             }
         }
@@ -1066,9 +999,9 @@ private struct MCPAgentDefaultsStepView: View {
 
     private func roleDefaultRow(current: MCPAgentRoleDefault, recommended: MCPAgentRoleDefault, isMatch: Bool) -> some View {
         HStack(spacing: 12) {
-            Image(systemName: iconForRole(current.role))
+            Image(systemName: current.role.presentationIconName)
                 .font(.title3)
-                .foregroundColor(colorForRole(current.role))
+                .foregroundColor(current.role.presentationColor)
                 .frame(width: 24)
 
             VStack(alignment: .leading, spacing: 2) {
@@ -1101,24 +1034,6 @@ private struct MCPAgentDefaultsStepView: View {
         .padding(10)
         .background(isMatch ? Color.primary.opacity(0.03) : Color.orange.opacity(0.06))
         .cornerRadius(8)
-    }
-
-    private func iconForRole(_ role: AgentModelCatalog.TaskLabelKind) -> String {
-        switch role {
-        case .explore: "magnifyingglass"
-        case .engineer: "hammer.fill"
-        case .pair: "person.2.fill"
-        case .design: "paintbrush.fill"
-        }
-    }
-
-    private func colorForRole(_ role: AgentModelCatalog.TaskLabelKind) -> Color {
-        switch role {
-        case .explore: .teal
-        case .engineer: .blue
-        case .pair: .purple
-        case .design: .orange
-        }
     }
 }
 
@@ -1323,13 +1238,7 @@ private struct SummaryStepView: View {
             Image(systemName: icon)
                 .foregroundColor(.blue)
                 .frame(width: 20)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.caption.bold())
-                Text(detail)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
+            summaryText(title: title, detail: detail)
             Spacer()
             Image(systemName: "checkmark")
                 .foregroundColor(.blue)
@@ -1386,13 +1295,7 @@ private struct SummaryStepView: View {
             Image(systemName: icon)
                 .foregroundColor(.orange)
                 .frame(width: 20)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.caption.bold())
-                Text(detail)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
+            summaryText(title: title, detail: detail)
             Spacer()
             Button(action: {
                 viewModel.unmute(kind)
@@ -1410,13 +1313,17 @@ private struct SummaryStepView: View {
             Image(systemName: icon)
                 .foregroundColor(.green)
                 .frame(width: 20)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.caption.bold())
-                Text(detail)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
+            summaryText(title: title, detail: detail)
+        }
+    }
+
+    private func summaryText(title: String, detail: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.caption.bold())
+            Text(detail)
+                .font(.caption)
+                .foregroundColor(.secondary)
         }
     }
 
@@ -1424,13 +1331,7 @@ private struct SummaryStepView: View {
         HStack(alignment: .top, spacing: 8) {
             Image(systemName: "arrow.right.circle")
                 .foregroundColor(.accentColor)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.caption.bold())
-                Text(description)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
+            summaryText(title: title, detail: description)
         }
     }
 }

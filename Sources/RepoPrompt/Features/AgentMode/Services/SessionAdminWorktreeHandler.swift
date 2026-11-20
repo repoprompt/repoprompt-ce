@@ -300,11 +300,7 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         var items: [SessionAdminItemResult] = []
         var authorityLost = false
         for lease in batch.leases {
-            guard !authorityLost, context.scopes.isCurrent(lease) else {
-                authorityLost = true
-                items.append(.revoked(lease.targetSessionID))
-                continue
-            }
+            if context.appendRevocationIfNeeded(lease, authorityLost: &authorityLost, items: &items) { continue }
             if batch.request.preview {
                 let idle = host.isIdleForWorktreeTransition(sessionID: lease.targetSessionID)
                 items.append(SessionAdminItemResult(
@@ -336,6 +332,8 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         do {
             let info = try await bindWithAdmission(lease: lease, scope: scope, worktree: worktree, repoRoot: repoRoot, onCommitted: { committedIDs = $0 })
             return SessionAdminItemResult(sessionID: target, result: "bound", fields: ["worktree": info.value])
+        } catch let partial as AgentSessionWorktreeRuntime.PartialTransition {
+            return Self.transitionCompletionFailure(partial, worktreeIDs: committedIDs ?? [], scopeID: scope.id)
         } catch where committedIDs != nil {
             // A published binding outranks every later error classification: it is neither a
             // refusal, a revocation, nor a busy target that may be queued or retried.
@@ -384,6 +382,29 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
                 ]
             )
         }
+    }
+
+    static func transitionCompletionFailure(
+        _ receipt: AgentSessionWorktreeRuntime.PartialTransition,
+        worktreeIDs: Set<String>, scopeID: UUID? = nil
+    ) -> SessionAdminItemResult {
+        let revoked = if let cause = receipt.cause as? SessionAdminHostError, case .authorityEnded = cause { true }
+        else { false }
+        var arguments: [String: Value] = ["op": .string("get"), "session_id": .string(receipt.writer.sessionID.uuidString)]
+        if let scopeID { arguments["scope_id"] = .string(scopeID.uuidString) }
+        return SessionAdminItemResult(
+            sessionID: receipt.writer.sessionID, result: "not_applied", code: revoked ? "scope_revoked" : "worktree_transition_incomplete",
+            fields: [
+                "detail": .string(receipt.localizedDescription),
+                "bindings_published": .bool(receipt.bindingsPublished),
+                "provider_retired": .bool(receipt.providerRetired),
+                "recovery_saved": .bool(receipt.recoverySaved),
+                "worktree_ids": .array(worktreeIDs.sorted().map(Value.string)),
+                AgentSessionAdminRendering.committedChangesKey: .bool(receipt.bindingsPublished || receipt.providerRetired),
+                "retryable": .bool(false),
+                "next_call": .object(["tool": .string("session_admin"), "arguments": .object(arguments)])
+            ]
+        )
     }
 
     /// The single receipt for a binding transition that published its change and then failed to
@@ -510,6 +531,16 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
                     onCommitted: { committedIDs = $0 }
                 )
                 return finishDeferredBind(pending, .applied(worktreeID: info.worktreeID))
+            } catch let partial as AgentSessionWorktreeRuntime.PartialTransition {
+                if partial.bindingsPublished {
+                    return finishDeferredBind(pending, .committedIncomplete(
+                        worktreeIDs: (committedIDs ?? []).sorted(), detail: partial.localizedDescription
+                    ))
+                }
+                return finishDeferredBind(pending, .failed(
+                    subreason: "provider_retired", detail: partial.localizedDescription,
+                    retryable: false, worktree: pending.worktree, repoRoot: pending.repoRoot
+                ))
             } catch where committedIDs != nil {
                 // Published, then completion failed: settle it. Retrying (including on a late
                 // not-idle or cancellation) would re-run an already committed bind. The pending
@@ -593,11 +624,7 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         var authorityLost = false
         for lease in batch.leases {
             let target = lease.targetSessionID
-            guard !authorityLost, context.scopes.isCurrent(lease) else {
-                authorityLost = true
-                items.append(.revoked(target))
-                continue
-            }
+            if context.appendRevocationIfNeeded(lease, authorityLost: &authorityLost, items: &items) { continue }
             let allBound = host.boundWorktrees(sessionID: target)
             let bound = allBound.filter { worktreeID == nil || $0.worktreeID == worktreeID }
             if let approvedBindings, approvedBindings[target] != Set(bound.map(\.worktreeID)) {
@@ -649,6 +676,8 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
                     sessionID: target, result: release ? "released" : "unbound",
                     fields: ["worktree_ids": .array(removed.map(Value.string))]
                 ))
+            } catch let partial as AgentSessionWorktreeRuntime.PartialTransition {
+                items.append(Self.transitionCompletionFailure(partial, worktreeIDs: committedRemoved ?? []))
             } catch where committedRemoved != nil {
                 // Published, then completion failed. This outranks every refusal classification so
                 // the receipt (and the approval settlement it drives) reflects the committed effect.
@@ -854,15 +883,41 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         guard let lease = batch.leases.first else { throw SessionAdminMCPToolService.unavailableError }
         let repoRoot = try SessionAdminArguments.string(batch.request.arguments, "repo_root", op: "merge_preview")
         let mergeTarget = try SessionAdminArguments.string(batch.request.arguments, "merge_target", op: "merge_preview")
-        let preview = try await host.previewMerge(sessionID: lease.targetSessionID, repoRoot: repoRoot, mergeTarget: mergeTarget)
-        try Task.checkCancellation()
-        guard context.isStillAuthorized(lease, scope: batch.scope, requiresMutationOwner: batch.request.operation.mutatesTarget) else {
+        let preview: Value
+        do {
+            preview = try await host.previewMerge(
+                sessionID: lease.targetSessionID, repoRoot: repoRoot, mergeTarget: mergeTarget,
+                isStillAuthorized: { [context] in
+                    context.isStillAuthorized(lease, scope: batch.scope, requiresMutationOwner: batch.request.operation.mutatesTarget)
+                }
+            )
+        } catch let partial as AgentSessionWorktreeRuntime.PartialMerge {
+            return try mergePartialReply(partial, op: "merge_preview")
+        } catch SessionAdminHostError.authorityEnded {
             throw SessionAdminMCPToolService.unavailableError
         }
+        // The host acknowledges committed artifacts/operation persistence. Late revocation or
+        // cancellation cannot turn that acknowledgement into a no-effect refusal.
         return .object([
             "result": .string("previewed"), "op": .string("merge_preview"),
             "session_id": .string(lease.targetSessionID.uuidString), "merge": preview
         ])
+    }
+
+    private func mergePartialReply(_ partial: AgentSessionWorktreeRuntime.PartialMerge, op: String) throws -> Value {
+        var fields: [String: Value] = [
+            "result": .string("committed_incomplete"), "op": .string(op),
+            "session_id": .string(partial.writer.sessionID.uuidString), "retryable": .bool(false),
+            "physical_attempt_admitted": .bool(partial.physicalAttemptAdmitted),
+            "operation_recorded": .bool(partial.operationRecorded),
+            "required_save_acknowledged": .bool(partial.requiredSaveAcknowledged),
+            "detail": .string(partial.localizedDescription)
+        ]
+        if let id = partial.operationID { fields["operation_id"] = .string(id) }
+        if let directory = partial.artifactDirectory { fields["artifact_directory"] = .string(directory.path) }
+        if let result = partial.applyResult { fields["merge"] = try SessionAdminReply.encoded(result) }
+        else if let preview = partial.preview { fields["merge"] = try SessionAdminReply.encoded(preview) }
+        return .object(fields)
     }
 
     private func mergeApply(_ batch: AgentSessionAdministrationAuthorizedBatch) async throws -> Value {
@@ -875,7 +930,16 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
             return .object(["result": .string("preview"), "op": .string("merge_apply"), "operation_id": .string(operationID)])
         }
         // The user decides in the existing review prompt; scope authority only lets the overseer ask.
-        let result = try await host.applyMerge(sessionID: lease.targetSessionID, operationID: operationID)
+        let result: Value
+        do {
+            result = try await host.applyMerge(sessionID: lease.targetSessionID, operationID: operationID, isStillAuthorized: { [context] in
+                context.isStillAuthorized(lease, scope: batch.scope, requiresMutationOwner: batch.request.operation.mutatesTarget)
+            })
+        } catch let partial as AgentSessionWorktreeRuntime.PartialMerge {
+            return try mergePartialReply(partial, op: "merge_apply")
+        } catch SessionAdminHostError.authorityEnded {
+            throw SessionAdminMCPToolService.unavailableError
+        }
         return .object([
             "result": .string("reviewed"), "op": .string("merge_apply"),
             "session_id": .string(lease.targetSessionID.uuidString), "merge": result,

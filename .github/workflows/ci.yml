@@ -78,7 +78,7 @@ jobs:
           node-version: 24
       - name: Install pinned Codex CLI
         id: install-pinned-codex-cli
-        run: npm install --global @openai/codex@0.164.0
+        run: npm install --global @openai/codex@0.170.0
       - name: Validate Codex app-server schema contract
         id: validate-codex-app-server-schema-contract
         run: make codex-schema-check
@@ -443,7 +443,7 @@ jobs:
       - name: Run root test shard without compiling
         id: run-root-test-shard-without-compiling
         timeout-minutes: 32
-        run: ./conductor ci-shard --shard-count 4 --shard-index ${{ matrix.shard }} --timeout 1800 --full-log
+        run: ./conductor ci-shard --shard-count 4 --shard-index ${{ matrix.shard }} --timeout 1800
 
       - name: Retain execution receipts and full shard logs
         id: retain-execution-receipts-and-full-shard-logs

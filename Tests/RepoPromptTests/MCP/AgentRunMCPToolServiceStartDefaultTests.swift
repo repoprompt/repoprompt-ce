@@ -2,6 +2,7 @@ import Foundation
 import MCP
 @testable import RepoPromptApp
 import RepoPromptSecureStorage
+@testable import RepoPromptWorkspaceContext
 import XCTest
 
 @MainActor
@@ -199,6 +200,135 @@ private final class AgentRunFailingSecurePlainStringStore: SecurePlainStringStor
 }
 
 final class MCPToolIdleWaitTests: XCTestCase {
+    @MainActor
+    func testRuntimeTrackingIsTokenOwnedAndIdleIsNotASideEffectDrain() async throws {
+        let runtime = MCPToolExecutionRuntime()
+        let runID = UUID(), connectionID = UUID(), otherConnectionID = UUID()
+        let first = UUID(), second = UUID(), connectionOnly = UUID()
+        var cancelled: [UUID] = []
+        var publications = 0
+        runtime.didChange = { publications += 1 }
+        runtime.registerToolExecution(executionID: first, runID: runID, connectionID: connectionID, toolName: "same_tool") {
+            cancelled.append(first)
+        }
+        runtime.registerToolExecution(executionID: second, runID: runID, connectionID: otherConnectionID, toolName: "same_tool") {
+            cancelled.append(second)
+        }
+        runtime.registerToolExecution(executionID: connectionOnly, runID: nil, connectionID: connectionID, toolName: "control_tool") {
+            cancelled.append(connectionOnly)
+        }
+        XCTAssertEqual(runtime.executionIDs(connectionID: connectionID), [first, connectionOnly])
+        for id in runtime.executionIDs(connectionID: connectionID) {
+            XCTAssertTrue(runtime.cancelToolExecution(executionID: id, reason: "disconnect"))
+        }
+        XCTAssertEqual(Set(cancelled), [first, connectionOnly])
+        XCTAssertTrue(runtime.hasActiveToolExecutions(runID: runID))
+        XCTAssertEqual(runtime.toolEndedCount(runID: runID), 1)
+        XCTAssertEqual(runtime.executionIDs(connectionID: otherConnectionID), [second])
+        XCTAssertFalse(runtime.cancelToolExecution(executionID: first, reason: "duplicate"))
+        runtime.unregisterToolExecution(executionID: first)
+        XCTAssertEqual(publications, 5)
+        runtime.didChange = nil // Optional presentation detachment must not affect tracking.
+        XCTAssertEqual(runtime.cancelActiveToolsForRun(runID: runID), 1)
+        XCTAssertEqual(cancelled.last, second)
+        XCTAssertEqual(runtime.activeExecutionCount, 0)
+        XCTAssertEqual(runtime.toolEndedCount(runID: runID), 0)
+        try await runtime.awaitNoActiveToolExecutions(runID: runID)
+        // The cancel closure only requested cancellation; no external effect completion was awaited.
+    }
+
+    @MainActor
+    func testRuntimeIdleWaitRetainsOwnerAndCancellationDoesNotCancelTrackedTools() async throws {
+        var runtime: MCPToolExecutionRuntime? = MCPToolExecutionRuntime()
+        weak let owner = runtime
+        let runID = UUID(), executionID = UUID()
+        var toolCancelled = false
+        runtime?.registerToolExecution(executionID: executionID, runID: runID, connectionID: nil, toolName: "held") {
+            toolCancelled = true
+        }
+        let entered = expectation(description: "idle wait entered on MainActor")
+        let wait = Task { @MainActor [runtime] in
+            let runtime = try XCTUnwrap(runtime)
+            entered.fulfill()
+            try await runtime.awaitNoActiveToolExecutions(runID: runID)
+        }
+        runtime = nil
+        await fulfillment(of: [entered], timeout: 2)
+        XCTAssertNotNil(owner)
+        XCTAssertTrue(owner?.hasActiveToolExecutions(runID: runID) == true)
+        wait.cancel()
+        do {
+            try await wait.value
+            XCTFail("Cancelled waiter must throw")
+        } catch is CancellationError {} catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+        XCTAssertFalse(toolCancelled)
+        XCTAssertNil(owner)
+    }
+
+    @MainActor
+    func testRuntimeIdleWaitResumesOnlyAfterLastTrackedExecution() async throws {
+        let runtime = MCPToolExecutionRuntime()
+        let runID = UUID(), first = UUID(), second = UUID()
+        for id in [first, second] {
+            runtime.registerToolExecution(executionID: id, runID: runID, connectionID: nil, toolName: "held", cancel: {})
+        }
+        let entered = expectation(description: "wait entered")
+        var completed = false
+        let wait = Task { @MainActor in
+            entered.fulfill()
+            try await runtime.awaitNoActiveToolExecutions(runID: runID)
+            completed = true
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        runtime.unregisterToolExecution(executionID: first)
+        XCTAssertFalse(completed)
+        XCTAssertTrue(runtime.hasActiveToolExecutions(runID: runID))
+        runtime.unregisterToolExecution(executionID: second)
+        try await wait.value
+        XCTAssertTrue(completed)
+        XCTAssertEqual(runtime.toolEndedCount(runID: runID), 2)
+    }
+
+    @MainActor
+    func testRuntimeWaitScopesRemainDistinctFromToolExecutionsAndExpireByCapturedTimeout() {
+        let runtime = MCPToolExecutionRuntime()
+        let parent = UUID(), child = UUID()
+        let metadata = MCPServerViewModel.RequestMetadata(connectionID: nil, clientName: nil, windowID: nil)
+        let short = runtime.beginAgentRunWaitScope(parentRunID: parent, metadata: metadata, sessionIDs: [child], timeoutSeconds: 0)
+        let long = runtime.beginAgentRunWaitScope(parentRunID: parent, metadata: metadata, sessionIDs: [child], timeoutSeconds: 600)
+        XCTAssertTrue(runtime.hasActiveChildAgentRunWaits(runID: parent))
+        XCTAssertFalse(runtime.hasActiveToolExecutions(runID: parent))
+        runtime.purgeStaleAgentRunWaitScopes(now: Date().addingTimeInterval(61), source: "test")
+        XCTAssertEqual(runtime.waitScopeCount(parentRunID: parent), 1)
+        let completion = AgentRunWaitScopeCompletion(reason: .cancelled, result: nil, winnerSessionID: nil, pendingSessionIDs: [], errorDescription: nil)
+        runtime.endAgentRunWaitScope(short.token, completion: completion)
+        XCTAssertTrue(runtime.hasActiveChildAgentRunWaits(runID: parent))
+        runtime.endAgentRunWaitScope(long.token, completion: completion)
+        XCTAssertFalse(runtime.hasActiveChildAgentRunWaits(runID: parent))
+    }
+
+    @MainActor
+    func testRuntimeCompletionSurvivesServerDisposalAndRemainsExactlyOnce() async throws {
+        var server: MCPServerViewModel? = makeServerViewModel(service: MCPService(
+            hostBootstrapOperation: {}, controllerStartOperation: {}, controllerFullShutdownOperation: {}
+        ))
+        weak let presentation = server
+        let runtime = try XCTUnwrap(server?.toolExecutionRuntime)
+        let runID = UUID(), executionID = UUID()
+        runtime.registerToolExecution(executionID: executionID, runID: runID, connectionID: nil, toolName: "held", cancel: {})
+        let completion = runtime.makeCompletionHandler(executionID: executionID, toolName: "held")
+        server = nil
+        XCTAssertNil(presentation, "The retained execution owner must not retain the server presentation")
+        XCTAssertTrue(runtime.hasActiveToolExecutions(runID: runID))
+        await completion("cancelled")
+        await completion("success")
+        XCTAssertFalse(runtime.hasActiveToolExecutions(runID: runID))
+        XCTAssertEqual(runtime.toolEndedCount(runID: runID), 1)
+        try await runtime.awaitNoActiveToolExecutions(runID: runID)
+    }
+
     @MainActor
     func testAlreadyCancelledToolIdleWaitDoesNotTakeIdleFastPath() async {
         let server = makeServerViewModel(service: MCPService(

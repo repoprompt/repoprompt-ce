@@ -1,4 +1,9 @@
 import Combine
+import RepoPromptACPProviders
+import RepoPromptAIContracts
+import RepoPromptClaudeProvider
+import RepoPromptCodexProvider
+import RepoPromptHTTPProviders
 import RepoPromptProcess
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
@@ -291,6 +296,10 @@ public class APISettingsViewModel: ObservableObject {
     @Published private(set) var claudeCodeCLIStatus: ClaudeCodeCLIStatus = UserDefaults.standard.bool(forKey: "ClaudeCodeConnected") ? .binaryPresent : .unknown
     @Published var claudeCodeError: String? = nil
     private var claudeCodeLogCollector: CLIProcessLogCollector?
+
+    var showsClaudeCodeConnectedBadge: Bool {
+        isClaudeCodeConnected && claudeCodeError == nil
+    }
 
     var isClaudeCodeBinaryPresent: Bool {
         isClaudeCodeConnected || claudeCodeCLIStatus.binaryPresent
@@ -845,7 +854,11 @@ public class APISettingsViewModel: ObservableObject {
         let provider = ClaudeCodeProvider()
         let start = Date()
         do {
-            let ok = try await provider.testCompatibleBackendConnection(id, timeout: 30)
+            let ok = try await provider.testCompatibleBackendConnection(
+                variant: ClaudeCLIAppModelPolicy.runtimeVariant(for: id),
+                requestedModel: { ClaudeCLIAppModelPolicy.compatibleBackendTestRequestedModel(for: id) },
+                timeout: 30
+            )
             await provider.dispose()
             let elapsed = max(1, Int(Date().timeIntervalSince(start) * 1000))
             let result: ClaudeCompatibleBackendTestResult = ok
@@ -1163,6 +1176,10 @@ public class APISettingsViewModel: ObservableObject {
     private(set) var managedRuntimeLeaseCount = 0
     private var windowCloseRequested = false
 
+    var canAcquireManagedRuntimeLease: Bool {
+        !hasPreparedForWindowClose
+    }
+
     func retainForManagedRuntime() {
         precondition(!hasPreparedForWindowClose)
         managedRuntimeLeaseCount += 1
@@ -1329,7 +1346,7 @@ public class APISettingsViewModel: ObservableObject {
 
         // Load persisted ACP catalogs before any provider result can trigger restoration.
         // A live refresh may legitimately omit dynamic metadata, especially for Cursor.
-        await AgentACPModelRegistry.shared.warmStandardStoreIfNeeded()
+        await AgentModelCatalogRuntime.shared.acpRegistry.warmStandardStoreIfNeeded()
         guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
         if isContextBuilderProviderValidationComplete { return }
         if let contextBuilderProviderValidationTask {
@@ -1441,8 +1458,11 @@ public class APISettingsViewModel: ObservableObject {
         case let .recovered(account):
             managedCodexAccount = account
             return true
-        case .requiresUserLogin, .executableUnavailable:
+        case .requiresUserLogin:
             managedCodexAccount = nil
+            return false
+        case .temporarilyUnavailable, .executableUnavailable:
+            // A transport or runtime failure says nothing about the saved connection.
             return false
         }
     }
@@ -1500,7 +1520,7 @@ public class APISettingsViewModel: ObservableObject {
             return .userInteractionCancelled
         case .itemNotFound:
             return .keychainError
-        case .duplicateItem, .invalidData, .unexpectedStatus:
+        case .duplicateItem, .invalidData, .invalidOwnerEdit, .deletionNotConfirmed, .unexpectedStatus:
             return .keychainError
         }
     }
@@ -2439,7 +2459,7 @@ public class APISettingsViewModel: ObservableObject {
         let baseURL = ollamaURL.hasSuffix("/v1") ? ollamaURL : (ollamaURL.hasSuffix("/") ? ollamaURL + "v1" : ollamaURL + "/v1")
 
         let provider = CustomOpenAIProvider(
-            baseURL: baseURL,
+            host: CustomOpenAIAppHost(), baseURL: baseURL,
             apiKey: "",
             defaultModel: "llama2",
             defaultTemperature: 0.7,
@@ -2777,6 +2797,7 @@ public class APISettingsViewModel: ObservableObject {
         if !userModel.isEmpty {
             // User specified a model → validate it with a test completion (skip model list fetch)
             let testProvider = OpenAIProvider(
+                host: OpenAIProviderAppHost(),
                 apiKey: apiKey,
                 baseURL: URL(string: baseURL),
                 configuredMaxTokens: 16,
@@ -2807,7 +2828,7 @@ public class APISettingsViewModel: ObservableObject {
         } else {
             // No custom model → fetch available models to validate endpoint
             let probeProvider = CustomOpenAIProvider(
-                baseURL: baseURL,
+                host: CustomOpenAIAppHost(), baseURL: baseURL,
                 apiKey: apiKey,
                 defaultModel: "gpt-4o",
                 defaultTemperature: 0.7,
@@ -2927,7 +2948,8 @@ public class APISettingsViewModel: ObservableObject {
             baseURL: normalizedURL,
             apiKey: trimmedKey,
             apiVersions: discoveryVersions,
-            httpCredentialConsentEndpoint: consentEndpoint
+            httpCredentialConsentEndpoint: consentEndpoint,
+            host: AzureOpenAIAppHost()
         )
         let resolvedAPIVersion = trimmedVersion
         AzureOpenAIProvider.debug("Retrieved \(models.count) Azure deployments")
@@ -3041,7 +3063,8 @@ public class APISettingsViewModel: ObservableObject {
                 baseURL: normalizedURL,
                 apiKey: trimmedKey,
                 apiVersions: discoveryVersions,
-                httpCredentialConsentEndpoint: azureHTTPConsentEndpoint
+                httpCredentialConsentEndpoint: azureHTTPConsentEndpoint,
+                host: AzureOpenAIAppHost()
             )
             availableAzureModels = AzureOpenAIProvider.mergedWithDefaultDescriptors(descriptors)
         } catch {
@@ -3074,7 +3097,7 @@ public class APISettingsViewModel: ObservableObject {
 
         do {
             let provider = CustomOpenAIProvider(
-                baseURL: customProviderConsentURL,
+                host: CustomOpenAIAppHost(), baseURL: customProviderConsentURL,
                 apiKey: customProviderApiKey,
                 defaultModel: "",
                 defaultTemperature: 0.7,
@@ -3094,7 +3117,9 @@ public class APISettingsViewModel: ObservableObject {
 
     // MARK: - Claude Code
 
-    func testClaudeCodeConnection() async throws -> Bool {
+    func testClaudeCodeConnection(
+        probe: @MainActor (ClaudeCodeProvider) async throws -> Bool = { try await $0.testConnection(timeout: 30) }
+    ) async throws -> Bool {
         let wasConnected = isClaudeCodeConnected
         let previousStatus = claudeCodeCLIStatus
         let collector = CLIProcessLogCollector()
@@ -3108,19 +3133,21 @@ public class APISettingsViewModel: ObservableObject {
         collector.append("Created Claude Code provider for health check")
 
         do {
-            let ok = try await provider.testConnection(timeout: 30)
+            let ok = try await probe(provider)
             collector.append("Health check completed with status: \(ok ? "success" : "empty response")")
             collector.append("Disposing Claude Code provider resources")
             await provider.dispose()
             collector.append("Claude Code provider disposed")
-            isClaudeCodeConnected = ok
-            if !ok || !wasConnected {
+            guard ok else {
+                claudeCodeError = "Claude Code CLI returned no text during the connection check. Try again."
+                return false
+            }
+            isClaudeCodeConnected = true
+            if !wasConnected {
                 await WindowStatesManager.shared.providerQuotaRuntime.claude.invalidate()
             }
-            setContextBuilderProviderVerified(.claudeCode, verified: ok)
-            if ok {
-                claudeCodeCLIStatus = .binaryPresent
-            }
+            setContextBuilderProviderVerified(.claudeCode, verified: true)
+            claudeCodeCLIStatus = .binaryPresent
             notifyClaudeCompatibleBackendRuntimeAvailabilityIfNeeded(previousStatus: previousStatus)
             claudeCodeError = nil
             UserDefaults.standard.set(isClaudeCodeConnected, forKey: "ClaudeCodeConnected")
@@ -3130,30 +3157,18 @@ public class APISettingsViewModel: ObservableObject {
                 object: nil,
                 userInfo: ["windowID": 0]
             )
-            if ok {
-                collector.append("Claude Code marked as connected")
-                claudeCodeLogCollector = nil
-            }
-            return isClaudeCodeConnected
+            collector.append("Claude Code marked as connected")
+            claudeCodeLogCollector = nil
+            return true
         } catch {
             collector.append("Connection test threw error: \(error.localizedDescription)")
             collector.append("Disposing Claude Code provider resources after failure")
             await provider.dispose()
             collector.append("Claude Code provider disposed")
-            await WindowStatesManager.shared.providerQuotaRuntime.claude.invalidate()
-            isClaudeCodeConnected = false
-            setContextBuilderProviderVerified(.claudeCode, verified: false)
             claudeCodeCLIStatus = Self.errorLooksLikeClaudeCodeBinaryMissing(error)
                 ? .binaryMissing(message: "Claude Code CLI isn't installed or isn't on PATH.")
                 : .binaryPresent
             notifyClaudeCompatibleBackendRuntimeAvailabilityIfNeeded(previousStatus: previousStatus)
-            UserDefaults.standard.set(isClaudeCodeConnected, forKey: "ClaudeCodeConnected")
-            await updateAvailableModels()
-            NotificationCenter.default.post(
-                name: .claudeCodeConnectionChanged,
-                object: nil,
-                userInfo: ["windowID": 0]
-            )
             var friendlyMessage: String = if let providerError = error as? AIProviderError {
                 switch providerError {
                 case let .invalidConfiguration(detail):
@@ -3488,15 +3503,8 @@ public class APISettingsViewModel: ObservableObject {
         let resolution = await codexExecutablePreflight(collector)
         guard codexSessionFence.allowsAuthenticationPublication(authenticationGeneration) else { return false }
         guard resolution.status == .available else {
-            managedCodexAccount = nil
             collector.append("Codex executable unavailable before managed authentication refresh")
-            await applyCodexConnectionState(
-                connected: false,
-                error: resolution.userMessage,
-                phase: .executableUnavailable(message: resolution.userMessage),
-                updateModels: true,
-                publicationToken: authenticationGeneration
-            )
+            applyCodexConnectionPhase(.executableUnavailable(message: resolution.userMessage), error: resolution.userMessage)
             collector.append("User guidance: \(resolution.userMessage)")
             throw AIProviderError.invalidConfiguration(detail: resolution.userMessage)
         }
@@ -3524,15 +3532,11 @@ public class APISettingsViewModel: ObservableObject {
             collector.append("User guidance: \(message)")
             throw AIProviderError.invalidConfiguration(detail: message)
         case let .executableUnavailable(message):
-            managedCodexAccount = nil
-            collector.append("Codex executable unavailable before health check")
-            await applyCodexConnectionState(
-                connected: false,
-                error: message,
-                phase: .executableUnavailable(message: message),
-                updateModels: true,
-                publicationToken: authenticationGeneration
-            )
+            applyCodexConnectionPhase(.executableUnavailable(message: message), error: message)
+            collector.append("User guidance: \(message)")
+            throw AIProviderError.invalidConfiguration(detail: message)
+        case let .temporarilyUnavailable(message):
+            applyCodexConnectionPhase(.failed(message: message), error: message)
             collector.append("User guidance: \(message)")
             throw AIProviderError.invalidConfiguration(detail: message)
         }
@@ -3550,10 +3554,15 @@ public class APISettingsViewModel: ObservableObject {
             await provider.dispose()
             guard codexSessionFence.allowsAuthenticationPublication(authenticationGeneration) else { return false }
             collector.append("Codex CLI provider disposed")
+            guard ok else {
+                let message = "Codex CLI health check returned an empty response."
+                applyCodexConnectionPhase(.failed(message: message), error: message)
+                return false
+            }
             await applyCodexConnectionState(
-                connected: ok,
-                error: ok ? nil : "Codex CLI health check returned an empty response.",
-                phase: ok ? .connected(resolvedExecutable: resolution.displayDescription) : .failed(message: "Codex CLI health check returned an empty response."),
+                connected: true,
+                error: nil,
+                phase: .connected(resolvedExecutable: resolution.displayDescription),
                 updateModels: true,
                 publicationToken: authenticationGeneration
             )
@@ -3570,13 +3579,7 @@ public class APISettingsViewModel: ObservableObject {
             guard codexSessionFence.allowsAuthenticationPublication(authenticationGeneration) else { return false }
             collector.append("Codex CLI provider disposed")
             let finalMessage = friendlyCodexMessage(for: error)
-            await applyCodexConnectionState(
-                connected: false,
-                error: finalMessage,
-                phase: codexFailurePhase(for: finalMessage),
-                updateModels: true,
-                publicationToken: authenticationGeneration
-            )
+            applyCodexConnectionPhase(codexFailurePhase(for: finalMessage), error: finalMessage)
             collector.append("User guidance: \(finalMessage)")
             throw error
         }
@@ -4209,7 +4212,7 @@ public class APISettingsViewModel: ObservableObject {
 
         do {
             let provider = CustomOpenAIProvider(
-                baseURL: "https://openrouter.ai/api/v1",
+                host: CustomOpenAIAppHost(), baseURL: "https://openrouter.ai/api/v1",
                 apiKey: openRouterApiKey,
                 defaultModel: "openai/gpt-4o-mini",
                 defaultTemperature: 0.7,
@@ -4254,7 +4257,7 @@ public class APISettingsViewModel: ObservableObject {
             let version = versionFromField ?? (UserDefaults.standard.string(forKey: "customOpenAIVersionOverride") ?? "v1")
 
             let provider = CustomOpenAIProvider(
-                baseURL: base,
+                host: CustomOpenAIAppHost(), baseURL: base,
                 apiKey: openAIApiKey,
                 defaultModel: "gpt-3.5-turbo",
                 defaultTemperature: 0.7,
@@ -4273,7 +4276,7 @@ public class APISettingsViewModel: ObservableObject {
         guard isDeepSeekKeyValid else { return }
         do {
             let provider = CustomOpenAIProvider(
-                baseURL: "https://api.deepseek.com/v1",
+                host: CustomOpenAIAppHost(), baseURL: "https://api.deepseek.com/v1",
                 apiKey: deepSeekApiKey,
                 defaultModel: "deepseek-chat",
                 defaultTemperature: 0.7
@@ -4290,7 +4293,7 @@ public class APISettingsViewModel: ObservableObject {
         guard isFireworksKeyValid else { return }
         do {
             let provider = CustomOpenAIProvider(
-                baseURL: "https://api.fireworks.ai/inference/v1",
+                host: CustomOpenAIAppHost(), baseURL: "https://api.fireworks.ai/inference/v1",
                 apiKey: fireworksApiKey,
                 defaultModel: "accounts/fireworks/models/llama-v4-maverick",
                 defaultTemperature: 0.7
@@ -4381,7 +4384,7 @@ public class APISettingsViewModel: ObservableObject {
             // GrokProvider inherits from OpenAIProvider, so CustomOpenAIProvider can be used for model listing
             // if Grok's /models endpoint is OpenAI-compatible.
             let provider = CustomOpenAIProvider(
-                baseURL: "https://api.x.ai/v1", // Grok API base URL for models
+                host: CustomOpenAIAppHost(), baseURL: "https://api.x.ai/v1", // Grok API base URL for models
                 apiKey: grokApiKey,
                 defaultModel: "grok-3-mini-beta", // A known Grok model
                 defaultTemperature: 0.7
@@ -4401,7 +4404,7 @@ public class APISettingsViewModel: ObservableObject {
             // GroqProvider inherits from OpenAIProvider, so CustomOpenAIProvider can be used for model listing
             // if Groq's /models endpoint is OpenAI-compatible.
             let provider = CustomOpenAIProvider(
-                baseURL: "https://api.groq.com/openai/v1", // Groq API base URL for models
+                host: CustomOpenAIAppHost(), baseURL: "https://api.groq.com/openai/v1", // Groq API base URL for models
                 apiKey: groqApiKey,
                 defaultModel: "moonshotai/kimi-k2-instruct", // Default Groq model
                 defaultTemperature: 0.7

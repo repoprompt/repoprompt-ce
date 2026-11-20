@@ -3,6 +3,7 @@ import Combine
 import Foundation
 import RepoPromptFileSystem
 import RepoPromptFoundation
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 // MARK: - SVG-Safe Preview Types
