@@ -432,7 +432,8 @@ final class AgentAskUserTranscriptPersistenceTests: XCTestCase {
         let startedAt = Date(timeIntervalSince1970: 0)
         let execution = AgentTranscriptToolExecution(
             stableExecutionID: "exec-ask-user",
-            toolName: "mcp__RepoPrompt__ask_user",
+            // Provider-prefixed name as Claude reports it; persistence normalizes it to ask_user.
+            toolName: "mcp__\(MCPIntegrationHelper.repoPromptMCPServerName)__ask_user",
             invocationID: UUID(),
             argsJSON: structuredArgs,
             resultJSON: structuredResult,
