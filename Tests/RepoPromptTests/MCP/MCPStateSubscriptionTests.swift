@@ -520,8 +520,8 @@ final class MCPStateSubscriptionTests: XCTestCase {
                     let request = ToolInvocationContext.trustedLocal(toolName: name, metadata: .init(connectionID: fixture.connectionID, clientName: nil, windowID: fixture.route.identity.routeID))
                     do {
                         _ = try await MCPInvocationContextBridge.withInvocation(request) { try await tool.binding([:]) }
-                        XCTFail("Unmigrated \(name) must retain its physical-owner check")
-                    } catch let error as MCPError { XCTAssertEqual(error, .internalError("Window deallocated while executing \(name)"))
+                        XCTFail("Unmigrated \(name) must not enter physical-window execution")
+                    } catch let error as MCPError { XCTAssertEqual(error, .invalidRequest("Tool \(name) is not supported by the independent Agent session route"))
                     } catch DomainMutationPolicyError.principalMissing {
                         XCTAssertTrue(["file_actions", "apply_edits"].contains(name), "Protected mutation admission remains in front of physical dispatch")
                     }
@@ -868,9 +868,9 @@ final class MCPStateSubscriptionTests: XCTestCase {
             XCTAssertEqual(route.toolExecutionRuntime.activeExecutionCount, 0)
             do {
                 _ = try await invokeRegistered(readFile, routeID: route.identity.routeID)
-                XCTFail("Unmigrated file capabilities must still require their real physical owner")
+                XCTFail("Unmigrated file capabilities must not enter physical-window execution")
             } catch let error as MCPError {
-                XCTAssertEqual(error, .internalError("Window deallocated while executing read_file"))
+                XCTAssertEqual(error, .invalidRequest("Tool read_file is not supported by the independent Agent session route"))
             }
             route.closeDomainAdmission()
             do {
