@@ -439,6 +439,75 @@ final class ProviderQuotaModelTests: XCTestCase {
         XCTAssertFalse(anthropic.refersToSameAccount(as: compatible))
     }
 
+    func testManagedQuotaMergeRequiresExactProfilePrincipalAndGenerations() throws {
+        let profileID = UUID()
+        let epoch = UUID()
+        let generation = UUID()
+        func managed(
+            profile: UUID? = nil,
+            identity: UUID? = nil,
+            credentials: UUID? = nil,
+            principal: String = "acct-1"
+        ) throws -> ProviderAccountKey {
+            try XCTUnwrap(ProviderAccountKey(
+                managedSubscriptionLineage: .codexFirstParty,
+                verifiedPrincipal: principal,
+                profileID: profile ?? profileID,
+                identityEpoch: identity ?? epoch,
+                credentialGeneration: credentials ?? generation
+            ))
+        }
+        func observation(_ key: ProviderAccountKey) -> ProviderQuotaSnapshotDelta {
+            ProviderQuotaSnapshotDelta(
+                accountKey: key, buckets: [], ordinaryUsageAllowed: nil,
+                source: .codexAppServerRead, observedAt: base, coverage: .accountWide
+            )
+        }
+
+        let key = try managed()
+        guard case let .merged(initial) = ProviderQuotaMerge.apply(observation(key), to: nil) else {
+            return XCTFail("Initial managed observation was rejected")
+        }
+        guard case .merged = try ProviderQuotaMerge.apply(observation(managed()), to: initial) else {
+            return XCTFail("An exact-scope observation should merge")
+        }
+
+        let mismatches: [ProviderAccountKey] = try [
+            managed(profile: UUID()), managed(identity: UUID()), managed(credentials: UUID()),
+            managed(principal: "acct-2"),
+            .init(lineage: .codexFirstParty, opaqueAccountID: "acct-1", credentialProfileID: profileID.uuidString),
+            .init(lineage: .codexFirstParty, opaqueAccountID: nil, credentialProfileID: profileID.uuidString)
+        ]
+        for mismatch in mismatches {
+            guard case .accountMismatch = ProviderQuotaMerge.apply(observation(mismatch), to: initial) else {
+                return XCTFail("An observation from another scope must not merge")
+            }
+            XCTAssertFalse(mismatch.refersToSameAccount(as: key))
+            guard case let .merged(other) = ProviderQuotaMerge.apply(observation(mismatch), to: nil),
+                  case .accountMismatch = ProviderQuotaMerge.apply(observation(key), to: other)
+            else { return XCTFail("A managed update must not inherit fields from an earlier snapshot in another scope") }
+        }
+        XCTAssertNil(ProviderAccountKey(
+            managedSubscriptionLineage: .codexFirstParty,
+            verifiedPrincipal: " ", profileID: profileID, identityEpoch: epoch, credentialGeneration: generation
+        ))
+        for unsupported in [ProviderQuotaLineage.claudeCompatible(backendID: "fixture"), .provider(id: .codex)] {
+            XCTAssertNil(ProviderAccountKey(
+                managedSubscriptionLineage: unsupported,
+                verifiedPrincipal: "acct-1", profileID: profileID, identityEpoch: epoch, credentialGeneration: generation
+            ))
+        }
+        let composed = try managed(principal: "caf\u{E9}")
+        let decomposed = try managed(principal: "cafe\u{301}")
+        XCTAssertEqual(composed.opaqueAccountID, decomposed.opaqueAccountID, "Fixture must demonstrate Swift normalization")
+        XCTAssertNotEqual(composed, decomposed, "Opaque managed identity must be byte-exact")
+        let mirror = String(describing: Mirror(reflecting: key).children.map { "\($0.label ?? ""):\($0.value)" })
+        for confidentialField in ["acct-1", profileID.uuidString, epoch.uuidString, generation.uuidString] {
+            XCTAssertFalse(mirror.contains(confidentialField))
+            XCTAssertFalse(String(reflecting: key).contains(confidentialField))
+        }
+    }
+
     // MARK: - Redaction
 
     func testAccountKeyMirrorExposesBooleansOnly() {
