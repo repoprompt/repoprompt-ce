@@ -22,7 +22,7 @@ import RepoPromptSettingsCore
 
 extension DomainAgentSessionLinkLease {
     nonisolated var activityLink: AgentSessionLinkActivityRecorder.Link {
-        .init(id: linkID, observer: observer.sessionID, target: target.sessionID)
+        .init(id: linkID, generation: linkGeneration, observer: observer.sessionID, target: target.sessionID)
     }
 }
 
@@ -1873,11 +1873,13 @@ final class AgentSessionLinkRuntimeBridge {
         guard let activityRecorder, let passive = claim.passive else { return }
         let links = passive.receipt.deliveredStatuses.map {
             AgentSessionLinkActivityRecorder.Link(
-                id: $0.reference.linkID, observer: claim.observerSessionID, target: $0.targetEndpoint.sessionID
+                id: $0.reference.linkID, generation: $0.reference.generation,
+                observer: claim.observerSessionID, target: $0.targetEndpoint.sessionID
             )
         } + passive.deliveredAttentionLinks.map {
             AgentSessionLinkActivityRecorder.Link(
-                id: $0.reference.linkID, observer: claim.observerSessionID, target: $0.targetSessionID
+                id: $0.reference.linkID, generation: $0.reference.generation,
+                observer: claim.observerSessionID, target: $0.targetSessionID
             )
         }
         activityRecorder.record(.wake, links: links, at: acceptedAt)
@@ -2400,6 +2402,10 @@ final class AgentSessionLinkRuntimeBridge {
                 linkID: notice.linkID,
                 generation: notice.generation
             )
+            let activityLink = AgentSessionLinkActivityRecorder.Link(
+                id: notice.linkID, generation: notice.generation,
+                observer: notice.observerSessionID, target: notice.targetSessionID
+            )
             // Read from the caller's *pre-hop* capture, never from the mutable table. Every
             // invalidation entry point crosses at least one reentrant actor hop before it gets here,
             // and a concurrent Stop, re-add, or rebind can remove or replace this reference's
@@ -2442,6 +2448,12 @@ final class AgentSessionLinkRuntimeBridge {
                     ifCurrent: token,
                     assertedAt: bookkeeping.assertionGeneration
                 )
+                switch receipt.outcome {
+                case .applied, .unchanged, .absent:
+                    self.activityRecorder?.retire(activityLink)
+                case .tokenMismatch, .writeFailed, .blocked:
+                    break
+                }
                 #if DEBUG
                     await self.test_afterDurableIntentRemoval?()
                 #endif
@@ -2686,7 +2698,8 @@ final class AgentSessionLinkRuntimeBridge {
         token: AgentSessionOversightIntentToken?,
         assertedAt generation: UInt64?,
         proof: AgentSessionOversightRestorationProof? = nil,
-        expectedEndpoints: AddEndpointExpectations = AddEndpointExpectations(observer: nil, target: nil)
+        expectedEndpoints: AddEndpointExpectations = AddEndpointExpectations(observer: nil, target: nil),
+        preservingActivity: Bool
     ) async -> EstablishmentResult {
         let key = EstablishmentKey(
             pair: pair,
@@ -2752,6 +2765,17 @@ final class AgentSessionLinkRuntimeBridge {
             expectedEndpoints: expectedEndpoints,
             preserveOnExpectationMismatch: false
         )
+        if case .added = outcome.outcome, let reference = outcome.reference {
+            activityRecorder?.bind(
+                .init(
+                    id: reference.linkID,
+                    generation: reference.generation,
+                    observer: pair.observerSessionID,
+                    target: pair.targetSessionID
+                ),
+                preservingHistory: preservingActivity
+            )
+        }
         if establishmentTasks[key] == task {
             establishmentTasks.removeValue(forKey: key)
             if expectedEndpoints.laneCreationActivation != nil {
@@ -3186,7 +3210,8 @@ final class AgentSessionLinkRuntimeBridge {
             token: token,
             assertedAt: assertionGeneration,
             proof: proof,
-            expectedEndpoints: expectedEndpoints
+            expectedEndpoints: expectedEndpoints,
+            preservingActivity: token != nil && !insertedDurableIntent
         )
         let outcome = establishment.outcome
         // Settles a deferred delegated reassertion: an established link retires the pending cleanup
@@ -4302,6 +4327,11 @@ final class AgentSessionLinkRuntimeBridge {
         }
 
         launchCoordinator?.noteRevocation(pair: pair, assertedAt: mapped.assertionGeneration, preservesIntent: false)
+        // The saved link can be stopped after its runtime reference was already parked on close.
+        activityRecorder?.retire(.init(
+            id: reference.linkID, generation: reference.generation,
+            observer: pair.observerSessionID, target: pair.targetSessionID
+        ))
         // Token A is gone from disk. Settle its establishment first so an in-flight activation
         // cannot leave its grant behind the removal, then retire only the expected reference.
         await settleEstablishment(pair: pair, token: token)
@@ -4364,7 +4394,8 @@ final class AgentSessionLinkRuntimeBridge {
             }
             await reconcile(
                 after: [notice],
-                capturedBookkeeping: settlesDurableIntent ? capturedBookkeeping : [:]
+                capturedBookkeeping: capturedBookkeeping,
+                settlesDurableIntent: settlesDurableIntent
             )
             return true
         }
@@ -4536,7 +4567,8 @@ final class AgentSessionLinkRuntimeBridge {
     private func reconcile(
         after notices: [DomainAgentSessionLinkRevocationNotice],
         capturedBookkeeping: [DomainAgentSessionLinkReference: ReferenceBookkeeping],
-        refreshingProjections: Bool = true
+        refreshingProjections: Bool = true,
+        settlesDurableIntent: Bool = true
     ) async {
         for notice in notices {
             let reference = DomainAgentSessionLinkReference(
@@ -4546,7 +4578,20 @@ final class AgentSessionLinkRuntimeBridge {
             // Seen state is generation-qualified: a fresh re-add of the same pair baselines against
             // current activity instead of inheriting an acknowledgement made under removed authority.
             monitorSeenByReference.removeValue(forKey: reference)
-            activityRecorder?.retire(reference.linkID)
+            // The exact grant already ended. A saved relationship's history ends only when
+            // its token-qualified retirement succeeds.
+            let hasDurableIntent = capturedBookkeeping[reference]?.token != nil
+            let preservesActivity = hasDurableIntent || !settlesDurableIntent || isFrozenForTermination
+                || Self.durableIntentPolicy(for: notice.reason) == .preserveIntent
+            activityRecorder?.retire(
+                .init(
+                    id: notice.linkID,
+                    generation: notice.generation,
+                    observer: notice.observerSessionID,
+                    target: notice.targetSessionID
+                ),
+                removingHistory: !preservesActivity
+            )
             // Retire only the disclosure lease before durable settlement can suspend. A proof
             // completed just before this known revocation must not survive its disk-write hop.
             if let observer = notice.observerEndpoint {
@@ -4561,7 +4606,9 @@ final class AgentSessionLinkRuntimeBridge {
         // Runs before the projection work so a revoked link's saved row is already gone by the time
         // the surviving endpoint repaints. Authority was revoked before this call, so a disk failure
         // here can only affect what comes back next launch, never what is operable now.
-        await settleDurableIntent(after: notices, capturedBookkeeping: capturedBookkeeping)
+        if settlesDurableIntent {
+            await settleDurableIntent(after: notices, capturedBookkeeping: capturedBookkeeping)
+        }
         await reconcile(afterTargetSessions: Set(notices.map(\.targetSessionID)))
         await pruneKnownEndpoints(sessionIDs: touched)
         if refreshingProjections {
@@ -6647,6 +6694,7 @@ final class AgentSessionLinkRuntimeBridge {
         case .accepted:
             activityRecorder?.record(.attention, links: [.init(
                 id: authorization.reference.linkID,
+                generation: authorization.reference.generation,
                 observer: authorization.observer.sessionID,
                 target: authorization.target.sessionID
             )], at: requestedAt)
@@ -9378,7 +9426,8 @@ extension AgentSessionLinkRuntimeBridge: AgentSessionOversightLaunchCoordinatorD
                 pair: currentPair,
                 token: currentToken,
                 assertedAt: generation,
-                proof: proof
+                proof: proof,
+                preservingActivity: true
             )
         }
     }

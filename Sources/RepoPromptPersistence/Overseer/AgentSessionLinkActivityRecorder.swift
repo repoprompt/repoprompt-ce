@@ -10,14 +10,23 @@ package actor AgentSessionLinkActivityRecorder {
     }
 
     package struct Link: Hashable {
-        let id: UUID
-        let observer: UUID
-        let target: UUID
+        fileprivate struct Pair: Hashable {
+            let observer: UUID
+            let target: UUID
 
-        package init(id: UUID, observer: UUID, target: UUID) {
+            var bindings: [SessionCatalogDatabase.Binding] {
+                [.text(observer.uuidString), .text(target.uuidString)]
+            }
+        }
+
+        let id: UUID
+        let generation: UInt64
+        fileprivate let pair: Pair
+
+        package init(id: UUID, generation: UInt64 = 0, observer: UUID, target: UUID) {
             self.id = id
-            self.observer = observer
-            self.target = target
+            self.generation = generation
+            pair = Pair(observer: observer, target: target)
         }
     }
 
@@ -39,17 +48,26 @@ package actor AgentSessionLinkActivityRecorder {
 
     private struct Batch {
         var updates: [Link: Times] = [:]
-        var removals: Set<UUID> = []
+        var bindings: [Link: Bool] = [:]
+        var removals: Set<Link> = []
+
+        var links: Set<Link> {
+            Set(updates.keys).union(bindings.keys).union(removals)
+        }
+
         var isEmpty: Bool {
-            updates.isEmpty && removals.isEmpty
+            updates.isEmpty && bindings.isEmpty && removals.isEmpty
         }
     }
 
     private let databaseURL: URL
     private let interval: Duration
     private var pending = Batch()
-    // Tasks from delivery and revocation can reach the actor out of order. Link UUIDs aren't reused.
-    private var revoked: Set<UUID> = []
+    /// Tasks from delivery and revocation can reach the actor out of order. Link UUIDs aren't reused.
+    /// A true value also prevents a late binding from resurrecting removed history.
+    private var retired: [UUID: Bool] = [:]
+    // A late rebind from an older grant must never move a newer grant's row.
+    private var latestWrittenGeneration: [Link.Pair: UInt64] = [:]
     private(set) var scheduled = false
     private static let logger = Logger(subsystem: "com.repoprompt.ce", category: "LinkActivity")
 
@@ -64,8 +82,13 @@ package actor AgentSessionLinkActivityRecorder {
     }
 
     @discardableResult
-    package nonisolated func retire(_ id: UUID) -> Task<Void, Never> {
-        Task(priority: .utility) { await self.enqueueRemoval(id) }
+    package nonisolated func bind(_ link: Link, preservingHistory: Bool) -> Task<Void, Never> {
+        Task(priority: .utility) { await self.enqueueBinding(link, preservingHistory: preservingHistory) }
+    }
+
+    @discardableResult
+    package nonisolated func retire(_ link: Link, removingHistory: Bool = true) -> Task<Void, Never> {
+        Task(priority: .utility) { await self.enqueueRetirement(link, removingHistory: removingHistory) }
     }
 
     func hasBufferedActivity(for link: Link) -> Bool {
@@ -74,16 +97,28 @@ package actor AgentSessionLinkActivityRecorder {
 
     private func enqueue(_ kind: Kind, links: [Link], at time: Double) {
         guard time.isFinite else { return }
-        for link in links where !revoked.contains(link.id) {
+        for link in links where retired[link.id] == nil {
             pending.updates[link, default: Times()].record(kind, at: time)
         }
         scheduleIfNeeded()
     }
 
-    private func enqueueRemoval(_ id: UUID) {
-        guard revoked.insert(id).inserted else { return }
-        pending.removals.insert(id)
+    private func enqueueBinding(_ link: Link, preservingHistory: Bool) {
+        pending.bindings[link] = preservingHistory
+        if retired[link.id] == true {
+            pending.removals.insert(link)
+        }
         scheduleIfNeeded()
+    }
+
+    private func enqueueRetirement(_ link: Link, removingHistory: Bool) {
+        if retired[link.id] != true {
+            retired[link.id] = removingHistory
+            if removingHistory {
+                pending.removals.insert(link)
+                scheduleIfNeeded()
+            }
+        }
     }
 
     private func scheduleIfNeeded() {
@@ -99,19 +134,27 @@ package actor AgentSessionLinkActivityRecorder {
     private func flush() async {
         let batch = pending
         pending = Batch()
+        let generations = latestWrittenGeneration
         let url = databaseURL
-        await Task.detached(priority: .utility) {
+        let didWrite = await Task.detached(priority: .utility) {
             do {
-                try Self.write(batch, to: url)
+                try Self.write(batch, generations: generations, to: url)
+                return true
             } catch {
                 Self.logger.warning("Dropped a link activity batch after a SQLite or filesystem failure.")
+                return false
             }
         }.value
+        if didWrite {
+            for link in batch.links {
+                latestWrittenGeneration[link.pair] = max(latestWrittenGeneration[link.pair, default: 0], link.generation)
+            }
+        }
         scheduled = false
         scheduleIfNeeded()
     }
 
-    private static func write(_ batch: Batch, to url: URL) throws {
+    private static func write(_ batch: Batch, generations: [Link.Pair: UInt64], to url: URL) throws {
         guard url.isFileURL else { throw SessionCatalogError.invalidRecord }
         let directory = url.deletingLastPathComponent()
         var ancestor = directory
@@ -156,7 +199,7 @@ package actor AgentSessionLinkActivityRecorder {
             return suffix
         }
         do {
-            try writeTransaction(batch, to: url)
+            try writeTransaction(batch, generations: generations, to: url)
         } catch let SessionCatalogError.database(code) where [SQLITE_CORRUPT, SQLITE_NOTADB].contains(code & 0xFF) {
             // SQLite closed the failed connection. A corrupt header cannot establish ownership,
             // so preserve the files under a shared backup name. Move the main file last.
@@ -166,11 +209,11 @@ package actor AgentSessionLinkActivityRecorder {
                     throw SessionCatalogError.filesystem(errno)
                 }
             }
-            try writeTransaction(batch, to: url)
+            try writeTransaction(batch, generations: generations, to: url)
         }
     }
 
-    private static func writeTransaction(_ batch: Batch, to url: URL) throws {
+    private static func writeTransaction(_ batch: Batch, generations: [Link.Pair: UInt64], to url: URL) throws {
         let db = try SessionCatalogDatabase(url: url)
         try db.execute("PRAGMA trusted_schema = OFF")
         guard let version = try db.integer("PRAGMA user_version"), version == 0 || version == 1 else {
@@ -201,11 +244,28 @@ package actor AgentSessionLinkActivityRecorder {
                 try db.execute("PRAGMA application_id = 0x52504C41") // RPLA
                 try db.execute("PRAGMA user_version = 1")
             }
-            for (link, times) in batch.updates where !batch.removals.contains(link.id) {
-                try upsert(link, times: times, in: db)
-            }
-            for id in batch.removals {
-                try db.execute("DELETE FROM link_activity WHERE link_id = ?", [.text(id.uuidString)])
+            try db.execute("CREATE INDEX IF NOT EXISTS link_activity_pair ON link_activity (observer_session_id, target_session_id)")
+            for link in batch.links.sorted(by: { $0.generation < $1.generation }) {
+                let isCurrent = link.generation >= generations[link.pair, default: 0]
+                if batch.removals.contains(link) {
+                    if isCurrent {
+                        // The restored grant may not yet have rebound the previous process's row.
+                        try db.execute(
+                            "DELETE FROM link_activity WHERE observer_session_id = ? AND target_session_id = ?",
+                            link.pair.bindings
+                        )
+                    } else {
+                        try db.execute("DELETE FROM link_activity WHERE link_id = ?", [.text(link.id.uuidString)])
+                    }
+                    continue
+                }
+                guard isCurrent else { continue }
+                if let preservingHistory = batch.bindings[link] {
+                    try bind(link, preservingHistory: preservingHistory, in: db)
+                }
+                if let times = batch.updates[link] {
+                    try upsert(link, times: times, in: db)
+                }
             }
             try db.execute("UPDATE activity_state SET revision = revision + 1 WHERE singleton = 1")
             try db.execute("COMMIT")
@@ -215,10 +275,31 @@ package actor AgentSessionLinkActivityRecorder {
         }
     }
 
+    private static func bind(_ link: Link, preservingHistory: Bool, in db: SessionCatalogDatabase) throws {
+        let bindings = link.pair.bindings + [.text(link.id.uuidString)]
+        let previousRows = "WHERE observer_session_id = ? AND target_session_id = ? AND link_id != ?"
+        if preservingHistory {
+            let values = try db.rows("""
+            SELECT max(last_wake_at), max(last_instruction_at), max(last_watch_at), max(last_attention_at)
+            FROM link_activity
+            \(previousRows)
+            GROUP BY observer_session_id, target_session_id
+            """, bindings) { statement in
+                func time(_ column: Int32) -> Double? {
+                    sqlite3_column_type(statement, column) == SQLITE_NULL ? nil : sqlite3_column_double(statement, column)
+                }
+                return Times(wake: time(0), instruction: time(1), watch: time(2), attention: time(3))
+            }
+            if let times = values.first {
+                try upsert(link, times: times, in: db)
+            }
+        }
+        try db.execute("DELETE FROM link_activity \(previousRows)", bindings)
+    }
+
     private static func upsert(_ link: Link, times: Times, in db: SessionCatalogDatabase) throws {
-        let bindings: [SessionCatalogDatabase.Binding] = [
-            .text(link.id.uuidString), .text(link.observer.uuidString), .text(link.target.uuidString)
-        ] + [times.wake, times.instruction, times.watch, times.attention].map { $0.map(SessionCatalogDatabase.Binding.real) ?? .null }
+        let bindings: [SessionCatalogDatabase.Binding] = [.text(link.id.uuidString)] + link.pair.bindings
+            + [times.wake, times.instruction, times.watch, times.attention].map { $0.map(SessionCatalogDatabase.Binding.real) ?? .null }
         try db.execute("""
         INSERT INTO link_activity VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(link_id) DO UPDATE SET

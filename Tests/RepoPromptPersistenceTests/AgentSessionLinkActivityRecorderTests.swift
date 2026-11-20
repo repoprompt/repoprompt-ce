@@ -8,8 +8,10 @@ final class AgentSessionLinkActivityRecorderTests: XCTestCase {
     func testKindsDirectionRestartAndUnlink() async throws {
         let url = try temporaryDatabase()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
-        let link = Recorder.Link(id: UUID(), observer: UUID(), target: UUID())
-        let reverse = Recorder.Link(id: UUID(), observer: link.target, target: link.observer)
+        let observer = UUID()
+        let target = UUID()
+        let link = Recorder.Link(id: UUID(), observer: observer, target: target)
+        let reverse = Recorder.Link(id: UUID(), observer: target, target: observer)
         let recorder = Recorder(databaseURL: url, interval: .milliseconds(100))
         for (kind, time) in [(Recorder.Kind.wake, 1.25), (.instruction, 2), (.watch, 3), (.attention, 4)] {
             await recorder.record(kind, links: [link], at: date(time)).value
@@ -20,21 +22,81 @@ final class AgentSessionLinkActivityRecorderTests: XCTestCase {
             let db = try SessionCatalogDatabase(url: url, readOnly: true)
             XCTAssertEqual(try db.integer("PRAGMA user_version"), 1)
             XCTAssertEqual(try db.rows("PRAGMA journal_mode") { try SessionCatalogDatabase.string($0) }, ["delete"])
-            XCTAssertEqual(try row(db, id: link.id), [link.observer.uuidString, link.target.uuidString, "1.25", "2.0", "3.0", "4.0"])
-            XCTAssertEqual(try row(db, id: reverse.id), [link.target.uuidString, link.observer.uuidString, "-", "-", "10.0", "-"])
+            XCTAssertEqual(try row(db, id: link.id), [observer.uuidString, target.uuidString, "1.25", "2.0", "3.0", "4.0"])
+            XCTAssertEqual(try row(db, id: reverse.id), [target.uuidString, observer.uuidString, "-", "-", "10.0", "-"])
         }
 
         let reopened = Recorder(databaseURL: url, interval: .milliseconds(100))
         await reopened.record(.watch, links: [link], at: date(5)).value
         await reopened.record(.wake, links: [link], at: date(1)).value
-        await reopened.retire(reverse.id).value
+        await reopened.retire(reverse).value
         await reopened.record(.watch, links: [reverse], at: date(11)).value
         try await settle(reopened)
         let db = try SessionCatalogDatabase(url: url, readOnly: true)
-        XCTAssertEqual(try row(db, id: link.id), [link.observer.uuidString, link.target.uuidString, "1.25", "2.0", "5.0", "4.0"])
+        XCTAssertEqual(try row(db, id: link.id), [observer.uuidString, target.uuidString, "1.25", "2.0", "5.0", "4.0"])
         XCTAssertNil(try row(db, id: reverse.id))
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.path + "-wal"))
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.path + "-shm"))
+    }
+
+    func testRestoredLinkRebindsHistoryAndCanUnlinkBeforeRecordingActivity() async throws {
+        let url = try temporaryDatabase()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let observer = UUID()
+        let target = UUID()
+        let original = Recorder.Link(id: UUID(), generation: 20, observer: observer, target: target)
+        let firstRun = Recorder(databaseURL: url, interval: .milliseconds(100))
+        await firstRun.record(.wake, links: [original], at: date(10)).value
+        await firstRun.retire(original, removingHistory: false).value
+        try await settle(firstRun)
+
+        let restored = Recorder.Link(id: UUID(), generation: 1, observer: observer, target: target)
+        let secondRun = Recorder(databaseURL: url, interval: .milliseconds(100))
+        await secondRun.bind(restored, preservingHistory: true).value
+        try await settle(secondRun)
+        let db = try SessionCatalogDatabase(url: url, readOnly: true)
+        XCTAssertEqual(try row(db, id: restored.id)?.suffix(4), ["10.0", "-", "-", "-"])
+        XCTAssertNil(try row(db, id: original.id))
+
+        let restoredAgain = Recorder.Link(id: UUID(), generation: 1, observer: observer, target: target)
+        let thirdRun = Recorder(databaseURL: url, interval: .milliseconds(100))
+        await thirdRun.retire(restoredAgain).value
+        try await settle(thirdRun)
+        XCTAssertNil(try row(db, id: restored.id))
+        await thirdRun.bind(restoredAgain, preservingHistory: true).value
+        try await settle(thirdRun)
+        XCTAssertNil(try row(db, id: restored.id))
+        XCTAssertNil(try row(db, id: restoredAgain.id))
+    }
+
+    func testFreshGrantClearsOldHistoryAndRejectsAStaleRebind() async throws {
+        let url = try temporaryDatabase()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let observer = UUID()
+        let target = UUID()
+        let original = Recorder.Link(id: UUID(), generation: 1, observer: observer, target: target)
+        let recorder = Recorder(databaseURL: url, interval: .milliseconds(100))
+        await recorder.record(.wake, links: [original], at: date(10)).value
+        try await settle(recorder)
+
+        let fresh = Recorder.Link(id: UUID(), generation: 2, observer: observer, target: target)
+        await recorder.record(.watch, links: [fresh], at: date(20)).value
+        await recorder.bind(fresh, preservingHistory: false).value
+        try await settle(recorder)
+        await recorder.bind(original, preservingHistory: true).value
+        await recorder.retire(original).value
+        try await settle(recorder)
+        let db = try SessionCatalogDatabase(url: url, readOnly: true)
+        XCTAssertEqual(try row(db, id: fresh.id)?.suffix(4), ["-", "-", "20.0", "-"])
+        XCTAssertNil(try row(db, id: original.id))
+
+        let restored = Recorder.Link(id: UUID(), generation: 3, observer: observer, target: target)
+        await recorder.bind(restored, preservingHistory: true).value
+        await recorder.bind(fresh, preservingHistory: true).value
+        await recorder.retire(fresh, removingHistory: false).value
+        try await settle(recorder)
+        XCTAssertNil(try row(db, id: fresh.id))
+        XCTAssertEqual(try row(db, id: restored.id)?.suffix(4), ["-", "-", "20.0", "-"])
     }
 
     func testCorruptFileIsPreservedAndLockedWriteIsDropped() async throws {
