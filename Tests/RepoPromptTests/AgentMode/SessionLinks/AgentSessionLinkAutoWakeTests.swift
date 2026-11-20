@@ -6347,7 +6347,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         XCTAssertEqual(agent.projection?.remainingSeconds, 18000)
         XCTAssertFalse(AgentSessionLinkAutoWakeSnooze.uiDurationSeconds.contains(18000))
         clock.advanceWithoutFiring(seconds: 600)
-        let remaining = try requireSnoozeSuccess(fixture.viewModel.agentSessionLinkAutoWakeSnoozeProjection(endpoint: endpoint, targetSessionID: Self.targetID(0), expectedReference: Self.laneReference(0)))
+        let remaining = try requireSnoozeSuccess(fixture.viewModel.linkExecutionRuntime.agentSessionLinkAutoWakeSnoozeProjection(endpoint: endpoint, targetSessionID: Self.targetID(0), expectedReference: Self.laneReference(0)))
         XCTAssertEqual(remaining?.remainingSeconds, 17400)
         let user = try requireSnoozeSuccess(mutateSnooze(fixture, endpoint: endpoint, command: .set(durationSeconds: 86400), origin: .user))
         XCTAssertEqual(user.projection?.remainingSeconds, 86400)
@@ -6356,7 +6356,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         XCTAssertEqual(shorter.projection?.remainingSeconds, 86400)
         XCTAssertEqual(shorter.projection?.origin, .user)
         clock.advanceWithoutFiring(seconds: 86400)
-        XCTAssertNil(try requireSnoozeSuccess(fixture.viewModel.agentSessionLinkAutoWakeSnoozeProjection(endpoint: endpoint, targetSessionID: Self.targetID(0), expectedReference: Self.laneReference(0))))
+        XCTAssertNil(try requireSnoozeSuccess(fixture.viewModel.linkExecutionRuntime.agentSessionLinkAutoWakeSnoozeProjection(endpoint: endpoint, targetSessionID: Self.targetID(0), expectedReference: Self.laneReference(0))))
     }
 
     func testEachOperationCapsTheHorizonWhileRepeatedOperationsExtendIndefinitely() throws {
