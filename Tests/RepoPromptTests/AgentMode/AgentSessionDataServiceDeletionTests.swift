@@ -1050,6 +1050,53 @@ final class AgentSessionMetadataCommitTests: XCTestCase {
         XCTAssertEqual(publicationCount, 0)
     }
 
+    func testStrictSaveRefusesSupersededSubmissionAndAcceptsCommittedWinner() async throws {
+        let fixture = try makeFixture()
+        let fence = TestReleaseFence(name: "strict save commit")
+        let fileURL = try await fixture.service.saveAgentSession(fixture.session, for: fixture.workspace)
+        await fixture.service.test_setBeforeSessionWriteHook { url in
+            guard url.standardizedFileURL == fileURL.standardizedFileURL else { return }
+            await fence.enterAndWait()
+        }
+        var superseded = fixture.session
+        superseded.name = "Superseded strict submission"
+        let firstPayload = superseded
+        let first = Task {
+            try await fixture.service.saveAgentSession(firstPayload, for: fixture.workspace, durability: .requireOwnCommit)
+        }
+        addTeardownBlock {
+            fence.release()
+            _ = await first.result
+            await fixture.service.test_setBeforeSessionWriteHook(nil)
+        }
+        guard await fence.waitUntilEntered() else { return }
+
+        var committed = fixture.session
+        committed.name = "Committed strict submission"
+        let winningPayload = committed
+        let second = Task {
+            try await fixture.service.saveAgentSession(winningPayload, for: fixture.workspace, durability: .requireOwnCommit)
+        }
+        addTeardownBlock {
+            fence.release()
+            _ = await second.result
+        }
+        try await AsyncTestWait.waitUntil("both strict saves admitted") {
+            await fixture.service.test_pendingSessionWriteCount(for: fileURL) == 2
+        }
+        fence.release()
+
+        switch await first.result {
+        case .failure(AgentSessionDataService.StrictSaveError.superseded):
+            break
+        default:
+            XCTFail("A superseded strict save must not report durable success")
+        }
+        let committedURL = try await second.value
+        XCTAssertEqual(committedURL, fileURL)
+        try await assertStoredAndIndexed(committed, fileURL: fileURL, fixture: fixture)
+    }
+
     func testCoalescedWriterReturnsReceiptOnlyToTheCommittedOwner() async throws {
         let fixture = try makeFixture()
         let writer = AgentSessionDiskWriter()
