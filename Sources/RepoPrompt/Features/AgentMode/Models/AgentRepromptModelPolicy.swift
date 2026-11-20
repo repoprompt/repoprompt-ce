@@ -46,7 +46,7 @@ enum AgentRepromptModelPolicy {
     }
 
     static func resolve(selection: String?, currentProvider: AgentProviderKind?, configured: [AIModel]) -> AIModel? {
-        let models = configured.filter(supportsSideCall)
+        let models = configured.filter(AgentOperationEligibility.AIOperation.reprompt.supports)
         if let selection, !selection.isEmpty {
             // An explicit disconnected or unknown model is an error, never an automatic fallback.
             return AIModel.fromModelName(selection).flatMap { models.contains($0) ? $0 : nil }

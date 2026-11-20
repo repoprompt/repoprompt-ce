@@ -9,6 +9,7 @@ struct AIModelDropdown: View {
     var windowID: Int?
     var useBorderlessStyle: Bool = true
     var isInGeneralSettings: Bool = false
+    var usesOracleEligibility = false
 
     /// The destination where model selection is applied.
     /// Defaults to `.chatModel(promptVM:)` if not specified.
@@ -39,7 +40,8 @@ struct AIModelDropdown: View {
         windowID: Int? = nil,
         useBorderlessStyle: Bool = true,
         isInGeneralSettings: Bool = false,
-        destination: ModelDestination
+        destination: ModelDestination,
+        usesOracleEligibility: Bool = false
     ) {
         self.promptViewModel = promptViewModel
         _showSettingsPopover = showSettingsPopover
@@ -47,6 +49,7 @@ struct AIModelDropdown: View {
         self.useBorderlessStyle = useBorderlessStyle
         self.isInGeneralSettings = isInGeneralSettings
         self.destination = destination
+        self.usesOracleEligibility = usesOracleEligibility
     }
 
     /// Convenience initializer that defaults to chat model destination
@@ -126,7 +129,10 @@ struct AIModelDropdown: View {
     // MARK: - AppKit Menu Content (Provider → Models)
 
     private func aiModelMenuItems() -> [StableMenuItem] {
-        let allModels = menuModelSnapshot ?? promptViewModel.availableModels
+        let availableModels = menuModelSnapshot ?? promptViewModel.availableModels
+        let allModels = usesOracleEligibility
+            ? availableModels.filter { promptViewModel.mcpOracleIsProviderConfigured(for: $0) }
+            : availableModels
         guard !allModels.isEmpty else {
             return [.action("Configure API Settings", handleConfigureAction)]
         }

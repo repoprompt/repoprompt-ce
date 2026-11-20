@@ -22,7 +22,7 @@ struct AgentRepromptSettingsEditor: View {
                 Text("Model")
                 AgentRepromptModelPicker(
                     selection: $viewModel.repromptModelDraft,
-                    availableModels: viewModel.apiSettingsVM.availableModels.filter { AgentRepromptModelPolicy.supportsSideCall($0) && $0.canStream },
+                    availableModels: viewModel.apiSettingsVM.availableModels.filter(AgentOperationEligibility.AIOperation.reprompt.supports),
                     resolvedModel: viewModel.resolvedRepromptDraftModel
                 )
             }

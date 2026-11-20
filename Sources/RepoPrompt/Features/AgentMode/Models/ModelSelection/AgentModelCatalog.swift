@@ -128,13 +128,19 @@ enum AgentModelCatalog {
         case general
         case headless
 
-        func allows(_ agentKind: AgentProviderKind) -> Bool {
+        var operation: AgentOperationEligibility.AgentOperation {
             switch self {
-            case .general:
-                true
-            case .headless:
-                agentKind != .antigravity
+            case .general: .subAgent
+            case .headless: .contextBuilder
             }
+        }
+
+        func allows(_ agentKind: AgentProviderKind) -> Bool {
+            operation.supports(agentKind)
+        }
+
+        func eligibility(for agentKind: AgentProviderKind, availability: AvailabilityContext) -> AgentOperationEligibility {
+            operation.eligibility(for: agentKind, available: AgentModelCatalog.isAgentAvailable(agentKind, availability: availability))
         }
     }
 
@@ -232,7 +238,7 @@ enum AgentModelCatalog {
         surface: AgentSelectionSurface = .general
     ) -> [AgentProviderKind] {
         [.codexExec, .claudeCode, .openCode, .cursor, .grokBuild, .antigravity, .devin, .claudeCodeGLM, .kimiCode, .customClaudeCompatible]
-            .filter { surface.allows($0) && isAgentAvailable($0, availability: availability) }
+            .filter { surface.eligibility(for: $0, availability: availability).isEligible }
     }
 
     static func hasUnconfiguredSupportedCLIProviders(
@@ -323,7 +329,7 @@ enum AgentModelCatalog {
             candidateModelRaw = ClaudeCompatibleModelCatalogAdapter.canonicalCompatibleBackendModelRaw(candidateModelRaw, for: agent)
         }
 
-        if !surface.allows(agent) || !isAgentAvailable(agent, availability: availability) {
+        if !surface.eligibility(for: agent, availability: availability).isEligible {
             if preserveUnavailableAgent, parsedAgent != nil, surface.allows(agent) {
                 effectiveAvailability = availability.assumingAvailable(agent)
             } else {
