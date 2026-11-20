@@ -486,7 +486,8 @@ actor AgentSessionDataService {
         encodedData: Data,
         fileURL: URL,
         folder: URL,
-        isLoadRepair: Bool
+        isLoadRepair: Bool,
+        durability: SaveDurability = .allowCoalescing
     ) async throws {
         let fileURL = fileURL.standardizedFileURL
         try ensureSessionWriteAllowed(session.id, fileURL: fileURL)
@@ -505,6 +506,7 @@ actor AgentSessionDataService {
             }
         #endif
         try await discardSaveIfSessionWasDeleted(session.id, fileURL: fileURL, folder: folder)
+        if durability == .requireOwnCommit, receipt == nil { throw StrictSaveError.superseded }
         if let receipt {
             let record = AgentSessionMetadataRecord.record(
                 from: session, fileURL: fileURL,
@@ -1282,13 +1284,26 @@ actor AgentSessionDataService {
 
     // MARK: - Public API
 
+    enum SaveDurability {
+        case allowCoalescing
+        case requireOwnCommit
+    }
+
+    enum StrictSaveError: Error {
+        case superseded
+    }
+
+    /// Strict success proves this submission received a writer receipt, not that its data
+    /// remains current. The caller must still revalidate admission before use.
     /// Save an AgentSession for a given workspace, returning the file URL on success.
     func saveAgentSession(
         _ session: AgentSession,
         for workspace: WorkspaceModel,
         preparation: SavePreparation = .canonicalize,
-        trustedCanonicalItemCount: Int? = nil
+        trustedCanonicalItemCount: Int? = nil,
+        durability: SaveDurability = .allowCoalescing
     ) async throws -> URL {
+        if durability == .requireOwnCommit { try Task.checkCancellation() }
         let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
 
         let filename = "AgentSession-\(session.id.uuidString).json"
@@ -1311,8 +1326,10 @@ actor AgentSessionDataService {
             encodedData: data,
             fileURL: fileURL,
             folder: agentSessionsFolder,
-            isLoadRepair: false
+            isLoadRepair: false,
+            durability: durability
         )
+        if durability == .requireOwnCommit { try Task.checkCancellation() }
         return fileURL
     }
 
