@@ -150,6 +150,8 @@ struct AgentWorkspaceCodemapPresentation: Equatable {
         guard let snapshot else { return .pending }
         let state: State = if snapshot.isGenerationSuspended {
             .paused
+        } else if snapshot.isNonGitCodeMapsPolicyDisabled {
+            .unavailable
         } else if snapshot.availability == .unavailable,
                   snapshot.unavailableReason == .workerRecoveryExhausted ||
                   snapshot.unavailableReason == .retryExhausted
@@ -177,7 +179,7 @@ struct AgentWorkspaceCodemapPresentation: Equatable {
             pendingCount: coverage?.pendingCount ?? 0,
             updatesPending: snapshot.updatesPending,
             graphRevision: snapshot.graphRevision,
-            graphIndexBudget: snapshot.graphIndexBudget
+            graphIndexBudget: snapshot.isNonGitCodeMapsPolicyDisabled ? nil : snapshot.graphIndexBudget
         )
     }
 }
