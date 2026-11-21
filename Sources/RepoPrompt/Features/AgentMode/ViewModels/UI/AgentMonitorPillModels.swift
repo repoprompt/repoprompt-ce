@@ -223,12 +223,12 @@ enum AgentMonitorAutoWakeCopy {
     static let tooltip = """
     When on, updates from every lane can start a turn for this agent, no more often than the limit \
     below. When off, only lanes you select individually can; other updates wait for its next turn. \
-    A lane that asks for attention wakes it either way.
+    A lane that asks for attention or waits for your input wakes it either way.
     """
     static let accessibilityLabel = "Auto-wake on overseen lane updates"
     static let accessibilityHint = """
     Lets updates from every lane start turns for this agent; when off, only individually selected lanes \
-    can. Attention requests wake it either way.
+    can. Attention requests and lanes waiting for your input wake it either way.
     """
     static let unavailableMessage = "That Agent session is no longer active."
     static let loadingReason = "This Agent session is still loading."
