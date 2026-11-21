@@ -330,6 +330,8 @@ final class MCPHostRouteResources {
     /// Join original publications before transferring the existing domain receipt and context.
     /// No new connection generation or catalog lookup is manufactured for a process refresh.
     func transferProcessConnection(_ connectionID: UUID, from origin: MCPRunRoutingCleanupReceipt, to successor: MCPRunRoutingCleanupReceipt) async -> Bool {
+        // Equal route IDs can belong to distinct epoch contexts. An explicit source requires new admission.
+        guard !origin.usesExplicitProviderContext, !successor.usesExplicitProviderContext else { return false }
         await settleRoutingPublications()
         guard !isClosing, origin.routeOwner === self, successor.routeOwner === self,
               coordinator == nil || connections[connectionID]?.policyID == origin.policyID,

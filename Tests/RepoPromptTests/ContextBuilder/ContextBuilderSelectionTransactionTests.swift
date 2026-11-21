@@ -63,6 +63,28 @@ final class MCPHostRouteResourceTests: XCTestCase {
         }
     }
 
+    func testExplicitBootstrapContextWithoutOwnerDoesNotTouchExistingWaiter() async {
+        let runID = UUID()
+        let generation = await MCPRoutingWaiter.registerOwned(runID: runID)
+        addTeardownBlock { await MCPRoutingWaiter.cleanup(runID: runID, generation: generation) }
+        let lease = MCPBootstrapLease(
+            spec: .agentMode(tabID: UUID(), runID: runID, gateID: UUID(), windowID: 42, agent: .codexExec),
+            mcpServerEnabler: {
+                XCTFail("An explicit context without an owner must fail before enabling the server")
+                return true
+            },
+            originatingContextSource: { _, _ in nil }
+        )
+
+        let acquired = await lease.acquire()
+        await lease.releaseWithoutRoutingWait()
+        let survivingGeneration = await MCPRoutingWaiter.generation(runID: runID)
+        let outcome = await lease.currentRoutingTerminalOutcome()
+        XCTAssertFalse(acquired)
+        XCTAssertEqual(survivingGeneration, generation)
+        XCTAssertEqual(outcome, .failed(.notRegistered))
+    }
+
     func testOwnedBootstrapCleanupDoesNotNeedFreshCommandAuthorityOrFollowSuccessor() async throws {
         let manager = ServerNetworkManager.shared
         let route = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: nil)
@@ -988,6 +1010,28 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
                     let target = sameProcess ? controller : replacement
                     let process = await target.routingProcessRegistration()
                     XCTAssertEqual(process != nil, sameProcess, "A different controller with reused wire IDs/PID has no original process registration")
+                    if let process, reregisterDuringTransfer == nil {
+                        let newContext = MCPTabContextSnapshot(
+                            tabID: context.tabID, windowID: route.identity.routeID, workspaceID: UUID(),
+                            promptText: "", selection: .init(), selectedMetaPromptIDs: [], tabName: "New epoch",
+                            runID: fixture.runID, explicitlyBound: true
+                        )
+                        let rejected = await manager.installClientConnectionPolicy(
+                            for: clientName, windowID: route.identity.routeID, restrictedTools: [], tabID: fixture.tabID,
+                            runID: fixture.runID, purpose: .agentModeRun, requiresExpectedAgentPID: true, routingOwner: route,
+                            originatingContextSource: { _, _ in
+                                { .init(snapshot: newContext, isCurrent: { true }, validateCarrier: { true }) }
+                            },
+                            reusingProcess: process
+                        )
+                        XCTAssertNil(rejected, "The existing process must not inherit another epoch's context")
+                        XCTAssertEqual(route.runRouteBindings.cleanupOwnership(for: fixture.connectionID)?.policyID, a.policyID)
+                        XCTAssertEqual(route.runRouteBindings.tabContextByConnectionID[fixture.connectionID]?.workspaceID, context.workspaceID)
+                        let stillCommitted = await manager.isRunRouteAuthoritativelyCommitted(
+                            runID: fixture.runID, windowID: route.identity.routeID, tabID: fixture.tabID, expectedAgentPID: pid, registration: a
+                        )
+                        XCTAssertTrue(stillCommitted)
+                    }
                     let second = await manager.installClientConnectionPolicy(
                         for: clientName, windowID: route.identity.routeID, restrictedTools: [], tabID: fixture.tabID,
                         runID: fixture.runID, purpose: .agentModeRun, requiresExpectedAgentPID: true, routingOwner: route, reusingProcess: process
