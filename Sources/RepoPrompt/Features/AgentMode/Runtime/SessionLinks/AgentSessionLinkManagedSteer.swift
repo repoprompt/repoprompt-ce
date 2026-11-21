@@ -141,6 +141,9 @@ extension AgentSessionLinkSteerAdmission {
         if pendingPromptExists {
             return .blocked(.targetAwaitingInteraction)
         }
+        if readiness.pendingSelfCompact || readiness.backgroundCompactionSettling {
+            return .blocked(.targetNotIdle)
+        }
         guard runStateIsActive else {
             // Idle but not yet send-ready: a last turn still committing, a queued instruction or
             // wake still draining, or a location change in progress. The strict send path is the
