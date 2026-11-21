@@ -1074,6 +1074,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
     }
 
     package struct FileSystemSettings: Codable, Equatable {
+        package var respectGitignore: Bool?
         package var respectRepoIgnore: Bool?
         package var respectCursorignore: Bool?
         package var globalIgnoreDefaults: String?
@@ -1082,6 +1083,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
         package var showEmptyFolders: Bool?
 
         package init(
+            respectGitignore: Bool? = nil,
             respectRepoIgnore: Bool? = nil,
             respectCursorignore: Bool? = nil,
             globalIgnoreDefaults: String? = nil,
@@ -1089,6 +1091,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             skipSymlinks: Bool? = nil,
             showEmptyFolders: Bool? = nil
         ) {
+            self.respectGitignore = respectGitignore
             self.respectRepoIgnore = respectRepoIgnore
             self.respectCursorignore = respectCursorignore
             self.globalIgnoreDefaults = globalIgnoreDefaults

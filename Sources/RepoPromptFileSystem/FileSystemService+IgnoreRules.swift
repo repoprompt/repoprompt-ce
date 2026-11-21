@@ -347,6 +347,10 @@ extension FileSystemService {
         try await ignoreRulesManager.repositoryExcludeDigest(for: path, policy: ignoreRulePolicy)
     }
 
+    package func respectsGitignoreRules() -> Bool {
+        ignoreRules.respectGitignore
+    }
+
     public func refreshIgnoreRules() async throws {
         let earlyFilterGeneration = watcherEarlyFilter.invalidate()
         let resolved = try await ignoreRulesManager.resolvedIgnoreRules(
@@ -421,7 +425,7 @@ extension FileSystemService {
         let effectiveRules = parentRules.clone()
         let repositoryRelativeDirectory = ignoreRulePolicy.repositoryRelativePath(appending: parentRelPath)
 
-        if hasGitignore {
+        if hasGitignore, effectiveRules.respectGitignore {
             let gitignoreURL = dirURL.appendingPathComponent(".gitignore")
             do {
                 let content: String

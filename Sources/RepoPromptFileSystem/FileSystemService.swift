@@ -860,8 +860,9 @@ package actor FileSystemService {
                 catalogPolicyIdentity = await WorkspaceRootCatalogPolicyIdentity(
                     schemaVersion: WorkspaceRootCatalogPolicyIdentity.currentSchemaVersion,
                     mandatoryIgnorePolicyIdentity: WorkspaceGitignorePolicyIdentity.current.rawValue,
-                    globalIgnoreDefaultsDigest: IgnoreRulesManager.globalIgnoreDefaultsDigest(
-                        for: ignoreRulesManager.resolvedGlobalIgnoreContent()
+                    globalIgnoreDefaultsDigest: IgnoreRulesManager.catalogGlobalIgnoreDigest(
+                        for: ignoreRulesManager.resolvedGlobalIgnoreContent(),
+                        respectGitignore: rules.respectGitignore
                     ),
                     respectRepoIgnore: respectRepoIgnore,
                     respectCursorignore: respectCursorignore,
