@@ -130,22 +130,26 @@ package struct AntigravityACPAgentProvider: ACPAgentProvider {
     }
 
     package func shouldEmitStderrLine(_ line: String) -> Bool {
+        stderrLineDisposition(line) == .transcript
+    }
+
+    package func stderrLineDisposition(_ line: String) -> ACPStderrLineDisposition {
         // Antigravity writes its Python harness and raw websocket frames to stderr
-        // (for example `I0906 ... local_connection.py ... RAW WS MSG`). These are
-        // diagnostics, not assistant content, and must never become transcript rows.
+        // (for example `I0906 ... local_connection.py ... RAW WS MSG`).
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
         // Classify the record header, never the frame payload: it can contain
         // arbitrary assistant text, tool errors, and even whole prompt bodies.
         let harnessPrefix = #"^[DIWEF]\d{4}\s+(?:\d{2}:\d{2}:\d{2}(?:\.\d+)?\s+)?\d+\s+"#
-        guard trimmed.range(of: harnessPrefix, options: .regularExpression) != nil else { return true }
+        guard trimmed.range(of: harnessPrefix, options: .regularExpression) != nil else { return .transcript }
         let frameHeader = harnessPrefix + #"local_connection\.py(?::\d+\])?\s+RAW WS MSG\b"#
-        if trimmed.range(of: frameHeader, options: .regularExpression) != nil { return false }
-        guard trimmed.first == "I" || trimmed.first == "D" else { return true }
+        if trimmed.range(of: frameHeader, options: .regularExpression) != nil { return .discard }
+        guard trimmed.first == "I" || trimmed.first == "D" else { return .transcript }
         let lowercased = trimmed.lowercased()
-        return lowercased.contains("error")
+        let isFailure = lowercased.contains("error")
             || lowercased.contains("exception")
             || lowercased.contains("traceback")
             || lowercased.contains("failed")
+        return isFailure ? .transcript : .diagnosticsOnly
     }
 
     package func normalizeError(_ error: Error) -> Error {
