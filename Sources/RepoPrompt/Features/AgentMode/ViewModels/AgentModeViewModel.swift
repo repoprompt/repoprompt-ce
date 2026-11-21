@@ -6111,7 +6111,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                   persistentBindingTransitionIsCurrent(targetToken),
                   sourceToken.map({ persistentBindingTransitionIsCurrent($0) }) ?? true
             else { throw PersistentBindingMutationError.staleTransition }
-            if (workspaceLink || workspaceManager?.isSessionRuntimeProjection != true),
+            if workspaceLink || workspaceManager?.isSessionRuntimeProjection != true,
                preparedSessionRuntimes?.hasPreparedRuntime(requestedSessionID) == true
             {
                 throw PersistentBindingMutationError.blockedByOwnership
