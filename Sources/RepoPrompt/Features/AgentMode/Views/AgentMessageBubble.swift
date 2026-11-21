@@ -255,10 +255,26 @@ struct AgentTranscriptRow: View, @MainActor Equatable {
     }
 
     var body: some View {
+        if let batch = Self.delegationBatch(for: inputs.item) {
+            AgentDelegationDecisionDisclosure(batch: batch, copy: copyContent)
+                .contextMenu {
+                    Button("Copy Batch") { copyContent(batch.text) }
+                }
+        } else {
+            messageBubble
+        }
+    }
+
+    static func delegationBatch(for item: AgentChatItem) -> AgentDelegationDecisionBatch? {
+        guard item.kind == .user, let batch = item.delegationDecisionBatch, !batch.decisions.isEmpty else { return nil }
+        return batch
+    }
+
+    private var messageBubble: some View {
         let cancelAction: (() -> Void)? = inputs.cancelRunID.map { runID in
             { [weak agentModeVM] in agentModeVM?.cancelActiveToolsForRun(runID: runID, reason: "tool_card_header_cancel") }
         }
-        AgentMessageBubble(
+        return AgentMessageBubble(
             item: inputs.item,
             isMostRecentEditBubble: inputs.isMostRecentEditBubble,
             windowID: inputs.windowID,
@@ -397,6 +413,52 @@ struct AgentTranscriptRow: View, @MainActor Equatable {
 /// Reads the navigation callback only for attributed rows. Keeping this dynamic environment
 /// dependency at its consumer lets unchanged transcript bubbles remain behind row equality.
 @MainActor
+private struct AgentDelegationDecisionDisclosure: View {
+    let batch: AgentDelegationDecisionBatch
+    let copy: (String) -> Void
+    @State private var isExpanded = false
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $isExpanded) {
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(batch.decisions.indices, id: \.self) { index in
+                    let decision = batch.decisions[index]
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text(outcomeLabel(decision.outcome)).fontWeight(.medium)
+                            Spacer()
+                            Button("Copy Decision") { copy(decision.text) }
+                        }
+                        if let target = decision.targetSessionID {
+                            Text("Target: \(target.uuidString)").font(.caption.monospaced()).textSelection(.enabled)
+                        }
+                        Text(decision.text).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                    }
+                }
+                Button("Copy Batch") { copy(batch.text) }
+            }
+            .padding(.top, 6)
+        } label: {
+            HStack(spacing: 6) {
+                Label("Delegation decisions", systemImage: "checkmark.shield")
+                Text(summary).foregroundStyle(.secondary).lineLimit(1)
+            }
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var summary: String {
+        guard let first = batch.decisions.first else { return "0" }
+        let mixed = batch.decisions.contains { $0.outcome != first.outcome }
+        return "\(batch.decisions.count) · \(mixed ? "Mixed outcomes" : outcomeLabel(first.outcome))"
+    }
+
+    private func outcomeLabel(_ outcome: String) -> String {
+        outcome.replacingOccurrences(of: "_", with: " ").capitalized
+    }
+}
+
 private struct AgentCrossSessionAttributionBadge: View {
     let attribution: AgentCrossSessionAttribution
     let fontPreset: FontScalePreset

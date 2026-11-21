@@ -15534,9 +15534,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// App-authored scope decisions use ordinary noncomposer submission, never the user's draft,
     /// attachments, workflow, or interview preference. Busy sessions retain the notice at its owner.
     func submitDelegationDecision(
-        _ text: String, tabID: UUID, expectedSessionID: UUID, stopFence: AgentRunStartStopFence,
+        _ batch: AgentDelegationDecisionBatch, tabID: UUID, expectedSessionID: UUID, stopFence: AgentRunStartStopFence,
         resuming persisted: AgentSessionLinkSendDelivery? = nil
     ) async -> DelegationDecisionDeliveryOutcome {
+        let text = batch.text
         let deletion = AgentSessionDeletionRegistry.shared
         guard !WindowStatesManager.shared.isTerminating,
               !deletion.isPermanentlyDeleted(sessionID: expectedSessionID),
@@ -15592,7 +15593,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 await linkExecutionRuntime.persistAndStartNoncomposerTurn(
                     session: session, tabID: tabID, workspaceID: endpoint.workspaceID,
                     claim: claim, displayText: text, providerMessage: text, workflow: nil,
-                    attribution: nil, stopFence: stopFence, dispatchIsCurrent: isCurrent
+                    attribution: nil, delegationDecisionBatch: batch, stopFence: stopFence, dispatchIsCurrent: isCurrent
                 )
             }
             let result = Self.delegationDecisionOutcome(outcome)
@@ -15607,6 +15608,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             managedTurn: AgentNoncomposerTurn(
                 endpoint: endpoint, providerText: text, sink: AgentSessionLinkManagedSteerSink()
             ),
+            delegationDecisionBatch: batch,
             stopFence: AgentRunStartStopFence(session: session), isLocalComposerInput: false
         )
         if case .submitted = submission {
@@ -15705,6 +15707,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         restorationSelectedWorkflow: AgentWorkflowDefinition? = nil,
         restorationSelectedWorkflowMutationGeneration: UInt64? = nil,
         managedTurn: AgentNoncomposerTurn? = nil,
+        delegationDecisionBatch: AgentDelegationDecisionBatch? = nil,
         stopFence: AgentRunStartStopFence? = nil,
         isLocalComposerInput: Bool = true,
         providerSwitchPreparation: ProviderSwitchSendPreparation? = nil,
@@ -15949,7 +15952,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // An accepted local or managed steer owns the boundary before its user row is published.
         agentSelfCompactCancelForAcceptedLocalInput(session)
         session.noteAcceptedTaskInput()
-        let userItem = AgentChatItem.user(
+        var userItem = AgentChatItem.user(
             bubbleText,
             attachments: attachmentsToSend,
             taggedFileAttachments: taggedFilesToSend,
@@ -15958,6 +15961,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             crossSessionAttribution: managedTurn?.attribution,
             dispatchedProviderText: managedTurn != nil || repromptedText != nil ? unexpandedWrappedText : nil
         )
+        userItem.delegationDecisionBatch = delegationDecisionBatch
         let canonicalPublication: AgentSessionComposerSubmitRuntime.PublicationCleanup?
         if canonicalLocalDispatch {
             guard let originalHost = canonicalHost, let claim = providerSwitchClaim,
