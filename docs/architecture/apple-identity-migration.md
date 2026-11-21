@@ -194,8 +194,7 @@ retained P build, so **every** client at or above P, including clients that alre
 successor identity, is eligible for any T item. Sparkle then prefers the greatest eligible build.
 Between 2026-11-18 and 2026-11-21 the Tip declaration stayed at `transition`. The progression gate
 also admitted "newer same-role builds" for T. So each protected-main push published another T
-(twelve T packages from `tip-d202e8add969`, build `43.24.69`, through `tip-84c123fb22b1`, build
-`44.25.57`), and every Tip update re-ran the
+(at least thirteen T packages, from `tip-d202e8add969`, build `43.24.69`, onward), and every Tip update re-ran the
 authorized package install on already-migrated Macs. The app-side migration markers persisted
 correctly; the defect was the release ladder re-offering the crossing.
 
@@ -212,7 +211,8 @@ The ladder now enforces:
 - The client is a second fence: once the running bundle identifier is the successor identity,
   `SparkleUpdateFeedDelegate.bestValidUpdate(in:for:)` and the passive appcast check never select a
   `package`/`interactive-package` item (`IdentityTransitionUpdatePolicy`).
-- Both checked-in declarations are `successor`. Tip retains `tip-84c123fb22b1` and P; Stable
+- Both checked-in declarations are `successor`. Tip retains the last published T pinned in
+  `tip-rollout.json` and P; Stable
   retains `v1.10.0` and the Tip-origin P. `S` items carry T's build as their floor.
 
 Cutover: a Tip run admitted before the successor declaration merged still uses its own pinned
@@ -223,8 +223,8 @@ one-shot check compares against the authenticated latest release.
 
 Known consequences of the already-published duplicate T items:
 
-- A Tip client still on an earlier duplicate T build (below `44.25.57`) is below the S floor. It
-  takes the retained `tip-84c123fb22b1` package once more, then only S ZIPs. A Stable v1.10.0 (build
+- A Tip client still on an earlier duplicate T build (below the pinned T's build) is below the S
+  floor. It takes the retained T package once more, then only S ZIPs. A Stable v1.10.0 (build
   `44`) client that switches to Tip is in the same position. Lowering S's floor globally is unsafe,
   because the floor cannot see the running identity. Those users can skip the extra package by
   installing the current official successor ZIP from the Tip release page once.

@@ -700,7 +700,7 @@ class StableTipFloorTests(unittest.TestCase):
             self.assertIn("resetAuthority declarations are retired", result.stderr)
 
     def test_checked_in_declarations_never_publish_another_transition(self) -> None:
-        # Both channels have published their one transition (Tip tip-84c123fb22b1,
+        # Both channels have published their one transition (Tip: the T pinned in tip-rollout.json,
         # Stable v1.10.0). Every later release must be a successor ZIP that
         # retains that exact T, never a newer T or a replacement P.
         for name in ("tip-rollout.json", "release-rollout.json"):
