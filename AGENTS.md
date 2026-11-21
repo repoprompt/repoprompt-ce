@@ -200,12 +200,17 @@ A state-directory override opts out of sibling discovery. Socket overrides do
 not determine the storage path or bypass the daemon-evidence checks.
 
 The selected BuildCache store expires known seeds unused for 14 days and targets
-16 GiB across legacy and current entries. Set
+4 GiB across legacy and current entries. Set
 `REPOPROMPT_DEV_BUILD_CACHE_LIMIT_BYTES` in the daemon's startup environment;
 use the same setting for daemons sharing a cache. Active key holders defer
-eviction; unknown data is not counted as garbage. Budget pressure prefers seeds
-with no checkout provenance or a disappeared checkout. Old layout seeds are
-not restored by updated daemons and expire after a day unused. New seeds live
+eviction; unknown data is not counted as garbage. A queued build does not reserve
+a seed: it may take a cold build if the seed expires before it starts. The sweep
+removes known legacy seeds, seeds for missing checkouts, and seeds whose recorded
+source commit is missing locally or more than 100 commits behind the checkout's
+HEAD. An inconclusive Git probe does not establish obsolescence. Under budget
+pressure, prefer the newest seed per active checkout, then keep recently used
+seeds within the remaining budget. Seeds larger than the budget are not published.
+New seeds live
 under `checkout-v2/` (including in custom stores) so older sweepers cannot remove
 them; their keys include the resolved checkout path, since SwiftPM products can
 contain absolute paths. The eviction rename prevents even an interrupted sweep

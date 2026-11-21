@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -126,14 +127,18 @@ class StorageFixture(unittest.TestCase):
         stale = seed("b" * 64, age=conductor.BUILD_CACHE_RETENTION_SECONDS + 10, checkout=str(self.repo))
         locked = seed("c" * 64, age=conductor.BUILD_CACHE_RETENTION_SECONDS + 10, checkout=str(self.repo))
         current = seed("d" * 64, checkout=str(self.repo))
+        orphan = seed("f" * 64, checkout=str(self.root / "removed-worktree"))
+        redundant = seed("0" * 64, age=10, checkout=str(self.repo))
         marker = legacy.parent / "unknown"
         marker.touch()
         with cache.key_lock("c" * 64, exclusive=False):
             report = cache.enforce_retention(dry_run=True)
-            self.assertEqual(report["reclaimableBytes"], 20)
+            self.assertEqual(report["reclaimableBytes"], 40)
             self.assertTrue(legacy.exists())
             result = cache.enforce_retention()
-        self.assertEqual(result["reclaimedBytes"], 20)
+        self.assertEqual(result["reclaimedBytes"], 40)
+        self.assertFalse(orphan.exists())
+        self.assertFalse(redundant.exists())
         self.assertEqual(result["remainingBytes"], 20)
         self.assertFalse(stale.exists())
         self.assertFalse(legacy.exists())
@@ -150,6 +155,32 @@ class StorageFixture(unittest.TestCase):
         self.assertEqual(cache._meta("e" * 64)["generation"], 1)
         self.assertFalse(cache._validate_seed("e" * 64, cache._meta("e" * 64)))
         self.assertEqual(len(list(interrupted.parent.glob("seed.tmp-*"))), 1)
+
+    def test_cache_source_history_detects_missing_and_behind_commits(self) -> None:
+        def git(*args: str) -> str:
+            return subprocess.check_output(["git", *args], cwd=self.repo, text=True).strip()
+
+        git("init", "-q")
+        git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.org", "-c", "commit.gpgsign=false",
+            "commit", "--quiet", "--allow-empty", "-m", "seed base")
+        base = git("rev-parse", "HEAD")
+        git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.org", "-c", "commit.gpgsign=false",
+            "commit", "--quiet", "--allow-empty", "-m", "new head")
+        head = git("rev-parse", "HEAD")
+        with mock.patch.dict(os.environ, {"GIT_DIR": str(self.root / "wrong-repo"), "GIT_ALLOW_PROTOCOL": "file"}):
+            self.assertEqual(conductor.BuildCacheManager._source_head(self.repo), head)
+        self.assertIsNone(conductor.BuildCacheManager._source_head(self.root))
+
+        def obsolete(path: Path, sha: str) -> bool:
+            return conductor.BuildCacheManager._obsolete_source(path, sha, conductor.time.monotonic() + 5)
+
+        self.assertFalse(obsolete(self.repo, base))
+        self.assertTrue(obsolete(self.repo, "1" * 40))
+        self.assertFalse(obsolete(self.repo, "unverified source"))
+        self.assertFalse(obsolete(self.root, base))
+        with mock.patch.object(conductor, "BUILD_CACHE_MAX_BEHIND_COMMITS", 0):
+            self.assertTrue(obsolete(self.repo, base))
+            self.assertFalse(obsolete(self.repo, head))
 
     def test_default_state_creates_a_private_parent(self) -> None:
         self.store.rmdir()

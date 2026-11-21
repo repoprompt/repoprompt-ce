@@ -95,7 +95,9 @@ LOG_TAIL_MAX_BYTES = 64 * 1024
 LOG_TAIL_FRAGMENT_MAX_BYTES = 4 * 1024
 BUILD_CACHE_DIAGNOSTIC_MAX_ROWS = 12
 BUILD_CACHE_SCHEMA_VERSION = 1
-BUILD_CACHE_DEFAULT_LIMIT_BYTES = 16 * 1024 * 1024 * 1024
+BUILD_CACHE_DEFAULT_LIMIT_BYTES = 4 * 1024 * 1024 * 1024
+BUILD_CACHE_MAX_BEHIND_COMMITS = 100
+BUILD_CACHE_HISTORY_SCAN_SECONDS = 3
 BUILD_CACHE_RETENTION_SECONDS = 14 * 24 * 60 * 60
 BUILD_CACHE_PUBLISH_THROTTLE_SECONDS = 60 * 60.0
 BUILD_CACHE_CLONE_MIN_SECONDS = 60.0
@@ -1355,19 +1357,26 @@ class BuildCacheManager:
             return False
 
     @staticmethod
-    def _source_head(repo_root: Path) -> Optional[str]:
+    def _checkout_git(checkout: Path, deadline: float, *args: str, stdin: bytes = b"") -> bytes:
+        timeout = deadline - time.monotonic()
+        if timeout <= 0:
+            raise subprocess.TimeoutExpired(args, 0)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        # Older Git may ignore NO_LAZY_FETCH; allow no fetch transports even
+        # when repository config or a partial clone would try to fetch an object.
+        env.update(GIT_NO_LAZY_FETCH="1", GIT_ALLOW_PROTOCOL="", GIT_OPTIONAL_LOCKS="0")
+        return subprocess.run(["git", *args], cwd=checkout, input=stdin, env=env,
+                              capture_output=True, timeout=timeout, check=True).stdout
+
+    @classmethod
+    def _source_head(cls, repo_root: Path) -> Optional[str]:
+        deadline = time.monotonic() + 5
         try:
-            completed = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=str(repo_root),
-                stdin=subprocess.DEVNULL,
-                text=True,
-                capture_output=True,
-                timeout=5.0,
-            )
-            value = completed.stdout.strip()
-            return value if completed.returncode == 0 and re.fullmatch(r"[0-9a-f]{40,64}", value) else None
-        except (OSError, subprocess.TimeoutExpired):
+            if cls._checkout_git(repo_root, deadline, "rev-parse", "--show-toplevel").removesuffix(b"\n") != os.fsencode(repo_root):
+                return None
+            value = cls._checkout_git(repo_root, deadline, "rev-parse", "HEAD").strip()
+            return value.decode("ascii") if re.fullmatch(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})", value) else None
+        except (OSError, subprocess.SubprocessError, ValueError):
             return None
 
     def _validate_seed_at(self, key: str, meta: Dict[str, Any], seed: Path) -> bool:
@@ -1633,6 +1642,8 @@ class BuildCacheManager:
                 self._sanitize_seed(temporary / ".build")
                 _atomic_write_json(temporary / ".generation.json", {"key": key, "generation": next_generation})
                 size = self._disk_usage_bytes(temporary / ".build")
+                if size > self._retention_limit_bytes():
+                    return {"state": "publicationSkipped", "reason": "seed exceeds cache budget", "sizeBytes": size}
                 source_head = self._source_head(self.repo_root)
                 meta = {
                     "schemaVersion": BUILD_CACHE_SCHEMA_VERSION,
@@ -1677,7 +1688,7 @@ class BuildCacheManager:
                     with contextlib.suppress(OSError):
                         self._remove_owned_temporary(previous)
         try:
-            retention = self.enforce_retention(context.snapshot.toolchain_signature)
+            retention = self.enforce_retention()
         except (ConductorError, OSError) as exc:
             retention = {"error": str(exc)[:500]}
         return {"state": "published", "key": key, "generation": next_generation, "sizeBytes": size, "retention": retention}
@@ -1701,10 +1712,10 @@ class BuildCacheManager:
             _atomic_write_json(key_dir / "meta.json", meta)
             return {"suspectCount": count, "quarantined": quarantined}
 
-    def enforce_retention(self, current_toolchain_signature: str = "", *, dry_run: bool = False) -> Dict[str, Any]:
+    def enforce_retention(self, *, dry_run: bool = False) -> Dict[str, Any]:
         roots = self._retention_roots()
         if dry_run or not roots:
-            return self._scan_retention(roots, current_toolchain_signature, dry_run=dry_run)
+            return self._scan_retention(roots, dry_run=dry_run)
         # Serialize budget calculations among updated daemons without waiting.
         # Older daemons still coordinate mutations through the persistent key locks.
         guard = self.cache_root / "retention.lock"
@@ -1716,7 +1727,7 @@ class BuildCacheManager:
             os.close(descriptor)
         try:
             with existing_storage_lock(guard):
-                return self._scan_retention(roots, current_toolchain_signature, dry_run=False)
+                return self._scan_retention(roots, dry_run=False)
         except BlockingIOError:
             return {"storePath": str(self.store_root), "deferred": "retention lock busy", "reclaimedBytes": 0}
 
@@ -1726,17 +1737,46 @@ class BuildCacheManager:
         return [root for root in (self.cache_root, self.store_root)
                 if private_retention_directory(root) and private_retention_directory(root / "locks")]
 
-    def _scan_retention(self, roots: List[Path], current_toolchain_signature: str, *, dry_run: bool) -> Dict[str, Any]:
+    def _retention_limit_bytes(self) -> int:
         try:
-            limit = max(0, int(self.env.get("REPOPROMPT_DEV_BUILD_CACHE_LIMIT_BYTES") or BUILD_CACHE_DEFAULT_LIMIT_BYTES))
+            return max(0, int(self.env.get("REPOPROMPT_DEV_BUILD_CACHE_LIMIT_BYTES") or BUILD_CACHE_DEFAULT_LIMIT_BYTES))
         except ValueError:
-            limit = BUILD_CACHE_DEFAULT_LIMIT_BYTES
+            return BUILD_CACHE_DEFAULT_LIMIT_BYTES
+
+    @classmethod
+    def _obsolete_source(cls, checkout: Path, source: Any, deadline: float) -> bool:
+        if not isinstance(source, str) or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", source):
+            return False
+        # These are read-only local probes. An unavailable or ambiguous history
+        # is not evidence that a checkout's seed has become obsolete.
+        def git(*args: str, stdin: bytes = b"") -> bytes:
+            return cls._checkout_git(checkout, deadline, *args, stdin=stdin)
+
+        try:
+            if git("rev-parse", "--show-toplevel").removesuffix(b"\n") != os.fsencode(checkout):
+                return False
+            kind = git("cat-file", "--batch-check=%(objecttype)", stdin=source.encode() + b"\n").strip()
+            if kind == source.encode() + b" missing":
+                return True
+            if kind != b"commit":
+                return False
+            ahead = git("rev-list", "--count", f"--max-count={BUILD_CACHE_MAX_BEHIND_COMMITS + 1}",
+                        "HEAD", "--not", source)
+            return int(ahead) > BUILD_CACHE_MAX_BEHIND_COMMITS
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return False
+
+    def _scan_retention(self, roots: List[Path], *, dry_run: bool) -> Dict[str, Any]:
+        limit = self._retention_limit_bytes()
         result: Dict[str, Any] = {
             "storePath": str(self.cache_root), "limitBytes": limit, "remainingBytes": 0,
             "reclaimableBytes": 0, "reclaimedBytes": 0, "evictedKeys": [], "skippedKeys": 0,
             "strandedTemporariesRemoved": 0,
         }
         rows = []
+        newest: Dict[str, Tuple[float, Path]] = {}
+        history: Dict[Tuple[str, str], bool] = {}
+        history_deadline = time.monotonic() + BUILD_CACHE_HISTORY_SCAN_SECONDS
         for child in (item for root in roots for item in root.iterdir()):
             if not HASHED_STORAGE_NAME.fullmatch(child.name) or not private_retention_directory(child):
                 continue
@@ -1761,23 +1801,31 @@ class BuildCacheManager:
             checkout = compatibility.get("checkoutPath") if isinstance(compatibility, dict) else None
             known_checkout = isinstance(checkout, str) and bool(checkout) and Path(checkout).is_absolute()
             obsolete = child.parent == self.cache_root or not known_checkout
-            if known_checkout:
+            if not obsolete:
                 try:
                     Path(checkout).lstat()
                 except FileNotFoundError:
                     obsolete = True
                 except (OSError, ValueError):
                     pass
-            same_toolchain = bool(current_toolchain_signature) and meta.get("toolchainSignature") == current_toolchain_signature
-            rows.append((not obsolete, same_toolchain, used, child, size, meta))
-        total = sum(row[4] for row in rows)
+                source = meta.get("sourceHead")
+                if not obsolete and isinstance(source, str):
+                    identity = (checkout, source)
+                    if identity not in history:
+                        history[identity] = self._obsolete_source(Path(checkout), source, history_deadline)
+                    obsolete = history[identity]
+                if not obsolete:
+                    newest[checkout] = max(newest.get(checkout, (0, child)), (used, child))
+            rows.append((not obsolete, used, child, size, meta))
+        preferred = {child for _, child in newest.values()}
+        total = sum(row[3] for row in rows)
         cutoff = self._clock() - BUILD_CACHE_RETENTION_SECONDS
-        for _safe_key, _same_toolchain, used, key_dir, size, snapshot in sorted(rows):
+        # Remove obsolete seeds regardless of size; under pressure, keep the
+        # newest seed for each extant checkout ahead of redundant generations.
+        ordered = sorted(rows, key=lambda row: (row[0], row[1] >= cutoff, row[2] in preferred, row[1], row[2]))
+        for compatible, used, key_dir, size, snapshot in ordered:
             key = key_dir.name
-            # Legacy seeds are no longer usable by updated daemons; give old
-            # daemons one day of reuse without allowing that namespace to linger.
-            deadline = self._clock() - TERMINAL_RETENTION_SECONDS if key_dir.parent == self.cache_root else cutoff
-            if used >= deadline and total <= limit:
+            if compatible and used >= cutoff and total <= limit:
                 continue
             try:
                 with existing_storage_lock(key_dir.parent / "locks" / f"{key}.lock"):
