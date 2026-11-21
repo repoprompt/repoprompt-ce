@@ -2350,12 +2350,21 @@ class WindowState: ObservableObject {
             return .tabUnavailable
         }
 
+        let visitRegistry = workspaceLink || workspaceManager.isSessionRuntimeProjection ? nil : agentModeViewModel.preparedSessionRuntimes
+        let visitIntent = sessionID.flatMap { visitRegistry?.beginRuntimeVisitIntent($0) }
+        func visitIsCurrent() -> Bool {
+            guard let sessionID, let visitRegistry else { return true }
+            return visitRegistry.isRuntimeVisitIntentCurrent(sessionID, intent: visitIntent)
+        }
+
+        guard visitIsCurrent() else { return .blockedByActiveDifferentSession }
         if let sessionID {
             let activationResult = await agentModeViewModel.activateRoutedAgentSession(
                 tabID: tabID,
                 sessionID: sessionID,
                 workspace: activeWorkspace,
-                workspaceLink: workspaceLink
+                workspaceLink: workspaceLink,
+                visitIntent: visitIntent
             )
             guard activationResult == .ready else {
                 return agentSessionRouteResult(for: activationResult)
@@ -2365,6 +2374,7 @@ class WindowState: ObservableObject {
         if workspaceLink, isClosing || Task.isCancelled || workspaceManager.activeWorkspaceID != workspaceID || workspaceManager.isSwitchingWorkspace {
             return .workspaceUnavailable
         }
+        guard visitIsCurrent() else { return .blockedByActiveDifferentSession }
         if tabIsStashed {
             guard await promptManager.restoreStashedComposeTab(containingTabID: tabID) != nil else {
                 return .tabUnavailable
@@ -2382,10 +2392,12 @@ class WindowState: ObservableObject {
             return .workspaceUnavailable
         }
         if workspaceLink { return .routed }
+        guard visitIsCurrent() else { return .blockedByActiveDifferentSession }
         let finalActivationResult = await agentModeViewModel.activateRoutedAgentSession(
             tabID: tabID,
             sessionID: sessionID,
-            workspace: finalWorkspace
+            workspace: finalWorkspace,
+            visitIntent: visitIntent
         )
         guard finalActivationResult == .ready else {
             return agentSessionRouteResult(for: finalActivationResult)

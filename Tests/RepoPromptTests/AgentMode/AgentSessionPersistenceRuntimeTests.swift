@@ -669,6 +669,29 @@ final class AgentSessionPersistenceRuntimeTests: XCTestCase {
         XCTAssertTrue(f.scope.sessions[f.session.tabID] === f.session)
         XCTAssertFalse(f.scope.hasReleasedWriterClaims)
         XCTAssertEqual(f.store.retainedDrains.count, 1)
+        let windowManager = WindowStatesManager.makeForTesting(
+            windowSessionFileURL: f.root.appendingPathComponent("windows.json"), agentRuntimeStore: f.store
+        )
+        let visitID = try XCTUnwrap(f.session.activeAgentSessionID)
+        var productionVisitCount = 0
+        var scheduledResume: (@MainActor () async -> Void)?
+        windowManager.test_scheduleCanonicalVisitResume = { scheduledResume = $0 }
+        XCTAssertTrue(windowManager.hasPreparedRuntime(visitID))
+        let older = windowManager.beginRuntimeVisitIntent(visitID)
+        let queued = windowManager.beginRuntimeVisitIntent(visitID)
+        XCTAssertTrue(windowManager.claimPreparedRuntimeVisit(visitID))
+        XCTAssertNil(windowManager.beginRuntimeVisitIntent(visitID), "A visit blocked by an active handoff must preserve its intent")
+        XCTAssertTrue(windowManager.isRuntimeVisitIntentCurrent(visitID, intent: queued))
+        windowManager.finishPreparedRuntimeVisit(visitID)
+        let released = await windowManager.releasePreparedOversightOwnerForVisit(sessionID: visitID)
+        XCTAssertFalse(released, "Visit admission must use the same runtime store as the drain lookup")
+        windowManager.queuePreparedRuntimeVisit(visitID, intent: queued) {
+            XCTAssertTrue(f.scope.hasReleasedWriterClaims)
+            productionVisitCount += 1
+        }
+        windowManager.queuePreparedRuntimeVisit(visitID, intent: older) { XCTFail("An older in-flight visit must not replace the latest visit") }
+        XCTAssertTrue(windowManager.preparedOversightPendingVisits.isEmpty, "Canonical visits must not enter legacy cleanup")
+        XCTAssertEqual(productionVisitCount, 0)
         XCTAssertNil(f.scope.sessions[cleanSibling.tabID], "A failed sibling save does not withhold this exact clean release")
         XCTAssertEqual(drain.sessionOutcomes[cleanSibling.tabID]?.outcome, .released)
         f.scope.noteSettlementChanged()
@@ -679,6 +702,14 @@ final class AgentSessionPersistenceRuntimeTests: XCTestCase {
         XCTAssertEqual(result, .released)
         XCTAssertEqual(writes, 3)
         XCTAssertEqual(resumedVisits, 1)
+        let oldResume = try XCTUnwrap(scheduledResume, "A released drain schedules the latest queued visit")
+        XCTAssertFalse(windowManager.hasPreparedRuntime(visitID))
+        windowManager.queuePreparedRuntimeVisit(visitID, intent: nil) { XCTFail("Passive readiness must not enqueue a visit") }
+        XCTAssertTrue(windowManager.isRuntimeVisitIntentCurrent(visitID, intent: queued))
+        let direct = windowManager.beginRuntimeVisitIntent(visitID)
+        XCTAssertTrue(windowManager.isRuntimeVisitIntentCurrent(visitID, intent: direct))
+        await oldResume()
+        XCTAssertEqual(productionVisitCount, 0, "A newer direct visit supersedes the scheduled resume")
         XCTAssertEqual(reentrantVisits, 1, "Withdrawal must still apply to a visit queued for dispatch")
         XCTAssertFalse(f.session.isDirty)
         XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
