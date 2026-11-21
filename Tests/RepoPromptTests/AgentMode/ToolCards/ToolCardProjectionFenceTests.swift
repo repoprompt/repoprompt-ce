@@ -291,6 +291,21 @@ final class ToolResultMarkdownRendererTests: XCTestCase {
         )
     }
 
+    func testMixedTransportPreservesEveryNonemptyTextBlock() {
+        let payload = #"""
+        {"content":[
+          {"type":"text","text":"  "},
+          {"type":"text","text":"## First"},
+          {"type":"image","data":"dGVzdA==","mimeType":"image/png"},
+          {"type":"text","text":"**Last**"}
+        ]}
+        """#
+        let output = ToolResultMarkdownRenderer.render(toolName: "read_file", argsJSON: nil, resultPayload: payload)
+        XCTAssertEqual(output?.text, "## First\n\n**Last**")
+        XCTAssertEqual(output?.isMarkdown, true)
+        XCTAssertEqual(ToolResultMarkdownRenderer.readablePayload(payload), output?.text)
+    }
+
     func testPlainPayloadKeptLiteralInRetainedContent() {
         let payload = "  <tag>\n[not a link]  \n"
         XCTAssertEqual(ToolResultMarkdownRenderer.readablePayload(payload), payload)

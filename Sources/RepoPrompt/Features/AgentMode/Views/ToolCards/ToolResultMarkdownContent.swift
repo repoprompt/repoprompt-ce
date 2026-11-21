@@ -175,7 +175,7 @@ enum ToolResultMarkdownRenderer {
         }.map {
             $0.trimmingCharacters(in: .whitespacesAndNewlines)
         }.filter { !$0.isEmpty }
-        guard textParts.count == content.count else { return nil }
+        guard !textParts.isEmpty else { return nil }
         return textParts.joined(separator: "\n\n")
     }
 
