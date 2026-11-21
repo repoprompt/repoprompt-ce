@@ -112,28 +112,33 @@ final class MCPStateSubscriptionTests: XCTestCase {
         addTeardownBlock { await route.close() }
 
         let runID = UUID()
-        func registration(workspaceID: UUID) -> MCPRunRoutingCleanupReceipt {
+        let manager = ServerNetworkManager.shared
+        func registration(workspaceID: UUID) async throws -> MCPRunRoutingCleanupReceipt {
             let snapshot = MCPTabContextSnapshot(
                 tabID: UUID(), windowID: route.identity.routeID, workspaceID: workspaceID,
                 promptText: "", selection: .init(), selectedMetaPromptIDs: [], tabName: "Epoch",
                 runID: runID, explicitlyBound: true
             )
-            return .init(
-                managerIdentity: ObjectIdentifier(route), policyID: UUID(), runID: runID,
-                routeID: route.identity.routeID, routingAuthorityGeneration: 0, routingWaitGeneration: nil,
-                routeOwner: route, providerContextResolver: {
-                    .init(snapshot: snapshot, isCurrent: { true }, validateCarrier: { true })
+            let issued = await manager.installClientConnectionPolicy(
+                for: "epoch-\(workspaceID)", windowID: route.identity.routeID, restrictedTools: [],
+                tabID: snapshot.tabID, runID: runID, purpose: .agentModeRun, routingOwner: route,
+                originatingContextSource: { _, _ in
+                    { .init(snapshot: snapshot, isCurrent: { true }, validateCarrier: { true }) }
                 }
             )
+            let receipt = try XCTUnwrap(issued)
+            addTeardownBlock { await manager.cleanupRunRoutingState(ownedBy: receipt) }
+            return receipt
         }
 
         let workspaceA = UUID()
         let workspaceB = UUID()
-        let predecessor = registration(workspaceID: workspaceA)
-        let successor = registration(workspaceID: workspaceB)
+        let predecessor = try await registration(workspaceID: workspaceA)
         let connectionA = UUID()
-        let connectionB = UUID()
         let admittedA = await route.installPendingPolicy(predecessor, connectionID: connectionA, clientName: nil, tabID: nil)
+        let successor = try await registration(workspaceID: workspaceB)
+        XCTAssertNotEqual(predecessor.policyID, successor.policyID)
+        let connectionB = UUID()
         let admittedB = await route.installPendingPolicy(successor, connectionID: connectionB, clientName: nil, tabID: nil)
         XCTAssertEqual(admittedA?.workspaceID, workspaceA)
         XCTAssertEqual(admittedB?.workspaceID, workspaceB)
@@ -143,8 +148,10 @@ final class MCPStateSubscriptionTests: XCTestCase {
         guard case .supersededByOtherConnection? = staleRollback else {
             return XCTFail("Stale predecessor must not roll back the successor")
         }
-        await route.consumeCleanup(predecessor)
-        await route.consumeCleanup(predecessor)
+        await manager.cleanupRunRoutingState(ownedBy: predecessor)
+        await manager.cleanupRunRoutingState(ownedBy: predecessor)
+        let survivingPolicies = await manager.debugPendingPolicySnapshot(for: "epoch-\(workspaceB)")
+        XCTAssertEqual(survivingPolicies.map(\.runID), [runID])
         XCTAssertNil(route.runRouteBindings.tabContextByConnectionID[connectionA])
         XCTAssertEqual(route.runRouteBindings.tabContextByConnectionID[connectionB]?.workspaceID, workspaceB)
         XCTAssertEqual(route.runRouteBindings.connectionIDByRunID[runID], connectionB)
@@ -157,6 +164,19 @@ final class MCPStateSubscriptionTests: XCTestCase {
         }
         XCTAssertNil(route.runRouteBindings.tabContextByConnectionID[connectionB])
         await route.consumeCleanup(successor)
+    }
+
+    @MainActor
+    func testOriginatingContextRefusalDoesNotConsultRouteDefault() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        let route = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: nil, runtime: runtime)
+        addTeardownBlock { await route.close() }
+        route.installProviderContextSource { _, _ in
+            XCTFail("An explicit originating source must never fall back to the route default")
+            return nil
+        }
+        let admission = route.admitProviderContext(runID: UUID(), tabID: nil, originatingContextSource: { _, _ in nil })
+        guard case .refused = admission else { return XCTFail("An unavailable originating context must fail closed") }
     }
 
     @MainActor
