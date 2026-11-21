@@ -383,6 +383,17 @@ final class AgentSessionWorktreeRuntime {
             try Task.checkCancellation()
             try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(desiredBindings)
             if let materializer, let preparation {
+                // Placement validation can suspend. Recheck authority before installing ownership,
+                // using the synchronous fence when the caller supplied one.
+                if resources.validatePlacement != nil {
+                    if let commitAuthority {
+                        try commitAuthority {}
+                    } else {
+                        try await revalidateAuthority?()
+                    }
+                    try requireCurrent()
+                    try Task.checkCancellation()
+                }
                 _ = try await materializer.commit(preparation)
                 ownershipCommitted = true
             }
