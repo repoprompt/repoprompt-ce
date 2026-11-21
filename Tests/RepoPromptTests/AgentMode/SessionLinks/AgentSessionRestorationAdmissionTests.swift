@@ -719,7 +719,13 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
             items: [AgentChatItemPersist(from: recoveredRow)], autoEditEnabled: false
         )
         repaired.composeTabID = tabID
-        _ = try await reopened.writer.saveAgentSession(repaired, for: workspace)
+        do {
+            _ = try await reopened.writer.saveAgentSession(repaired, for: workspace)
+            XCTFail("A normal save must preserve a file whose account binding cannot be read")
+        } catch DecodingError.dataCorrupted {
+            XCTAssertEqual(try Data(contentsOf: payloadURL), malformed)
+        }
+        try JSONEncoder().encode(repaired).write(to: payloadURL, options: .atomic)
         let retry = await reopened.vm.retrySessionRestoration(tabID: tabID)
         XCTAssertTrue(retry)
         XCTAssertTrue(restored.qualifiedRestorationReadiness.isAuthoritative)
