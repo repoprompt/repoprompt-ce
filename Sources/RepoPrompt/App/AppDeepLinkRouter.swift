@@ -448,94 +448,101 @@ final class AppDeepLinkRouter {
     @discardableResult
     private func routeAgentSession(_ route: AgentSessionDeepLinkRoute, sourceURL: URL?) async -> AgentSessionRouteResult {
         let liveWindows = windowStatesManager.allWindows.filter { !$0.isClosing }
-        if let app = NSApp {
-            app.activate(ignoringOtherApps: true)
-        }
         guard !liveWindows.isEmpty else {
             if let sourceURL {
                 windowStatesManager.pendingURLs.append(sourceURL)
+                NSApp?.activate(ignoringOtherApps: true)
             }
             return .workspaceUnavailable
         }
-        var attemptedWindowIDs = Set<Int>()
-        var latestResult: AgentSessionRouteResult = .workspaceUnavailable
-
-        for candidate in Self.agentSessionPreferredExistingWindows(for: route, in: liveWindows) {
-            attemptedWindowIDs.insert(candidate.windowID)
-            let result = await routeAgentSession(route, on: candidate)
-            latestResult = result
-            if result == .routed || !Self.shouldTryNextAgentSessionWindow(after: result) {
-                return result
+        // Cold-launch URLs may drain as soon as a window registers.
+        for window in liveWindows where !window.isClosing && !window.workspaceManager.isInitialized {
+            guard !Task.isCancelled, !windowStatesManager.isTerminating else { return .workspaceUnavailable }
+            await window.workspaceManager.awaitInitialized()
+        }
+        await windowStatesManager.waitForWindowRestoreBeforeWorkspaceLink(workspaceID: route.workspaceID)
+        return await Self.routeAgentSessionTarget(route, candidates: { () -> [AgentSessionCandidate<WindowState>] in
+            guard !self.windowStatesManager.isTerminating else { return [] }
+            let windows = self.windowStatesManager.allWindows.filter { !$0.isClosing }
+            let preferred = windows.first { $0.windowID == route.windowID }
+            let ordered = preferred.map { [$0] } ?? []
+            return (ordered + windows.filter { $0 !== preferred }).compactMap { window in
+                let manager = window.workspaceManager
+                let showingTarget = manager.activeWorkspaceID == route.workspaceID
+                guard manager.isInitialized, !manager.isSwitchingWorkspace, manager.activeWorkspaceSwitch == nil,
+                      !window.hasUnfinishedRestoreExecution
+                else { return showingTarget ? .unready : nil }
+                if showingTarget {
+                    guard let workspace = manager.activeWorkspace, workspace.id == route.workspaceID else { return .unready }
+                    return .showing(window, workspace)
+                }
+                return manager.workspace(withID: route.workspaceID) == nil ? nil : .canSwitch(window)
             }
-        }
+        }, resolveWorkspace: {
+            let store = AppDomainRuntimeComposition.shared.runtime.workspaceStore
+            guard let snapshot = await store.workspaceSnapshot(route.workspaceID), snapshot.health.acceptsMutations else { return nil }
+            return try? WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
+                documentBytes: snapshot.document.documentBytes,
+                fileURL: snapshot.document.fileURL,
+                preserveUnreadableDocument: false
+            )
+        }, navigate: { window, workspace in
+            await window.routeToAgentSession(route, validatedWorkspace: workspace)
+        })
+    }
 
-        for candidate in Self.agentSessionFallbackExistingWindows(for: route, in: liveWindows)
-            where !attemptedWindowIDs.contains(candidate.windowID)
-        {
-            let result = await routeAgentSession(route, on: candidate)
-            latestResult = result
-            if result == .routed || !Self.shouldTryNextAgentSessionWindow(after: result) {
-                return result
+    enum AgentSessionCandidate<Window> {
+        case showing(Window, WorkspaceModel)
+        case canSwitch(Window)
+        case unready
+    }
+
+    static func containsAgentDeepLinkTab(_ tabID: UUID, in workspace: WorkspaceModel) -> Bool {
+        workspace.composeTabs.contains { $0.id == tabID } || workspace.stashedTabs.contains { $0.tab.id == tabID }
+    }
+
+    static func routeAgentSessionTarget<Window>(
+        _ route: AgentSessionDeepLinkRoute,
+        candidates: () -> [AgentSessionCandidate<Window>],
+        resolveWorkspace: () async -> WorkspaceModel?,
+        navigate: (Window, WorkspaceModel) async -> AgentSessionRouteResult
+    ) async -> AgentSessionRouteResult {
+        var snapshot = candidates()
+        var readWorkspace = false
+        var workspace: WorkspaceModel?
+        while !Task.isCancelled {
+            var hasActiveCopy = false
+            var hasUnreadyCopy = false
+            var switchTarget: Window?
+            for candidate in snapshot {
+                switch candidate {
+                case let .showing(window, activeWorkspace):
+                    hasActiveCopy = true
+                    if activeWorkspace.composeTabsDecodeWasLossy {
+                        hasUnreadyCopy = true
+                    } else if containsAgentDeepLinkTab(route.tabID, in: activeWorkspace) {
+                        return await navigate(window, activeWorkspace)
+                    }
+                case let .canSwitch(window):
+                    if switchTarget == nil { switchTarget = window }
+                case .unready:
+                    hasUnreadyCopy = true
+                }
             }
+            if hasUnreadyCopy { return .workspaceUnavailable }
+            if hasActiveCopy { return .tabUnavailable }
+            guard let switchTarget else { return .workspaceUnavailable }
+            if readWorkspace {
+                guard let workspace, workspace.id == route.workspaceID,
+                      !workspace.composeTabsDecodeWasLossy else { return .workspaceUnavailable }
+                guard containsAgentDeepLinkTab(route.tabID, in: workspace) else { return .tabUnavailable }
+                return await navigate(switchTarget, workspace)
+            }
+            workspace = await resolveWorkspace()
+            readWorkspace = true
+            snapshot = candidates()
         }
-        return latestResult
-    }
-
-    private func routeAgentSession(_ route: AgentSessionDeepLinkRoute, on targetWindow: WindowState) async -> AgentSessionRouteResult {
-        if let window = targetWindow.nsWindow {
-            window.makeKeyAndOrderFront(nil)
-        } else {
-            targetWindow.focusWindowIfPossible()
-        }
-
-        return await targetWindow.routeToAgentSession(route)
-    }
-
-    @MainActor
-    static func agentSessionPreferredExistingWindows(for route: AgentSessionDeepLinkRoute, in liveWindows: [WindowState]) -> [WindowState] {
-        var ordered: [WindowState] = []
-        var seenWindowIDs = Set<Int>()
-
-        if let windowID = route.windowID,
-           let sourceWindow = liveWindows.first(where: { $0.windowID == windowID })
-        {
-            ordered.append(sourceWindow)
-            seenWindowIDs.insert(sourceWindow.windowID)
-        }
-
-        for window in liveWindows where window.workspaceManager.activeWorkspace?.id == route.workspaceID {
-            guard !seenWindowIDs.contains(window.windowID) else { continue }
-            ordered.append(window)
-            seenWindowIDs.insert(window.windowID)
-        }
-
-        return ordered
-    }
-
-    @MainActor
-    static func agentSessionPreferredExistingWindow(for route: AgentSessionDeepLinkRoute, in liveWindows: [WindowState]) -> WindowState? {
-        agentSessionPreferredExistingWindows(for: route, in: liveWindows).first
-    }
-
-    @MainActor
-    static func agentSessionFallbackExistingWindows(for route: AgentSessionDeepLinkRoute, in liveWindows: [WindowState]) -> [WindowState] {
-        liveWindows.filter { window in
-            window.workspaceManager.workspace(withID: route.workspaceID) != nil
-        }
-    }
-
-    @MainActor
-    static func agentSessionFallbackExistingWindow(for route: AgentSessionDeepLinkRoute, in liveWindows: [WindowState]) -> WindowState? {
-        agentSessionFallbackExistingWindows(for: route, in: liveWindows).first
-    }
-
-    nonisolated static func shouldTryNextAgentSessionWindow(after result: AgentSessionRouteResult) -> Bool {
-        switch result {
-        case .workspaceUnavailable, .workspaceSwitchBlocked, .tabUnavailable:
-            true
-        case .routed, .sessionUnavailable, .sessionMismatch, .blockedByActiveDifferentSession:
-            false
-        }
+        return .workspaceUnavailable
     }
 
     nonisolated static func legacyWindowPreference(for url: URL) -> LegacyWindowPreference {

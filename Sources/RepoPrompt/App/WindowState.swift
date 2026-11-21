@@ -2307,34 +2307,34 @@ class WindowState: ObservableObject {
     }
 
     @MainActor
-    func routeToAgentSession(_ route: AgentSessionDeepLinkRoute) async -> AgentSessionRouteResult {
-        await waitForWorkspaceInitializationForRouting()
-
-        guard let targetWorkspace = workspaceManager.workspace(withID: route.workspaceID) else {
-            return .workspaceUnavailable
+    func routeToAgentSession(_ route: AgentSessionDeepLinkRoute, validatedWorkspace: WorkspaceModel) async -> AgentSessionRouteResult {
+        let departure = workspaceManager.activeWorkspaceID
+        func canNavigate() -> Bool {
+            !Task.isCancelled && !isClosing && !hasUnfinishedRestoreExecution && workspaceManager.isInitialized
+                && !workspaceManager.isSwitchingWorkspace && workspaceManager.activeWorkspaceSwitch == nil
         }
+        guard canNavigate(), validatedWorkspace.id == route.workspaceID else { return .workspaceUnavailable }
+        let workspace = departure == route.workspaceID ? workspaceManager.activeWorkspace : validatedWorkspace
+        guard let workspace, workspace.id == route.workspaceID,
+              !workspace.composeTabsDecodeWasLossy else { return .workspaceUnavailable }
+        guard AppDeepLinkRouter.containsAgentDeepLinkTab(route.tabID, in: workspace) else { return .tabUnavailable }
 
-        NSApplication.shared.activate(ignoringOtherApps: true)
-        if let window = nsWindow {
-            window.makeKeyAndOrderFront(nil)
-        } else {
-            focusWindowIfPossible()
-        }
-
-        if workspaceManager.activeWorkspaceID != route.workspaceID {
-            let switchResult = await requestAgentDeepLinkWorkspaceSwitch(to: targetWorkspace)
+        focusWindowIfPossible()
+        guard canNavigate(), workspaceManager.activeWorkspaceID == departure else { return .workspaceUnavailable }
+        if departure != route.workspaceID {
+            let switchResult = await requestAgentDeepLinkWorkspaceSwitch(to: workspace)
             if !switchResult.didSwitch {
                 return .workspaceSwitchBlocked(switchResult.message)
             }
         }
 
+        guard canNavigate(), workspaceManager.activeWorkspaceID == route.workspaceID else { return .workspaceUnavailable }
         let result = await navigateAgentDeepLinkTab(route.tabID, sessionID: route.sessionID, workspaceID: route.workspaceID)
         guard result == .routed else { return result }
-        if let window = nsWindow {
-            window.makeKeyAndOrderFront(nil)
-        } else {
-            focusWindowIfPossible()
-        }
+        guard canNavigate(), let activeWorkspace = workspaceManager.activeWorkspace,
+              activeWorkspace.id == route.workspaceID else { return .workspaceUnavailable }
+        guard AppDeepLinkRouter.containsAgentDeepLinkTab(route.tabID, in: activeWorkspace) else { return .tabUnavailable }
+        focusWindowIfPossible()
         if route.interactionID != nil {
             agentModeViewModel.notificationAttention.revealRequests.send(route.tabID)
         }
@@ -2407,14 +2407,6 @@ class WindowState: ObservableObject {
     func isAgentSessionVisible(tabID: UUID, sessionID: UUID?) -> Bool {
         guard !isClosing, isCurrentlyFocused else { return false }
         return agentModeViewModel.isAgentSessionDisplayed(tabID: tabID, sessionID: sessionID)
-    }
-
-    @MainActor
-    private func waitForWorkspaceInitializationForRouting() async {
-        guard !workspaceManager.isInitialized else {
-            return
-        }
-        await workspaceManager.awaitInitialized()
     }
 
     private func agentSessionRouteResult(for activationResult: AgentRouteSessionActivationResult) -> AgentSessionRouteResult {

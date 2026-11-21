@@ -11,6 +11,91 @@ import XCTest
 
 final class AppPlatformUtilityRecoveryTests: XCTestCase {
     @MainActor
+    func testMissingAgentLinkTabDoesNotTouchAnyWindow() async {
+        let workspace = WorkspaceModel(name: "Destination", repoPaths: [])
+        let route = AgentSessionDeepLinkRoute(windowID: nil, workspaceID: workspace.id, tabID: UUID(), sessionID: UUID())
+        var focused: [Int] = []
+        var switches = 0
+        var cancellations = 0
+        var placementWrites = 0
+        let result = await AppDeepLinkRouter.routeAgentSessionTarget(route, candidates: { () -> [AppDeepLinkRouter.AgentSessionCandidate<Int>] in
+            [.canSwitch(1), .canSwitch(2)]
+        }, resolveWorkspace: {
+            workspace
+        }, navigate: { window, _ in
+            focused.append(window)
+            switches += 1
+            cancellations += 1
+            placementWrites += 1
+            return .tabUnavailable
+        })
+        XCTAssertEqual(result, .tabUnavailable)
+        XCTAssertTrue(focused.isEmpty)
+        XCTAssertEqual(switches, 0)
+        XCTAssertEqual(cancellations, 0)
+        XCTAssertEqual(placementWrites, 0)
+    }
+
+    @MainActor
+    func testAgentLinkPrefersShowingWindowForActiveAndStashedTabs() async {
+        let tab = ComposeTabState(name: "Destination tab")
+        var workspace = WorkspaceModel(name: "Destination", repoPaths: [])
+        let route = AgentSessionDeepLinkRoute(windowID: 1, workspaceID: workspace.id, tabID: tab.id, sessionID: UUID())
+        for stashed in [false, true] {
+            workspace.composeTabs = stashed ? [] : [tab]
+            workspace.stashedTabs = stashed ? [StashedTab(tab: tab)] : []
+            var visited: [Int] = []
+            let result = await AppDeepLinkRouter.routeAgentSessionTarget(route, candidates: { () -> [AppDeepLinkRouter.AgentSessionCandidate<Int>] in
+                [.canSwitch(1), .showing(2, workspace)]
+            }, resolveWorkspace: {
+                XCTFail("A matching live window does not need a workspace read")
+                return nil
+            }, navigate: { window, destination in
+                visited.append(window)
+                XCTAssertEqual(destination.stashedTabs.first?.tab.id, stashed ? tab.id : nil)
+                return .routed
+            })
+            XCTAssertEqual(result, .routed)
+            XCTAssertEqual(visited, [2])
+        }
+    }
+
+    @MainActor
+    func testAgentLinkDoesNotTryAnotherWindowAfterSwitchAttempt() async {
+        let tab = ComposeTabState(name: "Destination tab")
+        var workspace = WorkspaceModel(name: "Destination", repoPaths: [])
+        workspace.composeTabs = [tab]
+        let route = AgentSessionDeepLinkRoute(windowID: nil, workspaceID: workspace.id, tabID: tab.id, sessionID: UUID())
+        let outcomes: [AgentSessionRouteResult] = [.workspaceSwitchBlocked("Declined"), .tabUnavailable, .routed]
+        for outcome in outcomes {
+            var switchRequests: [Int] = []
+            let result = await AppDeepLinkRouter.routeAgentSessionTarget(route, candidates: { () -> [AppDeepLinkRouter.AgentSessionCandidate<Int>] in
+                [.canSwitch(1), .canSwitch(2)]
+            }, resolveWorkspace: {
+                workspace
+            }, navigate: { window, _ in
+                // The fake switch either declines or commits before the tab disappears.
+                switchRequests.append(window)
+                return outcome
+            })
+            XCTAssertEqual(result, outcome)
+            XCTAssertEqual(switchRequests, [1])
+        }
+    }
+
+    @MainActor
+    func testAgentLinkTreatsUnreadableWorkspaceAsUnavailable() async {
+        let route = AgentSessionDeepLinkRoute(windowID: nil, workspaceID: UUID(), tabID: UUID())
+        let result = await AppDeepLinkRouter.routeAgentSessionTarget(route, candidates: { () -> [AppDeepLinkRouter.AgentSessionCandidate<Int>] in
+            [.canSwitch(1), .canSwitch(2)]
+        }, resolveWorkspace: { nil }, navigate: { _, _ in
+            XCTFail("An unreadable destination cannot authorize navigation")
+            return .routed
+        })
+        XCTAssertEqual(result, .workspaceUnavailable)
+    }
+
+    @MainActor
     func testDelegateExposesOpenURLsSelector() {
         XCTAssertTrue(AppDelegate.instancesRespond(to: #selector(NSApplicationDelegate.application(_:open:))))
     }
