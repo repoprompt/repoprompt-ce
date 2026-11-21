@@ -2312,7 +2312,10 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
     func testOmittedObserverSelectorReturnsBoundedSortedAmbiguityAndExplicitSelectorResolves() async throws {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
-        let secondObserver = makeCandidate(windowID: 3, displayName: "Review")
+        let secondObserver = makeCandidate(
+            windowID: 3,
+            displayName: "  Review\n\u{0007} \(String(repeating: "é", count: 80))"
+        )
         fixture.host.candidates.append(secondObserver)
         let secondLink = await fixture.bridge.addMonitorLink(
             observerSessionID: secondObserver.sessionID,
@@ -2347,6 +2350,12 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 .map(\.uuidString)
         )
         XCTAssertEqual(payload["omitted_candidate_count"]?.intValue, 0)
+        let names: [UUID: Value] = [
+            fixture.observer.sessionID: .string("Planning"),
+            secondObserver.sessionID: .string("Review \(String(repeating: "é", count: 56))")
+        ]
+        let sortedIDs = names.keys.sorted { $0.uuidString < $1.uuidString }
+        XCTAssertEqual(payload["candidate_observer_session_names"]?.arrayValue, sortedIDs.compactMap { names[$0] })
 
         let selected = try await targetService.execute(args: [
             "op": .string("request_attention"),
@@ -2364,6 +2373,43 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 .attentionRequests.isEmpty ?? false,
             "the selector may address only its exact inbound grant"
         )
+    }
+
+    func testAttentionAmbiguityDoesNotNameAnUnlinkedIncarnationOrEnumerateExplicitSelectors() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let secondObserver = makeCandidate(windowID: 3, displayName: "Review")
+        fixture.host.candidates.append(secondObserver)
+        guard case .added = await fixture.bridge.addMonitorLink(
+            observerSessionID: secondObserver.sessionID,
+            rawTargetSessionID: fixture.target.sessionID.uuidString
+        ) else { return XCTFail("expected a second inbound grant") }
+
+        let duplicate = makeCandidate(windowID: 4, displayName: "Unlinked", sessionID: secondObserver.sessionID)
+        fixture.host.candidates.append(duplicate)
+        let service = fixture.routedService(from: fixture.target.domainEndpoint)
+        let ambiguous = try await service.execute(args: ["op": .string("request_attention")])
+        let sortedIDs = [fixture.observer.sessionID, secondObserver.sessionID].sorted { $0.uuidString < $1.uuidString }
+        XCTAssertEqual(ambiguous.objectValue?["candidate_observer_session_ids"]?.arrayValue, sortedIDs.map { .string($0.uuidString) })
+        XCTAssertEqual(
+            ambiguous.objectValue?["candidate_observer_session_names"]?.arrayValue,
+            sortedIDs.map { $0 == secondObserver.sessionID ? .null : .string("Planning") }
+        )
+
+        guard case let .reserved(reservation, _) = await fixture.authority.reserveLink(
+            observer: duplicate.domainEndpoint,
+            target: fixture.target.domainEndpoint
+        ), case .activated = await fixture.authority.activateLink(
+            reservation: reservation,
+            initialSnapshot: fixture.host.agentSessionLinkObservationSnapshot(for: fixture.target),
+            sourcePublicationSequence: 1
+        ) else { return XCTFail("expected an exact grant for the other incarnation") }
+
+        let explicit = try await service.execute(args: [
+            "op": .string("request_attention"),
+            "observer_session_id": .string(secondObserver.sessionID.uuidString)
+        ])
+        XCTAssertEqual(explicit.objectValue, ["result": .string("ambiguous_observer")])
     }
 
     func testEveryHiddenInboundOnlyOperationUsesExistingLiveAuthorizerDenial() async throws {
@@ -2494,15 +2540,17 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertEqual(try AgentSessionLinkMCPToolService.parseSnoozeDurationSeconds(nil), 600)
         XCTAssertEqual(try AgentSessionLinkMCPToolService.parseSnoozeDurationSeconds(.int(60)), 60)
         XCTAssertEqual(try AgentSessionLinkMCPToolService.parseSnoozeDurationSeconds(.int(3600)), 3600)
+        XCTAssertEqual(try AgentSessionLinkMCPToolService.parseSnoozeDurationSeconds(.int(18000)), 18000)
+        XCTAssertEqual(try AgentSessionLinkMCPToolService.parseSnoozeDurationSeconds(.int(86400)), 86400)
 
         // Out of range, and the two encodings that would otherwise be silently coerced: a string
         // numeral and a fractional one.
-        for rejected: Value in [.int(59), .int(3601), .int(0), .string("600"), .double(600.5), .bool(true)] {
+        for rejected: Value in [.int(59), .int(86401), .int(0), .string("600"), .double(600.5), .bool(true)] {
             XCTAssertThrowsError(
                 try AgentSessionLinkMCPToolService.parseSnoozeDurationSeconds(rejected)
             ) { error in
                 XCTAssertTrue(
-                    "\(error)".contains("must be an integer from 60 through 3600"),
+                    "\(error)".contains("must be an integer from 60 through 86400"),
                     "\(rejected)"
                 )
             }
@@ -2548,7 +2596,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         let expiresAt = Date(timeIntervalSince1970: 4000)
         let projection = AgentSessionLinkAutoWakeSnoozeProjection(
             expiresAt: expiresAt,
-            remainingSeconds: 1200,
+            remainingSeconds: 18000,
             origin: .agent
         )
         fixture.host.queuedSnoozeMutationResults = [
@@ -2568,7 +2616,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             ([
                 "op": .string("snooze_auto_wake"),
                 "session_id": .string(fixture.target.sessionID.uuidString),
-                "duration_seconds": .int(1200)
+                "duration_seconds": .int(18000)
             ], "extended", true, false),
             ([
                 "op": .string("snooze_auto_wake"),
@@ -2608,7 +2656,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 let snooze = try XCTUnwrap(object["auto_wake_snooze"]?.objectValue, expectation.result)
                 XCTAssertEqual(Set(snooze.keys), ["expires_at", "remaining_seconds", "set_by"])
                 XCTAssertEqual(snooze["expires_at"]?.stringValue, AgentMCPToolHelpers.timestamp(expiresAt))
-                XCTAssertEqual(snooze["remaining_seconds"]?.intValue, 1200)
+                XCTAssertEqual(snooze["remaining_seconds"]?.intValue, 18000)
                 XCTAssertEqual(snooze["set_by"]?.stringValue, "agent")
             } else {
                 // A cleared lane reports the absence explicitly rather than dropping the field.
@@ -2629,7 +2677,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             fixture.host.snoozeMutationCalls.map(\.command),
             [
                 .set(durationSeconds: 600),
-                .set(durationSeconds: 1200),
+                .set(durationSeconds: 18000),
                 .set(durationSeconds: 60),
                 .clear,
                 .clear
@@ -2725,7 +2773,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         let expiresAt = Date(timeIntervalSince1970: 5000)
         fixture.host.snoozeProjectionResult = .success(AgentSessionLinkAutoWakeSnoozeProjection(
             expiresAt: expiresAt,
-            remainingSeconds: 540,
+            remainingSeconds: 17400,
             origin: .user
         ))
 
@@ -2736,7 +2784,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         let single = try XCTUnwrap(singleValue.objectValue)
         let snooze = try XCTUnwrap(single["auto_wake_snooze"]?.objectValue)
         XCTAssertEqual(snooze["expires_at"]?.stringValue, AgentMCPToolHelpers.timestamp(expiresAt))
-        XCTAssertEqual(snooze["remaining_seconds"]?.intValue, 540)
+        XCTAssertEqual(snooze["remaining_seconds"]?.intValue, 17400)
         XCTAssertEqual(snooze["set_by"]?.stringValue, "user")
         // Observer-local policy, so it is rendered beside the sanitized target snapshot and never
         // inside it: another observer of the same target must not see this.
@@ -2999,6 +3047,30 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         ))
         let retried = try await steer("Keep going.", key: "steer-2")
         XCTAssertEqual(retried["delivery_state"]?.stringValue, "queued_interrupt")
+
+        // Compaction refuses before acceptance: release the key and retain the existing wire body.
+        fixture.host.steerOutcome = .blocked(.targetNotIdle)
+        let compactBlocked = try await steer("Continue after compaction.", key: "compact-held")
+        XCTAssertEqual(compactBlocked, [
+            "result": .string("target_not_idle"),
+            "session_id": sessionID,
+            "delivered": .bool(false),
+            "retryable": .bool(true),
+            "detail": .string("The overseen session is not ready to accept a message. Wait for it with until: \"sendable\" and send when a snapshot reports idle_for_send: true; until: \"idle\" is satisfied by targets this call still refuses."),
+            "managed": .bool(true),
+            "steered_by_session_id": .string(fixture.observer.sessionID.uuidString)
+        ])
+        fixture.host.steerOutcome = .delivered(AgentSessionLinkSendDelivery(
+            targetItemID: UUID(), acceptedAt: Date(timeIntervalSince1970: 1400),
+            deliveryState: .queuedInterrupt, resultingRunState: "running"
+        ))
+        let afterCompact = try await steer("Continue after compaction.", key: "compact-held")
+        XCTAssertEqual(afterCompact["result"]?.stringValue, "delivered")
+        XCTAssertEqual(afterCompact["duplicate"], .bool(false))
+        XCTAssertEqual(afterCompact["delivery_state"]?.stringValue, "queued_interrupt")
+        let afterCompactReplay = try await steer("Continue after compaction.", key: "compact-held")
+        XCTAssertEqual(afterCompactReplay["duplicate"], .bool(true))
+        XCTAssertEqual(afterCompactReplay["target_item_id"], afterCompact["target_item_id"])
 
         // An unconfirmed provider outcome spends the key: the observer must read before retrying.
         fixture.host.steerOutcome = .blocked(.steerUnconfirmed)
@@ -4464,9 +4536,10 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
 
     private func makeCandidate(
         windowID: Int,
-        displayName: String
+        displayName: String,
+        sessionID: UUID = UUID()
     ) -> AgentSessionLinkEndpointCandidate {
-        let binding = AgentPersistentSessionBindingIdentity(tabID: UUID(), sessionID: UUID())
+        let binding = AgentPersistentSessionBindingIdentity(tabID: UUID(), sessionID: sessionID)
         let token = AgentSessionRestorationBindingToken(bindingIdentity: binding, bindingTransitionGeneration: 1)
         return AgentSessionLinkEndpointCandidate(
             windowID: windowID,

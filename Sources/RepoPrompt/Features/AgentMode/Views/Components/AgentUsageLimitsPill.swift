@@ -100,13 +100,14 @@ struct AgentUsageLimitsPill: View {
 
     var body: some View {
         let runtime = WindowStatesManager.shared.providerQuotaRuntime
-        AgentUsageLimitsPillContent(
-            target: target,
-            windowID: windowID,
-            indicator: target == .codex ? runtime.codexIndicator : runtime.claudeIndicator
-        )
-        // A provider switch is a different store and surface lease.
-        .id(target)
+        let indicator = switch target {
+        case .codex: runtime.codexIndicator
+        case .claude: runtime.claudeIndicator
+        case .antigravity: runtime.antigravityIndicator
+        }
+        AgentUsageLimitsPillContent(target: target, windowID: windowID, indicator: indicator)
+            // A provider switch is a different store and surface lease.
+            .id(target)
     }
 }
 
@@ -119,7 +120,11 @@ private struct AgentUsageLimitsPillContent: View {
     @State private var isPopoverPresented = false
 
     private var providerName: String {
-        target == .codex ? "Codex" : "Claude"
+        switch target {
+        case .codex: "Codex"
+        case .claude: "Claude"
+        case .antigravity: "Google Antigravity"
+        }
     }
 
     var body: some View {
@@ -137,6 +142,8 @@ private struct AgentUsageLimitsPillContent: View {
     private func pill(_ presentation: AgentUsageLimitsPillPresentation) -> some View {
         let cornerRadius = AgentPillMetrics.cornerRadius()
         let height = AgentPillMetrics.height()
+        let detailsOnly = target == .antigravity
+        let tooltip = detailsOnly ? "View Google Antigravity CLI limits by model group" : presentation.tooltip
         let tint: Color = presentation.isReached ? .orange : .secondary
         return Button { isPopoverPresented.toggle() } label: {
             HStack(spacing: 4) {
@@ -151,12 +158,12 @@ private struct AgentUsageLimitsPillContent: View {
                     )
                     .frame(width: presentation.sessionFraction == nil ? 11 : 14, height: presentation.sessionFraction == nil ? 11 : 14)
                 }
-                Text(presentation.label)
+                Text(detailsOnly ? "Usage" : presentation.label)
                     .font(fontScale.preset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
                     .monospacedDigit()
                     .foregroundStyle(tint)
             }
-            .opacity(presentation.isDimmed ? 0.55 : 1)
+            .opacity(!detailsOnly && presentation.isDimmed ? 0.55 : 1)
             .padding(.horizontal, 7)
             .frame(height: height)
             .agentPillSurface(cornerRadius: cornerRadius, strokeColor: Color.secondary.opacity(0.15), lineWidth: 0.5)
@@ -165,9 +172,9 @@ private struct AgentUsageLimitsPillContent: View {
         .contextMenu {
             Button("Refresh usage") { indicator.refresh() }
         }
-        .hoverTooltip(presentation.tooltip, .top)
+        .hoverTooltip(tooltip, .top)
         .accessibilityLabel("\(providerName) plan usage")
-        .accessibilityValue(presentation.tooltip)
+        .accessibilityValue(tooltip)
         .popover(isPresented: $isPopoverPresented, arrowEdge: .top) {
             ProviderUsageQuotaSection(
                 provider: target,

@@ -6558,11 +6558,16 @@ final class AgentSessionLinkRuntimeBridge {
         }
     }
 
+    struct AttentionObserverCandidate: Equatable {
+        let sessionID: UUID
+        let displayName: String?
+    }
+
     enum AttentionRequestDisposition: Equatable {
         case accepted(hasWaitingOn: Bool)
         case atCapacity
         /// Candidate UUIDs are present only when the caller omitted `observer_session_id`.
-        case ambiguous(candidateObserverSessionIDs: [UUID]?, omittedCandidateCount: Int)
+        case ambiguous(candidates: [AttentionObserverCandidate]?, omittedCandidateCount: Int)
         case denied
         case shuttingDown
     }
@@ -6594,7 +6599,11 @@ final class AgentSessionLinkRuntimeBridge {
         case let .success(value):
             authorization = value
         case let .failure(error):
-            return Self.attentionDisposition(for: error, selectorWasOmitted: observerSessionID == nil)
+            return attentionDisposition(
+                for: error,
+                selectorWasOmitted: observerSessionID == nil,
+                liveEndpoints: initialLiveEndpoints
+            )
         }
 
         // An active inverse grant can precede this bridge's observer-local baseline publication.
@@ -6650,7 +6659,11 @@ final class AgentSessionLinkRuntimeBridge {
             authorization,
             liveEndpoints: currentLiveEndpoints
         ) {
-            return Self.attentionDisposition(for: error, selectorWasOmitted: observerSessionID == nil)
+            return attentionDisposition(
+                for: error,
+                selectorWasOmitted: observerSessionID == nil,
+                liveEndpoints: currentLiveEndpoints
+            )
         }
         guard !isFrozenForTermination else { return .shuttingDown }
 
@@ -6752,20 +6765,35 @@ final class AgentSessionLinkRuntimeBridge {
         return candidates
     }
 
-    private static func attentionDisposition(
+    private func attentionDisposition(
         for error: DomainAgentSessionLinkAuthority.RequestAttentionAuthorizationError,
-        selectorWasOmitted: Bool
+        selectorWasOmitted: Bool,
+        liveEndpoints: Set<DomainAgentSessionLinkEndpointIdentity>
     ) -> AttentionRequestDisposition {
         switch error {
         case .denied:
-            .denied
+            return .denied
         case let .ambiguousObserver(candidateObserverSessionIDs, omittedCandidateCount):
-            .ambiguous(
-                candidateObserverSessionIDs: selectorWasOmitted ? candidateObserverSessionIDs : nil,
-                omittedCandidateCount: selectorWasOmitted ? omittedCandidateCount : 0
-            )
+            guard selectorWasOmitted else {
+                return .ambiguous(candidates: nil, omittedCandidateCount: 0)
+            }
+            let endpointsBySessionID = Dictionary(grouping: liveEndpoints, by: \.sessionID)
+            let candidates = candidateObserverSessionIDs.map { sessionID in
+                // A UUID shared by multiple live endpoints cannot identify the authorized name source.
+                guard let endpoints = endpointsBySessionID[sessionID], endpoints.count == 1,
+                      let endpoint = endpoints.first,
+                      let candidate = host?.agentSessionLinkCandidate(for: endpoint, includeLocation: false),
+                      candidate.domainEndpoint == endpoint,
+                      let name = DomainAgentSessionLinkTextBudget.normalized(
+                          candidate.displayName,
+                          maxBytes: DomainAgentSessionLinkTextBudget.displayNameMaxBytes
+                      ), !name.isEmpty
+                else { return AttentionObserverCandidate(sessionID: sessionID, displayName: nil) }
+                return AttentionObserverCandidate(sessionID: sessionID, displayName: name)
+            }
+            return .ambiguous(candidates: candidates, omittedCandidateCount: omittedCandidateCount)
         case .runtimeShuttingDown:
-            .shuttingDown
+            return .shuttingDown
         }
     }
 

@@ -1448,7 +1448,7 @@ extension AgentSessionLinkExecutionRuntime {
         case let .set(durationSeconds):
             // The cap is a per-operation *remaining horizon*, never a lifetime cap: the deadline only
             // ever moves forward, so repeated operations may extend indefinitely while no single one
-            // of them leaves more than an hour on the clock.
+            // of them leaves more than 24 hours on the clock.
             let candidate = now.advanced(
                 by: .seconds(AgentSessionLinkAutoWakeSnooze.clampedDurationSeconds(durationSeconds))
             )

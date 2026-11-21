@@ -1074,6 +1074,11 @@ manufacture it, global MCP disable remains absolute, and the disabled-tool setti
 catalog advertisement. Reachability never supplies outbound or inverse operation authority; the
 service authorizes each direction independently.
 
+When the selector is omitted, an `ambiguous_observer` response aligns
+`candidate_observer_session_names` with `candidate_observer_session_ids` in the same order.
+Names are display labels, not selectors. A `null` entry means no name is available from a
+unique live endpoint for that UUID. Explicit selectors and denials do not enumerate candidates.
+
 After inverse authorization, the bridge awaits the existing observer-scoped authoritative projection
 refresh before revalidating the proof and enqueuing. This repairs a missing or lagging observer-local
 baseline without fabricating a grant or a one-lane reducer; all exact endpoint, eligibility, membership
@@ -1191,6 +1196,14 @@ A snooze is observer-local policy on one exact lane. It is keyed by
 `(observer endpoint, generation-qualified link reference)`, held only in process memory on the
 owning `AgentTabSession`, and dies with that incarnation — a rebind, unlink/relink, or relaunch
 always starts unsnoozed.
+
+Both user and agent requests use a 60–86,400-second clamp, with a 600-second default.
+The user menu reuses the periodic idle interval choices and compact labels; agents may request any
+integer in the range, including durations absent from that menu. A set keeps the later of the active
+deadline and `now + duration`, so a shorter agent request preserves a longer user snooze and its
+origin. Poll reports the exact remaining seconds (rounded upward), not the nearest menu choice.
+Historical one-hour tool definitions pass through an outer schema migration; their exact-match
+anchors remain intact. Lane guidance revision 15 teaches the widened range.
 
 What it does: stops routine status and overflow on that lane from being reasons an automatic turn
 starts. One still-pending attention occurrence from that exact lane may bypass this snooze, master

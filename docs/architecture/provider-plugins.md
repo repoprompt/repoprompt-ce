@@ -419,3 +419,25 @@ Add the relevant focused suite before any catalog/codec change, and snapshot mod
 - `Sources/RepoPrompt/Features/AgentMode/Runtime/Claude/ClaudeAgentModeCoordinator.swift` — interactive Claude-compatible coordinator.
 - SwiftPM package manifest docs: <https://docs.swift.org/package-manager/PackageDescription/PackageDescription.html>
 - Xcode local package override workflow: <https://developer.apple.com/documentation/xcode/editing-a-package-dependency-as-a-local-package>
+
+## Managed subscription rollback gate
+
+This procedure is for a **pre-activation backup restored into a separate app profile**. It does not support opening a newer profile in an older binary. Keep the newer profile and all provider state intact; never share the old and new ones.
+
+1. Before enabling any account adapter, capture the quiesced app profile, its preference domain, and a complete inventory of app-owned and custom workspace/session directories. Record the older build, target profile and effective preference domain, every retained root (including external volumes), and the build’s maximum settings schema in the same capture receipt. Do not assume a settings backup covers externally stored sessions.
+2. Restore copies into an isolated app profile. Materialize custom workspace data under the snapshot's app-owned workspace directory, remove custom storage overrides from the copied preferences and workspace index/documents, and rehome catalog file URLs. Do not symlink or hard-link retained storage into the snapshot. Keep a separate list of every retained active storage root, including external storage.
+3. Export the isolated preference domain into the snapshot, then run the static refusal precheck against the exact files to be used:
+
+   ```sh
+   python3 -B Scripts/audit_subscription_rollback.py \
+     --snapshot /isolated/profile \
+     --preferences /isolated/profile/old-preferences.plist \
+     --retained-root /current/profile \
+     --retained-root /current/external-workspaces \
+     --max-settings-schema 14
+   ```
+
+   Use the schema supported by the exact binary, not necessarily 14. The tool is intentionally conservative: it accepts only rehomed app-owned workspace storage, validates workspace indexes, catalog pointers, and working-journal destinations, and rejects known managed account/session metadata. It does not edit files or alter preferences, copy data, scan live provider stores, or authorize execution. Use a canonical, quiesced snapshot, preferably mounted read-only for the audit. The tool cannot discover omitted retained roots or verify preference-domain provenance from plist contents. The operator must attest these from the capture receipt and use the same inputs in the signed rehearsal. The schema check covers the known CE lineage rules and the supplied ceiling, not all decoder-compatibility conditions.
+4. With separate approval, rehearse on signed macOS: launch the exact older binary under the isolated preference domain and verify a legacy session can be opened and continued. Use a post-backup managed fixture in retained storage (including a previously external workspace) and prove it is absent from the older binary's lookup, resume, and deletion paths. Verify retained bytes are unchanged. Record the exact head, signing/profile identities, and redacted results. A static precheck pass does not replace this rehearsal or the per-provider verification gate.
+
+Fixture-only validation: `python3 -B Scripts/test_audit_subscription_rollback.py`.

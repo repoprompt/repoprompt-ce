@@ -14,6 +14,11 @@ package enum DomainChildLaunchContext {
 package enum DomainInteractionPresentationContext {
     package static let requestIDTaskLocal = BoxedTaskLocal<UUID?>(nil)
     package static var requestID: UUID? { requestIDTaskLocal.get() }
+    package static let deadlineTaskLocal = BoxedTaskLocal<DomainInteractionBroker.Deadline?>(nil)
+    package static var deadline: DomainInteractionBroker.Deadline? {
+        guard let deadline = deadlineTaskLocal.get(), deadline.originalTimeoutSeconds != nil else { return nil }
+        return deadline
+    }
 }
 
 package struct DomainLongRunningInteractionAdapter: Sendable {
@@ -296,7 +301,8 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
             invocationID: requestSeed.invocationID,
             runID: requestSeed.runID,
             payload: requestSeed.payload,
-            deadline: Date().addingTimeInterval(timeout + 1)
+            deadline: Date().addingTimeInterval(timeout + DomainInteractionBroker.Deadline.settlementGrace),
+            renewalTimeoutSeconds: timeout
         )
         let appUI = interactionAdapter.map { adapter in
             DomainInteractionProvider(
@@ -315,6 +321,8 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
         case let .response(value, _):
             return value
         case .timedOut:
+            // Preserve the existing fallback payload: unlike the presenter, it reports configured T,
+            // not measured elapsed time, and has no partial drafts.
             return .object([
                 "answers": .object([:]),
                 "timed_out": .bool(true),

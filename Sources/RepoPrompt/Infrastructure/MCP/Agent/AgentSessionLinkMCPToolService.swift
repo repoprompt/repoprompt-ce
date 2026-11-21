@@ -308,11 +308,14 @@ struct AgentSessionLinkMCPToolService {
                 "result": .string("attention_queue_full"),
                 "accepted": .bool(false)
             ])
-        case let .ambiguous(candidateObserverSessionIDs, omittedCandidateCount):
+        case let .ambiguous(candidates, omittedCandidateCount):
             var payload: [String: Value] = ["result": .string("ambiguous_observer")]
-            if let candidateObserverSessionIDs {
+            if let candidates {
                 payload["candidate_observer_session_ids"] = .array(
-                    candidateObserverSessionIDs.map { .string($0.uuidString) }
+                    candidates.map { .string($0.sessionID.uuidString) }
+                )
+                payload["candidate_observer_session_names"] = .array(
+                    candidates.map { AgentMCPToolHelpers.stringOrNull($0.displayName) }
                 )
                 payload["omitted_candidate_count"] = .int(omittedCandidateCount)
             }
@@ -1259,7 +1262,7 @@ struct AgentSessionLinkMCPToolService {
               seconds <= AgentSessionLinkAutoWakeSnooze.maximumDurationSeconds
         else {
             throw MCPError.invalidParams(
-                "agent_session_link snooze_auto_wake duration_seconds must be an integer from 60 through 3600."
+                "agent_session_link snooze_auto_wake duration_seconds must be an integer from \(AgentSessionLinkAutoWakeSnooze.minimumDurationSeconds) through \(AgentSessionLinkAutoWakeSnooze.maximumDurationSeconds)."
             )
         }
         return seconds

@@ -178,10 +178,14 @@ final class MCPAskUserToolProvider: MCPAppToolProviding {
         // Get target window.
         let targetWindow = try dependencies.requireTargetWindow()
 
-        let defaultTimeout = try await resolveDefaultTimeoutSeconds(
-            invocationContext: invocationContext,
-            dependencies: dependencies
-        )
+        let defaultTimeout: TimeInterval = if let resolvedTimeout = DomainInteractionPresentationContext.deadline?.originalTimeoutSeconds {
+            resolvedTimeout
+        } else {
+            try await resolveDefaultTimeoutSeconds(
+                invocationContext: invocationContext,
+                dependencies: dependencies
+            )
+        }
         let parsed = try parseAskUserInteraction(args: args, defaultTimeout: defaultTimeout)
 
         // Route based on run purpose.
