@@ -36,6 +36,9 @@ final class AgentSessionRuntimeHost {
     let claudeCoordinator: ClaudeAgentModeCoordinator
     let providerBindingService: AgentModeProviderBindingService
     let providerResources: AgentRunProviderComposition
+    private(set) lazy var workspaceSwitchCleanup = AgentModeWorkspaceSwitchCleanupProvider(
+        codexCoordinator: codexCoordinator, claudeCoordinator: claudeCoordinator
+    )
     private(set) var workspaceActivation: AgentSessionHostWorkspaceActivation?
 
     /// Install immutable activation/resource ownership before making any visible session. A
