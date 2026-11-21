@@ -66,6 +66,10 @@ removed from per-candidate integration, the measured workload, and rollout limit
 ## Candidate and evidence boundaries
 
 PRs check out `github.sha` (the synthetic merge), never just the topic head.
+For a native stack, GitHub still generates that commit against the direct parent branch.
+Admission checks both merge parents against the event and requires the direct parent to
+contain the event's pinned `main` trunk. The scan starts at that trunk, so it includes
+lower-layer commits even when they have their own PR checks.
 Queue events require the payload's `head_sha` and fully-qualified `head_ref` to
 match `GITHUB_SHA` and `GITHUB_REF`, and `base_ref == refs/heads/main`. Pushes use
 `before` and `after`. A real, available ancestor base is required. The secret
