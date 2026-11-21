@@ -18229,6 +18229,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let validatedName = AgentSession.validatedName(newName)
         guard !validatedName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         let session = try requireCurrentAgentSessionLifecycleTarget(target, intent: .setStatus)
+        if session?.subscriptionAccountBinding.blocksProviderOperations == true {
+            throw MCPError.invalidParams(AgentSessionSubscriptionBinding.notRunnableMessage)
+        }
         guard let identitySessionID = target.identity?.sessionID else {
             promptManager?.renameComposeTab(target.tabID, to: validatedName)
             return
@@ -18255,6 +18258,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func renameSession(tabID: UUID, to newName: String) {
+        guard sessions[tabID]?.subscriptionAccountBinding.blocksProviderOperations != true else { return }
         let validatedName = AgentSession.validatedName(newName)
         guard !validatedName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
 

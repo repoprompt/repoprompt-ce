@@ -83,6 +83,9 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
                 to: restored
             )
             XCTAssertFalse(restored.autoEditEnabled)
+            let originalTitle = fixture.manager.composeTab(with: tabID)?.name
+            fixture.vm.renameSession(tabID: tabID, to: "Unwritable title")
+            XCTAssertEqual(fixture.manager.composeTab(with: tabID)?.name, originalTitle)
             XCTAssertFalse(restored.isDirty)
             XCTAssertNil(restored.saveDebounceTask)
 
