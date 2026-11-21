@@ -106,6 +106,60 @@ private actor RouteHistoryScanner: HistorySessionScanning {
 /// view model can be deallocated once observation stops.
 final class MCPStateSubscriptionTests: XCTestCase {
     @MainActor
+    func testCanonicalReceiptsKeepTheirOwnContextsOnSharedPhysicalRoute() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        let route = MCPHostRouteResources(identity: .legacyWindow(42), coordinator: nil, runtime: runtime)
+        addTeardownBlock { await route.close() }
+
+        let runID = UUID()
+        func registration(workspaceID: UUID) -> MCPRunRoutingCleanupReceipt {
+            let snapshot = MCPTabContextSnapshot(
+                tabID: UUID(), windowID: route.identity.routeID, workspaceID: workspaceID,
+                promptText: "", selection: .init(), selectedMetaPromptIDs: [], tabName: "Epoch",
+                runID: runID, explicitlyBound: true
+            )
+            return .init(
+                managerIdentity: ObjectIdentifier(route), policyID: UUID(), runID: runID,
+                routeID: route.identity.routeID, routingAuthorityGeneration: 0, routingWaitGeneration: nil,
+                routeOwner: route, providerContextResolver: {
+                    .init(snapshot: snapshot, isCurrent: { true }, validateCarrier: { true })
+                }
+            )
+        }
+
+        let workspaceA = UUID()
+        let workspaceB = UUID()
+        let predecessor = registration(workspaceID: workspaceA)
+        let successor = registration(workspaceID: workspaceB)
+        let connectionA = UUID()
+        let connectionB = UUID()
+        let admittedA = await route.installPendingPolicy(predecessor, connectionID: connectionA, clientName: nil, tabID: nil)
+        let admittedB = await route.installPendingPolicy(successor, connectionID: connectionB, clientName: nil, tabID: nil)
+        XCTAssertEqual(admittedA?.workspaceID, workspaceA)
+        XCTAssertEqual(admittedB?.workspaceID, workspaceB)
+
+        let predecessorToken = try XCTUnwrap(admittedA?.token)
+        let staleRollback = route.rollbackPendingPolicy(predecessor, token: predecessorToken, clientName: nil)
+        guard case .supersededByOtherConnection? = staleRollback else {
+            return XCTFail("Stale predecessor must not roll back the successor")
+        }
+        await route.consumeCleanup(predecessor)
+        await route.consumeCleanup(predecessor)
+        XCTAssertNil(route.runRouteBindings.tabContextByConnectionID[connectionA])
+        XCTAssertEqual(route.runRouteBindings.tabContextByConnectionID[connectionB]?.workspaceID, workspaceB)
+        XCTAssertEqual(route.runRouteBindings.connectionIDByRunID[runID], connectionB)
+        XCTAssertFalse(route.isClosing)
+
+        let successorToken = try XCTUnwrap(admittedB?.token)
+        let rollback = route.rollbackPendingPolicy(successor, token: successorToken, clientName: nil)
+        if case .restored? = rollback {} else {
+            XCTFail("The originating canonical adapter must roll back the installation")
+        }
+        XCTAssertNil(route.runRouteBindings.tabContextByConnectionID[connectionB])
+        await route.consumeCleanup(successor)
+    }
+
+    @MainActor
     func testPhysicalRouteDisposalWaitsForSuccessorEpochExecutionLease() async throws {
         let runtime = try await makeHistoryRouteRuntime()
         let owner = MCPHostRouteResources.LeaseOwner(
