@@ -1,3 +1,5 @@
+import CryptoKit
+import Darwin
 import Foundation
 import RepoPromptDomainRuntime
 import RepoPromptRemoteProtocol
@@ -196,6 +198,7 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
         let thumbnails: [UUID: Data]
         if let previewItemID, let retainedAttachmentRoot {
             let attachments = Self.imageAttachments(in: transcript, itemID: previewItemID)
+                .prefix(RemoteAttachmentLimits.maxCount).filter { $0.kind == .image }.map(\.id)
             let worker = Task.detached(priority: .userInitiated) {
                 try Self.retainedPhotoThumbnails(
                     attachmentIDs: attachments, sessionID: sessionID, root: retainedAttachmentRoot
@@ -242,13 +245,13 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
         )
     }
 
-    private static func imageAttachments(in transcript: AgentTranscript, itemID: UUID) -> [UUID] {
+    private static func imageAttachments(in transcript: AgentTranscript, itemID: UUID) -> [AgentFileAttachment] {
         for turn in transcript.turns {
             if let request = turn.request, request.id == itemID {
-                return request.attachments.filter { $0.kind == .image }.map(\.id)
+                return request.attachments
             }
             if let activity = turn.allActivities.first(where: { $0.id == itemID }) {
-                return activity.attachments.filter { $0.kind == .image }.map(\.id)
+                return activity.attachments
             }
         }
         return []
@@ -270,6 +273,129 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
             thumbnails[id] = thumbnail
         }
         return thumbnails
+    }
+
+    func imageAttachment(_ request: RemoteImageAttachmentRequest) async throws -> RemoteImageAttachmentChunk {
+        guard request.isValid else { throw RemoteImageReadError.invalidImage }
+        let url = try await imageURL(for: request)
+        let worker = Task.detached(priority: .userInitiated) {
+            try Self.readImage(at: url, request: request)
+        }
+        return try await withTaskCancellationHandler {
+            try await worker.value
+        } onCancel: {
+            worker.cancel()
+        }
+    }
+
+    private func imageURL(for request: RemoteImageAttachmentRequest) async throws -> URL {
+        // Search live owners across every window before hitting a potentially older saved transcript.
+        for context in contexts {
+            guard let live = context.agentMode.sessions.values.first(where: { $0.activeAgentSessionID == request.sessionID })
+            else { continue }
+
+            if let attachment = Self.imageAttachment(in: live.transcript, request: request) {
+                let location = context.agentMode.attachmentLocation(for: live)
+                let retainedRoot = location?.retainedRoot ?? context.workspaceManager
+                    .workspace(withID: live.persistentSessionBindingIdentity?.workspaceID)
+                    .flatMap { context.agentMode.sessionAttachmentsRootURL(for: $0) }
+                if let url = Self.ownedImageURL(
+                    attachment: attachment,
+                    sessionID: request.sessionID,
+                    retainedRoot: retainedRoot,
+                    workspaceDirectory: location?.workspaceDirectory
+                ) { return url }
+            }
+            if live.hasLoadedPersistedState { throw RemoteImageReadError.unavailable }
+        }
+
+        var visited: Set<UUID> = []
+        for context in contexts {
+            for workspace in context.workspaceManager.workspaces where !workspace.isEphemeral && visited.insert(workspace.id).inserted {
+                try Task.checkCancellation()
+                guard let saved = try? await AgentSessionDataService.shared.loadAgentSession(id: request.sessionID, for: workspace)
+                else { continue }
+                guard let transcript = saved.transcript,
+                      let attachment = Self.imageAttachment(in: transcript, request: request),
+                      let url = Self.ownedImageURL(
+                          attachment: attachment, sessionID: request.sessionID,
+                          retainedRoot: context.agentMode.sessionAttachmentsRootURL(for: workspace),
+                          workspaceDirectory: nil
+                      )
+                else { throw RemoteImageReadError.unavailable }
+                return url
+            }
+        }
+        throw RemoteImageReadError.unavailable
+    }
+
+    static func imageAttachment(in transcript: AgentTranscript, request: RemoteImageAttachmentRequest) -> AgentFileAttachment? {
+        imageAttachments(in: transcript, itemID: request.itemID)
+            .prefix(RemoteAttachmentLimits.maxCount)
+            .first { $0.kind == .image && $0.id == request.attachmentID }
+    }
+
+    static func ownedImageURL(
+        attachment: AgentFileAttachment, sessionID: UUID, retainedRoot: URL?, workspaceDirectory: URL?
+    ) -> URL? {
+        guard attachment.kind == .image else { return nil }
+        if let retainedRoot, let retained = AgentSessionAttachmentStore(rootURL: retainedRoot)
+            .locateRetainedFile(attachmentID: attachment.id, sessionID: sessionID)
+        {
+            return retained
+        }
+        // Live uploads may still be in the app-managed import directory. A transcript's arbitrary
+        // local path or URL is never used as authority to read a file.
+        guard let workspaceDirectory, case let .localFile(path) = attachment.source else { return nil }
+        let root = AgentAttachmentStore.managedStorageRootURL(for: workspaceDirectory)
+        let candidate = URL(fileURLWithPath: path).standardizedFileURL
+        let keys: Set<URLResourceKey> = [.isRegularFileKey, .isSymbolicLinkKey]
+        guard candidate.deletingLastPathComponent().path == root.path,
+              UUID(uuidString: candidate.deletingPathExtension().lastPathComponent) != nil,
+              let values = try? candidate.resourceValues(forKeys: keys),
+              values.isRegularFile == true, values.isSymbolicLink == false,
+              (try? root.resourceValues(forKeys: [.isSymbolicLinkKey]))?.isSymbolicLink == false
+        else { return nil }
+        return candidate
+    }
+
+    nonisolated static func readImage(at url: URL, request: RemoteImageAttachmentRequest) throws -> RemoteImageAttachmentChunk {
+        try Task.checkCancellation()
+        let descriptor = open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+        guard descriptor >= 0 else { throw RemoteImageReadError.unavailable }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        defer { try? handle.close() }
+        let before = try imageRevision(descriptor)
+        if request.variant == .thumbnail {
+            guard let original = try handle.read(upToCount: before.size), original.count == before.size,
+                  try imageRevision(descriptor) == before
+            else { throw RemoteImageReadError.changed }
+            guard let bytes = try AttachmentPreviewRenderer.jpegData(fromRetainedPhoto: original),
+                  bytes.count <= RemoteImageAttachmentRequest.maxThumbnailBytes
+            else { throw RemoteImageReadError.invalidImage }
+            return RemoteImageAttachmentChunk(offset: 0, totalBytes: bytes.count, bytes: bytes)
+        }
+
+        guard request.revision == nil || request.revision == before.revision else { throw RemoteImageReadError.changed }
+        guard request.offset >= 0, request.offset < before.size else { throw RemoteImageReadError.invalidImage }
+        let count = min(RemoteImageAttachmentRequest.chunkBytes, before.size - request.offset)
+        try handle.seek(toOffset: UInt64(request.offset))
+        guard let bytes = try handle.read(upToCount: count), bytes.count == count,
+              try imageRevision(descriptor) == before
+        else { throw RemoteImageReadError.changed }
+        return RemoteImageAttachmentChunk(offset: request.offset, totalBytes: before.size, revision: before.revision, bytes: bytes)
+    }
+
+    private nonisolated static func imageRevision(_ descriptor: Int32) throws -> (size: Int, revision: String) {
+        var attributes = stat()
+        guard fstat(descriptor, &attributes) == 0,
+              attributes.st_mode & S_IFMT == S_IFREG,
+              attributes.st_size > 0, attributes.st_size <= RemoteAttachmentLimits.maxFileBytes
+        else { throw RemoteImageReadError.invalidImage }
+
+        let metadata = "\(attributes.st_dev):\(attributes.st_ino):\(attributes.st_size):\(attributes.st_mtimespec):\(attributes.st_ctimespec)"
+        let revision = Data(SHA256.hash(data: Data(metadata.utf8))).base64EncodedString()
+        return (Int(attributes.st_size), revision)
     }
 
     func history(_ request: RemoteHistoryRPCRequest) async throws -> RemoteHistoryPage {
@@ -645,4 +771,10 @@ enum RemoteReadServiceError: LocalizedError {
         case .invalidCursor: "The transcript cursor is invalid."
         }
     }
+}
+
+enum RemoteImageReadError: Error {
+    case unavailable
+    case invalidImage
+    case changed
 }

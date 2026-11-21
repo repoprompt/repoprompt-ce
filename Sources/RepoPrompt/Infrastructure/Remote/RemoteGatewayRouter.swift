@@ -41,6 +41,7 @@ enum RemoteGatewayRequest {
     case workflows
     case history(RemoteHistoryRPCRequest)
     case transcript(RemoteGatewayTranscriptRequest)
+    case imageAttachment(RemoteImageAttachmentRequest)
     case events(after: UInt64?)
     case command(RemoteCommandRequest, endpoint: RemoteGatewayCommandEndpoint)
 }
@@ -104,6 +105,7 @@ struct RemoteGatewayRoutingServices {
     var diagnostics: () async -> RemoteDiagnostics?
     var history: (RemoteHistoryRPCRequest) async throws -> RemoteHistoryPage?
     var transcript: (RemoteGatewayTranscriptRequest) async -> RemoteGatewayTranscriptResult
+    var imageAttachment: (RemoteImageAttachmentRequest) async throws -> RemoteImageAttachmentChunk?
     var replay: (UInt64?) async -> RemoteEventReplayResult
     var registerNotifications: (RemoteNotificationRegistration) -> RemoteGatewayRegistrationResult
     var authorizationState: () -> RemoteAuthorizationState
@@ -123,6 +125,7 @@ struct RemoteGatewayRoutingServices {
         authorizationState: @escaping () -> RemoteAuthorizationState,
         execute: @escaping (RemoteCommandRequest) async -> RemoteGatewayCommandResult,
         eventCursor: @escaping () async -> UInt64,
+        imageAttachment: @escaping (RemoteImageAttachmentRequest) async throws -> RemoteImageAttachmentChunk? = { _ in nil },
         pairIroh: @escaping (RemoteIrohPairingRequest, String) -> Result<RemoteIrohPairingResponse, Error> = { _, _ in
             .failure(RemoteGatewayRouterError.irohUnavailable)
         },
@@ -141,6 +144,7 @@ struct RemoteGatewayRoutingServices {
         self.diagnostics = diagnostics
         self.history = history
         self.transcript = transcript
+        self.imageAttachment = imageAttachment
         self.replay = replay
         self.registerNotifications = registerNotifications
         self.authorizationState = authorizationState
@@ -299,6 +303,24 @@ final class RemoteGatewayRequestRouter {
                 )
             case .unavailable:
                 return unavailableReadResponse()
+            }
+
+        case let .imageAttachment(request):
+            guard request.isValid else {
+                return .error(.init(code: "invalid_image_attachment", message: "Invalid image attachment request."), status: 400)
+            }
+            do {
+                guard let image = try await services.imageAttachment(request) else { return unavailableReadResponse() }
+                return encode(image)
+            } catch RemoteImageReadError.changed {
+                return .error(.init(code: "image_changed", message: "The image changed. Reopen it to retry."), status: 409)
+            } catch RemoteImageReadError.invalidImage {
+                return .error(.init(code: "invalid_image", message: "This attachment cannot be displayed as an image."), status: 422)
+            } catch {
+                return .error(
+                    .init(code: "image_unavailable", message: "The image is unavailable on the Mac.", retryable: true),
+                    status: 404
+                )
             }
 
         case let .events(cursor):

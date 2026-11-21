@@ -654,7 +654,8 @@ final class DesktopRemoteCatalogService: WorkflowCatalogService {
             toolCatalog: toolCatalog,
             supportsStartSelection: true,
             supportsSessionConfiguration: true,
-            supportsAttachments: true
+            supportsAttachments: true,
+            supportsImageAttachments: true
         )
 
         return RemoteCatalogRecord(workflows: workflows, agents: agents, metadata: metadata)

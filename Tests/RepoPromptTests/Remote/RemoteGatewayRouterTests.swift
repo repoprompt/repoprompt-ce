@@ -91,6 +91,38 @@ final class RemoteGatewayRouterTests: XCTestCase {
         XCTAssertEqual(snapshotCalls, 0)
     }
 
+    func testImageRouteRequiresPairedAuthorityAndValidChunkRequest() async throws {
+        let request = RemoteImageAttachmentRequest(sessionID: UUID(), itemID: UUID(), attachmentID: UUID(), variant: .thumbnail)
+        let chunk = RemoteImageAttachmentChunk(offset: 0, totalBytes: 2, bytes: Data([1, 2]))
+        var reads = 0
+        let router = makeRouter(
+            authorize: { $0.authorizationHeader == "Bearer paired" },
+            imageAttachment: { requestFromClient in
+                reads += 1
+                XCTAssertEqual(requestFromClient, request)
+                return chunk
+            }
+        )
+        let denied = await router.route(.imageAttachment(request), context: .legacyHTTPS(authorizationHeader: nil))
+        XCTAssertEqual(denied.status, 401)
+        XCTAssertEqual(reads, 0)
+
+        let networkRequest = try RemoteLegacyHTTPRequest(
+            method: "POST", target: RemoteProtocol.imageAttachmentPath, headers: [:], body: JSONEncoder().encode(request)
+        )
+        guard case let .request(decoded) = RemoteLegacyHTTPRequestDecoder.decode(networkRequest)
+        else { return XCTFail("Expected the HTTPS adapter to decode the image request.") }
+        let response = await router.route(decoded, context: .legacyHTTPS(authorizationHeader: "Bearer paired"))
+        XCTAssertEqual(try JSONDecoder().decode(RemoteImageAttachmentChunk.self, from: json(from: response)), chunk)
+
+        let invalid = RemoteImageAttachmentRequest(
+            sessionID: request.sessionID, itemID: request.itemID, attachmentID: request.attachmentID, variant: .original, offset: 20
+        )
+        let rejected = await router.route(.imageAttachment(invalid), context: .legacyHTTPS(authorizationHeader: "Bearer paired"))
+        XCTAssertEqual(rejected.status, 400)
+        XCTAssertEqual(reads, 1)
+    }
+
     func testUnpairReportsDurableRevocationFailure() async throws {
         let router = makeRouter(unpair: { .failed })
 
@@ -486,6 +518,7 @@ final class RemoteGatewayRouterTests: XCTestCase {
         registerNotifications: @escaping (RemoteNotificationRegistration) -> RemoteGatewayRegistrationResult = { _ in .failed },
         execute: @escaping (RemoteCommandRequest) async -> RemoteGatewayCommandResult = { _ in .unavailable },
         eventCursor: @escaping () async -> UInt64 = { 0 },
+        imageAttachment: @escaping (RemoteImageAttachmentRequest) async throws -> RemoteImageAttachmentChunk? = { _ in nil },
         bindIrohEndpoint: @escaping (RemoteIrohBindingRequest, String?) -> Result<RemoteIrohBindingResponse, Error> = { _, _ in
             .failure(TestFailure.unexpectedResponse)
         }
@@ -503,6 +536,7 @@ final class RemoteGatewayRouterTests: XCTestCase {
             authorizationState: authorizationState,
             execute: execute,
             eventCursor: eventCursor,
+            imageAttachment: imageAttachment,
             bindIrohEndpoint: bindIrohEndpoint
         ))
     }
@@ -536,6 +570,7 @@ final class RemoteGatewayRouterTests: XCTestCase {
         case .workflows: "workflows"
         case .history: "history"
         case .transcript: "transcript"
+        case .imageAttachment: "image_attachment"
         case .events: "events"
         case .command: "command"
         }
@@ -1316,6 +1351,45 @@ final class RemoteProducerParityTests: XCTestCase {
         XCTAssertEqual(customDescriptor.featuredRank, 1)
         XCTAssertFalse(customDescriptor.isBuiltIn)
         XCTAssertFalse(descriptors.contains { $0.displayName == "Director" })
+    }
+
+    func testImageDownloadIsScopedToTranscriptAndRejectsReplacedFile() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("remote-image-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = AgentSessionAttachmentStore(rootURL: directory)
+        let sessionID = UUID()
+        let attachment = AgentFileAttachment(source: .localFile(path: "/other/photo.jpg"), title: "Photo", kind: .image)
+        let row = AgentTranscriptRequestAnchor(from: .user("Photo", attachments: [attachment]))
+        let transcript = AgentTranscript(turns: [.init(request: row, startedAt: Date())], nextSequenceIndex: 1)
+        let request = RemoteImageAttachmentRequest(
+            sessionID: sessionID, itemID: row.id, attachmentID: attachment.id, variant: .original
+        )
+        XCTAssertEqual(WindowRemoteReadService.imageAttachment(in: transcript, request: request)?.id, attachment.id)
+        XCTAssertNil(WindowRemoteReadService.imageAttachment(
+            in: transcript, request: .init(sessionID: sessionID, itemID: UUID(), attachmentID: attachment.id, variant: .original)
+        ))
+        XCTAssertNil(WindowRemoteReadService.ownedImageURL(
+            attachment: attachment, sessionID: sessionID, retainedRoot: directory, workspaceDirectory: directory
+        ))
+        let folder = store.sessionFolderURL(sessionID: sessionID)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let url = folder.appendingPathComponent(attachment.id.uuidString).appendingPathExtension("jpg")
+        let size = RemoteImageAttachmentRequest.chunkBytes + 2
+        try Data(repeating: 7, count: size).write(to: url)
+        let owned = try XCTUnwrap(WindowRemoteReadService.ownedImageURL(
+            attachment: attachment, sessionID: sessionID, retainedRoot: directory, workspaceDirectory: nil
+        ))
+        let first = try WindowRemoteReadService.readImage(at: owned, request: request)
+        XCTAssertEqual(first.bytes.count, RemoteImageAttachmentRequest.chunkBytes)
+        let remainder = RemoteImageAttachmentRequest(
+            sessionID: sessionID, itemID: row.id, attachmentID: attachment.id, variant: .original,
+            offset: first.bytes.count, revision: first.revision
+        )
+        XCTAssertEqual(try WindowRemoteReadService.readImage(at: owned, request: remainder).bytes, Data([7, 7]))
+        try Data(repeating: 9, count: size).write(to: url, options: .atomic)
+        XCTAssertThrowsError(try WindowRemoteReadService.readImage(at: owned, request: remainder)) { error in
+            guard case RemoteImageReadError.changed = error else { return XCTFail("Expected an image revision mismatch.") }
+        }
     }
 
     func testClientTaskAttachmentShowsMessageInsteadOfProviderMarkup() throws {

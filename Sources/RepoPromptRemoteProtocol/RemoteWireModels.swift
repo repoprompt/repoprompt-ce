@@ -120,6 +120,7 @@ public enum RemoteRPCOperation: String, Codable, Sendable, CaseIterable {
     case workflows
     case history
     case transcript
+    case imageAttachment = "image_attachment"
     case command
     case contextBuilder = "context_builder"
     case transportBootstrap = "transport_bootstrap"
@@ -246,6 +247,60 @@ public struct RemoteHistoryRPCRequest: Codable, Sendable, Equatable {
 public enum RemoteTranscriptRPCPagingMode: String, Codable, Sendable, Equatable {
     case legacyForward = "legacy_forward"
     case recentBackward = "recent_backward"
+}
+
+public enum RemoteImageAttachmentVariant: String, Codable, Sendable {
+    case thumbnail
+    case original
+}
+
+/// A paired device can request an image referenced by a transcript row. No filesystem path crosses the wire.
+public struct RemoteImageAttachmentRequest: Codable, Sendable, Equatable {
+    public static let chunkBytes = 512 * 1024
+    public static let maxThumbnailBytes = 128 * 1024
+
+    public let sessionID: UUID
+    public let itemID: UUID
+    public let attachmentID: UUID
+    public let variant: RemoteImageAttachmentVariant
+    public let offset: Int
+    public let revision: String?
+
+    public init(
+        sessionID: UUID, itemID: UUID, attachmentID: UUID,
+        variant: RemoteImageAttachmentVariant, offset: Int = 0, revision: String? = nil
+    ) {
+        self.sessionID = sessionID
+        self.itemID = itemID
+        self.attachmentID = attachmentID
+        self.variant = variant
+        self.offset = offset
+        self.revision = revision
+    }
+
+    public var isValid: Bool {
+        switch variant {
+        case .thumbnail:
+            offset == 0 && revision == nil
+        case .original:
+            (0 ..< RemoteAttachmentLimits.maxFileBytes).contains(offset)
+                && (offset == 0 ? revision == nil : revision?.isEmpty == false && (revision?.utf8.count ?? 0) <= 128)
+        }
+    }
+}
+
+public struct RemoteImageAttachmentChunk: Codable, Sendable, Equatable {
+    public let offset: Int
+    public let totalBytes: Int
+    public let revision: String?
+    public let bytes: Data
+
+    public init(offset: Int, totalBytes: Int, revision: String? = nil, bytes: Data) {
+        self.offset = offset
+        self.totalBytes = totalBytes
+        self.revision = revision
+        self.bytes = bytes
+    }
 }
 
 public struct RemoteTranscriptRPCRequest: Codable, Sendable, Equatable {

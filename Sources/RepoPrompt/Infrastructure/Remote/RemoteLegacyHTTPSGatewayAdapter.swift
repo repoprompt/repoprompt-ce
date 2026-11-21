@@ -116,6 +116,12 @@ enum RemoteLegacyHTTPRequestDecoder {
         case ("GET", RemoteProtocol.transcriptPath):
             return decodeTranscript(components)
 
+        case ("POST", RemoteProtocol.imageAttachmentPath):
+            guard let image = try? JSONDecoder().decode(RemoteImageAttachmentRequest.self, from: request.body) else {
+                return .response(.error(.init(code: "invalid_image_attachment", message: "Invalid image attachment request."), status: 400))
+            }
+            return .request(.imageAttachment(image))
+
         case ("GET", RemoteProtocol.eventsPath):
             let cursor = components.queryItems?.first(where: { $0.name == "after" }).flatMap(\.value).flatMap(UInt64.init)
             return .request(.events(after: cursor))

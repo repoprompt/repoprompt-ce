@@ -393,6 +393,8 @@ final class RemoteIrohGatewayAdapter {
                 limit: request.limit,
                 includeDetails: request.includeDetails
             ))
+        case .imageAttachment:
+            return try .imageAttachment(decodePayload(RemoteImageAttachmentRequest.self, from: rpc.payload))
         case .command:
             return try .command(
                 decodePayload(RemoteCommandRequest.self, from: rpc.payload),

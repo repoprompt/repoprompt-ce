@@ -20,6 +20,7 @@ public enum RemoteProtocol {
     public static let commandsPath = versionedPath + "/commands"
     public static let historyPath = versionedPath + "/history"
     public static let transcriptPath = versionedPath + "/transcript"
+    public static let imageAttachmentPath = versionedPath + "/image_attachment"
     public static let diagnosticsPath = versionedPath + "/diagnostics"
     public static let transportBootstrapPath = versionedPath + "/transport/bootstrap"
     public static let irohBindingPath = versionedPath + "/transport/bind"
@@ -424,6 +425,7 @@ public struct RemoteCatalogMetadata: Codable, Sendable, Equatable {
     public let supportsStartSelection: Bool
     public let supportsSessionConfiguration: Bool
     public let supportsAttachments: Bool?
+    public let supportsImageAttachments: Bool?
 
     public init(
         defaultAgentID: String? = nil,
@@ -431,7 +433,8 @@ public struct RemoteCatalogMetadata: Codable, Sendable, Equatable {
         toolCatalog: RemoteToolCatalog? = nil,
         supportsStartSelection: Bool = false,
         supportsSessionConfiguration: Bool = false,
-        supportsAttachments: Bool? = nil
+        supportsAttachments: Bool? = nil,
+        supportsImageAttachments: Bool? = nil
     ) {
         self.defaultAgentID = defaultAgentID
         self.defaultSelection = defaultSelection
@@ -439,6 +442,7 @@ public struct RemoteCatalogMetadata: Codable, Sendable, Equatable {
         self.supportsStartSelection = supportsStartSelection
         self.supportsSessionConfiguration = supportsSessionConfiguration
         self.supportsAttachments = supportsAttachments
+        self.supportsImageAttachments = supportsImageAttachments
     }
 }
 

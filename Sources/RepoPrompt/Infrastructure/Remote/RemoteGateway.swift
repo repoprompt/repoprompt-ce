@@ -424,6 +424,10 @@ final class RemoteGatewayController: NSObject, ObservableObject {
             eventCursor: { [unowned self] in
                 await replayBuffer.latestCursor()
             },
+            imageAttachment: { [unowned self] request in
+                guard let readService = makeReadService() else { return nil }
+                return try await readService.imageAttachment(request)
+            },
             pairIroh: { [unowned self] request, peerEndpointID in
                 do {
                     let response = try pairingManager.pairIroh(
