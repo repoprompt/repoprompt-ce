@@ -169,9 +169,26 @@ protocol PreparedAgentSessionRuntimeRegistry: AnyObject {
     func finishPreparedRuntimeVisit(_ sessionID: UUID)
     func releasePreparedOversightOwnerForVisit(sessionID: UUID, preparingReplacement: Bool) async -> Bool
     func queuePreparedRuntimeVisit(_ sessionID: UUID, resume: @escaping @MainActor () async -> Void)
+    func beginRuntimeVisitIntent(_ sessionID: UUID) -> UUID?
+    func isRuntimeVisitIntentCurrent(_ sessionID: UUID, intent: UUID?) -> Bool
+    func queuePreparedRuntimeVisit(_ sessionID: UUID, intent: UUID?, resume: @escaping @MainActor () async -> Void)
     func beginPreparedOversightPreparation(_ id: UUID)
     func endPreparedOversightPreparation(_ id: UUID)
     func prepareScopedSavedTarget(_ sessionID: UUID, isStillAuthorized: @escaping @MainActor () -> Bool) async -> Bool
+}
+
+extension PreparedAgentSessionRuntimeRegistry {
+    func beginRuntimeVisitIntent(_ sessionID: UUID) -> UUID? {
+        nil
+    }
+
+    func isRuntimeVisitIntentCurrent(_ sessionID: UUID, intent: UUID?) -> Bool {
+        true
+    }
+
+    func queuePreparedRuntimeVisit(_ sessionID: UUID, intent: UUID?, resume: @escaping @MainActor () async -> Void) {
+        queuePreparedRuntimeVisit(sessionID, resume: resume)
+    }
 }
 
 @MainActor
