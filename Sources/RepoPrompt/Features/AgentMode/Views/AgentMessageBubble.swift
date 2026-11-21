@@ -255,14 +255,20 @@ struct AgentTranscriptRow: View, @MainActor Equatable {
     }
 
     var body: some View {
-        if let batch = Self.delegationBatch(for: inputs.item) {
-            AgentDelegationDecisionDisclosure(batch: batch, copy: copyContent)
-                .contextMenu {
-                    Button("Copy Batch") { copyContent(batch.text) }
-                }
-        } else {
-            messageBubble
+        Group {
+            if let batch = Self.delegationBatch(for: inputs.item) {
+                AgentDelegationDecisionDisclosure(batch: batch, copy: copyContent)
+                    .contextMenu {
+                        Button("Copy Batch") { copyContent(batch.text) }
+                    }
+            } else {
+                messageBubble
+            }
         }
+        .environment(\.agentTranscriptDisclosureScope, .init(
+            store: agentModeVM.ui.transcript, workspaceID: inputs.workspaceID,
+            tabID: inputs.tabID, itemID: inputs.item.id
+        ))
     }
 
     static func delegationBatch(for item: AgentChatItem) -> AgentDelegationDecisionBatch? {
@@ -304,10 +310,6 @@ struct AgentTranscriptRow: View, @MainActor Equatable {
         .environment(\.markdownFileLinkOpener, MarkdownFileLinkOpener { target in
             await promptManager.fileManager.openFileForMarkdownLink(target)
         })
-        .environment(\.agentTranscriptDisclosureScope, .init(
-            store: agentModeVM.ui.transcript, workspaceID: inputs.workspaceID,
-            tabID: inputs.tabID, itemID: inputs.item.id
-        ))
         .environment(\.agentToolCardAutoExpandEnabled, inputs.autoExpandEnabled)
         .environment(\.agentLiveBashExecutionByItemID, inputs.liveBashExecution.map { [inputs.item.id: $0] } ?? [:])
         .environment(\.agentApprovalVisible, inputs.approvalVisible)
@@ -410,13 +412,11 @@ struct AgentTranscriptRow: View, @MainActor Equatable {
     }
 }
 
-/// Reads the navigation callback only for attributed rows. Keeping this dynamic environment
-/// dependency at its consumer lets unchanged transcript bubbles remain behind row equality.
 @MainActor
 private struct AgentDelegationDecisionDisclosure: View {
     let batch: AgentDelegationDecisionBatch
     let copy: (String) -> Void
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("AgentDelegationDecisionDisclosure") private var isExpanded = false
 
     var body: some View {
         DisclosureGroup(isExpanded: $isExpanded) {
@@ -459,6 +459,9 @@ private struct AgentDelegationDecisionDisclosure: View {
     }
 }
 
+/// Reads the navigation callback only for attributed rows. Keeping this dynamic environment
+/// dependency at its consumer lets unchanged transcript bubbles remain behind row equality.
+@MainActor
 private struct AgentCrossSessionAttributionBadge: View {
     let attribution: AgentCrossSessionAttribution
     let fontPreset: FontScalePreset

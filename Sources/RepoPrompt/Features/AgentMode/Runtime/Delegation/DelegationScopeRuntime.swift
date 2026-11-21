@@ -1009,7 +1009,8 @@ final class DelegationScopeRuntime: ObservableObject {
             tabID: request.requesterTabID,
             result: "granted",
             identifier: record.id,
-            automaticContinuation: continuation != nil
+            automaticContinuation: continuation != nil,
+            targetSessionID: record.grant.kind.exactNoticeTargetSessionID
         )
     }
 
@@ -1111,7 +1112,8 @@ final class DelegationScopeRuntime: ObservableObject {
                 sessionID: request.requesterSessionID,
                 tabID: request.requesterTabID,
                 result: "denied",
-                identifier: request.id
+                identifier: request.id,
+                targetSessionID: request.kind.exactNoticeTargetSessionID
             )
         }
         return result
@@ -1127,7 +1129,8 @@ final class DelegationScopeRuntime: ObservableObject {
             sessionID: request.requesterSessionID,
             tabID: request.requesterTabID,
             result: "denied",
-            identifier: request.id
+            identifier: request.id,
+            targetSessionID: request.kind.exactNoticeTargetSessionID
         )
     }
 
@@ -1240,7 +1243,13 @@ final class DelegationScopeRuntime: ObservableObject {
         }
         didChange(grantees: Set(expired.map(\.grant.granteeSessionID)), invalidated: expired.map(\.id))
         for notice in notices {
-            enqueueDecision(sessionID: notice.record.grant.granteeSessionID, tabID: notice.tabID, result: "expired", identifier: notice.record.id)
+            enqueueDecision(
+                sessionID: notice.record.grant.granteeSessionID,
+                tabID: notice.tabID,
+                result: "expired",
+                identifier: notice.record.id,
+                targetSessionID: notice.record.grant.kind.exactNoticeTargetSessionID
+            )
         }
     }
 
@@ -1296,7 +1305,8 @@ final class DelegationScopeRuntime: ObservableObject {
                 sessionID: record.grant.granteeSessionID,
                 tabID: tabID,
                 result: "revoked",
-                identifier: record.id
+                identifier: record.id,
+                targetSessionID: record.grant.kind.exactNoticeTargetSessionID
             )
         }
     }
@@ -1533,5 +1543,12 @@ final class DelegationScopeRuntime: ObservableObject {
                 if requestIDByKey[scopedKey] == id { requestIDByKey.removeValue(forKey: scopedKey) }
             }
         }
+    }
+}
+
+private extension DomainDelegationScopeKind {
+    var exactNoticeTargetSessionID: UUID? {
+        guard case let .session(targetSessionID) = self else { return nil }
+        return targetSessionID
     }
 }

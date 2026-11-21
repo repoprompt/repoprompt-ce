@@ -9126,8 +9126,9 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 if exhausted { runtime.test_decisionStartRetryDelay = .milliseconds(1) }
                 var notices: [String] = []
                 runtime.test_scopeDecision = { _, text in notices.append(text) }
+                let grantTarget = UUID()
                 let request = try runtime.requestScope(
-                    requesterSessionID: requesterID, requesterTabID: tab.id, kind: .session(targetSessionID: UUID()),
+                    requesterSessionID: requesterID, requesterTabID: tab.id, kind: .session(targetSessionID: grantTarget),
                     capabilities: [.observe], guardrails: .init(), reason: nil, idempotencyKey: nil
                 ).get()
                 _ = try runtime.approve(requestID: request.id).get()
@@ -9140,6 +9141,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 }
                 let exactPayload = notices.joined(separator: "\n")
                 XCTAssertEqual(notices.count, 3)
+                XCTAssertFalse(try XCTUnwrap(notices.first).contains(grantTarget.uuidString))
                 if indeterminate {
                     try await AsyncTestWait.waitUntil("uncertain save flagged, never requeued") {
                         session.items.contains { $0.kind == .error && $0.text.contains("save is unconfirmed") } && runtime.test_pendingDecisionCount == 0
@@ -9160,7 +9162,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                     let restored = try JSONDecoder().decode(AgentTranscriptRequestAnchor.self, from: encoded).toItem()
                     let batch = try XCTUnwrap(AgentTranscriptRow.delegationBatch(for: restored))
                     XCTAssertEqual(batch.decisions.map(\.outcome), ["granted", "linked", "linked"])
-                    XCTAssertEqual(batch.decisions.compactMap(\.targetSessionID), targets)
+                    XCTAssertEqual(batch.decisions.compactMap(\.targetSessionID), [grantTarget] + targets)
                     XCTAssertEqual(batch.decisions.map(\.text), notices)
                     XCTAssertEqual(batch.text, exactPayload)
                     XCTAssertEqual(row.text, exactPayload)
