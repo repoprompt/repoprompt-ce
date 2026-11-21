@@ -58,8 +58,22 @@ def pull_request_base(pull: dict, ref: str) -> str:
 def verify_stacked_merge(pull: dict, trunk: str, root: Path) -> None:
     direct_base = pull['base']['sha']
     topic = pull['head']['sha']
-    if git(root, 'show', '-s', '--format=%P', 'HEAD').split() != [direct_base, topic]:
+    parents = git(root, 'show', '-s', '--format=%P', 'HEAD').split()
+    if len(parents) != 2 or parents[1] != topic or not isinstance(direct_base, str) or not SHA.fullmatch(direct_base):
         raise CandidateMismatch('stacked PR synthetic merge parents do not match its PR event')
+    preview_base = parents[0]
+    if preview_base != direct_base:
+        # GitHub can merge each layer into the previous layer's preview. The
+        # previous preview must name the raw base branch as its second parent.
+        lower_parents = git(root, 'show', '-s', '--format=%P', preview_base).split()
+        if len(lower_parents) != 2 or lower_parents[1] != direct_base:
+            raise CandidateMismatch('stacked PR synthetic merge parents do not match its PR event')
+        cursor = lower_parents[0]
+        while cursor != trunk:
+            lower_parents = git(root, 'show', '-s', '--format=%P', cursor).split()
+            if len(lower_parents) != 2:
+                raise CandidateMismatch('stacked PR synthetic merge chain is not rooted at the pinned main trunk')
+            cursor = lower_parents[0]
     # A retry cannot add a missing trunk to this immutable candidate.
     ancestry = subprocess.run(['git', 'merge-base', '--is-ancestor', trunk, direct_base], cwd=root)
     if ancestry.returncode != 0:
