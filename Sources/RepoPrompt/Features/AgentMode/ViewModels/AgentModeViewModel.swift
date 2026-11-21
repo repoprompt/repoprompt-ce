@@ -4660,11 +4660,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // This legacy path retires its private runtime, not merely its presentation. Fence
         // pending producers before the first await; final originating IO remains permitted.
         // The independent-host cutover must detach presentation without invoking retirement.
-        runtimeSessionStore.beginRetirement()
+        let canonicalDrain = runtimeHost.workspaceActivation == nil ? nil : runtimeHost.beginWindowRetirement()
+        if canonicalDrain == nil { runtimeSessionStore.beginRetirement() }
         closeOracleBackgroundWindowAdmission()
         let task = Task<Void, Never> { @MainActor [weak self] in
             guard let self else { return }
-            await performWindowClosePreparation()
+            await performWindowClosePreparation(canonicalDrain: canonicalDrain)
         }
         windowClosePreparationTask = task
         await task.value
@@ -4674,7 +4675,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         detachRunPresentation()
     }
 
-    private func performWindowClosePreparation() async {
+    private func performWindowClosePreparation(canonicalDrain: AgentSessionHostDrainRuntime?) async {
         queuedWorkspaceSwitchOwner = nil
         unregisterObserverRegistrations()
         stopOpenCodeModelsSubscription()
@@ -4687,6 +4688,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         cancelSessionIndexRefresh()
         // Teardown drops the ephemeral restoration join/baseline; nothing publishes into a successor.
         sessionIndexStore.abandonSidebarRestore(owner: nil)
+        if let canonicalDrain {
+            // The host retained the producer. A window wait is not a release receipt.
+            _ = await canonicalDrain.wait(until: .now.advanced(by: .seconds(2)))
+            return
+        }
         let tabIDs = Array(sessions.keys)
         await withTaskGroup(of: Void.self) { group in
             for tabID in tabIDs {
