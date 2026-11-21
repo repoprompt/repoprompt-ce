@@ -98,7 +98,8 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
     /// Latest guarded UI intent wins. These closures schedule activation, not waiter completion;
     /// a newer explicit visit supersedes an older queued one without running both.
     func beginRuntimeVisitIntent(_ sessionID: UUID) -> UUID? {
-        guard !isTerminating else { return nil }
+        // A visit that cannot acquire the active handoff must leave that handoff's intent in place.
+        guard !isTerminating, !preparedOversightUIVisits.contains(sessionID) else { return nil }
         let ticket = UUID()
         canonicalDeferredVisitTickets[sessionID] = ticket
         return ticket
@@ -385,7 +386,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
             return released
         }
         guard let owner = preparedOversightWindows[sessionID] else {
-            return !AgentSessionRuntimeStore.shared.hasRetiringWriter(sessionID: sessionID)
+            return !agentRuntimeStore.hasRetiringWriter(sessionID: sessionID)
         }
         guard preparedOversightPreparationInFlight[sessionID, default: 0] <= (preparingReplacement ? 1 : 0),
               owner.agentModeViewModel.preparedOversightSessionsAreIdle,
