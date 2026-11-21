@@ -84,6 +84,31 @@ final class AppPlatformUtilityRecoveryTests: XCTestCase {
     }
 
     @MainActor
+    func testAgentLinkSwitchesToAnInactiveEphemeralWorkspaceUsingItsOwningWindow() async {
+        let tab = ComposeTabState(name: "Temporary tab")
+        var workspace = WorkspaceModel(name: "Temporary workspace", repoPaths: [])
+        workspace.isEphemeral = true
+        workspace.stashedTabs = [StashedTab(tab: tab)]
+        var visited: [Int] = []
+        let cases: [(UUID, AgentSessionRouteResult)] = [(tab.id, .routed), (UUID(), .tabUnavailable)]
+        for (tabID, expectedResult) in cases {
+            let route = AgentSessionDeepLinkRoute(windowID: 1, workspaceID: workspace.id, tabID: tabID, sessionID: UUID())
+            let result = await AppDeepLinkRouter.routeAgentSessionTarget(route, candidates: {
+                [.canSwitch(2, localEphemeralWorkspace: workspace)]
+            }, resolveWorkspace: {
+                XCTFail("The temporary workspace belongs to its window's local catalog")
+                return nil
+            }, navigate: { (window: Int, destination) in
+                visited.append(window)
+                XCTAssertEqual(destination.stashedTabs.first?.tab.id, tab.id)
+                return .routed
+            })
+            XCTAssertEqual(result, expectedResult)
+        }
+        XCTAssertEqual(visited, [2])
+    }
+
+    @MainActor
     func testAgentLinkTreatsUnreadableWorkspaceAsUnavailable() async {
         let route = AgentSessionDeepLinkRoute(windowID: nil, workspaceID: UUID(), tabID: UUID())
         let result = await AppDeepLinkRouter.routeAgentSessionTarget(route, candidates: { () -> [AppDeepLinkRouter.AgentSessionCandidate<Int>] in

@@ -476,11 +476,12 @@ final class AppDeepLinkRouter {
                     guard let workspace = manager.activeWorkspace, workspace.id == route.workspaceID else { return .unready }
                     return .showing(window, workspace)
                 }
-                return manager.workspace(withID: route.workspaceID) == nil ? nil : .canSwitch(window)
+                guard let workspace = manager.workspace(withID: route.workspaceID) else { return nil }
+                return .canSwitch(window, localEphemeralWorkspace: workspace.isEphemeral ? workspace : nil)
             }
         }, resolveWorkspace: {
             let store = AppDomainRuntimeComposition.shared.runtime.workspaceStore
-            guard let snapshot = await store.workspaceSnapshot(route.workspaceID), snapshot.health.acceptsMutations else { return nil }
+            guard let snapshot = await store.canonicalWorkspaceSnapshot(route.workspaceID), snapshot.health.acceptsMutations else { return nil }
             return try? WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
                 documentBytes: snapshot.document.documentBytes,
                 fileURL: snapshot.document.fileURL,
@@ -493,7 +494,7 @@ final class AppDeepLinkRouter {
 
     enum AgentSessionCandidate<Window> {
         case showing(Window, WorkspaceModel)
-        case canSwitch(Window)
+        case canSwitch(Window, localEphemeralWorkspace: WorkspaceModel? = nil)
         case unready
     }
 
@@ -513,7 +514,7 @@ final class AppDeepLinkRouter {
         while !Task.isCancelled {
             var hasActiveCopy = false
             var hasUnreadyCopy = false
-            var switchTarget: Window?
+            var switchTarget: (window: Window, localEphemeralWorkspace: WorkspaceModel?)?
             for candidate in snapshot {
                 switch candidate {
                 case let .showing(window, activeWorkspace):
@@ -523,8 +524,8 @@ final class AppDeepLinkRouter {
                     } else if containsAgentDeepLinkTab(route.tabID, in: activeWorkspace) {
                         return await navigate(window, activeWorkspace)
                     }
-                case let .canSwitch(window):
-                    if switchTarget == nil { switchTarget = window }
+                case let .canSwitch(window, localEphemeralWorkspace):
+                    if switchTarget == nil { switchTarget = (window, localEphemeralWorkspace) }
                 case .unready:
                     hasUnreadyCopy = true
                 }
@@ -532,11 +533,12 @@ final class AppDeepLinkRouter {
             if hasUnreadyCopy { return .workspaceUnavailable }
             if hasActiveCopy { return .tabUnavailable }
             guard let switchTarget else { return .workspaceUnavailable }
-            if readWorkspace {
-                guard let workspace, workspace.id == route.workspaceID,
-                      !workspace.composeTabsDecodeWasLossy else { return .workspaceUnavailable }
-                guard containsAgentDeepLinkTab(route.tabID, in: workspace) else { return .tabUnavailable }
-                return await navigate(switchTarget, workspace)
+            let destination = switchTarget.localEphemeralWorkspace ?? workspace
+            if switchTarget.localEphemeralWorkspace != nil || readWorkspace {
+                guard let destination, destination.id == route.workspaceID,
+                      !destination.composeTabsDecodeWasLossy else { return .workspaceUnavailable }
+                guard containsAgentDeepLinkTab(route.tabID, in: destination) else { return .tabUnavailable }
+                return await navigate(switchTarget.window, destination)
             }
             workspace = await resolveWorkspace()
             readWorkspace = true
