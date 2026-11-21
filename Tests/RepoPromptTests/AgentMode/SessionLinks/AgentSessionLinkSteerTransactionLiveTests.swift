@@ -448,6 +448,68 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
         XCTAssertTrue(fixture.session.pendingClaudeSteeringInstructions.isEmpty)
     }
 
+    func testSelfCompactionPhasesRefuseBeforeSubmissionAndReleaseOrdinarySteering() async throws {
+        let fixture = try makeFixture()
+        makeRunning(fixture)
+        let workflow = stageComposerState(fixture)
+        for phase in AgentSelfCompactAttempt.Phase.allCases where phase != .parked {
+            let state = AgentSelfCompactState(active: .init(
+                idempotencyKey: "compact-\(phase.rawValue)", note: "Keep the continuation.", phase: phase
+            ))
+            fixture.session.selfCompactState = state
+            var commitCalls = 0
+            let outcome = await steer(fixture, commit: {
+                commitCalls += 1
+                return .committed
+            })
+            XCTAssertEqual(outcome, .blocked(.targetNotIdle), phase.rawValue)
+            XCTAssertEqual(commitCalls, 0, phase.rawValue)
+            XCTAssertEqual(fixture.session.selfCompactState, state, "A steer must not cancel or park \(phase)")
+            XCTAssertTrue(fixture.session.items.isEmpty)
+            XCTAssertTrue(fixture.session.pendingClaudeSteeringInstructions.isEmpty)
+            XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
+            XCTAssertTrue(fixture.providerLog.messages.isEmpty)
+            assertComposerUntouched(fixture, workflow: workflow)
+        }
+        fixture.session.selfCompactState = .init()
+        guard case let .delivered(delivery) = await steer(fixture) else {
+            return XCTFail("Ordinary steering must resume after self-compaction settles")
+        }
+        XCTAssertEqual(delivery.deliveryState, .queuedInterrupt)
+    }
+
+    func testCompactionBeginningDuringAuthorizationRefusesWithoutMutation() async throws {
+        let fixture = try makeFixture()
+        makeRunning(fixture)
+        let state = AgentSelfCompactState(active: .init(
+            idempotencyKey: "scheduled-at-fence", note: "Continue after compacting."
+        ))
+        let outcome = await steer(fixture, commit: {
+            fixture.session.selfCompactState = state
+            return .committed
+        })
+        XCTAssertEqual(outcome, .blocked(.targetNotIdle))
+        XCTAssertEqual(fixture.session.selfCompactState, state)
+        XCTAssertTrue(fixture.session.items.isEmpty)
+        XCTAssertTrue(fixture.session.pendingClaudeSteeringInstructions.isEmpty)
+        XCTAssertTrue(fixture.providerLog.messages.isEmpty)
+    }
+
+    func testIdleACPBackgroundSettleRefusesBeforeTheFence() async throws {
+        let fixture = try makeFixture()
+        fixture.session.beginACPBackgroundCompactionSettle(duration: 90)
+        var commitCalls = 0
+        let outcome = await steer(fixture, commit: {
+            commitCalls += 1
+            return .committed
+        })
+        XCTAssertEqual(outcome, .blocked(.targetNotIdle))
+        XCTAssertEqual(commitCalls, 0)
+        XCTAssertTrue(fixture.session.items.isEmpty)
+        XCTAssertTrue(fixture.session.isSettlingACPBackgroundCompaction)
+        fixture.session.endACPBackgroundCompactionSettle()
+    }
+
     func testWithdrawnManagementAtTheFenceDeliversNothing() async throws {
         let fixture = try makeFixture()
         makeRunning(fixture)
@@ -678,6 +740,28 @@ final class AgentSessionLinkSteerAdmissionTests: XCTestCase {
                 Admission.evaluate(readiness: running, runStateIsActive: true, pendingPromptExists: false, route: route),
                 .steer(route)
             )
+        }
+    }
+
+    func testCompactionHoldsRefuseAcrossRunStatesAndPreservePromptPrecedence() {
+        for active in [false, true] {
+            for selfCompact in [false, true] {
+                let readiness = snapshot {
+                    $0.runStateIsActive = active
+                    $0.pendingSelfCompact = selfCompact
+                    $0.backgroundCompactionSettling = !selfCompact
+                }
+                for route: AgentSessionLinkManagedSteerRoute in [.codex, .claudeInterrupt, .acpQueued, .waitingInstruction] {
+                    XCTAssertEqual(AgentSessionLinkSteerAdmission.evaluate(
+                        readiness: readiness, runStateIsActive: active,
+                        pendingPromptExists: false, route: route
+                    ), .blocked(.targetNotIdle))
+                    XCTAssertEqual(AgentSessionLinkSteerAdmission.evaluate(
+                        readiness: readiness, runStateIsActive: active,
+                        pendingPromptExists: true, route: route
+                    ), .blocked(.targetAwaitingInteraction))
+                }
+            }
         }
     }
 

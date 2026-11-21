@@ -43,7 +43,8 @@ enum FileSystemAppIntegration {
                       layout.workTreeRoot.resolvingSymlinksInPath().standardizedFileURL == root
                 else { throw IgnoreRulePolicyResolutionError.ambiguousGitTopology }
                 return layout.commonDir.appendingPathComponent("info/exclude")
-            }
+            },
+            respectGitignore: { @MainActor in GlobalSettingsStore.shared.respectGitignore() }
         )
     }
 

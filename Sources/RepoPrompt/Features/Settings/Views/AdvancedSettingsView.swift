@@ -47,6 +47,13 @@ struct AdvancedSettingsView: View {
         "\(AppDeepLinkURLScheme.canonical)://"
     }
 
+    private var respectGitignoreBinding: Binding<Bool> {
+        Binding(
+            get: { globalSettings.respectGitignore() },
+            set: { setFileSystemPreference($0, key: "file_system.respect_gitignore", store: { globalSettings.setRespectGitignore($0) }) }
+        )
+    }
+
     private var respectRepoIgnoreBinding: Binding<Bool> {
         Binding(
             get: { globalSettings.respectRepoIgnore() },
@@ -170,6 +177,12 @@ struct AdvancedSettingsView: View {
                 title: "Workspace Folder Scanning",
                 description: "Changes refresh open folders and are shared with app_settings MCP writes."
             ) {
+                SettingToggle(
+                    title: "Respect .gitignore rules",
+                    description: "Hide paths matched by .gitignore files. Turning this off can expose ignored files to agents; other ignore rules still apply.",
+                    isOn: respectGitignoreBinding
+                )
+
                 SettingToggle(
                     title: "Respect .repo_ignore rules",
                     description: "Honor RepoPrompt-specific .repo_ignore files. Edit local .repo_ignore content through the Ignore Patterns editor or file editing tools.",

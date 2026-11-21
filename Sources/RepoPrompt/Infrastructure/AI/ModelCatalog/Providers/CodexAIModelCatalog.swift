@@ -7,6 +7,8 @@ enum CodexDynamicModelStore {
     private static let cacheLock = NSLock()
     private static var cachedData: Data?
     private static var cachedRecords: [CodexDynamicModelRecord] = []
+    private static let optionsBudget = 1_048_576
+    private static var cachedOptions: (data: Data, locale: Locale, options: [CodexDynamicModelOption])?
 
     static func canonicalRecords(from models: [CodexAppServerClient.RemoteModel]) -> [CodexDynamicModelRecord] {
         models
@@ -23,19 +25,54 @@ enum CodexDynamicModelStore {
     static func load(defaults: UserDefaults = .standard) -> [CodexDynamicModelRecord] {
         cacheLock.lock()
         defer { cacheLock.unlock() }
-        // Parsing and picker ordering share this store. Decode only when the persisted
-        // payload changes, including writes from other windows or defaults suites.
-        let data = defaults.data(forKey: storageKey)
+        return records(for: defaults.data(forKey: storageKey))
+    }
+
+    /// Called under cacheLock; every caller reads its own defaults payload first.
+    private static func records(for data: Data?) -> [CodexDynamicModelRecord] {
         if data != cachedData {
             cachedData = data
+            cachedOptions = nil
             cachedRecords = data.flatMap { try? JSONDecoder().decode([CodexDynamicModelRecord].self, from: $0) } ?? []
         }
         return cachedRecords
     }
 
     static func modelOptions(defaults: UserDefaults = .standard) -> [CodexDynamicModelOption] {
-        CodexDynamicModelMapper.options(from: load(defaults: defaults))
+        modelOptions(defaults: defaults, afterCapture: {})
     }
+
+    private static func modelOptions(defaults: UserDefaults, afterCapture: () -> Void) -> [CodexDynamicModelOption] {
+        let locale = Locale.current
+        cacheLock.lock()
+        let data = defaults.data(forKey: storageKey)
+        let input = records(for: data)
+        if let data, let cachedOptions, cachedOptions.data == data, cachedOptions.locale == locale {
+            cacheLock.unlock()
+            return cachedOptions.options
+        }
+        cacheLock.unlock()
+        afterCapture()
+        let result = CodexDynamicModelMapper.options(from: input)
+        guard let data, !input.isEmpty, data.count <= optionsBudget else { return result }
+        // Include a conservative per-option allowance plus all variable-length UTF-8 fields.
+        let estimatedBytes = result.reduce(data.count) { size, option in
+            size + 512 + ([option.id, option.displayName, option.description, option.baseID] + option.supportedReasoningEffortRawValues + [option.defaultReasoningEffortRawValue].compactMap(\.self)).reduce(0) { $0 + $1.utf8.count }
+        }
+        guard estimatedBytes <= optionsBudget else { return result }
+        cacheLock.lock()
+        if defaults.data(forKey: storageKey) == data, Locale.current == locale {
+            cachedOptions = (data, locale, result)
+        }
+        cacheLock.unlock()
+        return result
+    }
+
+    #if DEBUG
+        static func test_modelOptions(defaults: UserDefaults, afterCapture: () -> Void) -> [CodexDynamicModelOption] {
+            modelOptions(defaults: defaults, afterCapture: afterCapture)
+        }
+    #endif
 
     static func displayName(forModelID id: String, defaults: UserDefaults = .standard) -> String? {
         CodexDynamicModelMapper.displayName(forModelID: id, records: load(defaults: defaults))

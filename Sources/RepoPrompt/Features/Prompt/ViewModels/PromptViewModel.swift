@@ -459,13 +459,13 @@ class PromptViewModel: ObservableObject {
         Self.mcpOraclePlanningModelResolution(
             rawValue: planningModelName,
             isModelAvailable: { [weak self] model in
-                self?.isProviderConfigured(for: model) ?? false
+                self?.mcpOracleIsProviderConfigured(for: model) ?? false
             }
         )
     }
 
     func mcpOracleIsProviderConfigured(for model: AIModel) -> Bool {
-        isProviderConfigured(for: model)
+        AgentOperationEligibility.AIOperation.oracle.eligibility(for: model, available: isProviderConfigured(for: model)).isEligible
     }
 
     nonisolated static func mcpOraclePlanningModelErrorMessage(

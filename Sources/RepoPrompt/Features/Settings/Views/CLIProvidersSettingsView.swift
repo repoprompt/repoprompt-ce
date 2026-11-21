@@ -2344,6 +2344,8 @@ struct CLIProvidersSettingsView: View {
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
+
+                ProviderUsageQuotaSection(provider: .antigravity)
             }
         }
     }

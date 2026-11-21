@@ -68,7 +68,8 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
     func testOnlyFirstPartyAgentsHaveAUsageTarget() {
         XCTAssertEqual(ProviderQuotaSettingsTarget(agent: .codexExec), .codex)
         XCTAssertEqual(ProviderQuotaSettingsTarget(agent: .claudeCode), .claude)
-        for agent in AgentProviderKind.allCases where agent != .codexExec && agent != .claudeCode {
+        XCTAssertEqual(ProviderQuotaSettingsTarget(agent: .antigravity), .antigravity)
+        for agent in AgentProviderKind.allCases where ![.codexExec, .claudeCode, .antigravity].contains(agent) {
             XCTAssertNil(ProviderQuotaSettingsTarget(agent: agent), agent.rawValue)
         }
     }

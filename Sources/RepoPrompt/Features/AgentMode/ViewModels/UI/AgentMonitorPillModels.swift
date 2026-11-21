@@ -223,12 +223,12 @@ enum AgentMonitorAutoWakeCopy {
     static let tooltip = """
     When on, updates from every lane can start a turn for this agent, no more often than the limit \
     below. When off, only lanes you select individually can; other updates wait for its next turn. \
-    A lane that asks for attention wakes it either way.
+    A lane that asks for attention or waits for your input wakes it either way.
     """
     static let accessibilityLabel = "Auto-wake on overseen lane updates"
     static let accessibilityHint = """
     Lets updates from every lane start turns for this agent; when off, only individually selected lanes \
-    can. Attention requests wake it either way.
+    can. Attention requests and lanes waiting for your input wake it either way.
     """
     static let unavailableMessage = "That Agent session is no longer active."
     static let loadingReason = "This Agent session is still loading."
@@ -679,18 +679,18 @@ enum AgentMonitorAutoWakeSnoozeCopy {
         return "Expires today at \(time)."
     }
 
-    static func minutes(forSeconds seconds: Int) -> Int {
-        max(1, seconds / 60)
+    static func durationLabel(seconds: Int) -> String {
+        AgentMonitorPeriodicWakeCopy.optionLabel(seconds: seconds)
     }
 
     static func setOptionLabel(seconds: Int) -> String {
-        "Snooze for \(minutes(forSeconds: seconds)) minutes"
+        "Snooze for \(durationLabel(seconds: seconds))"
     }
 
     /// `at least`, because the server keeps the later of the two deadlines: the horizon the user
     /// picks is a floor, never a replacement.
     static func extendOptionLabel(seconds: Int) -> String {
-        "Extend to at least \(minutes(forSeconds: seconds)) minutes from now"
+        "Extend to at least \(durationLabel(seconds: seconds)) from now"
     }
 
     /// The offers worth showing: everything when nothing is snoozed, and only the horizons that
@@ -709,10 +709,18 @@ enum AgentMonitorAutoWakeSnoozeCopy {
         seconds: Int,
         isExtension: Bool
     ) -> String {
-        isExtension
+        let duration: String
+        if seconds >= 3600 {
+            let hours = seconds / 3600
+            duration = "\(hours) \(hours == 1 ? "hour" : "hours")"
+        } else {
+            let minutes = max(1, seconds / 60)
+            duration = "\(minutes) \(minutes == 1 ? "minute" : "minutes")"
+        }
+        return isExtension
             ? "Extend status Auto-wake snooze for \(displayName) to at least "
-            + "\(minutes(forSeconds: seconds)) minutes from now"
-            : "Snooze status Auto-wake for \(displayName) for \(minutes(forSeconds: seconds)) minutes"
+            + "\(duration) from now"
+            : "Snooze status Auto-wake for \(displayName) for \(duration)"
     }
 
     static func menuAccessibilityLabel(displayName: String) -> String {

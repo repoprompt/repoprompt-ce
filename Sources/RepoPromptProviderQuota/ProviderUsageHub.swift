@@ -8,6 +8,7 @@ package struct ProviderUsageProviderID: RawRepresentable, Hashable {
 
     package static let codex = Self(rawValue: "codex")
     package static let claude = Self(rawValue: "claude")
+    package static let antigravity = Self(rawValue: "antigravity")
 }
 
 package enum ProviderUsageConsumer { case settingsPanel, agentIndicator, routerAdvisory }

@@ -600,6 +600,7 @@ final class AgentTabSession: ObservableObject {
     var transcriptAutoFollowArmingState: AgentModeViewModel.AgentTranscriptAutoFollowArmingState = .armed
     var askUserContinuation: CheckedContinuation<AgentAskUserResponse, Error>?
     var askUserTimeoutTask: Task<Void, Never>?
+    var askUserDeadline: DomainInteractionBroker.Deadline?
     var pendingAskUserTimeoutGeneration: UInt64 = 0
     var hasPendingQuestionUI: Bool {
         pendingAskUser != nil || pendingUserInputRequest != nil || pendingMCPElicitationRequest != nil
