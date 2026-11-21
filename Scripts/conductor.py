@@ -922,7 +922,7 @@ def ensure_private_dir(path: Path) -> None:
 HASHED_STORAGE_NAME = re.compile(r"[0-9a-f]{64}")
 JOB_STORAGE_NAME = re.compile(
     r"([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})"
-    r"\.(log|timing\.json|cache-attempt\.json|xctest-stall\.(?:json|sample\.txt)|log-rotation\.tmp)"
+    r"\.(log|timing\.json|cache-(?:attempt|outcome)\.json|xctest-stall\.(?:json|sample\.txt)|log-rotation\.tmp)"
 )
 
 
@@ -1065,6 +1065,7 @@ class BuildCacheManager:
         self.store_root = self.cache_root / "checkout-v2"
         self._retention_scope_valid = store_root is not None or bool(override) or self.cache_root == requested_root
         self.locks_dir = self.store_root / "locks"
+        self.repo_locks_dir = self.cache_root / "locks"
         self._probe_provider = probe_provider or self._probe_toolchain
         self._clone_runner = clone_runner or self._clone_cow
         self._clock = clock
@@ -1082,6 +1083,7 @@ class BuildCacheManager:
         ensure_private_dir(self.store_root.parent)
         ensure_private_dir(self.store_root)
         ensure_private_dir(self.locks_dir)
+        ensure_private_dir(self.repo_locks_dir)
 
     @staticmethod
     def _remove_owned_temporary(path: Path) -> None:
@@ -1105,7 +1107,8 @@ class BuildCacheManager:
     @contextlib.contextmanager
     def _repo_prepare_lock(self, *, nonblocking: bool = False):
         digest = hashlib.sha256(str(self.repo_root).encode("utf-8")).hexdigest()
-        lock_path = self.locks_dir / f"repo-{digest}.lock"
+        # Legacy restores stage their copies in the same checkout directory.
+        lock_path = self.repo_locks_dir / f"repo-{digest}.lock"
         lock_file = lock_path.open("a+", encoding="utf-8")
         os.chmod(lock_path, 0o600)
         flags = fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0)
@@ -1257,13 +1260,16 @@ class BuildCacheManager:
             raise ConductorError("invalid build-cache key")
         return self.store_root / key
 
-    @contextlib.contextmanager
     def key_lock(self, key: str, *, exclusive: bool, nonblocking: bool = False):
-        self._key_dir(key)
+        return self._key_lock_at(self._key_dir(key), exclusive=exclusive, nonblocking=nonblocking)
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _key_lock_at(key_dir: Path, *, exclusive: bool, nonblocking: bool = False):
         # The persistent per-key inode is the cross-process flock authority.
         # Unlinking a seemingly idle lock can split exclusion when a waiter has
         # already opened the old inode, so zero-byte lock files are retained.
-        lock_path = self.locks_dir / f"{key}.lock"
+        lock_path = key_dir.parent / "locks" / f"{key_dir.name}.lock"
         lock_file = lock_path.open("a+", encoding="utf-8")
         os.chmod(lock_path, 0o600)
         flags = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
@@ -1382,7 +1388,7 @@ class BuildCacheManager:
     def _validate_seed_at(self, key: str, meta: Dict[str, Any], seed: Path) -> bool:
         if not private_retention_directory(seed):
             return False
-        marker = self._read_json_file(seed / ".generation.json")
+        marker = read_storage_record(seed / ".generation.json")
         build = seed / ".build"
         return bool(
             marker
@@ -1693,22 +1699,40 @@ class BuildCacheManager:
             retention = {"error": str(exc)[:500]}
         return {"state": "published", "key": key, "generation": next_generation, "sizeBytes": size, "retention": retention}
 
-    def confirm_seeded_failure(self, key: str) -> Dict[str, Any]:
-        with self.key_lock(key, exclusive=True):
-            key_dir = self._key_dir(key)
-            meta = self._meta(key) or {"key": key, "generation": 0}
+    def confirm_seeded_failure(self, key: str, provenance: Dict[str, Any]) -> Dict[str, Any]:
+        key_dir = self._key_dir(key)
+        seed_path = provenance.get("seedPath")
+        # A running legacy daemon can invoke this updated wrapper with a legacy seed.
+        legacy_key_dir = self.cache_root / key
+        if seed_path == str(legacy_key_dir / "seed"):
+            key_dir = legacy_key_dir
+        seed = key_dir / "seed"
+        if seed_path != str(seed) or not all(
+            private_retention_directory(path)
+            for path in (self.cache_root, key_dir.parent, key_dir.parent / "locks", key_dir)
+        ):
+            return {"suspectBookkeepingSkipped": "unrecognized seed namespace"}
+        generation = provenance.get("generation")
+        with self._key_lock_at(key_dir, exclusive=True):
+            meta = read_storage_record(key_dir / "meta.json")
+            if (
+                provenance.get("schemaVersion") != BUILD_CACHE_SCHEMA_VERSION
+                or type(generation) is not int
+                or meta.get("key") != key
+                or meta.get("generation") != generation
+                or not self._validate_seed_at(key, meta, seed)
+            ):
+                return {"suspectBookkeepingSkipped": "seed generation changed or was removed"}
             count = int(meta.get("suspectCount") or 0) + 1
             meta["suspectCount"] = count
             meta["lastSuspectAt"] = self._clock()
             quarantined = False
-            seed = key_dir / "seed"
-            if count >= 2 and seed.exists() and not seed.is_symlink():
+            if count >= 2:
                 quarantine = key_dir / f"suspect-{int(self._clock())}-{uuid.uuid4().hex[:8]}"
                 os.replace(seed, quarantine)
                 shutil.rmtree(quarantine, ignore_errors=True)
                 meta["quarantinedAt"] = self._clock()
                 quarantined = True
-            ensure_private_dir(key_dir)
             _atomic_write_json(key_dir / "meta.json", meta)
             return {"suspectCount": count, "quarantined": quarantined}
 
@@ -2989,7 +3013,11 @@ def sweep_ticket_artifacts(
             continue
         if require_receipt:
             receipt = read_storage_record(jobs_dir / f"{ticket}.timing.json")
-            if receipt.get("schemaVersion") != 1 or receipt.get("ticket") != ticket or receipt.get("state") not in TERMINAL_STATES:
+            state = receipt.get("state")
+            if (
+                receipt.get("schemaVersion") != 1 or receipt.get("ticket") != ticket
+                or not isinstance(state, str) or state not in TERMINAL_STATES
+            ):
                 continue
         # Leave the receipt until last, so an interrupted legacy cleanup is retryable.
         for kind in sorted(group, key=lambda name: name == "timing.json"):
@@ -6387,7 +6415,7 @@ class DaemonState:
             if JOB_STORAGE_NAME.fullmatch(f"{ticket}.log"):
                 detached_paths.extend(
                     self.paths.jobs_dir / f"{ticket}.{suffix}"
-                    for suffix in ("log", "cache-attempt.json", "xctest-stall.json",
+                    for suffix in ("log", "cache-attempt.json", "cache-outcome.json", "xctest-stall.json",
                                    "xctest-stall.sample.txt", "log-rotation.tmp", "timing.json")
                 )
             for key, mapped_ticket in list(self.request_keys.items()):
@@ -9142,8 +9170,8 @@ def operation_cache_retry(repo_root: Path, args: Dict[str, Any]) -> int:
     outcome["coldSucceeded"] = cold_code == 0
     if cold_code == 0:
         try:
-            manager = BuildCacheManager(repo_root)
-            outcome.update(manager.confirm_seeded_failure(key))
+            manager = BuildCacheManager(repo_root, startup_hygiene=False)
+            outcome.update(manager.confirm_seeded_failure(key, provenance))
         except Exception as exc:
             # A successful cold build is authoritative. Suspect bookkeeping is
             # advisory, but its failure remains visible in the retained outcome.

@@ -62,11 +62,17 @@ class StorageFixture(unittest.TestCase):
         orphan = self.bucket("retired", record_identity=True)
         orphan_log = self.artifact(orphan, "log")
         sidecar = self.artifact(orphan, "cache-attempt.json")
+        outcome = self.artifact(orphan, "cache-outcome.json")
         unknown = orphan / "jobs" / "third-party.log"
         unknown.write_text("unknown")
         legacy = self.bucket("legacy")
         legacy_log = self.artifact(legacy, "log")
         receipt = self.artifact(legacy, "timing.json", receipt=True)
+        malformed = self.bucket("malformed")
+        malformed_log = self.artifact(malformed, "log")
+        malformed_receipt = self.artifact(malformed, "timing.json", receipt=True)
+        malformed_receipt.write_text(json.dumps({"schemaVersion": 1, "ticket": self.ticket, "state": []}))
+        os.utime(malformed_receipt, (self.stale, self.stale))
         no_receipt = self.artifact(self.bucket("unproved"), "log")
         extant = self.artifact(self.bucket("extant", record_identity=True, live_checkout=True), "log")
         active_bucket = self.bucket("active", record_identity=True)
@@ -83,14 +89,14 @@ class StorageFixture(unittest.TestCase):
         linked_receipt = self.artifact(symlink_bucket, "timing.json", receipt=True)
         with conductor.existing_storage_lock(busy_bucket / "daemon.start.lock"):
             report = conductor.sweep_sibling_storage(self.paths, dry_run=True)
-            self.assertEqual(report["files"], 4)
-            self.assertTrue(all(path.exists() for path in (orphan_log, sidecar, legacy_log, receipt)))
+            self.assertEqual(report["files"], 5)
+            self.assertTrue(all(path.exists() for path in (orphan_log, sidecar, outcome, legacy_log, receipt)))
             result = conductor.sweep_sibling_storage(self.paths, dry_run=False)
         self.assertEqual(result, report)
-        self.assertTrue(all(not path.exists() for path in (orphan_log, sidecar, legacy_log, receipt)))
+        self.assertTrue(all(not path.exists() for path in (orphan_log, sidecar, outcome, legacy_log, receipt)))
         self.assertTrue(all(path.exists() for path in (
             no_receipt, extant, active, busy, recent, recent_receipt, symlink, unknown, linked_receipt,
-            orphan / "daemon.start.lock", orphan / "checkout.json",
+            malformed_log, malformed_receipt, orphan / "daemon.start.lock", orphan / "checkout.json",
         )))
 
     def test_state_override_does_not_discover_sibling_buckets(self) -> None:
@@ -99,6 +105,85 @@ class StorageFixture(unittest.TestCase):
             result = conductor.sweep_sibling_storage(conductor.compute_paths(self.repo), dry_run=False)
         self.assertEqual(result["files"], 0)
         self.assertTrue(other.exists())
+
+    def test_new_startup_preserves_scratch_held_by_legacy_restore(self) -> None:
+        cache_root = self.store / "BuildCache"
+        legacy_locks = cache_root / "locks"
+        conductor.ensure_private_dir(cache_root)
+        conductor.ensure_private_dir(legacy_locks)
+        legacy_repo_lock = legacy_locks / f"repo-{digest(self.repo)}.lock"
+        legacy_repo_lock.touch(mode=0o600)
+        scratch = self.repo / (".build.seed-tmp-" + "a" * 32)
+        scratch.mkdir()
+
+        with conductor.existing_storage_lock(legacy_repo_lock):
+            cache = conductor.BuildCacheManager(self.repo, store_root=cache_root)
+            self.assertTrue(scratch.is_dir())
+        self.assertEqual(cache._sweep_repo_build_temporaries(nonblocking=True), 1)
+        self.assertFalse(scratch.exists())
+
+    def create_seed(self, namespace: Path, key: str, generation: int) -> Path:
+        locks = namespace / "locks"
+        conductor.ensure_private_dir(namespace)
+        conductor.ensure_private_dir(locks)
+        (locks / f"{key}.lock").touch(mode=0o600)
+        key_dir = namespace / key
+        conductor.ensure_private_dir(key_dir)
+        seed = key_dir / "seed"
+        conductor.ensure_private_dir(seed)
+        (seed / ".build").mkdir(exist_ok=True)
+        conductor._atomic_write_json(seed / ".generation.json", {"key": key, "generation": generation})
+        conductor._atomic_write_json(key_dir / "meta.json", {
+            "schemaVersion": 1, "key": key, "generation": generation, "sizeBytes": 10,
+            "lastUsedAt": conductor.now(), "suspectCount": 0,
+        })
+        return seed
+
+    def test_cold_retry_counts_only_the_originating_namespace_and_generation(self) -> None:
+        cache_root = self.store / "BuildCache"
+        key = "a" * 64
+        legacy_seed = self.create_seed(cache_root, key, 1)
+        current_seed = self.create_seed(cache_root / "checkout-v2", key, 1)
+        outcome_path = self.root / "outcome.json"
+        args = {
+            "argv": ["fixture"], "key": key, "ticket": self.ticket, "outcomePath": str(outcome_path),
+            "attemptRecordPath": str(self.root / f"{self.ticket}.cache-attempt.json"),
+        }
+
+        def retry(seed_path: Path, generation: int) -> dict:
+            build = self.repo / ".build"
+            build.mkdir(exist_ok=True)
+            conductor._atomic_write_json(build / ".conductor-cache-provenance.json", {
+                "schemaVersion": 1, "key": key, "generation": generation, "seedPath": str(seed_path),
+            })
+            with mock.patch.object(conductor, "_run_cache_attempt", side_effect=[(1, False), (0, False)]), \
+                    mock.patch.object(conductor, "_remove_cache_build_for_retry", return_value=True):
+                self.assertEqual(conductor.operation_cache_retry(self.repo, args), 0)
+            return json.loads(outcome_path.read_text())
+
+        self.assertEqual(retry(legacy_seed, 1)["suspectCount"], 1)
+        self.assertEqual(conductor.read_storage_record(legacy_seed.parent / "meta.json")["suspectCount"], 1)
+        self.assertEqual(conductor.read_storage_record(current_seed.parent / "meta.json")["suspectCount"], 0)
+        self.create_seed(cache_root, key, 2)
+        self.assertIn("suspectBookkeepingSkipped", retry(legacy_seed, 1))
+        self.assertIn("suspectBookkeepingSkipped", retry(self.root / key / "seed", 1))
+        self.assertEqual(conductor.read_storage_record(legacy_seed.parent / "meta.json")["suspectCount"], 0)
+        self.assertTrue(legacy_seed.is_dir())
+        self.assertEqual(retry(current_seed, 1)["suspectCount"], 1)
+        self.assertEqual(conductor.read_storage_record(current_seed.parent / "meta.json")["suspectCount"], 1)
+        self.assertEqual(conductor.read_storage_record(legacy_seed.parent / "meta.json")["suspectCount"], 0)
+
+    def test_bad_generation_marker_does_not_stop_cache_retention(self) -> None:
+        cache_root = self.store / "BuildCache"
+        unreadable = self.create_seed(cache_root, "a" * 64, 1)
+        readable = self.create_seed(cache_root, "b" * 64, 1)
+        (unreadable / ".generation.json").write_bytes(b"\xff")
+
+        cache = conductor.BuildCacheManager(self.repo, startup_hygiene=False)
+        report = cache.enforce_retention()
+        self.assertEqual(report["skippedKeys"], 1)
+        self.assertTrue(unreadable.is_dir())
+        self.assertFalse(readable.exists())
 
     def test_cache_limits_keep_current_checkout_preferred_and_lock_safe(self) -> None:
         root = self.store / "BuildCache"
