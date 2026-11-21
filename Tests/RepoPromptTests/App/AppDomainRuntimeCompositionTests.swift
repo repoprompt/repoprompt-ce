@@ -25,6 +25,7 @@ final class AppDomainRuntimeCompositionTests: XCTestCase {
             automaticProviderModelDiscoveryEnabled: false
         )
         let presenter = composition.agentModeViewModel
+        XCTAssertTrue(presenter.workspaceSwitchProvider === presenter.runtimeHost.workspaceSwitchCleanup)
         let scope = presenter.runtimeHost.scope
         // Inspect the scope before asking presentation for its projection.
         let installed = try XCTUnwrap(scope.linkExecution)

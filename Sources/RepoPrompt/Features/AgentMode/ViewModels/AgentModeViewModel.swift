@@ -979,7 +979,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private var skillCatalogDeltaObservationTask: Task<Void, Never>?
     private var skillCatalogRefreshDebounceTask: Task<Void, Never>?
     lazy var sessionIndexStore = AgentWorkspaceSessionIndexStore(perfRecorder: perfRecorder)
-    let workspaceSwitchProvider: AgentModeWorkspaceSwitchCleanupProvider
+    var workspaceSwitchProvider: AgentModeWorkspaceSwitchCleanupProvider {
+        runtimeHost.workspaceSwitchCleanup
+    }
+
     private var sessionListCacheTask: Task<Void, Never>?
     private var sessionListCacheGeneration: UInt64 = 0
     private var activeSessionIndexRefreshToken: SessionIndexRefreshToken?
@@ -2763,10 +2766,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         shouldManageCodexTooling = true
         self.usesProductionAgentDefaultsAndModelPolling = usesProductionAgentDefaultsAndModelPolling
         self.clearConsumedAttachmentsAfterProviderConsumption = clearConsumedAttachmentsAfterProviderConsumption
-        workspaceSwitchProvider = AgentModeWorkspaceSwitchCleanupProvider(
-            codexCoordinator: runtimeHost.codexCoordinator,
-            claudeCoordinator: runtimeHost.claudeCoordinator
-        )
         installAdministrationComposition(runtimeSessionStore.administration)
         installWorktreeComposition(runtimeSessionStore.worktrees)
         installLegacyLinkExecution()
@@ -2981,10 +2980,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 activeAgentRunWaitDrain: testCodexActiveAgentRunWaitDrain
             )
             self.clearConsumedAttachmentsAfterProviderConsumption = clearConsumedAttachmentsAfterProviderConsumption
-            workspaceSwitchProvider = AgentModeWorkspaceSwitchCleanupProvider(
-                codexCoordinator: codexCoordinator,
-                claudeCoordinator: claudeCoordinator
-            )
             installAdministrationComposition(runtimeSessionStore.administration)
             installWorktreeComposition(runtimeSessionStore.worktrees)
             installLegacyLinkExecution()
@@ -13119,6 +13114,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let teardownStartMS = restorePerfRecorder.timestampMSIfEnabled()
             let teardownSessionCount = sessions.count
         #endif
+        let originatingCleanup = runtimeHost.workspaceSwitchCleanup
         let oracleDrains = sessions.values.compactMap { runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).closeOracleBackground(for: $0) }
         for drain in oracleDrains {
             await drain.value
@@ -13177,7 +13173,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         tabDraftText.removeAll()
         draftRestorationLedger.removeAll()
         sidebarObservedRunStateByTabID.removeAll()
-        workspaceSwitchProvider.scheduleBackgroundCleanup(
+        originatingCleanup.scheduleBackgroundCleanup(
             targets: cleanupTargets,
             reason: "workspace_switch"
         )
