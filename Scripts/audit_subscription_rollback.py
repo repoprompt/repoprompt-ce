@@ -165,6 +165,14 @@ def audit(snapshot, preferences, retained_roots, max_settings_schema):
                     expected = workspace_documents.get(workspace_id(row.get("workspaceID")))
                     if expected is None or file_url(row.get("fileURL")) != expected:
                         raise AuditFailure("workspace_catalog_not_rehomed")
+            elif path.parent.name == "working-journals" and path.suffix == ".json":
+                journal = read_object(path)
+                identity = workspace_id(journal.get("workspaceID"))
+                if type(journal.get("version")) is not int or journal["version"] != 1 or workspace_id(path.stem) != identity:
+                    raise AuditFailure("invalid_workspace_journal")
+                expected = workspace_documents.get(identity)
+                if expected is None or file_url(journal.get("fileURL")) != expected:
+                    raise AuditFailure("workspace_journal_not_rehomed")
             elif path.name.startswith("AgentSession-") and path.suffix == ".json":
                 if "subscriptionAccountBinding" in read_object(path):
                     raise AuditFailure("managed_session_present")

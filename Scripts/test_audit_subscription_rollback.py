@@ -80,6 +80,25 @@ class SubscriptionRollbackAuditTests(unittest.TestCase):
         with self.assertRaisesRegex(AuditFailure, "settings_schema_unsupported"):
             self.run_audit()
 
+    def test_checks_working_journal_location_independently_of_catalog(self):
+        journals = self.catalog.parent / "working-journals"
+        journal = journals / f"{self.workspace_id}.json"
+        self.write(journal, {"version": 1, **self.catalog_entry(self.workspace)})
+        self.assertEqual(self.run_audit(), (1, 1))
+        self.write(journal, {"version": 1, **self.catalog_entry(self.external)})
+        with self.assertRaisesRegex(AuditFailure, "workspace_journal_not_rehomed"):
+            self.run_audit()
+
+        journal.unlink()
+        orphan = str(UUID(int=3))
+        self.write(journals / f"{orphan}.json", {
+            "version": 1,
+            "workspaceID": orphan,
+            "fileURL": (self.external / "workspace.json").as_uri(),
+        })
+        with self.assertRaisesRegex(AuditFailure, "workspace_journal_not_rehomed"):
+            self.run_audit()
+
     def test_refuses_unknown_schema_even_below_ceiling_and_linked_input(self):
         for payload in [
             {"schemaVersion": 5},
