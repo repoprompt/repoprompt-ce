@@ -679,6 +679,12 @@ final class AgentSessionPersistenceRuntimeTests: XCTestCase {
         XCTAssertTrue(windowManager.hasPreparedRuntime(visitID))
         let older = windowManager.beginRuntimeVisitIntent(visitID)
         let queued = windowManager.beginRuntimeVisitIntent(visitID)
+        XCTAssertTrue(windowManager.claimPreparedRuntimeVisit(visitID))
+        XCTAssertNil(windowManager.beginRuntimeVisitIntent(visitID), "A visit blocked by an active handoff must preserve its intent")
+        XCTAssertTrue(windowManager.isRuntimeVisitIntentCurrent(visitID, intent: queued))
+        windowManager.finishPreparedRuntimeVisit(visitID)
+        let released = await windowManager.releasePreparedOversightOwnerForVisit(sessionID: visitID)
+        XCTAssertFalse(released, "Visit admission must use the same runtime store as the drain lookup")
         windowManager.queuePreparedRuntimeVisit(visitID, intent: queued) {
             XCTAssertTrue(f.scope.hasReleasedWriterClaims)
             productionVisitCount += 1

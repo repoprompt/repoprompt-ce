@@ -7153,7 +7153,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // Readiness can carry an explicit visit, but a passive tool probe cannot supersede one.
         let intent = visitIntent
         func visitIsCurrent() -> Bool {
-            guard let intent, let visibleSessionID else { return true }
+            guard let intent else { return true }
+            guard let visibleSessionID,
+                  workspaceManager?.activeWorkspaceID == visibleWorkspaceID,
+                  workspaceManager?.activeAgentSessionID(forTabID: tabID) == visibleSessionID
+            else { return false }
             return owners?.isRuntimeVisitIntentCurrent(visibleSessionID, intent: intent) == true
         }
         guard visitIsCurrent() else { return session(for: tabID) }
@@ -7192,7 +7196,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             await loadSessionFromDisk(for: session)
         }
 
-        guard sessions[tabID] === session else { return self.session(for: tabID) }
+        guard visitIsCurrent(), sessions[tabID] === session else { return self.session(for: tabID) }
         if isAwaitingWorkspaceAdoption { return session }
         // Apply to bindings if this is the active tab
         if tabID == currentTabID {
@@ -7223,11 +7227,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         visitIntent: UUID? = nil
     ) async -> AgentRouteSessionActivationResult {
         let owners = preparedSessionRuntimes
-        let intent = workspaceLink || workspaceManager?.isSessionRuntimeProjection == true ? nil :
-            visitIntent ?? sessionID.flatMap { owners?.beginRuntimeVisitIntent($0) }
+        let qualifiesForVisit = !workspaceLink && workspaceManager?.isSessionRuntimeProjection != true
+        let intent = qualifiesForVisit ? visitIntent ?? sessionID.flatMap { owners?.beginRuntimeVisitIntent($0) } : nil
         func visitIsCurrent() -> Bool {
-            guard let intent, let sessionID else { return true }
-            return owners?.isRuntimeVisitIntentCurrent(sessionID, intent: intent) == true
+            guard qualifiesForVisit, let sessionID, let owners else { return true }
+            return owners.isRuntimeVisitIntentCurrent(sessionID, intent: intent)
         }
         guard visitIsCurrent() else { return .blockedByActiveDifferentSession }
         if workspaceLink, let sessionID, owners?.hasPreparedRuntime(sessionID) == true {
@@ -7276,7 +7280,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return finishWorkspaceLink(session)
         }
         if currentBinding == sessionID, !workspaceLink {
-            let session = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: true)
+            let session = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: true, visitIntent: intent)
+            guard visitIsCurrent() else { return .blockedByActiveDifferentSession }
             return sessions[tabID] === session && session.activeAgentSessionID == sessionID
                 && session.permitsBoundOperationAndSave ? .ready : .sessionNotFound
         }
@@ -7406,6 +7411,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return .sessionNotFound
         }
 
+        guard visitIsCurrent() else { return .blockedByActiveDifferentSession }
         if workspaceLink, preparedSessionRuntimes?.hasPreparedRuntime(sessionID) == true {
             return .blockedByActiveDifferentSession
         }
@@ -7430,7 +7436,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         settlePersistedLoadAttempt(routeAttempt, exit: .payloadApplied)
         if workspaceLink { return finishWorkspaceLink(session) }
-        let hydrated = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: true)
+        let hydrated = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: true, visitIntent: intent)
+        guard visitIsCurrent() else { return .blockedByActiveDifferentSession }
         return sessions[tabID] === hydrated && hydrated.activeAgentSessionID == sessionID
             && hydrated.permitsBoundOperationAndSave ? .ready : .sessionNotFound
     }
