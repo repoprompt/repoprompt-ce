@@ -36,6 +36,36 @@ def git(root: Path, *args: str) -> str:
     return subprocess.check_output(['git', *args], cwd=root, text=True).strip()
 
 
+def pull_request_base(pull: dict, ref: str) -> str:
+    if not re.fullmatch(r'refs/pull/[0-9]+/merge', ref):
+        raise ValueError('PR admission requires a synthetic merge ref')
+    direct_base = pull['base']
+    stack = pull.get('stack')
+    if stack is None:
+        if direct_base['ref'] != 'main':
+            raise ValueError('PR admission requires the synthetic merge into main')
+        return direct_base['sha']
+
+    trunk = stack.get('base') if isinstance(stack, dict) else None
+    if not isinstance(trunk, dict) or trunk.get('ref') != 'main':
+        raise ValueError('stacked PR admission requires a stack rooted on main')
+    number = pull.get('number')
+    if type(number) is not int or number <= 0 or ref != f'refs/pull/{number}/merge':
+        raise ValueError('stacked PR number does not match the synthetic merge ref')
+    return trunk.get('sha')
+
+
+def verify_stacked_merge(pull: dict, trunk: str, root: Path) -> None:
+    direct_base = pull['base']['sha']
+    topic = pull['head']['sha']
+    if git(root, 'show', '-s', '--format=%P', 'HEAD').split() != [direct_base, topic]:
+        raise CandidateMismatch('stacked PR synthetic merge parents do not match its PR event')
+    # A retry cannot add a missing trunk to this immutable candidate.
+    ancestry = subprocess.run(['git', 'merge-base', '--is-ancestor', trunk, direct_base], cwd=root)
+    if ancestry.returncode != 0:
+        raise CandidateMismatch('stacked PR direct parent does not contain the pinned main trunk; update the stack')
+
+
 def candidate(event_name: str, event: dict, sha: str, ref: str,
               run_id: str, attempt: str, tree: str) -> dict:
     if not all(SHA.fullmatch(value) and value != '0' * 40 for value in (sha, tree)):
@@ -43,9 +73,7 @@ def candidate(event_name: str, event: dict, sha: str, ref: str,
     positive(run_id)
     positive(attempt)
     if event_name == 'pull_request':
-        base = event['pull_request']['base']['sha']
-        if event['pull_request']['base']['ref'] != 'main' or not re.fullmatch(r'refs/pull/[0-9]+/merge', ref):
-            raise ValueError('PR admission requires the synthetic merge into main')
+        base = pull_request_base(event['pull_request'], ref)
     elif event_name == 'merge_group':
         group = event['merge_group']
         if (event['action'] != 'checks_requested' or group['base_ref'] != 'refs/heads/main'
@@ -58,7 +86,7 @@ def candidate(event_name: str, event: dict, sha: str, ref: str,
         base = event['before']
     else:
         raise ValueError('unsupported admission event/target')
-    if not SHA.fullmatch(base) or base == '0' * 40:
+    if not isinstance(base, str) or not SHA.fullmatch(base) or base == '0' * 40:
         raise ValueError('admission requires a real base commit; no unbounded scan fallback')
     return {'schema': 2, 'profile': PROFILE, 'event': event_name, 'head': sha, 'base': base,
             'ref': ref, 'tree': tree, 'run_id': run_id,
@@ -190,12 +218,17 @@ def main() -> int:
     args = parser.parse_args()
     try:
         if args.command == 'prepare':
-            context = candidate(args.event_name, json.loads(args.event_path.read_text()), args.sha,
-                                args.ref, args.run_id, args.attempt, git(args.root, 'rev-parse', 'HEAD^{tree}'))
+            event = json.loads(args.event_path.read_text())
+            context = candidate(args.event_name, event, args.sha, args.ref, args.run_id,
+                                args.attempt, git(args.root, 'rev-parse', 'HEAD^{tree}'))
             verify(context, args.root, args.run_id, args.attempt)
-            # Fail on incomplete history or an unrelated base, rather than scanning a different range.
-            subprocess.run(['git', 'merge-base', '--is-ancestor', context['base'], context['head']],
-                           cwd=args.root, check=True)
+            pull = event['pull_request'] if args.event_name == 'pull_request' else None
+            if pull is not None and pull.get('stack') is not None:
+                verify_stacked_merge(pull, context['base'], args.root)
+            else:
+                # Fail on incomplete history or an unrelated base instead of scanning a different range.
+                subprocess.run(['git', 'merge-base', '--is-ancestor', context['base'], context['head']],
+                               cwd=args.root, check=True)
             write_outputs(args.output, {'context': context, 'range': context['base'] + '..' + context['head']})
             print(json.dumps(context, sort_keys=True))
         else:
