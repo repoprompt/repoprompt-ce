@@ -709,10 +709,18 @@ enum AgentMonitorAutoWakeSnoozeCopy {
         seconds: Int,
         isExtension: Bool
     ) -> String {
-        isExtension
+        let duration: String
+        if seconds >= 3600 {
+            let hours = seconds / 3600
+            duration = "\(hours) \(hours == 1 ? "hour" : "hours")"
+        } else {
+            let minutes = max(1, seconds / 60)
+            duration = "\(minutes) \(minutes == 1 ? "minute" : "minutes")"
+        }
+        return isExtension
             ? "Extend status Auto-wake snooze for \(displayName) to at least "
-            + "\(durationLabel(seconds: seconds)) from now"
-            : "Snooze status Auto-wake for \(displayName) for \(durationLabel(seconds: seconds))"
+            + "\(duration) from now"
+            : "Snooze status Auto-wake for \(displayName) for \(duration)"
     }
 
     static func menuAccessibilityLabel(displayName: String) -> String {

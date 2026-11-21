@@ -32,10 +32,10 @@ enum AgentSessionLinkAutoWakeSnooze {
     /// Each accepted set/extend resolves to `max(activeDeadline, now + duration)`, so repeated
     /// operations may keep moving the deadline forward indefinitely while no single one of them ever
     /// leaves more than 24 hours on the clock.
-    static let maximumDurationSeconds = AgentSessionLinkPeriodicWakeInterval.maximumSeconds
+    static let maximumDurationSeconds = 86400
     /// The fixed local menu offers, in ascending order. Presentation only; the authority is always
     /// the server-side `max(existingDeadline, now + duration)`.
-    static let uiDurationSeconds = AgentSessionLinkPeriodicWakeInterval.optionsSeconds
+    static let uiDurationSeconds = [600, 1200, 1800, 2400, 3600, 7200, 10800, 21600, 43200, maximumDurationSeconds]
 
     /// Clamps any requested duration into the accepted range.
     ///
