@@ -489,6 +489,8 @@ class OracleViewModel: ObservableObject {
 
     /// An ephemeral dictionary to remember typed drafts across tab changes / onDisappear
     private var ephemeralDrafts: [UUID: String] = [:]
+    /// The original Chat record created by a presentation callback, never a restored record.
+    private var implicitDefaultChat: ChatSession?
 
     /// Add a flag to signal focusing the input field
     @Published var focusInputField: Bool = false
@@ -1929,12 +1931,12 @@ class OracleViewModel: ObservableObject {
         refreshSessionLists()
         guard !isSwitchingTabsForSession else { return }
         guard tabID != nil else { return }
-        _ = await ensureActiveSessionForCurrentTab(createIfMissing: true)
+        _ = await ensureActiveSessionForCurrentTab(createIfMissing: true, fromPresentation: true)
     }
 
     @MainActor
     @discardableResult
-    func ensureActiveSessionForCurrentTab(createIfMissing: Bool = true) async -> UUID? {
+    func ensureActiveSessionForCurrentTab(createIfMissing: Bool = true, fromPresentation: Bool = false) async -> UUID? {
         guard let tabID = promptViewModel.activeComposeTabID else { return nil }
 
         if let activeID = workspaceManager.activeChatSessionID(forTabID: tabID),
@@ -1954,8 +1956,23 @@ class OracleViewModel: ObservableObject {
         }
 
         guard createIfMissing else { return nil }
-        await startNewChatSession(tabID: tabID)
+        await startNewChatSession(tabID: tabID, fromPresentation: fromPresentation)
         return currentSessionID
+    }
+
+    @MainActor
+    func isUnusedImplicitDefaultChat(_ id: UUID) -> Bool {
+        guard let original = implicitDefaultChat, original.id == id,
+              let workspaceID = original.workspaceID, workspaceManager.activeWorkspaceID == workspaceID,
+              currentSessionID == id, sessions.count == 1, let current = sessions.first,
+              current.id == id, current.fileURL == nil, current.effectiveMessageCount == 0,
+              messages.isEmpty, messageStore[id]?.isEmpty != false, inputText.isEmpty, retrieveDraftText(for: id).isEmpty,
+              !isSessionStreaming(id), autosaveTasksByWorkspaceID[workspaceID]?.isEmpty != false
+        else { return false }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        guard let originalBytes = try? encoder.encode(original) else { return false }
+        return (try? encoder.encode(current)) == originalBytes
     }
 
     @MainActor
@@ -2290,7 +2307,7 @@ class OracleViewModel: ObservableObject {
         #if DEBUG
             let ensureActiveSessionStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
-        await ensureActiveSessionForCurrentTab(createIfMissing: true)
+        await ensureActiveSessionForCurrentTab(createIfMissing: true, fromPresentation: true)
         #if DEBUG
             restorePerfRecorder.event(
                 "chat.workspaceSwitch.ensureActiveSession",
@@ -2331,8 +2348,10 @@ class OracleViewModel: ObservableObject {
         oracleModelRaw: String? = nil,
         activateInUI: Bool = true,
         setActiveForTab: Bool = true,
-        reuseBlankSession: Bool = true
+        reuseBlankSession: Bool = true,
+        fromPresentation: Bool = false
     ) async -> UUID? {
+        implicitDefaultChat = nil
         if let activeWorkspace = workspaceManager.activeWorkspace,
            workspaceID == nil || workspaceID == activeWorkspace.id
         {
@@ -2406,6 +2425,12 @@ class OracleViewModel: ObservableObject {
             preferredAIModel: preferredModelName,
             selectedChatPresetID: selectedChatPresetId
         )
+        if fromPresentation, let active = workspaceManager.activeWorkspace,
+           WorkspaceManagerViewModel.isSyntheticFallbackWorkspace(active),
+           newSession.workspaceID == active.id, resolvedTabID == promptViewModel.activeComposeTabID
+        {
+            implicitDefaultChat = newSession
+        }
         sessions.append(newSession)
         if setActiveForTab, let resolvedTabID {
             workspaceManager.setActiveChatSessionID(newSession.id, forTabID: resolvedTabID)
@@ -2609,6 +2634,7 @@ class OracleViewModel: ObservableObject {
 
     @MainActor
     func switchToSession(_ id: UUID, setActiveForTab: Bool = true) async {
+        if setActiveForTab { implicitDefaultChat = nil }
         guard currentSessionID != id else {
             return
         }

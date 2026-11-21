@@ -3002,6 +3002,30 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         let retried = try await steer("Keep going.", key: "steer-2")
         XCTAssertEqual(retried["delivery_state"]?.stringValue, "queued_interrupt")
 
+        // Compaction refuses before acceptance: release the key and retain the existing wire body.
+        fixture.host.steerOutcome = .blocked(.targetNotIdle)
+        let compactBlocked = try await steer("Continue after compaction.", key: "compact-held")
+        XCTAssertEqual(compactBlocked, [
+            "result": .string("target_not_idle"),
+            "session_id": sessionID,
+            "delivered": .bool(false),
+            "retryable": .bool(true),
+            "detail": .string("The overseen session is not ready to accept a message. Wait for it with until: \"sendable\" and send when a snapshot reports idle_for_send: true; until: \"idle\" is satisfied by targets this call still refuses."),
+            "managed": .bool(true),
+            "steered_by_session_id": .string(fixture.observer.sessionID.uuidString)
+        ])
+        fixture.host.steerOutcome = .delivered(AgentSessionLinkSendDelivery(
+            targetItemID: UUID(), acceptedAt: Date(timeIntervalSince1970: 1400),
+            deliveryState: .queuedInterrupt, resultingRunState: "running"
+        ))
+        let afterCompact = try await steer("Continue after compaction.", key: "compact-held")
+        XCTAssertEqual(afterCompact["result"]?.stringValue, "delivered")
+        XCTAssertEqual(afterCompact["duplicate"], .bool(false))
+        XCTAssertEqual(afterCompact["delivery_state"]?.stringValue, "queued_interrupt")
+        let afterCompactReplay = try await steer("Continue after compaction.", key: "compact-held")
+        XCTAssertEqual(afterCompactReplay["duplicate"], .bool(true))
+        XCTAssertEqual(afterCompactReplay["target_item_id"], afterCompact["target_item_id"])
+
         // An unconfirmed provider outcome spends the key: the observer must read before retrying.
         fixture.host.steerOutcome = .blocked(.steerUnconfirmed)
         let unconfirmed = try await steer("Check the tests.", key: "steer-3")

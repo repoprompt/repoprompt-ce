@@ -45,6 +45,8 @@ package final class ProviderQuotaUIStore: ObservableObject {
     private let service: any ProviderQuotaObserving
     private let settingsProvider: @MainActor () -> Bool
     private let presentationProvider: @MainActor () -> Bool
+    /// Keep a details entry point for providers that cannot truthfully show an account-wide gauge.
+    private let showsDetailsOnlyIndicator: Bool
     private var presentationEnabled: Bool?
     private let now: @Sendable () -> Date
     private let freshnessInterval: TimeInterval
@@ -69,12 +71,14 @@ package final class ProviderQuotaUIStore: ObservableObject {
         service: any ProviderQuotaObserving,
         settingsProvider: @escaping @MainActor () -> Bool,
         presentationProvider: @escaping @MainActor () -> Bool = { true },
+        showsDetailsOnlyIndicator: Bool = false,
         now: @escaping @Sendable () -> Date = { Date() },
         freshnessInterval: TimeInterval = ProviderQuotaUIStore.freshnessRevalidationInterval
     ) {
         self.service = service
         self.settingsProvider = settingsProvider
         self.presentationProvider = presentationProvider
+        self.showsDetailsOnlyIndicator = showsDetailsOnlyIndicator
         self.now = now
         self.freshnessInterval = freshnessInterval
     }
@@ -321,7 +325,7 @@ package final class ProviderQuotaUIStore: ObservableObject {
     /// `.disabled` clears a shown indicator.
     private func publishIndicator() {
         let status = displayStatus
-        let wasShown = indicatorState != nil
+        let wasShown = indicatorState != nil || showsDetailsOnlyIndicator
         var projected: ProviderQuotaIndicatorState?
         switch status {
         case .disabled:
