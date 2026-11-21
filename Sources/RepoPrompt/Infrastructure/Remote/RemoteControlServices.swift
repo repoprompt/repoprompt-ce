@@ -363,9 +363,7 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
                 ?? context.workspaceManager.activeWorkspaceID
             guard let workspaceID else { continue }
             let liveByTabID = context.agentMode.sessions
-            let discoveryAgents = context.agentMode.availableAgents.reduce(into: [AgentProviderKind: AgentModelCatalog.DiscoveryAgent]()) {
-                $0[$1] = context.agentMode.remoteSelectableDiscoveryAgent(for: $1)
-            }
+            let discoveryAgents = context.agentMode.remoteDiscoveryAgents()
             for entry in context.agentMode.sessionIndex.values {
                 let live = Self.matchingLiveSession(
                     entryID: entry.id,
@@ -470,7 +468,7 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
         }
     }
 
-    private static func isConfigurationMutable(runState: RemoteRunState) -> Bool {
+    static func isConfigurationMutable(runState: RemoteRunState) -> Bool {
         switch runState {
         case .opening, .working, .waitingForInput:
             false
@@ -483,7 +481,7 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
         mapRunState(rawValue.flatMap(AgentSessionRunState.init(rawValue:)) ?? .idle)
     }
 
-    private static func remoteConfigurationControls(
+    static func remoteConfigurationControls(
         _ capabilities: AgentSessionSelectionCapabilities
     ) -> RemoteSessionConfigurationControls {
         RemoteSessionConfigurationControls(

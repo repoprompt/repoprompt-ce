@@ -376,7 +376,8 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                         olderCursor: page.olderCursor,
                         hasOlder: page.hasOlder,
                         transcriptRevision: page.transcriptRevision,
-                        transcriptRevisionEpoch: transcriptRevisionEpoch
+                        transcriptRevisionEpoch: transcriptRevisionEpoch,
+                        chatConfiguration: page.chatConfiguration
                     ))
                 } catch let error as RemoteReadServiceError {
                     switch error {

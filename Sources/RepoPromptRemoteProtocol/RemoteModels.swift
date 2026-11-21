@@ -993,6 +993,16 @@ public enum RemoteTranscriptPagingMode: String, Codable, Sendable {
     case recentBackward = "recent_backward"
 }
 
+public struct RemoteChatConfiguration: Codable, Sendable, Equatable {
+    public let selection: RemoteAgentSelection
+    public let controls: RemoteSessionConfigurationControls?
+
+    public init(selection: RemoteAgentSelection, controls: RemoteSessionConfigurationControls? = nil) {
+        self.selection = selection
+        self.controls = controls
+    }
+}
+
 public struct RemoteTranscriptPage: Codable, Sendable, Equatable {
     public let protocolVersion: Int
     public let sessionID: UUID
@@ -1006,6 +1016,7 @@ public struct RemoteTranscriptPage: Codable, Sendable, Equatable {
     public let transcriptRevision: UInt64?
     /// Matches the snapshot epoch for `transcriptRevision`. Absent on legacy CE.
     public let transcriptRevisionEpoch: UUID?
+    public let chatConfiguration: RemoteChatConfiguration?
 
     public init(
         protocolVersion: Int = RemoteProtocol.currentVersion,
@@ -1018,7 +1029,8 @@ public struct RemoteTranscriptPage: Codable, Sendable, Equatable {
         olderCursor: RemoteTranscriptCursor? = nil,
         hasOlder: Bool? = nil,
         transcriptRevision: UInt64? = nil,
-        transcriptRevisionEpoch: UUID? = nil
+        transcriptRevisionEpoch: UUID? = nil,
+        chatConfiguration: RemoteChatConfiguration? = nil
     ) {
         self.protocolVersion = protocolVersion
         self.sessionID = sessionID
@@ -1031,6 +1043,7 @@ public struct RemoteTranscriptPage: Codable, Sendable, Equatable {
         self.hasOlder = hasOlder
         self.transcriptRevision = transcriptRevision
         self.transcriptRevisionEpoch = transcriptRevisionEpoch
+        self.chatConfiguration = chatConfiguration
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -1045,6 +1058,7 @@ public struct RemoteTranscriptPage: Codable, Sendable, Equatable {
         case hasOlder
         case transcriptRevision
         case transcriptRevisionEpoch
+        case chatConfiguration
     }
 
     public init(from decoder: Decoder) throws {
@@ -1060,7 +1074,8 @@ public struct RemoteTranscriptPage: Codable, Sendable, Equatable {
             olderCursor: try container.decodeIfPresent(RemoteTranscriptCursor.self, forKey: .olderCursor),
             hasOlder: try container.decodeIfPresent(Bool.self, forKey: .hasOlder),
             transcriptRevision: try container.decodeIfPresent(UInt64.self, forKey: .transcriptRevision),
-            transcriptRevisionEpoch: try container.decodeIfPresent(UUID.self, forKey: .transcriptRevisionEpoch)
+            transcriptRevisionEpoch: try container.decodeIfPresent(UUID.self, forKey: .transcriptRevisionEpoch),
+            chatConfiguration: try container.decodeIfPresent(RemoteChatConfiguration.self, forKey: .chatConfiguration)
         )
     }
 }

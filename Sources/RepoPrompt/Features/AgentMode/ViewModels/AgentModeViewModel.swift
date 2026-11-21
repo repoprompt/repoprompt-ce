@@ -9726,6 +9726,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
+    func remoteDiscoveryAgents() -> [AgentProviderKind: AgentModelCatalog.DiscoveryAgent] {
+        availableAgents.reduce(into: [:]) { result, agent in
+            result[agent] = remoteSelectableDiscoveryAgent(for: agent)
+        }
+    }
+
     func mcpSessionSelectionCapabilities(
         tabID: UUID,
         sessionID: UUID,

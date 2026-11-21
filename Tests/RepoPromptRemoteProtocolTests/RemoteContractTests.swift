@@ -412,7 +412,10 @@ final class RemoteContractTests: XCTestCase {
             olderCursor: cursor,
             hasOlder: true,
             transcriptRevision: 12,
-            transcriptRevisionEpoch: revisionEpoch
+            transcriptRevisionEpoch: revisionEpoch,
+            chatConfiguration: RemoteChatConfiguration(
+                selection: RemoteAgentSelection(agentID: "codexExec", modelID: "gpt-5.6-sol", reasoningEffort: "high")
+            )
         )
 
         XCTAssertEqual(try roundTrip(workflow), workflow)

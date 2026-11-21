@@ -11,6 +11,7 @@ struct RemoteTranscriptPageRecord {
     let olderCursor: RemoteTranscriptCursor?
     let hasOlder: Bool?
     let transcriptRevision: UInt64?
+    let chatConfiguration: RemoteChatConfiguration?
 
     init(
         sessionID: UUID,
@@ -20,7 +21,8 @@ struct RemoteTranscriptPageRecord {
         pagingMode: RemoteTranscriptPagingMode? = nil,
         olderCursor: RemoteTranscriptCursor? = nil,
         hasOlder: Bool? = nil,
-        transcriptRevision: UInt64? = nil
+        transcriptRevision: UInt64? = nil,
+        chatConfiguration: RemoteChatConfiguration? = nil
     ) {
         self.sessionID = sessionID
         self.items = items
@@ -30,6 +32,7 @@ struct RemoteTranscriptPageRecord {
         self.olderCursor = olderCursor
         self.hasOlder = hasOlder
         self.transcriptRevision = transcriptRevision
+        self.chatConfiguration = chatConfiguration
     }
 }
 
@@ -108,6 +111,11 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
         var liveMutationRevision: UInt64?
         var liveOwnerID: ObjectIdentifier?
         var retainedAttachmentRoot: URL?
+        var chatConfiguration: RemoteChatConfiguration?
+        let includesChatConfiguration = switch paging {
+        case .recentBackward(before: nil), .legacyForward(afterSequenceIndex: nil): true
+        default: false
+        }
         let previewItemID: UUID? = if case let .exactItem(itemID) = paging, includeDetails {
             itemID
         } else {
@@ -119,6 +127,18 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
                 transcript = liveSession.transcript
                 liveMutationRevision = liveSession.remoteTranscriptMutationRevision
                 liveOwnerID = ObjectIdentifier(liveSession)
+                if includesChatConfiguration {
+                    let capabilities = context.agentMode.mcpSessionSelectionCapabilities(
+                        tabID: liveSession.tabID, sessionID: sessionID,
+                        discoveryAgents: context.agentMode.remoteDiscoveryAgents()
+                    )
+                    chatConfiguration = Self.chatConfiguration(
+                        agent: liveSession.selectedAgent.rawValue,
+                        model: liveSession.selectedModelRaw,
+                        reasoningEffort: liveSession.selectedReasoningEffortRaw,
+                        capabilities: capabilities
+                    )
+                }
                 if previewItemID != nil,
                    let workspace = context.workspaceManager.workspace(withID: liveSession.persistentSessionBindingIdentity?.workspaceID)
                 {
@@ -131,6 +151,23 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
                 if let persisted = try? await AgentSessionDataService.shared.loadAgentSession(id: sessionID, for: workspace) {
                     transcript = persisted.transcript ?? .empty
                     persistedSavedAt = persisted.savedAt
+                    if includesChatConfiguration {
+                        let selection = AgentModelCatalog.normalizePersistedSelection(
+                            agentRaw: persisted.agentKind, modelRaw: persisted.agentModel
+                        )
+                        let capabilities = context.agentMode.mcpPersistedSessionSelectionCapabilities(
+                            agentRaw: selection.agent.rawValue, modelRaw: selection.modelRaw,
+                            reasoningEffortRaw: persisted.agentReasoningEffort,
+                            isMutable: AgentModeRemoteSessionQueryService.isConfigurationMutable(
+                                runState: AgentModeRemoteSessionQueryService.mapPersistedRunState(persisted.lastRunState)
+                            ),
+                            discoveryAgents: context.agentMode.remoteDiscoveryAgents()
+                        )
+                        chatConfiguration = Self.chatConfiguration(
+                            agent: selection.agent.rawValue, model: selection.modelRaw,
+                            reasoningEffort: persisted.agentReasoningEffort, capabilities: capabilities
+                        )
+                    }
                     if previewItemID != nil {
                         retainedAttachmentRoot = context.agentMode.sessionAttachmentsRootURL(for: workspace)
                     }
@@ -185,7 +222,23 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
             allItems: allItems,
             paging: paging,
             limit: boundedLimit,
-            transcriptRevision: transcriptRevision
+            transcriptRevision: transcriptRevision,
+            chatConfiguration: chatConfiguration
+        )
+    }
+
+    static func chatConfiguration(
+        agent: String?, model: String?, reasoningEffort: String?,
+        capabilities: AgentSessionSelectionCapabilities?
+    ) -> RemoteChatConfiguration? {
+        guard let agent, let model, !agent.isEmpty, !model.isEmpty else { return nil }
+        return RemoteChatConfiguration(
+            selection: RemoteAgentSelection(
+                agentID: agent,
+                modelID: capabilities?.resolvedModelRaw ?? model,
+                reasoningEffort: capabilities.map(\.resolvedReasoningEffortRaw) ?? reasoningEffort
+            ),
+            controls: capabilities.map(AgentModeRemoteSessionQueryService.remoteConfigurationControls)
         )
     }
 
@@ -287,7 +340,8 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
         allItems: [RemoteTranscriptItem],
         paging: RemoteTranscriptPageRequest,
         limit: Int,
-        transcriptRevision: UInt64? = nil
+        transcriptRevision: UInt64? = nil,
+        chatConfiguration: RemoteChatConfiguration? = nil
     ) -> RemoteTranscriptPageRecord {
         switch paging {
         case let .exactItem(itemID):
@@ -316,7 +370,8 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
                 items: items,
                 nextSequenceIndex: hasMore ? items.last?.sequenceIndex : nil,
                 hasMore: hasMore,
-                transcriptRevision: transcriptRevision
+                transcriptRevision: transcriptRevision,
+                chatConfiguration: chatConfiguration
             )
 
         case let .recentBackward(before):
@@ -332,7 +387,8 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
                 pagingMode: .recentBackward,
                 olderCursor: hasOlder ? items.first.map(Self.cursor(for:)) : nil,
                 hasOlder: hasOlder,
-                transcriptRevision: transcriptRevision
+                transcriptRevision: transcriptRevision,
+                chatConfiguration: chatConfiguration
             )
         }
     }

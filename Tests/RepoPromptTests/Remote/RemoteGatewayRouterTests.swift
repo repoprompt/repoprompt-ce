@@ -1318,6 +1318,30 @@ final class RemoteProducerParityTests: XCTestCase {
         XCTAssertFalse(descriptors.contains { $0.displayName == "Director" })
     }
 
+    func testSavedTranscriptCarriesModelAndControlsWithoutASnapshotSession() throws {
+        let capabilities = AgentSessionSelectionCapabilities(
+            allowedAgentRawValues: ["codexExec"],
+            allowedModelRawValues: ["gpt-5.6-sol"],
+            allowedReasoningEffortRawValues: ["medium", "high"],
+            resolvedModelRaw: "gpt-5.6-sol",
+            resolvedReasoningEffortRaw: "high",
+            isMutable: true,
+            agentUnavailableReason: nil,
+            selectionUnavailableReason: nil
+        )
+        let configuration = try XCTUnwrap(WindowRemoteReadService.chatConfiguration(
+            agent: "codexExec", model: "gpt-5.6-sol-high", reasoningEffort: nil, capabilities: capabilities
+        ))
+        let page = WindowRemoteReadService.page(
+            sessionID: UUID(), allItems: [], paging: .recentBackward(before: nil), limit: 15,
+            chatConfiguration: configuration
+        )
+        XCTAssertEqual(page.chatConfiguration?.selection.modelID, "gpt-5.6-sol")
+        XCTAssertEqual(page.chatConfiguration?.selection.reasoningEffort, "high")
+        XCTAssertEqual(page.chatConfiguration?.controls?.reasoningEffort.allowedValueIDs, ["medium", "high"])
+        XCTAssertEqual(page.chatConfiguration?.controls?.model.isMutable, true)
+    }
+
     func testCatalogKeepsReasoningForAGroupedCodexModel() throws {
         let discovery = AgentModelCatalog.discoveryAgent(
             .codexExec,
