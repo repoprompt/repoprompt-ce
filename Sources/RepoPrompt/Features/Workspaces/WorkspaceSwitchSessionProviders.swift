@@ -107,6 +107,13 @@ final class AgentModeWorkspaceSwitchSessionProvider: WorkspaceSwitchSessionProvi
 
     func cancelSwitchSessions(for deletionToken: WorkspaceDeletionCancellationToken?) async {
         guard deletionToken?.isActive ?? true, let agentModeViewModel else { return }
+        // Window teardown starts the retained canonical drain, which owns these joins and
+        // cancellations. Ordinary workspace switches and explicit deletion keep their path.
+        if deletionToken == nil, agentModeViewModel.workspaceManager?.isPreparingForWindowClose == true,
+           agentModeViewModel.runtimeHost.workspaceActivation != nil
+        {
+            return
+        }
         let expectedWorkspaceID = agentModeViewModel.workspaceManager?.activeWorkspaceID
         if let deletionToken, deletionToken.workspaceID != expectedWorkspaceID { return }
         await agentModeViewModel.joinOracleBackgroundWindowDrain()
