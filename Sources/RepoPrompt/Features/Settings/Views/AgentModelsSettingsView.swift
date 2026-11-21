@@ -435,7 +435,10 @@ struct AgentModelsSettingsView: View {
     }
 
     private func oracleRow(at index: Int) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+        let destination = index == 0
+            ? viewModel.oracleModelDestination
+            : viewModel.additionalOracleModelDestination(at: index - 1)
+        return VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .center, spacing: 12) {
                 Text(viewModel.oracleLabel(at: index))
                     .font(.callout.weight(.medium))
@@ -447,9 +450,8 @@ struct AgentModelsSettingsView: View {
                     windowID: windowID,
                     useBorderlessStyle: false,
                     isInGeneralSettings: true,
-                    destination: index == 0
-                        ? viewModel.oracleModelDestination
-                        : viewModel.additionalOracleModelDestination(at: index - 1)
+                    destination: destination,
+                    usesOracleEligibility: true
                 )
 
                 Spacer(minLength: 0)
@@ -488,6 +490,22 @@ struct AgentModelsSettingsView: View {
                     .foregroundColor(.secondary)
             }
             .padding(.leading, 124)
+
+            let resolution = PromptViewModel.mcpOraclePlanningModelResolution(
+                rawValue: destination.currentRawValue,
+                isModelAvailable: { promptVM.mcpOracleIsProviderConfigured(for: $0) }
+            )
+            switch resolution {
+            case .configured, .unconfigured:
+                EmptyView()
+            case .invalid, .unavailable:
+                if let reason = PromptViewModel.mcpOraclePlanningModelErrorMessage(for: resolution) {
+                    Text(reason)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .padding(.leading, 124)
+                }
+            }
         }
     }
 
@@ -496,6 +514,12 @@ struct AgentModelsSettingsView: View {
     private var contextBuilderSection: some View {
         settingsCard {
             sectionHeader(title: "Context Builder Agent", subtitle: "Used to discover files and build optimized context for Oracle, plans, and reviews.")
+
+            if let warning = viewModel.contextBuilderSavedSelectionWarning {
+                Text(warning)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
 
             if !viewModel.hasConnectedCLIProvider {
                 HStack(spacing: 8) {

@@ -2,6 +2,37 @@
 import XCTest
 
 final class IgnoreRulesRecoveryTests: XCTestCase {
+    func testIncrementalScansDiscoverNewGitignoreUnlessIgnored() async throws {
+        for scanInParallel in [false, true] {
+            for gitignoreIsExcluded in [false, true] {
+                let fm = FileManager.default
+                let url = fm.temporaryDirectory.appendingPathComponent("IncrementalGitignore-\(UUID())")
+                try fm.createDirectory(at: url, withIntermediateDirectories: true)
+                defer { try? fm.removeItem(at: url) }
+                let manager = IgnoreRulesManager(
+                    globalIgnoreProvider: { gitignoreIsExcluded ? ".gitignore\n" : "" },
+                    ignorePolicyResolver: { _ in .nonGitRoot },
+                    repositoryRootValidator: { _ in false }
+                )
+                let service = try await FileSystemService(path: url.path, ignoreRulesManager: manager)
+
+                try "# repository rules\n".write(to: url.appendingPathComponent(".gitignore"), atomically: true, encoding: .utf8)
+                try "fixture\n".write(to: url.appendingPathComponent("kept.txt"), atomically: true, encoding: .utf8)
+
+                let deltas = if scanInParallel {
+                    try await service.scanFoldersInParallel([""]).deltas
+                } else {
+                    try await service.scanOneLevelAndDiff("")
+                }
+                let additions = deltas.compactMap { delta -> String? in
+                    guard case let .fileAdded(path) = delta else { return nil }
+                    return path
+                }
+                XCTAssertEqual(Set(additions), gitignoreIsExcluded ? ["kept.txt"] : [".gitignore", "kept.txt"])
+            }
+        }
+    }
+
     func testCompilerDistinguishesAnchoredDirectoryAndNegationPrecedence() {
         let compiled = GitignoreCompiler.compile(content: """
         /build/

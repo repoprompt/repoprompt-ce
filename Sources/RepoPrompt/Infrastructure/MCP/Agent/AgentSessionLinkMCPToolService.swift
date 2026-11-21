@@ -1262,7 +1262,7 @@ struct AgentSessionLinkMCPToolService {
               seconds <= AgentSessionLinkAutoWakeSnooze.maximumDurationSeconds
         else {
             throw MCPError.invalidParams(
-                "agent_session_link snooze_auto_wake duration_seconds must be an integer from 60 through 3600."
+                "agent_session_link snooze_auto_wake duration_seconds must be an integer from \(AgentSessionLinkAutoWakeSnooze.minimumDurationSeconds) through \(AgentSessionLinkAutoWakeSnooze.maximumDurationSeconds)."
             )
         }
         return seconds

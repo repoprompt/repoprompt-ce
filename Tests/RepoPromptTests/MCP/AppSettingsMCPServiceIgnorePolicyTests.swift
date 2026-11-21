@@ -6,15 +6,13 @@ import XCTest
 
 @MainActor
 final class AppSettingsMCPServiceIgnorePolicyTests: XCTestCase {
-    func testObsoleteGitignoreSettingIsAbsentAndRejectedWithoutMutation() async throws {
+    func testGitignoreSettingIsListedAndPersistsBothValues() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("AppSettingsMCPServiceIgnorePolicyTests-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let defaults = try XCTUnwrap(UserDefaults(suiteName: "AppSettingsMCPServiceIgnorePolicyTests.\(UUID().uuidString)"))
-        let store = GlobalSettingsStore(
-            defaults: defaults,
-            fileStore: GlobalSettingsFileStore(fileURL: root.appendingPathComponent("globalSettings.json"))
-        )
+        let fileURL = root.appendingPathComponent("globalSettings.json")
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: fileURL))
         let service = AppSettingsMCPService(store: store)
 
         let listed = try await service.handleForTesting([
@@ -22,29 +20,24 @@ final class AppSettingsMCPServiceIgnorePolicyTests: XCTestCase {
             "group": .string("file_system")
         ])
         let settings = try XCTUnwrap(listed.objectValue?["settings"]?.arrayValue)
-        let listedKeys = settings.compactMap { $0.objectValue?["key"]?.stringValue }
-        XCTAssertFalse(listedKeys.contains(obsoleteKey))
-
-        let before = store.respectRepoIgnore()
+        let key = "file_system.respect_gitignore"
+        let entry = try XCTUnwrap(settings.first { $0.objectValue?["key"]?.stringValue == key })
+        XCTAssertEqual(entry.objectValue?["writable"]?.boolValue, false)
+        XCTAssertTrue(store.respectGitignore())
         do {
             _ = try await service.handleForTesting([
-                "op": .string("get"),
-                "key": .string(obsoleteKey)
+                "op": .string("set"), "key": .string(key), "value": .bool(false)
             ])
-            XCTFail("Expected obsolete setting read to be rejected")
-        } catch {}
-        do {
-            _ = try await service.handleForTesting([
-                "op": .string("set"),
-                "key": .string(obsoleteKey),
-                "value": .bool(false)
-            ])
-            XCTFail("Expected obsolete setting write to be rejected")
-        } catch {}
-        XCTAssertEqual(store.respectRepoIgnore(), before)
-    }
-
-    private var obsoleteKey: String {
-        ["file_system", ".", "respect", "_", "gitignore"].joined()
+            XCTFail("Agents must not be able to opt themselves out of .gitignore rules")
+        } catch {
+            XCTAssertTrue(store.respectGitignore())
+        }
+        for enabled in [false, true] {
+            store.setRespectGitignore(enabled)
+            let result = try await service.handleForTesting(["op": .string("get"), "key": .string(key)])
+            XCTAssertEqual(result.objectValue?["values"]?.objectValue?[key]?.boolValue, enabled)
+            let reloaded = GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: fileURL))
+            XCTAssertEqual(reloaded.respectGitignore(), enabled)
+        }
     }
 }

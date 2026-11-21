@@ -100,7 +100,9 @@ package struct GlobalSettingsDocument: Codable {
     package static let agentRepromptGuidanceSchemaVersion = 13
     /// Workspace activation must survive writes by older Re-prompt-aware codecs.
     package static let workspaceRepromptActivationSchemaVersion = 14
-    package static let currentSchemaVersion = 14
+    /// Older typed writers must not open documents containing a subscription catalog.
+    package static let subscriptionProfileCatalogSchemaVersion = 15
+    package static let currentSchemaVersion = 15
     /// Lineage marker for settings files written by this open-source CE schema family.
     ///
     /// CE inherited numeric schema versions from classic/internal builds, so version numbers
@@ -161,6 +163,9 @@ package struct GlobalSettingsDocument: Codable {
     /// minimum version of content that existing features already know how to represent.
     package var requiredSchemaVersion: Int {
         var requiredVersion = Self.baselineSchemaVersion
+        if scalarPreferences?.subscriptionProfileCatalog != nil {
+            requiredVersion = max(requiredVersion, Self.subscriptionProfileCatalogSchemaVersion)
+        }
         if let agentModelsSettingsByWorkspaceID, !agentModelsSettingsByWorkspaceID.isEmpty {
             requiredVersion = max(requiredVersion, Self.workspaceAgentModelsSchemaVersion)
         }
@@ -780,6 +785,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
     /// `NotificationPreferences.defaults`. Older typed readers ignore the unknown key, and the
     /// raw-preserving save path keeps it, so it deliberately does not raise `requiredSchemaVersion`.
     package var notifications: NotificationSettings?
+    package var subscriptionProfileCatalog: SubscriptionProfileCatalog?
 
     package init(
         ui: UISettings? = nil,
@@ -1068,6 +1074,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
     }
 
     package struct FileSystemSettings: Codable, Equatable {
+        package var respectGitignore: Bool?
         package var respectRepoIgnore: Bool?
         package var respectCursorignore: Bool?
         package var globalIgnoreDefaults: String?
@@ -1076,6 +1083,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
         package var showEmptyFolders: Bool?
 
         package init(
+            respectGitignore: Bool? = nil,
             respectRepoIgnore: Bool? = nil,
             respectCursorignore: Bool? = nil,
             globalIgnoreDefaults: String? = nil,
@@ -1083,6 +1091,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             skipSymlinks: Bool? = nil,
             showEmptyFolders: Bool? = nil
         ) {
+            self.respectGitignore = respectGitignore
             self.respectRepoIgnore = respectRepoIgnore
             self.respectCursorignore = respectCursorignore
             self.globalIgnoreDefaults = globalIgnoreDefaults

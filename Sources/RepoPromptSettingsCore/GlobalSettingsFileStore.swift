@@ -8,6 +8,7 @@ package protocol GlobalSettingsFileStoring {
     var blockReason: GlobalSettingsPersistenceBlockReason? { get }
 
     func load() throws -> GlobalSettingsDocument
+    func readSnapshot() throws -> GlobalSettingsDocument?
     func loadOrCreateDefault() -> GlobalSettingsDocument
     func save(_ document: GlobalSettingsDocument) throws
     func saveStartupMigrationPreservingUnknownFields(
@@ -149,6 +150,14 @@ package final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
         return supportDirectory
             .appendingPathComponent(appSupportDirectoryName, isDirectory: true)
             .appendingPathComponent(settingsDirectoryName, isDirectory: true)
+    }
+
+    /// Projecting one setting must not adopt a new write generation or migration baseline.
+    package func readSnapshot() throws -> GlobalSettingsDocument? {
+        guard let data = try readCurrentData() else { return nil }
+        let header = try Self.decoder.decode(GlobalSettingsDocumentHeader.self, from: data)
+        guard Self.preservationBlockReason(for: header) == nil else { return nil }
+        return try Self.decoder.decode(GlobalSettingsDocument.self, from: data)
     }
 
     package func load() throws -> GlobalSettingsDocument {

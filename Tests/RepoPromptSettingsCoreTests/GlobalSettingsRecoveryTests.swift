@@ -130,6 +130,10 @@ private final class FailingRecoveryGlobalSettingsFileStore: GlobalSettingsFileSt
         self.defaultDocument = defaultDocument
     }
 
+    func readSnapshot() throws -> GlobalSettingsDocument? {
+        initialDocument
+    }
+
     func load() throws -> GlobalSettingsDocument {
         initialDocument
     }

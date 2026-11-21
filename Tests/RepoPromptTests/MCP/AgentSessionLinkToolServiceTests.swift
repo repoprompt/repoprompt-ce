@@ -2540,15 +2540,17 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertEqual(try AgentSessionLinkMCPToolService.parseSnoozeDurationSeconds(nil), 600)
         XCTAssertEqual(try AgentSessionLinkMCPToolService.parseSnoozeDurationSeconds(.int(60)), 60)
         XCTAssertEqual(try AgentSessionLinkMCPToolService.parseSnoozeDurationSeconds(.int(3600)), 3600)
+        XCTAssertEqual(try AgentSessionLinkMCPToolService.parseSnoozeDurationSeconds(.int(18000)), 18000)
+        XCTAssertEqual(try AgentSessionLinkMCPToolService.parseSnoozeDurationSeconds(.int(86400)), 86400)
 
         // Out of range, and the two encodings that would otherwise be silently coerced: a string
         // numeral and a fractional one.
-        for rejected: Value in [.int(59), .int(3601), .int(0), .string("600"), .double(600.5), .bool(true)] {
+        for rejected: Value in [.int(59), .int(86401), .int(0), .string("600"), .double(600.5), .bool(true)] {
             XCTAssertThrowsError(
                 try AgentSessionLinkMCPToolService.parseSnoozeDurationSeconds(rejected)
             ) { error in
                 XCTAssertTrue(
-                    "\(error)".contains("must be an integer from 60 through 3600"),
+                    "\(error)".contains("must be an integer from 60 through 86400"),
                     "\(rejected)"
                 )
             }
@@ -2594,7 +2596,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         let expiresAt = Date(timeIntervalSince1970: 4000)
         let projection = AgentSessionLinkAutoWakeSnoozeProjection(
             expiresAt: expiresAt,
-            remainingSeconds: 1200,
+            remainingSeconds: 18000,
             origin: .agent
         )
         fixture.host.queuedSnoozeMutationResults = [
@@ -2614,7 +2616,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             ([
                 "op": .string("snooze_auto_wake"),
                 "session_id": .string(fixture.target.sessionID.uuidString),
-                "duration_seconds": .int(1200)
+                "duration_seconds": .int(18000)
             ], "extended", true, false),
             ([
                 "op": .string("snooze_auto_wake"),
@@ -2654,7 +2656,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 let snooze = try XCTUnwrap(object["auto_wake_snooze"]?.objectValue, expectation.result)
                 XCTAssertEqual(Set(snooze.keys), ["expires_at", "remaining_seconds", "set_by"])
                 XCTAssertEqual(snooze["expires_at"]?.stringValue, AgentMCPToolHelpers.timestamp(expiresAt))
-                XCTAssertEqual(snooze["remaining_seconds"]?.intValue, 1200)
+                XCTAssertEqual(snooze["remaining_seconds"]?.intValue, 18000)
                 XCTAssertEqual(snooze["set_by"]?.stringValue, "agent")
             } else {
                 // A cleared lane reports the absence explicitly rather than dropping the field.
@@ -2675,7 +2677,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             fixture.host.snoozeMutationCalls.map(\.command),
             [
                 .set(durationSeconds: 600),
-                .set(durationSeconds: 1200),
+                .set(durationSeconds: 18000),
                 .set(durationSeconds: 60),
                 .clear,
                 .clear
@@ -2771,7 +2773,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         let expiresAt = Date(timeIntervalSince1970: 5000)
         fixture.host.snoozeProjectionResult = .success(AgentSessionLinkAutoWakeSnoozeProjection(
             expiresAt: expiresAt,
-            remainingSeconds: 540,
+            remainingSeconds: 17400,
             origin: .user
         ))
 
@@ -2782,7 +2784,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         let single = try XCTUnwrap(singleValue.objectValue)
         let snooze = try XCTUnwrap(single["auto_wake_snooze"]?.objectValue)
         XCTAssertEqual(snooze["expires_at"]?.stringValue, AgentMCPToolHelpers.timestamp(expiresAt))
-        XCTAssertEqual(snooze["remaining_seconds"]?.intValue, 540)
+        XCTAssertEqual(snooze["remaining_seconds"]?.intValue, 17400)
         XCTAssertEqual(snooze["set_by"]?.stringValue, "user")
         // Observer-local policy, so it is rendered beside the sanitized target snapshot and never
         // inside it: another observer of the same target must not see this.
