@@ -360,11 +360,13 @@ final class MCPHostRouteResources {
 
     func installPendingPolicy(_ receipt: MCPRunRoutingCleanupReceipt, connectionID: UUID, clientName: String?, tabID: UUID?) async -> PolicyContextInstallation? {
         guard !isClosing, !receipt.isConsumed, receipt.routeOwner === self else { return nil }
-        guard providerContextSource != nil else {
-            return runRouting?.install(self, receipt, connectionID, clientName, tabID)
+        // The receipt selects the originating adapter, even on a shared physical route.
+        if let resolve = receipt.providerContextResolver {
+            guard let context = await resolve() else { return nil }
+            return installProviderContext(context, receipt: receipt, connectionID: connectionID, tabID: tabID)
         }
-        guard let resolve = receipt.providerContextResolver, let context = await resolve() else { return nil }
-        return installProviderContext(context, receipt: receipt, connectionID: connectionID, tabID: tabID)
+        guard providerContextSource == nil else { return nil }
+        return runRouting?.install(self, receipt, connectionID, clientName, tabID)
     }
 
     func canCommitPendingPolicy(_ receipt: MCPRunRoutingCleanupReceipt, token: MCPRunRouteBindings.PendingPolicyToken) async -> Bool {
@@ -397,7 +399,7 @@ final class MCPHostRouteResources {
 
     func rollbackPendingPolicy(_ receipt: MCPRunRoutingCleanupReceipt, token: MCPRunRouteBindings.PendingPolicyToken, clientName: String?) -> MCPRunRouteBindings.PendingPolicyRollbackResult? {
         guard receipt.routeOwner === self else { return nil }
-        if providerContextSource != nil {
+        if receipt.providerContextResolver != nil {
             return rollbackProviderContext(receipt, token: token)
         }
         return runRouting?.rollback(self, token, clientName, receipt.routingWaitGeneration)
@@ -406,7 +408,7 @@ final class MCPHostRouteResources {
     func consumeCleanup(_ receipt: MCPRunRoutingCleanupReceipt) async {
         guard receipt.routeOwner === self else { return }
         runRouteBindings.consumeCleanup(receipt) { connectionID in
-            if providerContextSource != nil {
+            if receipt.providerContextResolver != nil {
                 removeProviderContext(connectionID: connectionID, runID: receipt.runID)
                 runRouteBindings.presentationWindowByConnection.removeValue(forKey: connectionID)
             } else {
