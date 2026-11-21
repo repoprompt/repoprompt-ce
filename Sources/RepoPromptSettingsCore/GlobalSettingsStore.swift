@@ -92,8 +92,8 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
 
     package func reloadFontScaleBodySizeFromDisk(normalize: (Double) -> Double) -> Double? {
         do {
-            let document = try fileStore.load()
-            guard let diskRawValue = document.scalarPreferences?.ui?.fontScaleBodySize else {
+            let document = try fileStore.readSnapshot()
+            guard let diskRawValue = document?.scalarPreferences?.ui?.fontScaleBodySize else {
                 return nil
             }
             let normalized = normalize(diskRawValue)
@@ -996,6 +996,16 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         }
     }
 
+    package func respectGitignore() -> Bool {
+        scalarPreferences.fileSystem?.respectGitignore ?? true
+    }
+
+    package func setRespectGitignore(_ enabled: Bool, commit: Bool = true) {
+        updateFileSystemScalar(commit: commit) { settings in
+            settings.respectGitignore = enabled
+        }
+    }
+
     package func respectRepoIgnore() -> Bool {
         scalarPreferences.fileSystem?.respectRepoIgnore ?? true
     }
@@ -1658,6 +1668,41 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         if commit {
             save()
         }
+    }
+
+    package enum SubscriptionCatalogPersistenceError: Error {
+        case settingsUnavailable
+        case writeFailed
+    }
+
+    package func subscriptionProfileCatalog() throws -> SubscriptionProfileCatalog {
+        guard persistenceBlockReason == nil, !isPendingPreservingMigrationRetry else {
+            throw SubscriptionCatalogPersistenceError.settingsUnavailable
+        }
+        return scalarPreferences.subscriptionProfileCatalog ?? SubscriptionProfileCatalog()
+    }
+
+    /// Commit via the canonical generation-checked settings writer before publishing the new catalog.
+    /// This changes metadata only; it conveys no provider authorization.
+    @discardableResult
+    package func updateSubscriptionProfileCatalog<Result>(
+        _ mutation: (inout SubscriptionProfileCatalog) throws -> Result
+    ) throws -> Result {
+        let before = try subscriptionProfileCatalog()
+        var catalog = before
+        let result = try mutation(&catalog)
+        guard catalog != before else { return result }
+
+        var preferences = scalarPreferences
+        preferences.subscriptionProfileCatalog = catalog
+        var document = makeDocument()
+        document.scalarPreferences = preferences
+        guard persist({ try fileStore.save(document) }) else {
+            throw SubscriptionCatalogPersistenceError.writeFailed
+        }
+        objectWillChange.send()
+        scalarPreferences = preferences
+        return result
     }
 
     // MARK: - Worktree Visual Identity

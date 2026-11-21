@@ -905,7 +905,7 @@ private struct MessageBubbleContent: View {
     private var debugContent: some View {
         CodeBlock(
             content: message.content,
-            allowTextInteraction: isLatestMessage && message.isFinalized
+            allowTextInteraction: message.isFinalized
         )
     }
 
@@ -913,7 +913,7 @@ private struct MessageBubbleContent: View {
         Text(message.content)
             .font(fontPreset.font)
             .textSelection(.enabled)
-            .allowsHitTesting(isLatestMessage && message.isFinalized)
+            .allowsHitTesting(message.isFinalized)
     }
 
     @ViewBuilder

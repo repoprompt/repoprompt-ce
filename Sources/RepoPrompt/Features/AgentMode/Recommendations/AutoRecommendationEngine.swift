@@ -381,26 +381,14 @@ final class AutoRecommendationEngine {
     ) -> AgentModelCatalog.NormalizedAgentSelection? {
         if let agentRaw = persistedAgentRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
            let agent = AgentProviderKind(rawValue: agentRaw),
-           AgentModelCatalog.AgentSelectionSurface.headless.allows(agent),
-           AgentModelCatalog.isAgentAvailable(agent, availability: availability)
+           contextBuilderSavedSelectionIssue(agentRaw: agentRaw, modelRaw: persistedModelRaw, availability: availability) == nil
         {
-            let modelRaw = persistedModelRaw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            if modelRaw.isEmpty {
-                return AgentModelCatalog.normalizeSelection(
-                    agentRaw: agent.rawValue,
-                    modelRaw: nil,
-                    availability: availability,
-                    surface: .headless
-                )
-            }
-            if isValidPersistedContextBuilderModel(modelRaw, for: agent, availability: availability) {
-                return AgentModelCatalog.normalizeSelection(
-                    agentRaw: agent.rawValue,
-                    modelRaw: modelRaw,
-                    availability: availability,
-                    surface: .headless
-                )
-            }
+            return AgentModelCatalog.normalizeSelection(
+                agentRaw: agent.rawValue,
+                modelRaw: persistedModelRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
+                availability: availability,
+                surface: .headless
+            )
         }
 
         let status = ProviderStatusSnapshot(
@@ -445,6 +433,25 @@ final class AutoRecommendationEngine {
             modelRaw: nil,
             availability: availability
         )
+    }
+
+    static func contextBuilderSavedSelectionIssue(
+        agentRaw: String?,
+        modelRaw: String?,
+        availability: AgentModelCatalog.AvailabilityContext
+    ) -> String? {
+        guard let raw = agentRaw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
+        guard let agent = AgentProviderKind(rawValue: raw) else { return "Unknown provider: \(raw)." }
+        switch AgentModelCatalog.AgentSelectionSurface.headless.eligibility(for: agent, availability: availability) {
+        case .unsupportedOperation:
+            return "\(agent.displayName) does not support Context Builder discovery."
+        case .unavailableModel:
+            return "\(agent.displayName) is not connected."
+        case .eligible:
+            let model = modelRaw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return model.isEmpty || isValidPersistedContextBuilderModel(model, for: agent, availability: availability)
+                ? nil : "The saved \(agent.displayName) model (\(model)) is unavailable."
+        }
     }
 
     private static func isValidPersistedContextBuilderModel(

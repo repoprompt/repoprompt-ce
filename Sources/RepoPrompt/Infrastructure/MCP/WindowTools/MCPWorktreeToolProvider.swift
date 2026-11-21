@@ -593,6 +593,50 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
 
     // MARK: - Binding
 
+    /// Freeze the writer and binding baseline before caller authorization can suspend. Legacy
+    /// windows also freeze their resource admission here; canonical writers never borrow it.
+    @MainActor
+    struct ExecutionAdmission {
+        private enum Source {
+            case legacy(Result<AgentSessionWorktreeRuntime.Admission, Error>)
+            case canonical(AgentSessionRuntimeHost)
+        }
+
+        private let command: AgentSessionRuntimeStore.Command
+        private let bindings: [AgentSessionWorktreeBinding]
+        private let source: Source
+
+        init(_ command: AgentSessionRuntimeStore.Command) {
+            self.command = command
+            bindings = command.writer.session.worktreeBindings
+            let scope = command.writer.scope
+            if let host = scope.executableHost, host.workspaceActivation != nil {
+                source = .canonical(host)
+            } else {
+                source = .legacy(Result { try scope.worktrees.admit(command) })
+            }
+        }
+
+        func resolve() async throws -> AgentSessionWorktreeRuntime.Admission {
+            guard command.isCurrent, command.writer.session.worktreeBindings == bindings else {
+                throw AgentSessionWorktreeRuntime.TransitionError.stale
+            }
+            let admission: AgentSessionWorktreeRuntime.Admission
+            switch source {
+            case let .legacy(legacy):
+                admission = try legacy.get()
+            case let .canonical(canonicalHost):
+                guard command.writer.scope.executableHost === canonicalHost else {
+                    throw AgentSessionWorktreeRuntime.TransitionError.stale
+                }
+                admission = try await canonicalHost.scope.worktrees.admitForExecution(command)
+            }
+            try admission.requireCurrent()
+            guard admission.bindings == bindings else { throw AgentSessionWorktreeRuntime.TransitionError.stale }
+            return admission
+        }
+    }
+
     private func applyBinding(
         request: BindingRequest,
         worktree: GitWorktreeDescriptor,
@@ -706,12 +750,26 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
 
     /// The mutation journal may suspend too; never carry an entry-only permission across it.
     private func commitBindingMutation(_ request: BindingRequest) async throws {
+        try await request.admission.resources.validatePlacement?()
         try await request.authority.revalidate()
         try request.admission.requireCurrent()
         try await MCPDomainMutationCommitContext.willCommit()
+        try await Self.commitAfterBindingAuthorization(
+            validatePlacement: request.admission.resources.validatePlacement,
+            revalidateAuthority: { try await request.authority.revalidate() },
+            commit: { try request.authority.commit { try request.admission.requireCurrent() } }
+        )
+    }
+
+    static func commitAfterBindingAuthorization(
+        validatePlacement: (@MainActor () async throws -> Void)?,
+        revalidateAuthority: @MainActor () async throws -> Void,
+        commit: @MainActor () throws -> Void
+    ) async throws {
         do {
-            try await request.authority.revalidate()
-            try request.authority.commit { try request.admission.requireCurrent() }
+            try await revalidateAuthority()
+            try await validatePlacement?()
+            try commit()
         } catch {
             throw DomainMutationRefusedBeforeEffects(error)
         }
@@ -892,7 +950,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         let targetWindow = try dependencies.execution.requireTargetWindow()
         let agentModeVM = targetWindow.agentModeViewModel
         // Capture before authorization suspends, but do not disclose liveness until it succeeds.
-        let capturedAdmission = agentModeVM.admitWorktreeTransition(forSessionID: sessionID)
+        let capturedCommand = try? agentModeVM.runtimeCommand(sessionID: sessionID)
+        let capturedAdmission = capturedCommand.map(ExecutionAdmission.init)
         let authority: AgentSessionTargetOperationGuard.WorktreeBindingAuthority = if let explicitSessionID {
             // A caller-supplied session UUID is a target reference, not authority over that session.
             try await AgentSessionTargetOperationGuard.requireWorktreeBindingAuthority(
@@ -932,9 +991,20 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         } else {
             nil
         }
-        guard let admission = capturedAdmission else {
+        guard let capturedAdmission else {
             throw MCPError.invalidParams("The requested agent session is not currently available.")
         }
+        let admission: AgentSessionWorktreeRuntime.Admission
+        do {
+            admission = try await capturedAdmission.resolve()
+        } catch {
+            try await authority.revalidate()
+            if case AgentSessionWorktreeRuntime.TransitionError.unavailable = error {
+                throw MCPError.invalidParams("The requested agent session is not currently available.")
+            }
+            throw error
+        }
+        try await authority.revalidate()
         try admission.requireCurrent()
         return BindingRequest(sessionID: sessionID, invocation: invocation, authority: authority, admission: admission, agentModeVM: agentModeVM)
     }

@@ -1363,7 +1363,8 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             return nil
         }
         let command = try host.scope.admit(session: f.session)
-        let admission = try await host.scope.worktrees.admitForExecution(command)
+        let captured = MCPWorktreeToolProvider.ExecutionAdmission(command)
+        let admission = try await captured.resolve()
         XCTAssertEqual(admission.command.identity, command.identity)
         XCTAssertNotNil(admission.resources.store)
         try admission.requireCurrent()
@@ -1379,19 +1380,34 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         XCTAssertEqual(result.disposition, .applied)
         let validatePlacement = try XCTUnwrap(admission.resources.validatePlacement)
         try await validatePlacement()
+        let afterPromptEdit = try await captured.resolve()
+        XCTAssertEqual(afterPromptEdit.command.identity, command.identity)
 
         let latest = await authority.canonicalWorkspaceSnapshot(command.identity.workspaceID)
         let edited = try XCTUnwrap(latest)
         changed.composeTabs[index].activeAgentSessionID = UUID()
-        let displaced = try await authority.replaceWorkingFailClosed(
-            changed, fileURL: edited.document.fileURL, expectedWorkspaceRevision: edited.revisions.workingRevision
-        )
-        XCTAssertEqual(displaced.disposition, .applied)
-        XCTAssertTrue(command.isCurrent, "The old writer can still exist while canonical placement changes")
         do {
-            try await validatePlacement()
-            XCTFail("A captured worktree operation must refuse a successor carrier")
-        } catch AgentSessionWorktreeRuntime.TransitionError.stale {}
+            try await MCPWorktreeToolProvider.commitAfterBindingAuthorization(
+                validatePlacement: validatePlacement,
+                revalidateAuthority: {
+                    let displaced = try await authority.replaceWorkingFailClosed(
+                        changed, fileURL: edited.document.fileURL, expectedWorkspaceRevision: edited.revisions.workingRevision
+                    )
+                    XCTAssertEqual(displaced.disposition, .applied)
+                    XCTAssertTrue(command.isCurrent, "The old writer can still exist while canonical placement changes")
+                },
+                commit: { XCTFail("A captured worktree operation must not commit against a successor carrier") }
+            )
+            XCTFail("Expected placement to be refused before effects")
+        } catch let refusal as DomainMutationRefusedBeforeEffects {
+            guard case AgentSessionWorktreeRuntime.TransitionError.stale = refusal.underlying else {
+                return XCTFail("Unexpected refusal: \(refusal.underlying)")
+            }
+        }
+        do {
+            _ = try await captured.resolve()
+            XCTFail("An MCP admission captured before authorization must not follow a successor carrier")
+        } catch AgentHostWorkspaceResources.Failure.contextUnavailable {}
         XCTAssertTrue(f.session.worktreeBindings.isEmpty)
     }
 
@@ -3348,7 +3364,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             render: AgentSessionLinkPrompts.rendered
         ))
         XCTAssertEqual(reOwed.laneGuidanceMode, .full)
-        XCTAssertTrue(reOwed.fragment.contains("Guidance revision 14 supersedes"))
+        XCTAssertTrue(reOwed.fragment.contains("Guidance revision 15 supersedes"))
         XCTAssertEqual(reOwed.inventoryGuidanceRevision, AgentSessionLinkPrompts.currentInventoryGuidanceRevision)
         XCTAssertTrue(reOwed.fragment.contains("`compact`"))
         XCTAssertTrue(reOwed.fragment.contains("`stop`"))
@@ -6336,6 +6352,29 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
 
     /// The cap is a per-operation remaining horizon, never a lifetime cap, and the origin follows the
     /// deadline rather than the caller.
+    func testLongAgentSnoozeAndUserDeadlineRemainExact() throws {
+        let fixture = try makeFixture()
+        let clock = installSnoozeClock(fixture)
+        try publishInventory(fixture, revision: 1)
+        fixture.session.oversight.autoWakeOnUpdates = true
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1, targetIndices: [], laneIndices: [0], selectedTargetIndices: [0])
+        let agent = try requireSnoozeSuccess(mutateSnooze(fixture, endpoint: endpoint, command: .set(durationSeconds: 18000), origin: .agent))
+        XCTAssertEqual(agent.projection?.remainingSeconds, 18000)
+        XCTAssertFalse(AgentSessionLinkAutoWakeSnooze.uiDurationSeconds.contains(18000))
+        clock.advanceWithoutFiring(seconds: 600)
+        let remaining = try requireSnoozeSuccess(fixture.viewModel.linkExecutionRuntime.agentSessionLinkAutoWakeSnoozeProjection(endpoint: endpoint, targetSessionID: Self.targetID(0), expectedReference: Self.laneReference(0)))
+        XCTAssertEqual(remaining?.remainingSeconds, 17400)
+        let user = try requireSnoozeSuccess(mutateSnooze(fixture, endpoint: endpoint, command: .set(durationSeconds: 86400), origin: .user))
+        XCTAssertEqual(user.projection?.remainingSeconds, 86400)
+        let shorter = try requireSnoozeSuccess(mutateSnooze(fixture, endpoint: endpoint, command: .set(durationSeconds: 60), origin: .agent))
+        XCTAssertEqual(shorter.change, .alreadySnoozed)
+        XCTAssertEqual(shorter.projection?.remainingSeconds, 86400)
+        XCTAssertEqual(shorter.projection?.origin, .user)
+        clock.advanceWithoutFiring(seconds: 86400)
+        XCTAssertNil(try requireSnoozeSuccess(fixture.viewModel.linkExecutionRuntime.agentSessionLinkAutoWakeSnoozeProjection(endpoint: endpoint, targetSessionID: Self.targetID(0), expectedReference: Self.laneReference(0))))
+    }
+
     func testEachOperationCapsTheHorizonWhileRepeatedOperationsExtendIndefinitely() throws {
         let fixture = try makeFixture()
         let clock = installSnoozeClock(fixture)
@@ -6356,7 +6395,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
 
         XCTAssertEqual(AgentSessionLinkAutoWakeSnooze.defaultDurationSeconds, 600)
         XCTAssertEqual(AgentSessionLinkAutoWakeSnooze.minimumDurationSeconds, 60)
-        XCTAssertEqual(AgentSessionLinkAutoWakeSnooze.maximumDurationSeconds, 3600)
+        XCTAssertEqual(AgentSessionLinkAutoWakeSnooze.maximumDurationSeconds, 86400)
 
         let first = try requireSnoozeSuccess(mutateSnooze(
             fixture,
@@ -6382,25 +6421,25 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         let extended = try requireSnoozeSuccess(mutateSnooze(
             fixture,
             endpoint: endpoint,
-            command: .set(durationSeconds: 3600),
+            command: .set(durationSeconds: 86400),
             origin: .agent
         ))
         XCTAssertEqual(extended.change, .extended)
-        XCTAssertEqual(extended.projection?.remainingSeconds, 3600)
+        XCTAssertEqual(extended.projection?.remainingSeconds, 86400)
         XCTAssertEqual(extended.projection?.origin, .agent, "moving the deadline takes over the origin")
 
         clock.advanceWithoutFiring(seconds: 300)
         let againExtended = try requireSnoozeSuccess(mutateSnooze(
             fixture,
             endpoint: endpoint,
-            command: .set(durationSeconds: 3600),
+            command: .set(durationSeconds: 86400),
             origin: .user
         ))
         XCTAssertEqual(againExtended.change, .extended)
         XCTAssertEqual(
             againExtended.projection?.remainingSeconds,
-            3600,
-            "no single operation ever leaves more than an hour on the clock"
+            86400,
+            "no single operation ever leaves more than 24 hours on the clock"
         )
         XCTAssertEqual(againExtended.projection?.origin, .user)
 
@@ -6419,7 +6458,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             laneIndex: 1,
             command: .set(durationSeconds: 100_000)
         ))
-        XCTAssertEqual(clampedHigh.projection?.remainingSeconds, 3600)
+        XCTAssertEqual(clampedHigh.projection?.remainingSeconds, 86400)
     }
 
     func testSnoozeMutationRefusesAStaleGenerationWrongTargetOrRetiredObserver() throws {

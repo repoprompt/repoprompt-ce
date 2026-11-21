@@ -29,6 +29,64 @@ final class GlobalSettingsOwnershipTests: XCTestCase {
         XCTAssertEqual(try GlobalSettingsFileStore(fileURL: url).load().scalarPreferences?.ui?.experimentalCommandCenter, false)
     }
 
+    func testSubscriptionCatalogSurvivesUnrelatedWriteAndRejectsStaleWriter() throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("globalSettings.json")
+        let suite = "SubscriptionCatalogPersistence.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let canonical = GlobalSettingsFileStore(fileURL: url)
+        try canonical.save(document("original"))
+        let first = GlobalSettingsStore(defaults: defaults, fileStore: canonical)
+        let stale = GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: url))
+        XCTAssertEqual(try first.subscriptionProfileCatalog().defaultSelection(for: .codex), .legacy(.codex))
+        XCTAssertNil(try canonical.load().scalarPreferences?.subscriptionProfileCatalog)
+        let id = try first.updateSubscriptionProfileCatalog { catalog in
+            let id = try catalog.add(backend: .codex, label: "Work")
+            try catalog.setDefault(.profile(id))
+            return id
+        }
+        let disk = try canonical.load()
+        XCTAssertEqual(disk.schemaVersion, GlobalSettingsDocument.subscriptionProfileCatalogSchemaVersion)
+        XCTAssertEqual(GlobalSettingsFileStore.preservationBlockReason(
+            schemaVersion: disk.schemaVersion, schemaLineage: disk.schemaLineage, supportedVersion: 14
+        ), .unsupportedFutureSchema(onDiskVersion: 15, supportedVersion: 14))
+        let winner = try Data(contentsOf: url)
+        // Even a projection that finds no font must not refresh the writer's generation.
+        XCTAssertNil(stale.reloadFontScaleBodySizeFromDisk(normalize: { $0 }))
+        XCTAssertThrowsError(try stale.updateSubscriptionProfileCatalog {
+            try $0.add(backend: .claudeCode, label: "Stale edit")
+        })
+        XCTAssertThrowsError(try stale.subscriptionProfileCatalog())
+        XCTAssertEqual(try Data(contentsOf: url), winner)
+
+        let fresh = GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: url))
+        fresh.updateScalarPreferences(commit: true) { $0.notifications = .init() }
+        let reloaded = GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: url))
+        XCTAssertEqual(try reloaded.subscriptionProfileCatalog().defaultSelection(for: .codex), .profile(id))
+        XCTAssertEqual(try reloaded.subscriptionProfileCatalog().profiles.map(\.id), [id])
+    }
+
+    func testInvalidSubscriptionCatalogBlocksStartupWithoutReplacingBytes() throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("globalSettings.json")
+        var raw = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded(document("original"))) as? [String: Any])
+        raw["schemaVersion"] = GlobalSettingsDocument.subscriptionProfileCatalogSchemaVersion
+        raw["scalarPreferences"] = ["subscriptionProfileCatalog": ["version": 99]]
+        let bytes = try JSONSerialization.data(withJSONObject: raw)
+        try bytes.write(to: url)
+
+        let store = GlobalSettingsStore(fileStore: GlobalSettingsFileStore(fileURL: url))
+        XCTAssertEqual(store.persistenceBlockReason, .corruptUnrecoverable)
+        XCTAssertThrowsError(try store.subscriptionProfileCatalog())
+        XCTAssertThrowsError(try store.updateSubscriptionProfileCatalog {
+            try $0.add(backend: .codex, label: "Work")
+        })
+        XCTAssertEqual(try Data(contentsOf: url), bytes)
+    }
+
     func testTwoStoresRejectStaleSaveAndMigrationThenReloadAllowsFreshEdit() throws {
         let root = try makeRoot()
         defer { try? FileManager.default.removeItem(at: root) }

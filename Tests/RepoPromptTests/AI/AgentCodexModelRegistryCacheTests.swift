@@ -1,4 +1,3 @@
-import Darwin
 import Foundation
 import RepoPromptAIContracts
 @testable import RepoPromptApp
@@ -125,7 +124,9 @@ final class CodexModelPollingServiceTests: XCTestCase {
         let failure: (any Error)?
 
         func listModels(limit _: Int) async throws -> [CodexAppServerClient.RemoteModel] {
-            if let failure { throw failure }
+            if let failure {
+                throw failure
+            }
             return models
         }
 
@@ -277,36 +278,6 @@ final class CodexMapperMemoTests: XCTestCase {
         }
     }
 
-    func testRepeatedMappingAndPickerTiming() throws {
-        let records = records()
-        let key = "CodexDynamicModelRecords"
-        let defaults = UserDefaults.standard
-        let previous = defaults.object(forKey: key)
-        defer { if let previous { defaults.set(previous, forKey: key) } else { defaults.removeObject(forKey: key) } }
-        try defaults.set(JSONEncoder().encode(records), forKey: key)
-        func measure(_ name: String, _ body: () -> Void) {
-            let start = ProcessInfo.processInfo.systemUptime
-            let cpu = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID)
-            body()
-            print("CODEX_BASELINE \(name) wall_ms=\((ProcessInfo.processInfo.systemUptime - start) * 1000) cpu_ms=\(Double(clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - cpu) / 1_000_000)")
-        }
-        measure("mapper cold") { _ = CodexDynamicModelMapper.options(from: records) }
-        measure("picker cold") { _ = CodexAIModelCatalog.modelsForPicker(staticModels: []) }
-        for pair in 0 ..< 5 {
-            for cached in pair.isMultiple(of: 2) ? [false, true] : [true, false] {
-                measure(cached ? "cached 37" : "mapper repeated 37") {
-                    for _ in 0 ..< 37 {
-                        if cached { _ = CodexDynamicModelStore.modelOptions(defaults: defaults) }
-                        else { _ = CodexDynamicModelMapper.options(from: records) }
-                    }
-                }
-            }
-        }
-        measure("picker repeated 37") { for _ in 0 ..< 37 {
-            _ = CodexAIModelCatalog.modelsForPicker(staticModels: [])
-        } }
-    }
-
     func testPayloadTransitionsAndConcurrentReplacement() throws {
         let suiteA = "CodexMapperMemoTests-A-\(UUID())"
         let suiteB = "CodexMapperMemoTests-B-\(UUID())"
@@ -353,32 +324,35 @@ final class CodexMapperMemoTests: XCTestCase {
         var mismatches = 0
         DispatchQueue.concurrentPerform(iterations: 40) { index in
             let result = CodexDynamicModelStore.modelOptions(defaults: index.isMultiple(of: 2) ? a : b)
-            if result != (index.isMultiple(of: 2) ? expectedA : expectedB) { lock.lock()
+            if result != (index.isMultiple(of: 2) ? expectedA : expectedB) {
+                lock.lock()
                 mismatches += 1
                 lock.unlock()
             }
         }
         XCTAssertEqual(mismatches, 0)
-        // Force a miss, then replace the exact store payload during computation.
-        let capturedData = try JSONEncoder().encode([duplicate] + original)
-        a.set(capturedData, forKey: key)
-        let captured = CodexDynamicModelStore.test_modelOptions(defaults: a) { a.set(dataB, forKey: key) }
-        XCTAssertEqual(captured, CodexDynamicModelMapper.options(from: [duplicate] + original))
-        a.set(capturedData, forKey: key) // No store read between replacement and restoration.
-        var recomputed = false
-        XCTAssertEqual(CodexDynamicModelStore.test_modelOptions(defaults: a) { recomputed = true }, captured)
-        XCTAssertTrue(recomputed, "A result computed for a replaced payload must not be installed")
-        a.set(dataB, forKey: key)
-        XCTAssertEqual(CodexDynamicModelStore.modelOptions(defaults: a), expectedB)
-        recomputed = false
-        XCTAssertEqual(CodexDynamicModelStore.test_modelOptions(defaults: a) { recomputed = true }, expectedB)
-        XCTAssertFalse(recomputed)
+        #if DEBUG
+            // Force a miss, then replace the exact store payload during computation.
+            let capturedData = try JSONEncoder().encode([duplicate] + original)
+            a.set(capturedData, forKey: key)
+            let captured = CodexDynamicModelStore.test_modelOptions(defaults: a) { a.set(dataB, forKey: key) }
+            XCTAssertEqual(captured, CodexDynamicModelMapper.options(from: [duplicate] + original))
+            a.set(capturedData, forKey: key) // No store read between replacement and restoration.
+            var recomputed = false
+            XCTAssertEqual(CodexDynamicModelStore.test_modelOptions(defaults: a) { recomputed = true }, captured)
+            XCTAssertTrue(recomputed, "A result computed for a replaced payload must not be installed")
+            a.set(dataB, forKey: key)
+            XCTAssertEqual(CodexDynamicModelStore.modelOptions(defaults: a), expectedB)
+            recomputed = false
+            XCTAssertEqual(CodexDynamicModelStore.test_modelOptions(defaults: a) { recomputed = true }, expectedB)
+            XCTAssertFalse(recomputed)
 
-        let oversized = [CodexDynamicModelRecord(id: "large", model: "large", displayName: "large", description: String(repeating: "x", count: 1_050_000), isDefault: false)]
-        try a.set(JSONEncoder().encode(oversized), forKey: key)
-        _ = CodexDynamicModelStore.modelOptions(defaults: a)
-        recomputed = false
-        _ = CodexDynamicModelStore.test_modelOptions(defaults: a) { recomputed = true }
-        XCTAssertTrue(recomputed)
+            let oversized = [CodexDynamicModelRecord(id: "large", model: "large", displayName: "large", description: String(repeating: "x", count: 1_050_000), isDefault: false)]
+            try a.set(JSONEncoder().encode(oversized), forKey: key)
+            _ = CodexDynamicModelStore.modelOptions(defaults: a)
+            recomputed = false
+            _ = CodexDynamicModelStore.test_modelOptions(defaults: a) { recomputed = true }
+            XCTAssertTrue(recomputed)
+        #endif
     }
 }

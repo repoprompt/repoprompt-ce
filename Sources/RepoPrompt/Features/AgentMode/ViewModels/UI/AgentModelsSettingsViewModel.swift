@@ -248,6 +248,18 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         )
     }
 
+    var contextBuilderSavedSelectionWarning: String? {
+        let agentRaw = profileSnapshot.contextBuilderAgentRaw
+        let modelRaw = agentRaw.flatMap { profileSnapshot.contextBuilderModelsByAgent?[$0] }
+        guard let issue = AutoRecommendationEngine.contextBuilderSavedSelectionIssue(
+            agentRaw: agentRaw,
+            modelRaw: modelRaw,
+            availability: apiSettingsVM.contextBuilderRestorationAvailabilityContext
+        ) else { return nil }
+        let saved = [agentRaw, modelRaw].compactMap(\.self).joined(separator: " · ")
+        return "Saved choice: \(saved). \(issue) Context Builder can use a fallback without replacing the saved choice."
+    }
+
     var selectedContextBuilderSelection: AgentModelCatalog.NormalizedAgentSelection {
         let selectedAgentRaw = profileSnapshot.contextBuilderAgentRaw
         let selectedModelRaw = selectedAgentRaw.flatMap { profileSnapshot.contextBuilderModelsByAgent?[$0] }
@@ -328,7 +340,7 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         AgentRepromptModelPolicy.resolve(
             selection: repromptModelDraft.isEmpty ? nil : repromptModelDraft,
             currentProvider: repromptCurrentProvider(),
-            configured: apiSettingsVM.availableModels.filter { AgentRepromptModelPolicy.supportsSideCall($0) && $0.canStream }
+            configured: apiSettingsVM.availableModels
         )
     }
 
