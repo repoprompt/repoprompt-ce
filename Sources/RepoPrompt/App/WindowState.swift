@@ -3183,7 +3183,11 @@ class WindowState: ObservableObject {
 
     func tearDown() async {
         beginClose()
-        if !WindowStatesManager.shared.isTerminating { await agentModeViewModel.joinOracleBackgroundWindowDrain() }
+        // The retained host drain joins its own Oracle producers. Waiting here would delay
+        // starting that drain and skip its bounded observation when the window closes.
+        if !WindowStatesManager.shared.isTerminating, agentModeViewModel.runtimeHost.workspaceActivation == nil {
+            await agentModeViewModel.joinOracleBackgroundWindowDrain()
+        }
         // Join cancelled startup before saves/root drains so it cannot publish or hydrate late.
         await workspaceManager.awaitInitialWorkspaceActivationCompletion()
         await workspaceManager.awaitPostSwitchGitDataLoadShutdown()
