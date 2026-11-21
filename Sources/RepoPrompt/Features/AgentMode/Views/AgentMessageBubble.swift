@@ -602,7 +602,10 @@ struct AgentMessageBubble: View {
     // MARK: - User Bubble
 
     private var userBubble: some View {
-        HStack {
+        let displayText = AgentModeViewModel.mcpResidentTaskDisplayText(
+            item.text, origin: item.userInputOrigin, attribution: item.crossSessionAttribution
+        )
+        return HStack {
             Spacer(minLength: 60)
 
             VStack(alignment: .trailing, spacing: 6) {
@@ -638,7 +641,7 @@ struct AgentMessageBubble: View {
                         TaggedFilesBadge(attachments: item.taggedFileAttachments)
                     }
                     MarkdownTextView(
-                        text: item.text,
+                        text: displayText,
                         isMarkdown: true,
                         allowInteraction: true,
                         bareURLLinkificationPolicy: .httpHTTPSOnly
@@ -649,7 +652,7 @@ struct AgentMessageBubble: View {
                 .background(BubbleColors.lightBlue)
                 .cornerRadius(20)
 
-                MessageFooterStrip(text: item.text, timestamp: item.timestamp, isTrailing: true, handoffConfig: handoffConfig, hasHandoffButton: handoffConfig != nil)
+                MessageFooterStrip(text: displayText, timestamp: item.timestamp, isTrailing: true, handoffConfig: handoffConfig, hasHandoffButton: handoffConfig != nil)
             }
         }
     }

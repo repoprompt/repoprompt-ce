@@ -1318,6 +1318,27 @@ final class RemoteProducerParityTests: XCTestCase {
         XCTAssertFalse(descriptors.contains { $0.displayName == "Director" })
     }
 
+    func testClientTaskAttachmentShowsMessageInsteadOfProviderMarkup() throws {
+        let text = "Look at <this> & keep &lt; literal."
+        let frame = AgentModeViewModel.mcpResidentTaskFrame(text)
+        let photo = AgentFileAttachment(source: .localFile(path: "/fixture/photo.jpg"), title: "Photo", kind: .image)
+        let turn = AgentTranscriptTurn(
+            id: UUID(),
+            request: AgentTranscriptRequestAnchor(from: .user(frame, attachments: [photo])),
+            startedAt: Date(timeIntervalSinceReferenceDate: 10)
+        )
+        let projected = WindowRemoteReadService.project(
+            transcript: AgentTranscript(turns: [turn], nextSequenceIndex: 1), includeDetails: false
+        )
+        let item = try XCTUnwrap(projected.first)
+        XCTAssertEqual(item.text, text)
+        XCTAssertEqual(item.attachments?.first?.id, photo.id)
+        XCTAssertEqual(turn.request?.text, frame)
+        XCTAssertEqual(AgentModeViewModel.mcpResidentTaskDisplayText(frame, origin: .localComposer, attribution: nil), frame)
+        let nested = AgentModeViewModel.mcpResidentTaskFrame(frame)
+        XCTAssertEqual(AgentModeViewModel.mcpResidentTaskDisplayText(nested, origin: nil, attribution: nil), frame)
+    }
+
     func testSavedTranscriptCarriesModelAndControlsWithoutASnapshotSession() throws {
         let capabilities = AgentSessionSelectionCapabilities(
             allowedAgentRawValues: ["codexExec"],

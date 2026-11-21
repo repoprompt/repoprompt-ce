@@ -401,6 +401,9 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
         var projected: [RemoteTranscriptItem] = []
         for turn in transcript.turns {
             if let request = turn.request {
+                let displayText = AgentModeViewModel.mcpResidentTaskDisplayText(
+                    request.text, origin: request.userInputOrigin, attribution: request.crossSessionAttribution
+                )
                 projected.append(
                     RemoteTranscriptItem(
                         id: request.id,
@@ -410,7 +413,7 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
                         kind: .request,
                         semanticKind: .userRequest,
                         role: "user",
-                        text: sanitizeVisibleText(request.text),
+                        text: sanitizeVisibleText(displayText),
                         summaryOnly: turn.retentionTier != .full,
                         detailAvailable: false,
                         attachments: projectAttachments(request.attachments) { thumbnail(request.id, $0) }
