@@ -4,8 +4,8 @@ import RepoPromptDomainRuntime
 import RepoPromptMCPServer
 
 extension MCPHostRouteResources {
-    /// The existing complete catalog consumes this binder for both route kinds. Unmigrated
-    /// physical capabilities retain their original preparation and presenter requirements.
+    /// The existing catalog consumes this binder for both route kinds. Only explicitly migrated
+    /// capabilities may execute independently; unmigrated tools remain physical-window only.
     func makeToolBinder(
         service: MCPService,
         validateInvocation: @escaping MCPToolInvocationValidator,
@@ -29,9 +29,10 @@ extension MCPHostRouteResources {
     ) async throws -> Value {
         // Capture exactly once, before preparation or provider work can suspend.
         let context = try service.captureInvocationContext(toolName: name, expectedWindowID: identity.routeID)
-        if identity.kind == .independent,
-           name == MCPWindowToolName.history || independentFileReads.contains(name)
-        {
+        if identity.kind == .independent {
+            guard name == MCPWindowToolName.history || independentFileReads.contains(name) else {
+                throw MCPError.invalidRequest("Tool \(name) is not supported by the independent Agent session route")
+            }
             // Only explicitly migrated read capabilities may use route-owned preparation.
             // A future freshness requirement must not be silently bypassed here.
             guard case .providerManaged = freshness else {
