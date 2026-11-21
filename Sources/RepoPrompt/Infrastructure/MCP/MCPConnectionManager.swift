@@ -9407,9 +9407,11 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         requiresExpectedAgentPID: Bool = false,
         prunesOnlyAfterSettlement: Bool = false,
         routingOwner: MCPHostRouteResources? = nil,
+        originatingContextSource: MCPHostRouteResources.ProviderContextSource? = nil,
         routingWaitGeneration: UUID? = nil,
         reusingProcess: MCPRunRoutingProcessRegistration? = nil
     ) async -> MCPRunRoutingCleanupReceipt? {
+        guard originatingContextSource == nil || (routingOwner?.identity.routeID == windowID && runID != nil) else { return nil }
         let storageKey = Self.clientStorageKey(clientName)
         pruneExpiredPolicies(for: clientName)
         let sanitizedRestricted = Self.sanitizedRoutingRestrictedTools(restrictedTools)
@@ -9440,7 +9442,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             let previousGeneration = runRoutingAuthorityGenerationByRunID[runID, default: 0]
             let providerContextResolver: MCPHostRouteResources.ProviderContextResolver?
             if let routingOwner {
-                let admission = await routingOwner.admitProviderContext(runID: runID, tabID: tabID)
+                let admission = await routingOwner.admitProviderContext(runID: runID, tabID: tabID, originatingContextSource: originatingContextSource)
                 guard runRoutingAuthorityGenerationByRunID[runID, default: 0] == previousGeneration else { return nil }
                 switch admission {
                 case .compatibility: providerContextResolver = nil
