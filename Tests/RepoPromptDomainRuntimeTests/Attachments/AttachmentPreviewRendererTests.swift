@@ -52,7 +52,7 @@ final class AttachmentPreviewRendererTests: XCTestCase {
         CGImageDestinationAddImage(destination, image, nil)
         XCTAssertTrue(CGImageDestinationFinalize(destination))
         XCTAssertNil(try AttachmentPreviewRenderer.jpegData(fromFileAt: url, kind: .image))
-        let jpeg = try XCTUnwrap(try AttachmentPreviewRenderer.jpegData(fromRetainedPhotoAt: url))
+        let jpeg = try XCTUnwrap(try AttachmentPreviewRenderer.jpegData(fromRetainedPhoto: Data(contentsOf: url)))
         let source = try XCTUnwrap(CGImageSourceCreateWithData(jpeg as CFData, nil))
         let thumbnail = try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil))
         XCTAssertEqual(max(thumbnail.width, thumbnail.height), AttachmentPreviewRenderer.maxPixelSize)

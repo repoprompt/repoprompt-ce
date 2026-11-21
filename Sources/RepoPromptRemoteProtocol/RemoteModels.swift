@@ -425,7 +425,6 @@ public struct RemoteCatalogMetadata: Codable, Sendable, Equatable {
     public let supportsStartSelection: Bool
     public let supportsSessionConfiguration: Bool
     public let supportsAttachments: Bool?
-    public let supportsImageAttachments: Bool?
 
     public init(
         defaultAgentID: String? = nil,
@@ -433,8 +432,7 @@ public struct RemoteCatalogMetadata: Codable, Sendable, Equatable {
         toolCatalog: RemoteToolCatalog? = nil,
         supportsStartSelection: Bool = false,
         supportsSessionConfiguration: Bool = false,
-        supportsAttachments: Bool? = nil,
-        supportsImageAttachments: Bool? = nil
+        supportsAttachments: Bool? = nil
     ) {
         self.defaultAgentID = defaultAgentID
         self.defaultSelection = defaultSelection
@@ -442,7 +440,6 @@ public struct RemoteCatalogMetadata: Codable, Sendable, Equatable {
         self.supportsStartSelection = supportsStartSelection
         self.supportsSessionConfiguration = supportsSessionConfiguration
         self.supportsAttachments = supportsAttachments
-        self.supportsImageAttachments = supportsImageAttachments
     }
 }
 
@@ -1319,13 +1316,10 @@ public struct RemoteTranscriptAttachment: Codable, Sendable, Equatable, Identifi
     public let id: UUID
     public let name: String
     public let isImage: Bool
-    public let thumbnail: Data?
-
-    public init(id: UUID, name: String, isImage: Bool, thumbnail: Data? = nil) {
+    public init(id: UUID, name: String, isImage: Bool) {
         self.id = id
         self.name = name
         self.isImage = isImage
-        self.thumbnail = thumbnail
     }
 }
 

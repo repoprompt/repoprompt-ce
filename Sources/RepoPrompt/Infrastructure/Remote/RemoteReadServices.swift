@@ -112,16 +112,10 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
         var persistedSavedAt: Date?
         var liveMutationRevision: UInt64?
         var liveOwnerID: ObjectIdentifier?
-        var retainedAttachmentRoot: URL?
         var chatConfiguration: RemoteChatConfiguration?
         let includesChatConfiguration = switch paging {
         case .recentBackward(before: nil), .legacyForward(afterSequenceIndex: nil): true
         default: false
-        }
-        let previewItemID: UUID? = if case let .exactItem(itemID) = paging, includeDetails {
-            itemID
-        } else {
-            nil
         }
 
         for context in contexts {
@@ -140,11 +134,6 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
                         reasoningEffort: liveSession.selectedReasoningEffortRaw,
                         capabilities: capabilities
                     )
-                }
-                if previewItemID != nil,
-                   let workspace = context.workspaceManager.workspace(withID: liveSession.persistentSessionBindingIdentity?.workspaceID)
-                {
-                    retainedAttachmentRoot = context.agentMode.sessionAttachmentsRootURL(for: workspace)
                 }
                 break
             }
@@ -170,9 +159,6 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
                             reasoningEffort: persisted.agentReasoningEffort, capabilities: capabilities
                         )
                     }
-                    if previewItemID != nil {
-                        retainedAttachmentRoot = context.agentMode.sessionAttachmentsRootURL(for: workspace)
-                    }
                     break
                 }
             }
@@ -195,26 +181,7 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
         } else {
             nil
         }
-        let thumbnails: [UUID: Data]
-        if let previewItemID, let retainedAttachmentRoot {
-            let attachments = Self.imageAttachments(in: transcript, itemID: previewItemID)
-                .prefix(RemoteAttachmentLimits.maxCount).filter { $0.kind == .image }.map(\.id)
-            let worker = Task.detached(priority: .userInitiated) {
-                try Self.retainedPhotoThumbnails(
-                    attachmentIDs: attachments, sessionID: sessionID, root: retainedAttachmentRoot
-                )
-            }
-            thumbnails = try await withTaskCancellationHandler {
-                try await worker.value
-            } onCancel: {
-                worker.cancel()
-            }
-        } else {
-            thumbnails = [:]
-        }
-        let allItems = Self.project(transcript: transcript, includeDetails: includeDetails) { id, attachment in
-            id == previewItemID ? thumbnails[attachment.id] : nil
-        }
+        let allItems = Self.project(transcript: transcript, includeDetails: includeDetails)
         if case let .exactItem(itemID) = paging,
            !allItems.contains(where: { $0.id == itemID })
         {
@@ -255,24 +222,6 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
             }
         }
         return []
-    }
-
-    private nonisolated static func retainedPhotoThumbnails(
-        attachmentIDs: [UUID],
-        sessionID: UUID,
-        root: URL
-    ) throws -> [UUID: Data] {
-        let store = AgentSessionAttachmentStore(rootURL: root)
-        var thumbnails: [UUID: Data] = [:]
-        for id in attachmentIDs.prefix(RemoteAttachmentLimits.maxCount) {
-            try Task.checkCancellation()
-            guard let url = store.locateRetainedFile(attachmentID: id, sessionID: sessionID),
-                  let thumbnail = try AttachmentPreviewRenderer.jpegData(fromRetainedPhotoAt: url),
-                  thumbnail.count <= 128 * 1024
-            else { continue }
-            thumbnails[id] = thumbnail
-        }
-        return thumbnails
     }
 
     func imageAttachment(_ request: RemoteImageAttachmentRequest) async throws -> RemoteImageAttachmentChunk {
@@ -519,11 +468,7 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
         }
     }
 
-    static func project(
-        transcript: AgentTranscript,
-        includeDetails: Bool,
-        thumbnail: (UUID, AgentFileAttachment) -> Data? = { _, _ in nil }
-    ) -> [RemoteTranscriptItem] {
+    static func project(transcript: AgentTranscript, includeDetails: Bool) -> [RemoteTranscriptItem] {
         var projected: [RemoteTranscriptItem] = []
         for turn in transcript.turns {
             if let request = turn.request {
@@ -542,7 +487,7 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
                         text: sanitizeVisibleText(displayText),
                         summaryOnly: turn.retentionTier != .full,
                         detailAvailable: false,
-                        attachments: projectAttachments(request.attachments) { thumbnail(request.id, $0) }
+                        attachments: projectAttachments(request.attachments)
                     )
                 )
             }
@@ -579,7 +524,7 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
                         detailAvailable: hasDetail(for: activity),
                         detailText: detail.map(renderDetail),
                         detail: detail,
-                        attachments: projectAttachments(activity.attachments) { thumbnail(activity.id, $0) }
+                        attachments: projectAttachments(activity.attachments)
                     )
                 )
             }
@@ -615,18 +560,14 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
         }
     }
 
-    private static func projectAttachments(
-        _ attachments: [AgentFileAttachment],
-        thumbnail: (AgentFileAttachment) -> Data?
-    ) -> [RemoteTranscriptAttachment]? {
+    private static func projectAttachments(_ attachments: [AgentFileAttachment]) -> [RemoteTranscriptAttachment]? {
         guard !attachments.isEmpty else { return nil }
         return attachments.prefix(RemoteAttachmentLimits.maxCount).map { attachment in
             let name = attachment.facts.fileName
             return RemoteTranscriptAttachment(
                 id: attachment.id,
                 name: name.isEmpty ? "Attachment" : sanitizeDetailText(String(name.prefix(200))),
-                isImage: attachment.kind == .image,
-                thumbnail: thumbnail(attachment)
+                isImage: attachment.kind == .image
             )
         }
     }
