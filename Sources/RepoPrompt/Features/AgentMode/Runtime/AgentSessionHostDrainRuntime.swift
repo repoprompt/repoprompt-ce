@@ -239,6 +239,12 @@ final class AgentSessionHostDrainRuntime {
         deferredVisits.removeValue(forKey: presenterID)
     }
 
+    /// Automatic lifecycle entry starts an unstarted drain; it never retries a failure.
+    func startIfNeeded() {
+        guard task == nil, outcome == nil else { return }
+        attemptRecovery()
+    }
+
     /// A failed attempt is retried only by this explicit action, never a timer or inventory read.
     func attemptRecovery() {
         guard outcome != .released else { return }
