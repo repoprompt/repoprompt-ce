@@ -104,7 +104,7 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
     ) async throws -> RemoteTranscriptPageRecord {
         let boundedLimit = min(max(limit, 1), 200)
         var transcript: AgentTranscript?
-        var revisionFingerprint: RemoteTranscriptRevisionFingerprint?
+        var persistedSavedAt: Date?
         var liveMutationRevision: UInt64?
         var liveOwnerID: ObjectIdentifier?
         var retainedAttachmentRoot: URL?
@@ -119,8 +119,10 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
                 transcript = liveSession.transcript
                 liveMutationRevision = liveSession.remoteTranscriptMutationRevision
                 liveOwnerID = ObjectIdentifier(liveSession)
-                if previewItemID != nil {
-                    retainedAttachmentRoot = context.agentMode.attachmentLocation(for: liveSession)?.retainedRoot
+                if previewItemID != nil,
+                   let workspace = context.workspaceManager.workspace(withID: liveSession.persistentSessionBindingIdentity?.workspaceID)
+                {
+                    retainedAttachmentRoot = context.agentMode.sessionAttachmentsRootURL(for: workspace)
                 }
                 break
             }
@@ -128,7 +130,7 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
             for workspace in context.workspaceManager.workspaces where !workspace.isEphemeral {
                 if let persisted = try? await AgentSessionDataService.shared.loadAgentSession(id: sessionID, for: workspace) {
                     transcript = persisted.transcript ?? .empty
-                    revisionFingerprint = .persisted(transcript: transcript ?? .empty)
+                    persistedSavedAt = persisted.savedAt
                     if previewItemID != nil {
                         retainedAttachmentRoot = context.agentMode.sessionAttachmentsRootURL(for: workspace)
                     }
@@ -142,20 +144,6 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
             throw RemoteReadServiceError.sessionNotFound
         }
 
-        let attachmentStore = retainedAttachmentRoot.map { AgentSessionAttachmentStore(rootURL: $0) }
-        let allItems = Self.project(transcript: transcript, includeDetails: includeDetails) { id, attachment in
-            guard id == previewItemID, attachment.kind == .image,
-                  let url = attachmentStore?.locateRetainedFile(attachmentID: attachment.id, sessionID: sessionID),
-                  let thumbnail = try? AttachmentPreviewRenderer.jpegData(fromFileAt: url, kind: .image),
-                  thumbnail.count <= 128 * 1024
-            else { return nil }
-            return thumbnail
-        }
-        if case let .exactItem(itemID) = paging,
-           !allItems.contains(where: { $0.id == itemID })
-        {
-            throw RemoteReadServiceError.transcriptItemNotFound
-        }
         let transcriptRevision: UInt64? = if let liveMutationRevision, let liveOwnerID {
             revisionTracker?.observeLive(
                 sessionID: sessionID,
@@ -163,11 +151,34 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
                 mutationRevision: liveMutationRevision,
                 ownerID: liveOwnerID
             )
+        } else if let persistedSavedAt {
+            revisionTracker?.observePersisted(sessionID: sessionID, savedAt: persistedSavedAt, fingerprint: .persisted(transcript: transcript))
         } else {
-            revisionTracker?.observe(
-                sessionID: sessionID,
-                fingerprint: revisionFingerprint ?? .persisted(transcript: transcript)
-            )
+            nil
+        }
+        let thumbnails: [UUID: Data]
+        if let previewItemID, let retainedAttachmentRoot {
+            let attachments = Self.imageAttachments(in: transcript, itemID: previewItemID)
+            let worker = Task.detached(priority: .userInitiated) {
+                try Self.retainedPhotoThumbnails(
+                    attachmentIDs: attachments, sessionID: sessionID, root: retainedAttachmentRoot
+                )
+            }
+            thumbnails = try await withTaskCancellationHandler {
+                try await worker.value
+            } onCancel: {
+                worker.cancel()
+            }
+        } else {
+            thumbnails = [:]
+        }
+        let allItems = Self.project(transcript: transcript, includeDetails: includeDetails) { id, attachment in
+            id == previewItemID ? thumbnails[attachment.id] : nil
+        }
+        if case let .exactItem(itemID) = paging,
+           !allItems.contains(where: { $0.id == itemID })
+        {
+            throw RemoteReadServiceError.transcriptItemNotFound
         }
         return Self.page(
             sessionID: sessionID,
@@ -176,6 +187,36 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
             limit: boundedLimit,
             transcriptRevision: transcriptRevision
         )
+    }
+
+    private static func imageAttachments(in transcript: AgentTranscript, itemID: UUID) -> [UUID] {
+        for turn in transcript.turns {
+            if let request = turn.request, request.id == itemID {
+                return request.attachments.filter { $0.kind == .image }.map(\.id)
+            }
+            if let activity = turn.allActivities.first(where: { $0.id == itemID }) {
+                return activity.attachments.filter { $0.kind == .image }.map(\.id)
+            }
+        }
+        return []
+    }
+
+    private nonisolated static func retainedPhotoThumbnails(
+        attachmentIDs: [UUID],
+        sessionID: UUID,
+        root: URL
+    ) throws -> [UUID: Data] {
+        let store = AgentSessionAttachmentStore(rootURL: root)
+        var thumbnails: [UUID: Data] = [:]
+        for id in attachmentIDs.prefix(RemoteAttachmentLimits.maxCount) {
+            try Task.checkCancellation()
+            guard let url = store.locateRetainedFile(attachmentID: id, sessionID: sessionID),
+                  let thumbnail = try AttachmentPreviewRenderer.jpegData(fromRetainedPhotoAt: url),
+                  thumbnail.count <= 128 * 1024
+            else { continue }
+            thumbnails[id] = thumbnail
+        }
+        return thumbnails
     }
 
     func history(_ request: RemoteHistoryRPCRequest) async throws -> RemoteHistoryPage {

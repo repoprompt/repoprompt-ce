@@ -2039,18 +2039,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let discoveryModel = discoveryAgent.flatMap {
             Self.discoveryModel(matching: normalized.modelRaw, in: $0)
         }
-        let supportedEfforts: [CodexReasoningEffort] = discoveryModel?.supportedReasoningEfforts ?? []
-        let preferredEffort: CodexReasoningEffort? = normalized.agent == .codexExec
-            ? CodexAgentToolPreferences.lastUsedReasoningEffort(forModelRaw: normalized.modelRaw)
+        let preferredEffort = normalized.agent == .codexExec
+            ? CodexAgentToolPreferences.lastUsedReasoningEffort(forModelRaw: normalized.modelRaw)?.rawValue
             : nil
-        let resolvedEffort: CodexReasoningEffort? = preferredEffort.flatMap {
-            supportedEfforts.contains($0) ? $0 : nil
-        } ?? discoveryModel?.defaultReasoningEffort
-            ?? (supportedEfforts.contains(CodexReasoningEffort.medium) ? CodexReasoningEffort.medium : supportedEfforts.first)
         return AgentSessionResolvedConfiguration(
             agentRaw: normalized.agent.rawValue,
             modelRaw: discoveryModel?.id ?? normalized.modelRaw,
-            reasoningEffortRaw: normalized.agent == .codexExec ? resolvedEffort?.rawValue : nil
+            reasoningEffortRaw: discoveryModel.flatMap {
+                try? Self.resolveRemoteReasoningEffort(for: $0, agent: normalized.agent, currentEffort: preferredEffort)
+            }
         )
     }
 
@@ -9731,14 +9728,18 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     func mcpSessionSelectionCapabilities(
         tabID: UUID,
-        sessionID: UUID
+        sessionID: UUID,
+        discoveryAgents: [AgentProviderKind: AgentModelCatalog.DiscoveryAgent]
     ) -> AgentSessionSelectionCapabilities? {
         guard let session = sessions[tabID], session.activeAgentSessionID == sessionID else { return nil }
         return remoteSessionSelectionCapabilities(
-            agent: session.selectedAgent,
+            discoveryAgent: discoveryAgents[session.selectedAgent],
+            allowedAgents: availableAgents.filter { discoveryAgents[$0] != nil && canSelectAgent($0, for: session) },
             modelRaw: session.selectedModelRaw,
-            reasoningEffortRaw: session.selectedReasoningEffortRaw,
+            reasoningEffortRaw: session.selectedAgent.usesClaudeNativeRuntime
+                ? session.selectedClaudeEffortRaw : session.selectedReasoningEffortRaw,
             isMutable: !session.runState.isActive && !Self.hasBlockingInteraction(session)
+                && session.pendingHandoff.providerSwitchDelivery == nil
         )
     }
 
@@ -9746,7 +9747,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         agentRaw: String?,
         modelRaw: String?,
         reasoningEffortRaw: String?,
-        isMutable: Bool
+        isMutable: Bool,
+        discoveryAgents: [AgentProviderKind: AgentModelCatalog.DiscoveryAgent]
     ) -> AgentSessionSelectionCapabilities? {
         guard let agentRaw,
               let agent = AgentProviderKind(rawValue: agentRaw),
@@ -9756,7 +9758,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return nil
         }
         return remoteSessionSelectionCapabilities(
-            agent: agent,
+            discoveryAgent: discoveryAgents[agent],
+            allowedAgents: availableAgents.filter {
+                discoveryAgents[$0] != nil && ($0 == agent || (agent.usesClaudeNativeRuntime && $0.usesClaudeNativeRuntime))
+            },
             modelRaw: modelRaw,
             reasoningEffortRaw: reasoningEffortRaw,
             isMutable: isMutable
@@ -9764,29 +9769,46 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func remoteSessionSelectionCapabilities(
-        agent: AgentProviderKind,
+        discoveryAgent: AgentModelCatalog.DiscoveryAgent?,
+        allowedAgents: [AgentProviderKind],
         modelRaw: String,
         reasoningEffortRaw: String?,
         isMutable: Bool
     ) -> AgentSessionSelectionCapabilities? {
-        guard let discoveryAgent = remoteSelectableDiscoveryAgent(for: agent) else { return nil }
+        guard let discoveryAgent else { return nil }
         let discoveryModel = Self.discoveryModel(matching: modelRaw, in: discoveryAgent)
-        let lockedAgentReason = "The agent is locked for this chat. Start a new chat to change agents."
-        let selectionReason = isMutable ? nil : "Model and effort controls are locked during an active run."
-        let efforts = agent == .codexExec
-            ? discoveryModel?.supportedReasoningEfforts.map(\.rawValue) ?? []
-            : []
-
+        let efforts = discoveryModel?.remoteReasoningEfforts(for: discoveryAgent.agent).map(\.id) ?? []
+        let selectionReason = isMutable ? nil : "Model and reasoning controls are locked in the current chat state."
         return AgentSessionSelectionCapabilities(
-            allowedAgentRawValues: [agent.rawValue],
+            allowedAgentRawValues: allowedAgents.map(\.rawValue),
             allowedModelRawValues: discoveryAgent.models.filter(\.available).map(\.id),
             allowedReasoningEffortRawValues: efforts,
             resolvedModelRaw: discoveryModel?.id ?? modelRaw,
             resolvedReasoningEffortRaw: reasoningEffortRaw,
             isMutable: isMutable,
-            agentUnavailableReason: lockedAgentReason,
+            agentUnavailableReason: allowedAgents.count > 1 ? selectionReason : "Start a new chat to switch providers.",
             selectionUnavailableReason: selectionReason
         )
+    }
+
+    static func resolveRemoteReasoningEffort(
+        for model: AgentModelCatalog.DiscoveryModel,
+        agent: AgentProviderKind,
+        requestedEffort: String? = nil,
+        currentEffort: String?
+    ) throws -> String? {
+        let allowed = model.remoteReasoningEfforts(for: agent).map(\.id)
+        if let requestedEffort {
+            let normalized = agent == .codexExec
+                ? CodexReasoningEffort.parse(requestedEffort)?.rawValue
+                : requestedEffort.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard let normalized, allowed.contains(normalized) else {
+                throw MCPError.invalidParams("The requested reasoning effort is unavailable for \(model.name).")
+            }
+            return normalized
+        }
+        if let currentEffort, allowed.contains(currentEffort) { return currentEffort }
+        return model.remoteDefaultReasoningEffort(for: agent)
     }
 
     func resolveRemoteLaunchSelection(
@@ -9830,30 +9852,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             throw MCPError.invalidParams("No configurable model is available for \(requestedAgent.displayName).")
         }
 
-        let supportedEfforts = requestedAgent == .codexExec
-            ? requestedModel.supportedReasoningEfforts
-            : []
-        let requestedEffort: CodexReasoningEffort?
-        if let reasoningEffortRaw {
-            guard let parsed = CodexReasoningEffort.parse(reasoningEffortRaw), supportedEfforts.contains(parsed) else {
-                throw MCPError.invalidParams("The requested reasoning effort is unavailable for \(requestedModel.name).")
-            }
-            requestedEffort = parsed
-        } else if requestedAgent == session.selectedAgent,
-                  requestedModel.id.caseInsensitiveCompare(currentModel?.id ?? "") == .orderedSame,
-                  let current = CodexReasoningEffort.parse(session.selectedReasoningEffortRaw),
-                  supportedEfforts.contains(current)
-        {
-            requestedEffort = current
+        let currentEffort: String? = if requestedModel.id == currentModel?.id {
+            requestedAgent.usesClaudeNativeRuntime ? session.selectedClaudeEffortRaw : session.selectedReasoningEffortRaw
         } else {
-            requestedEffort = requestedModel.defaultReasoningEffort
-                ?? (supportedEfforts.contains(.medium) ? .medium : supportedEfforts.first)
+            nil
         }
+        let requestedEffort = try Self.resolveRemoteReasoningEffort(
+            for: requestedModel, agent: requestedAgent, requestedEffort: reasoningEffortRaw, currentEffort: currentEffort
+        )
 
         return AgentSessionResolvedConfiguration(
             agentRaw: requestedAgent.rawValue,
             modelRaw: requestedModel.id,
-            reasoningEffortRaw: requestedEffort?.rawValue
+            reasoningEffortRaw: requestedEffort
         )
     }
 
@@ -9865,7 +9876,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return AgentSessionResolvedConfiguration(
             agentRaw: session.selectedAgent.rawValue,
             modelRaw: model?.id ?? session.selectedModelRaw,
-            reasoningEffortRaw: session.selectedReasoningEffortRaw
+            reasoningEffortRaw: session.selectedAgent.usesClaudeNativeRuntime
+                ? session.selectedClaudeEffortRaw : session.selectedReasoningEffortRaw
         )
     }
 
@@ -9895,8 +9907,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if let agentRaw {
             guard let exactAgent = availableAgents.first(where: {
                 $0.rawValue.caseInsensitiveCompare(agentRaw) == .orderedSame
-            }), exactAgent == session.selectedAgent else {
-                throw MCPError.invalidParams("The agent is locked for this chat. Start a new chat to change agents.")
+            }), canSelectAgent(exactAgent, for: session) else {
+                throw MCPError.invalidParams("The provider is locked for this chat. Start a new chat to switch providers.")
             }
             requestedAgent = exactAgent
         } else {
@@ -9925,31 +9937,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             throw MCPError.invalidParams("No configurable model is available for \(requestedAgent.displayName).")
         }
 
-        let supportedEfforts = requestedAgent == .codexExec
-            ? requestedModel.supportedReasoningEfforts
-            : []
-        let requestedEffort: CodexReasoningEffort?
-        if let reasoningEffortRaw {
-            guard let parsed = CodexReasoningEffort.parse(reasoningEffortRaw), supportedEfforts.contains(parsed) else {
-                throw MCPError.invalidParams("The requested reasoning effort is unavailable for \(requestedModel.name).")
-            }
-            requestedEffort = parsed
-        } else if requestedAgent == session.selectedAgent,
-                  requestedModel.id.caseInsensitiveCompare(currentModel?.id ?? "") == .orderedSame,
-                  let current = CodexReasoningEffort.parse(session.selectedReasoningEffortRaw),
-                  supportedEfforts.contains(current)
-        {
-            requestedEffort = current
+        let currentEffort: String? = if requestedModel.id == currentModel?.id {
+            requestedAgent.usesClaudeNativeRuntime ? session.selectedClaudeEffortRaw : session.selectedReasoningEffortRaw
         } else {
-            requestedEffort = requestedModel.defaultReasoningEffort
-                ?? (supportedEfforts.contains(.medium) ? .medium : supportedEfforts.first)
+            nil
         }
+        let requestedEffort = try Self.resolveRemoteReasoningEffort(
+            for: requestedModel, agent: requestedAgent, requestedEffort: reasoningEffortRaw, currentEffort: currentEffort
+        )
 
         try await mcpConfigureSession(
             tabID: tabID,
             agentRaw: requestedAgent.rawValue,
             modelRaw: requestedModel.id,
-            reasoningEffortRaw: requestedEffort?.rawValue,
+            reasoningEffortRaw: requestedEffort,
             requireInactiveRunState: true,
             workspaceAuthority: workspaceAuthority
         )
@@ -9957,7 +9958,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return AgentSessionResolvedConfiguration(
             agentRaw: session.selectedAgent.rawValue,
             modelRaw: resolvedModel?.id ?? session.selectedModelRaw,
-            reasoningEffortRaw: session.selectedReasoningEffortRaw
+            reasoningEffortRaw: session.selectedAgent.usesClaudeNativeRuntime
+                ? session.selectedClaudeEffortRaw : session.selectedReasoningEffortRaw
         )
     }
 

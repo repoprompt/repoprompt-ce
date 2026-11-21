@@ -1,5 +1,7 @@
 import Foundation
 import MCP
+import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptRemoteProtocol
@@ -1316,6 +1318,62 @@ final class RemoteProducerParityTests: XCTestCase {
         XCTAssertFalse(descriptors.contains { $0.displayName == "Director" })
     }
 
+    func testCatalogKeepsReasoningForAGroupedCodexModel() throws {
+        let discovery = AgentModelCatalog.discoveryAgent(
+            .codexExec,
+            availability: .none,
+            modelOptions: [
+                AgentModelOption(
+                    rawValue: "gpt-5.6-sol", displayName: "GPT-5.6 Sol", description: nil, isDefault: true,
+                    supportedReasoningEfforts: [.medium, .high], defaultReasoningEffort: .medium
+                )
+            ]
+        )
+        let model = try XCTUnwrap(discovery.models.first)
+        XCTAssertEqual(model.remoteReasoningEfforts(for: .codexExec).map(\.id), ["medium", "high"])
+        XCTAssertEqual(try AgentModeViewModel.resolveRemoteReasoningEffort(
+            for: model, agent: .codexExec, requestedEffort: "high", currentEffort: nil
+        ), "high")
+        XCTAssertEqual(try AgentModeViewModel.resolveRemoteReasoningEffort(
+            for: model, agent: .codexExec, currentEffort: nil
+        ), "medium")
+    }
+
+    func testSwitchingToAProviderWithoutReasoningDropsTheOldEffort() throws {
+        let discovery = AgentModelCatalog.discoveryAgent(
+            .openCode,
+            availability: .none,
+            modelOptions: [
+                AgentModelOption(rawValue: "opencode/example", displayName: "Example", description: nil, isDefault: true)
+            ]
+        )
+        let model = try XCTUnwrap(discovery.models.first)
+        XCTAssertNil(try AgentModeViewModel.resolveRemoteReasoningEffort(for: model, agent: .openCode, currentEffort: "high"))
+    }
+
+    func testUploadedPDFUsesAStablePathBeforeProviderDispatch() async throws {
+        let workspace = FileManager.default.temporaryDirectory.appendingPathComponent("remote-pdf-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let root = workspace.appendingPathComponent("AgentSessions/attachments", isDirectory: true)
+        let sessionID = UUID()
+        let bytes = Data("%PDF-1.4\n%%EOF\n".utf8)
+        let attachments = try await RemoteAttachmentUploads.prepareFiles(
+            [.init(name: "notes.pdf", size: bytes.count, bytes: bytes)], sessionID: sessionID, workspaceDirectory: workspace, retainedRoot: root
+        )
+        let attachment = try XCTUnwrap(attachments.first)
+        XCTAssertEqual(attachment.kind, .pdf)
+        let store = AgentSessionAttachmentStore(rootURL: root)
+        let retained = try XCTUnwrap(store.locateRetainedFile(attachmentID: attachment.id, sessionID: sessionID))
+        let initialMessage = AgentSessionProviderInputRuntime.renderProviderMessage(
+            text: "Read the PDF", attachments: attachments, agent: .codexExec
+        )
+        XCTAssertTrue(initialMessage.contains(retained.path))
+        _ = await AgentSessionDataService.shared.retainConsumedAttachments(
+            attachments, sessionID: sessionID, store: store, workspaceDirectory: workspace
+        )
+        XCTAssertEqual(try Data(contentsOf: retained), bytes)
+    }
+
     func testCatalogDefaultSelectionUsesPersistedPreferenceInsteadOfTransientWindowSelection() throws {
         let agents = [
             RemoteAgentDescriptor(
@@ -1325,7 +1383,10 @@ final class RemoteProducerParityTests: XCTestCase {
                 isAvailable: true,
                 modelDescriptors: [
                     RemoteModelDescriptor(id: "transient-model", displayName: "Transient"),
-                    RemoteModelDescriptor(id: "persisted-model", displayName: "Persisted")
+                    RemoteModelDescriptor(
+                        id: "persisted-model", displayName: "Persisted",
+                        reasoningEfforts: [.init(id: "high", displayName: "High")]
+                    )
                 ],
                 defaultModelID: "transient-model"
             )

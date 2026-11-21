@@ -1948,7 +1948,10 @@ enum AgentModelCatalog {
             }
             // Use the first option's metadata for family-level fields
             let representative = group.options.first
-            let allEfforts = group.options.compactMap { CodexModelSpecifier(raw: $0.rawValue).reasoningEffort }
+            let allEfforts = Set(group.options.flatMap { option in
+                option.supportedReasoningEfforts
+                    + [CodexModelSpecifier(raw: option.rawValue).reasoningEffort].compactMap(\.self)
+            })
             let defaultEffort = representative?.defaultReasoningEffort
                 ?? group.options.first(where: \.isProviderDefault)
                 .flatMap { CodexModelSpecifier(raw: $0.rawValue).reasoningEffort }
@@ -1970,7 +1973,7 @@ enum AgentModelCatalog {
                 available: true,
                 tags: allTags,
                 contextWindowTokens: nil,
-                supportedReasoningEfforts: allEfforts.isEmpty ? [] : CodexReasoningEffort.displayOrder.filter(allEfforts.contains),
+                supportedReasoningEfforts: CodexReasoningEffort.displayOrder.filter(allEfforts.contains),
                 defaultReasoningEffort: defaultEffort,
                 startTargets: targets
             ))

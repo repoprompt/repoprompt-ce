@@ -2,6 +2,7 @@ import CoreGraphics
 import Foundation
 import ImageIO
 import RepoPromptDomainRuntime
+import UniformTypeIdentifiers
 import XCTest
 
 final class AttachmentPreviewRendererTests: XCTestCase {
@@ -21,7 +22,7 @@ final class AttachmentPreviewRendererTests: XCTestCase {
     }
 
     func testPDFRendersPageOneToBoundedJPEG() throws {
-        let attachment = AttachmentTestFixtures.attachment(.pdf(try twoPagePDF()), fileName: "doc.pdf")
+        let attachment = try AttachmentTestFixtures.attachment(.pdf(twoPagePDF()), fileName: "doc.pdf")
         let jpeg = try XCTUnwrap(try AttachmentPreviewRenderer.jpegData(from: attachment))
         let source = try XCTUnwrap(CGImageSourceCreateWithData(jpeg as CFData, nil))
         let image = try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil))
@@ -39,13 +40,32 @@ final class AttachmentPreviewRendererTests: XCTestCase {
         XCTAssertNil(try AttachmentPreviewRenderer.jpegData(fromFileAt: url, kind: .text))
     }
 
+    func testHighResolutionRetainedPhotoRendersBoundedPreview() throws {
+        let context = try XCTUnwrap(CGContext(
+            data: nil, width: 4300, height: 4200, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+        ))
+        let image = try XCTUnwrap(context.makeImage())
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("photo-\(UUID()).jpg")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(url as CFURL, UTType.jpeg.identifier as CFString, 1, nil))
+        CGImageDestinationAddImage(destination, image, nil)
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
+        XCTAssertNil(try AttachmentPreviewRenderer.jpegData(fromFileAt: url, kind: .image))
+        let jpeg = try XCTUnwrap(try AttachmentPreviewRenderer.jpegData(fromRetainedPhotoAt: url))
+        let source = try XCTUnwrap(CGImageSourceCreateWithData(jpeg as CFData, nil))
+        let thumbnail = try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil))
+        XCTAssertEqual(max(thumbnail.width, thumbnail.height), AttachmentPreviewRenderer.maxPixelSize)
+        XCTAssertLessThanOrEqual(jpeg.count, 128 * 1024)
+    }
+
     func testUnrenderablePDFGivesNoPreviewInsteadOfFailing() throws {
         let broken = AttachmentTestFixtures.attachment(.pdf(AttachmentTestFixtures.pdfBytes()), fileName: "broken.pdf")
         XCTAssertNil(try AttachmentPreviewRenderer.jpegData(from: broken))
     }
 
     func testOversizedPDFPageGivesNoPreview() throws {
-        let attachment = AttachmentTestFixtures.attachment(.pdf(try twoPagePDF(width: 20000, height: 20000)), fileName: "huge.pdf")
+        let attachment = try AttachmentTestFixtures.attachment(.pdf(twoPagePDF(width: 20000, height: 20000)), fileName: "huge.pdf")
         XCTAssertNil(try AttachmentPreviewRenderer.jpegData(from: attachment))
     }
 }

@@ -41,16 +41,27 @@ package enum AttachmentPreviewRenderer {
         }
     }
 
+    /// Phone photos can exceed the general preview budget. Only use this for retained, owned files.
+    package static func jpegData(fromRetainedPhotoAt url: URL) throws -> Data? {
+        try Task.checkCancellation()
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, imageSourceOptions) else { return nil }
+        return try jpegData(fromImageSource: source, sourcePixelLimit: 64 * 1024 * 1024, sourceDimensionLimit: 12288)
+    }
+
     private static var imageSourceOptions: CFDictionary {
         [kCGImageSourceShouldCache: false] as CFDictionary
     }
 
-    private static func jpegData(fromImageSource source: CGImageSource) throws -> Data? {
+    private static func jpegData(
+        fromImageSource source: CGImageSource,
+        sourcePixelLimit: Int = maxSourcePixelCount,
+        sourceDimensionLimit: Int = maxSourceDimension
+    ) throws -> Data? {
         guard let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
               let width = sourceDimension(properties[kCGImagePropertyPixelWidth]),
               let height = sourceDimension(properties[kCGImagePropertyPixelHeight]),
-              width <= maxSourceDimension, height <= maxSourceDimension,
-              width <= maxSourcePixelCount / height
+              width <= sourceDimensionLimit, height <= sourceDimensionLimit,
+              width <= sourcePixelLimit / height
         else {
             try Task.checkCancellation()
             return nil

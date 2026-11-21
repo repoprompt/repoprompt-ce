@@ -72,7 +72,31 @@ struct RemoteAttachmentUploads {
         if now >= expiresAt { batches.removeAll() }
     }
 
-    static func importFiles(_ files: [File], workspaceDirectory: URL) throws -> [AgentFileAttachment] {
+    static func prepareFiles(
+        _ files: [File],
+        sessionID: UUID,
+        workspaceDirectory: URL,
+        retainedRoot: URL?
+    ) async throws -> [AgentFileAttachment] {
+        let imported = try importFiles(files, workspaceDirectory: workspaceDirectory)
+        guard let retainedRoot else { return imported }
+
+        // Hand the provider a conversation-owned path before any turn cleanup can move the file.
+        let retained = await AgentSessionDataService.shared.retainConsumedAttachments(
+            imported,
+            sessionID: sessionID,
+            store: AgentSessionAttachmentStore(rootURL: retainedRoot),
+            workspaceDirectory: workspaceDirectory
+        )
+        let attachments = imported.compactMap { retained.retained[$0.id] }
+        guard attachments.count == imported.count else {
+            AgentAttachmentStore().clearConsumedLocalFiles(imported, workspaceDirectory: workspaceDirectory)
+            throw RemoteAgentControlServiceError.commandRejected("The Mac could not keep the attachments with this chat.")
+        }
+        return attachments
+    }
+
+    private static func importFiles(_ files: [File], workspaceDirectory: URL) throws -> [AgentFileAttachment] {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let store = AgentAttachmentStore()

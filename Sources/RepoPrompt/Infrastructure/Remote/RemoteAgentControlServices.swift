@@ -225,7 +225,8 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
                 modelRaw: request.modelID,
                 reasoningEffortRaw: request.reasoningEffort
             )
-            let attachments = try importAttachments(files, in: context)
+            try context.agentMode.requireCurrentMCPWorkspaceTarget(target, expectedWorkspaceID: workspaceID)
+            let attachments = try await importAttachments(files, sessionID: sessionID, workspaceID: workspaceID, in: context)
             _ = try await AgentExternalMCPRunStarter.startPreservingCallerBinding(
                 target: target,
                 message: message,
@@ -407,7 +408,8 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
         if !files.isEmpty, session.runState.isActive || session.instructionContinuation != nil {
             throw RemoteAgentControlServiceError.commandRejected("Wait for the current run to finish before sending attachments.")
         }
-        let attachments = try importAttachments(files, in: context)
+        let attachments = try await importAttachments(files, sessionID: sessionID, workspaceID: expectedWorkspaceID, in: context)
+        try context.agentMode.requireCurrentMCPWorkspaceTarget(target, expectedWorkspaceID: expectedWorkspaceID)
         if let resident = try context.agentMode.mcpResidentTarget(sessionID: sessionID) {
             _ = try await context.agentMode.mcpSubmitResidentTask(
                 resident,
@@ -771,13 +773,21 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
 
     private func importAttachments(
         _ files: [RemoteAttachmentUploads.File],
+        sessionID: UUID,
+        workspaceID: UUID,
         in context: WindowContext
-    ) throws -> [AgentFileAttachment] {
+    ) async throws -> [AgentFileAttachment] {
         guard !files.isEmpty else { return [] }
         guard let directory = context.agentMode.attachmentWorkspaceDirectoryProvider() else {
             throw RemoteAgentControlServiceError.commandRejected("The Mac workspace cannot store attachments.")
         }
-        return try RemoteAttachmentUploads.importFiles(files, workspaceDirectory: directory)
+        let workspace = context.workspaceManager.workspace(withID: workspaceID)
+        return try await RemoteAttachmentUploads.prepareFiles(
+            files,
+            sessionID: sessionID,
+            workspaceDirectory: directory,
+            retainedRoot: context.agentMode.sessionAttachmentsRootURL(for: workspace)
+        )
     }
 
     private struct WindowContext {

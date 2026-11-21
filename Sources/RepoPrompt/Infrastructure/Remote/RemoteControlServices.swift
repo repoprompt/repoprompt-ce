@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 import RepoPromptRemoteProtocol
 
@@ -362,6 +363,9 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
                 ?? context.workspaceManager.activeWorkspaceID
             guard let workspaceID else { continue }
             let liveByTabID = context.agentMode.sessions
+            let discoveryAgents = context.agentMode.availableAgents.reduce(into: [AgentProviderKind: AgentModelCatalog.DiscoveryAgent]()) {
+                $0[$1] = context.agentMode.remoteSelectableDiscoveryAgent(for: $1)
+            }
             for entry in context.agentMode.sessionIndex.values {
                 let live = Self.matchingLiveSession(
                     entryID: entry.id,
@@ -377,36 +381,33 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
                         mutationRevision: live.remoteTranscriptMutationRevision,
                         ownerID: ObjectIdentifier(live)
                     )
-                } else if let cached = revisionTracker?.cachedPersistedRevision(
-                    sessionID: entry.id,
-                    savedAt: entry.savedAt
-                ) {
+                } else if let cached = revisionTracker?.cachedPersistedRevision(sessionID: entry.id, savedAt: entry.savedAt) {
                     cached
-                } else if let workspace = context.workspaceManager.workspaces.first(where: { $0.id == workspaceID }),
-                          let persisted = try? await AgentSessionDataService.shared.loadAgentSession(
-                              id: entry.id,
-                              for: workspace
-                          )
+                } else if revisionTracker?.revision(for: entry.id) != nil,
+                          let workspace = context.workspaceManager.workspace(withID: workspaceID),
+                          let persisted = try? await AgentSessionDataService.shared.loadAgentSession(id: entry.id, for: workspace)
                 {
+                    // Only refresh saved transcripts that Remote has already seen.
                     revisionTracker?.observePersisted(
-                        sessionID: entry.id,
-                        savedAt: entry.savedAt,
+                        sessionID: entry.id, savedAt: entry.savedAt,
                         fingerprint: .persisted(transcript: persisted.transcript ?? .empty)
                     )
                 } else {
-                    revisionTracker?.revision(for: entry.id)
+                    nil
                 }
                 let selectionCapabilities: AgentSessionSelectionCapabilities? = if let live {
                     context.agentMode.mcpSessionSelectionCapabilities(
                         tabID: live.tabID,
-                        sessionID: entry.id
+                        sessionID: entry.id,
+                        discoveryAgents: discoveryAgents
                     )
                 } else {
                     context.agentMode.mcpPersistedSessionSelectionCapabilities(
                         agentRaw: entry.agentKindRaw,
                         modelRaw: entry.agentModelRaw,
                         reasoningEffortRaw: entry.agentReasoningEffortRaw,
-                        isMutable: Self.isConfigurationMutable(runState: runState)
+                        isMutable: Self.isConfigurationMutable(runState: runState),
+                        discoveryAgents: discoveryAgents
                     )
                 }
                 let activity: String? = switch runState {
@@ -615,50 +616,21 @@ final class DesktopRemoteCatalogService: WorkflowCatalogService {
             reasoningEffort: persistedDefault.reasoningEffortRaw
         )
         let agents = source.availableAgents.compactMap { agent -> RemoteAgentDescriptor? in
-            let options = source.modelOptions(for: agent, includeClaudeEffortVariants: false)
-            let visible = options.filter { !$0.isPlaceholderDefault }
-            let selectable = visible.isEmpty ? options : visible
-            guard !selectable.isEmpty else { return nil }
-            let models: [RemoteModelDescriptor]
-            let defaultModelID: String?
-            if agent == .codexExec {
-                let discovered = source.remoteSelectableDiscoveryAgent(for: agent)?.models ?? []
-                models = discovered.map { model in
-                    let defaultEffort = model.defaultReasoningEffort
-                        ?? model.startTargets.first(where: \.isDefault)?.reasoningEffort
-                    return RemoteModelDescriptor(
-                        id: model.id,
-                        displayName: model.name,
-                        isAvailable: model.available,
-                        reasoningEfforts: model.supportedReasoningEfforts.map {
-                            RemoteReasoningEffortDescriptor(id: $0.rawValue, displayName: $0.displayName)
-                        },
-                        defaultReasoningEffortID: defaultEffort?.rawValue
-                    )
-                }
-                defaultModelID = if agent.rawValue == preferredDefault.agentID {
-                    discovered.first(where: { model in
-                        model.id.caseInsensitiveCompare(preferredDefault.modelID) == .orderedSame
-                            || model.startTargets.contains(where: {
-                                $0.modelRaw.caseInsensitiveCompare(preferredDefault.modelID) == .orderedSame
-                            })
-                    })?.id
-                } else {
-                    nil
-                }
-            } else {
-                models = selectable.map { option in
-                    RemoteModelDescriptor(id: option.rawValue, displayName: option.displayName)
-                }
-                defaultModelID = if agent.rawValue == preferredDefault.agentID {
-                    selectable.first(where: {
-                        $0.rawValue.caseInsensitiveCompare(preferredDefault.modelID) == .orderedSame
-                    })?.rawValue
-                } else {
-                    nil
-                }
+            guard let discovery = source.remoteSelectableDiscoveryAgent(for: agent) else { return nil }
+            let models = discovery.models.map { model in
+                RemoteModelDescriptor(
+                    id: model.id,
+                    displayName: model.name,
+                    isAvailable: model.available,
+                    reasoningEfforts: model.remoteReasoningEfforts(for: agent),
+                    defaultReasoningEffortID: model.remoteDefaultReasoningEffort(for: agent)
+                )
             }
             guard !models.isEmpty else { return nil }
+            let defaultModelID = discovery.models.first { model in
+                model.id.caseInsensitiveCompare(discovery.defaults.modelRaw ?? "") == .orderedSame
+                    || model.startTargets.contains(where: \.isDefault)
+            }?.id ?? models.first(where: \.isAvailable)?.id
             return RemoteAgentDescriptor(
                 id: agent.rawValue,
                 displayName: agent.displayName,
@@ -695,21 +667,25 @@ final class DesktopRemoteCatalogService: WorkflowCatalogService {
         agents: [RemoteAgentDescriptor]
     ) -> RemoteAgentSelection? {
         guard let agent = agents.first(where: {
-            $0.id.caseInsensitiveCompare(preferred.agentID) == .orderedSame
-        }) else { return nil }
+            $0.id.caseInsensitiveCompare(preferred.agentID) == .orderedSame && $0.isAvailable
+        }) ?? agents.first(where: \.isAvailable) else { return nil }
         let modelIDs = agent.modelDescriptors?.map(\.id) ?? agent.models
-        let resolvedModelID = modelIDs.first(where: {
+        let isPreferredAgent = agent.id.caseInsensitiveCompare(preferred.agentID) == .orderedSame
+        let requestedModel = isPreferredAgent ? modelIDs.first {
             $0.caseInsensitiveCompare(preferred.modelID) == .orderedSame
-        }) ?? agent.defaultModelID.flatMap { fallback in
+        } : nil
+        let resolvedModelID = requestedModel ?? agent.defaultModelID.flatMap { fallback in
             modelIDs.first(where: { $0.caseInsensitiveCompare(fallback) == .orderedSame })
         }
         guard let resolvedModelID else { return nil }
+        let model = agent.modelDescriptors?.first { $0.id == resolvedModelID }
+        let preferredEffort = requestedModel.flatMap { _ in
+            model?.reasoningEfforts.first { $0.id == preferred.reasoningEffort }?.id
+        }
         return RemoteAgentSelection(
             agentID: agent.id,
             modelID: resolvedModelID,
-            reasoningEffort: agent.id == AgentProviderKind.codexExec.rawValue
-                ? preferred.reasoningEffort
-                : nil
+            reasoningEffort: preferredEffort ?? model?.defaultReasoningEffortID
         )
     }
 
@@ -772,5 +748,27 @@ final class AppRemoteStateProjectionService: RemoteStateProjectionService {
             connection: connection,
             authorization: authorization
         )
+    }
+}
+
+extension AgentModelCatalog.DiscoveryModel {
+    func remoteReasoningEfforts(for agent: AgentProviderKind) -> [RemoteReasoningEffortDescriptor] {
+        if agent == .codexExec {
+            return supportedReasoningEfforts.map { .init(id: $0.rawValue, displayName: $0.displayName) }
+        }
+        if agent.usesClaudeNativeRuntime {
+            return AgentModelCatalog.supportedClaudeEfforts(forSelectedModelRaw: id, agentKind: agent)
+                .map { .init(id: $0.rawValue, displayName: $0.displayName) }
+        }
+        return []
+    }
+
+    func remoteDefaultReasoningEffort(for agent: AgentProviderKind) -> String? {
+        guard agent == .codexExec else { return nil }
+        let allowed = supportedReasoningEfforts
+        if let defaultReasoningEffort, allowed.contains(defaultReasoningEffort) {
+            return defaultReasoningEffort.rawValue
+        }
+        return (allowed.contains(.medium) ? .medium : allowed.first)?.rawValue
     }
 }
