@@ -1,4 +1,5 @@
 #if DEBUG
+    import Darwin
     import Foundation
     @testable import RepoPromptApp
     import RepoPromptDomainRuntime
@@ -827,6 +828,292 @@
                 }
                 cursor = range.upperBound
             }
+        }
+    }
+
+    @MainActor
+    final class AgentSkillCatalogStartupBenchmarkTests: XCTestCase {
+        func testDirectScanContentAndProviderPrecedence() async throws {
+            let fixture = try SkillScanFixture()
+            defer { fixture.remove() }
+            let catalog = fixture.catalog()
+            XCTAssertEqual(fixture.expected(globalOnly: true).count, 32)
+            XCTAssertEqual(fixture.expected().count, 70)
+            XCTAssertEqual(fixture.expected(genericOnly: true).count, 36)
+            await catalog.refresh(workspacePaths: [], agentKind: .claudeCode)
+            XCTAssertEqual(catalog.suggestions(prefix: "", limit: 100), fixture.expected(globalOnly: true))
+            await catalog.refresh(workspacePaths: [fixture.workspace.path], agentKind: .claudeCode)
+            XCTAssertEqual(catalog.suggestions(prefix: "", limit: 100), fixture.expected())
+            let fresh = fixture.catalog()
+            await fresh.refresh(workspacePaths: [fixture.workspace.path], agentKind: .claudeCode)
+            XCTAssertEqual(catalog.suggestions(prefix: "", limit: 100), fresh.suggestions(prefix: "", limit: 100))
+            await catalog.refresh(workspacePaths: [fixture.workspace.path], agentKind: .codexExec)
+            XCTAssertEqual(catalog.suggestions(prefix: "", limit: 100), fixture.expected(genericOnly: true))
+            XCTAssertEqual(catalog.resolve(name: "SHARED-STARTUP")?.source, .workspaceAgentsSkills)
+        }
+
+        func testSupersededDiscoveryCannotPublishOldFirstRootContent() async throws {
+            let fixture = try SkillScanFixture()
+            defer { fixture.remove() }
+            let catalog = fixture.catalog()
+            let winner = try XCTUnwrap(fixture.expected().first { $0.name == "shared-startup" })
+            let updatedTemplate = winner.template + "\nReplacement generation"
+            catalog.test_beforeSecondRoot = { @MainActor in
+                catalog.test_beforeSecondRoot = nil
+                do {
+                    try updatedTemplate.write(to: winner.fileURL, atomically: true, encoding: .utf8)
+                } catch {
+                    XCTFail("Fixture update failed: \(error)")
+                }
+                catalog.scheduleRefresh(workspacePaths: [fixture.workspace.path], agentKind: .claudeCode)
+                let replacement = catalog.test_scheduledRefreshTask
+                await replacement?.value
+            }
+            catalog.scheduleRefresh(workspacePaths: [fixture.workspace.path], agentKind: .claudeCode)
+            let original = catalog.test_scheduledRefreshTask
+            await original?.value
+            catalog.test_beforeSecondRoot = nil
+            let expected = fixture.expected().map { definition in
+                guard definition.id == winner.id else { return definition }
+                return AgentSkillDefinition(
+                    id: definition.id, name: definition.name, description: definition.description,
+                    variant: definition.variant, fileURL: definition.fileURL,
+                    template: updatedTemplate, source: definition.source
+                )
+            }
+            XCTAssertEqual(catalog.suggestions(prefix: "", limit: 100), expected)
+            XCTAssertEqual(fixture.manager.counts.roots, 9)
+            print("SKILL_CATALOG_SUPERSESSION roots=\(fixture.manager.counts.roots) directories=\(fixture.manager.counts.directories) exists=\(fixture.manager.counts.exists)")
+        }
+
+        func testDirectCallerCancellationKeepsCompleteDiscovery() async throws {
+            for generation: UInt64? in [nil, 0] {
+                let fixture = try SkillScanFixture()
+                defer { fixture.remove() }
+                let catalog = fixture.catalog()
+                var caller: Task<Void, Never>?
+                catalog.test_beforeSecondRoot = { @MainActor in
+                    caller?.cancel()
+                }
+                caller = Task {
+                    await catalog.refresh(workspacePaths: [fixture.workspace.path], agentKind: .claudeCode, generation: generation)
+                }
+                let task = try XCTUnwrap(caller)
+                await task.value
+                catalog.test_beforeSecondRoot = nil
+                XCTAssertTrue(task.isCancelled)
+                XCTAssertEqual(catalog.suggestions(prefix: "", limit: 100), fixture.expected())
+                XCTAssertEqual(fixture.manager.counts.roots, 8)
+            }
+        }
+
+        func testStartupCatalogFanoutBenchmark() async throws {
+            guard ProcessInfo.processInfo.environment["RPCE_RUN_SCALE_TESTS"] == "1" else {
+                throw XCTSkip("Opt-in component benchmark")
+            }
+            let fixture = try SkillScanFixture()
+            defer { fixture.remove() }
+            for sample in 0 ... 5 {
+                let control = (0 ..< 37).map { _ in fixture.catalog() }
+                let beforeA = fixture.manager.counts
+                let startA = SkillScanInstant()
+                await refreshAll(control, paths: [])
+                let timingA = startA.elapsed()
+                let countsA = fixture.manager.counts - beforeA
+                for catalog in control {
+                    XCTAssertEqual(catalog.suggestions(prefix: "", limit: 100), fixture.expected(globalOnly: true))
+                }
+                let beforeB = fixture.manager.counts
+                let startB = SkillScanInstant()
+                await refreshAll(control, paths: [fixture.workspace.path])
+                let timingB = startB.elapsed()
+                let countsB = fixture.manager.counts - beforeB
+                assertContents(control, fixture: fixture)
+                XCTAssertEqual(countsA.roots, 148)
+                XCTAssertEqual(countsB.roots, 296)
+                XCTAssertEqual((countsA + countsB).directories, 2368)
+
+                let superseded = (0 ..< 37).map { _ in fixture.catalog() }
+                var replacements: [Task<Void, Never>] = []
+                for catalog in superseded {
+                    catalog.test_beforeSecondRoot = { @MainActor in
+                        catalog.test_beforeSecondRoot = nil
+                        catalog.scheduleRefresh(workspacePaths: [fixture.workspace.path], agentKind: .claudeCode)
+                        if let replacement = catalog.test_scheduledRefreshTask {
+                            replacements.append(replacement)
+                        }
+                    }
+                }
+                let beforeS = fixture.manager.counts
+                let startS = SkillScanInstant()
+                let originals = superseded.compactMap { catalog in
+                    catalog.scheduleRefresh(workspacePaths: [fixture.workspace.path], agentKind: .claudeCode)
+                    return catalog.test_scheduledRefreshTask
+                }
+                for task in originals {
+                    await task.value
+                }
+                for task in replacements {
+                    await task.value
+                }
+                let timingS = startS.elapsed()
+                let countsS = fixture.manager.counts - beforeS
+                XCTAssertEqual(originals.count, 37)
+                XCTAssertEqual(replacements.count, 37)
+                assertContents(superseded, fixture: fixture)
+                if sample > 0 {
+                    emit(sample, workload: "control", phase: "A", counts: countsA, timing: timingA, definitions: 32)
+                    emit(sample, workload: "control", phase: "B", counts: countsB, timing: timingB, definitions: 70)
+                    emit(sample, workload: "control", phase: "total", counts: countsA + countsB, timing: timingA + timingB, definitions: 70)
+                    emit(sample, workload: "supersession", phase: "total", counts: countsS, timing: timingS, definitions: 70)
+                }
+            }
+        }
+
+        private func refreshAll(_ catalogs: [AgentSkillCatalog], paths: [String]) async {
+            let tasks = catalogs.map { catalog in
+                Task { await catalog.refresh(workspacePaths: paths, agentKind: .claudeCode) }
+            }
+            for task in tasks {
+                await task.value
+            }
+        }
+
+        private func assertContents(_ catalogs: [AgentSkillCatalog], fixture: SkillScanFixture) {
+            let expected = fixture.expected()
+            for catalog in catalogs {
+                XCTAssertEqual(catalog.suggestions(prefix: "", limit: 100), expected)
+            }
+        }
+
+        private func emit(_ sample: Int, workload: String, phase: String, counts: SkillScanCounts, timing: SkillScanTiming, definitions: Int) {
+            print("SKILL_CATALOG_BENCH sample=\(sample) workload=\(workload) phase=\(phase) catalogs=37 root_enum=\(counts.roots) directory_enum=\(counts.directories) exists=\(counts.exists) wall_ms=\(String(format: "%.3f", timing.wall)) cpu_ms=\(String(format: "%.3f", timing.cpu)) definitions_each=\(definitions)")
+        }
+    }
+
+    private struct SkillScanCounts {
+        var roots = 0
+        var directories = 0
+        var exists = 0
+
+        static func + (lhs: Self, rhs: Self) -> Self {
+            Self(roots: lhs.roots + rhs.roots, directories: lhs.directories + rhs.directories, exists: lhs.exists + rhs.exists)
+        }
+
+        static func - (lhs: Self, rhs: Self) -> Self {
+            Self(roots: lhs.roots - rhs.roots, directories: lhs.directories - rhs.directories, exists: lhs.exists - rhs.exists)
+        }
+    }
+
+    private final class SkillScanFileManager: FileManager, @unchecked Sendable {
+        private let lock = NSLock()
+        private var recorded = SkillScanCounts()
+        let rootPaths: Set<String>
+
+        init(roots: [URL]) {
+            rootPaths = Set(roots.map(\.path))
+            super.init()
+        }
+
+        var counts: SkillScanCounts {
+            lock.withLock { recorded }
+        }
+
+        override func contentsOfDirectory(at url: URL, includingPropertiesForKeys keys: [URLResourceKey]?, options mask: FileManager.DirectoryEnumerationOptions = []) throws -> [URL] {
+            lock.withLock {
+                recorded.directories += 1
+                if rootPaths.contains(url.path) { recorded.roots += 1 }
+            }
+            return try super.contentsOfDirectory(at: url, includingPropertiesForKeys: keys, options: mask)
+        }
+
+        override func fileExists(atPath path: String, isDirectory: UnsafeMutablePointer<ObjCBool>?) -> Bool {
+            lock.withLock { recorded.exists += 1 }
+            return super.fileExists(atPath: path, isDirectory: isDirectory)
+        }
+    }
+
+    @MainActor
+    private final class SkillScanFixture {
+        let root: URL
+        let workspace: URL
+        let home: URL
+        let manager: SkillScanFileManager
+        private var buckets: [[AgentSkillDefinition]] = []
+
+        init() throws {
+            root = FileManager.default.temporaryDirectory.appendingPathComponent("skill-scan-\(UUID().uuidString)")
+            workspace = root.appendingPathComponent("workspace")
+            home = root.appendingPathComponent("home")
+            let relativeRoots = [".claude/skills", ".claude/commands", ".agents/skills", ".agents/slash"]
+            let roots = [workspace, home].flatMap { base in relativeRoots.map { base.appendingPathComponent($0) } }
+            manager = SkillScanFileManager(roots: roots)
+            let sources: [AgentSkillDefinition.Source] = [
+                .workspaceClaudeSkills, .workspaceClaudeCommands, .workspaceAgentsSkills, .workspaceAgentsSlash,
+                .globalClaudeSkills, .globalClaudeCommands, .globalAgentsSkills, .globalAgentsSlash
+            ]
+            do {
+                for (bucket, directory) in roots.enumerated() {
+                    var definitions: [AgentSkillDefinition] = []
+                    for index in 0 ..< (bucket < 4 ? 10 : 8) {
+                        let name = [0, 2, 4].contains(bucket) && index == 0 ? "shared-startup" : String(format: "bucket-%d-item-%02d", bucket, index)
+                        let file = bucket.isMultiple(of: 2)
+                            ? directory.appendingPathComponent(name).appendingPathComponent("SKILL.md")
+                            : directory.appendingPathComponent(name + ".md")
+                        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+                        let description = "Fixture \(bucket)-\(index)"
+                        let template = "---\nname: \(name)\ndescription: \(description)\nrepoprompt_variant: diagnostic\n---\nBody \(bucket)-\(index)"
+                        try template.write(to: file, atomically: true, encoding: .utf8)
+                        definitions.append(AgentSkillDefinition(
+                            id: "\(sources[bucket].rawValue):\(name):\(file.path)", name: name,
+                            description: description, variant: "diagnostic", fileURL: file,
+                            template: template, source: sources[bucket]
+                        ))
+                    }
+                    buckets.append(definitions.sorted { $0.name < $1.name })
+                }
+            } catch {
+                try? FileManager.default.removeItem(at: root)
+                throw error
+            }
+        }
+
+        func catalog() -> AgentSkillCatalog {
+            AgentSkillCatalog(fileManager: manager, homeDirectoryURL: home)
+        }
+
+        func expected(globalOnly: Bool = false, genericOnly: Bool = false) -> [AgentSkillDefinition] {
+            let indices = globalOnly ? [4, 5, 6, 7] : genericOnly ? [2, 3, 6, 7] : Array(0 ..< 8)
+            var names = Set<String>()
+            return indices.flatMap { buckets[$0] }.filter { names.insert($0.name).inserted }
+        }
+
+        func remove() {
+            try? FileManager.default.removeItem(at: root)
+        }
+    }
+
+    private struct SkillScanTiming {
+        let wall: Double
+        let cpu: Double
+
+        static func + (lhs: Self, rhs: Self) -> Self {
+            Self(wall: lhs.wall + rhs.wall, cpu: lhs.cpu + rhs.cpu)
+        }
+    }
+
+    private struct SkillScanInstant {
+        private let wall = ProcessInfo.processInfo.systemUptime
+        private let cpu = Self.cpuMilliseconds()
+
+        func elapsed() -> SkillScanTiming {
+            SkillScanTiming(wall: (ProcessInfo.processInfo.systemUptime - wall) * 1000, cpu: Self.cpuMilliseconds() - cpu)
+        }
+
+        private static func cpuMilliseconds() -> Double {
+            var time = timespec()
+            precondition(clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &time) == 0)
+            return Double(time.tv_sec) * 1000 + Double(time.tv_nsec) / 1e6
         }
     }
 #endif

@@ -347,6 +347,19 @@ enum AgentToolResultPersistencePolicy {
             exitCode: exitCode,
             context: context
         )
+        // ask_user args are dropped from storage below, and its card shows only questions and
+        // answers, so keep a bounded record of both in the persisted result.
+        let askUserExchangeSummary: String? = {
+            guard normalizedToolName == "ask_user" || normalizedToolName == "ask_user_question" else { return nil }
+            return AgentAskUserTranscriptExchange.decode(
+                argsJSON: sourceItem.toolArgsJSON ?? generatedExecution?.argsJSON,
+                resultJSON: sourceItem.toolResultJSON
+            )?.persistedResultJSON(
+                statusWord: statusWord,
+                summaryText: summaryText,
+                byteBudget: maxPersistedToolSummaryBytes
+            )
+        }()
         let allowedStructuredSummary: String? = {
             let allowedTools: Set = [
                 "apply_edits",
@@ -383,6 +396,7 @@ enum AgentToolResultPersistencePolicy {
             return resultJSON
         }()
         let resultJSON = promptExportStructuredMetadata
+            ?? askUserExchangeSummary
             ?? cursorACPStructuredSummary
             ?? allowedStructuredSummary
             ?? (

@@ -80,6 +80,10 @@ extension AgentSkillDefinition.Source {
 final class AgentSkillCatalog {
     #if DEBUG
         var test_beforePublish: (@MainActor () async -> Void)?
+        var test_beforeSecondRoot: (@Sendable () async -> Void)?
+        var test_scheduledRefreshTask: Task<Void, Never>? {
+            refreshTask
+        }
     #endif
 
     // MARK: - Internal types
@@ -141,6 +145,7 @@ final class AgentSkillCatalog {
     private var isDirty = false
     private var refreshTask: Task<Void, Never>?
     private var refreshGeneration: UInt64 = 0
+    private var scheduledDiscovery: (generation: UInt64, task: Task<[AgentSkillDefinition], Never>)?
 
     init(fileManager: FileManager = .default, homeDirectoryURL: URL? = nil) {
         self.fileManager = fileManager
@@ -152,6 +157,10 @@ final class AgentSkillCatalog {
     func scheduleRefresh(workspacePaths: [String], agentKind: AgentProviderKind) {
         refreshTask?.cancel()
         refreshGeneration &+= 1
+        // Only a newer generation authorizes canceling a discovery worker.
+        let supersededDiscovery = scheduledDiscovery
+        scheduledDiscovery = nil
+        supersededDiscovery?.task.cancel()
         let generation = refreshGeneration
         refreshTask = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -169,7 +178,7 @@ final class AgentSkillCatalog {
     /// requires `shouldPublish()` (default true); nil-generation refreshes are otherwise always applied.
     func refresh(workspacePaths: [String], agentKind: AgentProviderKind, generation: UInt64? = nil, shouldPublish: @MainActor () -> Bool = { true }) async {
         let canonicalPaths = workspacePaths.compactMap { Self.canonicalWorkspacePath($0) }
-        let discovered = await discoverSkills(workspacePaths: canonicalPaths, agentKind: agentKind)
+        let discovered = await discoverSkills(workspacePaths: canonicalPaths, agentKind: agentKind, generation: generation)
 
         #if DEBUG
             await test_beforePublish?()
@@ -276,10 +285,14 @@ final class AgentSkillCatalog {
         return URL(fileURLWithPath: trimmed).standardizedFileURL.path
     }
 
-    private func discoverSkills(workspacePaths: [String], agentKind: AgentProviderKind) async -> [AgentSkillDefinition] {
+    private func discoverSkills(workspacePaths: [String], agentKind: AgentProviderKind, generation: UInt64?) async -> [AgentSkillDefinition] {
+        if let generation, generation != refreshGeneration { return [] }
         let roots = skillSearchRoots(workspacePaths: workspacePaths, agentKind: agentKind)
         let fileManager = fileManager
-        return await Task.detached(priority: .utility) {
+        #if DEBUG
+            let beforeSecondRoot = test_beforeSecondRoot
+        #endif
+        let worker = Task.detached(priority: .utility) {
             var winnersByName: [String: DiscoveredSkill] = [:]
             var seenRootKeys = Set<String>()
             var seenDefinitionFileKeys = Set<String>()
@@ -291,7 +304,14 @@ final class AgentSkillCatalog {
                 return lhs.rootOrdinal < rhs.rootOrdinal
             }
 
+            #if DEBUG
+                var traversalIndex = 0
+            #endif
             for root in orderedRoots {
+                #if DEBUG
+                    if traversalIndex == 1 { await beforeSecondRoot?() }
+                    traversalIndex += 1
+                #endif
                 if Task.isCancelled { break }
                 guard let rootDirectoryKey = Self.canonicalExistingDirectoryKey(for: root.url, fileManager: fileManager) else {
                     continue
@@ -335,7 +355,18 @@ final class AgentSkillCatalog {
                     return lhs.rootOrdinal < rhs.rootOrdinal
                 }
                 .map(\.definition)
-        }.value
+        }
+        // Nil-generation and additional same-generation discoveries stay independent.
+        let didRegister = generation != nil && scheduledDiscovery == nil
+        if let generation, didRegister {
+            scheduledDiscovery = (generation, worker)
+        }
+        // Caller cancellation alone must not truncate an otherwise publishable scan.
+        let discovered = await worker.value
+        if let generation, didRegister, scheduledDiscovery?.generation == generation {
+            scheduledDiscovery = nil
+        }
+        return discovered
     }
 
     /// Returns agent-specific search roots in precedence order.

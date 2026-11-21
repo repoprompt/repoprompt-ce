@@ -112,6 +112,7 @@ final class TaskLocalPayloadLayoutGuardTests: XCTestCase {
         assertPointerSizedCarrier(DomainChildLaunchContext.currentTaskLocal)
         assertPointerSizedCarrier(DomainChildLaunchContext.bundleTaskLocal)
         assertPointerSizedCarrier(DomainInteractionPresentationContext.requestIDTaskLocal)
+        assertPointerSizedCarrier(DomainInteractionPresentationContext.deadlineTaskLocal)
         assertPointerSizedCarrier(MCPDomainMutationCommitContext.controllerTaskLocal)
         assertPointerSizedCarrier(MCPRequestTimelineContext.currentTaskLocal)
         #if DEBUG

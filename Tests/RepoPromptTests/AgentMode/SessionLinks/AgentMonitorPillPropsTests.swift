@@ -1249,7 +1249,7 @@ final class AgentMonitorPillPropsTests: XCTestCase {
             fresh.snoozeActionLabel(seconds: 600, now: now),
             "Snooze status Auto-wake for Build API for 10 minutes"
         )
-        XCTAssertEqual(fresh.snoozeOptionLabel(seconds: 1200, now: now), "Snooze for 20 minutes")
+        XCTAssertEqual(fresh.snoozeOptionLabel(seconds: 3600, now: now), "Snooze for 1h")
 
         let active = outbound(
             autoWakeSnooze: snooze(minutesFromNow: 9, now: now),
@@ -1258,12 +1258,16 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         // `at least`, because the server keeps the later of the two deadlines rather than replacing
         // the current one.
         XCTAssertEqual(
-            active.snoozeOptionLabel(seconds: 1200, now: now),
-            "Extend to at least 20 minutes from now"
+            active.snoozeOptionLabel(seconds: 3600, now: now),
+            "Extend to at least 1h from now"
         )
         XCTAssertEqual(
-            active.snoozeActionLabel(seconds: 1200, now: now),
-            "Extend status Auto-wake snooze for Build API to at least 20 minutes from now"
+            active.snoozeActionLabel(seconds: 3600, now: now),
+            "Extend status Auto-wake snooze for Build API to at least 1 hour from now"
+        )
+        XCTAssertEqual(
+            active.snoozeActionLabel(seconds: 86400, now: now),
+            "Extend status Auto-wake snooze for Build API to at least 24 hours from now"
         )
     }
 
@@ -1273,20 +1277,20 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         let now = moment(hour: 16, minute: 11)
         XCTAssertEqual(
             outbound(isAutoWakeEffectivelySelected: true).availableSnoozeDurationSeconds(now: now),
-            [600, 1200, 2400, 3600]
+            [600, 1200, 1800, 2400, 3600, 7200, 10800, 21600, 43200, 86400]
         )
-        // 25 minutes left: ten and twenty would not move it, forty and sixty would.
+        // At 25 minutes, the ten- and twenty-minute choices cannot extend the deadline.
         XCTAssertEqual(
             outbound(
                 autoWakeSnooze: snooze(minutesFromNow: 25, now: now),
                 isAutoWakeEffectivelySelected: true
             ).availableSnoozeDurationSeconds(now: now),
-            [2400, 3600]
+            [1800, 2400, 3600, 7200, 10800, 21600, 43200, 86400]
         )
         // At the cap nothing can move it further, so the menu offers nothing at all.
         XCTAssertTrue(
             outbound(
-                autoWakeSnooze: snooze(minutesFromNow: 60, now: now),
+                autoWakeSnooze: snooze(minutesFromNow: 1440, now: now),
                 isAutoWakeEffectivelySelected: true
             ).availableSnoozeDurationSeconds(now: now).isEmpty
         )

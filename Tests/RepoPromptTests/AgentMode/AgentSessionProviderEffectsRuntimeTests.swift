@@ -1351,6 +1351,86 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
         ))
     }
 
+    func testCardActivityRenewsSharedDeadlineAndTimeoutReturnsPartialDraft() async throws {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let session = questionSession(in: scope)
+        let runtime = scope.interactions(routeID: 42, approvalStore: ApplyEditsApprovalStore())
+        let command = try questionCommand(in: scope, for: session)
+        let interaction = AgentAskUserInteraction(
+            timeoutSeconds: 0.5,
+            questions: [AgentAskUserQuestion(id: "notes", question: "Notes?", allowsCustom: true)]
+        )
+        let installed = expectation(description: "Question installed")
+        let attachment = observeQuestionInstallation(scope: scope, session: session, installed: installed)
+        let deadline = DomainInteractionBroker.Deadline(
+            deadline: Date().addingTimeInterval(1.3), renewalTimeoutSeconds: interaction.timeoutSeconds
+        )
+        let oldDeadline = try XCTUnwrap(deadline.acceptanceDeadline())
+        let task = Task {
+            try await DomainInteractionPresentationContext.deadlineTaskLocal.withValue(deadline) {
+                try await runtime.askUser(command: command, interaction: interaction)
+            }
+        }
+        addTeardownBlock { @MainActor in
+            task.cancel()
+            _ = await task.result
+        }
+        await fulfillment(of: [installed], timeout: 3)
+        scope.presentation.detach(attachment)
+        XCTAssertTrue(session.askUserDeadline === deadline)
+        XCTAssertTrue(runtime.updateAskUserDraft(
+            command: command, interactionID: interaction.id, questionID: "notes",
+            draft: AgentAskUserDraft(customResponse: "unfinished draft")
+        ))
+        XCTAssertTrue(runtime.noteAskUserCardActivity(command: command, interactionID: interaction.id))
+        let renewed = try XCTUnwrap(deadline.acceptanceDeadline())
+        XCTAssertGreaterThan(renewed, oldDeadline)
+        let anchor = try XCTUnwrap(session.pendingAskUser?.timeoutStartedAt)
+        XCTAssertEqual(anchor.addingTimeInterval(interaction.timeoutSeconds), renewed.addingTimeInterval(-1))
+        let response = try await task.value
+        XCTAssertTrue(response.timedOut)
+        XCTAssertFalse(response.skipped)
+        XCTAssertEqual(response.answersByQuestionID["notes"]?.answers, ["unfinished draft"])
+        XCTAssertNil(session.pendingAskUser)
+        XCTAssertNil(session.askUserDeadline)
+    }
+
+    func testCancelledCardIgnoresLaterActivity() async throws {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let session = questionSession(in: scope)
+        let runtime = scope.interactions(routeID: 42, approvalStore: ApplyEditsApprovalStore())
+        let command = try questionCommand(in: scope, for: session)
+        let interaction = runtimeQuestion()
+        let installed = expectation(description: "Question installed")
+        let attachment = observeQuestionInstallation(scope: scope, session: session, installed: installed)
+        let deadline = DomainInteractionBroker.Deadline(
+            deadline: Date().addingTimeInterval(interaction.timeoutSeconds + 1),
+            renewalTimeoutSeconds: interaction.timeoutSeconds
+        )
+        let task = Task {
+            try await DomainInteractionPresentationContext.deadlineTaskLocal.withValue(deadline) {
+                try await runtime.askUser(command: command, interaction: interaction)
+            }
+        }
+        addTeardownBlock { @MainActor in
+            task.cancel()
+            _ = await task.result
+        }
+        await fulfillment(of: [installed], timeout: 3)
+        scope.presentation.detach(attachment)
+        let waitID = try XCTUnwrap(runtime.questionWaits[ObjectIdentifier(session)]?.id)
+        XCTAssertTrue(runtime.cancelAskUserInteraction(session: session, interactionID: interaction.id, waitID: waitID))
+        let previous = deadline.acceptanceDeadline()
+        XCTAssertFalse(runtime.noteAskUserCardActivity(command: command, interactionID: interaction.id))
+        XCTAssertEqual(deadline.acceptanceDeadline(), previous)
+        XCTAssertNil(session.pendingAskUser)
+        XCTAssertNil(session.askUserDeadline)
+        do {
+            _ = try await task.value
+            XCTFail("Expected cancellation")
+        } catch is CancellationError {}
+    }
+
     func testProviderSwitchDeclineUsesOnlyItsOriginalLifecycleClaim() async throws {
         for drift in ["none", "released", "reacquired", "replacement", "other-scope"] {
             let scope = AgentSessionRuntimeStore().makeScope()

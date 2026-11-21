@@ -299,6 +299,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         var pendingAskUserRunID: UUID?
         /// Task for question timeout handling
         var askUserTimeoutTask: Task<Void, Never>?
+        var askUserDeadline: DomainInteractionBroker.Deadline?
         /// Generation token for timeout reset/cancellation races
         var pendingAskUserTimeoutGeneration: UInt64 = 0
 
@@ -5801,9 +5802,13 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             throw ContextBuilderGenerationError.askUserAlreadyPending
         }
 
+        let deadline = DomainInteractionPresentationContext.deadline
+        try Task.checkCancellation()
+        if let deadline, deadline.acceptanceDeadline() == nil { throw CancellationError() }
+        let anchor = deadline?.countdownAnchor() ?? interaction.askedAt
         let pending = AgentAskUserPendingState(
             interaction: interaction,
-            timeoutStartedAt: interaction.askedAt
+            timeoutStartedAt: anchor
         )
         session.pendingAskUser = pending
         session.pendingAskUserRunID = record.runID
@@ -5841,20 +5846,21 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                guard !Task.isCancelled else {
+                guard !Task.isCancelled, deadline?.acceptanceDeadline() != nil || deadline == nil else {
                     session.pendingAskUser = nil
                     session.pendingAskUserRunID = nil
                     updateRuntimeBindings(from: session)
                     continuation.resume(throwing: CancellationError())
                     return
                 }
+                session.askUserDeadline = deadline
                 session.askUserContinuation = continuation
                 schedulePendingAskUserTimeout(
                     for: session,
                     interactionID: interaction.id,
                     runID: record.runID,
                     timeoutSeconds: interaction.timeoutSeconds,
-                    startedAt: interaction.askedAt
+                    startedAt: anchor
                 )
             }
         } onCancel: {
@@ -5904,12 +5910,19 @@ final class ContextBuilderAgentViewModel: ObservableObject {
               session.askUserContinuation != nil
         else { return }
 
+        let anchor: Date
+        if let deadline = session.askUserDeadline {
+            guard deadline.renew() != nil, let renewedAnchor = deadline.countdownAnchor() else { return }
+            anchor = renewedAnchor
+        } else {
+            anchor = Date()
+        }
         schedulePendingAskUserTimeout(
             for: session,
             interactionID: interactionID,
             runID: runID,
             timeoutSeconds: pending.interaction.timeoutSeconds,
-            startedAt: Date()
+            startedAt: anchor
         )
         updateRuntimeBindings(from: session)
     }
@@ -5928,11 +5941,13 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             pending.timeoutStartedAt = startedAt
             session.pendingAskUser = pending
         }
-        let sleepNanoseconds = UInt64(max(0, timeoutSeconds) * 1_000_000_000)
+        let delay = session.askUserDeadline == nil
+            ? max(0, timeoutSeconds)
+            : max(0, startedAt.addingTimeInterval(timeoutSeconds).timeIntervalSinceNow)
 
         session.askUserTimeoutTask = Task { @MainActor [weak self, weak session] in
             do {
-                try await Task.sleep(nanoseconds: sleepNanoseconds)
+                try await Task.sleep(for: .seconds(delay))
             } catch {
                 return
             }
@@ -5947,6 +5962,17 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                   let continuation = session.askUserContinuation
             else { return }
 
+            if let deadline = session.askUserDeadline {
+                guard let anchor = deadline.countdownAnchor() else { return }
+                if anchor.addingTimeInterval(timeoutSeconds) > Date() {
+                    schedulePendingAskUserTimeout(
+                        for: session, interactionID: interactionID, runID: runID,
+                        timeoutSeconds: timeoutSeconds, startedAt: anchor
+                    )
+                    updateRuntimeBindings(from: session)
+                    return
+                }
+            }
             invalidatePendingAskUserTimeout(for: session)
             session.pendingAskUser = nil
             session.pendingAskUserRunID = nil
@@ -5967,6 +5993,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         session.pendingAskUserTimeoutGeneration &+= 1
         session.askUserTimeoutTask?.cancel()
         session.askUserTimeoutTask = nil
+        session.askUserDeadline = nil
         if var pending = session.pendingAskUser {
             pending.timeoutStartedAt = nil
             session.pendingAskUser = pending

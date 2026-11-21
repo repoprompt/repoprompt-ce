@@ -357,6 +357,18 @@ final class AgentRepromptModelPolicyTests: XCTestCase {
         XCTAssertTrue(AgentRepromptModelPolicy.supportsSideCall(AgentRepromptModelPolicy.preferredClaude))
     }
 
+    func testOpenCodeRepromptRequiresAnExplicitConnectedSelection() {
+        let model = AIModel.openCodeCustom(name: "google/gemini-test")
+        let automatic = AgentRepromptModelPolicy.preferredCodex
+        let selection = model.rawValue
+        XCTAssertTrue(model.canStream)
+        XCTAssertTrue(AgentRepromptModelPolicy.supportsSideCall(model))
+        XCTAssertEqual(AgentRepromptModelPolicy.resolve(selection: selection, currentProvider: .codexExec, configured: [automatic, model]), model)
+        XCTAssertNil(AgentRepromptModelPolicy.resolve(selection: selection, currentProvider: .codexExec, configured: [automatic]))
+        XCTAssertEqual(AgentRepromptModelPolicy.resolve(selection: nil, currentProvider: .codexExec, configured: [model, automatic]), automatic)
+        XCTAssertNil(AgentRepromptModelPolicy.resolve(selection: nil, currentProvider: .openCode, configured: [model]))
+    }
+
     func testPreparationSendsDraftAttachmentsAndConversationButNoManifest() async throws {
         let fixture = try await AgentRepromptTestFixture()
         defer { fixture.cleanUp() }
