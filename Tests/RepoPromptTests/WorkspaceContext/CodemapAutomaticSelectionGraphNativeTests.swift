@@ -6,6 +6,231 @@ import RepoPromptPersistence
 import XCTest
 
 final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
+    func testEnabledStartupKeepsDiscoveryPresentation() async throws {
+        let workspace = try PlainWorkspaceFixture(name: #function)
+        let fixture = try CodemapStoreFixture(name: #function, forbidCodeMapGitProcesses: true)
+        let store = fixture.makeProductionStore(nonGitCodeMapsEnabled: true)
+        let gate = TestReleaseFence(name: "enabled root startup")
+        await store.setCodemapGraphIndexBuildStartHandlerForTesting { _ in await gate.enterAndWait() }
+        let loaded = try await store.loadRoot(path: workspace.rootURL.path)
+        addTeardownBlock {
+            gate.release()
+            await store.unloadRoot(id: loaded.id)
+            await fixture.shutdown()
+            workspace.cleanup()
+        }
+        let entered = await gate.waitUntilEntered(timeout: 10)
+        XCTAssertTrue(entered)
+        let status = await store.codemapRootStatusSnapshot(rootID: loaded.id)
+        let snapshot = try XCTUnwrap(status)
+        XCTAssertFalse(snapshot.isNonGitCodeMapsPolicyDisabled)
+        let presentation = AgentWorkspaceCodemapPresentation.make(snapshot)
+        XCTAssertNotEqual(presentation.state, .unavailable)
+        XCTAssertTrue(presentation.showsProgress)
+        let starting = WorkspaceCodemapRootStatusSnapshot(
+            rootEpoch: snapshot.rootEpoch, availability: .notInitialized,
+            isGenerationSuspended: false, isNonGitCodeMapsPolicyDisabled: false,
+            coverage: snapshot.coverage, graphRevision: snapshot.graphRevision,
+            appliedGeneration: snapshot.appliedGeneration, observedGeneration: snapshot.observedGeneration,
+            updatesPending: snapshot.updatesPending, reconciliationAttempt: snapshot.reconciliationAttempt,
+            reconciliationDeadlineUptimeNanoseconds: snapshot.reconciliationDeadlineUptimeNanoseconds,
+            commitCadence: snapshot.commitCadence, diagnostics: snapshot.diagnostics,
+            unavailableReason: nil, graphIndexBudget: nil
+        )
+        XCTAssertEqual(AgentWorkspaceCodemapPresentation.make(starting).statusText, "Preparing…")
+        XCTAssertEqual(AgentWorkspaceCodemapPresentation.make(nil).statusText, "Preparing…")
+        gate.release()
+    }
+
+    func testPolicyChangesPublishWhilePausedWithoutIndexWork() async throws {
+        let workspace = try PlainWorkspaceFixture(name: #function)
+        let fixture = try CodemapStoreFixture(name: #function, forbidCodeMapGitProcesses: true)
+        let store = fixture.makeProductionStore(nonGitCodeMapsEnabled: false)
+        let loaded = try await store.loadRoot(path: workspace.rootURL.path)
+        let updates = CodemapLockedValues<WorkspaceCodemapRootStatusUpdate>()
+        let stream = await store.codemapRootStatusUpdates()
+        let observer = Task { for await update in stream {
+            updates.append(update)
+        } }
+        addTeardownBlock {
+            observer.cancel()
+            await store.unloadRoot(id: loaded.id)
+            await fixture.shutdown()
+            workspace.cleanup()
+        }
+        _ = await store.setCodemapGenerationSuspended(rootID: loaded.id, suspended: true)
+        await store.setNonGitCodeMapsEnabled(true)
+        try await AsyncTestWait.waitUntil("enabled policy delivered while paused", timeout: 10) {
+            updates.values.last?.roots.contains { $0.rootEpoch.rootID == loaded.id && !$0.isNonGitCodeMapsPolicyDisabled && $0.isGenerationSuspended } == true
+        }
+        let revision = updates.values.last?.revision ?? 0
+        await store.setNonGitCodeMapsEnabled(false)
+        try await AsyncTestWait.waitUntil("disabled policy delivered while paused", timeout: 10) {
+            guard let latest = updates.values.last, latest.revision > revision else { return false }
+            return latest.roots.contains { $0.rootEpoch.rootID == loaded.id && $0.isNonGitCodeMapsPolicyDisabled && $0.isGenerationSuspended }
+        }
+        let engine = try fixture.runtime().bindingEngine()
+        let accounting = await engine.accounting()
+        XCTAssertTrue(accounting.graphIndexRoots.isEmpty)
+        XCTAssertTrue(fixture.builtSourceTexts.values.isEmpty)
+    }
+
+    func testEmptyPlainRootWithNonGitDisabledDoesNotAdvertiseActivePreparation() async throws {
+        let workspace = try PlainWorkspaceFixture(name: #function)
+        let fixture = try CodemapStoreFixture(name: #function, forbidCodeMapGitProcesses: true)
+        let store = fixture.makeProductionStore(nonGitCodeMapsEnabled: false)
+        let loaded = try await store.loadRoot(path: workspace.rootURL.path)
+        addTeardownBlock {
+            await store.unloadRoot(id: loaded.id)
+            await fixture.shutdown()
+            workspace.cleanup()
+        }
+        let epochs = await store.codemapRootEpochs()
+        let rootEpoch = try XCTUnwrap(epochs[loaded.id])
+        let phase = await store.codemapGraphIndexBuildLaunchPhaseForTesting(rootEpoch: rootEpoch)
+        let engine = try fixture.runtime().bindingEngine()
+        let accounting = await engine.accounting()
+        XCTAssertNil(phase)
+        XCTAssertTrue(accounting.graphIndexRoots.isEmpty)
+        XCTAssertTrue(fixture.builtSourceTexts.values.isEmpty)
+        XCTAssertTrue(fixture.codeMapGitProcessAttempts.values.isEmpty)
+        let status = await store.codemapRootStatusSnapshot(rootID: loaded.id)
+        let snapshot = try XCTUnwrap(status)
+        XCTAssertTrue(snapshot.isNonGitCodeMapsPolicyDisabled)
+        XCTAssertEqual(snapshot.availability, .notInitialized)
+        XCTAssertNil(snapshot.unavailableReason)
+        let presentation = AgentWorkspaceCodemapPresentation.make(snapshot)
+        XCTAssertEqual(presentation.statusText, "Unavailable")
+        XCTAssertFalse(presentation.canToggle)
+        let summary = AgentWorkspaceCodemapSummary.make([presentation])
+        XCTAssertFalse(
+            presentation.showsProgress || summary.showsIndeterminateProgress,
+            "No work was admitted, but root=\(presentation.statusText), active=\(presentation.isActivelyMapping), summary=\(summary.preSealProgressText)"
+        )
+    }
+
+    func testEmptyPlainRootWithNonGitEnabledCompletesAndIndexesLaterFile() async throws {
+        let workspace = try PlainWorkspaceFixture(name: #function)
+        let fixture = try CodemapStoreFixture(name: #function, forbidCodeMapGitProcesses: true)
+        let store = fixture.makeProductionStore()
+        let loaded = try await store.loadRoot(path: workspace.rootURL.path)
+        addTeardownBlock {
+            await store.unloadRoot(id: loaded.id)
+            await fixture.shutdown()
+            workspace.cleanup()
+        }
+        let engine = try fixture.runtime().bindingEngine()
+        let completed = try await waitForGraphCompletion(engine: engine, rootID: loaded.id, timeout: .seconds(30))
+        XCTAssertEqual(completed.progress.counts.processedCandidateCount, 0)
+        XCTAssertNotNil(completed.progress.catalogCompletion)
+        let empty = try await requireReadySnapshot(engine: engine, rootEpoch: completed.rootEpoch)
+        XCTAssertTrue(empty.snapshot.coverage.isComplete)
+        XCTAssertEqual(empty.snapshot.coverage.supportedCount, 0)
+        XCTAssertTrue(empty.snapshot.nodesByFileID.isEmpty)
+        try await AsyncTestWait.waitUntil("empty filesystem graph status is ready", timeout: 10) {
+            await store.codemapRootStatusSnapshot(rootID: loaded.id)?.availability == .ready
+        }
+        let status = await store.codemapRootStatusSnapshot(rootID: loaded.id)
+        let presentation = AgentWorkspaceCodemapPresentation.make(status)
+        XCTAssertEqual(presentation.statusText, "Mapped")
+        XCTAssertFalse(presentation.showsProgress)
+        XCTAssertFalse(AgentWorkspaceCodemapSummary.make([presentation]).showsIndeterminateProgress)
+
+        try workspace.write("export interface LaterType { id: string }\n", to: "Later.ts")
+        await store.replayObservedFileSystemDeltas(rootID: loaded.id, deltas: [.fileAdded("Later.ts")])
+        let files = await store.files(inRoot: loaded.id)
+        let file = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Later.ts" })
+        let updated = try await waitForReadySnapshot(
+            engine: engine, rootEpoch: completed.rootEpoch, "later file contributes definitions"
+        ) { snapshot in
+            snapshot.snapshot.coverage.isComplete && Self.definitions(in: snapshot, fileID: file.id) == ["LaterType"]
+        }
+        XCTAssertEqual(definitions(in: updated, fileID: file.id), ["LaterType"])
+        XCTAssertTrue(fixture.codeMapGitProcessAttempts.values.isEmpty)
+    }
+
+    func testEmptyUnbornGitRootCompletesWithoutNonGitOptIn() async throws {
+        let repository = try ReviewGitRepositoryFixture(name: #function)
+        let rootURL = repository.sandbox.appendingPathComponent("root", isDirectory: true)
+        try repository.runGit(
+            ["-c", "init.defaultBranch=main", "init", "--quiet", rootURL.path], at: repository.sandbox
+        )
+        XCTAssertThrowsError(try repository.runGit(["rev-parse", "--verify", "HEAD"], at: rootURL))
+        let fixture = try CodemapStoreFixture(name: #function)
+        let store = fixture.makeProductionStore(nonGitCodeMapsEnabled: false)
+        let loaded = try await store.loadRoot(path: rootURL.path)
+        addTeardownBlock {
+            await store.unloadRoot(id: loaded.id)
+            await fixture.shutdown()
+            repository.cleanup()
+        }
+        let files = await store.files(inRoot: loaded.id)
+        XCTAssertTrue(files.isEmpty)
+        let engine = try fixture.runtime().bindingEngine()
+        let completed = try await waitForGraphCompletion(engine: engine, rootID: loaded.id, timeout: .seconds(30))
+        XCTAssertEqual(completed.progress.counts.processedCandidateCount, 0)
+        XCTAssertNotNil(completed.progress.catalogCompletion)
+        let empty = try await requireReadySnapshot(engine: engine, rootEpoch: completed.rootEpoch)
+        XCTAssertTrue(empty.snapshot.coverage.isComplete)
+        XCTAssertEqual(empty.snapshot.coverage.supportedCount, 0)
+        XCTAssertTrue(empty.snapshot.nodesByFileID.isEmpty)
+        try await AsyncTestWait.waitUntil("empty unborn Git graph status is ready", timeout: 10) {
+            await store.codemapRootStatusSnapshot(rootID: loaded.id)?.availability == .ready
+        }
+        let status = await store.codemapRootStatusSnapshot(rootID: loaded.id)
+        let presentation = AgentWorkspaceCodemapPresentation.make(status)
+        XCTAssertEqual(presentation.statusText, "Mapped")
+        XCTAssertFalse(presentation.showsProgress)
+        XCTAssertFalse(AgentWorkspaceCodemapSummary.make([presentation]).showsIndeterminateProgress)
+        XCTAssertTrue(fixture.builtSourceTexts.values.isEmpty)
+    }
+
+    func testEmptyPlainRootPauseEnableAndReloadWorkarounds() async throws {
+        let workspace = try PlainWorkspaceFixture(name: #function)
+        let fixture = try CodemapStoreFixture(name: #function, forbidCodeMapGitProcesses: true)
+        let defaults = try XCTUnwrap(EmptyRootPauseDefaults(suiteName: "EmptyRootPause-\(UUID().uuidString)"))
+        let store = fixture.makeProductionStore(
+            nonGitCodeMapsEnabled: false, pausePolicy: WorkspaceCodemapRootPausePolicy(defaults: defaults)
+        )
+        let loaded = try await store.loadRoot(path: workspace.rootURL.path)
+        addTeardownBlock {
+            await store.unloadRoot(id: loaded.id)
+            await fixture.shutdown()
+            workspace.cleanup()
+        }
+        _ = await store.setCodemapGenerationSuspended(rootID: loaded.id, suspended: true)
+        let pausedStatus = await store.codemapRootStatusSnapshot(rootID: loaded.id)
+        let paused = AgentWorkspaceCodemapPresentation.make(pausedStatus)
+        XCTAssertEqual(paused.statusText, "Paused")
+        XCTAssertFalse(paused.showsProgress)
+        XCTAssertFalse(AgentWorkspaceCodemapSummary.make([paused]).showsIndeterminateProgress)
+        _ = await store.setCodemapGenerationSuspended(rootID: loaded.id, suspended: false)
+        let resumedStatus = await store.codemapRootStatusSnapshot(rootID: loaded.id)
+        XCTAssertEqual(AgentWorkspaceCodemapPresentation.make(resumedStatus).statusText, "Unavailable")
+
+        await store.unloadRoot(id: loaded.id)
+        let reloaded = try await store.loadRoot(path: workspace.rootURL.path)
+        addTeardownBlock { await store.unloadRoot(id: reloaded.id) }
+        let reloadedStatus = await store.codemapRootStatusSnapshot(rootID: reloaded.id)
+        XCTAssertFalse(AgentWorkspaceCodemapPresentation.make(reloadedStatus).showsProgress)
+        try workspace.write("export interface EnabledLaterType { id: string }\n", to: "Later.ts")
+        await store.replayObservedFileSystemDeltas(rootID: reloaded.id, deltas: [.fileAdded("Later.ts")])
+        let addedStatus = await store.codemapRootStatusSnapshot(rootID: reloaded.id)
+        XCTAssertEqual(AgentWorkspaceCodemapPresentation.make(addedStatus).statusText, "Unavailable")
+        let engine = try fixture.runtime().bindingEngine()
+        let beforeEnable = await engine.accounting()
+        XCTAssertTrue(beforeEnable.graphIndexRoots.isEmpty)
+        XCTAssertTrue(fixture.builtSourceTexts.values.isEmpty)
+
+        await store.setNonGitCodeMapsEnabled(true)
+        let completed = try await waitForGraphCompletion(engine: engine, rootID: reloaded.id, timeout: .seconds(30))
+        let files = await store.files(inRoot: reloaded.id)
+        let file = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Later.ts" })
+        let snapshot = try await requireReadySnapshot(engine: engine, rootEpoch: completed.rootEpoch)
+        XCTAssertEqual(definitions(in: snapshot, fileID: file.id), ["EnabledLaterType"])
+        XCTAssertTrue(fixture.codeMapGitProcessAttempts.values.isEmpty)
+    }
+
     func testPausedRootSurvivesReloadAndGlobalOverrideWithoutAdmittingWork() async throws {
         let workspace = try PlainWorkspaceFixture(name: #function)
         try workspace.write("struct Feature {}\n", to: "Feature.swift")
@@ -2074,6 +2299,25 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
     ) -> UInt64? {
         guard case let .filesystem(_, authorityGeneration) = token else { return nil }
         return authorityGeneration
+    }
+}
+
+private final class EmptyRootPauseDefaults: UserDefaults, @unchecked Sendable {
+    private let lock = NSLock()
+    private var pausedKeys: Set<String> = []
+
+    override func bool(forKey defaultName: String) -> Bool {
+        lock.withLock { pausedKeys.contains(defaultName) }
+    }
+
+    override func set(_ value: Bool, forKey defaultName: String) {
+        lock.withLock {
+            if value { pausedKeys.insert(defaultName) } else { pausedKeys.remove(defaultName) }
+        }
+    }
+
+    override func removeObject(forKey defaultName: String) {
+        _ = lock.withLock { pausedKeys.remove(defaultName) }
     }
 }
 

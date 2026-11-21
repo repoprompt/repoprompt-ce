@@ -13,6 +13,36 @@ import XCTest
 
 @MainActor
 final class AgentOraclePillRoutingTests: XCTestCase {
+    func testSingleOracleModelNameTracksRequestNotPreviousAnswer() {
+        let previous = AIChatMessage(content: "old", isUser: false, modelName: "Previous")
+        var reply = AIChatMessage(content: "", isUser: false, modelName: "Recorded Model")
+        XCTAssertEqual(AgentOraclePillLogic.singleOracleModelName(messages: [previous, reply], activeQueryID: reply.id, isStreaming: true), "Recorded Model")
+        reply.setIsFinalized(true)
+        XCTAssertEqual(AgentOraclePillLogic.singleOracleModelName(messages: [previous, reply], activeQueryID: nil, isStreaming: false), "Recorded Model")
+        let missing = AIChatMessage(content: "error", isUser: false)
+        XCTAssertNil(AgentOraclePillLogic.singleOracleModelName(messages: [previous, missing], activeQueryID: missing.id, isStreaming: true))
+        XCTAssertNil(AgentOraclePillLogic.singleOracleModelName(messages: [previous, missing], activeQueryID: nil, isStreaming: false))
+        XCTAssertNil(AgentOraclePillLogic.singleOracleModelName(messages: [previous], activeQueryID: UUID(), isStreaming: true))
+        XCTAssertNil(AgentOraclePillLogic.singleOracleModelName(messages: [previous, AIChatMessage(content: "next", isUser: true)], activeQueryID: nil, isStreaming: false))
+    }
+
+    func testSingleOracleModelLabelSurvivesReloadAndSelectionChange() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanup() }
+        var session = ChatSession(workspaceID: fixture.workspace.id, composeTabID: fixture.tabID, name: "Recorded Oracle", messages: [StoredMessage(isUser: false, rawText: "answer", modelName: "Recorded Model")])
+        session.fileURL = try await fixture.oracleViewModel.chatData.saveChatSession(session, for: fixture.workspace)
+        fixture.oracleViewModel.sessions = [session.listStub()]
+        let loaded = await fixture.oracleViewModel.ensureSessionMessagesLoaded(session.id)
+        XCTAssertTrue(loaded)
+        let pill = AgentOraclePill(oracleViewModel: fixture.oracleViewModel, windowID: -1, currentTabID: fixture.tabID, activeAgentSessionID: nil, activeRunID: nil)
+        XCTAssertEqual(pill.popoverModelName(for: session), "Recorded Model")
+        let previousSelection = fixture.composition.promptManager.preferredModel
+        defer { fixture.composition.promptManager.preferredModel = previousSelection }
+        session.preferredAIModel = "Different Model"
+        fixture.composition.promptManager.preferredModel = "Different Model"
+        XCTAssertEqual(pill.popoverModelName(for: session), "Recorded Model")
+    }
+
     func testExplicitRequestStateRejectsBlankStaleTabAndMismatchedSession() throws {
         let tabID = UUID()
         let otherTabID = UUID()

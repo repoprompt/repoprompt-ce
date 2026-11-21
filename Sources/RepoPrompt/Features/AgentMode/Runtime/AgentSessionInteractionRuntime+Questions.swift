@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptDomainRuntime
 
 @MainActor
 extension AgentSessionInteractionRuntime {
@@ -17,6 +18,7 @@ extension AgentSessionInteractionRuntime {
         try interaction.validate()
         try rejectAskUserIfBlockingInteractionExists(in: session)
 
+        let deadline = DomainInteractionPresentationContext.deadline
         let identity = ObjectIdentifier(session)
         let waitID = UUID()
         questionWaits[identity] = QuestionWait(id: waitID, writer: command.identity, runID: session.runID, runAttemptID: session.activeRunAttemptID)
@@ -26,19 +28,22 @@ extension AgentSessionInteractionRuntime {
         }
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                guard !Task.isCancelled else {
+                let anchor = deadline?.countdownAnchor()
+                guard !Task.isCancelled, deadline == nil || anchor != nil else {
                     continuation.resume(throwing: CancellationError())
                     return
                 }
                 // Install the cancellation/response capability before publishing waiting state.
+                let startedAt = anchor ?? interaction.askedAt
+                session.askUserDeadline = deadline
                 session.askUserContinuation = continuation
-                session.pendingAskUser = AgentAskUserPendingState(interaction: interaction, timeoutStartedAt: interaction.askedAt)
+                session.pendingAskUser = AgentAskUserPendingState(interaction: interaction, timeoutStartedAt: startedAt)
                 Self.reconcileInteractiveRunState(session)
                 guard questionWaits[identity]?.id == waitID, session.askUserContinuation != nil,
                       session.pendingAskUser?.interaction.id == interaction.id else { return }
                 schedulePendingAskUserTimeout(
                     for: session, interactionID: interaction.id, waitID: waitID,
-                    timeoutSeconds: interaction.timeoutSeconds, startedAt: interaction.askedAt
+                    timeoutSeconds: interaction.timeoutSeconds, startedAt: startedAt
                 )
                 publishQuestionChange(session: session, wait: questionWaits[identity])
             }
@@ -126,9 +131,16 @@ extension AgentSessionInteractionRuntime {
         guard ownsQuestion(command: command, interactionID: interactionID), let pending = session.pendingAskUser,
               let wait = questionWaits[ObjectIdentifier(session)],
               pending.interaction.id == interactionID, session.askUserContinuation != nil else { return false }
+        let anchor: Date
+        if let deadline = session.askUserDeadline {
+            guard deadline.renew() != nil, let renewedAnchor = deadline.countdownAnchor() else { return false }
+            anchor = renewedAnchor
+        } else {
+            anchor = Date()
+        }
         schedulePendingAskUserTimeout(
             for: session, interactionID: interactionID, waitID: wait.id,
-            timeoutSeconds: pending.interaction.timeoutSeconds, startedAt: Date()
+            timeoutSeconds: pending.interaction.timeoutSeconds, startedAt: anchor
         )
         scope?.presentation.interactionChanged(session)
         return true
@@ -144,9 +156,11 @@ extension AgentSessionInteractionRuntime {
             pending.timeoutStartedAt = startedAt
             session.pendingAskUser = pending
         }
-        let sleepNanoseconds = UInt64(max(0, timeoutSeconds) * 1_000_000_000)
+        let delay = session.askUserDeadline == nil
+            ? max(0, timeoutSeconds)
+            : max(0, startedAt.addingTimeInterval(timeoutSeconds).timeIntervalSinceNow)
         session.askUserTimeoutTask = Task { @MainActor [weak self, weak session] in
-            do { try await Task.sleep(nanoseconds: sleepNanoseconds) } catch { return }
+            do { try await Task.sleep(for: .seconds(delay)) } catch { return }
             guard let self, let session else { return }
             expireAskUserTimeout(for: session, interactionID: interactionID, waitID: waitID, generation: generation)
         }
@@ -159,6 +173,18 @@ extension AgentSessionInteractionRuntime {
               session.pendingAskUserTimeoutGeneration == generation,
               let pending = session.pendingAskUser, pending.interaction.id == interactionID,
               let continuation = session.askUserContinuation else { return }
+        if let deadline = session.askUserDeadline {
+            guard let anchor = deadline.countdownAnchor() else { return }
+            let timeoutSeconds = pending.interaction.timeoutSeconds
+            if anchor.addingTimeInterval(timeoutSeconds) > Date() {
+                schedulePendingAskUserTimeout(
+                    for: session, interactionID: interactionID, waitID: waitID,
+                    timeoutSeconds: timeoutSeconds, startedAt: anchor
+                )
+                publishQuestionChange(session: session, wait: wait)
+                return
+            }
+        }
         Self.invalidatePendingAskUserTimeout(for: session)
         session.pendingAskUser = nil
         session.askUserContinuation = nil
