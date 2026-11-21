@@ -9462,7 +9462,8 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                 managerIdentity: ObjectIdentifier(self), policyID: policy.id, runID: runID,
                 routeID: windowID, routingAuthorityGeneration: previousGeneration &+ 1,
                 routingWaitGeneration: routingWaitGeneration, routeOwner: routingOwner,
-                providerContextResolver: providerContextResolver
+                providerContextResolver: providerContextResolver,
+                usesExplicitProviderContext: originatingContextSource != nil
             )
             var transferredPIDOrigin: UUID?
             if purpose == .agentModeRun, let process = reusingProcess, let routingOwner,

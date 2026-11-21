@@ -316,6 +316,11 @@ actor MCPBootstrapLease {
     /// PID-owned policies release the gate after their unique pending policy is confirmed armed.
     /// Returns `false` if cancelled, the gate could not be acquired, or PID ownership could not be armed.
     func acquire() async -> Bool {
+        if originatingContextSource != nil, routingOwner?.identity.routeID != spec.windowID {
+            hasReleased = true
+            routingTerminalOutcome = .failed(.notRegistered)
+            return false
+        }
         guard routingOwner != nil else { return await performAcquire() }
         guard !hasReleased else { return false }
         let operation: Task<Bool, Never>
