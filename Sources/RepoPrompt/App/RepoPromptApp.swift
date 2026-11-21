@@ -254,6 +254,7 @@ public enum RepoPromptApplication {
 
     public static func main() {
         if let code = ClaudeCLIUsageCollector.runIfInvoked(arguments: ProcessInfo.processInfo.arguments) { exit(code) }
+        if let code = AntigravityCLIUsageCollector.runIfInvoked(arguments: ProcessInfo.processInfo.arguments) { exit(code) }
         // Before defaults migration, provider launch snapshots, property wrappers,
         // or any settings/session singleton can observe or normalize this profile.
         let bootstrapSpan = StartupPhaseLog.begin(.bootstrap)

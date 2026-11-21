@@ -424,6 +424,7 @@ final class AgentSessionInteractionRuntime {
     }
 
     static func invalidatePendingAskUserTimeout(for session: AgentTabSession) {
+        session.askUserDeadline = nil
         session.pendingAskUserTimeoutGeneration &+= 1
         session.askUserTimeoutTask?.cancel()
         session.askUserTimeoutTask = nil

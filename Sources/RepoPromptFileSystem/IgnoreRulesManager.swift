@@ -71,6 +71,7 @@ package actor IgnoreRulesManager {
     ) // metadata → task
 
     private let globalIgnoreProvider: @Sendable () -> String
+    private let respectGitignore: @Sendable () async -> Bool
     private nonisolated let ignorePolicyResolver: @Sendable (URL) throws -> IgnoreRulePolicy
     private let repositoryRootValidator: @Sendable (URL) -> Bool
     private let repositoryExcludeURL: @Sendable (URL) throws -> URL?
@@ -79,9 +80,11 @@ package actor IgnoreRulesManager {
         globalIgnoreProvider: @escaping @Sendable () -> String,
         ignorePolicyResolver: @escaping @Sendable (URL) throws -> IgnoreRulePolicy,
         repositoryRootValidator: @escaping @Sendable (URL) -> Bool,
-        repositoryExcludeURL: @escaping @Sendable (URL) throws -> URL? = { _ in nil }
+        repositoryExcludeURL: @escaping @Sendable (URL) throws -> URL? = { _ in nil },
+        respectGitignore: @escaping @Sendable () async -> Bool = { true }
     ) {
         self.globalIgnoreProvider = globalIgnoreProvider
+        self.respectGitignore = respectGitignore
         self.ignorePolicyResolver = ignorePolicyResolver
         self.repositoryRootValidator = repositoryRootValidator
         self.repositoryExcludeURL = repositoryExcludeURL
@@ -131,8 +134,9 @@ package actor IgnoreRulesManager {
                 policy: policy
             )
         }
+        let respectGitignore = await respectGitignore()
         let gitignorePath = (path as NSString).appendingPathComponent(".gitignore")
-        let gitignoreContent: String? = if fm.fileExists(atPath: gitignorePath, isDirectory: nil) {
+        let gitignoreContent: String? = if respectGitignore, fm.fileExists(atPath: gitignorePath, isDirectory: nil) {
             try await loadFileContent(at: gitignorePath)
         } else {
             nil
@@ -177,12 +181,13 @@ package actor IgnoreRulesManager {
             authority: authority,
             respectRepoIgnore: respectRepoIgnore,
             respectCursorignore: respectCursorignore,
-            policy: policy
+            policy: policy,
+            respectGitignore: respectGitignore
         )
 
         return ResolvedIgnoreRules(
             rules: ignoreRules,
-            globalIgnoreDefaultsDigest: Self.globalIgnoreDefaultsDigest(for: globalIgnoreContent)
+            globalIgnoreDefaultsDigest: Self.catalogGlobalIgnoreDigest(for: globalIgnoreContent, respectGitignore: respectGitignore)
         )
     }
 
@@ -203,7 +208,8 @@ package actor IgnoreRulesManager {
         else { throw IgnoreRulePolicyResolutionError.ambiguousGitTopology }
 
         let globalIgnoreContent = fetchGlobalDefaults()
-        let rules = IgnoreRules(policy: policy)
+        let respectGitignore = await respectGitignore()
+        let rules = IgnoreRules(policy: policy, respectGitignore: respectGitignore)
         let repositoryExclude = try repositoryExcludeContent(for: repositoryRoot)
         if let content = repositoryExclude {
             rules.addCompiledLayer(
@@ -215,7 +221,7 @@ package actor IgnoreRulesManager {
         var relativeDirectory = ""
         for depth in 0 ... prefixComponents.count {
             let gitignoreURL = directory.appendingPathComponent(".gitignore")
-            if try Self.mandatoryGitIgnoreControlExists(at: gitignoreURL) {
+            if respectGitignore, try Self.mandatoryGitIgnoreControlExists(at: gitignoreURL) {
                 let content = try Self.loadMandatoryGitIgnoreContent(
                     at: gitignoreURL
                 )
@@ -258,7 +264,7 @@ package actor IgnoreRulesManager {
         guard directory == loadedRoot else { throw IgnoreRulePolicyResolutionError.ambiguousGitTopology }
         return ResolvedIgnoreRules(
             rules: rules,
-            globalIgnoreDefaultsDigest: Self.globalIgnoreDefaultsDigest(for: globalIgnoreContent),
+            globalIgnoreDefaultsDigest: Self.catalogGlobalIgnoreDigest(for: globalIgnoreContent, respectGitignore: respectGitignore),
             repositoryExcludeDigest: repositoryExclude.map(Self.globalIgnoreDefaultsDigest)
         )
     }
@@ -278,6 +284,15 @@ package actor IgnoreRulesManager {
               try Self.mandatoryGitIgnoreControlExists(at: url)
         else { return nil }
         return try Self.loadMandatoryGitIgnoreContent(at: url)
+    }
+
+    package nonisolated static func catalogGlobalIgnoreDigest(for content: String, respectGitignore: Bool) -> String {
+        if respectGitignore {
+            return globalIgnoreDefaultsDigest(for: content)
+        }
+        // Preserve catalog identities when respecting .gitignore. A leading non-UTF-8
+        // byte isolates the opt-out catalogs from the unadorned UTF-8 ignore defaults.
+        return SHA256.hash(data: Data([0xFF]) + Data(content.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
     package nonisolated static func globalIgnoreDefaultsDigest(for content: String) -> String {
@@ -382,10 +397,11 @@ package actor IgnoreRulesManager {
         authority: CompiledRootAuthority,
         respectRepoIgnore: Bool,
         respectCursorignore: Bool,
-        policy: IgnoreRulePolicy
+        policy: IgnoreRulePolicy,
+        respectGitignore: Bool = true
     ) -> IgnoreRules {
-        let rules = IgnoreRules(policy: policy)
-        if let gitignore = authority.gitignore {
+        let rules = IgnoreRules(policy: policy, respectGitignore: respectGitignore)
+        if respectGitignore, let gitignore = authority.gitignore {
             rules.addCompiledLayer(gitignore, authority: .mandatoryGit)
         }
         rules.addCompiledLayer(authority.global, authority: .secondary)

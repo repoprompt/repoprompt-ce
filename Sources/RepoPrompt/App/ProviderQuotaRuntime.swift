@@ -16,8 +16,10 @@ final class ProviderQuotaRuntime {
     private var routingObservation: ProviderUsageRoutingObservation?
     let codexUI: ProviderQuotaUIStore
     let claudeUI: ProviderQuotaUIStore
+    let antigravityUI: ProviderQuotaUIStore
     let codexIndicator: ProviderQuotaIndicatorStore
     let claudeIndicator: ProviderQuotaIndicatorStore
+    let antigravityIndicator: ProviderQuotaIndicatorStore
     private let claudeSource: ClaudeCLIUsageSource
     private let settingsStore: GlobalSettingsStore
     private var claudeConnectionGeneration: UInt64 = 0
@@ -61,7 +63,18 @@ final class ProviderQuotaRuntime {
         let claude = ProviderAccountQuotaService(periodicReads: false, cachedRead: { await source.cachedSnapshot() }, read: { context in try await source.read(context) })
         self.codex = codex
         self.claude = claude
-        data = ProviderUsageHub(sources: [.codex: codex, .claude: claude])
+        // Display only; no advisor, model routing or background reads.
+        let antigravity = ProviderAccountQuotaService(manualOnly: true) { context in
+            guard await settingsStore.antigravityUsageQuotaEnabled(), await settingsStore.usageLimitsDisplayEnabled() else {
+                throw ProviderQuotaReadError.needsConsent
+            }
+            let snapshot = try await AntigravityCLIUsageSource.read(context)
+            guard await settingsStore.antigravityUsageQuotaEnabled(), await settingsStore.usageLimitsDisplayEnabled() else {
+                throw ProviderQuotaReadError.needsConsent
+            }
+            return snapshot
+        }
+        data = ProviderUsageHub(sources: [.codex: codex, .claude: claude, .antigravity: antigravity])
         codexUI = ProviderQuotaUIStore(
             service: codex,
             settingsProvider: { settingsStore.codexUsageQuotaEnabled() },
@@ -77,6 +90,13 @@ final class ProviderQuotaRuntime {
         )
         codexIndicator = ProviderQuotaIndicatorStore(store: codexUI)
         claudeIndicator = ProviderQuotaIndicatorStore(store: claudeUI)
+        antigravityUI = ProviderQuotaUIStore(
+            service: antigravity,
+            settingsProvider: { settingsStore.antigravityUsageQuotaEnabled() },
+            presentationProvider: { settingsStore.usageLimitsDisplayEnabled() },
+            showsDetailsOnlyIndicator: true
+        )
+        antigravityIndicator = ProviderQuotaIndicatorStore(store: antigravityUI)
         consentObservation = settingsStore.objectWillChange.receive(on: RunLoop.main).sink { [weak self] _ in self?.applyAcquisitionConsent() }
         applyAcquisitionConsent()
         routingObservation = ProviderUsageRoutingObservation(settings: settingsStore, codex: codex, claude: claude, advisor: usageAdvisor, accountID: accountIDProvider)
@@ -138,7 +158,13 @@ final class ProviderQuotaRuntime {
         }
         codexUI.setPresentationEnabled(enabled)
         claudeUI.setPresentationEnabled(enabled)
+        antigravityUI.setPresentationEnabled(enabled)
         applyAcquisitionConsent()
+    }
+
+    func applyAntigravityUsageEnabled(_ enabled: Bool) {
+        settingsStore.setAntigravityUsageQuotaEnabled(enabled)
+        antigravityUI.setEnabled(enabled)
     }
 
     func applyCodexUsageEnabled(_ enabled: Bool) {

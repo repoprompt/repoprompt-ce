@@ -24,6 +24,24 @@ final class AntigravityHeadlessBoundaryTests: XCTestCase {
         antigravityAvailable: true
     )
 
+    @MainActor
+    func testOperationEligibilityDistinguishesUnsupportedFromDisconnected() {
+        XCTAssertEqual(AgentModelCatalog.AgentSelectionSurface.headless.eligibility(for: .antigravity, availability: availability), .unsupportedOperation)
+        XCTAssertEqual(AgentModelCatalog.AgentSelectionSurface.general.eligibility(for: .antigravity, availability: availability), .eligible)
+        XCTAssertEqual(AgentModelCatalog.AgentSelectionSurface.general.eligibility(for: .antigravity, availability: .none), .unavailableModel)
+        XCTAssertEqual(AgentModelCatalog.AgentSelectionSurface.headless.eligibility(for: .openCode, availability: .none), .unavailableModel)
+        XCTAssertNotNil(AutoRecommendationEngine.contextBuilderSavedSelectionIssue(
+            agentRaw: AgentProviderKind.antigravity.rawValue,
+            modelRaw: "gemini-test-model",
+            availability: availability
+        ))
+        XCTAssertNil(AutoRecommendationEngine.contextBuilderSavedSelectionIssue(
+            agentRaw: AgentProviderKind.openCode.rawValue,
+            modelRaw: AgentModel.defaultModel.rawValue,
+            availability: availability
+        ))
+    }
+
     func testGeneralCatalogIncludesAntigravityButHeadlessExcludesIt() {
         XCTAssertTrue(AgentModelCatalog.selectableAgents(availability: availability).contains(.antigravity))
         XCTAssertFalse(AgentModelCatalog.selectableAgents(availability: availability, surface: .headless).contains(.antigravity))
