@@ -1,0 +1,8 @@
+[bindings.swift]
+module_name = "IrohTransportBindings"
+ffi_module_name = "IrohTransportFFI"
+ffi_module_filename = "IrohTransportFFI"
+generate_module_map = true
+generate_immutable_records = true
+omit_localized_error_conformance = false
+link_frameworks = ["Network", "SystemConfiguration"]

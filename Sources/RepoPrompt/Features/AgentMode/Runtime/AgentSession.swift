@@ -230,6 +230,14 @@ struct AgentSession: Codable, Identifiable {
     /// State of the last run
     var lastRunState: String?
 
+    /// Workflow applied to the first accepted run. The identity is write-once.
+    var originWorkflowID: String?
+    var originWorkflowDisplayName: String?
+
+    /// Start time of the most recently accepted run. This is durable and is not
+    /// the transient elapsed-timer value used while a run is active.
+    var lastRunStartedAt: Date?
+
     /// Provider-specific resumable session identifier (e.g., Claude CLI session_id)
     /// Used to resume conversations with --resume instead of replaying history
     var providerSessionID: String?
@@ -342,6 +350,9 @@ struct AgentSession: Codable, Identifiable {
         agentReasoningEffort: String? = nil,
         acpModelParameterSelections: [ACPModelParameterSelection] = [],
         lastRunState: String? = nil,
+        originWorkflowID: String? = nil,
+        originWorkflowDisplayName: String? = nil,
+        lastRunStartedAt: Date? = nil,
         providerSessionID: String? = nil,
         providerCleanupHandle: ProviderConversationCleanupHandle? = nil,
         autoEditEnabled: Bool = true,
@@ -394,6 +405,9 @@ struct AgentSession: Codable, Identifiable {
         self.agentReasoningEffort = agentReasoningEffort
         self.acpModelParameterSelections = ACPModelParameterSelection.normalized(acpModelParameterSelections)
         self.lastRunState = lastRunState
+        self.originWorkflowID = originWorkflowID
+        self.originWorkflowDisplayName = originWorkflowDisplayName
+        self.lastRunStartedAt = lastRunStartedAt
         self.providerSessionID = providerSessionID
         self.providerCleanupHandle = providerCleanupHandle
         self.autoEditEnabled = autoEditEnabled
@@ -448,6 +462,9 @@ struct AgentSession: Codable, Identifiable {
         case agentReasoningEffort
         case acpModelParameterSelections
         case lastRunState
+        case originWorkflowID
+        case originWorkflowDisplayName
+        case lastRunStartedAt
         case providerSessionID
         case providerCleanupHandle
         case autoEditEnabled
@@ -507,6 +524,9 @@ struct AgentSession: Codable, Identifiable {
             container.decodeIfPresent([ACPModelParameterSelection].self, forKey: .acpModelParameterSelections) ?? []
         )
         lastRunState = try container.decodeIfPresent(String.self, forKey: .lastRunState)
+        originWorkflowID = try container.decodeIfPresent(String.self, forKey: .originWorkflowID)
+        originWorkflowDisplayName = try container.decodeIfPresent(String.self, forKey: .originWorkflowDisplayName)
+        lastRunStartedAt = try container.decodeIfPresent(Date.self, forKey: .lastRunStartedAt)
         providerSessionID = try container.decodeIfPresent(String.self, forKey: .providerSessionID)
         providerCleanupHandle = try container.decodeIfPresent(ProviderConversationCleanupHandle.self, forKey: .providerCleanupHandle)
         autoEditEnabled = try container.decode(Bool.self, forKey: .autoEditEnabled)

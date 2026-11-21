@@ -62,13 +62,13 @@ extension AgentSessionRuntimeHost {
                     availability: availability, includeEffortSuffix: false
                 )
             },
-            start: { [weak self] command, text, options, outcome, preparation in
+            start: { [weak self] command, text, attachments, options, outcome, preparation in
                 guard let self else {
                     outcome?.recordStartFailure(message: "The originating execution host is unavailable.")
                     return nil
                 }
                 return await startCanonicalRequest(
-                    command: command, message: text, options: options, outcome: outcome,
+                    command: command, message: text, attachments: attachments, options: options, outcome: outcome,
                     providerSwitchPreparation: preparation
                 )
             },

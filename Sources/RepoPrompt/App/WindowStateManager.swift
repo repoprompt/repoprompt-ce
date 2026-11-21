@@ -551,6 +551,10 @@ class WindowStatesManager: ObservableObject {
     /// 🚀 Single, shared instance for the entire app
     static let shared = WindowStatesManager()
 
+    /// One gateway per application window catalog. Lazy ownership keeps Remote
+    /// credentials and availability services out of ordinary window/test setup.
+    lazy var remoteGatewayController = RemoteGatewayController()
+
     /// App-global bundled router registry plus shared backend credential/readiness authorities.
     let modelRouterRuntime = AgentTaskRouterRuntime()
 

@@ -1862,13 +1862,15 @@ enum AgentModelCatalog {
 
     // MARK: - Discovery Internals
 
-    private static func discoveryAgent(
+    static func discoveryAgent(
         _ agent: AgentProviderKind,
-        availability: AvailabilityContext
+        availability: AvailabilityContext,
+        modelOptions: [AgentModelOption]? = nil,
+        preferredModelRaw: String? = nil
     ) -> DiscoveryAgent {
         let available = isAgentAvailable(agent, availability: availability)
-        let agentOptions = options(for: agent, availability: availability)
-        let defaultRaw = available ? defaultModelRaw(for: agent, availability: availability) : nil
+        let agentOptions = modelOptions ?? options(for: agent, availability: availability)
+        let defaultRaw = available ? preferredModelRaw ?? defaultModelRaw(for: agent, availability: availability) : nil
 
         let models: [DiscoveryModel] = if agent == .codexExec {
             codexDiscoveryModels(

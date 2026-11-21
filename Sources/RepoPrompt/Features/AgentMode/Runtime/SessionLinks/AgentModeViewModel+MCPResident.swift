@@ -194,6 +194,7 @@ extension AgentModeViewModel {
     /// No capture or borrowed link authority. Existing submission paths retain their save ordering.
     func mcpSubmitResidentTask(
         _ target: MCPResidentTarget, text: String, workflow: AgentWorkflowDefinition?,
+        remoteAttachments: [AgentFileAttachment] = [],
         windowIsAvailable: @escaping @MainActor () -> Bool
     ) async throws -> MCPInstructionDispatch {
         try Task.checkCancellation()
@@ -218,6 +219,12 @@ extension AgentModeViewModel {
             route: agentSessionLinkManagedSteerRoute(for: session)
         )
         let frame = Self.mcpResidentTaskFrame(text)
+        if !remoteAttachments.isEmpty {
+            guard case .idleTurn = admission else {
+                throw MCPError.invalidParams("Wait for the current run to finish before sending attachments.")
+            }
+            _ = attachmentRuntime
+        }
         switch admission {
         case let .blocked(failure):
             // Provider-switch refusals are non-retryable and need user review in the app; surface
@@ -266,7 +273,7 @@ extension AgentModeViewModel {
             let outcome = await linkExecutionRuntime.persistAndStartNoncomposerTurn(
                 session: session, tabID: session.tabID, workspaceID: target.endpoint.workspaceID,
                 claim: claim, displayText: frame, providerMessage: payload, workflow: workflow,
-                attribution: nil, stopFence: stopFence
+                attribution: nil, stopFence: stopFence, attachments: remoteAttachments
             ) {
                 windowIsAvailable() && self.mcpResidentTargetIsCurrent(target)
                     && self.composerSubmitRuntime.isCurrent(claim) && stopFence.permitsStart(of: session)

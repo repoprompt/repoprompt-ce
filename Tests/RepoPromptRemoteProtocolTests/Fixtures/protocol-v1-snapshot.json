@@ -1,0 +1,41 @@
+{
+  "protocolVersion": 1,
+  "desktop": {
+    "instanceID": "desktop-legacy",
+    "displayName": "Legacy Mac",
+    "appVersion": "1.0",
+    "isAvailable": true
+  },
+  "connection": {
+    "state": "connected",
+    "transport": "lan_https"
+  },
+  "authorization": {
+    "defaultLevel": 2
+  },
+  "workspaces": [],
+  "sessions": [
+    {
+      "sessionID": "11111111-1111-1111-1111-111111111111",
+      "workspaceID": "workspace-legacy",
+      "sessionName": "Legacy session",
+      "workflow": "Review",
+      "agent": "codexExec",
+      "runState": "working",
+      "childSessionIDs": [],
+      "lastUpdatedAt": 0,
+      "isLive": true
+    }
+  ],
+  "attentionItems": [],
+  "workflowCatalog": [
+    {
+      "id": "builtin-review",
+      "displayName": "Review",
+      "isBuiltIn": true,
+      "requiredAuthority": 2
+    }
+  ],
+  "agentCatalog": [],
+  "eventCursor": 7
+}

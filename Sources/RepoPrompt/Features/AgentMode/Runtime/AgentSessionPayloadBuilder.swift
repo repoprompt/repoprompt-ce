@@ -27,6 +27,9 @@ enum AgentSessionPayloadBuilder {
             agentReasoningEffort: session.persistedReasoningEffortRaw,
             acpModelParameterSelections: session.acpModelParameterSelections,
             lastRunState: session.runState.rawValue,
+            originWorkflowID: session.originWorkflowID,
+            originWorkflowDisplayName: session.originWorkflowDisplayName,
+            lastRunStartedAt: session.lastRunStartedAt,
             providerSessionID: session.providerSessionID,
             providerCleanupHandle: ProviderConversationCleanupHandle.resolved(
                 provider: session.selectedAgent.rawValue,
@@ -109,6 +112,9 @@ enum AgentSessionPayloadBuilder {
         payload.organizationalParentID = session.organizationalParentID
         payload.delegationScopeID = session.delegationScopeID
         payload.isMCPOriginated = session.isMCPOriginated
+        payload.originWorkflowID = session.originWorkflowID
+        payload.originWorkflowDisplayName = session.originWorkflowDisplayName
+        payload.lastRunStartedAt = session.lastRunStartedAt
         payload.worktreeBindings = session.worktreeBindings
         payload.worktreeMergeOperations = session.worktreeMergeOperations
         payload.pendingHandoffProviderSwitchDelivery = session.pendingHandoff.providerSwitchDelivery

@@ -1,0 +1,9 @@
+{
+  "protocolVersion": 1,
+  "desktopInstanceID": "legacy-desktop",
+  "serviceName": "RepoPrompt-legacy-desktop",
+  "host": "192.0.2.10",
+  "port": 8443,
+  "certificateSHA256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "oneTimeSecret": "legacy-one-time-secret"
+}
