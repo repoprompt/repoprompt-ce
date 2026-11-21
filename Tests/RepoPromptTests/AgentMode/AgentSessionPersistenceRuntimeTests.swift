@@ -634,8 +634,32 @@ final class AgentSessionPersistenceRuntimeTests: XCTestCase {
             managedInput: AgentSessionHostDrainTestEffects.empty, selfCompact: AgentSessionHostDrainTestEffects.empty,
             finishProvider: { _ in }, probe: { _, current in current() }
         ))
+        let presenterID = UUID()
+        var destinationIsCurrent = true
+        var resumedVisits = 0
+        var reentrantVisits = 0
+        let first = UUID(), second = UUID()
+        for (presenter, other) in [(first, second), (second, first)] {
+            drain.deferVisit(presenterID: presenter, isDestinationCurrent: { true }) { [weak drain] in
+                reentrantVisits += 1
+                drain?.withdrawDeferredVisit(presenterID: other)
+            }
+        }
+        drain.deferVisit(presenterID: presenterID, isDestinationCurrent: { true }) {
+            XCTFail("A replaced visit must not resume")
+        }
+        drain.deferVisit(presenterID: presenterID, isDestinationCurrent: { true }) {
+            XCTAssertTrue(f.scope.hasReleasedWriterClaims)
+            XCTAssertTrue(f.store.retainedDrains.isEmpty)
+            resumedVisits += 1
+        }
+        drain.deferVisit(presenterID: UUID(), isDestinationCurrent: { destinationIsCurrent }) {
+            XCTFail("The destination was superseded during recovery")
+        }
         drain.attemptRecovery()
         guard case .retained = await drain.wait(until: .now.advanced(by: .seconds(5))) else { return XCTFail("Failed real save must retain recovery") }
+        XCTAssertEqual(resumedVisits, 0)
+        destinationIsCurrent = false
         XCTAssertEqual(writes, 2)
         let status = try XCTUnwrap(drain.sessionOutcomes[f.session.tabID])
         XCTAssertEqual(status.membership, membership)
@@ -654,6 +678,8 @@ final class AgentSessionPersistenceRuntimeTests: XCTestCase {
         let result = await drain.wait(until: .now.advanced(by: .seconds(5)))
         XCTAssertEqual(result, .released)
         XCTAssertEqual(writes, 3)
+        XCTAssertEqual(resumedVisits, 1)
+        XCTAssertEqual(reentrantVisits, 1, "Withdrawal must still apply to a visit queued for dispatch")
         XCTAssertFalse(f.session.isDirty)
         XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
         XCTAssertTrue(f.store.retainedDrains.isEmpty)
