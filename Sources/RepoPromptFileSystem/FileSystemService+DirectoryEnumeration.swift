@@ -223,8 +223,8 @@ extension FileSystemService {
 
                     // Generate deltas for new items
                     for newItem in newItems {
-                        // Skip newly discovered ignore files
-                        if isIgnoreFile(newItem) {
+                        // Keep the existing special handling for app-specific ignore controls.
+                        if isAppIgnoreFile(newItem) {
                             continue
                         }
                         let isDir = scan.children[newItem] ?? false
@@ -403,8 +403,8 @@ extension FileSystemService {
 
         // 3) Handle new items
         for newItem in newItems {
-            // Skip newly discovered ignore files - they'll come through FSEvents
-            if isIgnoreFile(newItem) {
+            // Keep the existing special handling for app-specific ignore controls.
+            if isAppIgnoreFile(newItem) {
                 continue
             }
 

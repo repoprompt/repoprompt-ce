@@ -90,11 +90,13 @@ package final class IgnoreRules {
     private var tail: RulesNode
     private var cachedSnapshot: IgnoreRulesSnapshot?
     private let policy: IgnoreRulePolicy
+    package let respectGitignore: Bool
 
     // MARK: - Initialisers
 
     /// Creates a new instance that starts with the shared default ignore layer.
-    package init(policy: IgnoreRulePolicy) {
+    package init(policy: IgnoreRulePolicy, respectGitignore: Bool = true) {
+        self.respectGitignore = respectGitignore
         tail = switch policy {
         case .nonGitRoot: IgnoreRules.nonGitBaseNode
         case .gitRoot: IgnoreRules.baseNode
@@ -103,7 +105,8 @@ package final class IgnoreRules {
     }
 
     /// Private designated initialiser used by `clone()` to share the same chain.
-    private init(tail: RulesNode, policy: IgnoreRulePolicy) {
+    private init(tail: RulesNode, policy: IgnoreRulePolicy, respectGitignore: Bool) {
+        self.respectGitignore = respectGitignore
         self.tail = tail
         self.policy = policy
     }
@@ -232,7 +235,7 @@ package final class IgnoreRules {
 
     /// Returns a shallow clone that *shares* all rule layers with the original.
     package func clone() -> IgnoreRules {
-        IgnoreRules(tail: tail, policy: policy)
+        IgnoreRules(tail: tail, policy: policy, respectGitignore: respectGitignore)
     }
 
     /// The number of rule layers (including defaults).

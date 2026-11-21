@@ -52,8 +52,9 @@ extension GitService {
 }
 
 extension WorkspaceFileContextHost {
-    static func app() -> Self {
-        Self(
+    static func app(ignoreRulesManager: IgnoreRulesManager = .shared) -> Self {
+        FileSystemAppIntegration.installHooks()
+        return Self(
             rootReusableSnapshotCoordinator: .shared,
             rootMaterializationHintEvaluator: .shared,
             rootSeedPlanner: .shared,
@@ -65,7 +66,8 @@ extension WorkspaceFileContextHost {
                     respectRepoIgnore: repo,
                     respectCursorignore: cursor,
                     skipSymlinks: symlinks,
-                    enableHierarchicalIgnores: hierarchical
+                    enableHierarchicalIgnores: hierarchical,
+                    ignoreRulesManager: ignoreRulesManager
                 )
             }
         )

@@ -72,7 +72,7 @@ extension AgentModeViewModel {
         // The configured/runtime-facing list, not every parseable catalog ID.
         let candidates = repromptAvailability == nil ? (promptManager?.availableModels ?? []) : AIModel.allModels()
         return candidates.filter { model in
-            AgentRepromptModelPolicy.supportsSideCall(model) && model.canStream
+            AgentOperationEligibility.AIOperation.reprompt.supports(model)
                 && (repromptAvailability?(model) ?? (promptManager?.mcpOracleIsProviderConfigured(for: model) == true))
         }
     }

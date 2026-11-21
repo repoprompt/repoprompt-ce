@@ -62,6 +62,11 @@ extension AgentComposerActions {
             },
             storeDraft: { tabID, text, sequence in
                 guard isCurrent() else { return }
+                // A departing current-tab editor can deliver a delayed draft write after selection
+                // changes. It no longer has edit authority over a running rewrite's draft.
+                if active, tabID != agentModeVM.currentTabID, agentModeVM.repromptOperations[tabID]?.phase.isBusy == true {
+                    return
+                }
                 agentModeVM.storeDraftText(for: tabID, text, acknowledgingThrough: sequence)
             },
             loadDraft: { tabID in guard isCurrent() else { return .init(text: "", restorationSequence: 0) }

@@ -40,13 +40,14 @@ enum AgentRepromptModelPolicy {
 
     static func supportsSideCall(_ model: AIModel) -> Bool {
         switch model.providerType {
-        case .cursor, .openCode, .devin, .grokBuild: false
+        // OpenCode's AI adapter sets the managed no-tools mode before prompting.
+        case .cursor, .devin, .grokBuild: false
         default: true
         }
     }
 
     static func resolve(selection: String?, currentProvider: AgentProviderKind?, configured: [AIModel]) -> AIModel? {
-        let models = configured.filter(supportsSideCall)
+        let models = configured.filter(AgentOperationEligibility.AIOperation.reprompt.supports)
         if let selection, !selection.isEmpty {
             // An explicit disconnected or unknown model is an error, never an automatic fallback.
             return AIModel.fromModelName(selection).flatMap { models.contains($0) ? $0 : nil }

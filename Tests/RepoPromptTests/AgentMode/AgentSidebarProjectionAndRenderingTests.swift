@@ -1495,6 +1495,69 @@ final class AgentSidebarRowInvalidationTests: XCTestCase {
         (view as? StableMenuContextView).map { [$0] } ?? view.subviews.flatMap { rowRegions(in: $0) }
     }
 
+    func testRepromptCompletesAcrossComposeTabSelectionAndCanStillBeCancelled() async throws {
+        let fixture = try await makeFixture()
+        let vm = fixture.state.agentModeViewModel
+        let prompt = fixture.state.promptManager
+        let source = fixture.tabs[0].id
+        let destination = fixture.tabs[1].id
+        let session = vm.session(for: source)
+        let first = AgentRepromptStartGate()
+        let second = AgentRepromptStartGate()
+        defer {
+            vm.cancelReprompt()
+            Task {
+                await first.release()
+                await second.release()
+            }
+        }
+        vm.repromptAvailability = { $0 == .gpt61SolLow }
+        vm.repromptService = .init(transport: { message, _, publish in
+            let gate = message.conversationMessages[0].content.contains("Second draft") ? second : first
+            try await publish("Partial")
+            _ = await gate.wait()
+            try await publish(" rewrite")
+        })
+
+        func start(_ text: String) throws -> AgentRepromptOperation {
+            vm.storeDraftText(for: source, text)
+            let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: source, session: session))
+            XCTAssertTrue(vm.requestComposerRepromptAgain(target: target, text: text))
+            return try XCTUnwrap(vm.repromptOperation)
+        }
+
+        let editor = AgentComposerActions.make(vm: vm, subject: .currentTab, composerUI: vm.ui.composer, windowID: fixture.state.windowID)
+        let rewrite = try start("First draft")
+        let staleEditorSnapshot = editor.loadDraft(source)
+        try await AsyncTestWait.waitUntil("partial rewrite", timeout: 5) { session.draftText == "Partial" }
+        await prompt.switchComposeTab(destination)
+        XCTAssertEqual(vm.currentTabID, destination)
+        XCTAssertNil(vm.repromptOperation)
+        // A delayed editor callback can still carry the snapshot from before the first chunk.
+        editor.storeDraft(source, staleEditorSnapshot.text, staleEditorSnapshot.restorationSequence)
+        XCTAssertEqual(rewrite.phase, .generating)
+        XCTAssertEqual(session.draftText, "Partial")
+        await first.release()
+        try await AsyncTestWait.waitUntil("offscreen rewrite completion", timeout: 5) { rewrite.phase == .completed }
+        await prompt.switchComposeTab(source)
+        XCTAssertEqual(vm.currentTabID, source)
+        XCTAssertTrue(vm.repromptOperation === rewrite)
+        let remountedEditor = AgentComposerActions.make(vm: vm, subject: .currentTab, composerUI: vm.ui.composer, windowID: fixture.state.windowID)
+        XCTAssertEqual(remountedEditor.loadDraft(source).text, "Partial rewrite")
+
+        rewrite.cancel(restoreOriginal: false, recover: false)
+        let cancelled = try start("Second draft")
+        try await AsyncTestWait.waitUntil("second partial rewrite", timeout: 5) { session.draftText == "Partial" }
+        await prompt.switchComposeTab(destination)
+        await prompt.switchComposeTab(source)
+        XCTAssertTrue(vm.repromptOperation === cancelled)
+        vm.undoReprompt()
+        XCTAssertTrue(cancelled.isClosed)
+        XCTAssertNil(vm.repromptOperation)
+        XCTAssertEqual(session.draftText, "Second draft")
+        await second.release()
+    }
+
     private func makeFixture() async throws -> Fixture {
         _ = NSApplication.shared
         let oldAutoStart = GlobalSettingsStore.shared.mcpAutoStart()

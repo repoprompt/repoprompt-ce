@@ -6,6 +6,15 @@ import SwiftUI
 // MARK: - Oracle Pill
 
 enum AgentOraclePillLogic {
+    static func singleOracleModelName(messages: [AIChatMessage], activeQueryID: UUID?, isStreaming: Bool) -> String? {
+        let message: AIChatMessage? = if let activeQueryID {
+            messages.first { $0.id == activeQueryID && !$0.isUser }
+        } else {
+            isStreaming ? nil : messages.last.flatMap { $0.isUser ? nil : $0 }
+        }
+        return message?.modelName.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
+    }
+
     struct ExplicitOpenRequest: Equatable {
         let generation: UInt64
         let workspaceID: UUID
@@ -402,6 +411,20 @@ struct AgentOraclePill: View {
             .sorted { ($0.oracleLaneIndex ?? .max) < ($1.oracleLaneIndex ?? .max) }
     }
 
+    func popoverModelName(for session: ChatSession) -> String? {
+        if session.oracleGroupID != nil {
+            guard groupMemberSessions(for: session).count > 1 else { return nil }
+            return oracleViewModel.oracleMemberPresentation(for: session).capturedModelName
+                .flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 } ?? "Model unavailable"
+        }
+        _ = oracleViewModel.messageStoreRevision
+        return AgentOraclePillLogic.singleOracleModelName(
+            messages: oracleViewModel.messagesSnapshot(for: session.id),
+            activeQueryID: oracleViewModel.activeQueryId(for: session.id),
+            isStreaming: oracleViewModel.isSessionStreaming(session.id)
+        )
+    }
+
     @ViewBuilder
     private func oraclePopoverContent(_ presentation: PopoverPresentation) -> some View {
         // Popover dimensions scale so chat messages don't feel cramped at
@@ -486,10 +509,6 @@ struct AgentOraclePill: View {
                     }
                     .fixedSize(horizontal: false, vertical: true)
                     let selected = oracleViewModel.oracleMemberPresentation(for: presented)
-                    Text(selected.capturedModelName.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 } ?? "Model unavailable")
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
-                        .fixedSize(horizontal: false, vertical: true)
-                        .textSelection(.enabled)
                     if let errorMessage = selected.errorMessage {
                         Text(errorMessage)
                             .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
@@ -497,6 +516,15 @@ struct AgentOraclePill: View {
                             .textSelection(.enabled)
                     }
                 }
+            }
+
+            if let presented = presentedSession(for: presentation),
+               let modelName = popoverModelName(for: presented)
+            {
+                Text(modelName)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
             }
 
             ChatMessagesView(

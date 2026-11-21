@@ -13,6 +13,47 @@ final class ProviderAccountQuotaServiceTests: XCTestCase {
         )
     }
 
+    func testManualOnlySourceNeverStartsAutomaticOrAdvisoryReads() async throws {
+        let counter = try ReadCounter(value: reading())
+        let service = ProviderAccountQuotaService(automaticInterval: 0, manualOnly: true) { context in
+            XCTAssertTrue(context.userInitiated)
+            return await counter.read()
+        }
+        await service.setEnabled(true)
+        let stream = await service.subscribe()
+        await service.refreshOnForeground()
+        await service.refreshAutomatically(didStart: { XCTFail("Automatic read admitted") })
+        await service.refreshForAdvisory {
+            XCTFail("Advisory admission should not run")
+            return true
+        }
+        let countBeforeRefresh = await counter.count
+        XCTAssertEqual(countBeforeRefresh, 0)
+        await service.refreshNow()
+        let countAfterRefresh = await counter.count
+        XCTAssertEqual(countAfterRefresh, 1)
+        await service.shutdown()
+        withExtendedLifetime(stream) {}
+    }
+
+    func testAntigravityRefreshWithoutReadableQuotaClearsUnverifiedSnapshot() async throws {
+        let snapshot = try reading()
+        let service = ProviderAccountQuotaService(manualInterval: 0, manualOnly: true) { context in
+            guard context.expectedAccount == nil else { throw ProviderQuotaReadError.antigravityUsageNotReported }
+            return snapshot
+        }
+        await service.setEnabled(true)
+        let stream = await service.subscribe()
+        await service.refreshNow()
+        let first = await service.latestSnapshot()
+        XCTAssertEqual(first, snapshot)
+        await service.refreshNow()
+        let second = await service.latestSnapshot()
+        XCTAssertNil(second)
+        await service.shutdown()
+        withExtendedLifetime(stream) {}
+    }
+
     func testOneShotSourceDoesNotPollOnForegroundOrAnotherSubscriber() async throws {
         let value = try reading()
         let date = instant

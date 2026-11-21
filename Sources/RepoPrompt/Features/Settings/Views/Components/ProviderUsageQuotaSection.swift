@@ -24,13 +24,14 @@ import SwiftUI
 enum ProviderQuotaSettingsTarget: Hashable {
     case codex
     case claude
+    case antigravity
 
-    /// Only first-party agents own account usage. Claude-compatible launchers and every other
-    /// provider map to `nil`, so no indicator is shown for them.
+    /// Only providers with a first-party quota source are eligible.
     init?(agent: AgentProviderKind) {
         switch agent {
         case .codexExec: self = .codex
         case .claudeCode: self = .claude
+        case .antigravity: self = .antigravity
         default: return nil
         }
     }
@@ -154,7 +155,12 @@ struct ProviderUsageQuotaSection: View {
         self.style = style
         self.openSettings = openSettings
         let runtime = WindowStatesManager.shared.providerQuotaRuntime
-        _store = ObservedObject(wrappedValue: store ?? (provider == .codex ? runtime.codexUI : runtime.claudeUI))
+        let providerStore = switch provider {
+        case .codex: runtime.codexUI
+        case .claude: runtime.claudeUI
+        case .antigravity: runtime.antigravityUI
+        }
+        _store = ObservedObject(wrappedValue: store ?? providerStore)
     }
 
     var body: some View {
@@ -305,6 +311,25 @@ struct ProviderUsageQuotaSection: View {
                 },
                 diagnosticsToggle: nil
             )
+        case .antigravity:
+            return ProviderUsageSectionConfiguration(
+                displayName: "Google Antigravity",
+                sourceSentence: "Reads the signed-in Antigravity CLI’s status line when you click Refresh.",
+                detailLines: ["Requires agy and a Google sign-in in the CLI. Managed ACP-only installations cannot read these limits.", "These readings are for the CLI’s account, which may differ from your Agent Mode account. Percentages and reset times are kept in memory until you disconnect or quit."],
+                sourceState: settingsStore.antigravityUsageQuotaEnabled() ? .active(deactivateTitle: "Disconnect") : .inactive(
+                    activateTitle: "Connect Antigravity usage…",
+                    explanation: "Connect the Antigravity CLI to check its weekly and five-hour limits.",
+                    requiresConsent: true
+                ),
+                consent: ProviderUsageConsentCopy(
+                    title: "Connect Antigravity usage?",
+                    message: "Refresh briefly starts your installed agy in a temporary folder. The CLI can load its normal global configuration and contact Google. RepoPrompt does not read login credentials, send prompts, or change your CLI settings. Nothing runs automatically.",
+                    confirmTitle: "Connect Antigravity usage"
+                ),
+                activateSource: { WindowStatesManager.shared.providerQuotaRuntime.applyAntigravityUsageEnabled(true) },
+                deactivateSource: { WindowStatesManager.shared.providerQuotaRuntime.applyAntigravityUsageEnabled(false) },
+                diagnosticsToggle: nil
+            )
         case .claude:
             var lines = ["Checks once after launch when usage is shown, and when you press Refresh. No periodic polling.", "Cached readings may be older than your current usage. Account identity is not verified.", "If Claude asks for helper-folder trust or sign-in, use Open Claude setup. Claude may retain its own normal session bookkeeping."]
             if let claudeProfileID, !claudeProfileID.isEmpty {
@@ -412,7 +437,7 @@ struct ProviderUsageQuotaSection: View {
                 }
 
                 ForEach(sections) { section in
-                    ProviderQuotaBucketView(section: section, showsTitle: sections.count > 1)
+                    ProviderQuotaBucketView(section: section, showsTitle: provider == .antigravity || sections.count > 1)
                 }
 
                 if let footnote {

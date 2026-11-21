@@ -319,6 +319,9 @@ package actor WorkspaceRootSeedPlanner {
         hint: WorkspaceRootMaterializationHint,
         service: FileSystemService
     ) async -> WorkspaceRootSeedServingPlanningOutcome {
+        // Git target evidence omits untracked files that Git ignores. Only the
+        // ordinary crawl can produce a complete catalog when opting out.
+        guard await service.respectsGitignoreRules() else { return .fallback(.compatibilityMismatch) }
         if let reason = hint.validationFallbackReason ?? hint.creationReceipt.fallbackReason() {
             return .fallback(reason)
         }

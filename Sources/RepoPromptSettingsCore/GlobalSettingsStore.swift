@@ -996,6 +996,16 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         }
     }
 
+    package func respectGitignore() -> Bool {
+        scalarPreferences.fileSystem?.respectGitignore ?? true
+    }
+
+    package func setRespectGitignore(_ enabled: Bool, commit: Bool = true) {
+        updateFileSystemScalar(commit: commit) { settings in
+            settings.respectGitignore = enabled
+        }
+    }
+
     package func respectRepoIgnore() -> Bool {
         scalarPreferences.fileSystem?.respectRepoIgnore ?? true
     }
@@ -1184,6 +1194,14 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
 
     package func setCodexUsageQuotaEnabled(_ enabled: Bool, commit: Bool = true) {
         updateAgentModeScalar(commit: commit) { $0.codexUsageQuotaEnabled = enabled }
+    }
+
+    package func antigravityUsageQuotaEnabled() -> Bool {
+        scalarPreferences.agentMode?.antigravityUsageQuotaEnabled ?? false
+    }
+
+    package func setAntigravityUsageQuotaEnabled(_ enabled: Bool) {
+        updateAgentModeScalar(commit: true) { $0.antigravityUsageQuotaEnabled = enabled }
     }
 
     package func claudeUsageQuotaEnabled() -> Bool {
