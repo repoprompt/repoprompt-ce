@@ -1004,6 +1004,32 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         XCTAssertFalse(AgentSessionRuntimeStore.shared.retainedExecutionHosts.contains { $0 === host })
     }
 
+    func testWindowRetirementStartsRetainedDrainBeforeWaiting() async throws {
+        let (host, f, resources, provider, _, _, _) = try await hostStartupFixture()
+        host.scope.retainExecutableHost()
+        let outcome = AgentRunStartOutcomeRecorder()
+        _ = try await host.scope.startup.start(
+            session: f.session, initialMessage: "Cancel on window retirement", startOutcome: outcome,
+            claudeCoordinator: host.claudeCoordinator, links: f.runtime,
+            environment: host.makeStartupEnvironment(resources: resources)
+        )
+        XCTAssertTrue(outcome.outcome.didStart)
+        let originalTask = try XCTUnwrap(f.session.agentTask)
+        let fence = AgentRunStartStopFence(session: f.session)
+        // Quit can fence first, before its shared-deadline driver begins observing.
+        let quitDrain = host.beginFinalShutdown()
+        let drain = host.beginWindowRetirement()
+        XCTAssertTrue(drain === quitDrain)
+        XCTAssertFalse(fence.permitsStart(of: f.session))
+        XCTAssertTrue(host.beginWindowRetirement() === drain)
+        let result = await drain.wait(until: .now.advanced(by: .seconds(5)))
+        guard result == .released else { return XCTFail("Window retirement must complete: \(result)") }
+        await originalTask.value
+        XCTAssertTrue(host.scope.hasReleasedWriterClaims)
+        XCTAssertFalse(f.session.isDirty)
+        XCTAssertTrue(provider.promptedMessages.isEmpty)
+    }
+
     func testHostRetirementJoinsClosedControllerBeforeReleasingResources() async throws {
         let (host, f, resources, provider, _, _, _) = try await hostStartupFixture()
         let original = try host.scope.admit(session: f.session)

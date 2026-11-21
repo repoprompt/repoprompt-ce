@@ -6,6 +6,18 @@ extension AgentSessionRuntimeHost {
     /// original cancellation producers. The shared shutdown deadline bounds observation, not
     /// producer lifetime. This must never be used for a workspace/presenter switch.
     func beginFinalShutdown() -> AgentSessionHostDrainRuntime {
+        beginCancellationRetirement()
+    }
+
+    /// Window close still cancels its owned runs. Keep the exact cancellation and final-save
+    /// producer retained if the presenter stops waiting for it.
+    func beginWindowRetirement() -> AgentSessionHostDrainRuntime {
+        let drain = beginCancellationRetirement()
+        drain.startIfNeeded()
+        return drain
+    }
+
+    private func beginCancellationRetirement() -> AgentSessionHostDrainRuntime {
         let participants = scope.sessions.values.map { session in
             (
                 session: session,

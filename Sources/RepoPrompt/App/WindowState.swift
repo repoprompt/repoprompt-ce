@@ -3173,7 +3173,11 @@ class WindowState: ObservableObject {
 
     func tearDown() async {
         beginClose()
-        if !WindowStatesManager.shared.isTerminating { await agentModeViewModel.joinOracleBackgroundWindowDrain() }
+        // The retained host drain joins its own Oracle producers. Waiting here would delay
+        // starting that drain and skip its bounded observation when the window closes.
+        if !WindowStatesManager.shared.isTerminating, agentModeViewModel.runtimeHost.workspaceActivation == nil {
+            await agentModeViewModel.joinOracleBackgroundWindowDrain()
+        }
         // Join cancelled startup before saves/root drains so it cannot publish or hydrate late.
         await workspaceManager.awaitInitialWorkspaceActivationCompletion()
         await workspaceManager.awaitPostSwitchGitDataLoadShutdown()
@@ -3200,7 +3204,10 @@ class WindowState: ObservableObject {
         // a long-lived subscription, so explicit cancellation is required to bound closed-window
         // memory and prevent stale windows from multiplying catalog snapshot work.
         domainWorkspacePresentationBridge?.stop()
-        await mcpServer.unregisterDomainRoutingWindow()
+        // A shared route belongs to the lease owner, not this teardown. In particular a
+        // timed-out retirement waiter must not revoke routing needed by the retained host.
+        let routeDisposalIsLeased = mcpServer.routeResources.isLeaseManaged
+        if !routeDisposalIsLeased { await mcpServer.unregisterDomainRoutingWindow() }
         mcpServer.stopServiceObservation()
 
         // App-level termination already coordinates agent/session and MCP shutdown.
@@ -3215,8 +3222,8 @@ class WindowState: ObservableObject {
         await agentModeViewModel.prepareForWindowClose()
         WorkspaceApprovalManager.shared.cancelPending(forWindowID: windowID)
 
-        // Stop the local MCP server
-        await mcpServer.stopServer()
+        // Shared-route terminal disposal belongs to its lease owner, after both users release.
+        if !routeDisposalIsLeased { await mcpServer.stopServer() }
 
         // Cancel any ongoing AI query
         aiQueriesService.cancelQuery()
