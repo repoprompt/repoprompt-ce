@@ -26,7 +26,7 @@ final class MCPHostRouteResources {
     }
 
     typealias ProviderContextResolver = @MainActor @Sendable () async -> ProviderContext?
-    typealias ProviderContextSource = @MainActor (_ runID: UUID, _ tabID: UUID?) -> ProviderContextResolver?
+    typealias ProviderContextSource = @MainActor @Sendable (_ runID: UUID, _ tabID: UUID?) -> ProviderContextResolver?
 
     enum ProviderContextAdmission {
         case compatibility
@@ -351,9 +351,11 @@ final class MCPHostRouteResources {
         runRouting = nil
     }
 
-    func admitProviderContext(runID: UUID, tabID: UUID?) -> ProviderContextAdmission {
+    func admitProviderContext(
+        runID: UUID, tabID: UUID?, originatingContextSource: ProviderContextSource? = nil
+    ) -> ProviderContextAdmission {
         guard !isClosing else { return .refused }
-        guard let providerContextSource else { return .compatibility }
+        guard let providerContextSource = originatingContextSource ?? providerContextSource else { return .compatibility }
         guard let resolve = providerContextSource(runID, tabID) else { return .refused }
         return .canonical(resolve)
     }
