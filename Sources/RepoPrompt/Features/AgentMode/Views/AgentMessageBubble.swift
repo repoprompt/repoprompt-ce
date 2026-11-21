@@ -274,7 +274,7 @@ struct AgentTranscriptRow: View, @MainActor Equatable {
         let cancelAction: (() -> Void)? = inputs.cancelRunID.map { runID in
             { [weak agentModeVM] in agentModeVM?.cancelActiveToolsForRun(runID: runID, reason: "tool_card_header_cancel") }
         }
-        AgentMessageBubble(
+        return AgentMessageBubble(
             item: inputs.item,
             isMostRecentEditBubble: inputs.isMostRecentEditBubble,
             windowID: inputs.windowID,
