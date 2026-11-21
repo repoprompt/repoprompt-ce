@@ -191,7 +191,7 @@ final class MCPHostRouteResources {
     private var presentationRevision: UInt64 = 0
     private var routingPublicationTail: Task<Void, Never>?
 
-    private let isLeaseManaged: Bool
+    let isLeaseManaged: Bool
 
     convenience init(
         identity: MCPHostRouteIdentity,
@@ -591,6 +591,14 @@ final class MCPHostRouteResources {
             private let owner: LeaseOwner
             private let id: UUID
             let role: Role
+            private var claimedByExecutionHost = false
+
+            func transferToExecutionHost(on route: MCPHostRouteResources) -> (@MainActor () async -> Void)? {
+                guard role == .execution, owner.route === route, !owner.disposalRequested,
+                      owner.leases.contains(id), !claimedByExecutionHost else { return nil }
+                claimedByExecutionHost = true
+                return { [owner, id] in await owner.release(id) }
+            }
 
             fileprivate init(owner: LeaseOwner, id: UUID, role: Role) {
                 self.owner = owner
@@ -600,6 +608,7 @@ final class MCPHostRouteResources {
 
             /// Release only after this user has drained. Dropping a reference is not a drain receipt.
             func release() async {
+                guard !claimedByExecutionHost else { return }
                 await owner.release(id)
             }
         }

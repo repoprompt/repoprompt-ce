@@ -180,6 +180,43 @@ final class MCPStateSubscriptionTests: XCTestCase {
     }
 
     @MainActor
+    func testHostDrainReleasesOnlyItsExecutionLease() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        let owner = MCPHostRouteResources.LeaseOwner(
+            identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: runtime.routingCoordinator, runtime: runtime
+        )
+        let predecessor = try XCTUnwrap(owner.acquire(.execution))
+        let successor = try XCTUnwrap(owner.acquire(.execution))
+        func makeHost(_ lease: MCPHostRouteResources.LeaseOwner.Lease) -> AgentSessionRuntimeHost {
+            AgentSessionRuntimeHost(
+                route: owner.route, executionRouteLease: lease,
+                workspacePath: { _ in nil }, runtimeWorkspacePaths: { _ in throw AgentHostWorkspaceResources.Failure.authorityUnavailable },
+                connectionPolicyInstaller: AgentSessionRuntimeHost.defaultConnectionPolicyInstaller,
+                modelRouterSettingsStore: .shared, catalogDiagnosticsSink: AppAgentSessionLinkCatalogEventSink(),
+                perfRecorder: AppAgentModePerfRecorder()
+            )
+        }
+        let hostA = makeHost(predecessor)
+        let hostB = makeHost(successor)
+        XCTAssertNil(predecessor.transferToExecutionHost(on: owner.route))
+        await owner.requestTerminalDisposal()
+        await predecessor.release()
+        await successor.release()
+        XCTAssertFalse(owner.route.isClosing, "The acquiring callers no longer have release authority")
+
+        for (host, closesRoute) in [(hostA, false), (hostB, true)] {
+            let drain = host.beginRetirement(adapters: .init(
+                managedInput: AgentSessionHostDrainTestEffects.empty, selfCompact: AgentSessionHostDrainTestEffects.empty,
+                captureProvider: { _ in throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
+            ))
+            drain.attemptRecovery()
+            let outcome = await drain.wait(until: .now.advanced(by: .seconds(5)))
+            XCTAssertEqual(outcome, .released)
+            XCTAssertEqual(owner.route.isClosing, closesRoute)
+        }
+    }
+
+    @MainActor
     func testPhysicalRouteDisposalWaitsForSuccessorEpochExecutionLease() async throws {
         let runtime = try await makeHistoryRouteRuntime()
         let owner = MCPHostRouteResources.LeaseOwner(
