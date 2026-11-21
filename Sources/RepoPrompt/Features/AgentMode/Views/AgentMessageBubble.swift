@@ -244,6 +244,7 @@ struct AgentTranscriptRow: View, @MainActor Equatable {
     let promptManager: PromptViewModel
     let contextBuilderAgentVM: ContextBuilderAgentViewModel
     let codexManagedLoginAction: CodexManagedLoginAction?
+    @State private var showingRetainedContent = false
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.inputs == rhs.inputs
@@ -294,6 +295,79 @@ struct AgentTranscriptRow: View, @MainActor Equatable {
         .environment(\.agentToolCardAutoExpandEnabled, inputs.autoExpandEnabled)
         .environment(\.agentLiveBashExecutionByItemID, inputs.liveBashExecution.map { [inputs.item.id: $0] } ?? [:])
         .environment(\.agentApprovalVisible, inputs.approvalVisible)
+        .contextMenu {
+            if isToolRow {
+                if !retainedSections.isEmpty {
+                    Button("View Retained Content…") { showingRetainedContent = true }
+                    Button("Copy Content") { copyContent(readableRetainedContent) }
+                    if let sourceRetainedContent {
+                        Button("Copy Source") { copyContent(sourceRetainedContent) }
+                    }
+                }
+            } else if !inputs.item.text.isEmpty {
+                Button("Copy Text") { copyContent(inputs.item.text) }
+            }
+        }
+        .sheet(isPresented: $showingRetainedContent) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Text("Retained Tool Content").font(.headline)
+                    Spacer()
+                    Button("Copy Content") { copyContent(readableRetainedContent) }
+                    if let sourceRetainedContent {
+                        Button("Copy Source") { copyContent(sourceRetainedContent) }
+                    }
+                    Button("Done") { showingRetainedContent = false }
+                        .keyboardShortcut(.defaultAction)
+                }
+                ToolScrollableMarkdownTextView(text: readableRetainedContent, maxHeight: 400)
+            }
+            .padding()
+            .frame(minWidth: 620)
+        }
+    }
+
+    private var isToolRow: Bool {
+        inputs.item.kind == .toolCall || inputs.item.kind == .toolResult
+    }
+
+    private var retainedSections: [(title: String, text: String)] {
+        let item = inputs.item
+        var sections: [(String, String)] = []
+        if let args = item.toolArgsJSON, !args.isEmpty { sections.append(("Input", args)) }
+        if let result = retainedResultSource {
+            sections.append(("Output", result))
+        } else if !item.text.isEmpty, !toolResultIsSummaryOnly(item) {
+            sections.append((item.kind == .toolResult ? "Output" : "Text", item.text))
+        }
+        return sections
+    }
+
+    private var readableRetainedContent: String {
+        var sections = retainedSections.map { "\($0.title)\n\(ToolResultMarkdownRenderer.readablePayload($0.text))" }
+        if toolResultIsSummaryOnly(inputs.item), retainedResultSource == nil {
+            sections.append("Full output was not retained or is unavailable.")
+        }
+        return sections.joined(separator: "\n\n")
+    }
+
+    private var retainedResultSource: String? {
+        if let hydrated = inputs.rawToolResultPayload, !hydrated.isEmpty { return hydrated }
+        guard !toolResultIsSummaryOnly(inputs.item),
+              let stored = inputs.item.toolResultJSON, !stored.isEmpty
+        else { return nil }
+        return stored
+    }
+
+    private var sourceRetainedContent: String? {
+        if inputs.item.kind == .toolResult { return retainedResultSource }
+        guard let args = inputs.item.toolArgsJSON, !args.isEmpty else { return nil }
+        return args
+    }
+
+    private func copyContent(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
     }
 
     var handoffConfig: AgentHandoffConfig {
