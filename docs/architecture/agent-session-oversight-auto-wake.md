@@ -1074,6 +1074,11 @@ manufacture it, global MCP disable remains absolute, and the disabled-tool setti
 catalog advertisement. Reachability never supplies outbound or inverse operation authority; the
 service authorizes each direction independently.
 
+When the selector is omitted, an `ambiguous_observer` response aligns
+`candidate_observer_session_names` with `candidate_observer_session_ids` in the same order.
+Names are display labels, not selectors. A `null` entry means no name is available from a
+unique live endpoint for that UUID. Explicit selectors and denials do not enumerate candidates.
+
 After inverse authorization, the bridge awaits the existing observer-scoped authoritative projection
 refresh before revalidating the proof and enqueuing. This repairs a missing or lagging observer-local
 baseline without fabricating a grant or a one-lane reducer; all exact endpoint, eligibility, membership
