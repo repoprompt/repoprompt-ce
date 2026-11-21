@@ -207,6 +207,17 @@ import XCTest
                 XCTAssertEqual(explicitVisit, .routed)
                 XCTAssertEqual(window.promptManager.activeComposeTabID, tabs[1].id)
                 XCTAssertEqual(registry.issuedIntents, 1, "One explicit route must share its intent across both activation passes")
+
+                registry.preparedID = requestedSessionID
+                let visitsBeforeProbe = registry.visits
+                _ = await window.agentModeViewModel.ensureSessionReady(tabID: tabs[1].id)
+                XCTAssertEqual(registry.visits, visitsBeforeProbe, "Passive readiness must leave a prepared visit to its explicit owner")
+                XCTAssertEqual(registry.issuedIntents, 1)
+
+                let tabVisit = await window.navigateAgentDeepLinkTab(tabs[1].id, sessionID: nil, workspaceID: active.id)
+                XCTAssertEqual(tabVisit, .blockedByActiveDifferentSession)
+                XCTAssertEqual(registry.visits, visitsBeforeProbe + 1, "A tab-only route can still request the saved session handoff")
+                XCTAssertEqual(registry.issuedIntents, 2)
             }
         }
 

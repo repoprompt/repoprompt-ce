@@ -1206,6 +1206,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     #if DEBUG
         var test_afterRebindOwnershipChecks: (@MainActor () async -> Void)?
+        var test_afterRebindWorktreeRelease: (@MainActor () async -> Void)?
         var test_beforeRestorationHydrationAdmission: (@MainActor () async -> Void)?
         var test_restorationHydrationTaskDidFinish: (@MainActor () -> Void)?
         var test_afterMCPControlRegistration: (@MainActor (UUID) async -> Void)? {
@@ -1618,9 +1619,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         func test_rebindPersistentSession(
             _ sessionID: UUID,
-            to session: TabSession
+            to session: TabSession,
+            visitIntent: UUID? = nil
         ) async throws -> AgentPersistentSessionBindingIdentity {
-            try await rebindPersistentSession(sessionID, to: session)
+            try await rebindPersistentSession(sessionID, to: session, visitIntent: visitIntent)
         }
 
         func test_saveCommitToken(for session: TabSession, workspaceID: UUID) -> SessionSaveCommitToken? {
@@ -6102,28 +6104,32 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
             }
         }
-        func validateWorkspaceLinkRebind() throws {
-            try checkPreparedOwner()
+        func validateRebindCommit() throws {
             guard !Task.isCancelled, !hasPreparedForWindowClose, preparationIsCurrent(),
                   workspaceManager?.activeWorkspaceID == sourceWorkspaceID,
-                  workspaceManager?.isSwitchingWorkspace == false,
+                  !workspaceLink || workspaceManager?.isSwitchingWorkspace == false,
                   persistentBindingTransitionIsCurrent(targetToken),
                   sourceToken.map({ persistentBindingTransitionIsCurrent($0) }) ?? true
             else { throw PersistentBindingMutationError.staleTransition }
+            if (workspaceLink || workspaceManager?.isSessionRuntimeProjection != true),
+               preparedSessionRuntimes?.hasPreparedRuntime(requestedSessionID) == true
+            {
+                throw PersistentBindingMutationError.blockedByOwnership
+            }
             guard !bindingHasSynchronousOwnership(targetSession),
                   sourceSession.map({ !bindingHasSynchronousOwnership($0) }) ?? true
             else { throw PersistentBindingMutationError.blockedByOwnership }
             try validateVisibleBindings()
         }
-        if workspaceLink {
-            try validateWorkspaceLinkRebind()
-            if let targetCurrentSessionID, targetCurrentSessionID != requestedSessionID {
-                await releaseSessionWorktreeOwnership(sessionID: targetCurrentSessionID)
-                try validateWorkspaceLinkRebind()
-            }
-        } else {
-            guard preparationIsCurrent() else { throw PersistentBindingMutationError.staleTransition }
-            try validateVisibleBindings()
+        try validateRebindCommit()
+        if let targetCurrentSessionID, targetCurrentSessionID != requestedSessionID {
+            await releaseSessionWorktreeOwnership(sessionID: targetCurrentSessionID)
+            #if DEBUG
+                await test_afterRebindWorktreeRelease?()
+            #endif
+            // Releasing the old worktree can suspend. Keep both bindings intact until the
+            // original visit and both carriers are still current at the point of mutation.
+            try validateRebindCommit()
         }
 
         if let sourceSession, sourceSession !== targetSession {
@@ -6137,9 +6143,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
         }
 
-        if !workspaceLink, let targetCurrentSessionID, targetCurrentSessionID != requestedSessionID {
-            await releaseSessionWorktreeOwnership(sessionID: targetCurrentSessionID)
-        }
         if requiresHydration {
             targetSession.hasLoadedPersistedState = false
         }
@@ -7163,22 +7166,22 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard visitIsCurrent() else { return session(for: tabID) }
         let preparedVisitID = workspaceManager?.isSessionRuntimeProjection != true
             ? visibleSessionID.flatMap { owners?.hasPreparedRuntime($0) == true ? $0 : nil } : nil
-        if let preparedVisitID, owners?.claimPreparedRuntimeVisit(preparedVisitID) != true {
-            return session(for: tabID)
+        if let preparedVisitID {
+            // Only an explicit visit may take over a prepared owner and consume its queued visit.
+            guard intent != nil, owners?.claimPreparedRuntimeVisit(preparedVisitID) == true else {
+                return session(for: tabID)
+            }
         }
         defer {
             if let preparedVisitID {
                 owners?.finishPreparedRuntimeVisit(preparedVisitID)
             }
         }
-        if workspaceManager?.isSessionRuntimeProjection != true,
-           let id = workspaceManager?.activeAgentSessionID(forTabID: tabID),
-           let owners,
+        if let id = preparedVisitID, let owners,
            await !(owners.releasePreparedOversightOwnerForVisit(sessionID: id, preparingReplacement: false))
         {
             // Keep one writer while the run settles; the user's visit is resumed by the
             // owner's existing run-state observation, without a second click or polling timer.
-            guard id == visibleSessionID else { return session(for: tabID) }
             owners.queuePreparedRuntimeVisit(id, intent: intent) { [weak self] in
                 guard let self, !self.hasPreparedForWindowClose,
                       workspaceManager?.activeWorkspaceID == visibleWorkspaceID,
@@ -7228,17 +7231,18 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) async -> AgentRouteSessionActivationResult {
         let owners = preparedSessionRuntimes
         let qualifiesForVisit = !workspaceLink && workspaceManager?.isSessionRuntimeProjection != true
-        let intent = qualifiesForVisit ? visitIntent ?? sessionID.flatMap { owners?.beginRuntimeVisitIntent($0) } : nil
+        let visitSessionID = sessionID ?? workspaceManager?.activeAgentSessionID(forTabID: tabID, inWorkspaceID: workspace.id)
+        let intent = qualifiesForVisit ? visitIntent ?? visitSessionID.flatMap { owners?.beginRuntimeVisitIntent($0) } : nil
         func visitIsCurrent() -> Bool {
-            guard qualifiesForVisit, let sessionID, let owners else { return true }
-            return owners.isRuntimeVisitIntentCurrent(sessionID, intent: intent)
+            guard qualifiesForVisit, let visitSessionID, let owners else { return true }
+            return owners.isRuntimeVisitIntentCurrent(visitSessionID, intent: intent)
         }
         guard visitIsCurrent() else { return .blockedByActiveDifferentSession }
         if workspaceLink, let sessionID, owners?.hasPreparedRuntime(sessionID) == true {
             return .blockedByActiveDifferentSession
         }
-        let preparedVisitID = !workspaceLink && workspaceManager?.isSessionRuntimeProjection != true
-            ? sessionID.flatMap { owners?.hasPreparedRuntime($0) == true ? $0 : nil } : nil
+        let preparedVisitID = qualifiesForVisit
+            ? visitSessionID.flatMap { owners?.hasPreparedRuntime($0) == true ? $0 : nil } : nil
         if let preparedVisitID, owners?.claimPreparedRuntimeVisit(preparedVisitID) != true {
             return .blockedByActiveDifferentSession
         }
@@ -7262,7 +7266,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard visitIsCurrent() else { return .blockedByActiveDifferentSession }
         guard let sessionID else {
             guard !workspaceLink else { return .sessionNotFound }
-            let session = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: true)
+            let session = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: true, visitIntent: intent)
+            guard visitIsCurrent() else { return .blockedByActiveDifferentSession }
             return sessions[tabID] === session && session.operationAdmissionFailureMessage == nil
                 ? .ready : .sessionNotFound
         }
