@@ -32,6 +32,16 @@ struct AppearanceSettingsView: View {
         )
     }
 
+    private var appIconModeBinding: Binding<AppIconMode.RawValue> {
+        Binding(
+            get: { globalSettings.appIconModeRaw() },
+            set: { newValue in
+                globalSettings.setAppIconModeRaw(newValue)
+                AppearanceController.shared.applyAppIconMode(newValue)
+            }
+        )
+    }
+
     private var collapseLatestFileChangesBinding: Binding<Bool> {
         Binding(
             get: { globalSettings.collapseLatestFileChanges() },
@@ -86,6 +96,24 @@ struct AppearanceSettingsView: View {
                 }
                 .padding(.horizontal, fontPreset.scaledClamped(16, max: 24))
                 .padding(.top, fontPreset.scaledClamped(16, max: 24))
+
+                Divider()
+                    .padding(.vertical, fontPreset.scaledClamped(16, max: 24))
+
+                SettingSection(
+                    title: "App Icon",
+                    description: "Choose your preferred app icon"
+                ) {
+                    Picker("", selection: appIconModeBinding) {
+                        ForEach(AppIconMode.allCases) { mode in
+                            Text(mode.rawValue).tag(mode.rawValue)
+                        }
+                    }
+                    .pickerStyle(SegmentedPickerStyle())
+                    .labelsHidden()
+                    .frame(width: fontPreset.scaledClamped(300, max: 390), alignment: .leading)
+                }
+                .padding(.horizontal, fontPreset.scaledClamped(16, max: 24))
 
                 Divider()
                     .padding(.vertical, fontPreset.scaledClamped(16, max: 24))
