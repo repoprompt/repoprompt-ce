@@ -134,8 +134,13 @@ package struct AntigravityACPAgentProvider: ACPAgentProvider {
         // (for example `I0906 ... local_connection.py ... RAW WS MSG`). These are
         // diagnostics, not assistant content, and must never become transcript rows.
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-        let isAntigravityHarnessLog = trimmed.range(of: #"^I\d{4}\s+\d+\s"#, options: .regularExpression) != nil
-        guard isAntigravityHarnessLog else { return true }
+        // Classify the record header, never the frame payload: it can contain
+        // arbitrary assistant text, tool errors, and even whole prompt bodies.
+        let harnessPrefix = #"^[DIWEF]\d{4}\s+(?:\d{2}:\d{2}:\d{2}(?:\.\d+)?\s+)?\d+\s+"#
+        guard trimmed.range(of: harnessPrefix, options: .regularExpression) != nil else { return true }
+        let frameHeader = harnessPrefix + #"local_connection\.py(?::\d+\])?\s+RAW WS MSG\b"#
+        if trimmed.range(of: frameHeader, options: .regularExpression) != nil { return false }
+        guard trimmed.first == "I" || trimmed.first == "D" else { return true }
         let lowercased = trimmed.lowercased()
         return lowercased.contains("error")
             || lowercased.contains("exception")
