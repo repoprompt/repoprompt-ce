@@ -550,6 +550,7 @@ extension AgentSessionLinkExecutionRuntime {
         providerMessage: String,
         workflow: AgentWorkflowDefinition?,
         attribution: AgentCrossSessionAttribution?,
+        delegationDecisionBatch: AgentDelegationDecisionBatch? = nil,
         stopFence: AgentRunStartStopFence,
         providerSwitchPreparation: ProviderSwitchSendPreparation? = nil,
         dispatchIsCurrent: @MainActor () -> Bool
@@ -601,7 +602,7 @@ extension AgentSessionLinkExecutionRuntime {
         }
         liveSession.noteAcceptedTaskInput()
         // 6. Durable acceptance. The bubble keeps raw words; the exact provider payload is metadata.
-        let userItem = AgentChatItem.user(
+        var userItem = AgentChatItem.user(
             displayText,
             sequenceIndex: liveSession.nextSequenceIndex,
             // Badges the one-shot workflow the sender attached to *this* message through the row's
@@ -611,6 +612,7 @@ extension AgentSessionLinkExecutionRuntime {
             workflow: workflow,
             crossSessionAttribution: attribution
         )
+        userItem.delegationDecisionBatch = delegationDecisionBatch
         let anchorRollback = owner.turnTiming.recordAgentTurnUserAnchor(for: liveSession, userItem: userItem)
         switchPreparation = switchPreparation?.accepting(userItem.id, session: liveSession)
         liveSession.appendItem(userItem)
