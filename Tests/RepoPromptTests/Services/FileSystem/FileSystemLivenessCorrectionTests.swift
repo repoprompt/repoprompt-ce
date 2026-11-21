@@ -181,8 +181,15 @@ final class FileSystemLivenessCorrectionTests: XCTestCase {
         XCTAssertFalse(recoveredFlag)
 
         let deltaEvents = await store.fileSystemDeltaEvents()
-        var iterator = deltaEvents.makeAsyncIterator()
         let addedURL = rootURL.appendingPathComponent("AfterActiveRecovery.swift")
+        let mutationDelivered = expectation(description: "Recovered root publishes the file addition")
+        let observation = Self.observeFileAddition(
+            in: deltaEvents,
+            rootID: root.id,
+            relativePath: addedURL.lastPathComponent,
+            expectation: mutationDelivered
+        )
+        defer { observation.cancel() }
         try write("after recovery", to: addedURL)
         let accepted = try await store.acceptWatcherPayloadForTesting(
             rootID: root.id,
@@ -205,8 +212,7 @@ final class FileSystemLivenessCorrectionTests: XCTestCase {
             rootID: root.id,
             servicePublicationSequence: publicationSequence
         )
-        let event = await iterator.next()
-        XCTAssertEqual(event?.delta, .fileAdded("AfterActiveRecovery.swift"))
+        await fulfillment(of: [mutationDelivered], timeout: 2)
         await store.stopWatchingRoot(id: root.id)
         await store.setWatcherPublisherIngressDidOpenHandler(nil)
         publisherOpeningContinuation.finish()
@@ -712,8 +718,15 @@ final class FileSystemLivenessCorrectionTests: XCTestCase {
         XCTAssertTrue(watcherIsActive)
 
         let deltaEvents = await store.fileSystemDeltaEvents()
-        var iterator = deltaEvents.makeAsyncIterator()
         let addedURL = rootURL.appendingPathComponent("AfterRecovery.swift")
+        let mutationDelivered = expectation(description: "Recovered root publishes the file addition")
+        let observation = Self.observeFileAddition(
+            in: deltaEvents,
+            rootID: root.id,
+            relativePath: addedURL.lastPathComponent,
+            expectation: mutationDelivered
+        )
+        defer { observation.cancel() }
         try write("after recovery", to: addedURL)
         let accepted = try await store.acceptWatcherPayloadForTesting(
             rootID: root.id,
@@ -737,9 +750,23 @@ final class FileSystemLivenessCorrectionTests: XCTestCase {
             rootID: root.id,
             servicePublicationSequence: publicationSequence
         )
-        let event = await iterator.next()
-        XCTAssertEqual(event?.delta, .fileAdded("AfterRecovery.swift"))
+        await fulfillment(of: [mutationDelivered], timeout: 2)
         await recoveredService.stopWatchingForChanges()
+    }
+
+    private static func observeFileAddition(
+        in events: AsyncStream<WorkspaceFileSystemDeltaEvent>,
+        rootID: UUID,
+        relativePath: String,
+        expectation: XCTestExpectation
+    ) -> Task<Void, Never> {
+        Task {
+            // Native watcher callbacks may arrive before the injected creation event.
+            for await event in events where event.rootID == rootID && event.delta == .fileAdded(relativePath) {
+                expectation.fulfill()
+                return
+            }
+        }
     }
 
     func testSeededPublicationPermitLinearizesCallbackWrapAfterAssignment() async throws {

@@ -1186,6 +1186,14 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         updateAgentModeScalar(commit: commit) { $0.codexUsageQuotaEnabled = enabled }
     }
 
+    package func antigravityUsageQuotaEnabled() -> Bool {
+        scalarPreferences.agentMode?.antigravityUsageQuotaEnabled ?? false
+    }
+
+    package func setAntigravityUsageQuotaEnabled(_ enabled: Bool) {
+        updateAgentModeScalar(commit: true) { $0.antigravityUsageQuotaEnabled = enabled }
+    }
+
     package func claudeUsageQuotaEnabled() -> Bool {
         scalarPreferences.agentMode?.claudeUsageQuotaEnabled ?? false
     }
