@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import os
@@ -385,10 +384,9 @@ class StableTipFloorTests(unittest.TestCase):
         path: Path,
         role: str,
         predecessors: list[dict[str, str]] | None = None,
-        reset_authority: dict[str, object] | None = None,
     ) -> None:
         declaration = {
-            "schemaVersion": 2 if reset_authority is not None else 1,
+            "schemaVersion": 1,
             "channel": "tip",
             "currentRole": role,
             "eligibilityProfile": "tip-identity-dress-rehearsal-v1",
@@ -400,8 +398,6 @@ class StableTipFloorTests(unittest.TestCase):
             ),
             "predecessors": predecessors or [],
         }
-        if reset_authority is not None:
-            declaration["resetAuthority"] = reset_authority
         path.write_text(json.dumps(declaration, indent=2) + "\n", encoding="utf-8")
 
     def generate_release(
@@ -410,17 +406,16 @@ class StableTipFloorTests(unittest.TestCase):
         label: str,
         role: str,
         build: str,
-        predecessor: dict[str, object] | None = None,
+        predecessors: list[dict[str, object]] | None = None,
         tag: str | None = None,
         marketing_version: str = "1.4.0",
-        reset_authority: dict[str, object] | None = None,
     ) -> dict[str, Path | str]:
         release_root = root / label
         release_root.mkdir()
         release_tag = tag or f"tip-{label}"
         predecessor_entries: list[dict[str, str]] = []
         predecessor_paths: list[Path] = []
-        if predecessor is not None:
+        for predecessor in predecessors or []:
             predecessor_manifest = predecessor["manifest"]
             assert isinstance(predecessor_manifest, Path)
             predecessor_entries.append(
@@ -435,12 +430,7 @@ class StableTipFloorTests(unittest.TestCase):
             predecessor_paths.append(predecessor_manifest)
 
         declaration_path = release_root / "tip-rollout.json"
-        self.declaration(
-            declaration_path,
-            role,
-            predecessor_entries,
-            reset_authority,
-        )
+        self.declaration(declaration_path, role, predecessor_entries)
         is_preparer = role == "preparer"
         version_env = release_root / "version.env"
         version_env.write_text(
@@ -453,7 +443,7 @@ class StableTipFloorTests(unittest.TestCase):
         )
         enclosure_basename = f"RepoPrompt-{label}-{build}"
         enclosure = release_root / (
-            enclosure_basename + (".zip" if is_preparer else ".pkg")
+            enclosure_basename + (".pkg" if role == "transition" else ".zip")
         )
         enclosure.write_text(f"fixture enclosure {label}\n", encoding="utf-8")
         artifact_manifest = release_root / "artifact-manifest.json"
@@ -536,7 +526,6 @@ class StableTipFloorTests(unittest.TestCase):
         candidate: dict[str, Path | str],
         live: dict[str, Path | str],
         declaration: Path | None = None,
-        stable_appcast: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         arguments = [
             "validate-live-tip-progression",
@@ -552,164 +541,188 @@ class StableTipFloorTests(unittest.TestCase):
             str(live["appcast"]),
         ]
         if declaration is not None:
-            assert stable_appcast is not None
-            arguments.extend(
-                (
-                    "--declaration",
-                    str(declaration),
-                    "--stable-appcast",
-                    str(stable_appcast),
-                )
-            )
+            arguments.extend(("--declaration", str(declaration)))
         return self.rollout(*arguments)
 
-    def test_transition_to_replacement_preparer_requires_exact_reset_authority(self) -> None:
+    @staticmethod
+    def appcast_items(release: dict[str, Path | str]) -> list[dict[str, object]]:
+        manifest = release["manifest"]
+        assert isinstance(manifest, Path)
+        return json.loads(manifest.read_text(encoding="utf-8"))["appcastItems"]
+
+    def test_stale_preparer_floor_rejects_transition_against_newer_stable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             fixture_root = Path(temporary_directory)
             stable_appcast = fixture_root / "stable-appcast.xml"
             self.stable_appcast(stable_appcast, "36", "1.4.0")
-
-            stale_preparer = self.generate_release(
-                fixture_root,
-                "preparer-stale",
-                "preparer",
-                "35.15.18",
-                tag="tip-2f94412e6ab5",
+            preparer = self.generate_release(
+                fixture_root, "preparer", "preparer", "35.15.18", tag="tip-2f94412e6ab5"
             )
-            live_transition = self.generate_release(
+            transition = self.generate_release(
                 fixture_root,
-                "transition-live",
+                "transition",
                 "transition",
                 "35.15.39",
-                predecessor=stale_preparer,
+                predecessors=[preparer],
                 tag="tip-57b572038048",
             )
-            stale_floor = self.validate_floor(stable_appcast, live_transition)
+            stale_floor = self.validate_floor(stable_appcast, transition)
             self.assertNotEqual(stale_floor.returncode, 0)
             self.assertIn("Stable=36 preparer=35.15.18", stale_floor.stderr)
 
-            live_manifest_digest = hashlib.sha256(
-                Path(live_transition["manifest"]).read_bytes()
-            ).hexdigest()
-            stale_preparer_digest = hashlib.sha256(
-                Path(stale_preparer["manifest"]).read_bytes()
-            ).hexdigest()
-            reset_authority = {
-                "type": "transition-to-replacement-preparer-v1",
-                "liveTip": {
-                    "role": "transition",
-                    "tag": "tip-57b572038048",
-                    "buildNumber": "35.15.39",
-                    "rolloutManifestSha256": live_manifest_digest,
-                },
-                "stableEpoch": {
-                    "marketingVersion": "1.4.0",
-                    "buildNumber": "36",
-                },
-                "retainedPreparer": {
-                    "role": "preparer",
-                    "tag": "tip-2f94412e6ab5",
-                    "buildNumber": "35.15.18",
-                    "rolloutManifestSha256": stale_preparer_digest,
-                },
-            }
+    def test_identity_transition_is_published_exactly_once(self) -> None:
+        """Regression: every Tip release re-published T, re-prompting migrated clients.
+
+        A transition item's only Sparkle floor is the preparer build, so any
+        newer transition is eligible for (and preferred by) clients that already
+        crossed to the successor identity. After T, consecutive releases must be
+        successor ZIP application updates that retain the one original T and P.
+        """
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture_root = Path(temporary_directory)
+            preparer = self.generate_release(
+                fixture_root, "preparer", "preparer", "43.24.43", tag="tip-1e1d9fe4bbc6"
+            )
+            transition = self.generate_release(
+                fixture_root,
+                "transition",
+                "transition",
+                "44.25.57",
+                predecessors=[preparer],
+                tag="tip-84c123fb22b1",
+            )
+            advanced = self.validate_progression(
+                transition, preparer, Path(transition["declaration"])
+            )
+            self.assertEqual(advanced.returncode, 0, advanced.stderr)
+
+            # The pre-fix behavior: an unchanged transition declaration produced
+            # another T over the live T on every protected-main push.
+            repeated_transition = self.generate_release(
+                fixture_root,
+                "transition-repeat",
+                "transition",
+                "44.25.58",
+                predecessors=[preparer],
+                tag="tip-0123456789ab",
+            )
+            self.assertEqual(
+                [
+                    (item["role"], item["minimumUpdateVersion"], item["installationType"])
+                    for item in self.appcast_items(repeated_transition)
+                ],
+                [("transition", "43.24.43", "package"), ("preparer", None, "application")],
+                "a repeated T is reachable by every migrated client above the preparer floor",
+            )
+            repeated = self.validate_progression(repeated_transition, transition)
+            self.assertNotEqual(repeated.returncode, 0)
+            self.assertIn("one-time identity crossing", repeated.stderr)
+
+            # Two consecutive Tip updates after T stay successor application ZIPs.
+            first_successor = self.generate_release(
+                fixture_root,
+                "successor-1",
+                "successor",
+                "44.25.60",
+                predecessors=[transition, preparer],
+                tag="tip-aaaaaaaaaaa1",
+            )
+            first = self.validate_progression(
+                first_successor, transition, Path(first_successor["declaration"])
+            )
+            self.assertEqual(first.returncode, 0, first.stderr)
+            second_successor = self.generate_release(
+                fixture_root,
+                "successor-2",
+                "successor",
+                "44.25.61",
+                predecessors=[transition, preparer],
+                tag="tip-aaaaaaaaaaa2",
+            )
+            second = self.validate_progression(
+                second_successor, first_successor, Path(second_successor["declaration"])
+            )
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertEqual(
+                [
+                    (item["role"], item["tag"], item["minimumUpdateVersion"], item["installationType"])
+                    for item in self.appcast_items(second_successor)
+                ],
+                [
+                    ("successor", "tip-aaaaaaaaaaa2", "44.25.57", "application"),
+                    ("transition", "tip-84c123fb22b1", "43.24.43", "package"),
+                    ("preparer", "tip-1e1d9fe4bbc6", None, "application"),
+                ],
+            )
+
+            # Neither a later T nor a replacement P may follow a published T or S.
+            late_transition = self.generate_release(
+                fixture_root,
+                "transition-late",
+                "transition",
+                "44.25.62",
+                predecessors=[preparer],
+                tag="tip-bbbbbbbbbbb1",
+            )
             replacement_preparer = self.generate_release(
                 fixture_root,
                 "preparer-replacement",
                 "preparer",
-                "36.0.1",
-                tag="tip-aaaaaaaaaaaa",
-                reset_authority=reset_authority,
+                "44.25.63",
+                tag="tip-cccccccccccc",
             )
-
-            without_reset = self.validate_progression(replacement_preparer, live_transition)
-            self.assertNotEqual(without_reset.returncode, 0)
-            self.assertIn(
-                "candidate Tip rollout role would regress or skip the live rollout state",
-                without_reset.stderr,
-            )
-
-            with_reset = self.validate_progression(
-                replacement_preparer,
-                live_transition,
-                Path(replacement_preparer["declaration"]),
-                stable_appcast,
-            )
-            self.assertEqual(with_reset.returncode, 0, with_reset.stderr)
-            self.assertIn("explicit Tip reset authorized", with_reset.stdout)
-            self.assertIn("tip-57b572038048 (35.15.39)", with_reset.stdout)
-            self.assertIn("tip-2f94412e6ab5 (35.15.18)", with_reset.stdout)
-
-            low_replacement = self.generate_release(
-                fixture_root,
-                "preparer-too-low",
-                "preparer",
-                "35.15.40",
-                tag="tip-bbbbbbbbbbbb",
-                reset_authority=reset_authority,
-            )
-            too_low = self.validate_progression(
-                low_replacement,
-                live_transition,
-                Path(low_replacement["declaration"]),
-                stable_appcast,
-            )
-            self.assertNotEqual(too_low.returncode, 0)
-            self.assertIn("newer than both live Tip and Stable", too_low.stderr)
-
-            valid_declaration = json.loads(
-                Path(replacement_preparer["declaration"]).read_text(encoding="utf-8")
-            )
-            tampered_cases = [
-                ("missing reset", "missing", "explicit checked-in resetAuthority"),
-                ("wrong type", "type", "resetAuthority type must be"),
-                ("live tag", "live-tag", "live Tip tag mismatch"),
-                ("live build", "live-build", "live Tip buildNumber mismatch"),
-                ("live digest", "live-digest", "live Tip manifest digest mismatch"),
-                ("Stable marketing", "stable-marketing", "Stable epoch marketingVersion mismatch"),
-                ("Stable build", "stable-build", "Stable epoch buildNumber mismatch"),
-                ("retained tag", "retained-tag", "retained preparer tag mismatch"),
-                ("retained build", "retained-build", "retained preparer buildNumber mismatch"),
-                ("retained digest", "retained-digest", "retained preparer rolloutManifestSha256 mismatch"),
-            ]
-            for label, mutation, diagnostic in tampered_cases:
-                declaration = copy.deepcopy(valid_declaration)
-                if mutation == "missing":
-                    declaration["schemaVersion"] = 1
-                    del declaration["resetAuthority"]
-                elif mutation == "type":
-                    declaration["resetAuthority"]["type"] = "not-a-reset"
-                elif mutation == "live-tag":
-                    declaration["resetAuthority"]["liveTip"]["tag"] = "tip-cccccccccccc"
-                elif mutation == "live-build":
-                    declaration["resetAuthority"]["liveTip"]["buildNumber"] = "35.15.38"
-                elif mutation == "live-digest":
-                    declaration["resetAuthority"]["liveTip"]["rolloutManifestSha256"] = "0" * 64
-                elif mutation == "stable-marketing":
-                    declaration["resetAuthority"]["stableEpoch"]["marketingVersion"] = "1.3.0"
-                elif mutation == "stable-build":
-                    declaration["resetAuthority"]["stableEpoch"]["buildNumber"] = "35"
-                elif mutation == "retained-tag":
-                    declaration["resetAuthority"]["retainedPreparer"]["tag"] = "tip-dddddddddddd"
-                elif mutation == "retained-build":
-                    declaration["resetAuthority"]["retainedPreparer"]["buildNumber"] = "35.15.17"
-                elif mutation == "retained-digest":
-                    declaration["resetAuthority"]["retainedPreparer"]["rolloutManifestSha256"] = "1" * 64
-                else:
-                    self.fail(f"unhandled mutation: {mutation}")
-                tampered_declaration = fixture_root / f"tampered-{mutation}.json"
-                tampered_declaration.write_text(
-                    json.dumps(declaration, indent=2) + "\n", encoding="utf-8"
-                )
-                result = self.validate_progression(
-                    replacement_preparer,
-                    live_transition,
-                    tampered_declaration,
-                    stable_appcast,
-                )
-                with self.subTest(case=label):
+            for candidate, live in (
+                (late_transition, second_successor),
+                (replacement_preparer, transition),
+                (replacement_preparer, second_successor),
+            ):
+                result = self.validate_progression(candidate, live)
+                with self.subTest(candidate=candidate["tag"], live=live["tag"]):
                     self.assertNotEqual(result.returncode, 0)
-                    self.assertIn(diagnostic, result.stderr)
+                    self.assertIn("would regress or skip", result.stderr)
+
+            mismatched = self.validate_progression(
+                late_transition, second_successor, Path(second_successor["declaration"])
+            )
+            self.assertNotEqual(mismatched.returncode, 0)
+            self.assertIn("does not match its checked-in rollout declaration", mismatched.stderr)
+
+    def test_retired_tip_reset_authority_declaration_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            declaration_path = Path(temporary_directory) / "tip-rollout.json"
+            self.declaration(declaration_path, "preparer")
+            declaration = json.loads(declaration_path.read_text(encoding="utf-8"))
+            declaration["schemaVersion"] = 2
+            declaration["resetAuthority"] = {"type": "transition-to-replacement-preparer-v1"}
+            declaration_path.write_text(json.dumps(declaration), encoding="utf-8")
+            result = self.rollout("current-role", "--declaration", str(declaration_path))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("resetAuthority declarations are retired", result.stderr)
+
+    def test_checked_in_declarations_never_publish_another_transition(self) -> None:
+        # Both channels have published their one transition (Tip tip-84c123fb22b1,
+        # Stable v1.10.0). Every later release must be a successor ZIP that
+        # retains that exact T, never a newer T or a replacement P.
+        for name in ("tip-rollout.json", "release-rollout.json"):
+            with self.subTest(declaration=name):
+                declaration = json.loads((ROOT_DIR / name).read_text(encoding="utf-8"))
+                self.assertEqual(declaration["currentRole"], "successor")
+                self.assertEqual(
+                    [entry["role"] for entry in declaration["predecessors"]],
+                    ["transition", "preparer"],
+                )
+                result = self.rollout(
+                    "packaging-context",
+                    "--policy",
+                    str(POLICY),
+                    "--declaration",
+                    str(ROOT_DIR / name),
+                    "--version-env",
+                    str(ROOT_DIR / "version.env"),
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("ROLLOUT_INSTALLATION_TYPE=application", result.stdout)
+                self.assertIn("ROLLOUT_ENCLOSURE_SUFFIX=.zip", result.stdout)
 
 
 class EmbeddedProvisioningProfileTests(unittest.TestCase):

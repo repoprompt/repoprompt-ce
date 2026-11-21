@@ -27,6 +27,9 @@ struct AppcastVersion {
 struct AppcastEligibilityContext: Equatable {
     let currentBuildNumber: String
     let osVersion: SparkleBuildVersion
+    /// True when this install already runs the successor bundle identity, so a
+    /// privileged identity-transition package is never an eligible update.
+    var hasCompletedIdentityTransition = false
 }
 
 /// Eligibility rules for a single appcast item. Constraints that are absent keep
@@ -45,6 +48,11 @@ enum AppcastItemEligibility {
         }
         if let installationType = item.installationType {
             guard supportedInstallationTypes.contains(installationType) else { return false }
+        }
+        if context.hasCompletedIdentityTransition,
+           IdentityTransitionUpdatePolicy.requiresPrivilegedInstaller(installationType: item.installationType)
+        {
+            return false
         }
         if let minimumSystemVersion = item.minimumSystemVersion {
             guard let required = SparkleBuildVersion(minimumSystemVersion),

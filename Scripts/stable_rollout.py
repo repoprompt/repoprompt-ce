@@ -18,10 +18,13 @@ Commands:
   policy, version metadata, and enclosure/app-manifest digests.
 - ``validate-live-tip-progression``: prove the candidate rolls or advances the
   authenticated public Tip ladder without skipping or rewriting retained history.
+  The transition role is one-shot: a live T may only advance to S.
+  Never publish another T and never reset to P.
 - ``validate-stable-tip-floor``: keep unprepared Stable builds below Tip's P, or
   authenticate the exact shared bridge and ensure Tip leads Stable's role.
 - ``generate-adoption`` / ``validate-adoption``: unchanged Tip P projection for Stable.
-- ``validate-live-stable-progression``: preserve Stable P -> T -> S history.
+- ``validate-live-stable-progression``: preserve Stable P -> T -> S history with
+  the same one-shot transition rule.
 - ``max-build``: greatest Sparkle build in an appcast (monotonicity input).
 - ``sibling-values``: TSV projection of predecessor items for shell loops.
 
@@ -47,8 +50,7 @@ sys.dont_write_bytecode = True
 SPARKLE_NAMESPACE = "http://www.andymatuschak.org/xml-namespaces/sparkle"
 ROLLOUT_NAMESPACE = "https://repoprompt.com/xml-namespaces/rollout"
 DECLARATION_SCHEMA_VERSION = 1
-TIP_DECLARATION_SCHEMA_VERSION = 2
-RESET_AUTHORITY_TYPE = "transition-to-replacement-preparer-v1"
+RETIRED_TIP_RESET_SCHEMA_VERSION = 2
 MANIFEST_SCHEMA_VERSION = 1
 POLICY_SCHEMA_VERSION = 1
 
@@ -67,6 +69,13 @@ IDENTITY_TRANSITION_PACKAGE_KEYS = {
 ROLES = ("legacy", "preparer", "transition", "successor")
 CHANNELS = ("stable", "tip")
 WORKFLOW_ALLOWED_ROLES = ("legacy", "preparer")
+# Roles whose newer builds may replace the live item while retaining the same
+# predecessors. Transition is deliberately absent: it is the one-time identity
+# crossing (privileged .pkg + bundle ID/keychain move). Every transition item
+# has the preparer build as its only Sparkle floor, so a second transition
+# would be offered to every already-transitioned client and repeat the
+# installer authorization and slow package install on each release.
+ROLLING_ROLES = ("legacy", "preparer", "successor")
 ROLE_IDENTITY = {
     "legacy": "legacy",
     "preparer": "legacy",
@@ -112,14 +121,9 @@ DECLARATION_KEYS = {
     "expectedSigningIdentity",
     "predecessors",
 }
-TIP_RESET_DECLARATION_KEYS = DECLARATION_KEYS | {"resetAuthority"}
 STABLE_CAPABILITY_KEYS = DECLARATION_KEYS | {"runtimeMigrationProof"}
 ADOPTION_TYPE = "tip-preparer-adoption-v1"
 RUNTIME_PROOF_ACCEPTED_RISK = "unverified-accepted-risk"
-RESET_AUTHORITY_KEYS = {"type", "liveTip", "stableEpoch", "retainedPreparer"}
-RESET_LIVE_TIP_KEYS = {"role", "tag", "buildNumber", "rolloutManifestSha256"}
-RESET_STABLE_EPOCH_KEYS = {"marketingVersion", "buildNumber"}
-RESET_RETAINED_PREPARER_KEYS = {"role", "tag", "buildNumber", "rolloutManifestSha256"}
 PREDECESSOR_KEYS = {"role", "tag", "rolloutManifestSha256"}
 MANIFEST_KEYS = {
     "schemaVersion",
@@ -254,69 +258,6 @@ def validate_identity_transition_package(policy: dict) -> dict:
     return transition_package
 
 
-def validate_reset_authority_shape(declaration: dict) -> None:
-    authority = declaration.get("resetAuthority")
-    if authority is None:
-        return
-    if declaration["channel"] != "tip":
-        raise RolloutError("resetAuthority is only supported for the Tip channel")
-    if declaration["currentRole"] != "preparer":
-        raise RolloutError("resetAuthority requires the preparer rollout role")
-    if declaration["expectedMigrationPhase"] != "legacy-preparer":
-        raise RolloutError("resetAuthority requires the legacy-preparer migration phase")
-    if declaration["expectedSigningIdentity"] != "legacy":
-        raise RolloutError("resetAuthority requires the legacy signing identity")
-    if declaration["predecessors"] != []:
-        raise RolloutError("resetAuthority requires no declared predecessors")
-    if not isinstance(authority, dict) or set(authority) != RESET_AUTHORITY_KEYS:
-        raise RolloutError(
-            "resetAuthority keys must be exactly "
-            + ", ".join(sorted(RESET_AUTHORITY_KEYS))
-        )
-    if authority["type"] != RESET_AUTHORITY_TYPE:
-        raise RolloutError(f"resetAuthority type must be {RESET_AUTHORITY_TYPE}")
-
-    entries = (
-        ("liveTip", authority["liveTip"], RESET_LIVE_TIP_KEYS, "transition"),
-        ("retainedPreparer", authority["retainedPreparer"], RESET_RETAINED_PREPARER_KEYS, "preparer"),
-    )
-    for label, entry, expected_keys, expected_role in entries:
-        if not isinstance(entry, dict) or set(entry) != expected_keys:
-            raise RolloutError(
-                f"resetAuthority {label} keys must be exactly "
-                + ", ".join(sorted(expected_keys))
-            )
-        if entry["role"] != expected_role:
-            raise RolloutError(
-                f"resetAuthority {label} role must be {expected_role}"
-            )
-        if not isinstance(entry["tag"], str) or not re.fullmatch(
-            r"tip-[0-9a-f]{12}", entry["tag"]
-        ):
-            raise RolloutError(f"resetAuthority {label} tag must be tip-<12 lowercase hex>")
-        if not isinstance(entry["buildNumber"], str):
-            raise RolloutError(f"resetAuthority {label} buildNumber must be a string")
-        parse_build(entry["buildNumber"], f"resetAuthority {label} build number")
-        if not isinstance(entry["rolloutManifestSha256"], str) or not re.fullmatch(
-            r"[0-9a-f]{64}", entry["rolloutManifestSha256"]
-        ):
-            raise RolloutError(
-                f"resetAuthority {label} rolloutManifestSha256 must be lowercase hex sha256"
-            )
-
-    stable_epoch = authority["stableEpoch"]
-    if not isinstance(stable_epoch, dict) or set(stable_epoch) != RESET_STABLE_EPOCH_KEYS:
-        raise RolloutError(
-            "resetAuthority stableEpoch keys must be exactly "
-            + ", ".join(sorted(RESET_STABLE_EPOCH_KEYS))
-        )
-    if not isinstance(stable_epoch["marketingVersion"], str) or not stable_epoch["marketingVersion"]:
-        raise RolloutError("resetAuthority stableEpoch marketingVersion must be nonempty")
-    if not isinstance(stable_epoch["buildNumber"], str):
-        raise RolloutError("resetAuthority stableEpoch buildNumber must be a string")
-    parse_build(stable_epoch["buildNumber"], "resetAuthority Stable epoch build number")
-
-
 def load_declaration(path: Path) -> dict:
     declaration = load_json(path, "rollout declaration")
     schema_version = declaration.get("schemaVersion")
@@ -326,8 +267,12 @@ def load_declaration(path: Path) -> dict:
         expected_keys = STABLE_CAPABILITY_KEYS
         if "adoptedArtifact" in declaration:
             expected_keys = expected_keys | {"adoptedArtifact"}
-    elif schema_version == TIP_DECLARATION_SCHEMA_VERSION:
-        expected_keys = TIP_RESET_DECLARATION_KEYS
+    elif schema_version == RETIRED_TIP_RESET_SCHEMA_VERSION and declaration.get("channel") == "tip":
+        raise RolloutError(
+            "Tip resetAuthority declarations are retired: a published transition can never be "
+            "reset to a replacement preparer, because that would repeat the one-time identity "
+            "transition and offer a legacy-identity ZIP to already-transitioned clients"
+        )
     else:
         raise RolloutError("rollout declaration schema version mismatch")
     if set(declaration) != expected_keys:
@@ -401,8 +346,6 @@ def load_declaration(path: Path) -> dict:
                 raise RolloutError("adoption requires a SHA-256 manifest pin")
         elif role not in {"transition", "successor"} or predecessors[-1].get("sourceChannel") != "tip":
             raise RolloutError("Stable schema 2 requires adoption or T/S retaining the shared Tip preparer")
-    elif schema_version == TIP_DECLARATION_SCHEMA_VERSION:
-        validate_reset_authority_shape(declaration)
     return declaration
 
 
@@ -1009,7 +952,14 @@ def bind_live_item(live: dict, digest: str) -> dict:
 def expected_retained_history(live: dict, live_digest: str, candidate_role: str) -> list[dict]:
     live_role = live["currentRole"]
     live_items = live["appcastItems"]
-    if live_role == candidate_role:
+    if live_role == "transition" and candidate_role == "transition":
+        raise RolloutError(
+            "the transition role is a one-time identity crossing: live transition "
+            f"{live.get('sourceTag')} ({live.get('buildNumber')}) must advance to successor; "
+            "publishing another transition would re-offer the privileged package to every "
+            "already-transitioned client"
+        )
+    if live_role == candidate_role and live_role in ROLLING_ROLES:
         allowed_chain = next(chain for chain in ALLOWED_ROLE_CHAINS if chain[0] == live_role)
         retained_roles = tuple(item["role"] for item in live_items[1:])
         if retained_roles != allowed_chain[1:]:
@@ -1032,19 +982,9 @@ def expected_retained_history(live: dict, live_digest: str, candidate_role: str)
     )
 
 
-def validate_explicit_tip_reset(
-    declaration: dict,
-    candidate: dict,
-    live: dict,
-    live_manifest_path: Path,
-    stable_epoch: dict[str, str],
-) -> None:
-    authority = declaration.get("resetAuthority")
-    if authority is None:
-        raise RolloutError(
-            "transition -> preparer requires an explicit checked-in resetAuthority"
-        )
+def validate_candidate_matches_declaration(declaration: dict, candidate: dict) -> None:
     for declaration_key, manifest_key in (
+        ("channel", "channel"),
         ("currentRole", "currentRole"),
         ("expectedSigningIdentity", "signingIdentity"),
         ("expectedMigrationPhase", "migrationPhase"),
@@ -1052,83 +992,10 @@ def validate_explicit_tip_reset(
     ):
         if declaration[declaration_key] != candidate[manifest_key]:
             raise RolloutError(
-                "reset candidate does not match its checked-in rollout declaration: "
+                "candidate does not match its checked-in rollout declaration: "
                 f"{declaration_key}={declaration[declaration_key]!r} "
                 f"manifest={candidate[manifest_key]!r}"
             )
-    if candidate["currentRole"] != "preparer" or len(candidate["appcastItems"]) != 1:
-        raise RolloutError(
-            "reset candidate must be a single-item replacement preparer rollout"
-        )
-
-    live_tip = authority["liveTip"]
-    live_manifest_digest = sha256_file(live_manifest_path)
-    if live_manifest_digest != live_tip["rolloutManifestSha256"]:
-        raise RolloutError(
-            "reset authorization live Tip manifest digest mismatch: "
-            f"expected {live_tip['rolloutManifestSha256']} got {live_manifest_digest}"
-        )
-    for authority_key, live_key in (("role", "currentRole"), ("tag", "sourceTag"), ("buildNumber", "buildNumber")):
-        if live_tip[authority_key] != live[live_key]:
-            raise RolloutError(
-                "reset authorization live Tip "
-                f"{authority_key} mismatch: expected {live_tip[authority_key]!r} "
-                f"got {live[live_key]!r}"
-            )
-
-    if [item["role"] for item in live["appcastItems"]] != ["transition", "preparer"]:
-        raise RolloutError(
-            "reset authorization requires the live transition to retain exactly one preparer"
-        )
-    retained = live["appcastItems"][1]
-    authorized_preparer = authority["retainedPreparer"]
-    for key in ("role", "tag", "buildNumber", "rolloutManifestSha256"):
-        if authorized_preparer[key] != retained[key]:
-            raise RolloutError(
-                "reset authorization retained preparer "
-                f"{key} mismatch: expected {authorized_preparer[key]!r} got {retained[key]!r}"
-            )
-
-    authorized_epoch = authority["stableEpoch"]
-    for key in ("marketingVersion", "buildNumber"):
-        if authorized_epoch[key] != stable_epoch[key]:
-            raise RolloutError(
-                "reset authorization Stable epoch "
-                f"{key} mismatch: expected {authorized_epoch[key]!r} got {stable_epoch[key]!r}"
-            )
-
-    stable_build = parse_build(stable_epoch["buildNumber"], "Stable maximum build")
-    retained_build = parse_build(
-        authorized_preparer["buildNumber"], "authorized retained preparer build"
-    )
-    if stable_build < retained_build:
-        raise RolloutError(
-            "reset authorization is only valid after the retained preparer falls below "
-            f"the Stable epoch: Stable={stable_epoch['buildNumber']} "
-            f"preparer={authorized_preparer['buildNumber']}"
-        )
-    if candidate["marketingVersion"] != authorized_epoch["marketingVersion"]:
-        raise RolloutError(
-            "replacement preparer marketingVersion must match the authorized Stable epoch: "
-            f"candidate={candidate['marketingVersion']} "
-            f"Stable={authorized_epoch['marketingVersion']}"
-        )
-
-    candidate_build = parse_build(candidate["buildNumber"], "candidate Tip build")
-    live_build = parse_build(live["buildNumber"], "live Tip build")
-    if not candidate_build > live_build or not candidate_build > stable_build:
-        raise RolloutError(
-            "replacement preparer build must be newer than both live Tip and Stable: "
-            f"candidate={candidate['buildNumber']} live Tip={live['buildNumber']} "
-            f"Stable={stable_epoch['buildNumber']}"
-        )
-    print(
-        "OK: explicit Tip reset authorized for live transition "
-        f"{live_tip['tag']} ({live_tip['buildNumber']}), replacing retained preparer "
-        f"{authorized_preparer['tag']} ({authorized_preparer['buildNumber']}) "
-        f"for Stable {authorized_epoch['marketingVersion']} ({authorized_epoch['buildNumber']}) "
-        f"with replacement preparer {candidate['buildNumber']}."
-    )
 
 
 def run_validate_live_tip_progression(args: argparse.Namespace) -> None:
@@ -1141,8 +1008,10 @@ def run_validate_live_tip_progression(args: argparse.Namespace) -> None:
 
     if bool(args.live_manifest) != bool(args.live_appcast):
         raise RolloutError("--live-manifest and --live-appcast must be supplied together")
-    if bool(args.declaration) != bool(args.stable_appcast):
-        raise RolloutError("--declaration and --stable-appcast must be supplied together")
+    if args.declaration:
+        validate_candidate_matches_declaration(
+            load_declaration(Path(args.declaration)), candidate
+        )
     if not args.live_manifest:
         if candidate["currentRole"] not in {"legacy", "preparer"} or len(candidate["appcastItems"]) != 1:
             raise RolloutError(
@@ -1175,15 +1044,6 @@ def run_validate_live_tip_progression(args: argparse.Namespace) -> None:
             "candidate Tip build must be strictly newer than live Tip: "
             f"candidate={candidate['buildNumber']} live={live['buildNumber']}"
         )
-
-    if live["currentRole"] == "transition" and candidate["currentRole"] == "preparer":
-        if args.declaration:
-            declaration = load_declaration(Path(args.declaration))
-            stable_epoch = stable_epoch_from_appcast(Path(args.stable_appcast))
-            validate_explicit_tip_reset(
-                declaration, candidate, live, live_manifest_path, stable_epoch
-            )
-            return
 
     expected = expected_retained_history(live, live_digest, candidate["currentRole"])
     actual = candidate["appcastItems"][1:]
@@ -1648,7 +1508,6 @@ def build_parser() -> argparse.ArgumentParser:
     live_progression.add_argument("--live-manifest")
     live_progression.add_argument("--live-appcast")
     live_progression.add_argument("--declaration")
-    live_progression.add_argument("--stable-appcast")
     live_progression.set_defaults(func=run_validate_live_tip_progression)
 
     stable_floor = subparsers.add_parser("validate-stable-tip-floor")

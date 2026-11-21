@@ -619,6 +619,9 @@ final class SparkleUpdaterManager: ObservableObject {
                 major: osVersion.majorVersion,
                 minor: osVersion.minorVersion,
                 patch: osVersion.patchVersion
+            ),
+            hasCompletedIdentityTransition: IdentityTransitionUpdatePolicy.hasCompletedIdentityTransition(
+                bundleIdentifier: Bundle.main.bundleIdentifier
             )
         )
     }
