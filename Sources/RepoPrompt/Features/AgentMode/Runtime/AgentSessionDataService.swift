@@ -1149,16 +1149,25 @@ actor AgentSessionDataService {
 
     private func metadataRecords(
         for workspace: WorkspaceModel,
-        limit: Int? = nil
+        limit: Int? = nil,
+        verifyInventory: Bool = false
     ) async throws -> [AgentSessionMetadataRecord] {
-        let index = try await metadataIndex(for: workspace, mode: .backfillIfMissing)
+        var index = try await metadataIndex(for: workspace, mode: .backfillIfMissing)
+        if verifyInventory, let current = index, let folder = try existingAgentSessionsFolder(for: workspace),
+           try metadataIndexNeedsFilenameReconciliation(current, folder: folder)
+        {
+            index = try await reconcileMetadataIndex(folder: folder)
+        }
         let records = index?.entries.sortedForAgentSessionMetadataIndex() ?? []
         guard let limit else { return records }
         return Array(records.prefix(max(limit, 0)))
     }
 
-    func indexedAgentSessionMetadataRecords(for workspace: WorkspaceModel) async throws -> [AgentSessionMetadataRecord] {
-        try await metadataRecords(for: workspace)
+    func indexedAgentSessionMetadataRecords(
+        for workspace: WorkspaceModel,
+        verifyInventory: Bool = false
+    ) async throws -> [AgentSessionMetadataRecord] {
+        try await metadataRecords(for: workspace, verifyInventory: verifyInventory)
     }
 
     func sidebarStreamMetadataRecords(for workspace: WorkspaceModel) async throws -> [AgentSessionMetadataRecord] {

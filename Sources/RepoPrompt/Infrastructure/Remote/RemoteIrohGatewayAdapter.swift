@@ -384,7 +384,7 @@ final class RemoteIrohGatewayAdapter {
         case .workflows: return .workflows
         case .history:
             let request = try decodePayload(RemoteHistoryRPCRequest.self, from: rpc.payload)
-            return .history(query: request.query, limit: request.limit)
+            return .history(request)
         case .transcript:
             let request = try decodePayload(RemoteTranscriptRPCRequest.self, from: rpc.payload)
             return .transcript(.init(

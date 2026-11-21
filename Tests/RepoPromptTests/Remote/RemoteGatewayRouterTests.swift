@@ -8,6 +8,63 @@ import XCTest
 
 @MainActor
 final class RemoteGatewayRouterTests: XCTestCase {
+    func testWorkspaceHistoryScopesBeforePagingAndKeepsEqualTimestamps() throws {
+        let workspace = UUID()
+        let busyWorkspace = UUID()
+        let date = Date(timeIntervalSinceReferenceDate: 10)
+        let targetEntries = (0 ..< 131).map { index in
+            RemoteHistoryEntry(
+                id: UUID(), workspaceID: workspace.uuidString, sessionName: "Saved chat \(index)", lastActivityAt: date
+            )
+        }
+        let otherEntries = (0 ..< 150).map { index in
+            RemoteHistoryEntry(
+                id: UUID(), workspaceID: busyWorkspace.uuidString, sessionName: "New chat \(index)",
+                lastActivityAt: date.addingTimeInterval(100)
+            )
+        }
+        let entries = targetEntries + otherEntries
+        let legacy = WindowRemoteReadService.historyPage(entries: entries, request: .init(limit: 100))
+        XCTAssertTrue(legacy.entries.allSatisfy { $0.workspaceID == busyWorkspace.uuidString })
+        XCTAssertNil(legacy.workspaceID)
+
+        let first = WindowRemoteReadService.historyPage(entries: entries, request: .init(limit: 100, workspaceID: workspace))
+        let cursor = try XCTUnwrap(first.olderCursor)
+        let second = WindowRemoteReadService.historyPage(
+            entries: entries,
+            request: .init(limit: 100, workspaceID: workspace, before: cursor)
+        )
+
+        XCTAssertEqual(first.workspaceID, workspace)
+        XCTAssertEqual(first.entries.count, 100)
+        XCTAssertTrue(first.hasMore)
+        XCTAssertEqual(second.entries.count, 31)
+        XCTAssertFalse(second.hasMore)
+        XCTAssertNil(second.olderCursor)
+        XCTAssertEqual(
+            (first.entries + second.entries).map(\.id),
+            targetEntries.map(\.id).sorted { $0.uuidString > $1.uuidString }
+        )
+    }
+
+    func testLegacyHTTPDecodesWorkspaceHistoryScopeAndCursor() {
+        let workspace = UUID()
+        let session = UUID()
+        let request = RemoteLegacyHTTPRequest(
+            method: "GET",
+            target: "\(RemoteProtocol.historyPath)?workspace_id=\(workspace)&before_date=12.5&before_id=\(session)&limit=25",
+            headers: [:],
+            body: Data()
+        )
+        guard case let .request(.history(history)) = RemoteLegacyHTTPRequestDecoder.decode(request) else {
+            return XCTFail("Expected a workspace history request.")
+        }
+        XCTAssertEqual(history, RemoteHistoryRPCRequest(
+            limit: 25, workspaceID: workspace,
+            before: RemoteHistoryCursor(lastActivityAt: Date(timeIntervalSinceReferenceDate: 12.5), sessionID: session)
+        ))
+    }
+
     func testProtectedRequestsRequireAuthorizationBeforeRoutingForEveryTransportContext() async throws {
         var snapshotCalls = 0
         let router = makeRouter(
@@ -437,7 +494,7 @@ final class RemoteGatewayRouterTests: XCTestCase {
             unpair: unpair,
             snapshot: snapshot,
             diagnostics: { nil },
-            history: { _, _ in nil },
+            history: { _ in nil },
             transcript: { _ in .unavailable },
             replay: replay,
             registerNotifications: registerNotifications,
@@ -1369,6 +1426,47 @@ final class RemoteProducerParityTests: XCTestCase {
         XCTAssertNil(record.originWorkflowID)
         XCTAssertNil(record.originWorkflowDisplayName)
         XCTAssertNil(record.lastRunStartedAt)
+    }
+
+    func testWorkspaceHistoryInventoryFindsSavedFileMissingFromExistingIndex() async throws {
+        let service = AgentSessionDataService.shared
+        let workspace = makeTemporaryWorkspace()
+        let importWorkspace = makeTemporaryWorkspace()
+        let workspaceFolder = try XCTUnwrap(workspace.customStoragePath)
+        let importFolder = try XCTUnwrap(importWorkspace.customStoragePath)
+        defer {
+            try? FileManager.default.removeItem(at: workspaceFolder)
+            try? FileManager.default.removeItem(at: importFolder)
+        }
+
+        let firstID = UUID()
+        let importedID = UUID()
+        func fixture(_ id: UUID) -> AgentSession {
+            AgentSessionPayloadBuilder.makePayload(
+                session: AgentTabSession(tabID: UUID()),
+                sessionID: id,
+                workspaceID: workspace.id,
+                name: "Saved chat",
+                snapshot: .init(
+                    transcript: .empty,
+                    projectionCounts: .zero,
+                    canonicalVisibleRowCount: 1,
+                    lastUserMessageAt: nil
+                )
+            )
+        }
+        let first = try await service.saveAgentSession(fixture(firstID), for: workspace)
+        let indexed = try await service.indexedAgentSessionMetadataRecords(for: workspace)
+        XCTAssertEqual(indexed.map(\.id), [firstID])
+
+        let incoming = try await service.saveAgentSession(fixture(importedID), for: importWorkspace)
+        try FileManager.default.copyItem(
+            at: incoming,
+            to: first.deletingLastPathComponent().appendingPathComponent(incoming.lastPathComponent)
+        )
+
+        let refreshed = try await service.indexedAgentSessionMetadataRecords(for: workspace, verifyInventory: true)
+        XCTAssertEqual(Set(refreshed.map(\.id)), Set([firstID, importedID]))
     }
 
     func testDataServicePreservesLaunchMetadataAcrossFullStubIndexAndSidebar() async throws {

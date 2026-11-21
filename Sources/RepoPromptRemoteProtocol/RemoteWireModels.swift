@@ -227,10 +227,19 @@ public struct RemoteHelloAccepted: Codable, Sendable, Equatable {
 public struct RemoteHistoryRPCRequest: Codable, Sendable, Equatable {
     public let query: String?
     public let limit: Int
+    public let workspaceID: UUID?
+    public let before: RemoteHistoryCursor?
 
-    public init(query: String? = nil, limit: Int = 50) {
+    public init(
+        query: String? = nil,
+        limit: Int = 50,
+        workspaceID: UUID? = nil,
+        before: RemoteHistoryCursor? = nil
+    ) {
         self.query = query
         self.limit = limit
+        self.workspaceID = workspaceID
+        self.before = before
     }
 }
 

@@ -353,14 +353,9 @@ final class RemoteGatewayController: NSObject, ObservableObject {
             diagnostics: { [unowned self] in
                 await diagnostics()
             },
-            history: { [unowned self] query, limit in
+            history: { [unowned self] request in
                 guard let readService = makeReadService() else { return nil }
-                let page = await readService.history(query: query, limit: limit)
-                return RemoteHistoryPage(
-                    protocolVersion: RemoteProtocol.currentVersion,
-                    entries: page.entries,
-                    hasMore: page.hasMore
-                )
+                return try await readService.history(request)
             },
             transcript: { [unowned self] request in
                 guard let readService = makeReadService() else { return .unavailable }
@@ -385,6 +380,8 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                     ))
                 } catch let error as RemoteReadServiceError {
                     switch error {
+                    case .workspaceNotFound:
+                        return .failed
                     case .sessionNotFound:
                         return .sessionNotFound(error.localizedDescription)
                     case .transcriptItemNotFound:

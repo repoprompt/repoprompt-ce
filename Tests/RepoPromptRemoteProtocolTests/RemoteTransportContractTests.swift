@@ -243,6 +243,23 @@ final class RemoteTransportContractTests: XCTestCase {
         }
     }
 
+    func testWorkspaceHistoryPagingRoundTripsAndDecodesLegacyMessages() throws {
+        let workspaceID = UUID()
+        let cursor = RemoteHistoryCursor(lastActivityAt: Date(timeIntervalSinceReferenceDate: 12.5), sessionID: UUID())
+        let request = RemoteHistoryRPCRequest(workspaceID: workspaceID, before: cursor)
+        let page = RemoteHistoryPage(entries: [], hasMore: true, workspaceID: workspaceID, olderCursor: cursor)
+        let encoder = JSONEncoder()
+        let decoder = JSONDecoder()
+
+        XCTAssertEqual(try decoder.decode(RemoteHistoryRPCRequest.self, from: encoder.encode(request)), request)
+        XCTAssertEqual(try decoder.decode(RemoteHistoryPage.self, from: encoder.encode(page)), page)
+        XCTAssertNil(try decoder.decode(RemoteHistoryRPCRequest.self, from: Data(#"{"limit":100}"#.utf8)).workspaceID)
+        let legacy = try decoder.decode(RemoteHistoryPage.self, from: Data(#"{"protocolVersion":1,"entries":[],"hasMore":true}"#.utf8))
+        XCTAssertNil(legacy.workspaceID)
+        XCTAssertNil(legacy.olderCursor)
+        XCTAssertTrue(legacy.hasMore)
+    }
+
     func testTranscriptRPCPagingModeIsAdditiveAndLegacyPayloadStillDecodes() throws {
         let sessionID = UUID()
         for mode in [RemoteTranscriptRPCPagingMode.recentBackward, .legacyForward] {

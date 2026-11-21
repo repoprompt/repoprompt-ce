@@ -65,11 +65,6 @@ enum RemoteTranscriptCursorCodec {
     }
 }
 
-struct RemoteHistoryPageRecord {
-    let entries: [RemoteHistoryEntry]
-    let hasMore: Bool
-}
-
 @MainActor
 protocol RemoteTranscriptReadService: AnyObject {
     func transcript(
@@ -82,7 +77,7 @@ protocol RemoteTranscriptReadService: AnyObject {
 
 @MainActor
 protocol RemoteHistoryReadService: AnyObject {
-    func history(query: String?, limit: Int) async -> RemoteHistoryPageRecord
+    func history(_ request: RemoteHistoryRPCRequest) async throws -> RemoteHistoryPage
 }
 
 /// Read-only adapters for the mobile conversation surfaces. They prefer the
@@ -183,42 +178,67 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
         )
     }
 
-    func history(query: String?, limit: Int) async -> RemoteHistoryPageRecord {
-        let boundedLimit = min(max(limit, 1), 100)
-        let normalizedQuery = query?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    func history(_ request: RemoteHistoryRPCRequest) async throws -> RemoteHistoryPage {
+        let workspaceID = request.workspaceID
+        let candidates = contexts.flatMap(\.workspaceManager.workspaces)
+        var visited: Set<UUID> = []
         var entries: [RemoteHistoryEntry] = []
 
-        for context in contexts {
-            for workspace in context.workspaceManager.workspaces where !workspace.isEphemeral {
-                let records = await (try? AgentSessionDataService.shared.indexedAgentSessionMetadataRecords(for: workspace)) ?? []
-                entries.append(contentsOf: records.compactMap { record in
-                    let workspaceID = record.workspaceID ?? workspace.id
-                    let searchable = "\(record.name) \(record.id.uuidString)".lowercased()
-                    if let normalizedQuery, !normalizedQuery.isEmpty, !searchable.contains(normalizedQuery) {
-                        return nil
-                    }
-                    return RemoteHistoryEntry(
-                        id: record.id,
-                        workspaceID: workspaceID.uuidString,
-                        sessionName: record.name,
-                        lastActivityAt: record.lastActivityAt ?? record.lastUserMessageAt ?? record.savedAt,
-                        turnCount: record.transcriptProjectionCounts?.canonicalVisibleRowCount ?? record.itemCount,
-                        runState: AgentModeRemoteSessionQueryService.mapPersistedRunState(record.lastRunStateRaw)
-                    )
-                })
+        for workspace in candidates where workspaceID == nil || workspace.id == workspaceID {
+            guard visited.insert(workspace.id).inserted, !workspace.isEphemeral else { continue }
+            try Task.checkCancellation()
+            let records: [AgentSessionMetadataRecord] = if workspaceID != nil {
+                try await AgentSessionDataService.shared.indexedAgentSessionMetadataRecords(
+                    for: workspace, verifyInventory: request.before == nil
+                )
+            } else {
+                await (try? AgentSessionDataService.shared.indexedAgentSessionMetadataRecords(for: workspace)) ?? []
+            }
+            entries += records.map { record in
+                RemoteHistoryEntry(
+                    id: record.id,
+                    workspaceID: (workspaceID ?? record.workspaceID ?? workspace.id).uuidString,
+                    sessionName: record.name,
+                    lastActivityAt: record.lastActivityAt ?? record.lastUserMessageAt ?? record.savedAt,
+                    turnCount: record.transcriptProjectionCounts?.canonicalVisibleRowCount ?? record.itemCount,
+                    runState: AgentModeRemoteSessionQueryService.mapPersistedRunState(record.lastRunStateRaw)
+                )
             }
         }
+        if let workspaceID, !visited.contains(workspaceID) {
+            throw RemoteReadServiceError.workspaceNotFound
+        }
+        return Self.historyPage(entries: entries, request: request)
+    }
 
+    static func historyPage(entries: [RemoteHistoryEntry], request: RemoteHistoryRPCRequest) -> RemoteHistoryPage {
+        let limit = min(max(request.limit, 1), 100)
+        let query = request.query?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         var deduplicated: [UUID: RemoteHistoryEntry] = [:]
         for entry in entries {
+            if let workspaceID = request.workspaceID, UUID(uuidString: entry.workspaceID) != workspaceID { continue }
+            if let query, !query.isEmpty,
+               !("\(entry.sessionName) \(entry.id.uuidString)".lowercased().contains(query))
+            { continue }
             if let existing = deduplicated[entry.id], existing.lastActivityAt >= entry.lastActivityAt { continue }
             deduplicated[entry.id] = entry
         }
-        let sorted = deduplicated.values.sorted { $0.lastActivityAt > $1.lastActivityAt }
-        return RemoteHistoryPageRecord(
-            entries: Array(sorted.prefix(boundedLimit)),
-            hasMore: sorted.count > boundedLimit
+
+        let sorted = deduplicated.values
+            .filter { entry in request.before.map { historyCursor(for: entry) < $0 } ?? true }
+            .sorted { historyCursor(for: $0) > historyCursor(for: $1) }
+        let page = Array(sorted.prefix(limit))
+        let hasMore = sorted.count > page.count
+        return RemoteHistoryPage(
+            entries: page,
+            hasMore: hasMore,
+            workspaceID: request.workspaceID,
+            olderCursor: hasMore && request.workspaceID != nil ? page.last.map(historyCursor(for:)) : nil
         )
+    }
+
+    private static func historyCursor(for entry: RemoteHistoryEntry) -> RemoteHistoryCursor {
+        RemoteHistoryCursor(lastActivityAt: entry.lastActivityAt, sessionID: entry.id)
     }
 
     static func page(
@@ -512,12 +532,14 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
 }
 
 enum RemoteReadServiceError: LocalizedError {
+    case workspaceNotFound
     case sessionNotFound
     case transcriptItemNotFound
     case invalidCursor
 
     var errorDescription: String? {
         switch self {
+        case .workspaceNotFound: "The requested workspace was not found."
         case .sessionNotFound: "The requested session could not be found."
         case .transcriptItemNotFound: "The requested transcript item is no longer available."
         case .invalidCursor: "The transcript cursor is invalid."

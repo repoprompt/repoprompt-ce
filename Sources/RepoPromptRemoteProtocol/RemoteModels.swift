@@ -1093,19 +1093,42 @@ public struct RemoteHistoryEntry: Codable, Sendable, Equatable, Identifiable {
     }
 }
 
+/// Stable position in workspace history, ordered by activity time with a UUID tie-breaker.
+public struct RemoteHistoryCursor: Codable, Sendable, Equatable, Comparable {
+    public let lastActivityAt: Date
+    public let sessionID: UUID
+
+    public init(lastActivityAt: Date, sessionID: UUID) {
+        self.lastActivityAt = lastActivityAt
+        self.sessionID = sessionID
+    }
+
+    public static func < (lhs: Self, rhs: Self) -> Bool {
+        if lhs.lastActivityAt != rhs.lastActivityAt { return lhs.lastActivityAt < rhs.lastActivityAt }
+        return lhs.sessionID.uuidString < rhs.sessionID.uuidString
+    }
+}
+
 public struct RemoteHistoryPage: Codable, Sendable, Equatable {
     public let protocolVersion: Int
     public let entries: [RemoteHistoryEntry]
     public let hasMore: Bool
+    /// Echoed by a desktop that applied the requested workspace scope.
+    public let workspaceID: UUID?
+    public let olderCursor: RemoteHistoryCursor?
 
     public init(
         protocolVersion: Int = RemoteProtocol.currentVersion,
         entries: [RemoteHistoryEntry],
-        hasMore: Bool = false
+        hasMore: Bool = false,
+        workspaceID: UUID? = nil,
+        olderCursor: RemoteHistoryCursor? = nil
     ) {
         self.protocolVersion = protocolVersion
         self.entries = entries
         self.hasMore = hasMore
+        self.workspaceID = workspaceID
+        self.olderCursor = olderCursor
     }
 }
 

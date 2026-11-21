@@ -50,6 +50,13 @@ The current wire surface includes:
 - `POST /remote/v1/commands`
 - `POST /remote/v1/context-builder`
 
+History can be scoped with `workspace_id`. The response echoes the workspace
+and includes `olderCursor` when more chats are available. Pass its
+`lastActivityAt` and `sessionID` as `before_date` and `before_id` on the next
+HTTPS request, or as the typed `before` cursor over Iroh. Dates are measured in
+seconds since 2001-01-01 UTC. Older desktops return a global page without the
+workspace echo.
+
 The gateway emits coarse workspace, session, run-state, interaction, and
 authorization/catalog events from the same authoritative projection used for
 snapshots. Transcript rows are paged separately so the fleet stream stays

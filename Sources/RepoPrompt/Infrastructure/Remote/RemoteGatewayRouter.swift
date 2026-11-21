@@ -39,7 +39,7 @@ enum RemoteGatewayRequest {
     case sessions
     case agents
     case workflows
-    case history(query: String?, limit: Int)
+    case history(RemoteHistoryRPCRequest)
     case transcript(RemoteGatewayTranscriptRequest)
     case events(after: UInt64?)
     case command(RemoteCommandRequest, endpoint: RemoteGatewayCommandEndpoint)
@@ -102,7 +102,7 @@ struct RemoteGatewayRoutingServices {
     var unpair: () -> RemoteGatewayRevocationResult
     var snapshot: () async -> RemoteSnapshot?
     var diagnostics: () async -> RemoteDiagnostics?
-    var history: (String?, Int) async -> RemoteHistoryPage?
+    var history: (RemoteHistoryRPCRequest) async throws -> RemoteHistoryPage?
     var transcript: (RemoteGatewayTranscriptRequest) async -> RemoteGatewayTranscriptResult
     var replay: (UInt64?) async -> RemoteEventReplayResult
     var registerNotifications: (RemoteNotificationRegistration) -> RemoteGatewayRegistrationResult
@@ -116,7 +116,7 @@ struct RemoteGatewayRoutingServices {
         unpair: @escaping () -> RemoteGatewayRevocationResult,
         snapshot: @escaping () async -> RemoteSnapshot?,
         diagnostics: @escaping () async -> RemoteDiagnostics?,
-        history: @escaping (String?, Int) async -> RemoteHistoryPage?,
+        history: @escaping (RemoteHistoryRPCRequest) async throws -> RemoteHistoryPage?,
         transcript: @escaping (RemoteGatewayTranscriptRequest) async -> RemoteGatewayTranscriptResult,
         replay: @escaping (UInt64?) async -> RemoteEventReplayResult,
         registerNotifications: @escaping (RemoteNotificationRegistration) -> RemoteGatewayRegistrationResult,
@@ -263,9 +263,21 @@ final class RemoteGatewayRequestRouter {
             guard let snapshot = await services.snapshot() else { return unavailableReadResponse() }
             return encode(snapshot.workflowCatalog)
 
-        case let .history(query, limit):
-            guard let page = await services.history(query, limit) else { return unavailableReadResponse() }
-            return encode(page)
+        case let .history(request):
+            guard request.before == nil || request.workspaceID != nil else {
+                return .error(.init(code: "invalid_history_request", message: "Invalid workspace history request."), status: 400)
+            }
+            do {
+                guard let page = try await services.history(request) else { return unavailableReadResponse() }
+                return encode(page)
+            } catch RemoteReadServiceError.workspaceNotFound {
+                return .error(.init(code: "workspace_not_found", message: "The requested workspace was not found."), status: 404)
+            } catch {
+                return .error(
+                    .init(code: "history_failed", message: "The Mac could not load this workspace’s saved chats.", retryable: true),
+                    status: 500
+                )
+            }
 
         case let .transcript(request):
             switch await services.transcript(request) {

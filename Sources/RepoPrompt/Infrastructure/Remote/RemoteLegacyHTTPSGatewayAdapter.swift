@@ -111,9 +111,7 @@ enum RemoteLegacyHTTPRequestDecoder {
             return .request(.workflows)
 
         case ("GET", RemoteProtocol.historyPath):
-            let query = components.queryItems?.first(where: { $0.name == "q" })?.value
-            let limit = components.queryItems?.first(where: { $0.name == "limit" })?.value.flatMap(Int.init) ?? 50
-            return .request(.history(query: query, limit: limit))
+            return decodeHistory(components)
 
         case ("GET", RemoteProtocol.transcriptPath):
             return decodeTranscript(components)
@@ -140,6 +138,33 @@ enum RemoteLegacyHTTPRequestDecoder {
                 status: 404
             ))
         }
+    }
+
+    private static func decodeHistory(_ components: URLComponents) -> RemoteLegacyHTTPRequestDecodingResult {
+        let items = components.queryItems ?? []
+        let workspace = items.first { $0.name == "workspace_id" }
+        let timestamp = items.first { $0.name == "before_date" }
+        let session = items.first { $0.name == "before_id" }
+        let workspaceID = workspace?.value.flatMap(UUID.init(uuidString:))
+        let before: RemoteHistoryCursor?
+        if workspace != nil && workspaceID == nil {
+            return invalidHistoryRequest()
+        }
+        if timestamp != nil || session != nil {
+            guard workspaceID != nil, let time = timestamp?.value.flatMap(Double.init), time.isFinite,
+                  let id = session?.value.flatMap(UUID.init(uuidString:))
+            else { return invalidHistoryRequest() }
+            before = RemoteHistoryCursor(lastActivityAt: Date(timeIntervalSinceReferenceDate: time), sessionID: id)
+        } else {
+            before = nil
+        }
+        let query = items.first { $0.name == "q" }?.value
+        let limit = items.first { $0.name == "limit" }?.value.flatMap(Int.init) ?? 50
+        return .request(.history(RemoteHistoryRPCRequest(query: query, limit: limit, workspaceID: workspaceID, before: before)))
+    }
+
+    private static func invalidHistoryRequest() -> RemoteLegacyHTTPRequestDecodingResult {
+        .response(.error(.init(code: "invalid_history_request", message: "Invalid workspace history request."), status: 400))
     }
 
     private static func decodeTranscript(_ components: URLComponents) -> RemoteLegacyHTTPRequestDecodingResult {
