@@ -5931,8 +5931,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         to targetSession: TabSession,
         expectedTransition: PersistentBindingTransitionToken? = nil,
         requiresHydration: Bool = false,
-        workspaceLink: Bool = false
+        workspaceLink: Bool = false,
+        visitIntent: UUID? = nil
     ) async throws -> AgentPersistentSessionBindingIdentity {
+        let owners = preparedSessionRuntimes
+        let intent = visitIntent
+        func visitIsCurrent() -> Bool {
+            intent == nil || owners?.isRuntimeVisitIntentCurrent(requestedSessionID, intent: intent) == true
+        }
+        guard visitIsCurrent() else { throw PersistentBindingMutationError.staleTransition }
         func checkPreparedOwner() throws {
             if workspaceLink, preparedSessionRuntimes?.hasPreparedRuntime(requestedSessionID) == true {
                 throw PersistentBindingMutationError.blockedByOwnership
@@ -5942,23 +5949,23 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard let targetMembership = runtimeSessionStore.membership(of: targetSession),
               targetMembership.permitsBindingPreparation else { throw PersistentBindingMutationError.staleTransition }
         if !workspaceLink, workspaceManager?.isSessionRuntimeProjection != true,
-           let owners = preparedSessionRuntimes,
+           let owners,
            await !(owners.releasePreparedOversightOwnerForVisit(sessionID: requestedSessionID, preparingReplacement: false))
         {
             if let workspace = workspaceManager?.activeWorkspace {
                 let tabID = targetSession.tabID
                 let expectedVisibleID = workspaceManager?.activeAgentSessionID(forTabID: tabID)
-                owners.queuePreparedRuntimeVisit(requestedSessionID) { [weak self, weak targetSession] in
+                owners.queuePreparedRuntimeVisit(requestedSessionID, intent: intent) { [weak self, weak targetSession] in
                     guard let self, let targetSession, !self.hasPreparedForWindowClose,
                           sessions[tabID] === targetSession,
                           workspaceManager?.activeWorkspaceID == workspace.id,
                           workspaceManager?.activeAgentSessionID(forTabID: tabID) == expectedVisibleID else { return }
-                    _ = await activateRoutedAgentSession(tabID: tabID, sessionID: requestedSessionID, workspace: workspace)
+                    _ = await activateRoutedAgentSession(tabID: tabID, sessionID: requestedSessionID, workspace: workspace, visitIntent: intent)
                 }
             }
             throw PersistentBindingMutationError.blockedByOwnership
         }
-        guard targetMembership.permitsBindingPreparation else { throw PersistentBindingMutationError.staleTransition }
+        guard visitIsCurrent(), targetMembership.permitsBindingPreparation else { throw PersistentBindingMutationError.staleTransition }
         if targetSession.activeAgentSessionID == requestedSessionID,
            let binding = targetSession.persistentSessionBindingIdentity
         {
@@ -5976,7 +5983,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let sourceSession = existingSourceTabID.flatMap { sessions[$0] }
         let sourceMembership = sourceSession.flatMap { runtimeSessionStore.membership(of: $0) }
         @MainActor func preparationIsCurrent() -> Bool {
-            targetMembership.permitsBindingPreparation
+            visitIsCurrent() && targetMembership.permitsBindingPreparation
                 && (sourceSession == nil || sourceMembership?.permitsBindingPreparation == true)
         }
         guard preparationIsCurrent() else { throw PersistentBindingMutationError.staleTransition }
@@ -7136,12 +7143,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     /// Ensures a session exists for the given tab ID and loads any persisted state.
     /// Used by MCP tool handlers to ensure session is ready before accessing it.
-    func ensureSessionReady(tabID: UUID, reconnectActiveProviders: Bool = false) async -> TabSession {
+    func ensureSessionReady(tabID: UUID, reconnectActiveProviders: Bool = false, visitIntent: UUID? = nil) async -> TabSession {
         // Do not join adoption: its teardown can be draining work which called this method.
         // Return an explicitly not-ready payload, without hydration, handoff or provider effects.
         if isAwaitingWorkspaceAdoption { return session(for: tabID) }
         let owners = preparedSessionRuntimes
         let visibleSessionID = workspaceManager?.activeAgentSessionID(forTabID: tabID)
+        let visibleWorkspaceID = workspaceManager?.activeWorkspaceID
+        // Readiness can carry an explicit visit, but a passive tool probe cannot supersede one.
+        let intent = visitIntent
+        func visitIsCurrent() -> Bool {
+            guard let intent, let visibleSessionID else { return true }
+            return owners?.isRuntimeVisitIntentCurrent(visibleSessionID, intent: intent) == true
+        }
+        guard visitIsCurrent() else { return session(for: tabID) }
         let preparedVisitID = workspaceManager?.isSessionRuntimeProjection != true
             ? visibleSessionID.flatMap { owners?.hasPreparedRuntime($0) == true ? $0 : nil } : nil
         if let preparedVisitID, owners?.claimPreparedRuntimeVisit(preparedVisitID) != true {
@@ -7159,15 +7174,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         {
             // Keep one writer while the run settles; the user's visit is resumed by the
             // owner's existing run-state observation, without a second click or polling timer.
-            let workspaceID = workspaceManager?.activeWorkspaceID
-            owners.queuePreparedRuntimeVisit(id) { [weak self] in
+            guard id == visibleSessionID else { return session(for: tabID) }
+            owners.queuePreparedRuntimeVisit(id, intent: intent) { [weak self] in
                 guard let self, !self.hasPreparedForWindowClose,
-                      workspaceManager?.activeWorkspaceID == workspaceID,
+                      workspaceManager?.activeWorkspaceID == visibleWorkspaceID,
                       workspaceManager?.activeAgentSessionID(forTabID: tabID) == id else { return }
-                _ = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: reconnectActiveProviders)
+                _ = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: reconnectActiveProviders, visitIntent: intent)
             }
             return session(for: tabID)
         }
+        guard visitIsCurrent() else { return session(for: tabID) }
         let session = session(for: tabID)
         if isAwaitingWorkspaceAdoption { return session }
 
@@ -7203,9 +7219,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         tabID: UUID,
         sessionID: UUID?,
         workspace: WorkspaceModel,
-        workspaceLink: Bool = false
+        workspaceLink: Bool = false,
+        visitIntent: UUID? = nil
     ) async -> AgentRouteSessionActivationResult {
         let owners = preparedSessionRuntimes
+        let intent = workspaceLink || workspaceManager?.isSessionRuntimeProjection == true ? nil :
+            visitIntent ?? sessionID.flatMap { owners?.beginRuntimeVisitIntent($0) }
+        func visitIsCurrent() -> Bool {
+            guard let intent, let sessionID else { return true }
+            return owners?.isRuntimeVisitIntentCurrent(sessionID, intent: intent) == true
+        }
+        guard visitIsCurrent() else { return .blockedByActiveDifferentSession }
         if workspaceLink, let sessionID, owners?.hasPreparedRuntime(sessionID) == true {
             return .blockedByActiveDifferentSession
         }
@@ -7223,14 +7247,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
            await !(owners.releasePreparedOversightOwnerForVisit(sessionID: preparedVisitID, preparingReplacement: false))
         {
             let expectedVisibleID = workspaceManager?.activeAgentSessionID(forTabID: tabID)
-            owners.queuePreparedRuntimeVisit(preparedVisitID) { [weak self] in
+            owners.queuePreparedRuntimeVisit(preparedVisitID, intent: intent) { [weak self] in
                 guard let self, !self.hasPreparedForWindowClose,
                       workspaceManager?.activeWorkspaceID == workspace.id,
                       workspaceManager?.activeAgentSessionID(forTabID: tabID) == expectedVisibleID else { return }
-                _ = await activateRoutedAgentSession(tabID: tabID, sessionID: sessionID, workspace: workspace)
+                _ = await activateRoutedAgentSession(tabID: tabID, sessionID: sessionID, workspace: workspace, visitIntent: intent)
             }
             return .blockedByActiveDifferentSession
         }
+        guard visitIsCurrent() else { return .blockedByActiveDifferentSession }
         guard let sessionID else {
             guard !workspaceLink else { return .sessionNotFound }
             let session = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: true)
@@ -7372,7 +7397,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 to: session,
                 expectedTransition: transitionToken,
                 requiresHydration: true,
-                workspaceLink: workspaceLink
+                workspaceLink: workspaceLink,
+                visitIntent: intent
             )
         } catch PersistentBindingMutationError.blockedByOwnership {
             return .blockedByActiveDifferentSession
