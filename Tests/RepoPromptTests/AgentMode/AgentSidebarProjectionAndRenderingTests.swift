@@ -1526,17 +1526,24 @@ final class AgentSidebarRowInvalidationTests: XCTestCase {
             return try XCTUnwrap(vm.repromptOperation)
         }
 
+        let editor = AgentComposerActions.make(vm: vm, subject: .currentTab, composerUI: vm.ui.composer, windowID: fixture.state.windowID)
         let rewrite = try start("First draft")
+        let staleEditorSnapshot = editor.loadDraft(source)
         try await AsyncTestWait.waitUntil("partial rewrite", timeout: 5) { session.draftText == "Partial" }
         await prompt.switchComposeTab(destination)
         XCTAssertEqual(vm.currentTabID, destination)
         XCTAssertNil(vm.repromptOperation)
+        // A delayed editor callback can still carry the snapshot from before the first chunk.
+        editor.storeDraft(source, staleEditorSnapshot.text, staleEditorSnapshot.restorationSequence)
+        XCTAssertEqual(rewrite.phase, .generating)
+        XCTAssertEqual(session.draftText, "Partial")
         await first.release()
         try await AsyncTestWait.waitUntil("offscreen rewrite completion", timeout: 5) { rewrite.phase == .completed }
         await prompt.switchComposeTab(source)
         XCTAssertEqual(vm.currentTabID, source)
         XCTAssertTrue(vm.repromptOperation === rewrite)
-        XCTAssertEqual(session.draftText, "Partial rewrite")
+        let remountedEditor = AgentComposerActions.make(vm: vm, subject: .currentTab, composerUI: vm.ui.composer, windowID: fixture.state.windowID)
+        XCTAssertEqual(remountedEditor.loadDraft(source).text, "Partial rewrite")
 
         rewrite.cancel(restoreOriginal: false, recover: false)
         let cancelled = try start("Second draft")
