@@ -893,7 +893,17 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
             let controller = await controller()
             let stream = await controller.events
             if usesKeyedProtocol { try await feed(initFrame, to: controller) }
-            let turn = try await controller.sendUserMessage("/compact")
+            let ref = await controller.currentSessionRef()
+            let conversation = try XCTUnwrap(ref.sessionID)
+            do {
+                _ = try await controller.sendIsolatedCompact(expectedConversation: "wrong-conversation")
+                XCTFail("A different conversation must not be compacted")
+            } catch NativeAgentRuntimeControllerError.configurationNotCurrent {}
+            let turn = try await controller.sendIsolatedCompact(expectedConversation: conversation)
+            do {
+                _ = try await controller.sendIsolatedCompact(expectedConversation: conversation)
+                XCTFail("An outstanding input must prevent a second maintenance write")
+            } catch NativeAgentRuntimeControllerError.configurationNotCurrent {}
             let boundary: [String: Any] = ["type": "system", "subtype": "compact_boundary"]
             try await feed(boundary.merging(["user_message_uuid": UUID().uuidString]) { _, new in new }, to: controller)
             try await feed(boundary.merging(["parent_tool_use_id": "nested-tool"]) { _, new in new }, to: controller)

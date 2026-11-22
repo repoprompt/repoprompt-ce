@@ -1943,7 +1943,11 @@ final class ClaudeAgentModeCoordinator {
                 do {
                     let previousVouch = session.contextCountVouchRevision
                     defer { invalidateWakeUsageAfterSend(controller, previousVouch: previousVouch) }
-                    let turnID = try await controller.sendUserMessage(providerControlCommand.providerText)
+                    let turnID = if proactiveCompact != nil {
+                        try await controller.sendIsolatedCompact(expectedConversation: providerControlCommand.expectedProviderConversation)
+                    } else {
+                        try await controller.sendUserMessage(providerControlCommand.providerText)
+                    }
                     return await acceptSentTurn(turnID, controller: controller)
                 } catch {
                     guard intentIsCurrent(intent, for: session),

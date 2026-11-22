@@ -45,6 +45,8 @@ package protocol NativeAgentRuntimeControlling: Actor {
     func sendUserMessage(_ text: String, configuration: NativeAgentRuntimeConfigurationProof) async throws -> UUID
     /// Maintenance commands intentionally do not require an ordinary-turn configuration proof.
     func sendUserMessage(_ text: String) async throws -> UUID
+    /// A proactive compact must atomically prove this conversation is idle at the native write.
+    func sendIsolatedCompact(expectedConversation: String) async throws -> UUID
     /// Sends a reasoned interrupt request to the provider runtime.
     /// - Parameter reason: "interrupt" for steering (graceful), "cancel" for forceful stop.
     func interruptTurn(reason: String) async -> NativeAgentRuntimeInterruptOutcome
@@ -94,6 +96,10 @@ package extension NativeAgentRuntimeControlling {
     }
 
     func sendUserMessage(_: String, configuration _: NativeAgentRuntimeConfigurationProof) async throws -> UUID {
+        throw NativeAgentRuntimeControllerError.configurationNotCurrent
+    }
+
+    func sendIsolatedCompact(expectedConversation _: String) async throws -> UUID {
         throw NativeAgentRuntimeControllerError.configurationNotCurrent
     }
 
