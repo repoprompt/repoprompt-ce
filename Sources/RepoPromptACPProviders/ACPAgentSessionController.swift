@@ -146,6 +146,12 @@ package actor ACPAgentSessionController {
         }
     }
 
+    package nonisolated static func isAuthenticationRequired(_ error: any Error) -> Bool {
+        // ACP reserves -32000 for authentication-required responses.
+        guard case let ControllerError.requestFailed(_, code) = error else { return false }
+        return code == -32000
+    }
+
     private enum JSONRPCID: Hashable {
         case string(String)
         case int(Int)
