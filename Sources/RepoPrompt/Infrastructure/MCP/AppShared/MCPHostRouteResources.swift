@@ -96,6 +96,7 @@ final class MCPHostRouteResources {
         guard !isClosing, let current = runRouteBindings.tabContextByConnectionID[connectionID] else { return false }
         return current.windowID == original.windowID && current.workspaceID == original.workspaceID
             && current.tabID == original.tabID && current.runID == original.runID
+            && current.savedCarrierSessionID == original.savedCarrierSessionID
             && current.readFileAutoSelectionGeneration == original.readFileAutoSelectionGeneration
             && current.routeOwnerIdentity == original.routeOwnerIdentity
             && current.fileToolAuthoritySourceIdentity == original.fileToolAuthoritySourceIdentity
@@ -107,6 +108,14 @@ final class MCPHostRouteResources {
         fileprivate let registration: DomainConnectionRegistration
         fileprivate let policyID: UUID?
         fileprivate let tab: MCPTabContextSnapshot
+
+        var savedCarrierSessionID: UUID? { tab.savedCarrierSessionID }
+        var runID: UUID? { tab.runID }
+        var connectionID: UUID { registration.connectionID }
+        var writerAtBinding: AgentSessionRuntimeStore.WriterIdentity? {
+            if case let .captured(identity) = tab.modelWriterAtBinding { return identity }
+            return nil
+        }
 
         var lookupSource: AgentWorkspaceLookupContextSource {
             .init(activeAgentSessionID: tab.activeAgentSessionID, worktreeBindingState: tab.worktreeBindingState)
@@ -146,6 +155,11 @@ final class MCPHostRouteResources {
         guard fileReadConnectionIsCurrent(connection), handle.context == connection.context,
               MCPServerViewModel.domainReadBindingSatisfiesRequestedRun(requestedRunID: connection.tab.runID, resolvedBindingKind: handle.bindingKind)
         else { throw MCPFileToolAuthorityFailure.superseded }
+        if let sessionID = connection.savedCarrierSessionID, let runID = connection.runID {
+            guard handle.bindingKind == .savedRunScoped(runID: runID, sessionID: sessionID) else {
+                throw MCPFileToolAuthorityFailure.superseded
+            }
+        }
         return handle
     }
 
@@ -255,8 +269,10 @@ final class MCPHostRouteResources {
         if presentationRevision < .max { presentationRevision += 1 }
         let revision = presentationRevision
         let binding: DomainBinding = if let workspaceID = context.workspaceID {
-            if let runID = context.runID {
-                .runScoped(runID: runID, context: DomainContextIdentity(workspaceID: workspaceID, contextID: context.tabID))
+            if let runID = context.runID, let sessionID = context.savedCarrierSessionID {
+                .savedRunScoped(runID: runID, context: .init(workspaceID: workspaceID, contextID: context.tabID), sessionID: sessionID)
+            } else if let runID = context.runID {
+                .runScoped(runID: runID, context: .init(workspaceID: workspaceID, contextID: context.tabID))
             } else {
                 .context(DomainContextIdentity(workspaceID: workspaceID, contextID: context.tabID), explicit: context.explicitlyBound)
             }
@@ -395,10 +411,12 @@ final class MCPHostRouteResources {
               let context = runRouteBindings.tabContextByConnectionID[connectionID], let workspaceID = context.workspaceID,
               let handle = try? await coordinator.resolveReadContext(connection: registration.registration),
               connections[connectionID]?.registration == registration.registration,
-              handle.context == DomainContextIdentity(workspaceID: workspaceID, contextID: context.tabID),
-              handle.bindingKind == .runScoped(runID: receipt.runID)
+              handle.context == DomainContextIdentity(workspaceID: workspaceID, contextID: context.tabID)
         else { return false }
-        return true
+        let expectedBinding = context.savedCarrierSessionID.map {
+            DomainReadBindingKind.savedRunScoped(runID: receipt.runID, sessionID: $0)
+        } ?? .runScoped(runID: receipt.runID)
+        return handle.bindingKind == expectedBinding
     }
 
     func rollbackPendingPolicy(_ receipt: MCPRunRoutingCleanupReceipt, token: MCPRunRouteBindings.PendingPolicyToken, clientName: String?) -> MCPRunRouteBindings.PendingPolicyRollbackResult? {

@@ -40,6 +40,9 @@ final class AgentSessionRuntimeHost {
         codexCoordinator: codexCoordinator, claudeCoordinator: claudeCoordinator
     )
     private(set) var workspaceActivation: AgentSessionHostWorkspaceActivation?
+    private(set) lazy var originatingContextSource: MCPHostRouteResources.ProviderContextSource = { [weak self] runID, tabID in
+        self?.captureProviderContext(runID: runID, tabID: tabID)
+    }
 
     /// Install immutable activation/resource ownership before making any visible session. A
     /// later activation must compose another host; it cannot retarget this host's old requests.
@@ -77,9 +80,7 @@ final class AgentSessionRuntimeHost {
         }
         scope.attachments.configuration = attachments
         if route.identity.kind == .independent {
-            route.installProviderContextSource { [weak self] runID, tabID in
-                self?.captureProviderContext(runID: runID, tabID: tabID)
-            }
+            codexCoordinator.installOriginatingContextSource(originatingContextSource)
         }
         installCanonicalContinuationLauncher()
     }
@@ -495,6 +496,14 @@ final class AgentSessionRuntimeHost {
         precondition(dependencies.windowID == routeID, "Execution must use the composed host route")
         var dependencies = dependencies
         dependencies.routingOwner = route.identity.kind == .independent ? route : nil
+        if route.identity.kind == .independent {
+            dependencies.originatingContextSource = { [weak self, originatingContextSource] in
+                guard let self else { return originatingContextSource }
+                return workspaceActivation == nil ? nil : originatingContextSource
+            }
+        } else {
+            dependencies.originatingContextSource = nil
+        }
         let execution = AgentModeRunService(
             dependencies: dependencies,
             hooks: hooks,

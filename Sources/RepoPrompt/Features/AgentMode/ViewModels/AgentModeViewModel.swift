@@ -5458,6 +5458,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return true
     }
 
+    #if DEBUG
+    /// Legacy prepared-owner fixture only; app saved execution enters `loadRuntime`.
     func prepareSavedOversightSession(
         tabID: UUID, sessionID: UUID, workspaceID: UUID,
         isStillAuthorized: @MainActor () -> Bool
@@ -5503,6 +5505,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             && !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: sessionID)
             && !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: sessionID)
     }
+    #endif
 
     private enum PersistentSessionBindingMutationTarget {
         case runtimeOnly

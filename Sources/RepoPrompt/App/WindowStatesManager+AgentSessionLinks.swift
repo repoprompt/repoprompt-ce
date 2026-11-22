@@ -81,9 +81,39 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         return snapshot
     }
 
+    static let agentHostRecoveryWarningPrefix = "agent-host-recovery:"
+
+    func reportRetainedAgentHostDrain(_ drain: AgentSessionHostDrainRuntime) {
+        guard case .retained? = drain.outcome else { return }
+        AgentSessionLinkRuntimeBridge.shared.launchCoordinatorReportWarning(
+            id: Self.agentHostRecoveryWarningPrefix + drain.recoveryID.uuidString,
+            message: "A background Agent session could not finish saving or releasing its resources. Its original owner is retained. Retry settlement after correcting any storage problems."
+        )
+    }
+
+    /// The warning names an exact drain, not a reusable session ID. Reading or visiting it
+    /// never retries the save; only the explicit action below joins the retained producer.
+    func retryRetainedAgentHostDrain(warningID: String) async {
+        let prefix = Self.agentHostRecoveryWarningPrefix
+        guard !isTerminating, warningID.hasPrefix(prefix),
+              let recoveryID = UUID(uuidString: String(warningID.dropFirst(prefix.count))),
+              let drain = agentRuntimeStore.retainedDrains.first(where: { $0.recoveryID == recoveryID }),
+              case .retained? = drain.outcome else { return }
+        drain.attemptRecovery()
+        switch await drain.wait(until: .now.advanced(by: .seconds(5))) {
+        case .released:
+            AgentSessionLinkRuntimeBridge.shared.dismissPersistenceWarnings(ids: [warningID])
+        case .retained:
+            reportRetainedAgentHostDrain(drain)
+        case .cancelled, .timedOut:
+            // The producer still owns the drain and may complete after this observer leaves.
+            break
+        }
+    }
+
     func hasPreparedRuntime(_ sessionID: UUID) -> Bool {
         preparedOversightWindows[sessionID] != nil || retiringPreparedOversightWindows[sessionID] != nil
-            || agentRuntimeStore.hasRetiringWriter(sessionID: sessionID)
+            || canonicalSavedHost(sessionID) != nil || agentRuntimeStore.hasRetiringWriter(sessionID: sessionID)
     }
 
     func claimPreparedRuntimeVisit(_ sessionID: UUID) -> Bool {
@@ -121,6 +151,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
                 !$0.scope.liveSessionTabIDs(for: sessionID).isEmpty
             }
             if drains.count == 1, let drain = drains.first {
+                reportRetainedAgentHostDrain(drain)
                 preparedOversightPendingVisits.removeValue(forKey: sessionID)
                 drain.deferVisit(presenterID: sessionID, isDestinationCurrent: { [weak self] in
                     guard let self else { return false }
@@ -142,6 +173,13 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
                 }
                 return
             }
+        }
+        if !hasPreparedRuntime(sessionID) {
+            Task { [weak self] in
+                guard self?.isRuntimeVisitIntentCurrent(sessionID, intent: ticket) == true else { return }
+                await resume()
+            }
+            return
         }
         preparedOversightPendingVisits[sessionID] = { [weak self] in
             guard self?.isRuntimeVisitIntentCurrent(sessionID, intent: ticket) == true else { return }
@@ -292,91 +330,117 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         return .success(found)
     }
 
+    /// Approval preflight is a point read only. It never composes a host or creates a claim.
+    func checkSavedOversightTarget(_ sessionID: UUID) async -> SavedOversightPreparationFailure? {
+        guard !isTerminating, !AgentSessionDeletionRegistry.shared.blocksNewOversight(sessionID: sessionID) else { return .missing }
+        switch agentRuntimeStore.resolveWriter(sessionID: sessionID) {
+        case let .unique(writer): return (try? writer.admitCommand().get()) == nil ? .changed : nil
+        case .conflicting: return .ambiguous
+        case .unavailable(.absent): break
+        case .unavailable: return .changed
+        }
+        do {
+            _ = try await AppSavedAgentSessionExecution.resolve(sessionID, domain: AppDomainRuntimeComposition.shared.runtime) { [self] in
+                !isTerminating && !Task.isCancelled
+            }
+            return nil
+        } catch let failure as SavedOversightPreparationFailure {
+            return failure
+        } catch {
+            return .unreadable
+        }
+    }
+
     func prepareSavedOversightTarget(
         _ target: UUID, isStillAuthorized: @escaping @MainActor () -> Bool
-    ) async -> Result<WindowState, SavedOversightPreparationFailure> {
-        guard isStillAuthorized(), !Task.isCancelled, !preparedOversightUIVisits.contains(target),
-              retiringPreparedOversightWindows[target] == nil,
-              !AgentSessionRuntimeStore.shared.hasRetiringWriter(sessionID: target) else { return .failure(.changed) }
-        let resolution = await resolveSavedOversightLocation(target)
-        guard case let .success(location) = resolution else {
-            if case let .failure(reason) = resolution { return .failure(reason) }
-            return .failure(.missing)
+    ) async -> Result<AgentSessionRuntimeStore.Writer, SavedOversightPreparationFailure> {
+        let authorized: @MainActor () -> Bool = { [self] in
+            !Task.isCancelled && !isTerminating && isStillAuthorized()
+                && !preparedOversightUIVisits.contains(target)
+                && !AgentSessionDeletionRegistry.shared.blocksNewOversight(sessionID: target)
         }
-        guard isStillAuthorized(), location.isCurrent, let source = location.window,
-              retiringPreparedOversightWindows[target] == nil,
-              !AgentSessionRuntimeStore.shared.hasRetiringWriter(sessionID: target) else { return .failure(.changed) }
-        if preparedOversightWindows[target] != nil,
-           preparedOversightOwnerLocations[target]?.isCurrent != true
-           || preparedOversightOwnerLocations[target]?.agreesOnCarrierAndProvenance(with: location) != true
-        {
-            guard await releasePreparedOversightOwnerForVisit(sessionID: target, preparingReplacement: true) else { return .failure(.changed) }
-        }
-        guard isStillAuthorized(), !Task.isCancelled, location.isCurrent else { return .failure(.changed) }
-        // Resolve after every preparation suspension. The window below is an adapter for the
-        // exact writer, not an election among agreeing presentation replicas.
-        let writerOwner: WindowState?
-        switch AgentSessionRuntimeStore.shared.resolveWriter(sessionID: target, expectedWorkspaceID: location.workspace.id) {
+        guard authorized() else { return .failure(.changed) }
+        switch agentRuntimeStore.resolveWriter(sessionID: target) {
         case let .unique(writer):
-            guard let exact = sessionRuntimeWindows.first(where: {
-                !$0.isClosing && $0.agentModeViewModel.sessions[writer.session.tabID] === writer.session
-            }) else { return .failure(.changed) }
-            writerOwner = exact
-        case .unavailable(.absent): writerOwner = nil
-        case .unavailable: return .failure(.changed)
+            guard let host = writer.scope.executableHost, !host.route.isClosing, writer.scope.linkExecution != nil,
+                  host.route.identity.kind != .independent || host.workspaceActivation?.isCurrent == true,
+                  (try? writer.admitCommand().get()) != nil else { return .failure(.changed) }
+            return .success(writer)
         case .conflicting: return .failure(.ambiguous)
+        case .unavailable(.absent): break
+        case .unavailable: return .failure(.changed)
         }
-        let carriers = AgentSessionCarrierResolver.capture(windows: allWindows, sessionIDs: [target])
-        guard !carriers.ambiguousSessionIDs.contains(target) else { return .failure(.ambiguous) }
-        let owner: WindowState
-        if let writerOwner {
-            owner = writerOwner
-        } else if let existing = preparedOversightWindows[target], !existing.isClosing {
-            owner = existing
-        } else if !carriers.replicatedSessionIDs.contains(target),
-                  location.stashedTabID == nil, source.workspaceManager.activeWorkspaceID == location.workspace.id,
-                  location.tab.activeAgentSessionID == nil || location.tab.activeAgentSessionID == target
-        {
-            owner = source
-        } else {
-            #if DEBUG
-                owner = test_preparedOversightOwnerFactory?(location.runtimeWorkspace, source)
-                    ?? WindowState.makePreparedSessionOwner(workspace: location.runtimeWorkspace, borrowing: source)
-            #else
-                owner = WindowState.makePreparedSessionOwner(workspace: location.runtimeWorkspace, borrowing: source)
-            #endif
-            preparedOversightWindows[target] = owner
-            preparedOversightOwnerLocations[target] = location
-            preparedOversightCarrierSubscriptions[target] = source.workspaceManager.$workspaces
-                .dropFirst()
-                .receive(on: RunLoop.main)
-                .sink { [weak self] _ in self?.schedulePreparedOversightCleanup() }
+        let domain = AppDomainRuntimeComposition.shared.runtime
+        do {
+            let lookup = try await AppSavedAgentSessionExecution.resolve(target, domain: domain, isStillAuthorized: authorized)
+            let result = try await AppSavedAgentSessionExecution.compose(
+                target: lookup.target, catalog: lookup.catalog, domain: domain,
+                installRoute: { host, reads in
+                    try await host.registerSavedCatalog(fileReads: reads, service: WindowState.sharedMCPService)
+                }, isStillAuthorized: authorized
+            )
+            let writer = result.writer
+            if result.source == .savedPayload, let runtime = writer.scope.linkExecution,
+               let endpoint = runtime.agentSessionLinkObserverEndpoint(tabID: writer.session.tabID),
+               let candidate = runtime.agentSessionLinkRuntimeCandidate(for: endpoint, displayName: lookup.target.entry.name)
+            {
+                preparedOversightRunObservations[target] = agentSessionLinkInstallObservation(for: candidate) { [weak self] in
+                    self?.schedulePreparedOversightCleanup()
+                }
+                notifyAgentSessionLinkTopologyChanged()
+                schedulePreparedOversightCleanup()
+            }
+            guard authorized(), (try? writer.admitCommand().get()) != nil else { return .failure(.changed) }
+            return .success(writer)
+        } catch let failure as SavedOversightPreparationFailure {
+            return .failure(failure)
+        } catch let failure as AgentSavedSessionTargetLoader.RuntimeLoadFailure {
+            if case let .lookup(reason) = failure.reason { return .failure(reason) }
+            return .failure(.changed)
+        } catch {
+            return .failure(Task.isCancelled || !authorized() ? .changed : .unreadable)
         }
-        guard !owner.agentModeViewModel.isAwaitingWorkspaceAdoption else { return .failure(.changed) }
-        let ready = await owner.agentModeViewModel.prepareSavedOversightSession(
-            tabID: location.tab.id, sessionID: target, workspaceID: location.workspace.id,
-            isStillAuthorized: { isStillAuthorized() && location.isCurrent }
-        )
-        guard isStillAuthorized(), location.isCurrent,
-              !owner.agentModeViewModel.isAwaitingWorkspaceAdoption else { return .failure(.changed) }
-        guard ready else { return .failure(.unreadable) }
-        guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
-            sessionID: target, expectedWorkspaceID: location.workspace.id
-        ), writer.session === owner.agentModeViewModel.sessions[location.tab.id],
-        (try? writer.admitCommand().get()) != nil else { return .failure(.changed) }
-        if preparedOversightWindows[target] != nil, preparedOversightRunObservations[target] == nil,
-           let candidate = owner.agentModeViewModel.agentSessionLinkCandidates(isWindowClosing: false, includeLocation: false).first(where: { $0.sessionID == target })
-        {
-            preparedOversightRunObservations[target] = owner.agentModeViewModel.agentSessionLinkInstallObservation(for: candidate) { [weak self] in
-                self?.schedulePreparedOversightCleanup()
+    }
+
+    private func canonicalSavedHost(_ sessionID: UUID) -> AgentSessionRuntimeHost? {
+        guard case let .unique(writer) = agentRuntimeStore.resolveWriter(sessionID: sessionID),
+              let host = writer.scope.executableHost, host.workspaceActivation?.savedCarrierSessionID == sessionID else { return nil }
+        return host
+    }
+
+    private func startSavedHostRetirement(
+        _ host: AgentSessionRuntimeHost, sessionID: UUID, destructive: Bool
+    ) -> AgentSessionHostDrainRuntime {
+        if let drain = host.scope.retainedDrain { return drain }
+        let drain = destructive ? host.beginFinalShutdown() : host.beginRetirement()
+        let bridge = AgentSessionLinkRuntimeBridge.shared
+        if !destructive { bridge.noteOversightWindowClosing(windowID: host.routeID) }
+        if let visit = preparedOversightPendingVisits.removeValue(forKey: sessionID), !destructive {
+            queuePreparedRuntimeVisit(sessionID, intent: canonicalDeferredVisitTickets[sessionID], resume: visit)
+        }
+        preparedOversightConsentPairs.removeValue(forKey: sessionID)
+        preparedOversightRunObservations.removeValue(forKey: sessionID)?.invalidate()
+        Task { @MainActor [weak self] in
+            await bridge.invalidateWindow(host.routeID, reason: .windowClosed)
+            drain.startIfNeeded()
+            switch await drain.wait(until: .now.advanced(by: .seconds(30))) {
+            case .retained: self?.reportRetainedAgentHostDrain(drain)
+            case .released, .cancelled, .timedOut: break
             }
         }
-        return .success(owner)
+        return drain
     }
 
     /// A UI visit may take over an idle saved runtime, but never creates a second writer or
     /// cancels an accepted managed task. Active ownership is the ordinary binding-transition block.
     func releasePreparedOversightOwnerForVisit(sessionID: UUID, preparingReplacement: Bool = false) async -> Bool {
+        if let host = canonicalSavedHost(sessionID) {
+            guard !preparingReplacement, preparedOversightPreparationInFlight[sessionID] == nil,
+                  let session = host.scope.sessions.values.first(where: { $0.activeAgentSessionID == sessionID }),
+                  host.scope.settlement(for: session).canJoinHostDrain else { return false }
+            let drain = startSavedHostRetirement(host, sessionID: sessionID, destructive: false)
+            return await drain.wait(until: .now.advanced(by: .seconds(2))) == .released
+        }
         if let retiring = retiringPreparedOversightWindows[sessionID] {
             // An explicit visit may retry a failed final save, but never joins a still-running
             // drain on the UI path. That visit will be queued and resumed by the drain owner.
@@ -417,7 +481,10 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
     /// Event-driven lifetime, not a polling timer or an independent link authority. The bridge's
     /// committed live links retain an owner; a saved intent alone does not keep a revoked run alive.
     func schedulePreparedOversightCleanup() {
-        guard !isTerminating, !preparedOversightWindows.isEmpty || !retiringPreparedOversightWindows.isEmpty else { return }
+        guard !isTerminating,
+              !preparedOversightWindows.isEmpty || !retiringPreparedOversightWindows.isEmpty
+              || agentRuntimeStore.retainedExecutionHosts.contains(where: { $0.workspaceActivation?.savedCarrierSessionID != nil })
+        else { return }
         preparedOversightCleanupDirty = true
         guard preparedOversightCleanupTask == nil else { return }
         preparedOversightCleanupTask = Task { @MainActor [weak self] in
@@ -441,6 +508,25 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
                         consent.permits(scopeID: $0, observer: item.observerSessionID, target: item.targetSessionID, at: Date())
                     } ?? true
                 }.flatMap { [$0.observerSessionID, $0.targetSessionID] })
+                for host in agentRuntimeStore.retainedExecutionHosts {
+                    guard let id = host.workspaceActivation?.savedCarrierSessionID,
+                          preparedOversightPreparationInFlight[id] == nil,
+                          canonicalSavedHost(id) === host, !host.scope.isRetiring,
+                          let session = host.scope.sessions.values.first(where: { $0.activeAgentSessionID == id }) else { continue }
+                    let pairs = inventory.persisted.filter { $0.targetSessionID == id || $0.observerSessionID == id }
+                    for pair in pairs where pair.targetSessionID == id { preparedOversightConsentPairs[id, default: []].update(with: pair) }
+                    let known = preparedOversightConsentPairs[id] ?? []
+                    let revoked = !known.isEmpty && known.allSatisfy { pair in
+                        pair.sourceScopeID.map { !consent.permits(scopeID: $0, observer: pair.observerSessionID, target: id, at: Date()) } ?? false
+                    }
+                    let deleted = AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: id)
+                    let destructive = deleted || revoked
+                    let visitPending = preparedOversightPendingVisits[id] != nil
+                    let naturallyUnowned = !retained.contains(id) && pairs.isEmpty
+                    if destructive || ((visitPending || naturallyUnowned) && host.scope.settlement(for: session).canJoinHostDrain) {
+                        _ = startSavedHostRetirement(host, sessionID: id, destructive: destructive)
+                    }
+                }
                 for id in Array(preparedOversightWindows.keys) where preparedOversightPreparationInFlight[id] == nil {
                     guard let owner = preparedOversightWindows[id] else { continue }
                     let deleted = AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: id)
@@ -599,6 +685,30 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         }
     }
 
+    private func independentLinkRuntime(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> AgentSessionLinkExecutionRuntime? {
+        guard !isTerminating,
+              case let .unique(writer) = agentRuntimeStore.resolveWriter(sessionID: endpoint.sessionID, expectedWorkspaceID: endpoint.workspaceID),
+              let host = writer.scope.executableHost, host.route.identity.kind == .independent,
+              host.routeID == endpoint.windowID, host.workspaceActivation?.isCurrent == true,
+              let runtime = writer.scope.linkExecution, runtime.admit(endpoint: endpoint) != nil else { return nil }
+        return runtime
+    }
+
+    private func independentLinkCandidates(sessionIDs: Set<UUID>? = nil) -> [AgentSessionLinkEndpointCandidate] {
+        agentRuntimeStore.retainedExecutionHosts.flatMap { host -> [AgentSessionLinkEndpointCandidate] in
+            guard host.route.identity.kind == .independent, let runtime = host.scope.linkExecution else { return [] }
+            return host.scope.sessions.values.compactMap { session in
+                guard let id = session.activeAgentSessionID, sessionIDs?.contains(id) != false,
+                      let endpoint = runtime.agentSessionLinkObserverEndpoint(tabID: session.tabID),
+                      independentLinkRuntime(for: endpoint) === runtime else { return nil }
+                let title = host.scope.persistence.composition?.displayName(session.tabID) ?? "Agent Session"
+                return runtime.agentSessionLinkRuntimeCandidate(for: endpoint, displayName: title)
+            }
+        }
+    }
+
     func agentSessionLinkCandidates(includeLocation: Bool) -> [AgentSessionLinkEndpointCandidate] {
         #if DEBUG
             if AgentSessionLinkCatalogReadProbe.enabled {
@@ -607,7 +717,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
             }
         #endif
         guard !isTerminating else { return [] }
-        var candidates: [AgentSessionLinkEndpointCandidate] = []
+        var candidates = independentLinkCandidates()
         for window in sessionRuntimeWindows where !window.isClosing {
             guard modelRoutingWindow(withID: window.windowID) === window else { continue }
             candidates.append(
@@ -630,6 +740,10 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
     func agentSessionLinkCandidate(
         for endpoint: DomainAgentSessionLinkEndpointIdentity, includeLocation: Bool
     ) -> AgentSessionLinkEndpointCandidate? {
+        if let runtime = independentLinkRuntime(for: endpoint) {
+            return independentLinkCandidates(sessionIDs: [endpoint.sessionID]).first { $0.domainEndpoint == endpoint }
+                ?? runtime.agentSessionLinkRuntimeCandidate(for: endpoint, displayName: "Agent Session")
+        }
         guard let window = modelRoutingWindow(withID: endpoint.windowID) else { return nil }
         #if DEBUG
             if AgentSessionLinkCatalogReadProbe.enabled, includeLocation { AgentSessionLinkCatalogReadProbe.record(1) }
@@ -648,6 +762,9 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         #endif
         var result = Dictionary(uniqueKeysWithValues: sessionIDs.map { ($0, [AgentSessionLinkEndpointCandidate]()) })
         guard !isTerminating else { return result }
+        for candidate in independentLinkCandidates(sessionIDs: sessionIDs) {
+            result[candidate.sessionID, default: []].append(candidate)
+        }
         for window in sessionRuntimeWindows where !window.isClosing {
             guard modelRoutingWindow(withID: window.windowID) === window else { continue }
             let local = window.agentModeViewModel.agentSessionLinkCandidates(
@@ -670,6 +787,10 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
     func agentSessionLinkObservationSnapshot(
         for candidate: AgentSessionLinkEndpointCandidate
     ) -> DomainAgentSessionObservationSnapshot {
+        if let runtime = independentLinkRuntime(for: candidate.domainEndpoint),
+           let command = runtime.admit(candidate) {
+            return AgentModeViewModel.observationSnapshot(for: command.writer.session, candidate: candidate, subagentCounts: nil)
+        }
         guard let window = window(withID: candidate.windowID) else {
             return DomainAgentSessionObservationSnapshot(
                 sessionID: candidate.sessionID,
@@ -726,6 +847,9 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
     func agentSessionLinkStatusProjection(
         for candidate: AgentSessionLinkEndpointCandidate
     ) -> AgentSessionLinkStatusProjection? {
+        if let runtime = independentLinkRuntime(for: candidate.domainEndpoint), let command = runtime.admit(candidate) {
+            return AgentModeViewModel.statusProjection(for: command.writer.session)
+        }
         guard let window = window(withID: candidate.windowID) else { return nil }
         return window.agentModeViewModel.agentSessionLinkStatusProjection(for: candidate)
     }
@@ -733,6 +857,9 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
     func agentSessionLinkAutoWakeOnUpdatesEnabled(
         for candidate: AgentSessionLinkEndpointCandidate
     ) -> Bool {
+        if let runtime = independentLinkRuntime(for: candidate.domainEndpoint), let command = runtime.admit(candidate) {
+            return command.writer.session.oversight.autoWakeOnUpdates
+        }
         guard let window = window(withID: candidate.windowID) else { return false }
         return window.agentModeViewModel.agentSessionLinkAutoWakeOnUpdatesEnabled(for: candidate)
     }
@@ -740,6 +867,9 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
     func agentSessionLinkAutoWakeTargetSessionIDs(
         for candidate: AgentSessionLinkEndpointCandidate
     ) -> Set<UUID> {
+        if let runtime = independentLinkRuntime(for: candidate.domainEndpoint), let command = runtime.admit(candidate) {
+            return command.writer.session.oversight.autoWakeTargetSessionIDs
+        }
         guard let window = window(withID: candidate.windowID) else { return [] }
         return window.agentModeViewModel.agentSessionLinkAutoWakeTargetSessionIDs(for: candidate)
     }
@@ -809,6 +939,14 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         _ waitingOn: DomainAgentSessionWaitingOn?,
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> Bool {
+        if let runtime = independentLinkRuntime(for: endpoint), let command = runtime.admit(endpoint: endpoint) {
+            let session = command.writer.session
+            if session.oversight.waitingOn != waitingOn {
+                session.oversight.waitingOn = waitingOn
+                session.monitorObservationSignal.send(())
+            }
+            return true
+        }
         guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else { return false }
         return viewModel.agentSessionLinkSetWaitingOn(waitingOn, for: endpoint)
     }
@@ -861,6 +999,19 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         for candidate: AgentSessionLinkEndpointCandidate,
         onChange: @escaping @MainActor () -> Void
     ) -> AgentSessionLinkObservationToken? {
+        if let runtime = independentLinkRuntime(for: candidate.domainEndpoint),
+           let command = runtime.admit(candidate) {
+            let session = command.writer.session
+            let publishers = [
+                session.$runState.map { _ in () }.eraseToAnyPublisher(),
+                session.$items.map { _ in () }.eraseToAnyPublisher(),
+                session.monitorObservationSignal.eraseToAnyPublisher()
+            ] + session.interactionStatePublishers(includeHookGate: false)
+            let cancellable = Publishers.MergeMany(publishers).receive(on: DispatchQueue.main).sink { _ in
+                MainActor.assumeIsolated { onChange() }
+            }
+            return AgentSessionLinkObservationToken { cancellable.cancel() }
+        }
         guard let window = window(withID: candidate.windowID), !window.isClosing else { return nil }
         return window.agentModeViewModel.agentSessionLinkInstallObservation(
             for: candidate,
@@ -887,17 +1038,16 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         _ inventory: AgentSessionLinkPromptInventory,
         to endpoint: DomainAgentSessionLinkEndpointIdentity
     ) {
-        guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else { return }
-        viewModel.linkExecutionRuntime.agentSessionLinkPublishPromptInventory(inventory, to: endpoint)
+        let runtime = independentLinkRuntime(for: endpoint) ?? agentSessionLinkOwningViewModel(for: endpoint)?.linkExecutionRuntime
+        runtime?.agentSessionLinkPublishPromptInventory(inventory, to: endpoint)
     }
 
     func agentSessionLinkPublishRunCatalogProjection(
         _ projection: AgentSessionLinkRunCatalogProjection
     ) {
-        guard let endpoint = projection.routeToken?.observerEndpoint,
-              let viewModel = agentSessionLinkOwningViewModel(for: endpoint)
-        else { return }
-        viewModel.linkExecutionRuntime.agentSessionLinkPublishRunCatalogProjection(projection, to: endpoint)
+        guard let endpoint = projection.routeToken?.observerEndpoint else { return }
+        let runtime = independentLinkRuntime(for: endpoint) ?? agentSessionLinkOwningViewModel(for: endpoint)?.linkExecutionRuntime
+        runtime?.agentSessionLinkPublishRunCatalogProjection(projection, to: endpoint)
     }
 
     /// Routes one passive status-notice queue to the exact incarnation it was reduced for.
@@ -908,8 +1058,8 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         _ snapshot: AgentSessionLinkPassiveStatusNotices.Snapshot,
         to endpoint: DomainAgentSessionLinkEndpointIdentity
     ) {
-        guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else { return }
-        viewModel.linkExecutionRuntime.agentSessionLinkPublishPassiveStatusNotices(snapshot, to: endpoint)
+        let runtime = independentLinkRuntime(for: endpoint) ?? agentSessionLinkOwningViewModel(for: endpoint)?.linkExecutionRuntime
+        runtime?.agentSessionLinkPublishPassiveStatusNotices(snapshot, to: endpoint)
     }
 
     func agentSessionLinkWillActivate(_ endpoint: DomainAgentSessionLinkEndpointIdentity) async {
@@ -920,8 +1070,8 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
     func agentSessionLinkWithholdPromptInventory(
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> UInt64? {
-        guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else { return nil }
-        return viewModel.linkExecutionRuntime.agentSessionLinkWithholdPromptInventory(for: endpoint)
+        let runtime = independentLinkRuntime(for: endpoint) ?? agentSessionLinkOwningViewModel(for: endpoint)?.linkExecutionRuntime
+        return runtime?.agentSessionLinkWithholdPromptInventory(for: endpoint)
     }
 
     func agentSessionLinkReleasePromptInventoryHold(
@@ -929,8 +1079,8 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         for endpoint: DomainAgentSessionLinkEndpointIdentity,
         publishing inventory: AgentSessionLinkPromptInventory?
     ) {
-        guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else { return }
-        viewModel.linkExecutionRuntime.agentSessionLinkReleasePromptInventoryHold(
+        let runtime = independentLinkRuntime(for: endpoint) ?? agentSessionLinkOwningViewModel(for: endpoint)?.linkExecutionRuntime
+        runtime?.agentSessionLinkReleasePromptInventoryHold(
             token,
             for: endpoint,
             publishing: inventory
@@ -1006,7 +1156,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         // Resolved independently of the candidate sweep: a window with no eligible candidates is not
         // the same thing as a window that is tearing down.
         let targetWindow = window(withID: target.windowID)
-        let targetWindowIsClosing = targetWindow.map(\.isClosing) ?? true
+        let targetWindowIsClosing = independentLinkRuntime(for: target) == nil && (targetWindow.map(\.isClosing) ?? true)
         let live = agentSessionLinkCandidates()
         return AgentSessionLinkSendLiveness(
             observerEndpointIsLive: live.contains { $0.domainEndpoint == observer },
@@ -1057,7 +1207,11 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         #if DEBUG
             if AgentSessionLinkCatalogReadProbe.enabled { AgentSessionLinkCatalogReadProbe.record(2) }
         #endif
-        guard let window = modelRoutingWindow(withID: windowID) else { return .none }
+        let independent = agentRuntimeStore.retainedExecutionHosts.filter { $0.routeID == windowID && $0.route.identity.kind == .independent }
+        if independent.count == 1, let host = independent.first {
+            return host.workspaceActivation?.modelAvailability ?? .none
+        }
+        guard independent.isEmpty, let window = modelRoutingWindow(withID: windowID) else { return .none }
         return window.apiSettingsViewModel.agentAvailability
     }
 
@@ -1161,7 +1315,8 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
     func agentSessionLinkPendingInteraction(
         for candidate: AgentSessionLinkEndpointCandidate
     ) -> AgentSessionLinkPendingInteractionInspection {
-        guard !isTerminating, window(withID: candidate.windowID)?.isClosing == false,
+        guard !isTerminating,
+              independentLinkRuntime(for: candidate.domainEndpoint) != nil || window(withID: candidate.windowID)?.isClosing == false,
               let runtime = agentSessionLinkCommandRuntime(for: candidate)
         else { return .none }
         return runtime.agentSessionLinkPendingInteraction(for: candidate)
@@ -1173,7 +1328,8 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         request: AgentSessionLinkInteractionResponseRequest,
         authorize: @escaping @MainActor @Sendable () async -> Bool
     ) async -> AgentSessionLinkInteractionResponseOutcome {
-        guard !isTerminating, window(withID: candidate.windowID)?.isClosing == false,
+        guard !isTerminating,
+              independentLinkRuntime(for: candidate.domainEndpoint) != nil || window(withID: candidate.windowID)?.isClosing == false,
               let runtime = agentSessionLinkCommandRuntime(for: candidate)
         else { return .unavailable }
         return await runtime.agentSessionLinkRespondToPendingInteraction(

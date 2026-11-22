@@ -1121,10 +1121,16 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         let runID = try XCTUnwrap(session.runID)
         let network = ServerNetworkManager.shared
         let clientName = "canonical-provider-route-\(UUID())"
+        route.installProviderContextSource { _, _ in
+            XCTFail("The bootstrap receipt must never consult the physical route's default source")
+            return nil
+        }
+        let originatingContextSource = host.originatingContextSource
         func installPolicy() async -> MCPRunRoutingCleanupReceipt? {
             await network.installClientConnectionPolicy(
                 for: clientName, windowID: host.routeID, restrictedTools: [],
-                runID: runID, purpose: .agentModeRun, routingOwner: route
+                runID: runID, purpose: .agentModeRun, routingOwner: route,
+                originatingContextSource: originatingContextSource
             )
         }
         let withoutAttempt = await installPolicy()

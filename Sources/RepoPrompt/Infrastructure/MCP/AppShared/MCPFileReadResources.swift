@@ -13,15 +13,28 @@ import RepoPromptWorkspaceCore
 struct MCPFileReadResources {
     static let toolNames: Set<String> = [MCPWindowToolName.getFileTree, MCPWindowToolName.getCodeStructure]
 
+    struct ContentEffects: Sendable {
+        let artifact: MCPAppPhysicalCapabilityAdapters.ReadSelectedAuthorizedGitArtifact
+        let selectRead: @MainActor @Sendable (MCPHostRouteResources.FileReadConnection, WorkspaceLookupContext, ToolResultDTOs.ReadFileReply, String, String) async throws -> Void
+        let selectSearch: @MainActor @Sendable (MCPHostRouteResources.FileReadConnection, WorkspaceLookupContext, SearchMode, Int, ToolResultDTOs.SearchResultDTO, [String]) async throws -> Void
+    }
+
     let workspace: AgentHostWorkspaceResources.Lease
     let settings: GlobalSettingsStore
+    var contentEffects: ContentEffects?
+    var savedExecutionTab: (@MainActor (DomainWorkspaceSnapshot, MCPHostRouteResources.FileReadConnection) -> ComposeTabState?)?
+
+    var boundToolNames: Set<String> {
+        guard contentEffects != nil else { return Self.toolNames }
+        return Self.toolNames.union([MCPWindowToolName.readFile, MCPWindowToolName.search])
+    }
     #if DEBUG
         var beforeReplyValidationForTesting: (@MainActor () async -> Void)?
     #endif
 
     /// These bindings use the route's coordinator and the shared read tool definitions.
     func binding(named name: String, route: MCPHostRouteResources) -> MCPDomainToolBinding? {
-        guard Self.toolNames.contains(name) else { return nil }
+        guard boundToolNames.contains(name) else { return nil }
         guard let definition = MCPDomainReadToolDefinitions.definition(named: name) else {
             preconditionFailure("Missing canonical read definition for \(name)")
         }
@@ -60,8 +73,8 @@ struct MCPFileReadResources {
                 guard let failure = error as? MCPFileToolAuthorityFailure else { return nil }
                 return try MCPFileToolProvider.authorityFailureValue(toolName: tool, args: args, failure: failure)
             },
-            backend: .init { tool, invocation, args, _ in
-                try await execute(tool: tool, route: route, connection: admission.get(), invocation: invocation, args: args)
+            backend: .init { tool, invocation, args, effects in
+                try await execute(tool: tool, route: route, connection: admission.get(), invocation: invocation, args: args, effects: effects)
             },
             sideEffects: route.readSideEffectCoordinator
         )
@@ -73,25 +86,36 @@ struct MCPFileReadResources {
 
     private func execute(
         tool: String, route: MCPHostRouteResources, connection: MCPHostRouteResources.FileReadConnection,
-        invocation: DomainReadInvocationContext, args: [String: Value]
+        invocation: DomainReadInvocationContext, args: [String: Value], effects: MCPDomainReadSideEffectEmitter
     ) async throws -> Value {
         do {
             let context = connection.context
             guard let handle = invocation.handle, handle.context == context,
                   route.fileReadConnectionIsCurrent(connection)
             else { throw MCPFileToolAuthorityFailure.superseded }
-            let lease = try await workspace.capture(context: context)
-            guard let canonical = lease.snapshot.contexts.first(where: { $0.metadata.identity == context }) else {
-                throw MCPFileToolAuthorityFailure.unavailable
+            let lease: AgentHostWorkspaceResources.Lease
+            let selection: StoredSelection
+            let contextRevision: UInt64
+            let source = connection.lookupSource
+            if connection.savedCarrierSessionID != nil {
+                guard let savedExecutionTab else { throw MCPFileToolAuthorityFailure.unavailable }
+                lease = try await workspace.capture(workspaceID: context.workspaceID) { savedExecutionTab($0, connection) != nil }
+                guard let tab = savedExecutionTab(lease.snapshot, connection), tab.activeAgentSessionID == source.activeAgentSessionID else {
+                    throw MCPFileToolAuthorityFailure.superseded
+                }
+                contextRevision = lease.snapshot.revisions.workingRevision
+                selection = tab.selection
+            } else {
+                lease = try await workspace.capture(context: context)
+                guard let canonical = lease.snapshot.contexts.first(where: { $0.metadata.identity == context }),
+                      source.activeAgentSessionID == canonical.metadata.activeAgentSessionID else {
+                    throw MCPFileToolAuthorityFailure.unavailable
+                }
+                contextRevision = canonical.revisions.workingRevision
+                selection = try JSONDecoder().decode(ComposeTabState.self, from: canonical.metadata.documentBytes).selection
             }
             guard handle.workspaceRevision == lease.snapshot.revisions.workingRevision,
-                  handle.contextRevision == canonical.revisions.workingRevision
-            else {
-                throw MCPFileToolAuthorityFailure.superseded
-            }
-            let source = connection.lookupSource
-            guard source.activeAgentSessionID == canonical.metadata.activeAgentSessionID,
-                  route.fileReadConnectionIsCurrent(connection)
+                  handle.contextRevision == contextRevision, route.fileReadConnectionIsCurrent(connection)
             else { throw MCPFileToolAuthorityFailure.superseded }
             let store = lease.resources.files
             let roots = await store.rootRefs(scope: .visibleWorkspace)
@@ -110,7 +134,7 @@ struct MCPFileReadResources {
                 )
                 guard lifetime != nil else { throw MCPFileToolAuthorityFailure.worktreeScopeUnavailable }
             } else { lifetime = nil }
-            let validate: @MainActor () async throws -> Void = {
+            let validate: @MainActor @Sendable () async throws -> Void = {
                 try Task.checkCancellation()
                 let refreshed = try await route.fileReadHandle(for: connection)
                 guard refreshed.runtimeID == handle.runtimeID, refreshed.runtimeGeneration == handle.runtimeGeneration,
@@ -123,12 +147,11 @@ struct MCPFileReadResources {
                     throw MCPFileToolAuthorityFailure.worktreeScopeUnavailable
                 }
                 // Recheck synchronous revocations after the last actor hop as well.
-                guard lease.rootsAreCurrent, route.fileReadConnectionIsCurrent(connection) else {
+                guard lease.rootsAreCurrent, route.fileReadConnectionIsCurrent(connection),
+                      connection.savedCarrierSessionID == nil || savedExecutionTab?(lease.snapshot, connection) != nil else {
                     throw MCPFileToolAuthorityFailure.superseded
                 }
             }
-            // Selection is decoded from this exact canonical context, never the selected presenter.
-            let selection = try JSONDecoder().decode(ComposeTabState.self, from: canonical.metadata.documentBytes).selection
             let value: Value
             if tool == MCPWindowToolName.getCodeStructure {
                 let codeMapsDisabled = settings.globalCodeMapsDisabled()
@@ -152,11 +175,38 @@ struct MCPFileReadResources {
                         )
                     }
                 ))
-            } else {
+            } else if tool == MCPWindowToolName.getFileTree {
                 value = try await executeTree(
                     args: args, store: store, lookup: lookup, selection: selection,
                     isRootless: lease.snapshot.document.metadata.repoPaths.isEmpty, validate: validate
                 )
+            } else {
+                guard let contentEffects else { throw MCPFileToolAuthorityFailure.unavailable }
+                let invocationContext = try MCPInvocationContextBridge.require(toolName: tool, expectedWindowID: route.identity.routeID)
+                value = try await MCPFileToolProvider.executeContentRead(toolName: tool, args: args, authority: .init(
+                    metadata: invocationContext.metadata, lookupContext: lookup, store: store,
+                    isRunlessOneShotHint: false, validate: validate,
+                    readFile: { input, start, count, lookup in
+                        try await MCPServerViewModel.readStoreFile(
+                            input: input, startLine1Based: start, lineCount: count, lookupContext: lookup, store: store,
+                            workspaceMessage: { await Self.workspaceMessage(store: store, path: $0) }
+                        )
+                    }, readArtifact: contentEffects.artifact,
+                    search: { pattern, mode, regex, insensitive, maxPaths, maxMatches, paths, extensions, excludes, context, wholeWord, countOnly, fuzzy, scope in
+                        try await StoreBackedWorkspaceSearch.search(
+                            pattern: pattern, mode: mode, isRegex: regex, caseInsensitive: insensitive,
+                            maxPaths: maxPaths, maxMatches: maxMatches, paths: paths, includeExtensions: extensions,
+                            excludePatterns: excludes, contextLines: context, wholeWord: wholeWord, countOnly: countOnly,
+                            fuzzySpaceMatching: fuzzy, rootScope: scope, store: store, workspaceManager: nil
+                        )
+                    }, selectRead: { reply, path, physical in
+                        try await validate()
+                        try await contentEffects.selectRead(connection, lookup, reply, path, physical)
+                    }, selectSearch: { mode, context, reply, paths in
+                        try await validate()
+                        try await contentEffects.selectSearch(connection, lookup, mode, context, reply, paths)
+                    }
+                ), sideEffects: effects)
             }
             #if DEBUG
                 await beforeReplyValidationForTesting?()

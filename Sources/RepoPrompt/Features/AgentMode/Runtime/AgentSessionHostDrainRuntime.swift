@@ -133,6 +133,7 @@ final class AgentSessionHostDrainRuntime {
     }
 
     let scope: AgentSessionRuntimeStore.Scope
+    let recoveryID = UUID()
     private var participants: [Participant]
     /// Exact acknowledgements returned by Scope.releaseWriterClaim, not elected writers.
     private var releasedParticipants: Set<ObjectIdentifier> = []

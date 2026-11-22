@@ -25,6 +25,10 @@ extension MCPServerViewModel {
     }
 
     nonisolated func parseManageSelectionInputs(rawPaths: [String], slicesValue: Value?) -> ManageSelectionInputs {
+        Self.parseSavedOrVisibleSelectionInputs(rawPaths: rawPaths, slicesValue: slicesValue)
+    }
+
+    nonisolated static func parseSavedOrVisibleSelectionInputs(rawPaths: [String], slicesValue: Value?) -> ManageSelectionInputs {
         var sanitizedPaths: [String] = []
         var seenPaths = Set<String>()
         var sliceInputs: [WorkspaceSelectionSliceInput] = []

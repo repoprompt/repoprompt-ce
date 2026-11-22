@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 @MainActor
@@ -196,6 +197,80 @@ final class AgentSavedSessionTargetLoaderTests: XCTestCase {
 
 @MainActor
 final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
+    func testProductionSavedTargetLoadsStashAndPersistsExactWriterPlacementWithoutWindow() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SavedHost-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let runtime = MCPDomainRuntime(configuration: .init(
+            mode: .app, profileIdentifier: "saved-host-\(UUID())", storageDirectory: directory,
+            workspaceStorageDirectory: directory.appendingPathComponent("workspaces"),
+            eventDirectory: directory.appendingPathComponent("events"), temporaryDirectory: directory.appendingPathComponent("tmp"),
+            externalReloadInterval: nil
+        ))
+        try await runtime.start()
+        do {
+            try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
+                let fixture = Fixture()
+                defer { fixture.cleanUp() }
+                let visible = ComposeTabState(activeAgentSessionID: UUID())
+                let stash = StashedTab(tab: fixture.tab)
+                fixture.placement.workspace.composeTabs = [visible]
+                fixture.placement.workspace.stashedTabs = [stash]
+                let workspace = fixture.placement.workspace
+                let authority = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: 101)
+                let created = try await authority.create(workspace, fileURL: directory.appendingPathComponent("saved.json"))
+                XCTAssertEqual(created.disposition, .applied)
+                try await fixture.save()
+
+                let windows = WindowStatesManager.shared
+                let count = WindowState.windowCounter
+                windows.beginPreparedOversightPreparation(fixture.sessionID)
+                defer { windows.endPreparedOversightPreparation(fixture.sessionID) }
+                let loaded = await windows.prepareSavedOversightTarget(fixture.sessionID, isStillAuthorized: { true })
+                let writer = try loaded.get()
+                let host = try XCTUnwrap(writer.scope.executableHost)
+                do {
+                    XCTAssertEqual(writer.session.tabID, stash.tab.id)
+                    XCTAssertEqual(writer.session.items.map(\.text), ["Saved request", "Saved response"])
+                    XCTAssertEqual(host.route.identity.kind, .independent)
+                    XCTAssertNotNil(host.scope.execution)
+                    XCTAssertNotNil(host.scope.linkExecution)
+                    let registered = await host.route.hasActiveCatalog()
+                    XCTAssertTrue(registered)
+                    let reused = try await windows.prepareSavedOversightTarget(fixture.sessionID, isStillAuthorized: { true }).get()
+                    XCTAssertEqual(reused.identity, writer.identity)
+                    XCTAssertTrue(reused.scope.executableHost === host)
+                    let parent = UUID()
+                    let placement = try XCTUnwrap(SessionAdminWindowsStructureHost().commitOrganizationalPlacement(
+                        sessionID: fixture.sessionID, parentID: parent, delegationScopeID: nil
+                    ))
+                    try await placement.persisted()
+                    let persisted = try await fixture.service.loadAgentSession(id: fixture.sessionID, for: workspace)
+                    XCTAssertEqual(persisted?.organizationalParentID, parent)
+                    let current = await runtime.workspaceStore.canonicalWorkspaceSnapshot(workspace.id)
+                    let document = try XCTUnwrap(current?.document.documentBytes)
+                    let unchanged = try JSONDecoder().decode(WorkspaceModel.self, from: document)
+                    XCTAssertEqual(unchanged.composeTabs, [visible])
+                    XCTAssertEqual(unchanged.stashedTabs, [stash])
+                    XCTAssertEqual(WindowState.windowCounter, count)
+                } catch {
+                    let drain = host.beginRetirement()
+                    drain.startIfNeeded()
+                    _ = await drain.wait(until: .now.advanced(by: .seconds(5)))
+                    throw error
+                }
+                let drain = host.beginRetirement()
+                drain.startIfNeeded()
+                let outcome = await drain.wait(until: .now.advanced(by: .seconds(5)))
+                XCTAssertEqual(outcome, .released)
+                XCTAssertTrue(host.route.isClosing)
+            }
+        } catch {
+            _ = await runtime.shutdown()
+            throw error
+        }
+        _ = await runtime.shutdown()
+    }
+
     func testSavedHistoricalPayloadLoadsIntoCanonicalWriterWithoutWindowComposition() async throws {
         let f = Fixture()
         defer { f.cleanUp() }
@@ -216,6 +291,36 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
         XCTAssertEqual(second.source, .existingWriter)
         XCTAssertTrue(second.writer.session === result.writer.session)
         XCTAssertEqual(f.payloadReads, 1)
+    }
+
+    func testStashedHistoricalCarrierLoadsWithoutChangingPresentation() async throws {
+        let f = Fixture()
+        defer { f.cleanUp() }
+        let visible = ComposeTabState(activeAgentSessionID: UUID())
+        let stash = StashedTab(tab: f.tab)
+        f.placement.workspace.composeTabs = [visible]
+        f.placement.workspace.stashedTabs = [stash]
+        try await f.save()
+
+        let result = try await f.load().get()
+        XCTAssertEqual(result.writer.session.tabID, stash.tab.id)
+        XCTAssertEqual(result.writer.identity.sessionID, f.sessionID)
+        XCTAssertEqual(f.placement.workspace.composeTabs, [visible])
+        XCTAssertEqual(f.placement.workspace.stashedTabs, [stash])
+    }
+
+    func testCanonicalCarrierRevalidationRechecksAuthorizationAfterAwait() async throws {
+        let f = Fixture()
+        defer { f.cleanUp() }
+        try await f.save()
+        f.validateCanonicalTarget = { target in
+            await Task.yield()
+            if f.payloadReads == 1 { f.authorized = false }
+            return target.carrier(in: f.placement.workspace) != nil
+        }
+        await assertFailure(f.load(), reason: .lookup(.changed), effects: .loadingClaimReleased)
+        XCTAssertEqual(f.payloadReads, 1)
+        XCTAssertTrue(f.scope.sessions.isEmpty)
     }
 
     func testExistingForeignScopeIsReturnedWithoutComposingOrPopulatingColdScope() async throws {
@@ -425,6 +530,7 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
         let placement: Placement
         let storage: AgentSessionStorageInputs
         var authorized = true
+        var validateCanonicalTarget: ((AgentSavedSessionTargetLoader.Target) async -> Bool)?
         var payloadReads = 0
         var beforePayload: ((AgentSessionHydrationRequest) async throws -> Void)?
         var afterPayload: (() -> Void)?
@@ -463,8 +569,8 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                 catalog: .init(
                     workspaces: { [self] in [placement.workspace] }, currentWorkspace: storage.workspaceWithID,
                     currentMetadata: { _, _ in nil }, isCurrent: { [self] target in
-                        target.workspace.id == placement.workspace.id && target.tab == placement.workspace.composeTabs.first
-                    }
+                        target.carrier(in: placement.workspace) == target.tab
+                    }, validateCanonicalTarget: validateCanonicalTarget
                 ), storage: storage,
                 selection: { .init(agent: $0.normalizedSelection.agent, modelRaw: $0.normalizedSelection.modelRaw, explicitReasoningEffortRaw: nil) },
                 codexPolicy: { _ in .init(options: [], defaultEffort: nil, lastUsed: nil) },
@@ -483,6 +589,7 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
         func cleanUp() {
             beforePayload = nil
             afterPayload = nil
+            validateCanonicalTarget = nil
             for session in scope.sessions.values {
                 session.saveDebounceTask?.cancel()
                 session.derivedTranscriptRefreshTask?.cancel()

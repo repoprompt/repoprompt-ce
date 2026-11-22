@@ -45,6 +45,7 @@ final class AgentModeRunService {
         let childAgentRunWaitDrainTimeoutSeconds: TimeInterval
         /// Pinned by executable-host composition, never resolved from the selected window.
         var routingOwner: MCPHostRouteResources?
+        var originatingContextSource: (() -> MCPHostRouteResources.ProviderContextSource?)?
     }
 
     /// Neutral command/cancellation contracts shared with the direct/headless
@@ -410,6 +411,8 @@ final class AgentModeRunService {
         let allowsAgentExternalControlTools = session.mcpControlContext != nil && session.parentSessionID == nil
         let claudeProcess = session.claudeController as? ClaudeCompatibleNativeSessionAdapter
         let acpProcess = session.acpController
+        let routingOwner = dependencies.routingOwner
+        let originatingContextSource = dependencies.originatingContextSource?()
         let makeLease: (_ runID: UUID) -> MCPBootstrapLease = { runID in
             self.dependencies.bindPendingOracleReviewContext(tabID, runID)
             let leaseSpec = MCPBootstrapLeaseSpec.agentMode(
@@ -427,7 +430,8 @@ final class AgentModeRunService {
                 mcpServerEnabler: mcpServerEnabler,
                 policyInstaller: MCPBootstrapLease.agentModePolicyInstaller(connectionPolicyInstaller),
                 expectedPIDPolicyArmer: expectedPIDPolicyArmer,
-                routingOwner: self.dependencies.routingOwner,
+                routingOwner: routingOwner,
+                originatingContextSource: originatingContextSource,
                 processRegistrationProvider: {
                     if selectedAgent.usesClaudeNativeRuntime { return await claudeProcess?.routingProcessRegistration() }
                     if selectedAgent.acpProviderID != nil { return await acpProcess?.routingProcessRegistration() }

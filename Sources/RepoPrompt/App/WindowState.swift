@@ -745,8 +745,8 @@ class WindowState: ObservableObject {
 
     #endif
 
-    /// Runtime composition only: no NSWindow, restore claim, UI registration or automatic provider
-    /// reconnect. The borrowed workspace is an immutable placement projection, not a document owner.
+    #if DEBUG
+    /// Legacy fixture construction only. The production saved caller composes an executable host.
     static func makePreparedSessionOwner(
         workspace: WorkspaceModel,
         borrowing source: WindowState,
@@ -764,6 +764,7 @@ class WindowState: ObservableObject {
             managedSettingsLease: settingsLease
         )
     }
+    #endif
 
     let isPreparedSessionOwner: Bool
     private let compositionDomainRuntime: MCPDomainRuntime?

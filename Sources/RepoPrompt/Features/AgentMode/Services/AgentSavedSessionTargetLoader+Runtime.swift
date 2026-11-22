@@ -8,6 +8,9 @@ extension AgentSavedSessionTargetLoader {
         let currentWorkspace: (UUID) -> WorkspaceModel?
         let currentMetadata: (UUID, UUID) -> LiveMetadata?
         let isCurrent: (Target) -> Bool
+        /// Durable workspace authority may suspend. Local writer, deletion and authorization
+        /// fences are sampled again after this check, never carried across it.
+        var validateCanonicalTarget: ((Target) async -> Bool)?
     }
 
     struct RuntimeLoad {
@@ -98,7 +101,10 @@ extension AgentSavedSessionTargetLoader {
         case let .failure(reason): return failed(.lookup(reason))
         case let .success(value): target = value
         }
-        guard target.workspace.id == storage.workspaceID, catalog.isCurrent(target),
+        if let validate = catalog.validateCanonicalTarget, !(await validate(target)) {
+            return failed(.lookup(.changed))
+        }
+        guard !Task.isCancelled, isStillAuthorized(), target.workspace.id == storage.workspaceID, catalog.isCurrent(target),
               let workspace = storage.workspace, sameStorage(workspace, target.workspace), available()
         else { return failed(.lookup(.changed)) }
         if let existing = existing() { return existing }
@@ -152,6 +158,9 @@ extension AgentSavedSessionTargetLoader {
             ))
         } catch {
             return failLoading(.lookup(error is CancellationError || Task.isCancelled ? .changed : .unreadable))
+        }
+        if let validate = catalog.validateCanonicalTarget, !(await validate(target)) {
+            return failLoading(.lookup(.changed))
         }
         guard !Task.isCancelled, isStillAuthorized(), available(), !storage.isSuppressed(),
               catalog.isCurrent(target), let current = storage.workspace, sameStorage(current, workspace),

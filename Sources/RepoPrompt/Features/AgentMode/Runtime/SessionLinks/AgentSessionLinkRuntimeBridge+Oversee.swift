@@ -26,8 +26,7 @@ extension AgentSessionLinkRuntimeBridge {
         guard targetSessionID != observer.sessionID else {
             return refusal("link_refused", subreason: "self_monitor", detail: "A session cannot oversee itself. Choose a different target.")
         }
-        let resolution = await WindowStatesManager.shared.resolveSavedOversightLocation(targetSessionID)
-        if case let .failure(reason) = resolution {
+        if let reason = await WindowStatesManager.shared.checkSavedOversightTarget(targetSessionID) {
             return refusal(
                 "target_not_preparable",
                 subreason: reason.rawValue,
