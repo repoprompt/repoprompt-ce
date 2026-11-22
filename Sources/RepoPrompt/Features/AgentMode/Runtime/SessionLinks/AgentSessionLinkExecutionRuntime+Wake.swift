@@ -24,6 +24,13 @@ extension AgentSessionLinkExecutionRuntime {
             currentReferences: Set(snapshot.autoWakeLanes.map(\.reference))
         )
 
+        // A held conversation cannot reserve even a parked attempt. Retraction uses the
+        // existing tombstone rules; the canonical queue remains owned by the reducer.
+        if session.activeClaudeContextAutoWakeHold != nil {
+            cancelAgentSessionLinkAutoWake(for: endpoint, reason: .eligibilityLost)
+            return
+        }
+
         if let attempt = session.oversight.pendingAutoWake,
            attempt.isPeriodic,
            attempt.observerEndpoint == endpoint
