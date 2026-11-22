@@ -1115,8 +1115,12 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         try await runVisibleLifetimeWitness(switchWorkspace: false, failFinalSave: true)
     }
 
+    func testClosingVisibleWindowDuringFirstSaveWithdrawsUnpublishedComposer() async throws {
+        try await runVisibleLifetimeWitness(switchWorkspace: false, holdFirstSave: true)
+    }
+
     private func runVisibleLifetimeWitness(
-        switchWorkspace: Bool, failFinalSave: Bool = false, leaveOtherWindowOpen: Bool = false
+        switchWorkspace: Bool, failFinalSave: Bool = false, leaveOtherWindowOpen: Bool = false, holdFirstSave: Bool = false
     ) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("VisibleAgentLifetime-\(UUID())")
         let root = directory.appendingPathComponent("original-root")
@@ -1148,7 +1152,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
 
         let sessionID = UUID()
         var tab = ComposeTabState()
-        tab.activeAgentSessionID = sessionID
+        tab.activeAgentSessionID = holdFirstSave ? nil : sessionID
         var workspace = WorkspaceModel(name: "Original", repoPaths: [root.path], customStoragePath: directory.appendingPathComponent("first"))
         workspace.composeTabs = [tab]
         workspace.activeComposeTabID = tab.id
@@ -1171,6 +1175,11 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         XCTAssertNotEqual(host.routeID, window.windowID)
         XCTAssertEqual(rootLease.snapshot.document.metadata.repoPaths, [root.path])
         XCTAssertTrue(host.route.hasCurrentModelCatalogRoute)
+        if holdFirstSave {
+            try await assertFirstSaveWithdrawal(window: window, workspace: workspace, tabID: tab.id, host: host)
+            XCTAssertTrue(provider.promptedMessages.isEmpty)
+            return
+        }
 
         let session = host.scope.makeSession(tabID: tab.id)
         session.installPersistentSessionBinding(.init(tabID: tab.id, sessionID: sessionID, workspaceID: workspace.id))
@@ -1324,6 +1333,55 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         let record = try await AgentSessionDataService.shared.loadAgentSession(id: sessionID, for: workspace)
         XCTAssertEqual(record?.id, sessionID)
         XCTAssertEqual(try XCTUnwrap(record?.transcript).turns.compactMap { $0.request?.text }, [prompt])
+    }
+
+    private func assertFirstSaveWithdrawal(
+        window: WindowState, workspace: WorkspaceModel, tabID: UUID, host: AgentSessionRuntimeHost
+    ) async throws {
+        let agent = window.agentModeViewModel
+        let navigation = AgentModeNavigationController(isSystemWorkspaceMode: workspace.isSystemWorkspace)
+        navigation.onAppear(isSystem: workspace.isSystemWorkspace, windowState: window, agentModeVM: agent)
+        let session = await agent.ensureSessionReady(tabID: tabID)
+        session.selectedAgent = .openCode
+        var presentedTarget: AgentComposerSubmitTarget?
+        try await AsyncTestWait.waitUntil("present the blank composer") {
+            guard agent.currentTabID == tabID else { return false }
+            presentedTarget = AgentComposerProjection.props(vm: agent, subject: .currentTab).submitTarget
+            return presentedTarget != nil
+        }
+        let target = try XCTUnwrap(presentedTarget)
+        let prompt = "Restore this undispatched input"
+        let attempt = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: prompt)
+        guard case let .claimed(claim) = agent.claimComposerSubmitForImmediatePresentation(attempt) else {
+            return XCTFail("The visible composer did not own the local input")
+        }
+        let gate = AutoWakeCatalogAuthorityGate()
+        let originalSaver = host.scope.persistence.saver
+        var entered = false
+        host.scope.persistence.saver = { payload, workspace, count in
+            entered = true
+            _ = await gate.requirement()
+            return try await originalSaver(payload, workspace, count)
+        }
+        defer {
+            Task { await gate.open() }
+            host.scope.persistence.saver = originalSaver
+        }
+        let send = Task { await agent.executeComposerSubmitAttempt(text: prompt, claim: claim) }
+        try await AsyncTestWait.waitUntil("hold the real configured first save") { entered }
+        XCTAssertFalse(host.scope.saveQueue.inFlightSessionIDs.isEmpty)
+        XCTAssertTrue(host.scope.sessions.values.allSatisfy { !$0.runState.isActive })
+        WindowStatesManager.shared.unregisterWindowState(window)
+        let close = Task { await window.tearDown() }
+        XCTAssertTrue(claim.cancellation.isWithdrawn)
+        XCTAssertEqual(host.scope.drafts.text(for: tabID), prompt)
+        XCTAssertFalse(host.scope.isRetiring)
+        XCTAssertFalse(host.route.isClosing)
+        await gate.open()
+        let result = await send.value
+        guard case .blocked = result else { return XCTFail("A withdrawn composer dispatched after its save: \(result)") }
+        await close.value
+        XCTAssertTrue(host.scope.sessions.values.allSatisfy { $0.activeRunAttemptID == nil && $0.acpController == nil })
     }
 
     private func assertSupersededVisibleAdoption(
