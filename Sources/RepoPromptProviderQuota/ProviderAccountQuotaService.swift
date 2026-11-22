@@ -11,6 +11,7 @@ package enum ProviderQuotaReadError: Error, Equatable {
     case transport
     case cliUnavailable
     case antigravityCLIUnavailable
+    case antigravityCLILaunchFailed(reason: String)
     case antigravityUsageNotReported
 
     package var message: String {
@@ -23,6 +24,7 @@ package enum ProviderQuotaReadError: Error, Equatable {
         case .accountInvalidated: "Usage is not available for the current account. Refresh to try again."
         case .transport: "Usage limits are not available right now."
         case .antigravityUsageNotReported: "agy did not report usage limits. Check its sign-in and /usage in Terminal, then refresh."
+        case let .antigravityCLILaunchFailed(reason): reason
         case .antigravityCLIUnavailable: "Install the Antigravity CLI (agy) and sign in there, then refresh. The managed ACP runtime does not report plan limits."
         case .cliUnavailable: "Claude Code is not ready to read usage. Check installation, sign-in, and helper-folder trust, then refresh."
         }
@@ -310,7 +312,7 @@ package actor ProviderAccountQuotaService: ProviderQuotaObserving {
         }
         switch error {
         case .signInRequired, .insufficientScope, .needsConsent, .accountInvalidated,
-             .antigravityCLIUnavailable, .antigravityUsageNotReported:
+             .antigravityCLIUnavailable, .antigravityCLILaunchFailed, .antigravityUsageNotReported:
             snapshot = nil
         default: break
         }
