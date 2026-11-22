@@ -7236,7 +7236,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         sessionID: UUID?,
         workspace: WorkspaceModel,
         workspaceLink: Bool = false,
-        visitIntent: UUID? = nil
+        visitIntent: UUID? = nil,
+        resumePreparedVisit: (@MainActor (UUID) async -> Void)? = nil
     ) async -> AgentRouteSessionActivationResult {
         let owners = preparedSessionRuntimes
         let qualifiesForVisit = !workspaceLink && workspaceManager?.isSessionRuntimeProjection != true
@@ -7264,11 +7265,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
            await !(owners.releasePreparedOversightOwnerForVisit(sessionID: preparedVisitID, preparingReplacement: false))
         {
             let expectedVisibleID = workspaceManager?.activeAgentSessionID(forTabID: tabID)
+            let expectedActivation = sessionIndexStore.latestSessionIndexOwner
             owners.queuePreparedRuntimeVisit(preparedVisitID, intent: intent) { [weak self] in
-                guard let self, !self.hasPreparedForWindowClose,
-                      workspaceManager?.activeWorkspaceID == workspace.id,
+                guard let self, !self.hasPreparedForWindowClose, let intent,
+                      sessionIndexStore.latestSessionIndexOwner == expectedActivation, workspaceManager?.activeWorkspaceID == workspace.id,
                       workspaceManager?.activeAgentSessionID(forTabID: tabID) == expectedVisibleID else { return }
-                _ = await activateRoutedAgentSession(tabID: tabID, sessionID: sessionID, workspace: workspace, visitIntent: intent)
+                if let resumePreparedVisit {
+                    await resumePreparedVisit(intent)
+                } else {
+                    _ = await activateRoutedAgentSession(tabID: tabID, sessionID: sessionID, workspace: workspace, visitIntent: intent)
+                }
             }
             return .blockedByActiveDifferentSession
         }

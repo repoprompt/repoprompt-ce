@@ -58,6 +58,27 @@ enum AppSavedAgentSessionExecution {
         ))
     }
 
+    static func hydrateOriginal(
+        _ writer: AgentSessionRuntimeStore.Writer, lookup: Lookup,
+        isStillAuthorized: @escaping @MainActor () -> Bool
+    ) async throws -> AgentSavedSessionTargetLoader.RuntimeLoad {
+        guard let host = writer.scope.executableHost, !host.route.isClosing,
+              writer.identity.workspaceID == lookup.target.workspace.id else { throw AgentSavedSessionTargetLoader.Failure.changed }
+        let workspace = lookup.target.workspace
+        let storage = AgentSessionStorageInputs(
+            workspaceID: workspace.id, workspaceWithID: { $0 == workspace.id ? workspace : nil },
+            displayName: { _ in lookup.target.entry.name }, isSuppressed: { AppLaunchConfiguration.current.suppressesAgentSessionPersistence },
+            attachmentWorkspaceDirectory: { FileManager.default.temporaryDirectory }
+        )
+        let availability = host.workspaceActivation?.modelAvailability ?? makeProviderSettings().agentModeAvailabilityContext
+        return try await AgentSavedSessionTargetLoader.loadRuntime(
+            sessionID: writer.identity.sessionID, scope: writer.scope, catalog: lookup.catalog, storage: storage,
+            selection: { AgentSessionHydrationRuntime.selection(for: $0, availability: availability, codexDynamicModels: nil) },
+            codexPolicy: { host.codexCoordinator.selectionPolicy(forModelRaw: $0.modelRaw, includeGlobalFallback: true) },
+            isStillAuthorized: { isStillAuthorized() && !host.route.isClosing }, originalColdWriter: writer
+        ).get()
+    }
+
     static func compose(
         target: Target, catalog: AgentSavedSessionTargetLoader.Catalog,
         domain: MCPDomainRuntime, installRoute: InstallRoute, providerEnvironment: ProviderEnvironment?,

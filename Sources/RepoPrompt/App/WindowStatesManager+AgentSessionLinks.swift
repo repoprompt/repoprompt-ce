@@ -91,6 +91,21 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         )
     }
 
+    /// Connect presentation to the original producer. This never starts or retries a drain.
+    func observeAgentHostDrainRecovery(_ drain: AgentSessionHostDrainRuntime) {
+        let warningID = Self.agentHostRecoveryWarningPrefix + drain.recoveryID.uuidString
+        drain.observeRecovery { [weak self, weak drain] outcome in
+            switch outcome {
+            case .released:
+                AgentSessionLinkRuntimeBridge.shared.dismissPersistenceWarnings(ids: [warningID])
+            case .retained:
+                if let drain { self?.reportRetainedAgentHostDrain(drain) }
+            case .cancelled, .timedOut:
+                break
+            }
+        }
+    }
+
     /// The warning names an exact drain, not a reusable session ID. Reading or visiting it
     /// never retries the save; only the explicit action below joins the retained producer.
     func retryRetainedAgentHostDrain(warningID: String) async {
@@ -99,16 +114,9 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
               let recoveryID = UUID(uuidString: String(warningID.dropFirst(prefix.count))),
               let drain = agentRuntimeStore.retainedDrains.first(where: { $0.recoveryID == recoveryID }),
               case .retained? = drain.outcome else { return }
+        observeAgentHostDrainRecovery(drain)
         drain.attemptRecovery()
-        switch await drain.wait(until: .now.advanced(by: .seconds(5))) {
-        case .released:
-            AgentSessionLinkRuntimeBridge.shared.dismissPersistenceWarnings(ids: [warningID])
-        case .retained:
-            reportRetainedAgentHostDrain(drain)
-        case .cancelled, .timedOut:
-            // The producer still owns the drain and may complete after this observer leaves.
-            break
-        }
+        _ = await drain.wait(until: .now.advanced(by: .seconds(5)))
     }
 
     func hasPreparedRuntime(_ sessionID: UUID) -> Bool {
@@ -151,7 +159,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
                 !$0.scope.liveSessionTabIDs(for: sessionID).isEmpty
             }
             if drains.count == 1, let drain = drains.first {
-                reportRetainedAgentHostDrain(drain)
+                observeAgentHostDrainRecovery(drain)
                 preparedOversightPendingVisits.removeValue(forKey: sessionID)
                 drain.deferVisit(presenterID: sessionID, isDestinationCurrent: { [weak self] in
                     guard let self else { return false }
@@ -334,7 +342,9 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
     func checkSavedOversightTarget(_ sessionID: UUID) async -> SavedOversightPreparationFailure? {
         guard !isTerminating, !AgentSessionDeletionRegistry.shared.blocksNewOversight(sessionID: sessionID) else { return .missing }
         switch agentRuntimeStore.resolveWriter(sessionID: sessionID) {
-        case let .unique(writer): return (try? writer.admitCommand().get()) == nil ? .changed : nil
+        case let .unique(writer):
+            if (try? writer.admitCommand().get()) != nil { return nil }
+            guard AgentSavedSessionTargetLoader.canHydrateOriginalColdWriter(writer) else { return .changed }
         case .conflicting: return .ambiguous
         case .unavailable(.absent): break
         case .unavailable: return .changed
@@ -361,19 +371,27 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
                 && !AgentSessionDeletionRegistry.shared.blocksNewOversight(sessionID: target)
         }
         guard authorized() else { return .failure(.changed) }
+        let originalColdWriter: AgentSessionRuntimeStore.Writer?
         switch agentRuntimeStore.resolveWriter(sessionID: target) {
         case let .unique(writer):
             guard let host = writer.scope.executableHost, !host.route.isClosing, writer.scope.linkExecution != nil,
-                  host.route.identity.kind != .independent || host.workspaceActivation?.isCurrent == true,
-                  (try? writer.admitCommand().get()) != nil else { return .failure(.changed) }
-            return .success(writer)
+                  host.route.identity.kind != .independent || host.workspaceActivation?.isCurrent == true else { return .failure(.changed) }
+            if (try? writer.admitCommand().get()) != nil { return .success(writer) }
+            guard AgentSavedSessionTargetLoader.canHydrateOriginalColdWriter(writer) else { return .failure(.changed) }
+            originalColdWriter = writer
         case .conflicting: return .failure(.ambiguous)
-        case .unavailable(.absent): break
+        case .unavailable(.absent): originalColdWriter = nil
         case .unavailable: return .failure(.changed)
         }
         let domain = AppDomainRuntimeComposition.shared.runtime
         do {
             let lookup = try await AppSavedAgentSessionExecution.resolve(target, domain: domain, isStillAuthorized: authorized)
+            if let originalColdWriter {
+                let loaded = try await AppSavedAgentSessionExecution.hydrateOriginal(originalColdWriter, lookup: lookup, isStillAuthorized: authorized)
+                guard authorized(), (try? loaded.writer.admitCommand().get()) != nil else { return .failure(.changed) }
+                notifyAgentSessionLinkTopologyChanged()
+                return .success(loaded.writer)
+            }
             let result = try await AppSavedAgentSessionExecution.compose(
                 target: lookup.target, catalog: lookup.catalog, domain: domain,
                 installRoute: { host in
@@ -421,13 +439,10 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         }
         preparedOversightConsentPairs.removeValue(forKey: sessionID)
         preparedOversightRunObservations.removeValue(forKey: sessionID)?.invalidate()
-        Task { @MainActor [weak self] in
+        observeAgentHostDrainRecovery(drain)
+        Task { @MainActor in
             await bridge.invalidateWindow(host.routeID, reason: .windowClosed)
             drain.startIfNeeded()
-            switch await drain.wait(until: .now.advanced(by: .seconds(30))) {
-            case .retained: self?.reportRetainedAgentHostDrain(drain)
-            case .released, .cancelled, .timedOut: break
-            }
         }
         return drain
     }

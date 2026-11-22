@@ -250,7 +250,8 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                 let promptCount = PromptViewModel.constructionCountForTesting
                 let workspaceCount = WorkspaceManagerViewModel.constructionCountForTesting
                 windows.beginPreparedOversightPreparation(fixture.sessionID)
-                defer { windows.endPreparedOversightPreparation(fixture.sessionID) }
+                var holdingPreparation = true
+                defer { if holdingPreparation { windows.endPreparedOversightPreparation(fixture.sessionID) } }
                 let loaded = await windows.prepareSavedOversightTarget(fixture.sessionID, providerEnvironment: providerEnvironment, isStillAuthorized: { true })
                 let writer = try loaded.get()
                 let host = try XCTUnwrap(writer.scope.executableHost)
@@ -271,6 +272,7 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                     let command = try writer.admitCommand().get()
                     _ = await host.startCanonicalRequest(command: command, message: message, options: .init(skipsSlashExpansion: true), outcome: start)
                     XCTAssertTrue(start.outcome.didStart)
+                    XCTAssertFalse(writer.scope.isRetiring)
                     let receipt = try await originatingPolicyReceipt(for: writer.session)
                     let connectionID = UUID()
                     let installation = await host.route.installPendingPolicy(receipt, connectionID: connectionID, clientName: nil, tabID: stash.tab.id)
@@ -345,11 +347,12 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                     _ = await drain.wait(until: .now.advanced(by: .seconds(5)))
                     throw error
                 }
-                let drain = host.beginRetirement()
-                drain.startIfNeeded()
-                let outcome = await drain.wait(until: .now.advanced(by: .seconds(5)))
-                XCTAssertEqual(outcome, .released)
-                XCTAssertTrue(host.route.isClosing)
+                holdingPreparation = false
+                windows.endPreparedOversightPreparation(fixture.sessionID)
+                try await AsyncTestWait.waitUntil("ordinary saved-host completion retires its owner") {
+                    writer.scope.hasReleasedWriterClaims && host.route.isClosing
+                }
+                XCTAssertNil(writer.scope.retainedDrain)
             }
         } catch {
             _ = await runtime.shutdown()
@@ -367,6 +370,42 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
             return result != nil
         }
         return try XCTUnwrap(result)
+    }
+
+    func testExactColdWriterHydratesInPlaceAndCannotRebindDuringPayloadRead() async throws {
+        for replace in [false, true] {
+            let f = Fixture()
+            defer { f.cleanUp() }
+            try await f.save()
+            let original = f.scope.makeSession(tabID: f.tab.id)
+            let binding = AgentPersistentSessionBindingIdentity(tabID: f.tab.id, sessionID: f.sessionID, workspaceID: f.placement.workspace.id)
+            original.installPersistentSessionBinding(binding)
+            f.scope.replaceSessions([f.tab.id: original])
+            guard case let .unique(writer) = f.scope.resolveWriter(sessionID: f.sessionID) else {
+                return XCTFail("Must start with one exact cold writer")
+            }
+            XCTAssertTrue(AgentSavedSessionTargetLoader.canHydrateOriginalColdWriter(writer))
+            let successor = f.scope.makeSession(tabID: f.tab.id)
+            if replace {
+                f.beforePayload = { _ in
+                    successor.installPersistentSessionBinding(binding)
+                    f.scope.replaceSessions([f.tab.id: successor])
+                }
+            }
+            let result = await f.load(originalColdWriter: writer)
+            if replace {
+                await assertFailure(result, reason: .lookup(.changed), effects: .loadingClaimDisplaced)
+                XCTAssertTrue(f.scope.sessions[f.tab.id] === successor)
+                XCTAssertFalse(successor.hasLoadedPersistedState)
+                XCTAssertTrue(successor.items.isEmpty)
+            } else {
+                let restored = try result.get()
+                XCTAssertEqual(restored.source, .existingWriter)
+                XCTAssertEqual(restored.writer.identity, writer.identity)
+                XCTAssertTrue(restored.writer.session === original)
+                XCTAssertEqual(original.items.map(\.text), ["Saved request", "Saved response"])
+            }
+        }
     }
 
     func testSavedHistoricalPayloadLoadsIntoCanonicalWriterWithoutWindowComposition() async throws {
@@ -661,7 +700,9 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
             ), for: placement.workspace)
         }
 
-        func load(into destination: AgentSessionRuntimeStore.Scope? = nil) async -> Result<AgentSavedSessionTargetLoader.RuntimeLoad, AgentSavedSessionTargetLoader.RuntimeLoadFailure> {
+        func load(
+            into destination: AgentSessionRuntimeStore.Scope? = nil, originalColdWriter: AgentSessionRuntimeStore.Writer? = nil
+        ) async -> Result<AgentSavedSessionTargetLoader.RuntimeLoad, AgentSavedSessionTargetLoader.RuntimeLoadFailure> {
             await AgentSavedSessionTargetLoader.loadRuntime(
                 sessionID: sessionID, scope: destination ?? scope,
                 catalog: .init(
@@ -672,7 +713,7 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                 ), storage: storage,
                 selection: { .init(agent: $0.normalizedSelection.agent, modelRaw: $0.normalizedSelection.modelRaw, explicitReasoningEffortRaw: nil) },
                 codexPolicy: { _ in .init(options: [], defaultEffort: nil, lastUsed: nil) },
-                isStillAuthorized: { [self] in authorized },
+                isStillAuthorized: { [self] in authorized }, originalColdWriter: originalColdWriter,
                 readRecord: { [service] in try await service.metadataRecordForSessionID($0, for: $1) },
                 readPayload: { [self] request in
                     payloadReads += 1

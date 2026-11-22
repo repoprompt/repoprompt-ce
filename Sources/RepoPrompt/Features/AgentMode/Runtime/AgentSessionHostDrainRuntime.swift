@@ -134,6 +134,7 @@ final class AgentSessionHostDrainRuntime {
 
     let scope: AgentSessionRuntimeStore.Scope
     let recoveryID = UUID()
+    private var recoveryObserver: (@MainActor (Outcome) -> Void)?
     private var participants: [Participant]
     /// Exact acknowledgements returned by Scope.releaseWriterClaim, not elected writers.
     private var releasedParticipants: Set<ObjectIdentifier> = []
@@ -240,6 +241,13 @@ final class AgentSessionHostDrainRuntime {
         deferredVisits.removeValue(forKey: presenterID)
     }
 
+    /// Track the producer, not any bounded waiting UI task. A later failure or success still
+    /// updates the warning even when the original visit or recovery observer stopped waiting.
+    func observeRecovery(_ observer: @escaping @MainActor (Outcome) -> Void) {
+        if outcome != .released { recoveryObserver = observer }
+        if let outcome { observer(outcome) }
+    }
+
     /// Automatic lifecycle entry starts an unstarted drain; it never retries a failure.
     func startIfNeeded() {
         guard task == nil, outcome == nil else { return }
@@ -288,6 +296,9 @@ final class AgentSessionHostDrainRuntime {
                 }
                 dispatchingDeferredVisits = false
             }
+            let notify = recoveryObserver
+            if result == .released { recoveryObserver = nil }
+            notify?(result)
         }
     }
 

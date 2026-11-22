@@ -2329,8 +2329,16 @@ class WindowState: ObservableObject {
             }
         }
 
-        let result = await navigateAgentDeepLinkTab(route.tabID, sessionID: route.sessionID, workspaceID: route.workspaceID)
-        guard result == .routed else { return result }
+        let result = await navigateAgentDeepLinkTab(route.tabID, sessionID: route.sessionID, workspaceID: route.workspaceID) { [weak self] in
+            self?.finishAgentRoutePresentation(route)
+        }
+        if result == .routed { finishAgentRoutePresentation(route) }
+        return result
+    }
+
+    private func finishAgentRoutePresentation(_ route: AgentSessionDeepLinkRoute) {
+        guard !isClosing, workspaceManager.activeWorkspaceID == route.workspaceID,
+              promptManager.activeComposeTabID == route.tabID else { return }
         if let window = nsWindow {
             window.makeKeyAndOrderFront(nil)
         } else {
@@ -2339,11 +2347,14 @@ class WindowState: ObservableObject {
         if route.interactionID != nil {
             agentModeViewModel.notificationAttention.revealRequests.send(route.tabID)
         }
-        return .routed
     }
 
-    func navigateAgentDeepLinkTab(_ tabID: UUID, sessionID: UUID?, workspaceID: UUID, workspaceLink: Bool = false) async -> AgentSessionRouteResult {
-        guard let activeWorkspace = workspaceManager.activeWorkspace,
+    func navigateAgentDeepLinkTab(
+        _ tabID: UUID, sessionID: UUID?, workspaceID: UUID, workspaceLink: Bool = false,
+        existingVisitIntent: UUID? = nil, onDeferredSuccess: (@MainActor () -> Void)? = nil
+    ) async -> AgentSessionRouteResult {
+        guard !isClosing, !Task.isCancelled, !workspaceManager.isSwitchingWorkspace,
+              let activeWorkspace = workspaceManager.activeWorkspace,
               activeWorkspace.id == workspaceID
         else {
             return .workspaceUnavailable
@@ -2356,20 +2367,30 @@ class WindowState: ObservableObject {
         }
 
         let visitRegistry = workspaceLink || workspaceManager.isSessionRuntimeProjection ? nil : agentModeViewModel.preparedSessionRuntimes
-        let visitIntent = sessionID.flatMap { visitRegistry?.beginRuntimeVisitIntent($0) }
+        let visitSessionID = sessionID ?? workspaceManager.activeAgentSessionID(forTabID: tabID, inWorkspaceID: workspaceID)
+        let visitIntent = existingVisitIntent ?? visitSessionID.flatMap { visitRegistry?.beginRuntimeVisitIntent($0) }
         func visitIsCurrent() -> Bool {
-            guard let sessionID, let visitRegistry else { return true }
-            return visitRegistry.isRuntimeVisitIntentCurrent(sessionID, intent: visitIntent)
+            guard let visitSessionID, let visitRegistry else { return true }
+            return visitRegistry.isRuntimeVisitIntentCurrent(visitSessionID, intent: visitIntent)
+        }
+        let resume: @MainActor (UUID) async -> Void = { [weak self] intent in
+            guard let self else { return }
+            let result = await navigateAgentDeepLinkTab(
+                tabID, sessionID: sessionID, workspaceID: workspaceID, existingVisitIntent: intent, onDeferredSuccess: onDeferredSuccess
+            )
+            if result == .routed { onDeferredSuccess?() }
         }
 
         guard visitIsCurrent() else { return .blockedByActiveDifferentSession }
-        if let sessionID {
+        let preparedTarget = visitSessionID.flatMap { visitRegistry?.hasPreparedRuntime($0) == true ? $0 : nil }
+        if let target = sessionID ?? preparedTarget {
             let activationResult = await agentModeViewModel.activateRoutedAgentSession(
                 tabID: tabID,
-                sessionID: sessionID,
+                sessionID: target,
                 workspace: activeWorkspace,
                 workspaceLink: workspaceLink,
-                visitIntent: visitIntent
+                visitIntent: visitIntent,
+                resumePreparedVisit: resume
             )
             guard activationResult == .ready else {
                 return agentSessionRouteResult(for: activationResult)
@@ -2402,7 +2423,8 @@ class WindowState: ObservableObject {
             tabID: tabID,
             sessionID: sessionID,
             workspace: finalWorkspace,
-            visitIntent: visitIntent
+            visitIntent: visitIntent,
+            resumePreparedVisit: resume
         )
         guard finalActivationResult == .ready else {
             return agentSessionRouteResult(for: finalActivationResult)
