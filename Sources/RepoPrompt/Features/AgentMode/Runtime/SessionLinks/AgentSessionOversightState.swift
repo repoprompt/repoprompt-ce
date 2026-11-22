@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 
 struct ClaudeContextAutoWakeHold: Equatable {
