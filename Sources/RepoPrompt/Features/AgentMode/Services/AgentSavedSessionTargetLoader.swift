@@ -7,7 +7,7 @@ import RepoPromptWorkspaceContext
 @MainActor
 enum AgentSavedSessionTargetLoader {
     enum Failure: Error, Equatable {
-        case missing, ambiguous, changed, unreadable
+        case missing, ambiguous, changed, unreadable, providerSettingsUnavailable
         case rootsUnavailable(WorkspaceRootReadinessFailure.Availability)
 
         var rawValue: String {
@@ -16,6 +16,7 @@ enum AgentSavedSessionTargetLoader {
             case .ambiguous: "target_ambiguous"
             case .changed: "target_binding_changed"
             case .unreadable: "target_saved_state_unreadable"
+            case .providerSettingsUnavailable: "provider_settings_unavailable"
             case .rootsUnavailable: "workspace_not_ready"
             }
         }

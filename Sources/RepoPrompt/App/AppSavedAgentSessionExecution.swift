@@ -14,6 +14,7 @@ enum AppSavedAgentSessionExecution {
     struct ProviderEnvironment {
         let resources: AgentRunProviderComposition
         let settings: APISettingsViewModel
+        var claudeControllerFactory: ClaudeAgentModeCoordinator.ClaudeControllerFactory?
     }
 
     struct Lookup {
@@ -70,7 +71,15 @@ enum AppSavedAgentSessionExecution {
             displayName: { _ in lookup.target.entry.name }, isSuppressed: { AppLaunchConfiguration.current.suppressesAgentSessionPersistence },
             attachmentWorkspaceDirectory: { FileManager.default.temporaryDirectory }
         )
-        let availability = host.workspaceActivation?.modelAvailability ?? makeProviderSettings().agentModeAvailabilityContext
+        let availability = if let available = host.workspaceActivation?.modelAvailability {
+            available
+        } else {
+            try await makeProviderSettings().agentModeAvailabilityContext
+        }
+        try Task.checkCancellation()
+        guard isStillAuthorized(), writer.isCurrent, !host.route.isClosing else {
+            throw AgentSavedSessionTargetLoader.Failure.changed
+        }
         return try await AgentSavedSessionTargetLoader.loadRuntime(
             sessionID: writer.identity.sessionID, scope: writer.scope, catalog: lookup.catalog, storage: storage,
             selection: { AgentSessionHydrationRuntime.selection(for: $0, availability: availability, codexDynamicModels: nil) },
@@ -96,6 +105,9 @@ enum AppSavedAgentSessionExecution {
             guard isStillAuthorized() else { throw AgentSavedSessionTargetLoader.Failure.changed }
             if let failure { throw AgentSavedSessionTargetLoader.Failure.rootsUnavailable(failure) }
         }
+        let providerSettings = if let providerEnvironment { providerEnvironment.settings } else { try await makeProviderSettings() }
+        try Task.checkCancellation()
+        guard isStillAuthorized() else { throw AgentSavedSessionTargetLoader.Failure.changed }
         let owner = MCPHostRouteResources.LeaseOwner(
             identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: domain.routingCoordinator, runtime: domain
         )
@@ -110,7 +122,7 @@ enum AppSavedAgentSessionExecution {
             workspacePath: paths.sessionWorkspacePath, runtimeWorkspacePaths: paths.codexRuntimeWorkspacePaths,
             connectionPolicyInstaller: AgentSessionRuntimeHost.defaultConnectionPolicyInstaller,
             modelRouterSettingsStore: settings, catalogDiagnosticsSink: diagnostics, perfRecorder: perf,
-            providerResources: providerEnvironment?.resources
+            providerResources: providerEnvironment?.resources, claudeControllerFactory: providerEnvironment?.claudeControllerFactory
         )
         // A saved carrier does not attach a presenter to this physical route. Disposal is
         // requested exactly once, and waits for the transferred execution lease's release.
@@ -132,7 +144,6 @@ enum AppSavedAgentSessionExecution {
         let resources = AgentHostWorkspaceResources(files: files, contexts: domain.contextStore)
         let index = AgentWorkspaceSessionIndexStore()
         index.receiveWorkspaceSwitchNotification(workspace)
-        let providerSettings = providerEnvironment?.settings ?? makeProviderSettings()
         let loaded: AgentSavedSessionTargetLoader.RuntimeLoad
         do {
             guard let settingsLease = APISettingsRuntimeLease.acquire(from: providerSettings) else {
@@ -194,9 +205,15 @@ enum AppSavedAgentSessionExecution {
         return loaded
     }
 
-    private static func makeProviderSettings() -> APISettingsViewModel {
+    private static func makeProviderSettings() async throws -> APISettingsViewModel {
         let keys = KeyManager()
-        return APISettingsViewModel(aiQueriesService: AIQueriesService(keyManager: keys), keyManager: keys)
+        let settings = APISettingsViewModel(aiQueriesService: AIQueriesService(keyManager: keys), keyManager: keys)
+        // An approved delivery can dispatch as soon as the writer is published. Ready the app
+        // settings before then; a stuck load must not hold the requester, route or writer.
+        let ready = await settings.awaitInitialAgentProviderSettings(until: .now.advanced(by: .seconds(8)))
+        try Task.checkCancellation()
+        guard ready else { throw AgentSavedSessionTargetLoader.Failure.providerSettingsUnavailable }
+        return settings
     }
 }
 

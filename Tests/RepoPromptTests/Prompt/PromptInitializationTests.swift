@@ -170,6 +170,32 @@ final class ReviewPromptUpgradeTests: XCTestCase {
 #if DEBUG
     @MainActor
     final class PromptInitialModelRefreshLifecycleTests: XCTestCase {
+        func testIndependentAgentProviderAdmissionTimesOutBeforeCredentialReads() async {
+            let backend = TestSecureStorageBackend()
+            let keys = KeyManager(secureService: SecureKeysService(secureStorage: backend))
+            let entered = XCTestExpectation(description: "provider bootstrap reached the persisted settings boundary")
+            let gate = Gate()
+            let api = APISettingsViewModel(
+                aiQueriesService: AIQueriesService(keyManager: keys), keyManager: keys,
+                storedDataLoadBoundary: {
+                    entered.fulfill()
+                    await gate.wait()
+                }
+            )
+            defer { gate.release()
+                api.prepareForWindowClose()
+            }
+            await fulfillment(of: [entered], timeout: 5)
+            let ready = await api.awaitInitialAgentProviderSettings(until: .now.advanced(by: .milliseconds(50)))
+            XCTAssertFalse(ready)
+            XCTAssertFalse(api.test_hasFinishedInitialStoredDataLoad)
+            let task = api.test_initialLoadTask
+            XCTAssertTrue(task?.isCancelled == true)
+            gate.release()
+            await task?.value
+            XCTAssertTrue(backend.calls.isEmpty, "Timed-out admission cancels the original load before credential reads")
+        }
+
         func testDefaultRefreshIsOwnedAndCloseJoinWaitsForItsLoadBoundary() async {
             let backend = TestSecureStorageBackend()
             let keys = KeyManager(secureService: SecureKeysService(secureStorage: backend))

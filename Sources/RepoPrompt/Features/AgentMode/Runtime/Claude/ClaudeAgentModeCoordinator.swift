@@ -2557,6 +2557,24 @@ final class ClaudeAgentModeCoordinator {
         return sessionRef
     }
 
+    /// Final host drain has already captured this idle controller and its exact settlement
+    /// receipt. Withdraw its listener before shutdown so expected EOF cannot masquerade as
+    /// a provider failure, clear the original run identity, or enqueue a successor save.
+    func finishControllerForHostDrain(_ controller: any NativeAgentRuntimeControlling, session: AgentTabSession) async {
+        let handler: ClaudeAgentToolTrackingHandler?
+        if sessionOwnsClaudeController(controller, for: session) {
+            if let listener = controllerListeners.removeValue(forKey: session.tabID) {
+                listener.isCurrent = { false }
+                listener.retire()
+            }
+            handler = toolHandlerByTabID.removeValue(forKey: session.tabID)
+        } else {
+            handler = nil
+        }
+        await controller.shutdown()
+        await handler?.stopTracking(for: session)
+    }
+
     func shutdownClaudeSessionIfNeeded(_ session: AgentTabSession) async {
         guard session.claudeController != nil
             || hasPendingResumeTransfer(for: session)

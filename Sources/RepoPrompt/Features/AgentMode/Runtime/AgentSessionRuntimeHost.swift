@@ -160,7 +160,8 @@ final class AgentSessionRuntimeHost {
         connectionPolicyInstaller: @escaping AgentRunExecutionContracts.ConnectionPolicyInstaller,
         modelRouterSettingsStore: GlobalSettingsStore,
         catalogDiagnosticsSink: any AgentSessionLinkCatalogEventSink,
-        perfRecorder: any AgentModePerfRecording, providerResources: AgentRunProviderComposition? = nil
+        perfRecorder: any AgentModePerfRecording, providerResources: AgentRunProviderComposition? = nil,
+        claudeControllerFactory: ClaudeAgentModeCoordinator.ClaudeControllerFactory? = nil
     ) {
         precondition(route.isLeaseManaged == (executionRouteLease != nil), "A leased route requires an execution lease")
         let releaseExecutionRoute = executionRouteLease?.transferToExecutionHost(on: route)
@@ -223,6 +224,7 @@ final class AgentSessionRuntimeHost {
         claudeCoordinator = ClaudeAgentModeCoordinator(
             windowID: routeID,
             workspacePathProvider: workspacePath,
+            claudeControllerFactory: claudeControllerFactory,
             awaitNoActiveMCPTools: { runID in try await tools.awaitNoActiveToolExecutions(runID: runID) },
             toolEndedCount: { runID in tools.toolEndedCount(runID: runID) },
             hasActiveMCPTools: { runID in tools.hasActiveToolExecutions(runID: runID) },
