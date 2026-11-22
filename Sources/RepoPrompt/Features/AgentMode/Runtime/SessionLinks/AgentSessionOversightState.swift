@@ -9,6 +9,7 @@ struct ClaudeContextAutoWakeHold: Equatable {
     let provider: AgentProviderKind
     let failure: ClaudeTurnSizeFailure
     let conversationID: String?
+    var recoveryOriginAttemptID: UUID?
 
     func blocks(provider: AgentProviderKind, conversationID: String?) -> Bool {
         guard self.provider == provider else { return false }

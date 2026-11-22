@@ -1162,10 +1162,17 @@ final class AgentTabSession: ObservableObject {
     /// Provider session ID for resumption (e.g., Claude CLI session_id)
     var providerSessionID: String?
 
+    /// A successful compact must not start a compact/wake loop if the conversation refills.
+    var claudeOverflowRecoveryAttemptedConversation: String?
+
     var activeClaudeContextAutoWakeHold: ClaudeContextAutoWakeHold? {
         guard let hold = oversight.claudeContextAutoWakeHold,
               hold.blocks(provider: selectedAgent, conversationID: providerSessionID) else { return nil }
         return hold
+    }
+
+    var claudeContextBlocksAutoWake: Bool {
+        activeClaudeContextAutoWakeHold != nil || pendingHandoff.awaitsLocalClaudeOverflowInput
     }
 
     /// Recovery may release only the hold it actually repaired.

@@ -193,6 +193,10 @@ final class ClaudeIntegratedAgentModeRunner {
             }
         }
         guard stopFence?.permitsStart(of: session) ?? true else { return }
+        guard !session.pendingHandoff.awaitsLocalClaudeOverflowInput || localComposerCandidate != nil else {
+            startOutcome?.recordStartFailure(message: "The fresh Claude conversation is waiting for local composer input.")
+            return
+        }
         let runID = session.claudeController.flatMap { _ in
             AgentModeProcessRunIdentity.existingProcessRunID(for: session)
         } ?? AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
@@ -701,6 +705,17 @@ final class ClaudeIntegratedAgentModeRunner {
                     session.claudeProviderOutputBoundary = (runAttemptID, session.nextSequenceIndex)
                 }
             case let .stream(result):
+                if let evidence = result.claudeCompactEvidence {
+                    if session.claudeExpectedTurnIDs == [evidence.turnID],
+                       session.selfCompactState.active?.compactRunAttemptID == runAttemptID,
+                       session.selfCompactState.active?.compactRunID == runID,
+                       session.selfCompactState.active?.claudeOverflowHoldID != nil,
+                       session.selfCompactState.active?.compactProviderConversation == evidence.conversationID
+                    {
+                        session.selfCompactState.active?.claudePostCompactTokens = evidence.postTokens
+                    }
+                    continue eventLoop
+                }
                 #if DEBUG
                     if ClaudeReasoningExtractionFeature.isEnabled, result.type == "reasoning" {
                         let text = result.reasoning ?? result.text ?? ""
@@ -956,7 +971,19 @@ final class ClaudeIntegratedAgentModeRunner {
     ) async -> AgentRunTerminalCommitRevision? {
         let hold = sizeFailure.flatMap { failure -> ClaudeContextAutoWakeHold? in
             guard failure.kind != .outputLimit else { return nil }
-            return .init(provider: session.selectedAgent, failure: failure, conversationID: failure.conversationID ?? session.providerSessionID)
+            if let existing = session.activeClaudeContextAutoWakeHold {
+                return existing
+            }
+            let load = AgentModeViewModel.observationContextLoad(for: session)
+            let origin = failure.kind == .inputContextRejected
+                && failure.conversationID != nil && failure.conversationID == session.providerSessionID
+                && ClaudeOverflowRecoveryPolicy.historyIsNearLimit(used: load?.usedTokens, window: load?.windowTokens)
+                ? ownership.attemptID : nil
+            return .init(
+                provider: session.selectedAgent, failure: failure,
+                conversationID: failure.conversationID ?? session.providerSessionID,
+                recoveryOriginAttemptID: origin
+            )
         }
         return await terminalCommitBarrier.commit(.init(
             binding: claudeCoordinator.bindingQuietDeclarationObservations(

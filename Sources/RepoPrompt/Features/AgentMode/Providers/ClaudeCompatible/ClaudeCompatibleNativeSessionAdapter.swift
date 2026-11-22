@@ -121,6 +121,11 @@ actor ClaudeCompatibleNativeSessionAdapter: NativeAgentRuntimeControlling, MCPRu
         try await controller.sendUserMessage(text)
     }
 
+    func compactContext(expectedConversationID: String) async throws -> UUID {
+        guard shutdownTask == nil else { throw CancellationError() }
+        return try await controller.compactContext(expectedConversationID: expectedConversationID)
+    }
+
     func interruptTurn(reason: String) async -> NativeAgentRuntimeInterruptOutcome {
         await controller.interruptTurn(reason: reason)
     }

@@ -26,7 +26,7 @@ extension AgentSessionLinkExecutionRuntime {
 
         // A held conversation cannot reserve even a parked attempt. Retraction uses the
         // existing tombstone rules; the canonical queue remains owned by the reducer.
-        if session.activeClaudeContextAutoWakeHold != nil {
+        if session.claudeContextBlocksAutoWake {
             cancelAgentSessionLinkAutoWake(for: endpoint, reason: .eligibilityLost)
             return
         }
@@ -1256,7 +1256,7 @@ extension AgentSessionLinkExecutionRuntime {
         session: TabSession,
         endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> AgentMonitorWakeNowRefusal? {
-        if session.activeClaudeContextAutoWakeHold != nil { return .claudeSizeFailure }
+        if session.claudeContextBlocksAutoWake { return .claudeSizeFailure }
         guard let snapshot = agentSessionLinkCurrentPassiveSnapshot(for: endpoint),
               snapshot.isDeliverable,
               snapshot.hasDeliverableContent
@@ -1753,7 +1753,7 @@ extension AgentSessionLinkExecutionRuntime {
 
     /// First refusing predicate, shared by routing and its bounded release-safe diagnostic.
     private func agentSessionLinkAutoWakeRouteRefusal(_ session: TabSession) -> AutoWakeRouteRefusal? {
-        guard session.activeClaudeContextAutoWakeHold == nil else { return .claudeSizeFailure }
+        guard !session.claudeContextBlocksAutoWake else { return .claudeSizeFailure }
         guard !session.bindingTransitionInProgress else { return .bindingTransitionInProgress }
         guard session.permitsBoundOperationAndSave else { return .hasLoadedPersistedState }
         guard !session.terminalCommitInProgress else { return .terminalCommitInProgress }
@@ -2153,7 +2153,7 @@ extension AgentSessionLinkExecutionRuntime {
         _ attempt: AgentSessionLinkAutoWakeAttempt,
         session: TabSession
     ) -> Bool {
-        guard session.activeClaudeContextAutoWakeHold == nil else { return false }
+        guard !session.claudeContextBlocksAutoWake else { return false }
         if attempt.isPeriodic {
             return agentSessionLinkPeriodicWakeIsEligible(session, endpoint: attempt.observerEndpoint, requiresReadyCatalog: false)
         }

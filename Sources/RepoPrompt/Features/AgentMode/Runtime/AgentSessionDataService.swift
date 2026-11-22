@@ -185,6 +185,7 @@ actor AgentSessionDataService {
         let worktreeMergeOperations: [AgentSessionWorktreeMergeOperation]?
         let pendingHandoffProviderSwitchDelivery: AgentProviderSwitchDelivery?
         let pendingHandoffPayload: String?
+        let pendingHandoffAwaitsLocalClaudeOverflowInput: Bool?
         let pendingHandoffCreatedAt: Date?
         let pendingHandoffSourceItemID: UUID?
         let pendingHandoffDefersProviderLockUntilSend: Bool?
@@ -1519,6 +1520,7 @@ actor AgentSessionDataService {
                 delegationScopeID: header.delegationScopeID,
                 pendingHandoffProviderSwitchDelivery: header.pendingHandoffProviderSwitchDelivery,
                 pendingHandoffPayload: header.pendingHandoffPayload,
+                pendingHandoffAwaitsLocalClaudeOverflowInput: header.pendingHandoffAwaitsLocalClaudeOverflowInput,
                 pendingHandoffCreatedAt: header.pendingHandoffCreatedAt,
                 pendingHandoffSourceItemID: header.pendingHandoffSourceItemID,
                 pendingHandoffDefersProviderLockUntilSend: header.pendingHandoffDefersProviderLockUntilSend ?? false,

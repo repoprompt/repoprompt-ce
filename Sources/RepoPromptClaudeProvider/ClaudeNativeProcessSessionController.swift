@@ -133,6 +133,7 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
     /// controller's lifetime.  When true, turn completion defers until `idle` (or a fallback
     /// timeout) rather than completing immediately on `result/message_stop`.
     private var observedSessionStateChangedEvents = false
+    private var compactReceipt: ClaudeNativeCompactReceipt?
 
     private struct DeferredCompletion {
         let executionID: UUID
@@ -564,6 +565,13 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
         try writeUserMessage(text)
     }
 
+    package func compactContext(expectedConversationID: String) async throws -> UUID {
+        guard !Task.isCancelled, !isShuttingDown, isInitialized, sessionID == expectedConversationID,
+              !correlation.hasOutstanding, correlation.providerTurnID == nil, deferredCompletions.isEmpty
+        else { throw ControllerError.configurationNotCurrent }
+        return try writeUserMessage("/compact")
+    }
+
     private func writeUserMessage(_ text: String) throws -> UUID {
         guard hasActiveSession else {
             throw ControllerError.processNotRunning
@@ -571,8 +579,14 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
         guard !correlationFailed else { throw ControllerError.processNotRunning }
         let id = UUID()
         let payload = try ClaudeSDKProtocolCodec.encodeUserMessage(text: text, sessionID: sessionID, uuid: id)
+        compactReceipt = nil
+        let compactConversation = text == "/compact" && !correlation.hasOutstanding
+            && correlation.providerTurnID == nil && deferredCompletions.isEmpty ? sessionID : nil
         try sendLine(payload)
         correlation.register(id)
+        if let compactConversation {
+            compactReceipt = .init(conversationID: compactConversation, turnID: id)
+        }
         return id
     }
 
@@ -1610,7 +1624,13 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
                         // safely answer host input or attach a poisoned-conversation hold.
                         throw ClaudeNativeTurnCorrelation.CorrelationError.missingAnswerIdentity
                     }
-                    let resolved = try correlation.resolve(payload)
+                    var answeringPayload = payload
+                    if correlation.providerTurnID == nil, try ClaudeNativeTurnCorrelation.inputIDs(payload) == nil,
+                       let compactAnswer = compactReceipt?.unkeyedCommandAnswer(payload, currentConversation: sessionID)
+                    {
+                        answeringPayload["user_message_uuid"] = compactAnswer.uuidString
+                    }
+                    let resolved = try correlation.resolve(answeringPayload)
                     ownsOutput = !resolved.inputIDs.isEmpty || resolved.providerTurnID != nil
                     let stopReason = streamResults.last(where: { $0.type == "message_stop" })?.stopReason
                     let status: TurnStatus = resolved.interrupted ? .cancelled : determineTurnStatus(from: payload, stopReasonHint: stopReason)
@@ -1651,6 +1671,23 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
            !translatorSessionID.isEmpty
         {
             recordObservedSessionID(translatorSessionID)
+        }
+
+        if !correlationFailed, !Self.isSubagentActivity(payload) {
+            if isResultPayload {
+                let answered = correlation.enabled ? completion?.inputIDs : nil
+                if let evidence = compactReceipt?.finish(
+                    payload, answeredIDs: answered, isKeyed: correlation.enabled,
+                    currentConversation: sessionID
+                ) {
+                    emit(.stream(AIStreamResult(type: AIStreamResult.transportActivityType, text: nil, claudeCompactEvidence: evidence)))
+                }
+                compactReceipt = nil
+            } else if correlation.providerTurnID == nil {
+                compactReceipt?.observeBoundary(payload)
+            } else {
+                compactReceipt = nil
+            }
         }
 
         // Only complete a turn when the original payload is a "result" type — the

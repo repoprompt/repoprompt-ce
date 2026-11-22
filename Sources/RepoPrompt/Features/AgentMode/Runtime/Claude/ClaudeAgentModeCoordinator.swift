@@ -749,7 +749,8 @@ final class ClaudeAgentModeCoordinator {
         session: AgentTabSession,
         intent: NativeSessionIntent,
         providerLaunchInput: AgentProviderLaunchInput? = nil,
-        routingLease: MCPBootstrapLease? = nil
+        routingLease: MCPBootstrapLease? = nil,
+        controlCommand: AgentProviderControlCommand? = nil
     ) async -> EnsureSessionOutcome {
         if let message = session.operationAdmissionFailureMessage {
             return intent.allowsFreshStartRecovery ? .superseded : .failed(message: message)
@@ -768,6 +769,7 @@ final class ClaudeAgentModeCoordinator {
         }
         guard intentIsCurrent(intent, for: session, providerLaunchInput: providerLaunchInput) else { return .superseded }
 
+        if let controlCommand, session.providerSessionID != controlCommand.expectedProviderConversation { return .superseded }
         let runID = intent.runID
         let launchModelRaw = session.selectedModelRaw
         let runtimeVariant = session.selectedAgent.claudeRuntimeVariant ?? .standard
@@ -883,9 +885,16 @@ final class ClaudeAgentModeCoordinator {
                 effectiveAllowNativeBashTool: effectiveAllowNativeBashTool,
                 effectiveMCPStrictMode: effectiveMCPStrictMode,
                 providerLaunchInput: providerLaunchInput,
-                routingLease: routingLease
+                routingLease: routingLease,
+                controlCommand: controlCommand
             )
             guard intentIsCurrent(intent, for: session, providerLaunchInput: providerLaunchInput) else { return .superseded }
+            if let controlCommand, controlCommand.expectedProviderConversation != sessionRef.sessionID {
+                if let detached = detachClaudeController(controller, from: session, removeToolTracking: true) {
+                    await cancelClaudeRun(session, oldController: detached)
+                }
+                return .superseded
+            }
             updateProviderSessionIDIfNeeded(sessionRef.sessionID, for: session)
             return .ready
         } catch ControllerLifecycleError.superseded {
@@ -1124,10 +1133,14 @@ final class ClaudeAgentModeCoordinator {
         effectiveAllowNativeBashTool: Bool?,
         effectiveMCPStrictMode: Bool?,
         providerLaunchInput: AgentProviderLaunchInput?,
-        routingLease: MCPBootstrapLease?
+        routingLease: MCPBootstrapLease?,
+        controlCommand: AgentProviderControlCommand?
     ) async throws -> NativeAgentRuntimeSessionRef {
         let isPeriodic = session.oversight.pendingAutoWake?.isPeriodic == true
         let existingSessionID = session.providerSessionID
+        if let controlCommand, existingSessionID == nil || existingSessionID != controlCommand.expectedProviderConversation {
+            throw ControllerLifecycleError.superseded
+        }
         let systemPromptOverride = agentModeSystemPromptOverride(for: session)
         let effortLevel = currentClaudeEffortLevel(for: session)
         guard await retainRoutingCleanup(from: routingLease, on: controller, for: session),
@@ -1162,7 +1175,7 @@ final class ClaudeAgentModeCoordinator {
                 throw ControllerLifecycleError.superseded
             }
             // A periodic turn cannot recover into a fresh conversation without its handoff.
-            guard !isPeriodic, intent.allowsFreshStartRecovery,
+            guard !isPeriodic, controlCommand == nil, intent.allowsFreshStartRecovery,
                   shouldRetryFreshStartWithoutResume(after: error, existingSessionID: existingSessionID)
             else {
                 throw error
@@ -1587,7 +1600,7 @@ final class ClaudeAgentModeCoordinator {
                       session.selfCompactState.active?.owner?.matchesLocalBinding(session) == true
                 else { return .superseded }
             }
-            switch isSelfNote ? .ready : await ensureClaudeNativeSession(session: session, intent: intent, providerLaunchInput: providerLaunchInput, routingLease: routingLease) {
+            switch isSelfNote ? .ready : await ensureClaudeNativeSession(session: session, intent: intent, providerLaunchInput: providerLaunchInput, routingLease: routingLease, controlCommand: providerControlCommand?.isClaudeOverflowRecovery == true ? providerControlCommand : nil) {
             case .ready:
                 break
             case let .failed(message):
@@ -1923,7 +1936,16 @@ final class ClaudeAgentModeCoordinator {
                     return .superseded
                 }
                 do {
-                    let turnID = try await controller.sendUserMessage(providerControlCommand.providerText)
+                    let turnID: UUID
+                    if providerControlCommand.isClaudeOverflowRecovery {
+                        guard let active = session.selfCompactState.active, active.claudeOverflowHoldID != nil,
+                              providerControlCommand.selfCompactDispatchID?.requestID == active.id,
+                              active.compactProviderConversation == providerControlCommand.expectedProviderConversation
+                        else { return .superseded }
+                        turnID = try await controller.compactContext(expectedConversationID: providerControlCommand.expectedProviderConversation)
+                    } else {
+                        turnID = try await controller.sendUserMessage(providerControlCommand.providerText)
+                    }
                     return await acceptSentTurn(turnID, controller: controller)
                 } catch {
                     guard intentIsCurrent(intent, for: session),
@@ -2305,6 +2327,11 @@ final class ClaudeAgentModeCoordinator {
         session.providerSessionID = nil
         session.providerCleanupHandle = nil
         return detached
+    }
+
+    func prepareFreshConversationAfterOverflow(_ session: AgentTabSession) {
+        let detached = prepareClaudeProviderIdentityResetSync(session)
+        beginClaudeResumeTransferIfNeeded(for: session, oldController: detached, captureProviderSessionID: false)
     }
 
     func handleProviderIdentityTransitionSync(

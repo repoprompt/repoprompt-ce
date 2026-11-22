@@ -35,17 +35,20 @@ struct AgentProviderControlCommand: Equatable {
     /// conversation; a fresh-start fallback or any other conversation refuses it.
     let expectedProviderConversation: String
     let selfCompactDispatchID: AgentSelfCompactionDispatchID?
+    let isClaudeOverflowRecovery: Bool
 
     static func compact(
         expectedBinding: AgentPersistentSessionBindingIdentity,
         expectedProviderConversation: String,
-        selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil
+        selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
+        isClaudeOverflowRecovery: Bool = false
     ) -> AgentProviderControlCommand {
         AgentProviderControlCommand(
             kind: .compact,
             expectedBinding: expectedBinding,
             expectedProviderConversation: expectedProviderConversation,
-            selfCompactDispatchID: selfCompactDispatchID
+            selfCompactDispatchID: selfCompactDispatchID,
+            isClaudeOverflowRecovery: isClaudeOverflowRecovery
         )
     }
 

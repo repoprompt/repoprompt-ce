@@ -306,6 +306,7 @@ enum AgentSessionHydrationRuntime {
             sourceItemID: persisted.pendingHandoffSourceItemID,
             defersProviderLockUntilSend: persisted.pendingHandoffDefersProviderLockUntilSend,
             isStagedForSend: false,
+            awaitsLocalClaudeOverflowInput: persisted.pendingHandoffAwaitsLocalClaudeOverflowInput == true && persisted.pendingHandoffPayload?.isEmpty == false,
             executionLocationFailure: persisted.pendingHandoffExecutionLocationFailure,
             providerSwitchDelivery: persisted.pendingHandoffProviderSwitchDelivery
         )

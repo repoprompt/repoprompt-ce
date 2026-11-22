@@ -60,6 +60,14 @@ final class AgentSessionRunStartRuntime {
               !owner.isRetiring, !owner.hasReleasedWriterClaims,
               let originalMembership = owner.membership(of: session) else { return nil }
         defer { withExtendedLifetime(owner) {} }
+        func overflowInputIsAllowed() -> Bool {
+            !session.pendingHandoff.awaitsLocalClaudeOverflowInput || directStartOptions.localComposerCandidate != nil
+        }
+        guard overflowInputIsAllowed() else {
+            let message = "Send a new message in the composer to continue the fresh Claude conversation."
+            startOutcome?.recordStartFailure(message: message)
+            return .failed(message: message)
+        }
         let tabID = session.tabID
         var writer: AgentSessionRuntimeStore.Writer?
         if let sessionID = session.activeAgentSessionID {
@@ -89,7 +97,7 @@ final class AgentSessionRunStartRuntime {
         }
         func isCurrent() -> Bool {
             guard owner.sessions[tabID] === session, !owner.isRetiring, !owner.hasReleasedWriterClaims,
-                  resourcesAreCurrent() else { return false }
+                  overflowInputIsAllowed(), resourcesAreCurrent() else { return false }
             if let writer { return writer.isCurrent }
             // A blank draft has no persistent Writer yet. Its slot still has exact provenance:
             // preparation must not adopt a remove/re-add of the same unbound object.

@@ -509,6 +509,66 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
         await controller.test_receiveConfigurationResponseLine(data)
     }
 
+    func testObservedUnkeyedLocalCompactResultAnswersOnlyItsExactIdleCommand() async throws {
+        let controller = await controller()
+        let conversation = "application-proof-session"
+        try await feed(initFrame.merging(["claude_code_version": "2.1.330", "session_id": conversation]) { _, new in new }, to: controller)
+        do {
+            _ = try await controller.compactContext(expectedConversationID: "other")
+            XCTFail("The atomic write must refuse a different conversation")
+        } catch {}
+        let command = try await controller.compactContext(expectedConversationID: conversation)
+        try await feed([
+            "type": "system", "subtype": "compact_boundary", "session_id": conversation,
+            "compact_metadata": ["trigger": "manual", "pre_tokens": 979_016, "post_tokens": 12329]
+        ], to: controller)
+        try await feed(result(text: "").merging([
+            "session_id": conversation, "local_command": "compact", "queued_turn_count": 0, "is_error": false
+        ]) { _, new in new }, to: controller)
+        let events = await finish(controller)
+        let terminals = completions(events)
+        XCTAssertEqual(terminals.count, 1)
+        XCTAssertEqual(terminals.first?.0, [command])
+        XCTAssertEqual(terminals.first?.1, .completed)
+        let evidence = events.compactMap { event in
+            if case let .stream(result) = event { return result.claudeCompactEvidence }
+            return nil
+        }
+        XCTAssertEqual(evidence.map(\.turnID), [command])
+        XCTAssertEqual(evidence.map(\.postTokens), [12329])
+    }
+
+    func testCompactReceiptRejectsMissingOrUnrelatedBoundaryAndTerminal() {
+        let conversation = "fixture-conversation"
+        let turn = UUID()
+        let valid: [String: Any] = ["trigger": "manual", "pre_tokens": 979_016, "post_tokens": 12329]
+        var boundary: [String: Any] = ["type": "system", "subtype": "compact_boundary", "session_id": conversation]
+        var terminal = result(text: "")
+        terminal["session_id"] = conversation
+        terminal["local_command"] = "compact"
+        terminal["queued_turn_count"] = 0
+        terminal["is_error"] = false
+        for metadata in [
+            ["trigger": "manual", "pre_tokens": 979_016],
+            valid.merging(["post_tokens": true]) { _, new in new },
+            valid.merging(["post_tokens": 979_016]) { _, new in new },
+            valid.merging(["trigger": "auto"]) { _, new in new }
+        ] {
+            var receipt = ClaudeNativeCompactReceipt(conversationID: conversation, turnID: turn)
+            boundary["compact_metadata"] = metadata
+            receipt.observeBoundary(boundary)
+            XCTAssertNil(receipt.finish(terminal, answeredIDs: [turn], isKeyed: true, currentConversation: conversation))
+        }
+        var receipt = ClaudeNativeCompactReceipt(conversationID: conversation, turnID: turn)
+        boundary["compact_metadata"] = valid
+        receipt.observeBoundary(boundary)
+        XCTAssertNil(receipt.finish(terminal, answeredIDs: [UUID()], isKeyed: true, currentConversation: conversation))
+        XCTAssertNil(receipt.finish(terminal, answeredIDs: [turn], isKeyed: true, currentConversation: "replacement"))
+        XCTAssertNil(receipt.finish(terminal.merging(["is_error": true]) { _, new in new }, answeredIDs: [turn], isKeyed: true, currentConversation: conversation))
+        XCTAssertNil(receipt.unkeyedCommandAnswer(terminal.merging(["local_command": "other"]) { _, new in new }, currentConversation: conversation))
+        XCTAssertNil(receipt.unkeyedCommandAnswer(terminal.merging(["queued_turn_count": 1]) { _, new in new }, currentConversation: conversation))
+    }
+
     func testLocalSizeRejectionSettlesOnlyTheCorrelatedInput() async throws {
         for keyed in [false, true] {
             let controller = await controller()
