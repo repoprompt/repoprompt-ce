@@ -7065,6 +7065,16 @@ final class AgentSessionLinkRuntimeBridge {
         await reconcile(after: notices, capturedBookkeeping: capturedBookkeeping)
     }
 
+    /// Synchronous endpoint fence for preparation and commits that already own consent.
+    func exactOverseeRequesterIsCurrent(_ endpoint: DomainAgentSessionLinkEndpointIdentity) -> Bool {
+        guard !isFrozenForTermination, !Task.isCancelled,
+              let candidate = host?.agentSessionLinkCandidate(for: endpoint, includeLocation: false),
+              candidate.domainEndpoint == endpoint else { return false }
+        return AgentSessionLinkEndpointEligibility.addDisabledReason(
+            candidate.eligibilityInput, roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring
+        ) == nil
+    }
+
     /// Resolves and re-checks the caller for a targetless operation.
     ///
     /// `list` presents no per-target proof, so without this it would remain callable by an observer

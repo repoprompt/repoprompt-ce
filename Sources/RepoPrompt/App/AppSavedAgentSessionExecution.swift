@@ -2,6 +2,7 @@ import Foundation
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
+import RepoPromptShared
 import RepoPromptWorkspaceContext
 
 /// App composition for a saved Agent carrier. Dependencies describe app authority, not an
@@ -11,10 +12,19 @@ enum AppSavedAgentSessionExecution {
     typealias Target = AgentSavedSessionTargetLoader.Target
     typealias InstallRoute = (AgentSessionRuntimeHost) async throws -> Void
 
+    struct ApprovedLinkOrigin {
+        let observer: DomainAgentSessionLinkEndpointIdentity
+        let target: AgentSessionRuntimeStore.WriterIdentity
+    }
+
+    /// Retain both admitted incarnations across the asynchronous administration call.
+    static let approvedLinkOrigin = BoxedTaskLocal<ApprovedLinkOrigin?>(nil)
+
     struct ProviderEnvironment {
         let resources: AgentRunProviderComposition
         let settings: APISettingsViewModel
         var claudeControllerFactory: ClaudeAgentModeCoordinator.ClaudeControllerFactory?
+        var mcpTransport: MCPService?
     }
 
     struct Lookup {
@@ -225,7 +235,7 @@ extension AgentSessionRuntimeHost {
         perf: any AgentModePerfRecording, diagnostics: any AgentSessionLinkCatalogEventSink
     ) throws {
         let links = try installCanonicalLinkExecution(skillCatalog: AgentSkillCatalog(), perfRecorder: perf, diagnostics: diagnostics)
-        let enable: AgentRunExecutionContracts.MCPServerEnabler = { [route] in await route.hasActiveCatalog() }
+        let enable: AgentRunExecutionContracts.MCPServerEnabler = { [route] in await route.ensureHostProviderTransport() }
         installCodexRuntime(codexCoordinator, routeID: routeID, approvalStore: .shared, links: links, mcpServerEnabler: enable, modelRouterSettingsStore: settings)
         let input = makeCanonicalInputEnvironment()
         claudeCoordinator.installHostCapabilities(

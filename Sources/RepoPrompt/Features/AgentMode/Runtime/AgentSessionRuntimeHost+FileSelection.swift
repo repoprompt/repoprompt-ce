@@ -81,7 +81,7 @@ extension AgentSessionRuntimeHost {
             await store.sessionBoundRootScopeValidationSnapshot(lookup.rootScope, expectedPhysicalRoots: projection.physicalRootRefs)
         } else { nil as WorkspaceSessionRootLifetimeSnapshot? }
         guard lookup.bindingProjection == nil || lookupLifetime != nil else { throw MCPFileToolAuthorityFailure.worktreeScopeUnavailable }
-        if op != "get" { _ = try await store.awaitAppliedIngress(rootScope: lookup.rootScope) }
+        if op != "get" { _ = await store.awaitAppliedIngress(rootScope: lookup.rootScope) }
         try Task.checkCancellation()
         let physical = lookup.physicalizeSelection(tab.selection)
         let input = MCPServerViewModel.parseSavedOrVisibleSelectionInputs(

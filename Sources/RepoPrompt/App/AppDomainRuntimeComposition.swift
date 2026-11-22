@@ -229,6 +229,9 @@ final class AppGlobalMCPServiceComposition {
         }
     }
 
+    /// Single process listener shared by explicit app startup and independent provider hosts.
+    static let transport = MCPService()
+
     static let shared = AppGlobalMCPServiceComposition(
         runtime: AppDomainRuntimeComposition.shared.runtime,
         windowStates: .shared,

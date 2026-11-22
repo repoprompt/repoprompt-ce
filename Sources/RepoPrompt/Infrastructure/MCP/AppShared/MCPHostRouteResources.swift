@@ -499,6 +499,28 @@ final class MCPHostRouteResources {
         return await domainRuntime.toolRegistry.isActive(handle)
     }
 
+    func hasHostTransport(_ candidate: MCPService) -> Bool {
+        catalog?.hostTransport === candidate
+    }
+
+    /// A provider start, not a window joining or a catalog being registered, requests the
+    /// process listener. Transport startup cannot transfer admission to a replacement catalog.
+    func ensureHostProviderTransport() async -> Bool {
+        guard identity.kind == .independent, !isClosing, !Task.isCancelled,
+              let catalog, let handle = catalogHandle, let transport = catalog.hostTransport else { return false }
+        let demand: @MainActor @Sendable () async -> Bool = { [weak self] in
+            guard let self, !isClosing, !Task.isCancelled, catalogHandle == handle, self.catalog === catalog else { return false }
+            return await domainRuntime.toolRegistry.isActive(handle) && catalogHandle == handle
+                && self.catalog === catalog && !isClosing && !Task.isCancelled
+        }
+        do {
+            try await transport.start(requiring: demand)
+        } catch {
+            return false
+        }
+        return await demand()
+    }
+
     func unregisterCatalog(_ handle: MCPDomainToolRegistrationHandle) async {
         let predecessor = catalogTransitionTail
         let task = Task { @MainActor in
