@@ -293,7 +293,8 @@ final class AgentSessionRunStartRuntime {
                 && inputSources.allSatisfy { $0.isCurrent() }
         }
         func runInputIsCurrent() -> Bool {
-            periodicStartIsCurrent() && stopFence.permitsStart(of: session) && command.isCurrent && resourcesAreCurrent()
+            directStartOptions.providerControlCommand?.claudeWakeCompaction?.isCurrent(for: session) != false
+                && periodicStartIsCurrent() && stopFence.permitsStart(of: session) && command.isCurrent && resourcesAreCurrent()
                 && session.operationAdmissionFailureMessage == nil && inputSources.allSatisfy { $0.isCurrent() }
         }
         guard await owner.mcp.prepareWaitTrackingForRunStart(session: session, stopFence: stopFence) else { return nil }
@@ -304,6 +305,7 @@ final class AgentSessionRunStartRuntime {
         // the rendered lane claim the supplement path attaches.
         let switchMessages: (user: String, initial: String)?
         if session.pendingHandoff.providerSwitchDelivery != nil {
+            guard directStartOptions.providerControlCommand?.claudeWakeCompaction == nil else { return nil }
             switchMessages = await links.prepareProviderSwitchHandoverForSend(providerSwitchPreparation, session: session, stopFence: stopFence)
             guard inputIsCurrent() else { return nil }
             guard switchMessages != nil else {

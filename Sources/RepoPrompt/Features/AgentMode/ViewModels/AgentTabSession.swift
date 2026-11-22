@@ -1160,7 +1160,24 @@ final class AgentTabSession: ObservableObject {
     }
 
     /// Provider session ID for resumption (e.g., Claude CLI session_id)
-    var providerSessionID: String?
+    var providerSessionID: String? {
+        didSet {
+            if providerSessionID != oldValue, selectedAgent == .claudeCode {
+                invalidateClaudeWakeUsage(includingWindow: true)
+            }
+        }
+    }
+
+    /// The conversation whose current high-pressure episode already received maintenance.
+    /// Retired only by measured headroom or replaced by evidence for another conversation.
+    var claudeWakeCompactionSpentConversation: String? {
+        didSet {
+            if claudeWakeCompactionSpentConversation != oldValue { isDirty = true }
+        }
+    }
+
+    /// Only an actual provider compact boundary advances this (not a `compacting` status).
+    var claudeCompactBoundaryID: UUID?
 
     var providerCleanupHandle: ProviderConversationCleanupHandle?
     var providerTokenUsageByTurn: [AgentTokenUsagePersist] = []
@@ -1185,6 +1202,7 @@ final class AgentTabSession: ObservableObject {
     var activeNonCodexTurnTokenAccumulator: AgentModeViewModel.NonCodexTurnTokenAccumulator?
 
     func beginProviderInitiatedTurnAccounting() {
+        invalidateClaudeWakeUsage()
         activeNonCodexTurnTokenAccumulator = .init()
     }
 
@@ -1348,6 +1366,16 @@ final class AgentTabSession: ObservableObject {
         }
     }
 
+    /// The last occupancy describes the last input, never an unmeasured successor. A new
+    /// controller or conversation must also re-vouch for the effective window.
+    func invalidateClaudeWakeUsage(includingWindow: Bool = false) {
+        guard selectedAgent == .claudeCode else { return }
+        batchingContextVouchSignals {
+            vouchedContextCount = nil
+            if includingWindow { vouchedContextWindow = nil }
+        }
+    }
+
     /// Withdraws the count vouch (the stored figure stays in the ring) and re-evaluates the window
     /// vouch against `modelContextWindow`, republishing at most once for both.
     func withdrawContextCountVouch(notingWindow modelContextWindow: Int?) {
@@ -1379,7 +1407,7 @@ final class AgentTabSession: ObservableObject {
 
     /// Bumped by every write to `vouchedContextCount`, including a withdrawal that leaves it `nil`, so
     /// a restore can prove no report touched the count since it was withdrawn.
-    private var contextCountVouchRevision: UInt64 = 0
+    private(set) var contextCountVouchRevision: UInt64 = 0
 
     /// A count vouch withdrawn at a compaction dispatch, with the revision the withdrawal produced.
     struct WithdrawnContextCountVouch {
@@ -1591,7 +1619,14 @@ final class AgentTabSession: ObservableObject {
         pendingCodexComputerUseActivation != nil
     }
 
-    var claudeController: (any NativeAgentRuntimeControlling)?
+    var claudeController: (any NativeAgentRuntimeControlling)? {
+        didSet {
+            if oldValue.map({ ObjectIdentifier($0 as AnyObject) }) != claudeController.map({ ObjectIdentifier($0 as AnyObject) }) {
+                invalidateClaudeWakeUsage(includingWindow: true)
+            }
+        }
+    }
+
     var acpController: ACPAgentSessionController?
     /// Retained input, not liveness: use only with its exact ownership and restoration binding.
     var acpWorkspaceAdmission: AgentACPWorkspaceAdmission?

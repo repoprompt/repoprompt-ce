@@ -312,6 +312,7 @@ enum AgentSessionHydrationRuntime {
         session.selfCompactState = persisted.selfCompactState ?? .init()
         session.selfCompactPersistenceWarning = persisted.selfCompactPersistenceWarning
         session.contextWindowCapacity = persisted.contextWindowCapacity
+        session.claudeWakeCompactionSpentConversation = persisted.claudeWakeCompactionSpentConversation
         session.claudeAutoCompactWindowTokens = nil
         restoreCodexMetadata(from: persisted, to: session)
         switch session.selectedAgent {

@@ -12455,6 +12455,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             || runtimeSnapshot.observedReadFileCount != analyticsSnapshot.observedReadFiles.count
             || runtimeSnapshot.selectedAgent != session.selectedAgent
             || runtimeSnapshot.selectedModelRaw != session.selectedModelRaw
+            || runtimeSnapshot.claudeWakePressure != .init(session: session)
         {
             invalidation.insert(.runtimeMetrics)
         }

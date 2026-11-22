@@ -274,7 +274,7 @@ final class ClaudeIntegratedAgentModeRunner {
         let rollbackUserItemID = providerControlCommand == nil && selfCompactDispatchID == nil && !isPeriodic
             ? initialUserItemID
             : nil
-        session.agentTask = Task { [weak self, weak session, hooks] in
+        session.agentTask = Task { [weak self, weak session, weak startOutcome, hooks] in
             guard let session else { return }
             defer {
                 if receipt.disposition(for: session) != .claimLost {
@@ -351,6 +351,7 @@ final class ClaudeIntegratedAgentModeRunner {
                 let providerName = session.selectedAgent.rawValue
                 var startupRefused = false
                 var didSendToProvider = false
+                var compactBoundaryVerified = false
                 var routeRefusalMessage: String?
                 var nativeFailureMetadata: (errorText: String?, shouldShutdownSession: Bool)?
                 let report = await DomainAgentRunExecutionCore.execute(
@@ -426,12 +427,21 @@ final class ClaudeIntegratedAgentModeRunner {
                     _ = await lease.releaseWhenRouted()
 
                     session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .running)
+                    let compactInputID = if providerControlCommand?.claudeWakeCompaction != nil,
+                                            session.claudeExpectedTurnIDs.count == 1
+                    {
+                        session.claudeExpectedTurnIDs.first
+                    } else {
+                        nil as UUID?
+                    }
                     switch await self.consumeEvents(
                         next: { await subscription.next() },
                         close: { listener.close(subscription, returningTail: true) },
                         session: session,
                         runID: runID,
-                        runAttemptID: runAttemptID
+                        runAttemptID: runAttemptID,
+                        compactInputID: compactInputID,
+                        onVerifiedCompact: { compactBoundaryVerified = true }
                     ) {
                     case .completed:
                         return .completed(assistantText: nil)
@@ -479,18 +489,21 @@ final class ClaudeIntegratedAgentModeRunner {
                     if !didSendToProvider {
                         if !isPeriodic, providerControlCommand == nil, selfCompactDispatchID == nil { self.hooks.providerInput.recordPendingHandoffSendOutcome(session, false) }
                     }
-                    await self.finalize(
+                    let revision = await self.finalize(
                         session: session,
                         runID: runID,
                         ownership: ownership,
                         attachmentReservationID: attachmentReservationID,
                         terminalState: terminalState,
                         errorText: outcome.kind == .failed ? nativeFailureMetadata?.errorText : nil,
-                        notifyTurnComplete: outcome.kind == .completed,
+                        notifyTurnComplete: outcome.kind == .completed && providerControlCommand?.claudeWakeCompaction == nil,
                         classifiesQuietCheckIn: qualifiesQuietProvider && outcome.kind == .completed && providerControlCommand == nil && selfCompactDispatchID == nil,
                         shouldShutdownSession: outcome.kind == .failed
                             && (nativeFailureMetadata?.shouldShutdownSession == true || listener.runtimeFailure != nil)
                     )
+                    if compactBoundaryVerified, outcome.kind == .completed, revision != nil {
+                        startOutcome?.claudeWakeCompactionVerified = true
+                    }
                     // Route refusals happen before any provider write, so the user's message was never
                     // sent. Mirror Codex: withdraw the unsent row and hand the text back for a resend.
                     if outcome.kind == .failed, !didSendToProvider,
@@ -507,6 +520,9 @@ final class ClaudeIntegratedAgentModeRunner {
             } onCancel: {}
         }
         handedToRunTask = true
+        if providerControlCommand?.claudeWakeCompaction != nil {
+            startOutcome?.claudeWakeCompactionTask = session.agentTask
+        }
         startOutcome?.recordAccepted()
     }
 
@@ -575,9 +591,12 @@ final class ClaudeIntegratedAgentModeRunner {
         close: () -> Void,
         session: AgentTabSession,
         runID: UUID,
-        runAttemptID: UUID
+        runAttemptID: UUID,
+        compactInputID: UUID? = nil,
+        onVerifiedCompact: () -> Void = {}
     ) async -> ConsumeEventsOutcome {
         defer { close() }
+        var observedCompactBoundary = false
         var exitedDueToAttemptMismatch = false
         // Keyed answers may settle several unprotected inputs across separate events.
         // Keep their strongest outcome until the existing settlement boundary is terminal.
@@ -685,6 +704,9 @@ final class ClaudeIntegratedAgentModeRunner {
                     session.claudeProviderOutputBoundary = (runAttemptID, session.nextSequenceIndex)
                 }
             case let .stream(result):
+                if let compactInputID, result.nativeCompactInputID == compactInputID {
+                    observedCompactBoundary = true
+                }
                 #if DEBUG
                     if ClaudeReasoningExtractionFeature.isEnabled, result.type == "reasoning" {
                         let text = result.reasoning ?? result.text ?? ""
@@ -765,6 +787,9 @@ final class ClaudeIntegratedAgentModeRunner {
                 }
                 switch unprotectedTurnStatus {
                 case .completed:
+                    if observedCompactBoundary, let compactInputID, ids == [compactInputID], turnStatus == .completed {
+                        onVerifiedCompact()
+                    }
                     return .completed
                 case .cancelled:
                     return .cancelled

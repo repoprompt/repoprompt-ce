@@ -1732,6 +1732,73 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         }
     }
 
+    func testWindowFreeClaudeWakeCompactionReservesOnceWithoutPayingTheWake() async throws {
+        for behavior in ["verified", "unverified", "stop"] {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("ClaudeWakeCompact-\(UUID())")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let workspace = WorkspaceModel(name: "Claude wake maintenance", repoPaths: [], customStoragePath: root)
+            let conversation = "monitor-native-session"
+            var starts: [String] = []
+            let f = try fixture(workspace: workspace, start: { session, text, outcome in
+                starts.append(text)
+                let saved = try? await AgentSessionDataService.shared.loadAgentSession(id: XCTUnwrap(session.activeAgentSessionID), for: workspace)
+                XCTAssertEqual(saved?.claudeWakeCompactionSpentConversation, conversation)
+                XCTAssertEqual(saved?.effectiveItemCount, 0, "Maintenance must not record a user turn or a delivered lane update")
+                outcome?.recordAccepted()
+                outcome?.claudeWakeCompactionTask = Task { @MainActor [weak outcome] in
+                    await Task.yield()
+                    XCTAssertNotNil(session.activeComposerSubmitAttempt, "Start acceptance cannot release the native producer's composer claim")
+                    outcome?.claudeWakeCompactionVerified = behavior == "verified"
+                    session.invalidateClaudeWakeUsage()
+                }
+            })
+            let session = f.session
+            session.selectedAgent = .claudeCode
+            session.providerSessionID = conversation
+            session.claudeController = MonitorFakeNativeController()
+            session.runState = .completed
+            _ = f.scope.usage.ingestNonCodexUsageReport(
+                promptTokens: nil, completionTokens: nil, contextUsedTokens: 850_000,
+                modelContextWindow: 900_000, session: session
+            )
+            let lane = AgentSessionLinkAutoWakeTests.laneSnapshot(observerEndpoint: f.endpoint)
+            f.runtime.agentSessionLinkPublishPassiveStatusNotices(lane, to: f.endpoint)
+            session.oversight.autoWakeOnUpdates = true
+            let attempt = AgentSessionLinkAutoWakeAttempt(
+                wakeID: UUID(), observerEndpoint: f.endpoint, queueEpoch: lane.queueEpoch,
+                queueRevision: lane.queueRevision, wakeFingerprint: lane.wakeEligibilityFingerprint,
+                admissionBasis: .routineStatusOrOverflow, attemptedFingerprint: nil,
+                physicalOutcome: .notAttempted, phase: .scheduled, task: nil
+            )
+            session.oversight.pendingAutoWake = attempt
+            f.scope.persistence.saver = { payload, workspace, count in
+                let url = try await AgentSessionDataService.shared.saveAgentSession(payload, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count)
+                if behavior == "stop" { session.stopState.invalidateScheduledStarts() }
+                return url
+            }
+            let before = f.runtime.agentSessionLinkPassiveNoticesBySessionID[f.endpoint.sessionID]
+            let result = await f.runtime.agentSessionLinkPrepareClaudeWake(attempt, session: session)
+            switch (behavior, result) {
+            case ("verified", .recheckAfterCompaction), ("unverified", .withholdWake), ("stop", .withholdWake): break
+            default: XCTFail("Unexpected maintenance disposition for \(behavior)")
+            }
+            XCTAssertEqual(starts, behavior == "stop" ? [] : ["/compact"])
+            XCTAssertEqual(f.runtime.agentSessionLinkPassiveNoticesBySessionID[f.endpoint.sessionID], before)
+            XCTAssertEqual(session.oversight.pendingAutoWake?.wakeID, attempt.wakeID)
+            XCTAssertTrue(session.items.isEmpty)
+            XCTAssertNil(session.activeComposerSubmitAttempt)
+            _ = f.scope.usage.ingestNonCodexUsageReport(
+                promptTokens: nil, completionTokens: nil, contextUsedTokens: 890_000,
+                modelContextWindow: 900_000, session: session
+            )
+            if case .unchanged = await f.runtime.agentSessionLinkPrepareClaudeWake(attempt, session: session) {} else {
+                XCTFail("Another high reading must not mint another command")
+            }
+            XCTAssertEqual(starts.count, behavior == "stop" ? 0 : 1)
+            session.saveDebounceTask?.cancel()
+        }
+    }
+
     func testWindowFreePartialSendWriteRequiresDurableCompensationAndRestoresAnchors() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("M9SendRollback-\(UUID())")
         defer { try? FileManager.default.removeItem(at: root) }

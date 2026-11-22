@@ -274,6 +274,7 @@ struct AgentSession: Codable, Identifiable {
     /// The model's own context capacity, before any Claude auto-compact cap. `codexContextWindow`
     /// keeps the effective window; this is the validation ceiling for the provider and model it names.
     var contextWindowCapacity: AgentContextWindowCapacity?
+    var claudeWakeCompactionSpentConversation: String?
 
     /// Parent session ID for thread nesting (child sessions spawned from another session)
     var parentSessionID: UUID?
@@ -362,6 +363,7 @@ struct AgentSession: Codable, Identifiable {
         codexTotalTotalTokens: Int? = nil,
         codexMcpSessionKey: String? = nil,
         contextWindowCapacity: AgentContextWindowCapacity? = nil,
+        claudeWakeCompactionSpentConversation: String? = nil,
         parentSessionID: UUID? = nil,
         createdByOverseerSessionID: UUID? = nil,
         organizationalParentID: UUID? = nil,
@@ -414,6 +416,7 @@ struct AgentSession: Codable, Identifiable {
         self.codexTotalTotalTokens = codexTotalTotalTokens
         self.codexMcpSessionKey = codexMcpSessionKey
         self.contextWindowCapacity = contextWindowCapacity
+        self.claudeWakeCompactionSpentConversation = claudeWakeCompactionSpentConversation
         self.parentSessionID = parentSessionID
         self.createdByOverseerSessionID = createdByOverseerSessionID
         self.organizationalParentID = organizationalParentID
@@ -468,6 +471,7 @@ struct AgentSession: Codable, Identifiable {
         case codexTotalTotalTokens
         case codexMcpSessionKey
         case contextWindowCapacity
+        case claudeWakeCompactionSpentConversation
         case parentSessionID
         case createdByOverseerSessionID
         case organizationalParentID
@@ -532,6 +536,7 @@ struct AgentSession: Codable, Identifiable {
         codexTotalTotalTokens = try container.decodeIfPresent(Int.self, forKey: .codexTotalTotalTokens)
         codexMcpSessionKey = try container.decodeIfPresent(String.self, forKey: .codexMcpSessionKey)
         contextWindowCapacity = try? container.decodeIfPresent(AgentContextWindowCapacity.self, forKey: .contextWindowCapacity)
+        claudeWakeCompactionSpentConversation = try? container.decodeIfPresent(String.self, forKey: .claudeWakeCompactionSpentConversation)
         parentSessionID = try container.decodeIfPresent(UUID.self, forKey: .parentSessionID)
         createdByOverseerSessionID = try container.decodeIfPresent(UUID.self, forKey: .createdByOverseerSessionID)
         organizationalParentID = try container.decodeIfPresent(UUID.self, forKey: .organizationalParentID)

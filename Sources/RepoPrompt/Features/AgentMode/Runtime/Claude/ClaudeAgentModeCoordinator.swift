@@ -1440,6 +1440,8 @@ final class ClaudeAgentModeCoordinator {
         guard inputResourcesAreCurrent() else { return .failed(message: "The input resource generation changed before Claude dispatch.") }
         guard intentIsCurrent(intent, for: session) else { return .superseded }
         let isSelfNote = selfCompactDispatchID?.stage == .note
+        let proactiveCompact = providerControlCommand?.claudeWakeCompaction
+        let usesExistingControllerOnly = isSelfNote || proactiveCompact != nil
         let isMaintenance = providerControlCommand != nil || isSelfNote
         let auditTurnID = session.pendingTurnRuntimeAnchors.first?.userItemID
         var handler = toolHandler(for: session)
@@ -1449,6 +1451,15 @@ final class ClaudeAgentModeCoordinator {
         // controller is a transport retry of the *same* user turn, so every attempt must carry a
         // byte-equivalent oversight supplement rather than re-deciding per attempt.
         let promptDispatchID = AgentSessionLinkPromptDispatchID.claudeNativeSend(UUID())
+        func invalidateWakeUsageAfterSend(_ controller: any NativeAgentRuntimeControlling, previousVouch: UInt64) {
+            // A new count can arrive while the stdin call is suspended. Only retire the vouch
+            // that existed before the write, never a newer provider reading.
+            if session.contextCountVouchRevision == previousVouch,
+               intentIsCurrent(intent, for: session), sessionOwnsClaudeController(controller, for: session)
+            {
+                session.invalidateClaudeWakeUsage()
+            }
+        }
         /// A control command acts only on the conversation it was admitted for and never interrupts.
         /// A rebind, a fresh-start fallback after a failed resume (whose staged recovery handoff stays
         /// for the next ordinary turn), or a turn in flight all refuse it.
@@ -1460,7 +1471,8 @@ final class ClaudeAgentModeCoordinator {
             // nothing can rebind between this answer and the caller's next step.
             let turnInFlight = await controller.hasTurnInFlight
             guard intentIsCurrent(intent, for: session),
-                  sessionOwnsClaudeController(controller, for: session)
+                  sessionOwnsClaudeController(controller, for: session),
+                  command.claudeWakeCompaction?.isCurrent(for: session) != false
             else {
                 return .superseded
             }
@@ -1587,7 +1599,8 @@ final class ClaudeAgentModeCoordinator {
                       session.selfCompactState.active?.owner?.matchesLocalBinding(session) == true
                 else { return .superseded }
             }
-            switch isSelfNote ? .ready : await ensureClaudeNativeSession(session: session, intent: intent, providerLaunchInput: providerLaunchInput, routingLease: routingLease) {
+            if let proactiveCompact, !proactiveCompact.isCurrent(for: session) { return .superseded }
+            switch usesExistingControllerOnly ? .ready : await ensureClaudeNativeSession(session: session, intent: intent, providerLaunchInput: providerLaunchInput, routingLease: routingLease) {
             case .ready:
                 break
             case let .failed(message):
@@ -1619,6 +1632,7 @@ final class ClaudeAgentModeCoordinator {
             }
 
             if hasEffectiveClaudeControllerLaunchSettingsMismatch(for: session, providerLaunchInput: providerLaunchInput) {
+                if proactiveCompact != nil { return .superseded }
                 if let refusal = await prepareClearTurn(controller) { return refusal }
                 guard await recycleAndRefreshTracking(controller) else { return .superseded }
                 continue
@@ -1718,6 +1732,7 @@ final class ClaudeAgentModeCoordinator {
             // Validate launch settings before ordinary-turn configuration application below.
             // Application can suspend, so the complete snapshot is fenced again before dispatch.
             if hasEffectiveClaudeControllerLaunchSettingsMismatch(for: session, providerLaunchInput: providerLaunchInput) {
+                if proactiveCompact != nil { return .superseded }
                 guard await recycleAndRefreshTracking(controller) else { return .superseded }
                 continue
             }
@@ -1922,7 +1937,12 @@ final class ClaudeAgentModeCoordinator {
                 {
                     return .superseded
                 }
+                if proactiveCompact != nil {
+                    guard inputResourcesAreCurrent(), session.claudeExpectedTurnIDs.isEmpty else { return .superseded }
+                }
                 do {
+                    let previousVouch = session.contextCountVouchRevision
+                    defer { invalidateWakeUsageAfterSend(controller, previousVouch: previousVouch) }
                     let turnID = try await controller.sendUserMessage(providerControlCommand.providerText)
                     return await acceptSentTurn(turnID, controller: controller)
                 } catch {
@@ -1959,6 +1979,8 @@ final class ClaudeAgentModeCoordinator {
                 session.selfCompactState = state
                 hostCapabilities.scheduleSave(session)
                 do {
+                    let previousVouch = session.contextCountVouchRevision
+                    defer { invalidateWakeUsageAfterSend(controller, previousVouch: previousVouch) }
                     let turnID = try await controller.sendUserMessage(text)
                     state = session.selfCompactState
                     if state.noteAccepted(dispatchID) {
@@ -2076,7 +2098,12 @@ final class ClaudeAgentModeCoordinator {
                 inputInbox?.beginInputHandoff()
                 defer { inputInbox?.endInputHandoff() }
                 inputAttemptChanged?(true)
-                let turnID = try await controller.sendUserMessage(providerBoundText, configuration: configurationProof)
+                let turnID: UUID
+                do {
+                    let previousVouch = session.contextCountVouchRevision
+                    defer { invalidateWakeUsageAfterSend(controller, previousVouch: previousVouch) }
+                    turnID = try await controller.sendUserMessage(providerBoundText, configuration: configurationProof)
+                }
                 session.oracleBackgroundAwareness.accept(oracle)
                 recordOrdinaryDispatchAttempt()
                 if let parked {

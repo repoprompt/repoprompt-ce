@@ -177,6 +177,7 @@ actor AgentSessionDataService {
         let codexMcpSessionKey: String?
         /// Decoded leniently: one malformed capacity must not fail the header of an otherwise valid file.
         let contextWindowCapacity: LenientContextWindowCapacity?
+        let claudeWakeCompactionSpentConversation: String?
         let parentSessionID: UUID?
         let createdByOverseerSessionID: UUID?
         let organizationalParentID: UUID?
@@ -1513,6 +1514,7 @@ actor AgentSessionDataService {
                 codexTotalTotalTokens: header.codexTotalTotalTokens,
                 codexMcpSessionKey: header.codexMcpSessionKey,
                 contextWindowCapacity: header.contextWindowCapacity?.value,
+                claudeWakeCompactionSpentConversation: header.claudeWakeCompactionSpentConversation,
                 parentSessionID: header.parentSessionID,
                 createdByOverseerSessionID: header.createdByOverseerSessionID,
                 organizationalParentID: header.organizationalParentID,

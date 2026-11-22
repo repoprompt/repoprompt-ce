@@ -35,17 +35,20 @@ struct AgentProviderControlCommand: Equatable {
     /// conversation; a fresh-start fallback or any other conversation refuses it.
     let expectedProviderConversation: String
     let selfCompactDispatchID: AgentSelfCompactionDispatchID?
+    let claudeWakeCompaction: ClaudeWakeCompactionAdmission?
 
     static func compact(
         expectedBinding: AgentPersistentSessionBindingIdentity,
         expectedProviderConversation: String,
-        selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil
+        selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
+        claudeWakeCompaction: ClaudeWakeCompactionAdmission? = nil
     ) -> AgentProviderControlCommand {
         AgentProviderControlCommand(
             kind: .compact,
             expectedBinding: expectedBinding,
             expectedProviderConversation: expectedProviderConversation,
-            selfCompactDispatchID: selfCompactDispatchID
+            selfCompactDispatchID: selfCompactDispatchID,
+            claudeWakeCompaction: claudeWakeCompaction
         )
     }
 
@@ -159,7 +162,8 @@ struct AgentDirectRunStartOptions: Equatable {
         AgentDirectRunStartOptions(
             ignoresPendingHandoff: true,
             providerControlCommand: command,
-            selfCompactDispatchID: command.selfCompactDispatchID
+            selfCompactDispatchID: command.selfCompactDispatchID,
+            stopFence: command.claudeWakeCompaction?.stopFence
         )
     }
 
@@ -208,6 +212,11 @@ final class AgentRunStartOutcomeRecorder {
             self == .accepted
         }
     }
+
+    /// Only the Claude proactive maintenance pipeline sets these. Start acceptance alone is not
+    /// evidence of a successful compact, and another run's task must never resume the parked wake.
+    var claudeWakeCompactionTask: Task<Void, Never>?
+    var claudeWakeCompactionVerified = false
 
     private(set) var hasRecordedOutcome = false
     private(set) var outcome: Outcome = .startFailed(message: nil) {

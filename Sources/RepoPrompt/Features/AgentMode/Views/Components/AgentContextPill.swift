@@ -2,6 +2,7 @@ import Combine
 import Foundation
 import KeyboardShortcuts
 import RepoPromptInstrumentation
+import RepoPromptSettingsCore
 import RepoPromptWorkspaceContext
 import SwiftUI
 
@@ -19,6 +20,7 @@ struct AgentContextPill: View {
     let worktreeBindingsProvider: @MainActor (UUID, UUID?) -> [AgentSessionWorktreeBinding]
 
     @ObservedObject private var fontScale = FontScaleManager.shared
+    @ObservedObject private var settings = GlobalSettingsStore.shared
     @State private var contextComposerShortcut = KeyboardShortcuts.getShortcut(for: .toggleContextComposer)
 
     private var fontPreset: FontScalePreset {
@@ -74,6 +76,18 @@ struct AgentContextPill: View {
         return "Click to review and edit · \(contextComposerShortcut)"
     }
 
+    private var claudePressureNotice: String? {
+        let threshold = settings.claudeWakeCompactionThresholdPercent()
+        guard threshold > 0, let state = runtimeVM.snapshot.claudeWakePressure else { return nil }
+        if state.episodeSpent {
+            return "Claude: no further automatic compaction until context has measured headroom."
+        }
+        if state.pressure?.isHigh(thresholdPercent: threshold) == true {
+            return "Claude context is under pressure. RepoPrompt may compact before the next Auto-wake."
+        }
+        return nil
+    }
+
     private func contextUsageTooltip(detailedFileSummaryText: String) -> String {
         var lines: [String] = []
 
@@ -96,6 +110,7 @@ struct AgentContextPill: View {
         if !runtimeVM.snapshot.awaitingPostCompactionUsage {
             lines.append("Source: \(runtimeVM.snapshot.displayUsageLabel)")
         }
+        if let claudePressureNotice { lines.append(claudePressureNotice) }
         lines.append("Selected context: \(detailedFileSummaryText)")
         if let selectionTokens {
             lines.append("Selection: \(AgentContextIndicator.formatTokens(selectionTokens)) tokens")
@@ -128,6 +143,12 @@ struct AgentContextPill: View {
                     .lineLimit(1)
                     .fixedSize(horizontal: true, vertical: false)
 
+                if claudePressureNotice != nil {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .imageScale(.small)
+                        .foregroundStyle(.orange)
+                        .accessibilityHidden(true)
+                }
                 AgentContextIndicator(
                     contextWindowTokens: contextWindowTokens,
                     usedTokens: estimatedUsedTokens,
@@ -143,7 +164,7 @@ struct AgentContextPill: View {
         .buttonStyle(.plain)
         .hoverTooltip(contextUsageTooltip(detailedFileSummaryText: detailedFileSummaryText), .top)
         .accessibilityLabel("Agent context: \(detailedFileSummaryText)")
-        .accessibilityHint("Review and edit selected context")
+        .accessibilityHint(claudePressureNotice ?? "Review and edit selected context")
         .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)) { _ in
             contextComposerShortcut = KeyboardShortcuts.getShortcut(for: .toggleContextComposer)
         }

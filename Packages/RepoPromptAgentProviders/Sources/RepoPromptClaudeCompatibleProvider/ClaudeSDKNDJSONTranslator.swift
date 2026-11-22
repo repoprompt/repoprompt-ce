@@ -149,6 +149,7 @@ public struct ClaudeSDKNDJSONTranslator {
         }
 
         if subtype == "compact_boundary" {
+            guard !isSubagentMessage(json) else { return [Self.unrepresentedActivity] }
             let metadata = (json["compact_metadata"] as? [String: Any]) ?? [:]
             let trigger = firstString(in: metadata, keys: ["trigger"])
             let preTokens = numberToInt(metadata["pre_tokens"])

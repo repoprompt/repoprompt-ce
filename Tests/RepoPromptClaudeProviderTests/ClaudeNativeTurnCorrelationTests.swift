@@ -888,6 +888,28 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
         }
     }
 
+    func testNativeCompactBoundaryVouchesOnlyForTheIsolatedHostInput() async throws {
+        for usesKeyedProtocol in [false, true] {
+            let controller = await controller()
+            let stream = await controller.events
+            if usesKeyedProtocol { try await feed(initFrame, to: controller) }
+            let turn = try await controller.sendUserMessage("/compact")
+            let boundary: [String: Any] = ["type": "system", "subtype": "compact_boundary"]
+            try await feed(boundary.merging(["user_message_uuid": UUID().uuidString]) { _, new in new }, to: controller)
+            try await feed(boundary.merging(["parent_tool_use_id": "nested-tool"]) { _, new in new }, to: controller)
+            try await feed(boundary.merging(["session_id": "another-conversation"]) { _, new in new }, to: controller)
+            try await feed(boundary, to: controller)
+            try await feed(result(usesKeyedProtocol ? [turn] : nil), to: controller)
+            try await feed(boundary, to: controller)
+            await controller.shutdown()
+            var proof: [UUID] = []
+            for await event in stream {
+                if case let .stream(report) = event, let input = report.nativeCompactInputID { proof.append(input) }
+            }
+            XCTAssertEqual(proof, [turn])
+        }
+    }
+
     func testProviderStartPrecedesDeferredHostCompletionOnIdleAndFallback() async throws {
         for useIdle in [true, false] {
             let controller = await controller(fallback: useIdle ? 10 : 0.01)
