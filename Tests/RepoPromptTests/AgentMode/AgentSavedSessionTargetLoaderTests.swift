@@ -272,6 +272,7 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                 let loaded = await windows.prepareSavedOversightTarget(fixture.sessionID, providerEnvironment: providerEnvironment, isStillAuthorized: { true })
                 let writer = try loaded.get()
                 let host = try XCTUnwrap(writer.scope.executableHost)
+                var originalFileReceipt: AgentSessionRuntimeHost.HostFileInvocation?
                 do {
                     XCTAssertEqual(writer.session.tabID, stash.tab.id)
                     XCTAssertEqual(writer.session.items.map(\.text), ["Saved request", "Saved response"])
@@ -322,11 +323,16 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                             ephemeralGrantedToolNames: grantingAccess ? [name] : []
                         )
                         let request = ToolInvocationContext.trustedLocal(toolName: name, metadata: metadata)
-                        return try await MCPInvocationContextBridge.withInvocation(request) {
-                            try await runtime.domainHost.invoke(.init(
-                                invocationID: invocationID, connectionID: connectionID, resolution: resolution,
-                                arguments: arguments, securityContext: security
-                            ))
+                        do {
+                            return try await MCPInvocationContextBridge.withInvocation(request) {
+                                try await runtime.domainHost.invoke(.init(
+                                    invocationID: invocationID, connectionID: connectionID, resolution: resolution,
+                                    arguments: arguments, securityContext: security
+                                ))
+                            }
+                        } catch let error as MCPFileToolAuthorityFailure {
+                            XCTFail("Registered \(name) \(arguments[\"op\"]?.stringValue ?? \"\") failed its file receipt: \(error)")
+                            throw error
                         }
                     }
                     await ServerNetworkManager.shared.debugSeedConnectionRunRouting(
@@ -407,6 +413,28 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                         writer.session.pendingApplyEditsReview != nil
                     }
                     XCTAssertTrue(try String(contentsOf: file, encoding: .utf8).contains("{ 42 }"))
+                    // Reproduce both pieces of A → B handoff at the shared host boundary:
+                    // the presenter's ordinary A save and its newer B activation epoch.
+                    let activation = try XCTUnwrap(host.workspaceActivation)
+                    let beforeSwitchRead = await activation.authority.canonicalWorkspaceSnapshot(workspace.id)
+                    let beforeSwitch = try XCTUnwrap(beforeSwitchRead)
+                    var departingWorkspace = try JSONDecoder().decode(WorkspaceModel.self, from: beforeSwitch.document.documentBytes)
+                    departingWorkspace.lastSearchQuery = "flushed while leaving A"
+                    let departingSave = try await activation.authority.saveFailClosed(
+                        departingWorkspace, fileURL: beforeSwitch.document.fileURL,
+                        expectedWorkspaceRevision: beforeSwitch.revisions.workingRevision,
+                        expectedContentDigest: beforeSwitch.document.contentDigest
+                    )
+                    XCTAssertEqual(departingSave.saved?.disposition, .applied)
+                    let nextRoot = directory.appendingPathComponent("presented-B", isDirectory: true)
+                    try FileManager.default.createDirectory(at: nextRoot, withIntermediateDirectories: true)
+                    let otherFile = nextRoot.appendingPathComponent(file.lastPathComponent)
+                    try "workspace B stays untouched".write(to: otherFile, atomically: true, encoding: .utf8)
+                    let otherWorkspace = WorkspaceModel(name: "Presenter moved to B", repoPaths: [nextRoot.path])
+                    activation.activations.receiveWorkspaceSwitchNotification(otherWorkspace)
+                    XCTAssertEqual(activation.activations.latestSessionIndexOwner?.workspaceID, otherWorkspace.id)
+                    XCTAssertFalse(activation.isPresenterCurrent)
+                    XCTAssertTrue(activation.owns(scope: writer.scope, route: host.route))
                     let review = try XCTUnwrap(writer.session.pendingApplyEditsReview)
                     let applied = await interactions.submitApplyEditsReviewDecision(command: command, reviewID: review.id, decision: .accept)
                     XCTAssertTrue(applied)
@@ -414,6 +442,9 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                     XCTAssertEqual(edited.objectValue?["edits_applied"]?.intValue, 1, "\(edited)")
                     XCTAssertEqual(edited.objectValue?["operation_id"]?.stringValue, "saved-host-edit-witness")
                     XCTAssertTrue(try String(contentsOf: file, encoding: .utf8).contains("{ 43 }"))
+                    XCTAssertEqual(try String(contentsOf: otherFile, encoding: .utf8), "workspace B stays untouched")
+                    let readback = try await invoke("read_file", ["path": .string(file.path)])
+                    XCTAssertTrue(readback.objectValue?["content"]?.stringValue?.contains("{ 43 }") == true, "\(readback)")
                     let status = try await invoke("git", ["op": .string("status")])
                     XCTAssertEqual(status.objectValue?["status"]?.objectValue?["branch"]?.stringValue, "main", "\(status)")
                     let diff = try await invoke("git", ["op": .string("diff"), "detail": .string("patches")])
@@ -428,6 +459,12 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                     XCTAssertTrue(String(describing: repicked).contains(alias), "\(repicked)")
                     let artifact = try await invoke("read_file", ["path": .string(alias)])
                     XCTAssertTrue(artifact.objectValue?["content"]?.stringValue?.contains("Witness.swift") == true, "\(artifact)")
+                    do {
+                        originalFileReceipt = try await host.captureHostFileInvocation(.trustedLocal(toolName: "git", metadata: metadata))
+                    } catch {
+                        XCTFail("The still-live A host did not issue a retirement witness receipt: \(error)")
+                        throw error
+                    }
                     let models = try await invoke("agent_manage", ["op": .string("list_agents"), "roles_only": .bool(true)])
                     XCTAssertNotNil(models.objectValue)
                     let generation = try XCTUnwrap(receipt.routingWaitGeneration)
@@ -452,6 +489,7 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                     let unchanged = try JSONDecoder().decode(WorkspaceModel.self, from: document)
                     XCTAssertEqual(unchanged.composeTabs, [visible])
                     XCTAssertEqual(unchanged.stashedTabs, [stash])
+                    XCTAssertEqual(unchanged.lastSearchQuery, "flushed while leaving A")
                     XCTAssertEqual(WindowState.windowCounter, count)
                     XCTAssertEqual(PromptViewModel.constructionCountForTesting, promptCount)
                     XCTAssertEqual(WorkspaceManagerViewModel.constructionCountForTesting, workspaceCount)
@@ -465,6 +503,13 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                 windows.endPreparedOversightPreparation(fixture.sessionID)
                 try await AsyncTestWait.waitUntil("ordinary saved-host completion retires its owner") {
                     writer.scope.hasReleasedWriterClaims && host.route.isClosing && writer.scope.retainedDrain == nil
+                }
+                let staleReceipt = try XCTUnwrap(originalFileReceipt)
+                do {
+                    try await staleReceipt.requireCurrent()
+                    XCTFail("Actual retirement must revoke the original tool receipt")
+                } catch let error as MCPFileToolAuthorityFailure {
+                    XCTAssertEqual(error, .superseded)
                 }
             }
         } catch {
