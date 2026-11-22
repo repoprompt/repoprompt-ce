@@ -81,6 +81,16 @@ final class AntigravityACPProviderTests: XCTestCase {
         XCTAssertNil(AntigravityACPModelPollingService.launchFailureMessage(for: TransportClosed()))
     }
 
+    func testLaunchFailureMessageOmitsUndescribedPreHandshakeReason() {
+        // The exit can surface as a broken stdin pipe, whose generic NSError text is noise.
+        XCTAssertEqual(
+            AntigravityACPModelPollingService.launchFailureMessage(
+                for: ACPPreHandshakeLaunchError(underlying: FDWriteError.brokenPipe(errno: EPIPE))
+            ),
+            "Couldn't launch the Antigravity CLI. It stopped before completing the ACP handshake. Check the installation, then test again."
+        )
+    }
+
     func testRefreshResultTreatsThrownCancellationAsNoFailure() async {
         struct CancelledClient: AntigravityACPModelDiscoveryClient {
             func discoverModels(workspacePath _: String?) async throws -> ACPDiscoveredSessionModels? {

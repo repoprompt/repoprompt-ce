@@ -225,9 +225,14 @@ package actor AntigravityACPModelPollingService {
             guard case let .invalidConfiguration(configurationDetail) = providerError else { return nil }
             detail = configurationDetail
         case let handshakeError as ACPPreHandshakeLaunchError:
-            var reason = handshakeError.underlying.localizedDescription
-            if reason.hasSuffix(".") { reason.removeLast() }
-            detail = "It stopped before completing the ACP handshake (\(reason))"
+            // Only self-describing errors add information; a bare error (e.g. a broken stdin
+            // pipe) would render as Foundation's generic "operation couldn't be completed".
+            if var reason = (handshakeError.underlying as? LocalizedError)?.errorDescription, !reason.isEmpty {
+                if reason.hasSuffix(".") { reason.removeLast() }
+                detail = "It stopped before completing the ACP handshake (\(reason))"
+            } else {
+                detail = "It stopped before completing the ACP handshake"
+            }
             nextStep = " Check the installation, then test again."
         default:
             return nil
