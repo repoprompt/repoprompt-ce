@@ -1123,9 +1123,25 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         try await runVisibleLifetimeWitness(switchWorkspace: false, explicitStop: true)
     }
 
+    func testSwitchDuringFirstSaveWithdrawsOnlyTheUnpublishedComposer() async throws {
+        try await runVisibleLifetimeWitness(switchWorkspace: true, holdFirstSave: true)
+    }
+
+    func testConfirmedWorkspaceDeletionDrainsDetachedVisibleAttempt() async throws {
+        try await runVisibleLifetimeWitness(switchWorkspace: false, detachedShutdown: .workspaceDeletion)
+    }
+
+    func testExplicitQuitBoundsDetachedVisibleDrainWithoutDroppingRequiredSave() async throws {
+        try await runVisibleLifetimeWitness(switchWorkspace: false, detachedShutdown: .quit)
+    }
+
+    private enum DetachedShutdown {
+        case workspaceDeletion, quit
+    }
+
     private func runVisibleLifetimeWitness(
         switchWorkspace: Bool, failFinalSave: Bool = false, leaveOtherWindowOpen: Bool = false,
-        holdFirstSave: Bool = false, explicitStop: Bool = false
+        holdFirstSave: Bool = false, explicitStop: Bool = false, detachedShutdown: DetachedShutdown? = nil
     ) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("VisibleAgentLifetime-\(UUID())")
         let root = directory.appendingPathComponent("original-root")
@@ -1181,7 +1197,9 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         XCTAssertEqual(rootLease.snapshot.document.metadata.repoPaths, [root.path])
         XCTAssertTrue(host.route.hasCurrentModelCatalogRoute)
         if holdFirstSave {
-            try await assertFirstSaveWithdrawal(window: window, workspace: workspace, tabID: tab.id, host: host)
+            try await assertFirstSaveWithdrawal(
+                window: window, workspace: workspace, tabID: tab.id, host: host, switchTarget: switchWorkspace ? second : nil
+            )
             XCTAssertTrue(provider.promptedMessages.isEmpty)
             return
         }
@@ -1294,6 +1312,14 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             XCTAssertFalse(host.scope.presentation.hasPresenter(for: session))
             XCTAssertFalse(AppDelegate.shouldTerminateAfterLastWindowClosed(isBackgrounded: false))
             try assertOriginalAttempt()
+            if let detachedShutdown {
+                try await assertExplicitDetachedShutdown(
+                    detachedShutdown, host: host, session: session, attemptID: attemptID, workspaceID: workspace.id,
+                    releaseProvider: gate.release
+                )
+                XCTAssertEqual(provider.promptedMessages.count, 1)
+                return
+            }
             if let failedSaveDestination {
                 try await assertVisibleSaveRecovery(
                     destination: failedSaveDestination, host: host, session: session, workspace: workspace,
@@ -1343,7 +1369,11 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         if switchWorkspace || leaveOtherWindowOpen {
             XCTAssertTrue(incoming.agentModeViewModel.tabsWithActiveAgentRun.contains(tab.id))
             try assertOriginalAttempt()
-            gate.release()
+            if switchWorkspace {
+                try await assertSwitchDuringFinalSave(host: host, session: session, in: incoming, to: second, releaseProvider: gate.release)
+            } else {
+                gate.release()
+            }
             await task.value
         } else {
             XCTAssertFalse(incoming.agentModeViewModel.tabsWithActiveAgentRun.contains(tab.id))
@@ -1358,8 +1388,90 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(record?.transcript).turns.compactMap { $0.request?.text }, [prompt])
     }
 
+    private func assertExplicitDetachedShutdown(
+        _ shutdown: DetachedShutdown, host: AgentSessionRuntimeHost, session: AgentTabSession,
+        attemptID: UUID, workspaceID: UUID, releaseProvider: () -> Void
+    ) async throws {
+        let fence = AgentRunStartStopFence(session: session)
+        switch shutdown {
+        case .workspaceDeletion:
+            let token = WorkspaceDeletionCancellationToken(workspaceID: workspaceID)
+            let operation = Task {
+                await AgentSessionRuntimeHost.drainRetainedHostsForWorkspaceDeletion(token: token, until: .now.advanced(by: .seconds(5)))
+            }
+            try await AsyncTestWait.waitUntil("confirmed deletion fences the detached attempt") { !fence.permitsStart(of: session) }
+            releaseProvider()
+            let deletedHostDrained = await operation.value
+            XCTAssertTrue(deletedHostDrained)
+        case .quit:
+            let gate = AutoWakeCatalogAuthorityGate()
+            let saver = host.scope.persistence.saver
+            var saveEntered = false
+            host.scope.persistence.saver = { payload, workspace, count in
+                saveEntered = true
+                _ = await gate.requirement()
+                return try await saver(payload, workspace, count)
+            }
+            defer {
+                Task { await gate.open() }
+                host.scope.persistence.saver = saver
+            }
+            let drain = host.beginFinalShutdown()
+            XCTAssertFalse(fence.permitsStart(of: session))
+            let quit = Task { await AgentSessionHostDrainRuntime.shutdown([drain]) }
+            releaseProvider()
+            try await AsyncTestWait.waitUntil("Quit owes a suspended final save") { saveEntered }
+            let bounded = await quit.value
+            XCTAssertEqual(bounded, [.timedOut])
+            XCTAssertFalse(host.scope.hasReleasedWriterClaims)
+            XCTAssertFalse(host.route.isClosing)
+            XCTAssertTrue(AppDelegate.hasUnsettledAgentExecution())
+            await gate.open()
+            let settled = await drain.wait(until: .now.advanced(by: .seconds(5)))
+            XCTAssertEqual(settled, .released)
+        }
+        XCTAssertEqual(session.runState, .cancelled)
+        XCTAssertEqual(session.lastTerminalCommitRevision?.ownership.attemptID, attemptID)
+        XCTAssertTrue(host.scope.hasReleasedWriterClaims)
+        XCTAssertTrue(host.route.isClosing)
+    }
+
+    private func assertSwitchDuringFinalSave(
+        host: AgentSessionRuntimeHost, session: AgentTabSession, in window: WindowState, to workspace: WorkspaceModel,
+        releaseProvider: () -> Void
+    ) async throws {
+        let gate = AutoWakeCatalogAuthorityGate()
+        let saver = host.scope.persistence.saver
+        let sessionID = try XCTUnwrap(session.activeAgentSessionID)
+        var entered = false
+        host.scope.persistence.saver = { payload, workspace, count in
+            if !session.runState.isActive, session.lastTerminalCommitRevision != nil {
+                entered = true
+                _ = await gate.requirement()
+            }
+            return try await saver(payload, workspace, count)
+        }
+        defer {
+            Task { await gate.open() }
+            host.scope.persistence.saver = saver
+        }
+        releaseProvider()
+        try await AsyncTestWait.waitUntil("hold A's final save before switching") { entered }
+        try await activateVisibleLifetimeWorkspace(workspace, in: window)
+        XCTAssertFalse(window.agentModeViewModel.runtimeHost === host)
+        XCTAssertFalse(host.scope.presentation.hasPresenter(for: session))
+        XCTAssertTrue(host.scope.saveQueue.inFlightSessionIDs.contains(sessionID))
+        XCTAssertFalse(host.scope.isRetiring)
+        XCTAssertFalse(host.route.isClosing)
+        await gate.open()
+        try await AsyncTestWait.waitUntil("settle A's exact final save while B is visible") {
+            !session.isDirty && !host.scope.saveQueue.inFlightSessionIDs.contains(sessionID)
+        }
+        XCTAssertEqual(window.agentModeViewModel.runtimeHost.workspaceActivation?.key.owner.workspaceID, workspace.id)
+    }
+
     private func assertFirstSaveWithdrawal(
-        window: WindowState, workspace: WorkspaceModel, tabID: UUID, host: AgentSessionRuntimeHost
+        window: WindowState, workspace: WorkspaceModel, tabID: UUID, host: AgentSessionRuntimeHost, switchTarget: WorkspaceModel?
     ) async throws {
         let agent = window.agentModeViewModel
         let navigation = AgentModeNavigationController(isSystemWorkspaceMode: workspace.isSystemWorkspace)
@@ -1394,8 +1506,15 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         try await AsyncTestWait.waitUntil("hold the real configured first save") { entered }
         XCTAssertFalse(host.scope.saveQueue.inFlightSessionIDs.isEmpty)
         XCTAssertTrue(host.scope.sessions.values.allSatisfy { !$0.runState.isActive })
-        WindowStatesManager.shared.unregisterWindowState(window)
-        let close = Task { await window.tearDown() }
+        let close: Task<Void, Never>?
+        if let switchTarget {
+            try await activateVisibleLifetimeWorkspace(switchTarget, in: window)
+            XCTAssertFalse(window.agentModeViewModel.runtimeHost === host)
+            close = nil
+        } else {
+            WindowStatesManager.shared.unregisterWindowState(window)
+            close = Task { await window.tearDown() }
+        }
         XCTAssertTrue(claim.cancellation.isWithdrawn)
         XCTAssertEqual(host.scope.drafts.text(for: tabID), prompt)
         XCTAssertFalse(host.scope.isRetiring)
@@ -1403,7 +1522,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         await gate.open()
         let result = await send.value
         guard case .blocked = result else { return XCTFail("A withdrawn composer dispatched after its save: \(result)") }
-        await close.value
+        await close?.value
         XCTAssertTrue(host.scope.sessions.values.allSatisfy { $0.activeRunAttemptID == nil && $0.acpController == nil })
     }
 
