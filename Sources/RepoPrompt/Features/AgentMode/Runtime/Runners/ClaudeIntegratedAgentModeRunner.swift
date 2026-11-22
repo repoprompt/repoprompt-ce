@@ -11,6 +11,7 @@ final class ClaudeIntegratedAgentModeRunner {
         case completed
         case cancelled
         case failed(errorText: String?, shouldShutdownSession: Bool)
+        case claudeSizeFailure(ClaudeTurnSizeFailure)
     }
 
     /// Claude's native stream reports terminal cancellation and failure as values,
@@ -112,10 +113,14 @@ final class ClaudeIntegratedAgentModeRunner {
             )
             let state: AgentSessionRunState
             let error: String?
+            var sizeFailure: ClaudeTurnSizeFailure?
             switch outcome {
             case .completed: (state, error) = (.completed, nil)
             case .cancelled: (state, error) = (.cancelled, nil)
             case let .failed(message, _): (state, error) = (.failed, message)
+            case let .claudeSizeFailure(failure):
+                (state, error) = (.failed, nil)
+                sizeFailure = failure
             }
             await finalize(
                 session: session,
@@ -125,7 +130,8 @@ final class ClaudeIntegratedAgentModeRunner {
                 terminalState: state,
                 errorText: error,
                 notifyTurnComplete: state == .completed,
-                shouldShutdownSession: state == .failed
+                shouldShutdownSession: state == .failed && sizeFailure == nil,
+                sizeFailure: sizeFailure
             )
         }
         return true
@@ -353,6 +359,7 @@ final class ClaudeIntegratedAgentModeRunner {
                 var didSendToProvider = false
                 var routeRefusalMessage: String?
                 var nativeFailureMetadata: (errorText: String?, shouldShutdownSession: Bool)?
+                var claudeSizeFailure: ClaudeTurnSizeFailure?
                 let report = await DomainAgentRunExecutionCore.execute(
                     failureText: { _ in nativeFailureMetadata?.errorText ?? "" }
                 ) {
@@ -440,6 +447,9 @@ final class ClaudeIntegratedAgentModeRunner {
                     case let .failed(errorText, shouldShutdownSession):
                         nativeFailureMetadata = (errorText, shouldShutdownSession)
                         throw NativeTerminalFailure()
+                    case let .claudeSizeFailure(failure):
+                        claudeSizeFailure = failure
+                        throw NativeTerminalFailure()
                     }
                 }
 
@@ -489,7 +499,8 @@ final class ClaudeIntegratedAgentModeRunner {
                         notifyTurnComplete: outcome.kind == .completed,
                         classifiesQuietCheckIn: qualifiesQuietProvider && outcome.kind == .completed && providerControlCommand == nil && selfCompactDispatchID == nil,
                         shouldShutdownSession: outcome.kind == .failed
-                            && (nativeFailureMetadata?.shouldShutdownSession == true || listener.runtimeFailure != nil)
+                            && (nativeFailureMetadata?.shouldShutdownSession == true || listener.runtimeFailure != nil),
+                        sizeFailure: outcome.kind == .failed ? claudeSizeFailure : nil
                     )
                     // Route refusals happen before any provider write, so the user's message was never
                     // sent. Mirror Codex: withdraw the unsent row and hand the text back for a resend.
@@ -556,6 +567,7 @@ final class ClaudeIntegratedAgentModeRunner {
             case .completed: return .completed
             case .cancelled: return .cancelled
             case .failed: return .failed
+            case let .claudeSizeFailure(failure): return .claudeSizeFailure(failure)
             }
         }
     #endif
@@ -609,6 +621,9 @@ final class ClaudeIntegratedAgentModeRunner {
 
         func strongest(_ current: NativeAgentRuntimeTurnStatus, _ next: NativeAgentRuntimeTurnStatus) -> NativeAgentRuntimeTurnStatus {
             switch (current, next) {
+            case (.cancelled, .claudeSizeFailure), (.claudeSizeFailure, .cancelled): .cancelled
+            case (_, .claudeSizeFailure): next
+            case (.claudeSizeFailure, _): current
             case (.failed, _), (_, .failed): .failed
             case (.cancelled, _), (_, .cancelled): .cancelled
             default: .completed
@@ -651,6 +666,7 @@ final class ClaudeIntegratedAgentModeRunner {
                     case .completed: return .completed
                     case .cancelled: return .cancelled
                     case .failed: return .failed(errorText: nil, shouldShutdownSession: false)
+                    case let .claudeSizeFailure(failure): return .claudeSizeFailure(failure)
                     }
                 }
                 continue eventLoop
@@ -770,6 +786,8 @@ final class ClaudeIntegratedAgentModeRunner {
                     return .cancelled
                 case .failed:
                     return .failed(errorText: nil, shouldShutdownSession: false)
+                case let .claudeSizeFailure(failure):
+                    return .claudeSizeFailure(failure)
                 }
             case let .error(message):
                 session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
@@ -933,9 +951,14 @@ final class ClaudeIntegratedAgentModeRunner {
         errorText: String?,
         notifyTurnComplete: Bool,
         classifiesQuietCheckIn: Bool = false,
-        shouldShutdownSession: Bool = false
+        shouldShutdownSession: Bool = false,
+        sizeFailure: ClaudeTurnSizeFailure? = nil
     ) async -> AgentRunTerminalCommitRevision? {
-        await terminalCommitBarrier.commit(.init(
+        let hold = sizeFailure.flatMap { failure -> ClaudeContextAutoWakeHold? in
+            guard failure.kind != .outputLimit else { return nil }
+            return .init(provider: session.selectedAgent, failure: failure, conversationID: failure.conversationID ?? session.providerSessionID)
+        }
+        return await terminalCommitBarrier.commit(.init(
             binding: claudeCoordinator.bindingQuietDeclarationObservations(
                 hooks.bindTerminalSession(session), session: session, owner: ownership, runID: runID
             ),
@@ -943,7 +966,8 @@ final class ClaudeIntegratedAgentModeRunner {
             expectedRunID: runID,
             terminalState: terminalState,
             source: "claudeNative.finalize",
-            errorText: errorText,
+            errorText: sizeFailure.map { $0.terminalMessage(session: session, pausesAutoWake: hold != nil) } ?? errorText,
+            failureReason: sizeFailure?.failureReason,
             attachmentReservationID: attachmentReservationID,
             attachmentDisposition: .deleteFiles,
             finalizeNonCodexUsage: true,
@@ -952,6 +976,7 @@ final class ClaudeIntegratedAgentModeRunner {
             classifiesQuietCheckIn: classifiesQuietCheckIn,
             terminalAnchor: session.terminalAnchor(for: ownership),
             prepareProviderState: { [claudeCoordinator] in
+                if let hold { session.oversight.claudeContextAutoWakeHold = hold }
                 session.pendingSupersedingTurnCompletions = 0
                 session.claudeSupersedingProtectedTurnIDs.removeAll()
                 session.claudeExpectedTurnIDs.removeAll()

@@ -1325,6 +1325,17 @@ the interval is the one thing delaying a wake that would otherwise be accepted r
 omitted rather than shown as zero once elapsed. `agent_session_link` is unchanged: the interval and
 `Wake now` have no agent-facing surface.
 
+## Claude conversation size hold
+
+A correlated Claude size rejection installs a process-local hold before the run publishes idle.
+The hold names the provider and conversation, not its process, model, or last wake fingerprint.
+An unknown conversation identity does not prove a replacement. An output cap alone does not hold
+wakes. Status, exact attention, Wake now, and periodic wakes all obey the hold, including at the
+first physical acquisition. The hold does not change preferences, link authority, pending notices,
+or receipts. Explicit local input and maintenance remain available. Nothing attempts compact,
+replay, or rollover automatically in this path. A verified recovery can clear only the specific
+hold it repaired. Holds are not restored on app restart.
+
 ## Periodic idle wake
 
 Periodic waking is a separate, default-off observer-session preference, not notification admission

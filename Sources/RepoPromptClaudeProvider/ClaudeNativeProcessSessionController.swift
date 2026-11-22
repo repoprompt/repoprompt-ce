@@ -1531,6 +1531,9 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
 
     private func handleStreamPayload(_ payload: [String: Any]) {
         guard !isShuttingDown else { return }
+        let isResultPayload = payload["type"] as? String == "result"
+        // A subordinate result must never consume a main-thread input or install a hold.
+        if isResultPayload, Self.isSubagentActivity(payload) { return }
         recordObservedSessionID(Self.firstSessionIdentifier(in: payload))
         #if DEBUG
             if host.isReasoningExtractionEnabled() {
@@ -1572,7 +1575,6 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
         // provider session/model and tool-invocation context.
         let streamResults = translator.parseNDJSONLine(data)
         guard !correlationFailed else { return }
-        let isResultPayload = payload["type"] as? String == "result"
         var completion: DeferredCompletion?
         var ownsOutput = true
         if correlation.enabled {
@@ -1580,7 +1582,15 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
                 let previousProviderTurnID = correlation.providerTurnID
                 var frameOwnsOutput: Bool?
                 if Self.isMainThreadActivity(payload) {
-                    frameOwnsOutput = try correlation.observeActivity(payload)
+                    // The synthetic rejection isn't a provider-initiated turn. If marked with
+                    // a host identity, ordinary correlation can still use that exact evidence.
+                    if ClaudeCompatibleProviderRuntimeBridge.isSyntheticSizeRejection(payload),
+                       try ClaudeNativeTurnCorrelation.inputIDs(payload) == nil
+                    {
+                        frameOwnsOutput = false
+                    } else {
+                        frameOwnsOutput = try correlation.observeActivity(payload)
+                    }
                 } else if payload["type"] as? String == "command_lifecycle",
                           payload["state"] as? String == "started",
                           let commandID = payload["command_uuid"] as? String,
@@ -1592,6 +1602,14 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
                     emit(.providerTurnStarted(turnID: providerID))
                 }
                 if isResultPayload {
+                    if correlation.hasOutstanding,
+                       ClaudeCompatibleProviderRuntimeBridge.classifySizeFailure(payload, conversationID: sessionID)?.source == .localCLIRejection,
+                       try ClaudeNativeTurnCorrelation.inputIDs(payload) == nil
+                    {
+                        // The capture is unkeyed. After keyed negotiation, no FIFO guess can
+                        // safely answer host input or attach a poisoned-conversation hold.
+                        throw ClaudeNativeTurnCorrelation.CorrelationError.missingAnswerIdentity
+                    }
                     let resolved = try correlation.resolve(payload)
                     ownsOutput = !resolved.inputIDs.isEmpty || resolved.providerTurnID != nil
                     let stopReason = streamResults.last(where: { $0.type == "message_stop" })?.stopReason
@@ -2010,6 +2028,9 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
             return .cancelled
         }
 
+        if let failure = ClaudeCompatibleProviderRuntimeBridge.classifySizeFailure(payload, conversationID: sessionID) {
+            return .claudeSizeFailure(failure)
+        }
         if (payload["is_error"] as? Bool) == true
             || subtype.contains("error")
             || !resultErrors.isEmpty

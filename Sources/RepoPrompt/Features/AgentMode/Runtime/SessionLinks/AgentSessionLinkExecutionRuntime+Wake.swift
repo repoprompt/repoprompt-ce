@@ -1249,6 +1249,7 @@ extension AgentSessionLinkExecutionRuntime {
         session: TabSession,
         endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> AgentMonitorWakeNowRefusal? {
+        if session.activeClaudeContextAutoWakeHold != nil { return .claudeSizeFailure }
         guard let snapshot = agentSessionLinkCurrentPassiveSnapshot(for: endpoint),
               snapshot.isDeliverable,
               snapshot.hasDeliverableContent
@@ -1745,6 +1746,7 @@ extension AgentSessionLinkExecutionRuntime {
 
     /// First refusing predicate, shared by routing and its bounded release-safe diagnostic.
     private func agentSessionLinkAutoWakeRouteRefusal(_ session: TabSession) -> AutoWakeRouteRefusal? {
+        guard session.activeClaudeContextAutoWakeHold == nil else { return .claudeSizeFailure }
         guard !session.bindingTransitionInProgress else { return .bindingTransitionInProgress }
         guard session.permitsBoundOperationAndSave else { return .hasLoadedPersistedState }
         guard !session.terminalCommitInProgress else { return .terminalCommitInProgress }
@@ -2144,6 +2146,7 @@ extension AgentSessionLinkExecutionRuntime {
         _ attempt: AgentSessionLinkAutoWakeAttempt,
         session: TabSession
     ) -> Bool {
+        guard session.activeClaudeContextAutoWakeHold == nil else { return false }
         if attempt.isPeriodic {
             return agentSessionLinkPeriodicWakeIsEligible(session, endpoint: attempt.observerEndpoint, requiresReadyCatalog: false)
         }

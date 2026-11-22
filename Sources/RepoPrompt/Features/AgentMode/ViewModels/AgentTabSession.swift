@@ -1162,6 +1162,21 @@ final class AgentTabSession: ObservableObject {
     /// Provider session ID for resumption (e.g., Claude CLI session_id)
     var providerSessionID: String?
 
+    var activeClaudeContextAutoWakeHold: ClaudeContextAutoWakeHold? {
+        guard let hold = oversight.claudeContextAutoWakeHold,
+              hold.blocks(provider: selectedAgent, conversationID: providerSessionID) else { return nil }
+        return hold
+    }
+
+    /// Recovery may release only the hold it actually repaired.
+    @discardableResult
+    func clearClaudeContextAutoWakeHold(matching hold: ClaudeContextAutoWakeHold) -> Bool {
+        guard oversight.claudeContextAutoWakeHold == hold else { return false }
+        oversight.claudeContextAutoWakeHold = nil
+        noteMonitorObservationInputsChanged()
+        return true
+    }
+
     var providerCleanupHandle: ProviderConversationCleanupHandle?
     var providerTokenUsageByTurn: [AgentTokenUsagePersist] = []
     var automationTurnAudit: [AgentAutomationTurnAudit] = []

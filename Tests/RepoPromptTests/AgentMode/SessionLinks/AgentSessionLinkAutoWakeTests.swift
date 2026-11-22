@@ -2,6 +2,7 @@ import Combine
 import Foundation
 import MCP
 import RepoPromptACPProviders
+import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
@@ -2253,6 +2254,48 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         }
         retained.removeAll()
         super.tearDown()
+    }
+
+    func testClaudeSizeHoldBlocksChangedStatusAttentionAndWakeNowUntilConversationChanges() throws {
+        let fixture = try makeFixture()
+        fixture.session.selectedAgent = .claudeCode
+        fixture.session.providerSessionID = "overfull"
+        let failure = ClaudeTurnSizeFailure(kind: .inputContextRejected, source: .localCLIRejection, conversationID: "overfull")
+        fixture.session.oversight.claudeContextAutoWakeHold = .init(provider: .claudeCode, failure: failure, conversationID: "overfull")
+        try publishInventory(fixture, revision: 1)
+        fixture.session.oversight.autoWakeOnUpdates = true
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 2, laneIndices: [0], attentionRequests: [Self.attentionRequest(0)])
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+        let runtime = fixture.viewModel.linkExecutionRuntime
+        XCTAssertEqual(runtime.agentSessionLinkRequestManualWakeNow(for: endpoint), .refused(.claudeSizeFailure))
+        fixture.session.providerSessionID = nil // Controller retirement is not proof of recovery.
+        XCTAssertEqual(runtime.agentSessionLinkRequestManualWakeNow(for: endpoint), .refused(.claudeSizeFailure))
+        fixture.session.providerSessionID = "fresh"
+        XCTAssertEqual(runtime.agentSessionLinkRequestManualWakeNow(for: endpoint), .scheduled, "The held conversation did not consume pending updates")
+    }
+
+    func testClaudeSizeHoldFencesPreparedPeriodicWakeAtPhysicalAcquisition() throws {
+        let (fixture, clock, endpoint) = try periodicFixture()
+        _ = try reservePeriodic(fixture, clock: clock, endpoint: endpoint)
+        var attempt = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        let dispatchID = AgentSessionLinkPromptDispatchID.headlessRun(runID: UUID())
+        attempt.periodicProducerDispatchID = dispatchID
+        attempt.phase = .preparingDispatch
+        fixture.session.oversight.pendingAutoWake = attempt
+        fixture.session.selectedAgent = .claudeCode
+        fixture.session.providerSessionID = "overfull"
+        fixture.session.oversight.claudeContextAutoWakeHold = .init(
+            provider: .claudeCode,
+            failure: .init(kind: .generationContextLimit, source: .resultStopReason, conversationID: "overfull"),
+            conversationID: "overfull"
+        )
+        let runtime = fixture.viewModel.linkExecutionRuntime
+        XCTAssertFalse(runtime.agentSessionLinkPeriodicWakeIsEligible(fixture.session, endpoint: endpoint, requiresReadyCatalog: false))
+        XCTAssertFalse(runtime.agentSessionLinkAcquireAutoWakePhysicalDispatch(for: fixture.session, dispatchID: dispatchID))
+        XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.wakeID, attempt.wakeID)
     }
 
     func testScheduledWakeDuringWorktreeCommitAdmissionCannotDispatchOrChangeBinding() async throws {

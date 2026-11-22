@@ -509,6 +509,63 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
         await controller.test_receiveConfigurationResponseLine(data)
     }
 
+    func testLocalSizeRejectionSettlesOnlyTheCorrelatedInput() async throws {
+        for keyed in [false, true] {
+            let controller = await controller()
+            if keyed { try await feed(initFrame, to: controller) }
+            let host = try await controller.sendUserMessage("host input")
+            var rejected = result(keyed ? [host] : nil, text: "Prompt is too long")
+            rejected["session_id"] = "overfull"
+            rejected["is_error"] = true
+            rejected["duration_api_ms"] = 0
+            rejected["api_error_status"] = NSNull()
+            rejected["terminal_reason"] = "blocking_limit"
+            try await feed(syntheticSizeRejection(), to: controller)
+            var subordinate = rejected
+            subordinate["parent_tool_use_id"] = "helper"
+            try await feed(subordinate, to: controller)
+            try await feed(rejected, to: controller)
+            let events = await finish(controller)
+            let terminal = completions(events)
+            XCTAssertEqual(terminal.count, 1)
+            XCTAssertEqual(terminal.first?.0, [host])
+            XCTAssertEqual(terminal.first?.1, .claudeSizeFailure(.init(
+                kind: .inputContextRejected, source: .localCLIRejection, conversationID: "overfull"
+            )))
+            XCTAssertFalse(events.contains { event in
+                if case let .stream(value) = event { return value.text == "Prompt is too long" }
+                return false
+            })
+        }
+    }
+
+    func testUnkeyedSizeRejectionAfterKeyedNegotiationFailsClosedWithoutAdoptingProviderTurn() async throws {
+        let controller = await controller()
+        try await feed(initFrame, to: controller)
+        let host = try await controller.sendUserMessage("host input")
+        try await feed(syntheticSizeRejection(), to: controller)
+        var rejected = result(text: "Prompt is too long")
+        rejected["is_error"] = true
+        rejected["duration_api_ms"] = 0
+        rejected["api_error_status"] = NSNull()
+        rejected["terminal_reason"] = "blocking_limit"
+        try await feed(rejected, to: controller)
+        let events = await failureEvents(controller)
+        let terminal = completions(events)
+        XCTAssertEqual(terminal.count, 1)
+        XCTAssertEqual(terminal.first?.0, [host])
+        XCTAssertEqual(terminal.first?.1, .failed)
+        XCTAssertFalse(events.contains { if case .providerTurnStarted = $0 { return true }
+            return false
+        })
+    }
+
+    private func syntheticSizeRejection() -> [String: Any] {
+        ["type": "assistant", "error": "invalid_request", "session_id": "overfull", "message": [
+            "model": "<synthetic>", "content": [["type": "text", "text": "Prompt is too long"]]
+        ]]
+    }
+
     private func result(_ ids: [UUID]? = nil, text: String = "answer") -> [String: Any] {
         var frame: [String: Any] = ["type": "result", "subtype": "success", "num_turns": 0, "result": text]
         if let ids {
