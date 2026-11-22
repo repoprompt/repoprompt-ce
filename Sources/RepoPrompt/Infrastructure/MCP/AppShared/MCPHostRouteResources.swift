@@ -503,6 +503,21 @@ final class MCPHostRouteResources {
         catalog?.hostTransport === candidate
     }
 
+    /// Resolve only through the installed catalog's canonical execution adapter. The caller
+    /// still checks the returned writer against the connection's immutable binding receipt.
+    func resolveHostModelEndpoint(_ metadata: MCPRequestMetadata) -> ModelEndpoint? {
+        guard catalogHandle != nil, !isClosing else { return nil }
+        return catalog?.hostModelEndpoint?(metadata)
+    }
+
+    var workspaceStorageDirectory: URL {
+        domainRuntime.configuration.workspaceStorageDirectory
+    }
+
+    var domainRuntimeIdentity: DomainRuntimeIdentity {
+        domainRuntime.identity
+    }
+
     /// A provider start, not a window joining or a catalog being registered, requests the
     /// process listener. Transport startup cannot transfer admission to a replacement catalog.
     func ensureHostProviderTransport() async -> Bool {

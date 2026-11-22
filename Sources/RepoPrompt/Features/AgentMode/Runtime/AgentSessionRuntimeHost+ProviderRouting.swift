@@ -2,6 +2,25 @@ import Foundation
 import RepoPromptDomainRuntime
 
 extension AgentSessionRuntimeHost {
+    /// Route registration contributes the original writer incarnation; workspace/tab identifiers
+    /// alone are insufficient when the carrier displays another transcript.
+    func hostFileCommand(_ connection: MCPHostRouteResources.FileReadConnection) -> AgentSessionRuntimeStore.Command? {
+        guard let sessionID = connection.lookupSource.activeAgentSessionID, let runID = connection.runID,
+              let activation = workspaceActivation, activation.owns(scope: scope, route: route),
+              activation.savedCarrierSessionID == connection.savedCarrierSessionID,
+              route.fileReadConnectionIsCurrent(connection),
+              let session = scope.sessions[connection.context.contextID], session.runID == runID,
+              connection.runAttemptIDAtBinding.map({ $0 == session.activeRunAttemptID }) ?? true,
+              let command = try? scope.admit(session: session, expectedWorkspaceID: connection.context.workspaceID),
+              command.identity == connection.writerAtBinding, command.identity.sessionID == sessionID,
+              connection.lookupSource.worktreeBindingState.bindings == session.worktreeBindings else { return nil }
+        if let origin = AgentSelfMCPCallOrigin.current {
+            guard origin.runID == runID, origin.runAttemptID == session.activeRunAttemptID,
+                  scope.linkExecution?.agentSessionLinkObserverEndpoint(tabID: session.tabID) == origin.endpoint else { return nil }
+        }
+        return command
+    }
+
     /// Policy issuance captures the originating writer and startup before the provider connects.
     /// The returned resolver may read fresh canonical bytes only for that same carrier.
     func captureProviderContext(runID: UUID, tabID: UUID?) -> MCPHostRouteResources.ProviderContextResolver? {

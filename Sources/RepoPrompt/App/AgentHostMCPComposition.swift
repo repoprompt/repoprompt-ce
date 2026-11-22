@@ -140,7 +140,13 @@ extension MCPHostRouteResources {
         do {
             _ = try await registerCatalog(MCPAppToolCatalogRegistration(
                 windowID: identity.routeID, providers: [], sharedBindings: bindings, runtime: binder,
-                hostInteractionAdapter: interactions, hostTransport: service
+                hostInteractionAdapter: interactions, hostTransport: service, hostModelEndpoint: { [weak self] metadata in
+                    guard let invocation = self?.canonicalHostInvocation(metadata),
+                          let endpoint = invocation.host.scope.linkExecution?.agentSessionLinkObserverEndpoint(
+                              tabID: invocation.command.writer.session.tabID
+                          ) else { return nil }
+                    return .init(endpoint: endpoint, writer: invocation.command.identity)
+                }
             ))
         } catch RegistrationFailure.differentCatalog {
             guard usesHostCapabilities, await hasActiveCatalog(), hasHostTransport(service) else {

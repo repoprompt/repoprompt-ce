@@ -8,25 +8,6 @@ import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 extension AgentSessionRuntimeHost {
-    /// Route registration contributes the original writer incarnation; workspace/tab identifiers
-    /// alone are insufficient when the carrier displays another transcript.
-    func hostFileCommand(_ connection: MCPHostRouteResources.FileReadConnection) -> AgentSessionRuntimeStore.Command? {
-        guard let sessionID = connection.lookupSource.activeAgentSessionID, let runID = connection.runID,
-              let activation = workspaceActivation, activation.owns(scope: scope, route: route),
-              activation.savedCarrierSessionID == connection.savedCarrierSessionID,
-              route.fileReadConnectionIsCurrent(connection),
-              let session = scope.sessions[connection.context.contextID], session.runID == runID,
-              connection.runAttemptIDAtBinding.map({ $0 == session.activeRunAttemptID }) ?? true,
-              let command = try? scope.admit(session: session, expectedWorkspaceID: connection.context.workspaceID),
-              command.identity == connection.writerAtBinding, command.identity.sessionID == sessionID,
-              connection.lookupSource.worktreeBindingState.bindings == session.worktreeBindings else { return nil }
-        if let origin = AgentSelfMCPCallOrigin.current {
-            guard origin.runID == runID, origin.runAttemptID == session.activeRunAttemptID,
-                  scope.linkExecution?.agentSessionLinkObserverEndpoint(tabID: session.tabID) == origin.endpoint else { return nil }
-        }
-        return command
-    }
-
     func makeHostFileReadResources(_ lease: AgentHostWorkspaceResources.Lease) -> MCPFileReadResources {
         .init(workspace: lease, settings: .shared, contentEffects: .init(
             artifact: { [weak self] requested, translated, start, count, _, lookup in
@@ -66,7 +47,7 @@ extension AgentSessionRuntimeHost {
         guard ["full", "slices", "codemap_only"].contains(mode) else { throw MCPError.invalidParams("Unknown selection mode") }
         let codeMapsDisabled = GlobalSettingsStore.shared.globalCodeMapsDisabled()
         if codeMapsDisabled, mode == "codemap_only" || op == "demote" {
-            throw MCPError.invalidParams(MCPServerViewModel.codeMapsGloballyDisabledMCPMessage)
+            throw MCPError.invalidParams(MCPSelectionArguments.codeMapsGloballyDisabledMCPMessage)
         }
         guard let activation = workspaceActivation else { throw MCPFileToolAuthorityFailure.unavailable }
         let origin = try await captureHostFileInvocation(invocation)
@@ -76,7 +57,7 @@ extension AgentSessionRuntimeHost {
         if op != "get" { _ = await store.awaitAppliedIngress(rootScope: lookup.rootScope) }
         try Task.checkCancellation()
         let physical = lookup.physicalizeSelection(tab.selection)
-        var input = MCPServerViewModel.parseSavedOrVisibleSelectionInputs(
+        var input = MCPSelectionArguments.parse(
             rawPaths: args["paths"]?.arrayValue?.compactMap(\.stringValue) ?? [], slicesValue: args["slices"]
         )
         let isArtifact = { (path: String) in path == "_git_data" || path.hasPrefix("_git_data/") }
@@ -155,7 +136,7 @@ extension AgentSessionRuntimeHost {
     }
 
     private func computeHostSelection(
-        op: String, mode: String, physical: StoredSelection, paths: [String], input: MCPServerViewModel.ManageSelectionInputs,
+        op: String, mode: String, physical: StoredSelection, paths: [String], input: MCPSelectionArguments.Inputs,
         slices: [WorkspaceSelectionSliceInput], service: WorkspaceSelectionMutationService, rootScope: WorkspaceLookupRootScope
     ) async throws -> (selection: StoredSelection, invalid: [String]) {
         switch op {

@@ -30,17 +30,16 @@ extension AgentSessionRuntimeHost {
         domain: DomainReadInvocationContext, effects: MCPDomainReadSideEffectEmitter
     ) async throws -> Value {
         let origin = try await captureHostFileInvocation(invocation)
-        let runtime = AppDomainRuntimeComposition.shared.runtime
         let snapshot = origin.lease.snapshot
         guard let activation = workspaceActivation, let handle = domain.handle,
-              handle.context == origin.connection.context, handle.runtimeID == runtime.identity.runtimeID,
-              handle.runtimeGeneration == runtime.identity.lifecycleGeneration,
+              handle.context == origin.connection.context, handle.runtimeID == route.domainRuntimeIdentity.runtimeID,
+              handle.runtimeGeneration == route.domainRuntimeIdentity.lifecycleGeneration,
               handle.workspaceRevision == snapshot.revisions.workingRevision
         else {
             throw MCPFileToolAuthorityFailure.superseded
         }
         let workspace = try JSONDecoder().decode(WorkspaceModel.self, from: snapshot.document.documentBytes)
-        let directory = WorkspaceSessionSidecarMigration.workspaceDirectory(for: workspace, root: runtime.configuration.workspaceStorageDirectory)
+        let directory = WorkspaceSessionSidecarMigration.workspaceDirectory(for: workspace, root: route.workspaceStorageDirectory)
         let files = origin.lease.resources.files
         let requireCurrent = origin.requireCurrent
         let identity = WorkspaceSelectionIdentity(workspaceID: workspace.id, tabID: origin.tab.id)
@@ -98,9 +97,8 @@ extension AgentSessionRuntimeHost {
         guard usesAlias || paths.contains(where: { $0.hasPrefix("/") && $0.contains("/_git_data/") }) else { return nil }
         let invocation = try MCPInvocationContextBridge.require(toolName: MCPWindowToolName.readFile, expectedWindowID: routeID)
         let origin = try await captureHostFileInvocation(invocation)
-        let runtime = AppDomainRuntimeComposition.shared.runtime
         let workspace = try JSONDecoder().decode(WorkspaceModel.self, from: origin.lease.snapshot.document.documentBytes)
-        let directory = WorkspaceSessionSidecarMigration.workspaceDirectory(for: workspace, root: runtime.configuration.workspaceStorageDirectory)
+        let directory = WorkspaceSessionSidecarMigration.workspaceDirectory(for: workspace, root: route.workspaceStorageDirectory)
         let artifactRoot = directory.appendingPathComponent("_git_data", isDirectory: true).standardizedFileURL.path
         guard usesAlias || paths.contains(where: { StandardizedPath.isDescendant($0, of: artifactRoot) }) else { return nil }
         let denied = MCPError.invalidParams("Cannot read '\(requested)'. Git-data artifacts must already be selected and authorized.")
@@ -129,9 +127,8 @@ extension AgentSessionRuntimeHost {
     }
 
     func hostGitArtifactCapability(for origin: HostFileInvocation) async throws -> SelectedGitArtifactCapability? {
-        let runtime = AppDomainRuntimeComposition.shared.runtime
         let workspace = try JSONDecoder().decode(WorkspaceModel.self, from: origin.lease.snapshot.document.documentBytes)
-        let directory = WorkspaceSessionSidecarMigration.workspaceDirectory(for: workspace, root: runtime.configuration.workspaceStorageDirectory)
+        let directory = WorkspaceSessionSidecarMigration.workspaceDirectory(for: workspace, root: route.workspaceStorageDirectory)
         return await Self.hostGitArtifactCapability(for: origin, directory: directory)
     }
 
