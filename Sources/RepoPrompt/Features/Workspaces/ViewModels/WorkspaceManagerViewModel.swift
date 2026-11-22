@@ -7389,7 +7389,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             #if DEBUG
                 let preloadUnloadStartMS = restorePerfRecorder.timestampMSIfEnabled()
             #endif
-            await fileManager.unloadAllRootFolders()
+            await fileManager.detachAllRootFolderPresentations()
             rootsUnloadedBeforeFolderLoad = true
             markWorkspaceSwitchRootsUnloaded(operationID)
             if let cancellation = cancellationResult(
@@ -16083,7 +16083,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             #if DEBUG
                 let initialUnloadStartMS = restorePerfRecorder.timestampMSIfEnabled()
             #endif
-            await fileManager.unloadAllRootFolders()
+            await fileManager.detachAllRootFolderPresentations()
             onInitialRootUnloadCompleted?()
             #if DEBUG
                 restorePerfRecorder.event(

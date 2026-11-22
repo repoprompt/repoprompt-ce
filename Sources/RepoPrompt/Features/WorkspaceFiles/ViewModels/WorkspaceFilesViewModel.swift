@@ -6565,11 +6565,15 @@ class WorkspaceFilesViewModel: ObservableObject {
     func unloadAllRootFolders() async {
         let signpost = WorkspaceExitPerf.begin("unloadAllRootFolders")
         defer { WorkspaceExitPerf.end("unloadAllRootFolders", signpost) }
-        await unloadAllRootFoldersFast()
+        await unloadAllRootFoldersFast(preservingRetainedLifetimes: false)
+    }
+
+    func detachAllRootFolderPresentations() async {
+        await unloadAllRootFoldersFast(preservingRetainedLifetimes: true)
     }
 
     @MainActor
-    private func unloadAllRootFoldersFast() async {
+    private func unloadAllRootFoldersFast(preservingRetainedLifetimes: Bool) async {
         invalidateAllRootLoadTokens()
         currentFolderLoadingTask?.cancel()
         currentFolderLoadingTask = nil
@@ -6630,7 +6634,11 @@ class WorkspaceFilesViewModel: ObservableObject {
         await clearPathResolutionCaches()
         await Task.yield()
 
-        await workspaceFileContextStore.unloadRoots(ids: storeRootsToUnload.map(\.id))
+        if preservingRetainedLifetimes {
+            await workspaceFileContextStore.detachRootPresentations(ids: storeRootsToUnload.map(\.id))
+        } else {
+            await workspaceFileContextStore.unloadRoots(ids: storeRootsToUnload.map(\.id))
+        }
 
         // Identity-pinned teardowns own their Store unloads; join them before the final reset.
         while let teardown = rootTeardownsByRootKey.values.first {
