@@ -140,6 +140,8 @@ package struct AIStreamResult {
     /// Stable provider message identifier for content chunks when available.
     /// Used by lightweight aggregators to separate whole-message chunks without affecting token deltas.
     package let contentMessageID: String?
+    /// Native transport proof attached only to an attributed Claude compact boundary.
+    package var nativeCompactInputID: UUID?
     /// Optional provider conversation cleanup handle, used for best-effort Oracle cleanup.
     package let cleanupHandle: ProviderConversationCleanupHandle?
 

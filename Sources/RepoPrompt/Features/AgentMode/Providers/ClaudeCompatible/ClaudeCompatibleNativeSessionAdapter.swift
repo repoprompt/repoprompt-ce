@@ -121,6 +121,10 @@ actor ClaudeCompatibleNativeSessionAdapter: NativeAgentRuntimeControlling, MCPRu
         try await controller.sendUserMessage(text)
     }
 
+    func sendIsolatedCompact(expectedConversation: String) async throws -> UUID {
+        try await controller.sendIsolatedCompact(expectedConversation: expectedConversation)
+    }
+
     func interruptTurn(reason: String) async -> NativeAgentRuntimeInterruptOutcome {
         await controller.interruptTurn(reason: reason)
     }

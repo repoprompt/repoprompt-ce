@@ -15,7 +15,8 @@ extension AgentModeViewModel {
             liveSelectedFileCount: liveSelectedFileCount,
             liveSelectionSummary: liveSelectionSummary,
             selectedAgent: selectedAgent,
-            selectedModelRaw: selectedModelRaw
+            selectedModelRaw: selectedModelRaw,
+            claudeWakePressure: activeSession.flatMap { .init(session: $0) }
         )
     }
 }

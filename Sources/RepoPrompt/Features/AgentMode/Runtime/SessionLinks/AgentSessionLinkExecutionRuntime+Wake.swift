@@ -321,7 +321,11 @@ extension AgentSessionLinkExecutionRuntime {
 
             agentSelfCompactSettleStaleParkedNote(session)
             if attempt.isPeriodic {
-                await agentSessionLinkRunPeriodicAttempt(attempt, session: session)
+                switch await agentSessionLinkPrepareClaudeWake(attempt, session: session) {
+                case .unchanged: await agentSessionLinkRunPeriodicAttempt(attempt, session: session)
+                case .recheckAfterCompaction: continue
+                case .withholdWake: cancelWakeAfterClaudeMaintenance(wakeID: wakeID, endpoint: endpoint, session: session)
+                }
                 return
             }
             guard let route = agentSessionLinkAutoWakeRoute(session, refusalPhase: attempt.phase) else {
@@ -366,6 +370,15 @@ extension AgentSessionLinkExecutionRuntime {
             ) else {
                 cancelAgentSessionLinkAutoWake(for: endpoint, reason: .eligibilityLost)
                 return
+            }
+            if route == .idleFollowUp, let current = session.oversight.pendingAutoWake {
+                switch await agentSessionLinkPrepareClaudeWake(current, session: session) {
+                case .unchanged: break
+                case .recheckAfterCompaction: continue
+                case .withholdWake:
+                    cancelWakeAfterClaudeMaintenance(wakeID: wakeID, endpoint: endpoint, session: session)
+                    return
+                }
             }
             // Reserve the exact rendered lane batch before provider preparation. Budget omission,
             // receipt competition, revocation, and membership drift therefore remain definite
@@ -457,6 +470,17 @@ extension AgentSessionLinkExecutionRuntime {
                 endpoint: endpoint
             )
             return
+        }
+    }
+
+    private func cancelWakeAfterClaudeMaintenance(
+        wakeID: UUID, endpoint: DomainAgentSessionLinkEndpointIdentity, session: TabSession
+    ) {
+        guard agentSessionLinkAutoWakeSession(for: endpoint) === session,
+              session.oversight.pendingAutoWake?.wakeID == wakeID else { return }
+        cancelAgentSessionLinkAutoWake(for: endpoint, reason: .requiredClaimUnavailable)
+        if session.oversight.periodicIdleWakeEnabled {
+            agentSessionLinkReconcilePeriodicWake(for: endpoint)
         }
     }
 

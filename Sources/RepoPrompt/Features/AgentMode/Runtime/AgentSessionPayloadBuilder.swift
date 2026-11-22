@@ -137,6 +137,7 @@ enum AgentSessionPayloadBuilder {
         agentSession.codexReasoningEffort = session.codexReasoningEffort
         agentSession.codexContextWindow = session.codexContextUsage?.modelContextWindow
         agentSession.contextWindowCapacity = session.contextWindowCapacity
+        agentSession.claudeWakeCompactionSpentConversation = session.claudeWakeCompactionSpentConversation
         agentSession.codexLastTotalTokens = session.codexContextUsage?.lastTotalTokens
         agentSession.codexTotalTotalTokens = session.codexContextUsage?.totalTotalTokens
     }

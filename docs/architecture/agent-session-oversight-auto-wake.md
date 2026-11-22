@@ -148,6 +148,23 @@ commands, self-compaction settlement and composer claims remain required composi
 legacy app adapter still supplies those inputs; this relocation alone does not make the saved-session
 execution host independent of windows.
 
+Claude Code proactive compaction runs inside the existing wake producer, before it reserves any
+prompt claim. This applies to automatic idle lane updates (including attention) and periodic wakes,
+not `Wake now`, waiting continuations, or local sends. The threshold defaults to 80% of the
+provider-vouched effective window, with an earlier trigger if the bounded wake and output reserve
+would not fit. The context pill shows measured pressure. Billing totals, restored counts, and
+unverified windows never qualify. The session's existing save keeps one spent reservation per
+provider conversation, shared with provider-initiated compaction boundaries. Only verified low load
+(at most 60%, with room for the reserve) rearms that episode; a fresh conversation with its own
+live measurement has its own budget. A process restart or new lane fingerprint cannot rearm it.
+
+This path sends only native `/compact` against the same live Claude controller. It cannot start a
+replacement process, interrupt a turn, acknowledge a lane batch, or consume a staged handoff. A
+successful drained command with a compact boundary re-enters wake admission; an absent
+post-compact measurement is not reported as headroom. An unverified compact, or a result that still
+shows high pressure, withholds that wake attempt without consuming the notices. This is not a
+context-exhaustion hold: future eligible wakes still use their ordinary policy.
+
 The lane board is derived data in the existing passive observation pipeline, not a fifth owner. The target view model combines its own run outcome, stamped failure reason, send-readiness blockers, and a current child-session census into the observation snapshot; the runtime bridge publishes that snapshot through link authority, and `poll`/`wait` render it. A board change can advance the existing `wait(until: "change")` cursor, but it creates no new status or attention edge for the passive reducer, changes no Auto-wake admission rule, and persists no board state.
 
 Existing managed-link status and attention rows also carry cached `context_used_percent`,
