@@ -207,7 +207,8 @@ extension AgentSessionLinkRuntimeBridge {
             scopes.notifyOverseeContinuation(
                 sessionID: observer.sessionID, tabID: observer.tabID, requestID: requestID,
                 result: "oversee target=\(targetSessionID.uuidString); \(result)", continuing: continuing,
-                deliveredNothing: deliveredNothing
+                deliveredNothing: deliveredNothing,
+                outcome: result.components(separatedBy: ";").first, targetSessionID: targetSessionID
             )
         }
         func finish(_ code: String, subreason: String, detail: String, applied: Bool = false, retryable: Bool = false, continuing: Bool = false) {

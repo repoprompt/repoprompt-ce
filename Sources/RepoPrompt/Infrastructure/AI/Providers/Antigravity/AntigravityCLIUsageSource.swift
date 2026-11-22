@@ -29,7 +29,9 @@ enum AntigravityCLIUsageSource {
                 environment: environment,
                 workingDirectory: root.path
             )
-        } catch { throw ProviderQuotaReadError.antigravityCLIUnavailable }
+        } catch {
+            throw launchFailure(for: error)
+        }
 
         let result: Result<ProviderQuotaSnapshot, any Error>
         do {
@@ -41,6 +43,10 @@ enum AntigravityCLIUsageSource {
         }.value
         try Task.checkCancellation()
         return try result.get()
+    }
+
+    static func launchFailure(for error: any Error) -> ProviderQuotaReadError {
+        .antigravityCLILaunchFailed(reason: AntigravityLaunchDiagnostic.message(for: error) ?? "Could not start Antigravity.")
     }
 
     static func collectionSettings(helper: URL, runDirectory: URL) throws -> String {
