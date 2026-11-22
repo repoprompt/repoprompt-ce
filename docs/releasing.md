@@ -110,11 +110,10 @@ retain the process-wide active selection until relaunch. Model availability cont
 come from runtime metadata and existing explicit model selections are not rewritten.
 External version validation uses the captured launch environment, including its interpreter
 search path.
-RepoPrompt rejects custom executables older than 0.149.0, the last proven external
-compatibility floor. This is intentionally distinct from the exact bundled and schema-gate
-pin at 0.170.0: the bounded app-server projection passes unchanged at 48 methods,
-230 parameter paths, and 143 response paths, and this bundle rotation adds no new
-outgoing request requirement. Bundled and external runtimes both use
+RepoPrompt rejects custom executables older than 0.155.0, the first stable Codex minor
+with the rollout writer locks needed for safe background compression in a shared home.
+This storage compatibility floor is distinct from the bundled and schema-gate pin.
+Bundled and external runtimes both use
 RepoPrompt-owned `CODEX_HOME` and `CODEX_SQLITE_HOME` directories under
 `~/Library/Application Support/RepoPrompt CE/Codex/{Debug,Release}/`, leaving
 `~/.codex` and official Codex App state untouched.
