@@ -1119,8 +1119,13 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         try await runVisibleLifetimeWitness(switchWorkspace: false, holdFirstSave: true)
     }
 
+    func testExplicitStopStillCancelsTheVisibleHostAttempt() async throws {
+        try await runVisibleLifetimeWitness(switchWorkspace: false, explicitStop: true)
+    }
+
     private func runVisibleLifetimeWitness(
-        switchWorkspace: Bool, failFinalSave: Bool = false, leaveOtherWindowOpen: Bool = false, holdFirstSave: Bool = false
+        switchWorkspace: Bool, failFinalSave: Bool = false, leaveOtherWindowOpen: Bool = false,
+        holdFirstSave: Bool = false, explicitStop: Bool = false
     ) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("VisibleAgentLifetime-\(UUID())")
         let root = directory.appendingPathComponent("original-root")
@@ -1236,6 +1241,24 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             XCTAssertTrue(resources.isCurrent)
             XCTAssertFalse(host.route.isClosing)
             XCTAssertEqual(provider.promptedMessages.count, 1)
+        }
+
+        if explicitStop {
+            let stopFence = AgentRunStartStopFence(session: session)
+            let target = agent.makeRunCancelTarget(tabID: tab.id, session: session)
+            let stop = Task { await agent.cancelAgentRun(target: target) }
+            try await AsyncTestWait.waitUntil("explicit Stop fences the exact accepted turn") { !stopFence.permitsStart(of: session) }
+            gate.release()
+            let didStop = await stop.value
+            XCTAssertTrue(didStop)
+            await task.value
+            XCTAssertEqual(session.runState, .cancelled)
+            XCTAssertEqual(session.lastTerminalCommitRevision?.ownership.attemptID, attemptID)
+            XCTAssertEqual(try host.scope.admit(session: session).identity, command.identity)
+            XCTAssertFalse(host.scope.isRetiring)
+            XCTAssertFalse(host.route.isClosing)
+            XCTAssertEqual(provider.promptedMessages.count, 1)
+            return
         }
 
         let otherWindow: WindowState?
@@ -1424,6 +1447,13 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
     ) async throws {
         let sessionID = try XCTUnwrap(session.activeAgentSessionID)
         let manager = WindowStatesManager.shared
+        let originalWriter = try host.scope.admit(session: session).writer
+        let originalRun = try XCTUnwrap(session.runID)
+        let originalAttempt = try XCTUnwrap(session.activeRunAttemptID)
+        let oldStop = AgentRunCancelTarget(
+            tabID: session.tabID, expectedRunID: originalRun, expectedActiveAgentSessionID: sessionID,
+            expectedRunAttemptID: originalAttempt, expectedPendingUserInputReceipt: nil
+        )
         let saved = host.scope.persistence.saver
         let recoveryGate = AutoWakeCatalogAuthorityGate()
         var writes = 0
@@ -1454,10 +1484,13 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         let window = makeVisibleLifetimeWindow(runtime: runtime, providerResources: providerResources)
         try await activateVisibleLifetimeWorkspace(workspace, in: window, expectsHost: false)
         var visited: [Int] = []
+        var staleIntent: UUID?
         for index in [1, 2] {
-            let result = await window.navigateAgentDeepLinkTab(session.tabID, sessionID: sessionID, workspaceID: workspace.id) {
-                visited.append(index)
-            }
+            let intent = try XCTUnwrap(manager.beginRuntimeVisitIntent(sessionID))
+            if index == 1 { staleIntent = intent }
+            let result = await window.navigateAgentDeepLinkTab(
+                session.tabID, sessionID: sessionID, workspaceID: workspace.id, existingVisitIntent: intent
+            ) { visited.append(index) }
             XCTAssertEqual(result, .blockedByActiveDifferentSession)
         }
         XCTAssertEqual(writes, 1, "Neither passive inventory nor a visit retries storage")
@@ -1483,6 +1516,25 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         let successor = try XCTUnwrap(window.agentModeViewModel.sessions[session.tabID])
         XCTAssertFalse(successor === session)
         XCTAssertEqual(successor.activeAgentSessionID, sessionID)
+        let successorHost = window.agentModeViewModel.runtimeHost
+        let successorWriter = try successorHost.scope.admit(session: successor).writer
+        let successorRevision = successor.sourceItemsRevision
+        XCTAssertNotEqual(successorWriter.identity, originalWriter.identity)
+        XCTAssertFalse(originalWriter.ownsPersistentClaim)
+
+        await host.scope.stream.handleStreamResult(
+            AIStreamResult(type: "final_content", text: "late predecessor output"),
+            session: session, runID: originalRun, runAttemptID: originalAttempt
+        )
+        let stopped = await window.agentModeViewModel.cancelAgentRun(target: oldStop)
+        XCTAssertFalse(stopped)
+        let staleVisit = try await window.navigateAgentDeepLinkTab(
+            session.tabID, sessionID: sessionID, workspaceID: workspace.id, existingVisitIntent: XCTUnwrap(staleIntent)
+        ) { XCTFail("A stale visit must not publish after a same-ID replacement") }
+        XCTAssertEqual(staleVisit, .blockedByActiveDifferentSession)
+        XCTAssertEqual(successor.sourceItemsRevision, successorRevision)
+        XCTAssertTrue(successorWriter.isCurrent)
+        XCTAssertTrue(window.agentModeViewModel.sessions[session.tabID] === successor)
         let stored = try await AgentSessionDataService.shared.loadAgentSession(id: sessionID, for: workspace)
         XCTAssertEqual(try XCTUnwrap(stored?.transcript).turns.compactMap { $0.request?.text }, [prompt])
     }
