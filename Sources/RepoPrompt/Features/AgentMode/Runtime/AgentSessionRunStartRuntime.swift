@@ -97,7 +97,7 @@ final class AgentSessionRunStartRuntime {
         }
         func isCurrent() -> Bool {
             guard owner.sessions[tabID] === session, !owner.isRetiring, !owner.hasReleasedWriterClaims,
-                  overflowInputIsAllowed(), resourcesAreCurrent() else { return false }
+                  overflowInputIsAllowed(), resourcesAreCurrent(), startOutcome?.allowsStartup() != false else { return false }
             if let writer { return writer.isCurrent }
             // A blank draft has no persistent Writer yet. Its slot still has exact provenance:
             // preparation must not adopt a remove/re-add of the same unbound object.
@@ -297,11 +297,13 @@ final class AgentSessionRunStartRuntime {
         }
         var inputSources = providerSwitchPreparation?.inputSources ?? []
         func inputIsCurrent() -> Bool {
-            command.isCurrent && resourcesAreCurrent() && stopFence.permitsStart(of: session) && periodicStartIsCurrent()
+            startOutcome?.allowsStartup() != false && command.isCurrent && resourcesAreCurrent()
+                && stopFence.permitsStart(of: session) && periodicStartIsCurrent()
                 && inputSources.allSatisfy { $0.isCurrent() }
         }
         func runInputIsCurrent() -> Bool {
-            directStartOptions.providerControlCommand?.claudeWakeCompaction?.isCurrent(for: session) != false
+            startOutcome?.allowsStartup() != false
+                && directStartOptions.providerControlCommand?.claudeWakeCompaction?.isCurrent(for: session) != false
                 && periodicStartIsCurrent() && stopFence.permitsStart(of: session) && command.isCurrent && resourcesAreCurrent()
                 && session.operationAdmissionFailureMessage == nil && inputSources.allSatisfy { $0.isCurrent() }
         }

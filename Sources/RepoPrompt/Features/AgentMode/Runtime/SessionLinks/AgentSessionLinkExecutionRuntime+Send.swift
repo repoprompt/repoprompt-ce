@@ -520,7 +520,8 @@ extension AgentSessionLinkExecutionRuntime {
             workflow: request.workflow,
             attribution: request.attribution,
             stopFence: stopFence,
-            providerSwitchPreparation: switchPreparation
+            providerSwitchPreparation: switchPreparation,
+            linkReference: .init(linkID: request.linkID, generation: request.linkGeneration)
         ) {
             let dispatchLiveness = liveness()
             guard self.agentSessionLinkLiveSession(matching: candidate) === liveSession,
@@ -552,6 +553,7 @@ extension AgentSessionLinkExecutionRuntime {
         attribution: AgentCrossSessionAttribution?,
         stopFence: AgentRunStartStopFence,
         providerSwitchPreparation: ProviderSwitchSendPreparation? = nil,
+        linkReference: DomainAgentSessionLinkReference? = nil,
         dispatchIsCurrent: @MainActor () -> Bool
     ) async -> AgentSessionLinkSendTransactionOutcome {
         guard let owner = scope, !owner.hasReleasedWriterClaims, !owner.isRetiring else {
@@ -578,6 +580,22 @@ extension AgentSessionLinkExecutionRuntime {
         }
         defer { withExtendedLifetime(command) {} }
         let writer = command.writer
+        // Committed input remains the target's durable row. On a visible canonical host the
+        // link generation owns only its pending provider start and the attempt it actually makes.
+        let managedStart: LinkStartedAttempt?
+        if let linkReference, owner.executableHost?.route.identity.kind == .independent,
+           let activation = owner.executableHost?.workspaceActivation, activation.savedCarrierSessionID == nil
+        {
+            managedStart = LinkStartedAttempt(reference: linkReference, writer: command.identity)
+            liveSession.linkStartedAttempt = managedStart
+        } else {
+            managedStart = nil
+        }
+        defer {
+            if let managedStart, managedStart.ownership == nil, liveSession.linkStartedAttempt === managedStart {
+                liveSession.linkStartedAttempt = nil
+            }
+        }
         var switchPreparation = providerSwitchPreparation
         if liveSession.pendingHandoff.providerSwitchDelivery != nil, switchPreparation == nil {
             let input = liveSession.isCodexComputerUseArmed
@@ -647,6 +665,7 @@ extension AgentSessionLinkExecutionRuntime {
             session: liveSession, tabID: tabID, claim: claim, savedItemID: userItem.id,
             acceptedAt: Date(), providerMessage: providerMessage, stopFence: stopFence,
             providerSwitchPreparation: switchPreparation,
+            managedStart: managedStart,
             dispatchIsCurrent: dispatchIsCurrent
         )
     }
@@ -656,6 +675,7 @@ extension AgentSessionLinkExecutionRuntime {
         savedItemID: UUID, acceptedAt: Date, providerMessage: String,
         stopFence: AgentRunStartStopFence,
         providerSwitchPreparation: ProviderSwitchSendPreparation? = nil,
+        managedStart: LinkStartedAttempt? = nil,
         dispatchIsCurrent: @MainActor () -> Bool
     ) async -> AgentSessionLinkSendTransactionOutcome {
         let persistedOnly = AgentSessionLinkSendDelivery(
@@ -682,8 +702,8 @@ extension AgentSessionLinkExecutionRuntime {
         // would otherwise let a tab-resolved start dispatch this turn against whatever now occupies
         // the tab — possibly a replacement binding the grant never covered.
         //
-        // The probe is deliberately endpoint/window liveness only and never link liveness: manual
-        // revocation is *intended* to lose once the commit fence has been won.
+        // Endpoint liveness and provider-start authority are separate. An explicit revocation
+        // on this canonical host can withdraw a pending start without rolling back the row.
         //
         // Drift retains the durable delivery and withholds only the provider start: the row is
         // already the target's, so rolling it back here would contradict the linearization point and
@@ -695,7 +715,7 @@ extension AgentSessionLinkExecutionRuntime {
               liveSession.permitsBoundOperationAndSave,
               providerSwitchPreparation.map({ providerSwitchPreparationIsCurrent($0, session: liveSession) })
               ?? (liveSession.pendingHandoff.providerSwitchDelivery == nil),
-              dispatchIsCurrent()
+              managedStart?.isRevoked != true, dispatchIsCurrent()
         else {
             releaseComposerSubmitClaim(claim)
             return .delivered(persistedOnly)
@@ -729,7 +749,10 @@ extension AgentSessionLinkExecutionRuntime {
         }
         // The run service's `nil` return is "not a Codex native send", not "started", so the
         // recorder is what distinguishes a Claude/ACP/headless pre-start failure from success.
-        let startRecorder = AgentRunStartOutcomeRecorder()
+        let startRecorder = AgentRunStartOutcomeRecorder(
+            allowsStartup: { managedStart?.isRevoked != true },
+            attemptStarted: { managedStart?.ownership = $0 }
+        )
         _ = await startAgentRun(
             command: command,
             initialMessage: dispatchedProviderMessage,
@@ -749,6 +772,7 @@ extension AgentSessionLinkExecutionRuntime {
             scheduleSave(for: tabID)
         }
 
+        if managedStart?.isRevoked == true, managedStart?.ownership == nil { return .delivered(persistedOnly) }
         let resultingRunState = sessions[tabID]?.runState ?? liveSession.runState
         return .delivered(AgentSessionLinkSendDelivery(
             targetItemID: savedItemID,
@@ -756,6 +780,38 @@ extension AgentSessionLinkExecutionRuntime {
             deliveryState: startRecorder.outcome.didStart ? .runStarted : .runStartFailed,
             resultingRunState: resultingRunState.rawValue
         ))
+    }
+
+    @MainActor
+    final class LinkStartedAttempt {
+        let reference: DomainAgentSessionLinkReference
+        let writer: AgentSessionRuntimeStore.WriterIdentity
+        var ownership: AgentRunOwnership?
+        var isRevoked = false
+
+        init(reference: DomainAgentSessionLinkReference, writer: AgentSessionRuntimeStore.WriterIdentity) {
+            self.reference = reference
+            self.writer = writer
+        }
+    }
+
+    /// The authority has already withdrawn this link generation. Cancel only a turn that it
+    /// started, not a local run it observed or steered. The cleanup effect outlives the caller.
+    static func cancelRunStartedByRevokedLink(_ notice: DomainAgentSessionLinkRevocationNotice) {
+        guard notice.reason == .userRequested, let endpoint = notice.targetEndpoint,
+              case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: endpoint.sessionID, expectedWorkspaceID: endpoint.workspaceID),
+              let executor = writer.scope.linkExecution, executor.routeID == endpoint.windowID,
+              let execution = writer.scope.execution,
+              let receipt = writer.session.linkStartedAttempt, receipt.writer == writer.identity,
+              receipt.reference == .init(linkID: notice.linkID, generation: notice.generation) else { return }
+        let session = writer.session
+        receipt.isRevoked = true
+        session.linkStartedAttempt = nil
+        guard let ownership = receipt.ownership, session.activeRunOwnership == ownership else { return }
+        executor.retainManagedInputEffect(session: session, owner: writer.scope) {
+            guard writer.ownsPersistentClaim, session.activeRunOwnership == ownership else { return }
+            await execution.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted)
+        }
     }
 
     func agentSessionLinkLiveSession(

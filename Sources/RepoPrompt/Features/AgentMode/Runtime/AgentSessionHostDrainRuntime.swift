@@ -118,17 +118,20 @@ final class AgentSessionHostDrainRuntime {
         let outcome: Outcome
     }
 
+    @MainActor
     private final class Participant {
         let session: AgentTabSession
         let membership: AgentSessionRuntimeStore.Membership?
         let sessionID: UUID?
+        let overlappingDeletion: AgentSessionHostDrainRuntime?
         var provider: Adapters.Provider?
         var providerIsCurrent: (@MainActor () -> Bool)?
 
-        init(session: AgentTabSession, membership: AgentSessionRuntimeStore.Membership?, sessionID: UUID?) {
+        init(session: AgentTabSession, scope: AgentSessionRuntimeStore.Scope) {
             self.session = session
-            self.membership = membership
-            self.sessionID = sessionID
+            membership = scope.membership(of: session)
+            sessionID = session.activeAgentSessionID
+            overlappingDeletion = scope.sessionDeletionDrains[ObjectIdentifier(session)]
         }
     }
 
@@ -136,6 +139,7 @@ final class AgentSessionHostDrainRuntime {
     let recoveryID = UUID()
     private var recoveryObserver: (@MainActor (Outcome) -> Void)?
     private var participants: [Participant]
+    private let deletedSessionIdentity: ObjectIdentifier?
     /// Exact acknowledgements returned by Scope.releaseWriterClaim, not elected writers.
     private var releasedParticipants: Set<ObjectIdentifier> = []
     private var acknowledgedDeletions: Set<UUID> = []
@@ -185,25 +189,41 @@ final class AgentSessionHostDrainRuntime {
     /// Fences admission and installs strong retention synchronously, before any await.
     private init(
         scope: AgentSessionRuntimeStore.Scope, owner: AnyObject, adapters: Adapters,
-        releaseResources: @escaping @MainActor () async -> Void
+        releaseResources: @escaping @MainActor () async -> Void,
+        deletedSession: AgentTabSession? = nil
     ) {
         self.scope = scope
+        deletedSessionIdentity = deletedSession.map(ObjectIdentifier.init)
         retainedOwner = owner
         self.adapters = adapters
         self.releaseResources = releaseResources
-        participants = scope.sessions.values.map {
-            Participant(session: $0, membership: scope.membership(of: $0), sessionID: $0.activeAgentSessionID)
+        let sessions = deletedSession.map { [$0] } ?? Array(scope.sessions.values)
+        participants = sessions.map {
+            Participant(session: $0, scope: scope)
         }
-        scope.beginRetirement()
-        scope.retainDrain(self)
-        for session in scope.sessions.values {
+        if let deletedSession {
+            scope.sessionDeletionDrains[ObjectIdentifier(deletedSession)] = self
+        } else {
+            scope.beginRetirement()
+            scope.retainDrain(self)
+        }
+        for session in sessions {
             session.monitorReadinessChangePublisher.sink { [weak scope] _ in
                 Task { @MainActor [weak scope] in scope?.noteSettlementChanged() }
             }.store(in: &observations)
         }
     }
 
-    /// Final shutdown alone installs this original producer. A deadline/cancelled waiter cannot
+    /// A durable single-session deletion uses the same participant protocol, but does not
+    /// withdraw workspace admission or release the shared route/root/settings leases.
+    static func beginDeletion(
+        scope: AgentSessionRuntimeStore.Scope, session: AgentTabSession, owner: AnyObject, adapters: Adapters
+    ) -> AgentSessionHostDrainRuntime {
+        if let existing = scope.sessionDeletionDrains[ObjectIdentifier(session)] { return existing }
+        return AgentSessionHostDrainRuntime(scope: scope, owner: owner, adapters: adapters, releaseResources: {}, deletedSession: session)
+    }
+
+    /// Final shutdown installs this original producer. A deadline/cancelled waiter cannot
     /// cancel it, and repeated shutdown cannot replace it with a later session census. Ordinary
     /// presentation detach and provider logout never install a whole-host shutdown preparation.
     func prepareForFinalShutdown(
@@ -279,11 +299,15 @@ final class AgentSessionHostDrainRuntime {
               participants.contains(where: { $0.sessionID == sessionID && $0.membership?.isCurrent == true }),
               acknowledgedDeletions.insert(sessionID).inserted else { return }
         withdrawDeferredVisit(presenterID: sessionID)
-        attemptRecovery()
+        attemptRecovery(afterDeleting: sessionID)
     }
 
     /// A failed attempt is retried only by this explicit action, never a timer or inventory read.
     func attemptRecovery() {
+        attemptRecovery(afterDeleting: nil)
+    }
+
+    private func attemptRecovery(afterDeleting sessionID: UUID?) {
         guard outcome != .released else { return }
         if task != nil {
             // An explicit recovery action may recheck a non-published blocker, without
@@ -292,10 +316,12 @@ final class AgentSessionHostDrainRuntime {
             return
         }
         outcome = nil
-        sessionOutcomes = sessionOutcomes.filter { $0.value.outcome == .released }
+        if sessionID == nil {
+            sessionOutcomes = sessionOutcomes.filter { $0.value.outcome == .released }
+        }
         task = Task { [self] in
             await shutdownPreparation?.value
-            let result = await drain()
+            let result = await drain(onlyDeletedSessionID: sessionID)
             if result == .released {
                 // Keep the exact host and its release obligation retained until resource cleanup
                 // itself completes. A cancelled/deadline waiter cannot skip this producer.
@@ -317,7 +343,12 @@ final class AgentSessionHostDrainRuntime {
                 participants.removeAll()
                 releasedParticipants.removeAll()
                 retainedOwner = nil
-                scope.acknowledgeDrain()
+                if let deletedSessionIdentity {
+                    scope.sessionDeletionDrains.removeValue(forKey: deletedSessionIdentity)
+                    scope.noteSettlementChanged()
+                } else {
+                    scope.acknowledgeDrain()
+                }
                 dispatchingDeferredVisits = true
                 while let presenterID = deferredVisits.keys.first {
                     deferredVisits.removeValue(forKey: presenterID)?()
@@ -369,13 +400,22 @@ final class AgentSessionHostDrainRuntime {
         return results
     }
 
-    private func drain() async -> Outcome {
+    private func drain(onlyDeletedSessionID: UUID?) async -> Outcome {
         if participants.isEmpty, !hasEffectCapabilities {
             return .retained("Exact managed-input or self-compaction drain capability is unavailable.")
         }
-        let tasks = participants.filter { !releasedParticipants.contains(ObjectIdentifier($0.session)) }.map { participant in
+        let tasks = participants.filter {
+            !releasedParticipants.contains(ObjectIdentifier($0.session)) && (onlyDeletedSessionID == nil || $0.sessionID == onlyDeletedSessionID)
+        }.map { participant in
             Task { @MainActor [self] in
-                let result = await drainSession(participant)
+                let result: Outcome
+                if let deletion = participant.overlappingDeletion {
+                    // An overlapping Quit joins the deletion's original acknowledgement.
+                    await deletion.task?.value
+                    result = deletion.outcome ?? .retained("Session deletion drain is unsettled.")
+                } else {
+                    result = await drainSession(participant)
+                }
                 sessionOutcomes[participant.session.tabID] = .init(
                     membership: participant.membership?.identity, sessionID: participant.sessionID, outcome: result
                 )
@@ -388,6 +428,10 @@ final class AgentSessionHostDrainRuntime {
             if result != .released { failure = result }
         }
         if let failure { return failure }
+        if onlyDeletedSessionID != nil, releasedParticipants.count != participants.count {
+            return .retained("Other sessions still require explicit recovery.")
+        }
+        if deletedSessionIdentity != nil { return .released }
         // Scope resources may still have exact cleanup for an object removed before retirement.
         // Aggregate retention is distinct from each sibling's already acknowledged claim.
         guard let managedInput = adapters?.managedInput, let selfCompact = adapters?.selfCompact else {
@@ -488,7 +532,7 @@ final class AgentSessionHostDrainRuntime {
             }
             guard current() else { return .retained("The originating execution changed during final save.") }
         }
-        guard current(), scope.releaseWriterClaim(for: session) else {
+        guard current(), scope.releaseWriterClaim(for: session, afterCommittedDeletion: deletedSessionIdentity != nil) else {
             return .retained("Final synchronous settlement did not acknowledge release.")
         }
         releasedParticipants.insert(ObjectIdentifier(session))

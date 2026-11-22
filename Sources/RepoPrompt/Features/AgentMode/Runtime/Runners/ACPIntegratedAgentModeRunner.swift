@@ -241,6 +241,7 @@ final class ACPIntegratedAgentModeRunner {
         guard stopFence?.permitsStart(of: session) ?? true else { return nil }
         let binding = session.currentRestorationBindingToken
         let ownership = session.beginRunAttempt(source: "acp")
+        startOutcome?.recordNewAttempt(ownership)
         session.acpWorkspaceAdmission = AgentACPWorkspaceAdmission(input: workspace, ownership: ownership, session: session)
         let runAttemptID = ownership.attemptID
         session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .preparingRuntime)

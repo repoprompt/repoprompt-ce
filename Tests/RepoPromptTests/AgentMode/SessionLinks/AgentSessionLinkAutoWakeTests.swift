@@ -1135,13 +1135,26 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         try await runVisibleLifetimeWitness(switchWorkspace: false, detachedShutdown: .quit)
     }
 
+    func testCommittedSessionDeletionDrainsOnlyTheDetachedWriter() async throws {
+        try await runVisibleLifetimeWitness(switchWorkspace: false, detachedShutdown: .sessionDeletion)
+    }
+
+    func testExplicitRevocationCancelsTheLinkStartedVisibleAttempt() async throws {
+        try await runVisibleLifetimeWitness(switchWorkspace: false, revokeLinkStartedRun: true)
+    }
+
+    func testRevocationDuringFirstSaveKeepsDeliveredRowWithoutStartingProvider() async throws {
+        try await runVisibleLifetimeWitness(switchWorkspace: false, revokeLinkStartedRun: true, revokeDuringLinkSave: true)
+    }
+
     private enum DetachedShutdown {
-        case workspaceDeletion, quit
+        case workspaceDeletion, quit, sessionDeletion
     }
 
     private func runVisibleLifetimeWitness(
         switchWorkspace: Bool, failFinalSave: Bool = false, leaveOtherWindowOpen: Bool = false,
-        holdFirstSave: Bool = false, explicitStop: Bool = false, detachedShutdown: DetachedShutdown? = nil
+        holdFirstSave: Bool = false, explicitStop: Bool = false, detachedShutdown: DetachedShutdown? = nil,
+        revokeLinkStartedRun: Bool = false, revokeDuringLinkSave: Bool = false
     ) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("VisibleAgentLifetime-\(UUID())")
         let root = directory.appendingPathComponent("original-root")
@@ -1175,7 +1188,9 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         var tab = ComposeTabState()
         tab.activeAgentSessionID = holdFirstSave ? nil : sessionID
         var workspace = WorkspaceModel(name: "Original", repoPaths: [root.path], customStoragePath: directory.appendingPathComponent("first"))
-        workspace.composeTabs = [tab]
+        var siblingTab = ComposeTabState()
+        if revokeLinkStartedRun { siblingTab.activeAgentSessionID = UUID() }
+        workspace.composeTabs = detachedShutdown == .sessionDeletion || revokeLinkStartedRun ? [tab, siblingTab] : [tab]
         workspace.activeComposeTabID = tab.id
         let second = WorkspaceModel(name: "Other", repoPaths: [], customStoragePath: directory.appendingPathComponent("second"))
         let authority = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: 0)
@@ -1235,8 +1250,42 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         let target = try XCTUnwrap(presentedTarget)
         XCTAssertEqual(target.expectedWriterIdentity, command.identity)
         let prompt = "Retain the originating provider"
-        let submitted = await agent.submitUserTurnCreatingSessionIfNeeded(text: prompt, target: target)
-        guard submitted == .submitted else { return XCTFail("Composer did not accept the run: \(submitted)") }
+        let linkSaveGate = AutoWakeCatalogAuthorityGate()
+        let originalSaver = host.scope.persistence.saver
+        var linkSaveEntered = false
+        if revokeDuringLinkSave {
+            host.scope.persistence.saver = { payload, workspace, count in
+                linkSaveEntered = true
+                _ = await linkSaveGate.requirement()
+                return try await originalSaver(payload, workspace, count)
+            }
+        }
+        defer {
+            if revokeDuringLinkSave {
+                Task { await linkSaveGate.open() }
+                host.scope.persistence.saver = originalSaver
+            }
+        }
+        let revocation = revokeLinkStartedRun ? try await startThroughVisibleLink(
+            host: host, observerTab: siblingTab, workspace: workspace, targetSessionID: sessionID, message: prompt
+        ) : nil
+        if revokeDuringLinkSave, let revocation {
+            try await AsyncTestWait.waitUntil("hold the accepted link row at its first save") { linkSaveEntered }
+            await revocation.bridge.revokeLink(linkID: revocation.reference.linkID, generation: revocation.reference.generation)
+            await linkSaveGate.open()
+            let delivery = await revocation.delivery.value
+            guard case let .receipt(receipt) = delivery else { return XCTFail("Expected durable link delivery, got \(delivery)") }
+            XCTAssertEqual(receipt.deliveryState, .persisted)
+            XCTAssertNil(session.activeRunOwnership)
+            XCTAssertTrue(provider.promptedMessages.isEmpty)
+            let saved = try await AgentSessionDataService.shared.loadAgentSession(id: sessionID, for: workspace)
+            XCTAssertEqual(saved?.transcript?.turns.compactMap { $0.request?.text }, [prompt])
+            return
+        }
+        if revocation == nil {
+            let submitted = await agent.submitUserTurnCreatingSessionIfNeeded(text: prompt, target: target)
+            guard submitted == .submitted else { return XCTFail("Composer did not accept the run: \(submitted)") }
+        }
         try await AsyncTestWait.waitUntil("launch the originating ACP attempt") {
             session.agentTask != nil && session.runID != nil && session.acpController != nil
         }
@@ -1312,6 +1361,54 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             XCTAssertFalse(host.scope.presentation.hasPresenter(for: session))
             XCTAssertFalse(AppDelegate.shouldTerminateAfterLastWindowClosed(isBackgrounded: false))
             try assertOriginalAttempt()
+            if let revocation {
+                let fence = AgentRunStartStopFence(session: session)
+                let revoke = Task { await revocation.bridge.revokeLink(linkID: revocation.reference.linkID, generation: revocation.reference.generation) }
+                try await AsyncTestWait.waitUntil("revocation fences the exact link-started attempt") { !fence.permitsStart(of: session) }
+                gate.release()
+                await revoke.value
+                await task.value
+                await host.scope.linkExecution?.drainPendingManagedInputEffects(for: session)
+                XCTAssertEqual(session.runState, .cancelled)
+                XCTAssertEqual(session.lastTerminalCommitRevision?.ownership.attemptID, attemptID)
+                XCTAssertTrue(command.writer.ownsPersistentClaim)
+                XCTAssertNil(session.linkStartedAttempt)
+                XCTAssertFalse(host.scope.isRetiring)
+                XCTAssertTrue(host.route.hasCurrentModelCatalogRoute)
+                XCTAssertEqual(provider.promptedMessages.count, 1)
+                return
+            }
+            if detachedShutdown == .sessionDeletion {
+                let sibling = host.scope.makeSession(tabID: siblingTab.id)
+                sibling.installPersistentSessionBinding(.init(tabID: siblingTab.id, sessionID: UUID(), workspaceID: workspace.id))
+                sibling.recordRestorationAuthoritative(.persistedPayloadApplied)
+                sibling.hasLoadedPersistedState = true
+                var installed = host.scope.sessions
+                installed[sibling.tabID] = sibling
+                host.scope.replaceSessions(installed)
+                let siblingWriter = try host.scope.admit(session: sibling).identity
+                let deletion = Task { try await AgentSessionDataService.shared.deleteAgentSession(id: sessionID, for: workspace) }
+                try await AsyncTestWait.waitUntil("commit deletion and capture the detached drain") {
+                    host.scope.sessionDeletionDrains[ObjectIdentifier(session)] != nil
+                }
+                let drain = try XCTUnwrap(host.scope.sessionDeletionDrains[ObjectIdentifier(session)])
+                gate.release()
+                try await deletion.value
+                let acknowledgement = await drain.wait(until: ContinuousClock.now.advanced(by: .seconds(2)))
+                XCTAssertEqual(acknowledgement, .released)
+                XCTAssertEqual(session.runState, .cancelled)
+                XCTAssertEqual(session.lastTerminalCommitRevision?.ownership.attemptID, attemptID)
+                XCTAssertFalse(command.writer.ownsPersistentClaim)
+                XCTAssertTrue(host.scope.sessionDeletionDrains.isEmpty)
+                XCTAssertFalse(host.scope.isRetiring)
+                XCTAssertTrue(host.route.hasCurrentModelCatalogRoute)
+                XCTAssertTrue(rootLease.rootsAreCurrent)
+                XCTAssertEqual(try host.scope.admit(session: sibling).identity, siblingWriter)
+                let deleted = try await AgentSessionDataService.shared.loadAgentSession(id: sessionID, for: workspace)
+                XCTAssertNil(deleted)
+                XCTAssertEqual(provider.promptedMessages.count, 1)
+                return
+            }
             if let detachedShutdown {
                 try await assertExplicitDetachedShutdown(
                     detachedShutdown, host: host, session: session, attemptID: attemptID, workspaceID: workspace.id,
@@ -1388,12 +1485,50 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(record?.transcript).turns.compactMap { $0.request?.text }, [prompt])
     }
 
+    private func startThroughVisibleLink(
+        host: AgentSessionRuntimeHost, observerTab: ComposeTabState, workspace: WorkspaceModel, targetSessionID: UUID, message: String
+    ) async throws -> (
+        bridge: AgentSessionLinkRuntimeBridge, reference: DomainAgentSessionLinkReference,
+        delivery: Task<AgentSessionLinkRuntimeBridge.SendOutcome, Never>
+    ) {
+        let observer = host.scope.makeSession(tabID: observerTab.id)
+        let observerID = try XCTUnwrap(observerTab.activeAgentSessionID)
+        observer.installPersistentSessionBinding(.init(tabID: observerTab.id, sessionID: observerID, workspaceID: workspace.id))
+        observer.recordRestorationAuthoritative(.persistedPayloadApplied)
+        observer.hasLoadedPersistedState = true
+        observer.oversight.autoWakeOnUpdates = false
+        var installed = host.scope.sessions
+        installed[observer.tabID] = observer
+        host.scope.replaceSessions(installed)
+        let executor = try XCTUnwrap(host.scope.linkExecution)
+        let endpoint = try XCTUnwrap(executor.agentSessionLinkObserverEndpoint(tabID: observer.tabID))
+        let authority = DomainAgentSessionLinkAuthority(identity: .init(
+            runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date()
+        ))
+        let bridge = AgentSessionLinkRuntimeBridge(authority: authority, host: WindowStatesManager.shared, toolAdvertisementInvalidator: { _ in })
+        let candidates = WindowStatesManager.shared.agentSessionLinkCandidates(forSessionIDs: [observerID, targetSessionID], includeLocation: false)
+        XCTAssertEqual(candidates[observerID]?.map(\.domainEndpoint), [endpoint])
+        XCTAssertEqual(candidates[targetSessionID]?.map(\.windowID), [host.routeID])
+        let added = await bridge.addMonitorLink(observerSessionID: observerID, rawTargetSessionID: targetSessionID.uuidString)
+        guard case .added = added else {
+            XCTFail("Expected a live visible-host grant, got \(added)")
+            throw CancellationError()
+        }
+        let authorization = await bridge.authorizeTarget(operation: .monitorSend, observerEndpoint: endpoint, targetSessionID: targetSessionID)
+        let target = try authorization.get()
+        let delivery = Task { await bridge.send(target: target, message: message, idempotencyKey: UUID().uuidString, workflowReference: nil) }
+        addTeardownBlock { _ = await delivery.value }
+        return (bridge, .init(linkID: target.lease.linkID, generation: target.lease.linkGeneration), delivery)
+    }
+
     private func assertExplicitDetachedShutdown(
         _ shutdown: DetachedShutdown, host: AgentSessionRuntimeHost, session: AgentTabSession,
         attemptID: UUID, workspaceID: UUID, releaseProvider: () -> Void
     ) async throws {
         let fence = AgentRunStartStopFence(session: session)
         switch shutdown {
+        case .sessionDeletion:
+            return XCTFail("Single-session deletion must use the session data service.")
         case .workspaceDeletion:
             let token = WorkspaceDeletionCancellationToken(workspaceID: workspaceID)
             let operation = Task {

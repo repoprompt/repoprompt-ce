@@ -226,7 +226,17 @@ final class AgentRunStartOutcomeRecorder {
         didSet { hasRecordedOutcome = true }
     }
 
-    init() {}
+    let allowsStartup: () -> Bool
+    private let attemptStarted: ((AgentRunOwnership) -> Void)?
+
+    init(allowsStartup: @escaping () -> Bool = { true }, attemptStarted: ((AgentRunOwnership) -> Void)? = nil) {
+        self.allowsStartup = allowsStartup
+        self.attemptStarted = attemptStarted
+    }
+
+    func recordNewAttempt(_ ownership: AgentRunOwnership) {
+        attemptStarted?(ownership)
+    }
 
     func recordAccepted() {
         outcome = .accepted

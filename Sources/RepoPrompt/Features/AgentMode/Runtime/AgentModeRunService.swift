@@ -321,7 +321,7 @@ final class AgentModeRunService {
             }
         }
         guard case .restored = origin.requirement, origin.writer.session === session, origin.isCurrent,
-              providerLaunchInput?.isCurrent(for: session) != false
+              startOutcome?.allowsStartup() != false, providerLaunchInput?.isCurrent(for: session) != false
         else {
             startOutcome?.recordStartFailure(message: nil)
             return .completed(nil)
@@ -391,7 +391,8 @@ final class AgentModeRunService {
                 fallbackContext: codexFallbackContext,
                 autoEffortSelection: autoEffortSelection,
                 selfCompactDispatchID: selfCompactDispatchID,
-                stopFence: stopFence
+                stopFence: stopFence,
+                startOutcome: startOutcome
             )
             startOutcome?.record(codexOutcome: outcome)
             return .completed(outcome)

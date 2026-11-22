@@ -119,7 +119,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         let prefix = Self.agentHostRecoveryWarningPrefix
         guard !isTerminating, warningID.hasPrefix(prefix),
               let recoveryID = UUID(uuidString: String(warningID.dropFirst(prefix.count))),
-              let drain = agentRuntimeStore.retainedDrains.first(where: { $0.recoveryID == recoveryID }),
+              let drain = (agentRuntimeStore.retainedDrains + agentRuntimeStore.retainedSessionDeletionDrains).first(where: { $0.recoveryID == recoveryID }),
               case .retained? = drain.outcome else { return }
         observeAgentHostDrainRecovery(drain)
         drain.attemptRecovery()
@@ -762,6 +762,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
             guard modelRoutingWindow(withID: window.windowID) === window else { continue }
             candidates.append(
                 contentsOf: window.agentModeViewModel.agentSessionLinkCandidates(isWindowClosing: false, includeLocation: includeLocation)
+                    .filter { !isCanonicalPresentationAlias($0, in: window) }
             )
         }
         return candidates
@@ -811,10 +812,20 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
                 forSessionIDs: sessionIDs, includeLocation: includeLocation
             )
             for sessionID in sessionIDs {
-                result[sessionID, default: []] += local[sessionID] ?? []
+                result[sessionID, default: []] += (local[sessionID] ?? []).filter { !isCanonicalPresentationAlias($0, in: window) }
             }
         }
         return result
+    }
+
+    /// A presenter of an independent writer is not another endpoint. Do not deduplicate by
+    /// session UUID: genuinely distinct writer claims must still fail closed as ambiguous.
+    private func isCanonicalPresentationAlias(_ candidate: AgentSessionLinkEndpointCandidate, in window: WindowState) -> Bool {
+        let host = window.agentModeViewModel.runtimeHost
+        guard let session = host.scope.sessions[candidate.tabID], session.activeAgentSessionID == candidate.sessionID,
+              let runtime = host.scope.linkExecution, let endpoint = runtime.agentSessionLinkObserverEndpoint(tabID: candidate.tabID),
+              endpoint.workspaceID == candidate.workspaceID, independentLinkRuntime(for: endpoint) === runtime else { return false }
+        return true
     }
 
     func agentSessionLinkRunFacts(

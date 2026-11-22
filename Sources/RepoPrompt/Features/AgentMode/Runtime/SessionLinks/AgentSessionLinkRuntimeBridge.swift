@@ -4595,6 +4595,7 @@ final class AgentSessionLinkRuntimeBridge {
             // Seen state is generation-qualified: a fresh re-add of the same pair baselines against
             // current activity instead of inheriting an acknowledgement made under removed authority.
             monitorSeenByReference.removeValue(forKey: reference)
+            AgentSessionLinkExecutionRuntime.cancelRunStartedByRevokedLink(notice)
             // The exact grant already ended. A saved relationship's history ends only when
             // its token-qualified retirement succeeds.
             let hasDurableIntent = capturedBookkeeping[reference]?.token != nil

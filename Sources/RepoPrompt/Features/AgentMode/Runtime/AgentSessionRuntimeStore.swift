@@ -230,6 +230,10 @@ final class AgentSessionRuntimeStore {
         Array(drainingHosts.values)
     }
 
+    var retainedSessionDeletionDrains: [AgentSessionHostDrainRuntime] {
+        retainedExecutionHosts.flatMap(\.scope.sessionDeletionDrains.values)
+    }
+
     func makeScope() -> Scope {
         scopes = scopes.filter { $0.value.value != nil }
         let scope = Scope(store: self)
@@ -562,20 +566,23 @@ final class AgentSessionRuntimeStore {
             return releaseWriterClaimsAfterDrain()
         }
 
-        /// Per-session release under the existing scope retirement fence. The host must first
-        /// join provider/domain teardown and acknowledge the final save; timeout is not a receipt.
-        /// A sibling's effects never release or block this exact object's claim. This primitive
-        /// has no VM caller until host cutover; presentation removal/publication belongs to that host.
+        /// A release requires positive teardown and settlement on the originating object. A
+        /// deletion can acknowledge one participant without closing sibling admission.
         @discardableResult
-        func releaseWriterClaim(for session: AgentTabSession) -> Bool {
-            guard isRetiring, worktrees.pendingTransitions == 0, settlement(for: session).isSettled else { return false }
+        func releaseWriterClaim(for session: AgentTabSession, afterCommittedDeletion: Bool = false) -> Bool {
+            if afterCommittedDeletion {
+                guard let id = session.activeAgentSessionID, AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: id),
+                      sessionDeletionDrains[ObjectIdentifier(session)] != nil else { return false }
+            } else if !isRetiring { return false }
+            guard worktrees.pendingTransitions == 0, settlement(for: session).isSettled else { return false }
             var remaining = sessions
             remaining.removeValue(forKey: session.tabID)
-            releasedSessionTabIDs.insert(session.tabID)
-            replaceSessions(remaining)
+            if isRetiring { releasedSessionTabIDs.insert(session.tabID) }
+            replaceSessions(remaining, acknowledgingDeletion: afterCommittedDeletion ? ObjectIdentifier(session) : nil)
             return true
         }
 
+        var sessionDeletionDrains: [ObjectIdentifier: AgentSessionHostDrainRuntime] = [:]
         private(set) var sessions: [UUID: AgentTabSession] = [:]
         private var releasedSessionTabIDs: Set<UUID> = []
         fileprivate struct LiveClaim {
@@ -591,9 +598,21 @@ final class AgentSessionRuntimeStore {
         }
 
         func replaceSessions(_ replacement: [UUID: AgentTabSession]) {
+            replaceSessions(replacement, acknowledgingDeletion: nil)
+        }
+
+        private func replaceSessions(_ replacement: [UUID: AgentTabSession], acknowledgingDeletion: ObjectIdentifier?) {
             guard !hasReleasedWriterClaims || replacement.isEmpty else { return }
             let previous = sessions
             sessions = replacement.filter { !releasedSessionTabIDs.contains($0.key) }
+            if !sessionDeletionDrains.isEmpty {
+                for (tabID, session) in previous {
+                    let identity = ObjectIdentifier(session)
+                    if identity != acknowledgingDeletion, sessionDeletionDrains[identity] != nil {
+                        sessions[tabID] = session
+                    }
+                }
+            }
             for (tabID, session) in previous where sessions[tabID] !== session {
                 store.refreshBindingObservation(for: session)
                 updateLiveSessionBindingIndex(tabID: tabID)

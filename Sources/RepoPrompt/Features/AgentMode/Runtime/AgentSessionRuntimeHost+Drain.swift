@@ -41,8 +41,36 @@ extension AgentSessionRuntimeHost {
         return token.isActive && !Task.isCancelled && ContinuousClock.now < deadline && retainedHosts().isEmpty
     }
 
+    /// Invoked only after the process-lifetime deletion fence commits. The caller can time out
+    /// waiting; the workspace retains the exact producer until its effects acknowledge release.
+    static func beginCommittedDetachedSessionDeletion(_ id: UUID) -> AgentSessionHostDrainRuntime? {
+        guard AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: id),
+              case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: id),
+              let host = writer.scope.executableHost,
+              host.route.identity.kind == .independent, let activation = host.workspaceActivation,
+              activation.savedCarrierSessionID == nil, !host.scope.presentation.hasPresenter(for: writer.session)
+        else { return nil }
+        if let retiring = host.scope.retainedDrain {
+            retiring.settleAfterDurableDeletion(sessionID: id)
+            return retiring
+        }
+        let drain = AgentSessionHostDrainRuntime.beginDeletion(scope: host.scope, session: writer.session, owner: host, adapters: host.drainAdapters())
+        WindowStatesManager.shared.observeAgentHostDrainRecovery(drain)
+        host.prepareCancellation(drain: drain, sessions: [writer.session])
+        drain.startIfNeeded()
+        return drain
+    }
+
     private func beginCancellationRetirement() -> AgentSessionHostDrainRuntime {
-        let participants = scope.sessions.values.map { session in
+        let drain = beginRetirement()
+        prepareCancellation(drain: drain, sessions: scope.sessions.values.filter {
+            scope.sessionDeletionDrains[ObjectIdentifier($0)] == nil
+        })
+        return drain
+    }
+
+    private func prepareCancellation(drain: AgentSessionHostDrainRuntime, sessions: [AgentTabSession]) {
+        let participants = sessions.map { session in
             (
                 session: session,
                 membership: scope.membership(of: session),
@@ -52,7 +80,6 @@ extension AgentSessionRuntimeHost {
                 context: session.mcpControlContext
             )
         }
-        let drain = beginRetirement()
         drain.prepareForFinalShutdown(withdrawScheduledStarts: { [self] in
             for participant in participants {
                 guard let membership = participant.membership,
@@ -103,18 +130,21 @@ extension AgentSessionRuntimeHost {
                 }
             }
         }
-        return drain
     }
 
     /// Executable composition for an explicitly authorized retirement. Stop and presentation
     /// detachment do not call this. The retained drain alone releases route/root/settings leases.
     func beginRetirement() -> AgentSessionHostDrainRuntime {
+        beginRetirement(adapters: drainAdapters())
+    }
+
+    private func drainAdapters() -> AgentSessionHostDrainRuntime.Adapters {
         let links = scope.linkExecution
         let execution = scope.execution
         let coordinator = codexCoordinator
         let claudeCoordinator = claudeCoordinator
         let tools = route.toolExecutionRuntime
-        return beginRetirement(adapters: .init(
+        return .init(
             managedInput: links.map { .managedInput($0) },
             selfCompact: links.map { .selfCompact($0) },
             captureProvider: { session in
@@ -160,6 +190,6 @@ extension AgentSessionRuntimeHost {
                     return current()
                 })
             }
-        ))
+        )
     }
 }

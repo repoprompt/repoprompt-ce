@@ -256,7 +256,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         let store = store ?? .shared
         if store.retainedDrains.contains(where: { $0.outcome != .released }) { return true }
         return store.retainedExecutionHosts.contains { host in
-            host.scope.sessions.values.contains { !host.scope.settlement(for: $0).isSettled }
+            !host.scope.sessionDeletionDrains.isEmpty || host.scope.sessions.values.contains { !host.scope.settlement(for: $0).isSettled }
         }
     }
 
