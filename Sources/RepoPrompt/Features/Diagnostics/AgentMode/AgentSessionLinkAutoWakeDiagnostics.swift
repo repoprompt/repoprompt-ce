@@ -10,7 +10,7 @@ enum AgentSessionLinkAutoWakeDiagnostics {
         case pendingACPSteeringInstructions, pendingClaudeSteeringInstructions, isSettlingACPBackgroundCompaction
         case pendingAskUser, pendingUserInputRequest, pendingApproval, pendingPermissionsRequest
         case pendingMCPElicitationRequest, pendingApplyEditsReview, pendingWorktreeMergeReview
-        case runStateIsActive, waitingForUserWithoutContinuation
+        case runStateIsActive, waitingForUserWithoutContinuation, claudeSizeFailure
     }
 
     private static let logger = Logger(subsystem: "com.repoprompt.agents", category: "AutoWake")

@@ -11,6 +11,7 @@ final class ClaudeIntegratedAgentModeRunner {
         case completed
         case cancelled
         case failed(errorText: String?, shouldShutdownSession: Bool)
+        case claudeSizeFailure(ClaudeTurnSizeFailure)
     }
 
     /// Claude's native stream reports terminal cancellation and failure as values,
@@ -112,10 +113,14 @@ final class ClaudeIntegratedAgentModeRunner {
             )
             let state: AgentSessionRunState
             let error: String?
+            var sizeFailure: ClaudeTurnSizeFailure?
             switch outcome {
             case .completed: (state, error) = (.completed, nil)
             case .cancelled: (state, error) = (.cancelled, nil)
             case let .failed(message, _): (state, error) = (.failed, message)
+            case let .claudeSizeFailure(failure):
+                (state, error) = (.failed, nil)
+                sizeFailure = failure
             }
             await finalize(
                 session: session,
@@ -125,7 +130,8 @@ final class ClaudeIntegratedAgentModeRunner {
                 terminalState: state,
                 errorText: error,
                 notifyTurnComplete: state == .completed,
-                shouldShutdownSession: state == .failed
+                shouldShutdownSession: state == .failed && sizeFailure == nil,
+                sizeFailure: sizeFailure
             )
         }
         return true
@@ -187,6 +193,10 @@ final class ClaudeIntegratedAgentModeRunner {
             }
         }
         guard stopFence?.permitsStart(of: session) ?? true else { return }
+        guard !session.pendingHandoff.awaitsLocalClaudeOverflowInput || localComposerCandidate != nil else {
+            startOutcome?.recordStartFailure(message: "The fresh Claude conversation is waiting for local composer input.")
+            return
+        }
         let runID = session.claudeController.flatMap { _ in
             AgentModeProcessRunIdentity.existingProcessRunID(for: session)
         } ?? AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
@@ -354,6 +364,7 @@ final class ClaudeIntegratedAgentModeRunner {
                 var compactBoundaryVerified = false
                 var routeRefusalMessage: String?
                 var nativeFailureMetadata: (errorText: String?, shouldShutdownSession: Bool)?
+                var claudeSizeFailure: ClaudeTurnSizeFailure?
                 let report = await DomainAgentRunExecutionCore.execute(
                     failureText: { _ in nativeFailureMetadata?.errorText ?? "" }
                 ) {
@@ -450,6 +461,9 @@ final class ClaudeIntegratedAgentModeRunner {
                     case let .failed(errorText, shouldShutdownSession):
                         nativeFailureMetadata = (errorText, shouldShutdownSession)
                         throw NativeTerminalFailure()
+                    case let .claudeSizeFailure(failure):
+                        claudeSizeFailure = failure
+                        throw NativeTerminalFailure()
                     }
                 }
 
@@ -499,7 +513,8 @@ final class ClaudeIntegratedAgentModeRunner {
                         notifyTurnComplete: outcome.kind == .completed && providerControlCommand?.claudeWakeCompaction == nil,
                         classifiesQuietCheckIn: qualifiesQuietProvider && outcome.kind == .completed && providerControlCommand == nil && selfCompactDispatchID == nil,
                         shouldShutdownSession: outcome.kind == .failed
-                            && (nativeFailureMetadata?.shouldShutdownSession == true || listener.runtimeFailure != nil)
+                            && (nativeFailureMetadata?.shouldShutdownSession == true || listener.runtimeFailure != nil),
+                        sizeFailure: outcome.kind == .failed ? claudeSizeFailure : nil
                     )
                     if compactBoundaryVerified, outcome.kind == .completed, revision != nil {
                         startOutcome?.claudeWakeCompactionVerified = true
@@ -572,6 +587,7 @@ final class ClaudeIntegratedAgentModeRunner {
             case .completed: return .completed
             case .cancelled: return .cancelled
             case .failed: return .failed
+            case let .claudeSizeFailure(failure): return .claudeSizeFailure(failure)
             }
         }
     #endif
@@ -628,6 +644,9 @@ final class ClaudeIntegratedAgentModeRunner {
 
         func strongest(_ current: NativeAgentRuntimeTurnStatus, _ next: NativeAgentRuntimeTurnStatus) -> NativeAgentRuntimeTurnStatus {
             switch (current, next) {
+            case (.cancelled, .claudeSizeFailure), (.claudeSizeFailure, .cancelled): .cancelled
+            case (_, .claudeSizeFailure): next
+            case (.claudeSizeFailure, _): current
             case (.failed, _), (_, .failed): .failed
             case (.cancelled, _), (_, .cancelled): .cancelled
             default: .completed
@@ -670,6 +689,7 @@ final class ClaudeIntegratedAgentModeRunner {
                     case .completed: return .completed
                     case .cancelled: return .cancelled
                     case .failed: return .failed(errorText: nil, shouldShutdownSession: false)
+                    case let .claudeSizeFailure(failure): return .claudeSizeFailure(failure)
                     }
                 }
                 continue eventLoop
@@ -706,6 +726,17 @@ final class ClaudeIntegratedAgentModeRunner {
             case let .stream(result):
                 if let compactInputID, result.nativeCompactInputID == compactInputID {
                     observedCompactBoundary = true
+                }
+                if let evidence = result.claudeCompactEvidence {
+                    if session.claudeExpectedTurnIDs == [evidence.turnID],
+                       session.selfCompactState.active?.compactRunAttemptID == runAttemptID,
+                       session.selfCompactState.active?.compactRunID == runID,
+                       session.selfCompactState.active?.claudeOverflowHoldID != nil,
+                       session.selfCompactState.active?.compactProviderConversation == evidence.conversationID
+                    {
+                        session.selfCompactState.active?.claudePostCompactTokens = evidence.postTokens
+                    }
+                    continue eventLoop
                 }
                 #if DEBUG
                     if ClaudeReasoningExtractionFeature.isEnabled, result.type == "reasoning" {
@@ -795,6 +826,8 @@ final class ClaudeIntegratedAgentModeRunner {
                     return .cancelled
                 case .failed:
                     return .failed(errorText: nil, shouldShutdownSession: false)
+                case let .claudeSizeFailure(failure):
+                    return .claudeSizeFailure(failure)
                 }
             case let .error(message):
                 session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
@@ -958,9 +991,31 @@ final class ClaudeIntegratedAgentModeRunner {
         errorText: String?,
         notifyTurnComplete: Bool,
         classifiesQuietCheckIn: Bool = false,
-        shouldShutdownSession: Bool = false
+        shouldShutdownSession: Bool = false,
+        sizeFailure: ClaudeTurnSizeFailure? = nil
     ) async -> AgentRunTerminalCommitRevision? {
-        await terminalCommitBarrier.commit(.init(
+        let hold = sizeFailure.flatMap { failure -> ClaudeContextAutoWakeHold? in
+            guard failure.kind != .outputLimit else { return nil }
+            let load = AgentModeViewModel.observationContextLoad(for: session)
+            let origin = failure.kind == .inputContextRejected
+                && failure.conversationID != nil && failure.conversationID == session.providerSessionID
+                && failure.conversationID != session.claudeOverflowRecoveryAttemptedConversation
+                && ClaudeOverflowRecoveryPolicy.historyIsNearLimit(used: load?.usedTokens, window: load?.windowTokens)
+                ? ownership.attemptID : nil
+            if var existing = session.activeClaudeContextAutoWakeHold {
+                guard let origin else { return existing }
+                if existing.conversationID == failure.conversationID {
+                    existing.recoveryOriginAttemptID = origin
+                    return existing
+                }
+            }
+            return .init(
+                provider: session.selectedAgent, failure: failure,
+                conversationID: failure.conversationID ?? session.providerSessionID,
+                recoveryOriginAttemptID: origin
+            )
+        }
+        return await terminalCommitBarrier.commit(.init(
             binding: claudeCoordinator.bindingQuietDeclarationObservations(
                 hooks.bindTerminalSession(session), session: session, owner: ownership, runID: runID
             ),
@@ -968,7 +1023,8 @@ final class ClaudeIntegratedAgentModeRunner {
             expectedRunID: runID,
             terminalState: terminalState,
             source: "claudeNative.finalize",
-            errorText: errorText,
+            errorText: sizeFailure.map { $0.terminalMessage(session: session, pausesAutoWake: hold != nil) } ?? errorText,
+            failureReason: sizeFailure?.failureReason,
             attachmentReservationID: attachmentReservationID,
             attachmentDisposition: .deleteFiles,
             finalizeNonCodexUsage: true,
@@ -977,6 +1033,7 @@ final class ClaudeIntegratedAgentModeRunner {
             classifiesQuietCheckIn: classifiesQuietCheckIn,
             terminalAnchor: session.terminalAnchor(for: ownership),
             prepareProviderState: { [claudeCoordinator] in
+                if let hold { session.oversight.claudeContextAutoWakeHold = hold }
                 session.pendingSupersedingTurnCompletions = 0
                 session.claudeSupersedingProtectedTurnIDs.removeAll()
                 session.claudeExpectedTurnIDs.removeAll()

@@ -18234,6 +18234,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // The cap described the process just torn down; the next process's runtime init reports its own.
         session.claudeAutoCompactWindowTokens = nil
         session.providerSessionID = nil
+        if let hold = session.oversight.claudeContextAutoWakeHold {
+            session.clearClaudeContextAutoWakeHold(matching: hold)
+        }
         session.providerCleanupHandle = nil
         session.providerTokenUsageByTurn.removeAll()
         session.automationTurnAudit.removeAll()

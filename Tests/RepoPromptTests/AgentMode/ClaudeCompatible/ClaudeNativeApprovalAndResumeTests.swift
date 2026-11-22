@@ -2824,6 +2824,25 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         await h.host.claudeCoordinator.shutdownClaudeSession(session)
     }
 
+    func testClaudeSizeFailureCommitsOneErrorAndHoldsTheFailedConversation() async throws {
+        let (h, session, controller, _) = try await spyFixture()
+        let conversation = "overfull-conversation"
+        session.providerSessionID = conversation
+        let providerID = UUID()
+        await controller.setTurnInFlight(true)
+        await controller.emit(.providerTurnStarted(turnID: providerID))
+        await until("provider starts") { session.runState == .running }
+        let failure = ClaudeTurnSizeFailure(kind: .inputContextRejected, source: .localCLIRejection, conversationID: conversation)
+        await controller.emit(.turnCompleted(turnID: providerID, status: .claudeSizeFailure(failure)))
+        await until("typed size rejection settles") { session.runState == .failed && session.agentTask == nil }
+        XCTAssertEqual(session.lastTerminalCommitRevision?.failureReason, .contextExhausted)
+        XCTAssertEqual(session.activeClaudeContextAutoWakeHold?.failure, failure)
+        let errors = session.items.filter { $0.kind == .error }
+        XCTAssertEqual(errors.count, 1)
+        XCTAssertTrue(try XCTUnwrap(errors.first).text.contains("Auto-wake is paused"))
+        await h.host.claudeCoordinator.shutdownClaudeSession(session)
+    }
+
     func testLateApprovalCancellationDoesNotReopenWaitingStateAfterSteer() async throws {
         let (h, session, controller, listener) = try await spyFixture()
         let providerID = UUID()

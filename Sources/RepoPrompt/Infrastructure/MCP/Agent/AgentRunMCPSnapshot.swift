@@ -156,6 +156,12 @@ extension DomainAgentRunSnapshot.FailureReason {
             "Resume Timed Out"
         case .resumeHistoryTooLarge:
             "Resume History Too Large"
+        case .contextExhausted:
+            "Context Exhausted"
+        case .requestTooLarge:
+            "Request Too Large"
+        case .outputLimitReached:
+            "Output Limit Reached"
         case .cancelled:
             "Cancelled"
         }

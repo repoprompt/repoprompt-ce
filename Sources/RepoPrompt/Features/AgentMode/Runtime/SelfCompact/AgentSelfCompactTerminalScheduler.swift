@@ -55,6 +55,7 @@ final class AgentSelfCompactTerminalScheduler {
         terminalState: AgentSessionRunState,
         publication: AgentRunTerminalPublicationResult,
         successorClaimed: Bool,
+        verifiedOverflowOrigin: Bool = false,
         teardownSettled: @escaping @MainActor () -> Bool
     ) -> Task<Void, Never>? {
         var state = load()
@@ -83,10 +84,10 @@ final class AgentSelfCompactTerminalScheduler {
             store(state)
             return nil
         }
-        // Item 2 deliberately narrowed the plan's failed-origin allowance. A generic .failed
-        // terminal does not prove context exhaustion or even a live provider conversation, so native
-        // self-compaction remains fail-closed until a typed context-limit failure is available.
-        guard !successorClaimed, terminalState == .completed, isCurrentOwner(owner) else {
+        // Only the host's typed, exact-conversation overflow request may use a failed origin.
+        let admissibleTerminal = terminalState == .completed
+            || (terminalState == .failed && verifiedOverflowOrigin && attempt.claudeOverflowHoldID != nil)
+        guard !successorClaimed, admissibleTerminal, isCurrentOwner(owner) else {
             state.settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
             store(state)
             return nil

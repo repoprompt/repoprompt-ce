@@ -255,6 +255,7 @@ enum AgentMonitorWakeNowRefusal: Equatable {
     case sessionBusy
     /// The provider context cannot carry a lane supplement right now.
     case notReady
+    case claudeSizeFailure
 
     /// Shown in the dashboard's existing observer-control message area, and as the button tooltip.
     var message: String {
@@ -269,6 +270,8 @@ enum AgentMonitorWakeNowRefusal: Equatable {
             "This session is busy. Try again when its current turn finishes."
         case .notReady:
             "This session can’t carry an update right now."
+        case .claudeSizeFailure:
+            "Auto-wake is paused after Claude hit a size limit. See the last turn’s error for next steps."
         }
     }
 }

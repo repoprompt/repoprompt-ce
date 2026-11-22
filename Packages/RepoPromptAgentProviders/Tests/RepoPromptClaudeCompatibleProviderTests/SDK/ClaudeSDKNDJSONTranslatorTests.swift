@@ -3,6 +3,48 @@ import Foundation
 import XCTest
 
 final class ClaudeSDKNDJSONTranslatorTests: XCTestCase {
+    func testCapturedLocalBlockingLimitDoesNotBecomeAnAssistantAnswer() throws {
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "claude-cli-2.1.330-prompt-too-long.fixture", withExtension: "ndjson", subdirectory: "Fixtures"))
+        let lines = try Data(contentsOf: url).split(separator: 10).map { Data($0) }
+        XCTAssertEqual(lines.count, 2)
+        var transcript = ClaudeSDKNDJSONTranslator(defersSizeFailuresToTerminalOwner: true)
+        let outputs = lines.flatMap { transcript.parseNDJSONLine($0) }
+        XCTAssertEqual(outputs.count(where: { $0.type == "message_stop" }), 1)
+        XCTAssertFalse(outputs.contains { ["content", "final_content", "error"].contains($0.type) })
+        let terminal = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(lines.last)) as? [String: Any])
+        let failure = try XCTUnwrap(ClaudeSDKSizeFailure.classifyResult(terminal))
+        XCTAssertEqual(failure.kind, .inputContextRejected)
+        XCTAssertEqual(failure.source, .localCLIRejection)
+        XCTAssertNil(failure.inputTokens)
+        XCTAssertNil(failure.limitTokens)
+        for key in ["is_error", "terminal_reason", "duration_api_ms", "api_error_status"] {
+            var weakened = terminal
+            weakened[key] = nil
+            XCTAssertNil(ClaudeSDKSizeFailure.classifyResult(weakened), key)
+        }
+    }
+
+    func testSizeClassificationSeparatesOutputFromContextAndRequestLimits() throws {
+        let basic: [String: Any] = ["type": "result", "subtype": "success", "result": "Prompt is too long"]
+        XCTAssertNil(ClaudeSDKSizeFailure.classifyResult(basic), "Ordinary answer text is not terminal evidence")
+        for (reason, kind) in [("max_tokens", ClaudeSDKSizeFailure.Kind.outputLimit), ("model_context_window_exceeded", .generationContextLimit)] {
+            var frame = basic
+            frame["stop_reason"] = reason
+            XCTAssertEqual(ClaudeSDKSizeFailure.classifyResult(frame)?.kind, kind)
+            var translator = ClaudeSDKNDJSONTranslator(defersSizeFailuresToTerminalOwner: true)
+            XCTAssertTrue(try translator.parseNDJSONLine(JSONSerialization.data(withJSONObject: frame)).contains { $0.type == "final_content" })
+            frame["parent_tool_use_id"] = "subagent"
+            XCTAssertNil(ClaudeSDKSizeFailure.classifyResult(frame))
+        }
+        let body: [String: Any] = ["type": "result", "is_error": true, "api_error_status": 413]
+        XCTAssertEqual(ClaudeSDKSizeFailure.classifyResult(body)?.kind, .requestTooLarge)
+        let api: [String: Any] = ["type": "result", "error": ["type": "invalid_request_error", "message": "prompt is too long: 123 tokens > 100 maximum"]]
+        let failure = try XCTUnwrap(ClaudeSDKSizeFailure.classifyResult(api))
+        XCTAssertEqual(failure.kind, .inputContextRejected)
+        XCTAssertEqual(failure.inputTokens, 123)
+        XCTAssertEqual(failure.limitTokens, 100)
+    }
+
     func testExactSyntheticRepromptPreservesPositiveEvidenceThroughBothEntryPoints() throws {
         let text = "[Your previous response had no visible output. Please continue and produce a user-visible response.]"
         let singleton: [[String: Any]] = [["type": "text", "text": text]]

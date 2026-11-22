@@ -17,6 +17,7 @@ package struct ClaudeSDKNDJSONTranslator {
     package init(enableDebugLogging: Bool = false, isRepoPromptToolName: @escaping @Sendable (String) -> Bool) {
         providerTranslator = ClaudeCompatiblePluginNDJSONTranslator(
             enableDebugLogging: enableDebugLogging,
+            defersSizeFailuresToTerminalOwner: true,
             treatsToolResultErrorsAsHostOwned: isRepoPromptToolName
         )
     }
