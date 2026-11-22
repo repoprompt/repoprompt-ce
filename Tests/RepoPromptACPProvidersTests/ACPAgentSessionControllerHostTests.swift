@@ -115,6 +115,56 @@ final class ACPAgentSessionControllerHostTests: XCTestCase {
         }
     }
 
+    func testAntigravityBootstrapKeepsRawFramesOutOfTimeoutDiagnostics() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("AntigravityStderr-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let script = directory.appendingPathComponent("agy-acp-fixture")
+        let warning = "W0906 123 local_connection.py:42] Retrying connection"
+        let marker = "raw-websocket-fixture-payload"
+        try #"""
+        #!/bin/sh
+        printf '%s\n' '\#(warning)' 'I0906 123 local_connection.py:42] RAW WS MSG: {"content":"\#(marker)"}' >&2
+        while IFS= read -r line; do :; done
+        """#.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
+
+        let provider = AntigravityACPAgentProvider(
+            executablePath: script.path,
+            harnessPath: nil,
+            installedRuntime: { nil },
+            prepareSessionHome: { directory },
+            toolNames: ACPToolNameResolution(
+                isRepoPromptServerIdentifier: { _ in false },
+                canonicalRepoPromptToolName: { _ in nil },
+                isRepoPromptToolNameWithServerPrefix: { _ in false }
+            ),
+            includeRepoPromptMCPServer: false
+        )
+        let request = ACPRunRequest(agentKind: .antigravity, modelString: nil, workspacePath: directory.path, resumeSessionID: nil, attachments: [], taskLabelKind: nil)
+        let controller = try ACPAgentSessionController(
+            provider: provider,
+            runRequest: request,
+            host: RecordingHost(),
+            diagnosticSink: { event in
+                if case let .stderrLine(line) = event {
+                    XCTAssertFalse(line.contains(marker))
+                }
+            },
+            requestTimeouts: .init(bootstrapSeconds: 2),
+            allowsProviderProcessLaunchForTesting: true
+        )
+        do {
+            _ = try await controller.bootstrap()
+            XCTFail("The fixture never responds to initialize.")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains(warning), error.localizedDescription)
+            XCTAssertFalse(error.localizedDescription.contains(marker))
+        }
+        await controller.shutdown()
+    }
+
     func testRequiredHostRoutesLaunchAndReadsRegistryAtSelectionTime() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ACPHost-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

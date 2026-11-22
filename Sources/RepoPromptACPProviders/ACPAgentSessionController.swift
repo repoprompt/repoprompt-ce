@@ -1976,10 +1976,12 @@ package actor ACPAgentSessionController {
             let text = Self.strippingANSIEscapeSequences(from: rawText)
             guard !text.isEmpty else { return }
             stderrLineCount += 1
+            let disposition = provider.stderrLineDisposition(text)
+            guard disposition != .discard else { return }
             lastStderrPreview = Self.truncatedDiagnosticPreview(text)
             recordActivePromptStderrLine(text)
             diagnose(.stderrLine(text))
-            guard provider.shouldEmitStderrLine(text) else { return }
+            guard disposition == .transcript else { return }
             emit(.stream(AIStreamResult(type: "system", text: text)))
         }
     }
