@@ -86,6 +86,12 @@ enum ToolResultMarkdownRenderer {
 
     private static let resultKeys: Set<String> = ["content", "structuredContent", "isError", "_meta"]
     private static let wrapperKeys = ["Ok", "ok", "Err", "err"]
+    /// Follow the DTO fallback's envelope paths only to detect lossy normalization.
+    /// These additional keys never authorize treating the result as MCP transport.
+    private static let fallbackEnvelopeKeys = wrapperKeys + [
+        "structuredContent", "structured_content", "structuredResult", "structured_result", "toolResult", "tool_result"
+    ]
+    private static let fallbackSingleKeyEnvelopes = ["result", "output", "response", "payload", "data", "value"]
 
     private static let emitResourceContentKey = "mcp.emitResourceContent"
 
@@ -222,10 +228,15 @@ enum ToolResultMarkdownRenderer {
     private static func containsContentCandidate(_ value: Any, depth: Int = 0) -> Bool {
         guard depth < 4 else { return false }
         if let object = value as? [String: Any] {
-            return object["content"] is [Any]
-                || wrapperKeys.contains { key in
-                    object[key].map { containsContentCandidate($0, depth: depth + 1) } == true
-                }
+            if object["content"] is [Any] { return true }
+            if fallbackEnvelopeKeys.contains(where: { key in
+                object[key].map { containsContentCandidate($0, depth: depth + 1) } == true
+            }) {
+                return true
+            }
+            if object.count == 1, let (key, nested) = object.first, fallbackSingleKeyEnvelopes.contains(key) {
+                return containsContentCandidate(nested, depth: depth + 1)
+            }
         }
         if let array = value as? [Any] {
             return array.contains { containsContentCandidate($0, depth: depth + 1) }
@@ -235,7 +246,7 @@ enum ToolResultMarkdownRenderer {
 
     private static func isMCPContentBlock(_ block: [String: Any]) -> Bool {
         let commonKeys: Set = ["type", "annotations", "_meta"]
-        guard isOptionalObject(block["annotations"]), isOptionalObject(block["_meta"]) else { return false }
+        guard isMCPAnnotations(block["annotations"]), isOptionalObject(block["_meta"]) else { return false }
         switch block["type"] as? String {
         case "text":
             return block["text"] is String && block.keys.allSatisfy(commonKeys.union(["text"]).contains)
@@ -257,6 +268,23 @@ enum ToolResultMarkdownRenderer {
         default:
             return false
         }
+    }
+
+    private static func isMCPAnnotations(_ value: Any?) -> Bool {
+        guard let value, !(value is NSNull) else { return true }
+        let annotationKeys: Set = ["audience", "priority", "lastModified"]
+        guard let object = value as? [String: Any], object.keys.allSatisfy(annotationKeys.contains),
+              isOptionalString(object["lastModified"])
+        else { return false }
+        if let audience = object["audience"], !(audience is NSNull) {
+            guard let roles = audience as? [String], roles.allSatisfy({ $0 == "user" || $0 == "assistant" }) else { return false }
+        }
+        if let priority = object["priority"], !(priority is NSNull) {
+            guard let number = priority as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+                  (0 ... 1).contains(number.doubleValue)
+            else { return false }
+        }
+        return true
     }
 
     private static func isOptionalObject(_ value: Any?) -> Bool {

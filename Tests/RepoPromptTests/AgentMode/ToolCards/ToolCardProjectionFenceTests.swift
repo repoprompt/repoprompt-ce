@@ -333,6 +333,33 @@ final class ToolResultMarkdownRendererTests: XCTestCase {
         assertFieldProjection(numericErrorFlag, "content:\n  1:\n    text: first\n    type: text\nisError: 1")
     }
 
+    func testInvalidAnnotationsPreserveOriginalFields() {
+        let invalidAudience = #"{"content":[{"type":"text","text":"first","annotations":{"audience":"user"}}]}"#
+        assertFieldProjection(invalidAudience, "content:\n  1:\n    annotations:\n      audience: user\n    text: first\n    type: text")
+
+        let businessAnnotations = #"{"content":[{"type":"text","text":"first","annotations":{"audience":["user"],"documentID":"a"}}]}"#
+        assertFieldProjection(businessAnnotations, "content:\n  1:\n    annotations:\n      audience:\n        1: user\n      documentID: a\n    text: first\n    type: text")
+    }
+
+    func testValidAnnotatedTransportStillRendersMarkdown() {
+        let payload = ###"{"content":[{"type":"text","text":"## First","annotations":{"audience":["user","assistant"],"priority":0.5,"lastModified":"2025-01-12T15:00:58Z"}}]}"###
+        XCTAssertEqual(render(payload), .init(text: "## First", isMarkdown: true))
+        XCTAssertEqual(ToolResultMarkdownRenderer.readableResult(payload), "## First")
+    }
+
+    func testLegacyOutputWrapperCannotRestoreLossyContentFallback() {
+        let payload = #"{"output":{"total":2,"content":[{"text":"first","documentID":"a"}],"next":"b"}}"#
+        let fields = "output:\n  content:\n    1:\n      documentID: a\n      text: first\n  next: b\n  total: 2"
+        assertFieldProjection(payload, fields, toolName: "custom_lookup")
+    }
+
+    func testStructuredContentTakesPrecedenceOverDiagnosticTextInErrorResults() {
+        let bare = #"{"content":[{"type":"text","text":"Unclassified failure"}],"isError":true,"structuredContent":{"code":"not_found","detail":"Requested file is missing"}}"#
+        let expected = "code: not_found\ndetail: Requested file is missing"
+        assertFieldProjection(bare, expected)
+        assertFieldProjection("{\"Err\":\(bare)}", expected)
+    }
+
     func testCanonicalStructuredContentWinsOverTextInBareAndWrappedResults() {
         let bare = ###"{"content":[{"type":"text","text":"## Preview"}],"structuredContent":{"items":["canonical"],"total":1},"isError":false,"_meta":{"transport":"private"}}"###
         let expected = "items:\n  1: canonical\ntotal: 1"
