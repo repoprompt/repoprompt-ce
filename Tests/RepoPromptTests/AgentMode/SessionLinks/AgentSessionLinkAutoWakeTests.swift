@@ -1099,6 +1099,230 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         XCTAssertEqual(transcript.turns.compactMap { $0.request?.text }, [prompt])
     }
 
+    func testOrdinaryLastWindowClosePreservesAttemptThroughDurableSaveAndVisit() async throws {
+        try await runVisibleLifetimeWitness(switchWorkspace: false)
+    }
+
+    func testVisibleWorkspaceRoundTripPreservesDispatchedAttempt() async throws {
+        try await runVisibleLifetimeWitness(switchWorkspace: true)
+    }
+
+    private func runVisibleLifetimeWitness(switchWorkspace: Bool) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("VisibleAgentLifetime-\(UUID())")
+        let root = directory.appendingPathComponent("original-root")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let runtime = MCPDomainRuntime(configuration: .init(
+            mode: .app, profileIdentifier: "visible-agent-\(UUID())", storageDirectory: directory,
+            workspaceStorageDirectory: directory.appendingPathComponent("workspaces"),
+            eventDirectory: directory.appendingPathComponent("events"),
+            temporaryDirectory: directory.appendingPathComponent("tmp"), externalReloadInterval: nil
+        ))
+        try await runtime.start()
+        addTeardownBlock {
+            _ = await runtime.shutdown()
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let gate = try AgentSessionLinkACPResponseGate(directory: directory)
+        let script = try AgentSessionLinkACPServerScript.write(to: directory)
+        let provider = AgentSessionLinkCapturingACPProvider(providerID: .openCode, commandPath: script.path, environment: [
+            "ACP_HOLD_METHOD": "session/prompt", "ACP_RESPONSE_GATE": gate.path
+        ])
+        defer { gate.release() }
+        let providerResources = AgentRunProviderComposition(
+            headless: { _, _ in preconditionFailure("The fixture only launches ACP") }, acp: { _, _ in provider },
+            controller: { try ACPAgentSessionController(provider: $0, runRequest: $1, allowsProviderProcessLaunchForTesting: true) }
+        )
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        defer { GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false) }
+
+        let sessionID = UUID()
+        var tab = ComposeTabState()
+        tab.activeAgentSessionID = sessionID
+        var workspace = WorkspaceModel(name: "Original", repoPaths: [root.path], customStoragePath: directory.appendingPathComponent("first"))
+        workspace.composeTabs = [tab]
+        workspace.activeComposeTabID = tab.id
+        let second = WorkspaceModel(name: "Other", repoPaths: [], customStoragePath: directory.appendingPathComponent("second"))
+        let authority = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: 0)
+        for workspace in [workspace, second] {
+            let result = try await authority.create(
+                workspace, fileURL: runtime.configuration.workspaceStorageDirectory.appendingPathComponent("\(workspace.id.uuidString).json")
+            )
+            XCTAssertEqual(result.disposition, .applied)
+        }
+        let window = makeVisibleLifetimeWindow(runtime: runtime, providerResources: providerResources)
+        try await activateVisibleLifetimeWorkspace(workspace, in: window)
+        let agent = window.agentModeViewModel
+        let host = agent.runtimeHost
+        let activation = try XCTUnwrap(host.workspaceActivation)
+        addVisibleLifetimeHostCleanup(host)
+        let rootLease = try XCTUnwrap(activation.catalogFileLease)
+        XCTAssertEqual(host.route.identity.kind, .independent)
+        XCTAssertNotEqual(host.routeID, window.windowID)
+        XCTAssertEqual(rootLease.snapshot.document.metadata.repoPaths, [root.path])
+        XCTAssertTrue(host.route.hasCurrentModelCatalogRoute)
+
+        let session = host.scope.makeSession(tabID: tab.id)
+        session.installPersistentSessionBinding(.init(tabID: tab.id, sessionID: sessionID, workspaceID: workspace.id))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        session.hasLoadedPersistedState = true
+        session.selectedAgent = .openCode
+        session.oversight.autoWakeOnUpdates = false
+        agent.test_installLiveSession(session)
+        let command = try host.scope.admit(session: session)
+        let rootIDs = try await activation.loadedRootIDs(for: command, route: host.route)
+        XCTAssertEqual(rootIDs.count, 1)
+        let resources = try await host.captureStartupResources(for: command, rootIDs: rootIDs)
+        let navigation = AgentModeNavigationController(isSystemWorkspaceMode: workspace.isSystemWorkspace)
+        navigation.onAppear(isSystem: workspace.isSystemWorkspace, windowState: window, agentModeVM: agent)
+        var presentedTarget: AgentComposerSubmitTarget?
+        try await AsyncTestWait.waitUntil("present the original composer") {
+            guard agent.currentTabID == tab.id, agent.sessions[tab.id] === session else { return false }
+            presentedTarget = AgentComposerProjection.props(vm: agent, subject: .currentTab).submitTarget
+            return presentedTarget != nil
+        }
+        let target = try XCTUnwrap(presentedTarget)
+        XCTAssertEqual(target.expectedWriterIdentity, command.identity)
+        let prompt = "Retain the originating provider"
+        let submitted = await agent.submitUserTurnCreatingSessionIfNeeded(text: prompt, target: target)
+        guard submitted == .submitted else { return XCTFail("Composer did not accept the run: \(submitted)") }
+        try await AsyncTestWait.waitUntil("launch the originating ACP attempt") {
+            session.agentTask != nil && session.runID != nil && session.acpController != nil
+        }
+        let task = try XCTUnwrap(session.agentTask)
+        let runID = try XCTUnwrap(session.runID)
+        let controller = try XCTUnwrap(session.acpController)
+        try await routeScriptedHostProvider(session)
+        try await gate.waitUntilEntered()
+        let attemptID = try XCTUnwrap(session.activeRunAttemptID)
+
+        func assertOriginalAttempt() throws {
+            XCTAssertEqual(try host.scope.admit(session: session).identity, command.identity)
+            XCTAssertFalse(host.scope.isRetiring)
+            XCTAssertTrue(session.acpController === controller)
+            XCTAssertEqual(session.runID, runID)
+            XCTAssertEqual(session.activeRunAttemptID, attemptID)
+            XCTAssertTrue(host.workspaceActivation === activation)
+            XCTAssertTrue(activation.catalogFileLease === rootLease)
+            XCTAssertTrue(rootLease.rootsAreCurrent)
+            XCTAssertTrue(resources.isCurrent)
+            XCTAssertFalse(host.route.isClosing)
+            XCTAssertEqual(provider.promptedMessages.count, 1)
+        }
+
+        let incoming: WindowState
+        if switchWorkspace {
+            try await activateVisibleLifetimeWorkspace(second, in: window)
+            XCTAssertFalse(agent.runtimeHost === host)
+            XCTAssertFalse(host.scope.presentation.hasPresenter(for: session))
+            addVisibleLifetimeHostCleanup(agent.runtimeHost)
+            try assertOriginalAttempt()
+            try await activateVisibleLifetimeWorkspace(workspace, in: window)
+            incoming = window
+        } else {
+            WindowStatesManager.shared.unregisterWindowState(window)
+            await window.tearDown()
+            XCTAssertTrue(WindowStatesManager.shared.allWindows.isEmpty)
+            XCTAssertFalse(host.scope.presentation.hasPresenter(for: session))
+            XCTAssertFalse(AppDelegate.shouldTerminateAfterLastWindowClosed(isBackgrounded: false))
+            try assertOriginalAttempt()
+
+            let saveGate = AutoWakeCatalogAuthorityGate()
+            let originalSaver = host.scope.persistence.saver
+            var terminalSaveEntered = false
+            host.scope.persistence.saver = { payload, workspace, count in
+                if !session.runState.isActive, session.lastTerminalCommitRevision != nil {
+                    terminalSaveEntered = true
+                    _ = await saveGate.requirement()
+                }
+                return try await originalSaver(payload, workspace, count)
+            }
+            defer {
+                Task { await saveGate.open() }
+                host.scope.persistence.saver = originalSaver
+            }
+            gate.release()
+            try await AsyncTestWait.waitUntil("hold the terminal save with no window") { terminalSaveEntered }
+            XCTAssertFalse(session.runState.isActive)
+            XCTAssertEqual(session.lastTerminalCommitRevision?.ownership.attemptID, attemptID)
+            XCTAssertTrue(host.scope.saveQueue.inFlightSessionIDs.contains(sessionID))
+            XCTAssertFalse(AppDelegate.shouldTerminateAfterLastWindowClosed(isBackgrounded: false))
+            XCTAssertTrue(resources.isCurrent)
+            await saveGate.open()
+            await task.value
+            try await AsyncTestWait.waitUntil("automatically save before reopening") {
+                !session.isDirty && !host.scope.saveQueue.inFlightSessionIDs.contains(sessionID)
+            }
+            let saved = try await AgentSessionDataService.shared.loadAgentSession(id: sessionID, for: workspace)
+            XCTAssertEqual(try XCTUnwrap(saved?.transcript).turns.compactMap { $0.request?.text }, [prompt])
+
+            incoming = makeVisibleLifetimeWindow(runtime: runtime, providerResources: providerResources)
+            try await activateVisibleLifetimeWorkspace(workspace, in: incoming)
+        }
+        let routed = await incoming.navigateAgentDeepLinkTab(tab.id, sessionID: sessionID, workspaceID: workspace.id)
+        XCTAssertEqual(routed, .routed)
+        XCTAssertTrue(incoming.agentModeViewModel.runtimeHost === host)
+        XCTAssertTrue(incoming.agentModeViewModel.sessions[tab.id] === session)
+        if switchWorkspace {
+            XCTAssertTrue(incoming.agentModeViewModel.tabsWithActiveAgentRun.contains(tab.id))
+            try assertOriginalAttempt()
+            gate.release()
+            await task.value
+        } else {
+            XCTAssertFalse(incoming.agentModeViewModel.tabsWithActiveAgentRun.contains(tab.id))
+            XCTAssertEqual(try host.scope.admit(session: session).identity, command.identity)
+        }
+        XCTAssertFalse(session.runState.isActive)
+        XCTAssertEqual(session.lastTerminalCommitRevision?.ownership.attemptID, attemptID)
+        XCTAssertEqual(provider.promptedMessages.count, 1)
+        try await host.scope.persistence.flushSaveRequired(for: tab.id, workspaceID: workspace.id).get()
+        let record = try await AgentSessionDataService.shared.loadAgentSession(id: sessionID, for: workspace)
+        XCTAssertEqual(record?.id, sessionID)
+        XCTAssertEqual(try XCTUnwrap(record?.transcript).turns.compactMap { $0.request?.text }, [prompt])
+    }
+
+    private func activateVisibleLifetimeWorkspace(_ workspace: WorkspaceModel, in window: WindowState) async throws {
+        let manager = window.workspaceManager
+        try await AsyncTestWait.waitUntil("project the canonical workspace") { manager.workspace(withID: workspace.id) != nil }
+        var completed = false
+        window.agentModeViewModel.test_afterWorkspaceSwitchAdoptionCompleted = { owner in
+            if owner.workspaceID == workspace.id { completed = true }
+        }
+        defer { window.agentModeViewModel.test_afterWorkspaceSwitchAdoptionCompleted = nil }
+        let result = await manager.requestWorkspaceSwitch(to: workspace, reason: "visibleAgentLifetimeWitness", silent: true)
+        guard result.didSwitch else {
+            XCTFail("Production workspace switch did not complete: \(result)")
+            throw AgentHostWorkspaceResources.Failure.authorityUnavailable
+        }
+        try await AsyncTestWait.waitUntil("settle Agent workspace adoption") { completed }
+        XCTAssertEqual(window.agentModeViewModel.runtimeHost.workspaceActivation?.key.owner.workspaceID, workspace.id)
+    }
+
+    private func makeVisibleLifetimeWindow(runtime: MCPDomainRuntime, providerResources: AgentRunProviderComposition) -> WindowState {
+        let window = WindowState(domainRuntime: runtime, visibleAgentProviderResources: providerResources)
+        window.apiSettingsViewModel.isOpenCodeConnected = true
+        WindowStatesManager.shared.registerWindowState(window)
+        addTeardownBlock { @MainActor in
+            let host = window.agentModeViewModel.runtimeHost
+            if WindowStatesManager.shared.allWindows.contains(where: { $0 === window }) {
+                WindowStatesManager.shared.unregisterWindowState(window)
+                await window.tearDown()
+            }
+            if host.workspaceActivation != nil, !host.scope.hasReleasedWriterClaims {
+                _ = await AgentSessionHostDrainRuntime.shutdown([host.beginFinalShutdown()])
+            }
+        }
+        return window
+    }
+
+    private func addVisibleLifetimeHostCleanup(_ host: AgentSessionRuntimeHost) {
+        addTeardownBlock { @MainActor in
+            if !host.scope.hasReleasedWriterClaims {
+                _ = await AgentSessionHostDrainRuntime.shutdown([host.beginFinalShutdown()])
+            }
+        }
+    }
+
     func testHostRetirementJoinsClosedControllerBeforeReleasingResources() async throws {
         let (host, f, resources, provider, _, _, _) = try await hostStartupFixture()
         let original = try host.scope.admit(session: f.session)

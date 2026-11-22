@@ -686,6 +686,14 @@ class WindowState: ObservableObject {
             await domainWorkspacePresentationBridge?.stopAndJoinForTesting()
         }
 
+        convenience init(domainRuntime: MCPDomainRuntime, visibleAgentProviderResources: AgentRunProviderComposition) {
+            self.init(
+                contextBuilderProviderFactory: nil, loadStoredAPISettingsDataOnInit: false,
+                codexModelPollingService: .shared, automaticProviderModelDiscoveryEnabled: false,
+                domainRuntimeOverride: domainRuntime, visibleAgentProviderResources: visibleAgentProviderResources
+            )
+        }
+
         func restartDomainWorkspaceProjectionForTesting() {
             domainWorkspacePresentationBridge?.start()
         }
@@ -821,7 +829,8 @@ class WindowState: ObservableObject {
         agentModeViewModelFactory: WindowStateCompositionFactory.AgentModeViewModelFactory? = nil,
         sessionRuntimeWorkspace: WorkspaceModel? = nil,
         borrowedAPISettingsViewModel: APISettingsViewModel? = nil,
-        managedSettingsLease: APISettingsRuntimeLease? = nil
+        managedSettingsLease: APISettingsRuntimeLease? = nil,
+        visibleAgentProviderResources: AgentRunProviderComposition? = nil
     ) {
         self.managedSettingsLease = managedSettingsLease
         isPreparedSessionOwner = sessionRuntimeWorkspace != nil
@@ -853,7 +862,8 @@ class WindowState: ObservableObject {
             codexModelPollingService: codexModelPollingService,
             agentModeViewModelFactory: agentModeViewModelFactory,
             sessionRuntimeWorkspace: sessionRuntimeWorkspace,
-            borrowedAPISettingsViewModel: borrowedAPISettingsViewModel
+            borrowedAPISettingsViewModel: borrowedAPISettingsViewModel,
+            visibleAgentProviderResources: visibleAgentProviderResources
         )
         compositionSpan.end()
 

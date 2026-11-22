@@ -243,7 +243,11 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        !MCPBackgroundModeCoordinator.shared.isBackgrounded && !Self.hasUnsettledAgentExecution()
+        Self.shouldTerminateAfterLastWindowClosed(isBackgrounded: MCPBackgroundModeCoordinator.shared.isBackgrounded)
+    }
+
+    static func shouldTerminateAfterLastWindowClosed(isBackgrounded: Bool) -> Bool {
+        !isBackgrounded && !hasUnsettledAgentExecution()
     }
 
     /// Closing the last presenter is not Quit. A terminal run state does not acknowledge

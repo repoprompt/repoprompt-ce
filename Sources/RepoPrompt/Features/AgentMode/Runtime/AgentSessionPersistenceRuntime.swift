@@ -86,6 +86,11 @@ final class AgentSessionPersistenceRuntime {
         let admitBinding: (AgentTabSession) -> Admission?
         var isRestoringConfiguration: () -> Bool = { false }
         var canonicalStorage: CanonicalStorage?
+        var canonicalDisplayName: ((WorkspaceModel, UUID) -> String?)?
+
+        func displayName(for tabID: UUID, in workspace: WorkspaceModel) -> String {
+            canonicalDisplayName?(workspace, tabID) ?? displayName(tabID)
+        }
 
         var workspaceID: UUID? {
             canonicalStorage?.workspaceID ?? workspace()?.id
@@ -439,7 +444,11 @@ final class AgentSessionPersistenceRuntime {
 
         // Build the persisted session only for the binding generation captured below.
         let canonicalItemCount = persistableSnapshot.canonicalVisibleRowCount
-        let sessionName = composition?.displayName(tabID) ?? AgentSessionRestoreSupport.normalizedSessionTitle(nil)
+        func displayName(in workspace: WorkspaceModel) -> String {
+            composition?.displayName(for: tabID, in: workspace) ?? AgentSessionRestoreSupport.normalizedSessionTitle(nil)
+        }
+        let sessionName = displayName(in: workspace)
+        var lastValidatedWorkspace = workspace
         let agentSession = AgentSessionPayloadBuilder.makePayload(
             session: session, sessionID: sessionID, workspaceID: workspace.id,
             name: sessionName, snapshot: persistableSnapshot
@@ -488,11 +497,15 @@ final class AgentSessionPersistenceRuntime {
                           current.id == workspace.id, admissionFailure() == nil,
                           isSaveCommitTokenCurrent(saveToken, requireWorkspaceMatch: composition?.canonicalStorage == nil, creationHandle: effectiveCreationSave?.handle)
                     else { return false }
-                    return WorkspaceSessionSidecarMigration.workspaceDirectory(
+                    guard WorkspaceSessionSidecarMigration.workspaceDirectory(
                         for: current, root: AgentSessionDataService.defaultWorkspaceRootURL()
-                    ).standardizedFileURL.path == saveToken.workspaceDirectoryPath
+                    ).standardizedFileURL.path == saveToken.workspaceDirectoryPath,
+                        composition?.canonicalDisplayName == nil || displayName(in: current) == sessionName
+                    else { return false }
+                    lastValidatedWorkspace = current
+                    return true
                 },
-                currentName: { composition?.displayName(tabID) ?? AgentSessionRestoreSupport.normalizedSessionTitle(nil) },
+                currentName: { displayName(in: lastValidatedWorkspace) },
                 observingPhase: observingPhase,
                 saver: saver
             )
@@ -511,7 +524,11 @@ final class AgentSessionPersistenceRuntime {
             guard permits(expectation, tabID: tabID) else {
                 return .deferred("The originating writer changed after persistence committed.")
             }
-            presentation?.didCommit(session, receipt, canonicalItemCount)
+            if let presentation {
+                presentation.didCommit(session, receipt, canonicalItemCount)
+            } else {
+                scope?.presentation.sessionSaveCommitted(session, receipt: receipt, canonicalItemCount: canonicalItemCount)
+            }
             #if DEBUG
                 if let diagnosticsStartMS {
                     perfRecorder.event(

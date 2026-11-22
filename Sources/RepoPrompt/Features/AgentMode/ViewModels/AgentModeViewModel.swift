@@ -909,6 +909,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     let applyEditsApprovalStore: ApplyEditsApprovalStore
     var runService: AgentModeRunService {
         if let execution = runtimeSessionStore.execution { return execution }
+        precondition(runtimeHost.workspaceActivation == nil, "Compose canonical execution before attaching presentation.")
         let execution = makeRunService()
         runtimeSessionStore.installExecution(execution)
         return execution
@@ -2249,6 +2250,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         applyLocalSessionIndexUpsert(entry)
                     }
                 },
+                saveCommitted: { [weak self, weak host] session, receipt, count in
+                    guard let self, let host, runtimeHost === host, sessions[session.tabID] === session,
+                          !hasDetachedClosingPresentation, !hasPreparedForWindowClose else { return }
+                    publishSessionSave(session, receipt: receipt, canonicalItemCount: count)
+                },
                 isAvailable: { [weak self] in self != nil }
             )
             let identity = ObjectIdentifier(session)
@@ -3156,7 +3162,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     var interactionRuntime: AgentSessionInteractionRuntime {
-        let runtime = runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore)
+        let runtime = runtimeSessionStore.interactions(routeID: runtimeHost.routeID, approvalStore: applyEditsApprovalStore)
         runtime.observer = codexCoordinator
         runtime.installClaudeCancellationCommands(claudeCoordinator)
         _ = persistenceRuntime
@@ -3177,6 +3183,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     var mcpRuntime: AgentSessionMCPRuntime {
         let runtime = runtimeSessionStore.mcp
+        if runtimeHost.workspaceActivation != nil { return runtime }
         if let mcpServer { runtime.installRunRoute(id: windowID, bindings: mcpServer.runRouteBindings) }
         if runtime.workspaceHasProvisionalClaim == nil {
             runtime.workspaceHasProvisionalClaim = { [weak self] workspaceID, sessionID in
@@ -4619,8 +4626,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     "agentActivation.inactive windowID=\(windowID) workspaceID=\(restorePerfRecorder.shortID(workspaceIDForLog))"
                 )
             #endif
-            codexCoordinator.stop()
-            claudeCoordinator.stop()
+            if runtimeHost.workspaceActivation == nil {
+                codexCoordinator.stop()
+                claudeCoordinator.stop()
+            }
             stopOpenCodeModelsSubscription()
             stopCursorModelsSubscription()
             let cancelledOwner = activeSessionIndexRefreshToken?.owner
@@ -4847,7 +4856,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func prepareSessionForWindowClose(_ session: TabSession) async {
-        if let drain = runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).closeOracleBackground(for: session), !OracleBackgroundInvocationRegistry.shared.isShuttingDown {
+        if let drain = runtimeSessionStore.interactions(routeID: runtimeHost.routeID, approvalStore: applyEditsApprovalStore).closeOracleBackground(for: session), !OracleBackgroundInvocationRegistry.shared.isShuttingDown {
             await drain.value
         }
         removePendingUIRefresh(for: session.tabID)
@@ -5555,7 +5564,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
 
         if let owner = session.oracleBackgroundOwner {
-            runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).closeOracleBackground(for: session)
+            runtimeSessionStore.interactions(routeID: runtimeHost.routeID, approvalStore: applyEditsApprovalStore).closeOracleBackground(for: session)
             guard OracleBackgroundInvocationRegistry.shared.isDrained(owner) else { return nil }
             session.oracleBackgroundOwner = nil
             session.oracleBackgroundDrain = nil
@@ -6060,7 +6069,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         {
             return binding
         }
-        guard await runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).awaitOracleBackgroundDrain(for: targetSession) else { throw PersistentBindingMutationError.blockedByOwnership }
+        guard await runtimeSessionStore.interactions(routeID: runtimeHost.routeID, approvalStore: applyEditsApprovalStore).awaitOracleBackgroundDrain(for: targetSession) else { throw PersistentBindingMutationError.blockedByOwnership }
         try checkPreparedOwner()
         guard targetMembership.permitsBindingPreparation else { throw PersistentBindingMutationError.staleTransition }
 
@@ -6077,7 +6086,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         guard preparationIsCurrent() else { throw PersistentBindingMutationError.staleTransition }
         if let sourceSession, sourceSession !== targetSession {
-            guard await runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).awaitOracleBackgroundDrain(for: sourceSession) else { throw PersistentBindingMutationError.blockedByOwnership }
+            guard await runtimeSessionStore.interactions(routeID: runtimeHost.routeID, approvalStore: applyEditsApprovalStore).awaitOracleBackgroundDrain(for: sourceSession) else { throw PersistentBindingMutationError.blockedByOwnership }
             try checkPreparedOwner()
         }
         guard preparationIsCurrent() else { throw PersistentBindingMutationError.staleTransition }
@@ -6811,7 +6820,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if destructiveWorkspaceAdoptionOwner != nil || runtimeSessionStore.isAwaitingWorkspaceAdoption { return true }
         // A refused destination preparation leaves the last owner intact, not authorized to
         // serve the newly selected workspace through the old presenter.
-        guard let activation = runtimeHost.workspaceActivation else { return false }
+        guard let activation = runtimeHost.workspaceActivation else {
+            return canonicalWorkspaceHostPreparation != nil && activeWorkspaceIDForSessionIndexOwnership != nil
+        }
         return activation.key.owner.workspaceID != activeWorkspaceIDForSessionIndexOwnership
     }
 
@@ -13372,7 +13383,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             cleanupTargets = []
         } else {
             let oracleDrains = sessions.values.compactMap {
-                outgoing.scope.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).closeOracleBackground(for: $0)
+                outgoing.scope.interactions(routeID: outgoing.routeID, approvalStore: applyEditsApprovalStore).closeOracleBackground(for: $0)
             }
             for drain in oracleDrains { await drain.value }
             guard adoptionIsCurrent() else {
@@ -17430,7 +17441,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     var providerInputRuntime: AgentSessionProviderInputRuntime {
-        runtimeSessionStore.providerInput(skillCatalog: skillCatalog, perfRecorder: perfRecorder)
+        if runtimeHost.workspaceActivation != nil {
+            guard let input = runtimeSessionStore.installedProviderInput else {
+                preconditionFailure("Compose canonical provider input before attaching presentation.")
+            }
+            return input
+        }
+        return runtimeSessionStore.providerInput(skillCatalog: skillCatalog, perfRecorder: perfRecorder)
     }
 
     var handoffRuntime: AgentSessionHandoffRuntime {
@@ -17468,6 +17485,24 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         startOutcome: AgentRunStartOutcomeRecorder? = nil,
         providerSwitchPreparation: ProviderSwitchSendPreparation? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
+        let host = runtimeHost
+        guard !isAwaitingWorkspaceAdoption else {
+            startOutcome?.recordStartFailure(message: Self.staleComposerSubmitTargetMessage)
+            return .preDispatchRejected(message: Self.staleComposerSubmitTargetMessage)
+        }
+        if let activation = host.workspaceActivation {
+            guard let session = host.scope.sessions[tabID],
+                  let command = try? host.scope.admit(session: session, expectedWorkspaceID: activation.key.owner.workspaceID)
+            else {
+                startOutcome?.recordStartFailure(message: Self.staleComposerSubmitTargetMessage)
+                return .preDispatchRejected(message: Self.staleComposerSubmitTargetMessage)
+            }
+            return await host.startCanonicalRequest(
+                command: command, message: initialMessage, attachments: attachments, taggedFileAttachments: taggedFileAttachments,
+                codexFallbackContext: codexFallbackContext, autoEffortSelection: autoEffortSelection,
+                options: directStartOptions, outcome: startOutcome, providerSwitchPreparation: providerSwitchPreparation
+            )
+        }
         let session: TabSession
         if directStartOptions.periodicWakeID != nil {
             guard let existing = sessions[tabID] else { return nil }
@@ -17596,13 +17631,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             prepareAgentRunCancellation(session: session, intent: .userStop, origin: origin)
             runService.withdrawQueuedWorkForManagedStop(tabID: tabID, session: session)
             if completion == .terminalTeardownCompleted { _ = await start.awaitFinalization() }
-            _ = await runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).awaitOracleBackgroundDrain(for: session)
+            _ = await runtimeSessionStore.interactions(routeID: runtimeHost.routeID, approvalStore: applyEditsApprovalStore).awaitOracleBackgroundDrain(for: session)
             return
         }
         if let operation = repromptOperations[tabID] {
             operation.invalidate(reason: "The run was stopped.")
             if !session.runState.isActive {
-                if origin == .explicitStop { _ = await runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).awaitOracleBackgroundDrain(for: session) }
+                if origin == .explicitStop { _ = await runtimeSessionStore.interactions(routeID: runtimeHost.routeID, approvalStore: applyEditsApprovalStore).awaitOracleBackgroundDrain(for: session) }
                 return
             }
         }
@@ -17661,7 +17696,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
            OracleBackgroundInvocationRegistry.shared.hasLiveOwner(owner)
         {
             prepareAgentRunCancellation(session: session, intent: .userStop, origin: .explicitStop)
-            _ = await runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).awaitOracleBackgroundDrain(for: session)
+            _ = await runtimeSessionStore.interactions(routeID: runtimeHost.routeID, approvalStore: applyEditsApprovalStore).awaitOracleBackgroundDrain(for: session)
             return true
         }
         if let rejectionReason = cancelTargetRejectionReason(target, session: session) {
@@ -18451,7 +18486,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// Clear the chat transcript for a specific tab
     func clearChat(tabID: UUID) {
         guard let session = sessions[tabID] else { return }
-        runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).closeOracleBackground(for: session)
+        runtimeSessionStore.interactions(routeID: runtimeHost.routeID, approvalStore: applyEditsApprovalStore).closeOracleBackground(for: session)
 
         ui.transcript.clearDisclosureChoices(for: tabID)
         session.setItemsSilently([], reason: .clearedChat)
@@ -18812,7 +18847,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let sessionID = boundSessionID(for: tabID)
         let liveSession = sessions[tabID]
         if let liveSession {
-            guard await runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).awaitOracleBackgroundDrain(for: liveSession) else { throw CancellationError() }
+            guard await runtimeSessionStore.interactions(routeID: runtimeHost.routeID, approvalStore: applyEditsApprovalStore).awaitOracleBackgroundDrain(for: liveSession) else { throw CancellationError() }
             guard sessions[tabID] === liveSession, liveSession.activeAgentSessionID == sessionID else { throw CancellationError() }
         }
         if let sessionID {
@@ -20054,11 +20089,11 @@ extension AgentModeViewModel: WorkspaceSwitchSessionProviderDelegate {
 
 extension AgentModeViewModel {
     func closeOracleBackgroundWindowAdmission() {
-        runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).closeOracleBackgroundAdmission()
+        runtimeSessionStore.interactions(routeID: runtimeHost.routeID, approvalStore: applyEditsApprovalStore).closeOracleBackgroundAdmission()
     }
 
     func joinOracleBackgroundWindowDrain() async {
-        await runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).joinOracleBackgroundDrain()
+        await runtimeSessionStore.interactions(routeID: runtimeHost.routeID, approvalStore: applyEditsApprovalStore).joinOracleBackgroundDrain()
     }
 }
 

@@ -473,6 +473,7 @@ final class AgentSessionRuntimeStore {
         }
 
         private var providerInputRuntime: AgentSessionProviderInputRuntime?
+        var installedProviderInput: AgentSessionProviderInputRuntime? { providerInputRuntime }
 
         /// Install once from host composition. The legacy VM has an immutable private scope,
         /// catalog and recorder; presentation attachment must reuse this service, not reconfigure it.

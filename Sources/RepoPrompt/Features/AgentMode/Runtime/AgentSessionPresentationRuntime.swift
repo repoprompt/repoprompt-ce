@@ -40,6 +40,7 @@ final class AgentSessionPresentationRuntime {
         var reasoningEffort: ((AgentTabSession) -> Void)?
         var mcpControl: ((AgentTabSession, Bool) -> Void)?
         var hydration: ((AgentTabSession, AgentSessionHydrationProjection) -> Void)?
+        var saveCommitted: ((AgentTabSession, AgentSessionSaveRuntime.Receipt, Int) -> Void)?
         var isAvailable: (() -> Bool)?
     }
 
@@ -164,6 +165,10 @@ final class AgentSessionPresentationRuntime {
 
     func hydrationProjected(_ session: AgentTabSession, event: AgentSessionHydrationProjection) {
         sink(for: session)?.hydration?(session, event)
+    }
+
+    func sessionSaveCommitted(_ session: AgentTabSession, receipt: AgentSessionSaveRuntime.Receipt, canonicalItemCount: Int) {
+        sink(for: session)?.saveCommitted?(session, receipt, canonicalItemCount)
     }
 
     func permissionsChanged(_ session: AgentTabSession) {
