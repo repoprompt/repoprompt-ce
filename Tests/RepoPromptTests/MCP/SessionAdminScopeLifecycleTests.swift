@@ -10187,7 +10187,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             }
             let terminalNotice = switch terminalStatus {
             case .completed: "target_idle_with_new_activity"
-            case .failed: "target_failed_with_new_activity"
+            case .failed, .claudeSizeFailure: "target_failed_with_new_activity"
             case .cancelled: "target_cancelled_with_new_activity"
             }
             await controller.completeLastTurn(text: "Hi!", status: terminalStatus)
