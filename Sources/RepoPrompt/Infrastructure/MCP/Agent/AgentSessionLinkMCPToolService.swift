@@ -86,6 +86,7 @@ struct AgentSessionLinkMCPToolService {
             _ operation: @escaping HeartbeatOperation
         ) async throws -> Value
 
+    var resolveCanonicalObserverEndpoint: ((RequestMetadata) async -> DomainAgentSessionLinkEndpointIdentity?)?
     var captureWaitInput: () -> DomainAgentSessionLinkWaitInput? = { AgentSessionLinkWaitCallOrigin.current }
     // Deliberately fail-closed by default: never fall back to the generic recovery resolver.
     var resolveModelObserverEndpoint: (RequestMetadata) async -> DomainAgentSessionLinkEndpointIdentity? = { _ in nil }
@@ -559,6 +560,10 @@ struct AgentSessionLinkMCPToolService {
         -> DomainAgentSessionLinkEndpointIdentity
     {
         let metadata = await captureRequestMetadata()
+        if let resolveCanonicalObserverEndpoint {
+            guard let endpoint = await resolveCanonicalObserverEndpoint(metadata) else { throw Self.unavailableError }
+            return endpoint
+        }
         let targetWindow = try requireTargetWindow()
         guard let endpoint = await AgentSessionTargetOperationGuard.resolveObserverEndpoint(
             metadata: metadata,

@@ -291,6 +291,13 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
     private var toolTrackingByTabID: [UUID: AgentToolTrackingController] = [:]
     private let windowID: Int
     private let routingOwner: MCPHostRouteResources?
+    private var originatingContextSource: MCPHostRouteResources.ProviderContextSource?
+
+    func installOriginatingContextSource(_ source: @escaping MCPHostRouteResources.ProviderContextSource) {
+        precondition(originatingContextSource == nil)
+        originatingContextSource = source
+    }
+
     private let runtimeWorkspacePathsProvider: (AgentTabSession) throws -> CodexRuntimeWorkspacePaths
     private let codexControllerFactory: CodexControllerFactory
     private let codexCapabilitiesForLaunch: (_ isMCPRelated: Bool) -> CodexCapabilitySettings
@@ -4218,6 +4225,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             policyInstaller: MCPBootstrapLease.agentModePolicyInstaller(connectionPolicyInstaller),
             routingStateOwner: routingStateOwner,
             routingOwner: routingOwner,
+            originatingContextSource: originatingContextSource,
             processRegistrationProvider: { await (reusingController as? CodexNativeSessionController)?.routingProcessRegistration() }
         )
     }

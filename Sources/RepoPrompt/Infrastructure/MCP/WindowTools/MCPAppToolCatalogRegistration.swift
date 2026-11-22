@@ -41,6 +41,7 @@ final class MCPAppToolCatalogRegistration: WindowScopedService {
     private let sharedBindings: [MCPDomainToolBinding]
     private let runtime: MCPAppToolBinder
     private let requiredToolNames: Set<String>
+    private let hostInteractionAdapter: DomainLongRunningInteractionAdapter?
     private let logger = Logger(label: "com.repoprompt.mcp.app-tool-catalog")
     private var toolsCache: [Tool]?
     private(set) var materializationErrorDescription: String?
@@ -51,7 +52,8 @@ final class MCPAppToolCatalogRegistration: WindowScopedService {
         sharedBindings: [MCPDomainToolBinding] = [],
         runtime: MCPAppToolBinder,
         requiredToolNames: Set<String> = Set(MCPAppToolGroup.orderedToolNames),
-        runRouting: MCPHostRouteResources.RunRouting? = nil
+        runRouting: MCPHostRouteResources.RunRouting? = nil,
+        hostInteractionAdapter: DomainLongRunningInteractionAdapter? = nil
     ) {
         #if DEBUG || EDIT_FLOW_PERF
             let constructionState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPWindowToolCatalog.construction)
@@ -63,6 +65,7 @@ final class MCPAppToolCatalogRegistration: WindowScopedService {
         self.sharedBindings = sharedBindings
         self.runtime = runtime
         self.requiredToolNames = requiredToolNames
+        self.hostInteractionAdapter = hostInteractionAdapter
     }
 
     /// One complete app catalog for either a physical presentation or an executable host route.
@@ -106,7 +109,7 @@ final class MCPAppToolCatalogRegistration: WindowScopedService {
     }
 
     var longRunningInteractionAdapter: DomainLongRunningInteractionAdapter? {
-        providers.compactMap { ($0 as? MCPAskUserToolProvider)?.domainInteractionAdapter }.first
+        hostInteractionAdapter ?? providers.compactMap { ($0 as? MCPAskUserToolProvider)?.domainInteractionAdapter }.first
     }
 
     /// Read-only catalog inspection materializes the same canonical projection used by startup.

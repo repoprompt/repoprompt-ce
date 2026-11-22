@@ -697,7 +697,10 @@ final class AgentSessionPersistenceRuntimeTests: XCTestCase {
         f.scope.noteSettlementChanged()
         XCTAssertEqual(writes, 2, "Observation cannot retry a failed save")
         try FileManager.default.removeItem(at: url)
-        drain.attemptRecovery()
+        let prefix = WindowStatesManager.agentHostRecoveryWarningPrefix
+        await windowManager.retryRetainedAgentHostDrain(warningID: prefix + UUID().uuidString)
+        XCTAssertEqual(writes, 2, "An unrelated warning cannot retry the retained writer")
+        await windowManager.retryRetainedAgentHostDrain(warningID: prefix + drain.recoveryID.uuidString)
         let result = await drain.wait(until: .now.advanced(by: .seconds(5)))
         XCTAssertEqual(result, .released)
         XCTAssertEqual(writes, 3)

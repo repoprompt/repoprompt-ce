@@ -37,26 +37,23 @@ extension AgentSessionRuntimeHost {
                   let workspace = await activation.authority.canonicalWorkspaceSnapshot(workspaceID),
                   workspace.health != .removed, isCurrent()
             else { return nil }
-            let carriers = workspace.contexts.filter { $0.metadata.identity == context && $0.health != .removed }
-            guard carriers.count == 1, let carrier = carriers.first,
-                  let tab = try? JSONDecoder().decode(ComposeTabState.self, from: carrier.metadata.documentBytes),
-                  tab.id == context.contextID, tab.activeAgentSessionID == sessionID, isCurrent()
-            else { return nil }
-            return .init(snapshot: .init(
+            guard let tab = activation.executionTab(in: workspace, workspaceID: workspaceID, tabID: context.contextID, sessionID: sessionID),
+                  isCurrent() else { return nil }
+            let revision = workspace.contexts.first(where: { $0.metadata.identity == context })?.revisions.workingRevision
+                ?? workspace.revisions.workingRevision
+            var snapshot = MCPTabContextSnapshot(
                 tabID: tab.id, windowID: routeID, workspaceID: workspaceID, promptText: tab.promptText,
-                selection: tab.selection, selectionRevision: carrier.revisions.workingRevision,
+                selection: tab.selection, selectionRevision: revision,
                 selectedMetaPromptIDs: tab.selectedMetaPromptIDs,
                 selectedContextBuilderPromptIDs: tab.contextBuilder.selectedContextBuilderPromptIDs,
                 tabName: tab.name, runID: runID, activeAgentSessionID: sessionID,
                 worktreeBindings: bindings, explicitlyBound: false
-            ), isCurrent: isCurrent, validateCarrier: { [weak activation] in
+            )
+            snapshot.savedCarrierSessionID = activation.savedCarrierSessionID
+            return .init(snapshot: snapshot, isCurrent: isCurrent, validateCarrier: { [weak activation] in
                 guard isCurrent(), let latest = await activation?.authority.canonicalWorkspaceSnapshot(workspaceID),
                       latest.health != .removed else { return false }
-                let carrierStillBound = latest.contexts.contains {
-                    $0.metadata.identity == context && $0.health != .removed
-                        && $0.metadata.activeAgentSessionID == sessionID
-                }
-                return carrierStillBound && isCurrent()
+                return activation?.executionTab(in: latest, workspaceID: workspaceID, tabID: context.contextID, sessionID: sessionID) != nil && isCurrent()
             })
         }
     }

@@ -157,7 +157,7 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
     private func prepareIfUnloaded(
         _ sessionID: UUID, isStillAuthorized: @escaping @MainActor () -> Bool
     ) async -> SessionAdminLifecycleOutcome? {
-        guard SessionAdminWindows.liveSession(sessionID) == nil, let preparation else { return nil }
+        guard (try? SessionAdminWindows.command(for: sessionID)) == nil, let preparation else { return nil }
         let outcome = await preparation(sessionID, isStillAuthorized)
         guard isStillAuthorized() else { return .blocked("Delegated authority ended while preparing the target.") }
         return outcome == .ready ? nil : .invalid(Self.preparationDetail(outcome))
@@ -250,17 +250,16 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         defer { manager.endPreparedOversightPreparation(target) }
         let prepared = await manager.prepareSavedOversightTarget(target, isStillAuthorized: isStillAuthorized)
         guard isStillAuthorized(), !Task.isCancelled else { return .revoked }
-        guard case let .success(owner) = prepared,
-              let location = manager.preparedOversightLocations[target], location.isCurrent
+        guard case let .success(writer) = prepared,
+              let host = writer.scope.executableHost, !host.route.isClosing
         else {
             let code = if case let .failure(reason) = prepared { reason.rawValue } else { "target_binding_changed" }
             return .failed("\(code): The exact saved target could not be prepared. Ask the user to check whether it was deleted, moved or has conflicting saved copies; nothing was linked.")
         }
-        guard !owner.isClosing else { return .revoked }
         // Re-read after hydration: no captured endpoint, deletion state or ambiguity claim earns a link.
         let current = AgentSessionCarrierResolver.capture(windows: WindowStatesManager.shared.allWindows, sessionIDs: [target])
         guard !current.ambiguousSessionIDs.contains(target),
-              (try? SessionAdminWindows.command(for: target)) != nil
+              let command = try? SessionAdminWindows.command(for: target), command.identity == writer.identity
         else {
             return .failed("target_ambiguous: Target ownership changed during preparation. Use session_admin inventory; nothing was linked.")
         }
@@ -271,9 +270,8 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
             return .failed("observer_changed: The requesting session's exact binding changed; nothing was linked.")
         }
         guard let targetEndpoint = candidates[target]?.only?.domainEndpoint,
-              targetEndpoint.windowID == owner.windowID,
-              targetEndpoint.workspaceID == location.workspace.id, targetEndpoint.tabID == location.tab.id,
-              location.isCurrent,
+              targetEndpoint.windowID == host.routeID,
+              targetEndpoint.workspaceID == writer.identity.workspaceID, targetEndpoint.tabID == writer.session.tabID,
               !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: target),
               !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: target)
         else { return .failed("target_unloaded_unpreparable: The exact target binding changed during preparation. Use session_admin inventory; nothing was linked.") }
@@ -328,8 +326,10 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         modelID: String,
         isStillAuthorized: @escaping @MainActor () -> Bool
     ) async -> SessionAdminLifecycleOutcome {
-        if let refusal = await prepareIfUnloaded(sessionID, isStillAuthorized: isStillAuthorized) { return refusal }
         let windows = WindowStatesManager.shared
+        windows.beginPreparedOversightPreparation(sessionID)
+        defer { windows.endPreparedOversightPreparation(sessionID) }
+        if let refusal = await prepareIfUnloaded(sessionID, isStillAuthorized: isStillAuthorized) { return refusal }
         guard let command = try? SessionAdminWindows.command(for: sessionID),
               let runtime = command.writer.scope.linkExecution,
               let endpoint = runtime.agentSessionLinkObserverEndpoint(tabID: command.writer.session.tabID),
@@ -366,6 +366,9 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         effort: String,
         isStillAuthorized: @escaping @MainActor () -> Bool
     ) async -> SessionAdminLifecycleOutcome {
+        let windows = WindowStatesManager.shared
+        windows.beginPreparedOversightPreparation(sessionID)
+        defer { windows.endPreparedOversightPreparation(sessionID) }
         if let refusal = await prepareIfUnloaded(sessionID, isStillAuthorized: isStillAuthorized) { return refusal }
         guard let command = try? SessionAdminWindows.command(for: sessionID),
               let runtime = command.writer.scope.linkExecution

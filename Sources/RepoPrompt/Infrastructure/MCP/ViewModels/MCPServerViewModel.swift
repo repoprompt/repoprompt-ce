@@ -2264,7 +2264,7 @@ final class MCPServerViewModel: ObservableObject {
     @MainActor
     func makeToolCatalog(route routeResources: MCPHostRouteResources, fileReads: MCPFileReadResources? = nil) -> MCPAppToolCatalogRegistration {
         precondition(fileReads == nil || routeResources.identity.kind == .independent)
-        let runtime = makeWindowToolRuntime(route: routeResources, independentFileReads: fileReads == nil ? [] : MCPFileReadResources.toolNames)
+        let runtime = makeWindowToolRuntime(route: routeResources, independentFileReads: fileReads?.boundToolNames ?? [])
         let context = makeWindowToolContextCapabilities(route: routeResources)
         let selection = makeWindowToolSelectionCapabilities(route: routeResources)
         let files = makeWindowToolFileCapabilities(route: routeResources)
@@ -5846,12 +5846,24 @@ final class MCPServerViewModel: ObservableObject {
         lineCount: Int? = nil,
         lookupContext: WorkspaceLookupContext = .visibleWorkspace
     ) async throws -> MCPAppFileReadResult {
-        try await MCPToolWorkCountDiagnostics.withReadFileInvocation { [self] in
+        try await Self.readStoreFile(
+            input: input, startLine1Based: startLine1Based, lineCount: lineCount,
+            lookupContext: lookupContext, store: promptVM.workspaceFileContextStore,
+            workspaceMessage: { [weak self] path in
+                await self?.workspaceContextMessage(forOperation: "read file", path: path) ?? "Workspace authority unavailable."
+            }
+        )
+    }
+
+    static func readStoreFile(
+        input: WorkspaceExactFileInput, startLine1Based: Int?, lineCount: Int?,
+        lookupContext: WorkspaceLookupContext, store: WorkspaceFileContextStore,
+        workspaceMessage: (String) async -> String
+    ) async throws -> MCPAppFileReadResult {
+        try await MCPToolWorkCountDiagnostics.withReadFileInvocation {
             try await readFileBody(
-                input: input,
-                startLine1Based: startLine1Based,
-                lineCount: lineCount,
-                lookupContext: lookupContext
+                input: input, startLine1Based: startLine1Based, lineCount: lineCount,
+                lookupContext: lookupContext, store: store, workspaceMessage: workspaceMessage
             )
         }
     }
@@ -5882,14 +5894,15 @@ final class MCPServerViewModel: ObservableObject {
         return resolution
     }
 
-    private func readFileBody(
+    private static func readFileBody(
         input: WorkspaceExactFileInput,
-        startLine1Based: Int? = nil,
-        lineCount: Int? = nil,
-        lookupContext: WorkspaceLookupContext = .visibleWorkspace
+        startLine1Based: Int?,
+        lineCount: Int?,
+        lookupContext: WorkspaceLookupContext,
+        store: WorkspaceFileContextStore,
+        workspaceMessage: (String) async -> String
     ) async throws -> MCPAppFileReadResult {
         try Task.checkCancellation()
-        let store = promptVM.workspaceFileContextStore
         let readableService = WorkspaceReadableFileService(store: store)
         let roots = await store.rootRefs(scope: lookupContext.rootScope)
         let namespace = lookupContext.exactFileNamespace(storeRoots: roots)
@@ -5919,7 +5932,7 @@ final class MCPServerViewModel: ObservableObject {
             if readableService.isAlwaysReadableExternalPath(requestedPath) {
                 throw MCPError.invalidParams("File not found: '\(readableService.displayPath(forExternalPath: requestedPath))'.")
             }
-            let msg = await workspaceContextMessage(forOperation: "read file", path: requestedPath)
+            let msg = await workspaceMessage(requestedPath)
             throw MCPError.invalidParams("Cannot read '\(requestedPath)'. \(msg)")
         }
 

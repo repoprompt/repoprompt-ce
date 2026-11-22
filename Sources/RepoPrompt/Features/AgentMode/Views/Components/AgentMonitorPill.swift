@@ -982,6 +982,19 @@ struct AgentMonitorPopoverView: View {
             }
             ForEach(props.persistence.warnings) { warning in
                 messageText(warning.message)
+                if warning.id.hasPrefix(WindowStatesManager.agentHostRecoveryWarningPrefix) {
+                    Button("Retry session settlement") {
+                        guard !isRetryingSave else { return }
+                        isRetryingSave = true
+                        Task {
+                            await WindowStatesManager.shared.retryRetainedAgentHostDrain(warningID: warning.id)
+                            isRetryingSave = false
+                        }
+                    }
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+                    .disabled(isRetryingSave)
+                    .accessibilityHint("Retries saving and releasing the original Agent session resources")
+                }
             }
             if props.persistence.hasPendingCleanupRetry {
                 Button("Retry saving") {
