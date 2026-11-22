@@ -735,24 +735,24 @@ class WindowState: ObservableObject {
     #endif
 
     #if DEBUG
-    /// Legacy fixture construction only. The production saved caller composes an executable host.
-    static func makePreparedSessionOwner(
-        workspace: WorkspaceModel,
-        borrowing source: WindowState,
-        agentModeViewModelFactory: WindowStateCompositionFactory.AgentModeViewModelFactory? = nil
-    ) -> WindowState {
-        guard let settingsLease = APISettingsRuntimeLease.acquire(from: source.apiSettingsViewModel) else {
-            preconditionFailure("Prepared owner requires live settings")
+        /// Legacy fixture construction only. The production saved caller composes an executable host.
+        static func makePreparedSessionOwner(
+            workspace: WorkspaceModel,
+            borrowing source: WindowState,
+            agentModeViewModelFactory: WindowStateCompositionFactory.AgentModeViewModelFactory? = nil
+        ) -> WindowState {
+            guard let settingsLease = APISettingsRuntimeLease.acquire(from: source.apiSettingsViewModel) else {
+                preconditionFailure("Prepared owner requires live settings")
+            }
+            return WindowState(
+                contextBuilderProviderFactory: nil, loadStoredAPISettingsDataOnInit: false,
+                codexModelPollingService: .shared, domainRuntimeOverride: source.compositionDomainRuntime,
+                keyManager: source.keyManager,
+                agentModeViewModelFactory: agentModeViewModelFactory, sessionRuntimeWorkspace: workspace,
+                borrowedAPISettingsViewModel: source.apiSettingsViewModel,
+                managedSettingsLease: settingsLease
+            )
         }
-        return WindowState(
-            contextBuilderProviderFactory: nil, loadStoredAPISettingsDataOnInit: false,
-            codexModelPollingService: .shared, domainRuntimeOverride: source.compositionDomainRuntime,
-            keyManager: source.keyManager,
-            agentModeViewModelFactory: agentModeViewModelFactory, sessionRuntimeWorkspace: workspace,
-            borrowedAPISettingsViewModel: source.apiSettingsViewModel,
-            managedSettingsLease: settingsLease
-        )
-    }
     #endif
 
     let isPreparedSessionOwner: Bool

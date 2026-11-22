@@ -27,6 +27,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         guard let physical else { throw MCPError.invalidRequest("This worktree request requires a physical presenter") }
         return physical
     }
+
     private let vcsService: VCSService
     private let resolver: GitRepoTargetResolver
     private let resolveSpawnParentSessionID: AgentSessionTargetOperationGuard.SpawnParentSessionResolver
@@ -968,12 +969,14 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             }
             try current()
             let invocation: AgentModeViewModel.WorktreeBindingMutationInvocationIdentity? = if let connectionID = metadata.connectionID,
-                 let runID = command.writer.session.runID, MCPClientIdentity.matches(metadata.clientName, AgentProviderKind.codexMCPClientID)
+                                                                                               let runID = command.writer.session.runID, MCPClientIdentity.matches(metadata.clientName, AgentProviderKind.codexMCPClientID)
             {
                 .init(connectionID: connectionID, sessionID: sessionID, runID: runID, provider: .codexExec)
             } else { nil }
             return BindingRequest(sessionID: sessionID, invocation: invocation, authority: .init(
-                revalidate: current, commit: { body in try current(); try body() }
+                revalidate: current, commit: { body in try current()
+                    try body()
+                }
             ), admission: admission, agentModeVM: nil)
         }
         let dependencies = try physicalDependencies()

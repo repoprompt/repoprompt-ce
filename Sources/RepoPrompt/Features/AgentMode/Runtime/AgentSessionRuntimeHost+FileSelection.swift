@@ -95,7 +95,7 @@ extension AgentSessionRuntimeHost {
         }
         guard await lease.isCurrent(), await validatesOrigin() else { throw MCPFileToolAuthorityFailure.superseded }
         let next = lookup.logicalizeSelection(selection.selection)
-        if op != "preview" && op != "get" && next != tab.selection {
+        if op != "preview", op != "get", next != tab.selection {
             _ = try await activation.commitHostSelection(
                 next, replacing: tab.selection, in: lease.snapshot, command: original,
                 connectionID: connection.connectionID, validatesOrigin: validatesOrigin
@@ -161,7 +161,8 @@ extension AgentSessionRuntimeHost {
     ) async throws -> DomainWorkspaceSnapshot? {
         guard let invocation = MCPInvocationContextBridge.current,
               invocation.connectionID == connection.connectionID,
-              let original = hostFileCommand(connection), let activation = workspaceActivation else {
+              let original = hostFileCommand(connection), let activation = workspaceActivation
+        else {
             throw MCPFileToolAuthorityFailure.superseded
         }
         let purpose = await ServerNetworkManager.shared.runPurpose(for: connection.connectionID)

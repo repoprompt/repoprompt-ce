@@ -1,15 +1,24 @@
 import Foundation
+import RepoPromptWorkspaceContext
 
 /// Exact saved-carrier lookup, independent of window/prompt/workspace view models.
 /// The result is evidence, not a writer or permission. The host revalidates it at
 /// mutation admission and supplies live metadata without retaining a census across IO.
 @MainActor
 enum AgentSavedSessionTargetLoader {
-    enum Failure: String, Error {
-        case missing = "target_missing"
-        case ambiguous = "target_ambiguous"
-        case changed = "target_binding_changed"
-        case unreadable = "target_saved_state_unreadable"
+    enum Failure: Error, Equatable {
+        case missing, ambiguous, changed, unreadable
+        case rootsUnavailable(WorkspaceRootReadinessFailure.Availability)
+
+        var rawValue: String {
+            switch self {
+            case .missing: "target_missing"
+            case .ambiguous: "target_ambiguous"
+            case .changed: "target_binding_changed"
+            case .unreadable: "target_saved_state_unreadable"
+            case .rootsUnavailable: "workspace_not_ready"
+            }
+        }
     }
 
     struct Target {

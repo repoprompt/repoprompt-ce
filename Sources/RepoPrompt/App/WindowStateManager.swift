@@ -639,6 +639,7 @@ class WindowStatesManager: ObservableObject {
 
     #if DEBUG
         var test_preparedOversightOwnerFactory: ((WorkspaceModel, WindowState) -> WindowState)?
+        var test_savedHostRootProbeCheckpoint: WorkspaceRootDirectoryProbe.Checkpoint?
     #endif
 
     private var modelRoutingWindowIndexes: [Int: Int] = [:]

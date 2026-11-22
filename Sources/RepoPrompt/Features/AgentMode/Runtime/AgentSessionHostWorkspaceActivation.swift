@@ -17,7 +17,10 @@ final class AgentSessionHostWorkspaceActivation {
     private let resources: AgentHostWorkspaceResources
     private let settings: APISettingsRuntimeLease
     private let savedTarget: AgentSavedSessionTargetLoader.Target?
-    var savedCarrierSessionID: UUID? { savedTarget?.entry.id }
+    var savedCarrierSessionID: UUID? {
+        savedTarget?.entry.id
+    }
+
     private var savedSelection: StoredSelection?
     private var rootLeases: [Set<UUID>: AgentHostWorkspaceResources.Lease] = [:]
     private(set) var catalogFileLease: AgentHostWorkspaceResources.Lease?
@@ -121,7 +124,8 @@ final class AgentSessionHostWorkspaceActivation {
             return savedTarget.carrier(in: workspace) != nil
         }
         guard await authority.canonicalWorkspaceSnapshot(workspaceID) == lease.snapshot, isCurrent,
-              !Task.isCancelled, catalogFileLease == nil else {
+              !Task.isCancelled, catalogFileLease == nil
+        else {
             await lease.release()
             throw AgentHostWorkspaceResources.Failure.contextChanged
         }

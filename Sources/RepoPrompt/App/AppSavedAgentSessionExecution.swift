@@ -82,13 +82,20 @@ enum AppSavedAgentSessionExecution {
     static func compose(
         target: Target, catalog: AgentSavedSessionTargetLoader.Catalog,
         domain: MCPDomainRuntime, installRoute: InstallRoute, providerEnvironment: ProviderEnvironment?,
-        isStillAuthorized: @escaping @MainActor () -> Bool
+        rootProbeCheckpoint: WorkspaceRootDirectoryProbe.Checkpoint?, isStillAuthorized: @escaping @MainActor () -> Bool
     ) async throws -> AgentSavedSessionTargetLoader.RuntimeLoad {
         try Task.checkCancellation()
         guard isStillAuthorized(), !AppLaunchConfiguration.current.suppressesAgentSessionPersistence else {
             throw AgentHostWorkspaceResources.Failure.authorityUnavailable
         }
 
+        let workspace = target.workspace
+        if !workspace.repoPaths.isEmpty {
+            let failure = try await WorkspaceRootDirectoryProbe().run(paths: workspace.repoPaths, attemptID: UUID(), checkpoint: rootProbeCheckpoint)
+            try Task.checkCancellation()
+            guard isStillAuthorized() else { throw AgentSavedSessionTargetLoader.Failure.changed }
+            if let failure { throw AgentSavedSessionTargetLoader.Failure.rootsUnavailable(failure) }
+        }
         let owner = MCPHostRouteResources.LeaseOwner(
             identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: domain.routingCoordinator, runtime: domain
         )
@@ -97,7 +104,6 @@ enum AppSavedAgentSessionExecution {
         let settings = GlobalSettingsStore.shared
         let diagnostics = AppAgentSessionLinkCatalogEventSink()
         let perf = AppAgentModePerfRecorder()
-        let workspace = target.workspace
         let paths = AgentSessionRuntimeHost.makeSessionWorkspaceProviders { workspace.repoPaths.first }
         let host = AgentSessionRuntimeHost(
             route: route, executionRouteLease: routeLease,
@@ -145,8 +151,13 @@ enum AppSavedAgentSessionExecution {
             for path in workspace.repoPaths {
                 try Task.checkCancellation()
                 guard isStillAuthorized() else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
-                let root = try await files.loadRoot(path: path, cancelUnderlyingLoadOnCallerCancellation: true)
-                rootIDs.append(root.id)
+                do {
+                    let root = try await files.loadRoot(path: path, cancelUnderlyingLoadOnCallerCancellation: true)
+                    rootIDs.append(root.id)
+                } catch {
+                    guard isStillAuthorized(), !Task.isCancelled else { throw AgentSavedSessionTargetLoader.Failure.changed }
+                    throw AgentSavedSessionTargetLoader.Failure.rootsUnavailable(.loadFailed)
+                }
             }
             guard let activation = host.workspaceActivation, isStillAuthorized() else {
                 throw AgentHostWorkspaceResources.Failure.authorityUnavailable
@@ -157,7 +168,7 @@ enum AppSavedAgentSessionExecution {
             var catalog = catalog
             let validateCatalog = catalog.validateCanonicalTarget
             catalog.validateCanonicalTarget = { candidate in
-                if let validateCatalog, !(await validateCatalog(candidate)) { return false }
+                if let validateCatalog, await !validateCatalog(candidate) { return false }
                 guard candidate.workspace.id == workspace.id, candidate.entry.id == target.entry.id,
                       candidate.tab.id == target.tab.id, candidate.stashedTabID == target.stashedTabID,
                       let current = await canonicalStorage.readWorkspace(workspace.id)

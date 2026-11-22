@@ -118,7 +118,7 @@ extension AgentSavedSessionTargetLoader {
         case let .failure(reason): return failed(.lookup(reason))
         case let .success(value): target = value
         }
-        if let validate = catalog.validateCanonicalTarget, !(await validate(target)) {
+        if let validate = catalog.validateCanonicalTarget, await !validate(target) {
             return failed(.lookup(.changed))
         }
         guard !Task.isCancelled, isStillAuthorized(), target.workspace.id == storage.workspaceID, catalog.isCurrent(target),
@@ -185,7 +185,7 @@ extension AgentSavedSessionTargetLoader {
         } catch {
             return failLoading(.lookup(error is CancellationError || Task.isCancelled ? .changed : .unreadable))
         }
-        if let validate = catalog.validateCanonicalTarget, !(await validate(target)) {
+        if let validate = catalog.validateCanonicalTarget, await !validate(target) {
             return failLoading(.lookup(.changed))
         }
         guard !Task.isCancelled, isStillAuthorized(), available(), !storage.isSuppressed(),

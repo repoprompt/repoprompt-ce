@@ -14,7 +14,7 @@ struct MCPFileReadResources {
     static let toolNames: Set<String> = [MCPWindowToolName.getFileTree, MCPWindowToolName.getCodeStructure]
     static let contentToolNames: Set<String> = [MCPWindowToolName.readFile, MCPWindowToolName.search]
 
-    struct ReadResourceCheck: Sendable {
+    struct ReadResourceCheck {
         let validate: @MainActor @Sendable () async throws -> Void
 
         @MainActor
@@ -23,7 +23,7 @@ struct MCPFileReadResources {
         }
     }
 
-    struct ContentEffects: Sendable {
+    struct ContentEffects {
         let artifact: MCPAppPhysicalCapabilityAdapters.ReadSelectedAuthorizedGitArtifact
         let selectRead: @MainActor @Sendable (MCPHostRouteResources.FileReadConnection, DomainWorkspaceSnapshot, ReadResourceCheck, WorkspaceLookupContext, ToolResultDTOs.ReadFileReply, String, String) async throws -> DomainWorkspaceSnapshot?
         let selectSearch: @MainActor @Sendable (MCPHostRouteResources.FileReadConnection, DomainWorkspaceSnapshot, ReadResourceCheck, WorkspaceLookupContext, SearchMode, Int, ToolResultDTOs.SearchResultDTO, [String]) async throws -> DomainWorkspaceSnapshot?
@@ -43,6 +43,7 @@ struct MCPFileReadResources {
         guard contentEffects != nil else { return Self.toolNames }
         return Self.toolNames.union(Self.contentToolNames)
     }
+
     #if DEBUG
         var beforeReplyValidationForTesting: (@MainActor () async -> Void)?
     #endif
@@ -130,7 +131,8 @@ struct MCPFileReadResources {
                 guard connection.savedCarrierSessionID == nil else { throw MCPFileToolAuthorityFailure.unavailable }
                 lease = try await workspace.capture(context: context)
                 guard let canonical = lease.snapshot.contexts.first(where: { $0.metadata.identity == context }),
-                      source.activeAgentSessionID == canonical.metadata.activeAgentSessionID else {
+                      source.activeAgentSessionID == canonical.metadata.activeAgentSessionID
+                else {
                     throw MCPFileToolAuthorityFailure.unavailable
                 }
                 contextRevision = canonical.revisions.workingRevision
@@ -179,7 +181,8 @@ struct MCPFileReadResources {
                 }
                 // Recheck synchronous revocations after the last actor hop as well.
                 guard lease.rootsAreCurrent, route.fileReadConnectionIsCurrent(connection),
-                      hostExecutionTab.map({ $0(expectedWorkspace, connection) != nil }) ?? true else {
+                      hostExecutionTab.map({ $0(expectedWorkspace, connection) != nil }) ?? true
+                else {
                     throw MCPFileToolAuthorityFailure.superseded
                 }
             }

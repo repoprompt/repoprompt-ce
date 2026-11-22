@@ -108,7 +108,9 @@ final class MCPAppToolCatalogRegistration: WindowScopedService {
         )
     }
 
-    var ownsHostInteractions: Bool { hostInteractionAdapter != nil }
+    var ownsHostInteractions: Bool {
+        hostInteractionAdapter != nil
+    }
 
     var longRunningInteractionAdapter: DomainLongRunningInteractionAdapter? {
         hostInteractionAdapter ?? providers.compactMap { ($0 as? MCPAskUserToolProvider)?.domainInteractionAdapter }.first

@@ -5382,52 +5382,52 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     #if DEBUG
-    /// Legacy prepared-owner fixture only; app saved execution enters `loadRuntime`.
-    func prepareSavedOversightSession(
-        tabID: UUID, sessionID: UUID, workspaceID: UUID,
-        isStillAuthorized: @MainActor () -> Bool
-    ) async -> Bool {
-        guard !isAwaitingWorkspaceAdoption, !Task.isCancelled, isStillAuthorized(), let workspaceManager,
-              workspaceManager.activeWorkspaceID == workspaceID,
-              let tab = workspaceManager.modelRoutingTab(workspaceID: workspaceID, tabID: tabID),
-              tab.activeAgentSessionID == nil || tab.activeAgentSessionID == sessionID,
-              !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: sessionID),
-              !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: sessionID)
-        else { return false }
-        if tab.activeAgentSessionID == nil {
-            guard let entry = ownerValidatedSessionIndex[sessionID], entry.tabID == tabID,
-                  preferredActiveSidebarEntry(for: tabID, tabName: tab.name, workspaceID: workspaceID)?.id == sessionID,
-                  sessions[tabID].map({
-                      $0.activeAgentSessionID == nil && !$0.isDirty && $0.items.isEmpty
-                          && !$0.runState.isActive && !$0.bindingTransitionInProgress
-                          && !bindingHasSynchronousOwnership($0)
-                  }) ?? true,
-                  isStillAuthorized(),
-                  workspaceManager.compareAndSetActiveAgentSessionID(
-                      expected: nil, replacement: sessionID, forTabID: tabID, inWorkspaceID: workspaceID
-                  )
+        /// Legacy prepared-owner fixture only; app saved execution enters `loadRuntime`.
+        func prepareSavedOversightSession(
+            tabID: UUID, sessionID: UUID, workspaceID: UUID,
+            isStillAuthorized: @MainActor () -> Bool
+        ) async -> Bool {
+            guard !isAwaitingWorkspaceAdoption, !Task.isCancelled, isStillAuthorized(), let workspaceManager,
+                  workspaceManager.activeWorkspaceID == workspaceID,
+                  let tab = workspaceManager.modelRoutingTab(workspaceID: workspaceID, tabID: tabID),
+                  tab.activeAgentSessionID == nil || tab.activeAgentSessionID == sessionID,
+                  !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: sessionID),
+                  !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: sessionID)
             else { return false }
+            if tab.activeAgentSessionID == nil {
+                guard let entry = ownerValidatedSessionIndex[sessionID], entry.tabID == tabID,
+                      preferredActiveSidebarEntry(for: tabID, tabName: tab.name, workspaceID: workspaceID)?.id == sessionID,
+                      sessions[tabID].map({
+                          $0.activeAgentSessionID == nil && !$0.isDirty && $0.items.isEmpty
+                              && !$0.runState.isActive && !$0.bindingTransitionInProgress
+                              && !bindingHasSynchronousOwnership($0)
+                      }) ?? true,
+                      isStillAuthorized(),
+                      workspaceManager.compareAndSetActiveAgentSessionID(
+                          expected: nil, replacement: sessionID, forTabID: tabID, inWorkspaceID: workspaceID
+                      )
+                else { return false }
+            }
+            let session = session(for: tabID)
+            if session.activeAgentSessionID == nil {
+                guard !session.isDirty, session.items.isEmpty, !session.runState.isActive,
+                      !session.bindingTransitionInProgress, !bindingHasSynchronousOwnership(session),
+                      isStillAuthorized(), installPersistentSessionBinding(
+                          sessionID: sessionID, on: session, mutationTarget: .runtimeOnly, invalidateAsyncWork: false
+                      ) != nil
+                else { return false }
+                // The previous unbound/empty payload was not a load of this saved identity.
+                session.hasLoadedPersistedState = false
+            }
+            guard session.activeAgentSessionID == sessionID else { return false }
+            _ = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: false)
+            return !Task.isCancelled && isStillAuthorized() && sessions[tabID] === session
+                && workspaceManager.activeWorkspaceID == workspaceID
+                && workspaceManager.activeAgentSessionID(forTabID: tabID, inWorkspaceID: workspaceID) == sessionID
+                && session.activeAgentSessionID == sessionID && session.permitsBoundOperationAndSave
+                && !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: sessionID)
+                && !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: sessionID)
         }
-        let session = session(for: tabID)
-        if session.activeAgentSessionID == nil {
-            guard !session.isDirty, session.items.isEmpty, !session.runState.isActive,
-                  !session.bindingTransitionInProgress, !bindingHasSynchronousOwnership(session),
-                  isStillAuthorized(), installPersistentSessionBinding(
-                      sessionID: sessionID, on: session, mutationTarget: .runtimeOnly, invalidateAsyncWork: false
-                  ) != nil
-            else { return false }
-            // The previous unbound/empty payload was not a load of this saved identity.
-            session.hasLoadedPersistedState = false
-        }
-        guard session.activeAgentSessionID == sessionID else { return false }
-        _ = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: false)
-        return !Task.isCancelled && isStillAuthorized() && sessions[tabID] === session
-            && workspaceManager.activeWorkspaceID == workspaceID
-            && workspaceManager.activeAgentSessionID(forTabID: tabID, inWorkspaceID: workspaceID) == sessionID
-            && session.activeAgentSessionID == sessionID && session.permitsBoundOperationAndSave
-            && !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: sessionID)
-            && !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: sessionID)
-    }
     #endif
 
     private enum PersistentSessionBindingMutationTarget {

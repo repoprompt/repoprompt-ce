@@ -41,7 +41,8 @@ extension MCPHostRouteResources {
 
     fileprivate func registerHostCapabilities(service: MCPService, workspaceID: UUID) async throws {
         guard identity.kind == .independent,
-              await ensureRegistered(workspaceID: workspaceID, contextID: nil, revision: 0) != nil else {
+              await ensureRegistered(workspaceID: workspaceID, contextID: nil, revision: 0) != nil
+        else {
             throw AgentHostWorkspaceResources.Failure.authorityUnavailable
         }
         if usesHostCapabilities, await hasActiveCatalog() { return }
@@ -117,7 +118,8 @@ extension MCPHostRouteResources {
             }, resolveDefaultTimeoutSeconds: { [weak self] request in
                 let invocation = try MCPInvocationContextBridge.require(toolName: MCPWindowToolName.askUser)
                 guard let connectionID = invocation.connectionID, request.clientID == connectionID,
-                      await self?.hostQuestionIsAvailable(invocation.metadata) == true else {
+                      await self?.hostQuestionIsAvailable(invocation.metadata) == true
+                else {
                     throw MCPError.invalidParams("The originating Agent question owner is unavailable")
                 }
                 return await AgentSessionRuntimeHost.hostQuestionTimeout()
@@ -141,12 +143,12 @@ extension MCPHostRouteResources {
     }
 }
 
-extension AgentSessionRuntimeHost {
-    fileprivate static func hostQuestionTimeout() -> TimeInterval {
+private extension AgentSessionRuntimeHost {
+    static func hostQuestionTimeout() -> TimeInterval {
         GlobalSettingsStore.shared.contextBuilderBehaviorSettings().questionTimeoutSeconds
     }
 
-    fileprivate func hostInteractionCommand(_ metadata: MCPRequestMetadata) async -> AgentSessionRuntimeStore.Command? {
+    func hostInteractionCommand(_ metadata: MCPRequestMetadata) async -> AgentSessionRuntimeStore.Command? {
         guard let connectionID = metadata.connectionID,
               let connection = try? route.fileReadConnection(metadata: metadata),
               let original = hostFileCommand(connection),
@@ -155,7 +157,7 @@ extension AgentSessionRuntimeHost {
         return original
     }
 
-    fileprivate func executeHostAskUser(_ args: [String: Value], invocation: ToolInvocationContext) async throws -> Value {
+    func executeHostAskUser(_ args: [String: Value], invocation: ToolInvocationContext) async throws -> Value {
         guard let command = await hostInteractionCommand(invocation.metadata), let interactions = scope.installedInteractions else {
             throw MCPError.invalidParams("The originating Agent question owner is unavailable")
         }
@@ -174,7 +176,7 @@ extension AgentSessionRuntimeHost {
         return MCPAskUserToolProvider.askUserResponseValue(result, includeLegacyResponse: parsed.includeLegacyResponse)
     }
 
-    fileprivate func executeHostAgentManage(_ args: [String: Value], invocation: ToolInvocationContext) async throws -> Value {
+    func executeHostAgentManage(_ args: [String: Value], invocation: ToolInvocationContext) async throws -> Value {
         guard AgentMCPToolHelpers.normalizedString(args["op"])?.lowercased() == "list_agents" else {
             throw MCPError.invalidRequest("This route supports model discovery through agent_manage list_agents, but cannot manage presentation sessions")
         }
@@ -201,7 +203,7 @@ extension AgentSessionRuntimeHost {
         return reply
     }
 
-    fileprivate func executeHostSessionAdmin(_ args: [String: Value], invocation: ToolInvocationContext) async throws -> Value {
+    func executeHostSessionAdmin(_ args: [String: Value], invocation: ToolInvocationContext) async throws -> Value {
         let bridge = AgentSessionLinkRuntimeBridge.shared
         return try await SessionAdminMCPToolService(
             captureRequestMetadata: { invocation.metadata },
@@ -215,7 +217,7 @@ extension AgentSessionRuntimeHost {
         ).execute(args: args)
     }
 
-    fileprivate func executeHostSessionLink(_ args: [String: Value], invocation: ToolInvocationContext) async throws -> Value {
+    func executeHostSessionLink(_ args: [String: Value], invocation: ToolInvocationContext) async throws -> Value {
         let resolve: (MCPRequestMetadata) async -> DomainAgentSessionLinkEndpointIdentity? = { [weak self] metadata in
             guard let self, let command = await hostInteractionCommand(metadata) else { return nil }
             return scope.linkExecution?.agentSessionLinkObserverEndpoint(tabID: command.writer.session.tabID)

@@ -392,11 +392,16 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
                 notifyAgentSessionLinkTopologyChanged()
                 return .success(loaded.writer)
             }
+            #if DEBUG
+                let rootProbeCheckpoint = test_savedHostRootProbeCheckpoint
+            #else
+                let rootProbeCheckpoint: WorkspaceRootDirectoryProbe.Checkpoint? = nil
+            #endif
             let result = try await AppSavedAgentSessionExecution.compose(
                 target: lookup.target, catalog: lookup.catalog, domain: domain,
                 installRoute: { host in
                     try await host.registerHostCatalog(service: WindowState.sharedMCPService)
-                }, providerEnvironment: providerEnvironment, isStillAuthorized: authorized
+                }, providerEnvironment: providerEnvironment, rootProbeCheckpoint: rootProbeCheckpoint, isStillAuthorized: authorized
             )
             let writer = result.writer
             if result.source == .savedPayload, let runtime = writer.scope.linkExecution,
@@ -530,7 +535,9 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
                           canonicalSavedHost(id) === host, !host.scope.isRetiring,
                           let session = host.scope.sessions.values.first(where: { $0.activeAgentSessionID == id }) else { continue }
                     let pairs = inventory.persisted.filter { $0.targetSessionID == id || $0.observerSessionID == id }
-                    for pair in pairs where pair.targetSessionID == id { preparedOversightConsentPairs[id, default: []].update(with: pair) }
+                    for pair in pairs where pair.targetSessionID == id {
+                        preparedOversightConsentPairs[id, default: []].update(with: pair)
+                    }
                     let known = preparedOversightConsentPairs[id] ?? []
                     let revoked = !known.isEmpty && known.allSatisfy { pair in
                         pair.sourceScopeID.map { !consent.permits(scopeID: $0, observer: pair.observerSessionID, target: id, at: Date()) } ?? false
@@ -804,7 +811,8 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         for candidate: AgentSessionLinkEndpointCandidate
     ) -> DomainAgentSessionObservationSnapshot {
         if let runtime = independentLinkRuntime(for: candidate.domainEndpoint),
-           let command = runtime.admit(candidate) {
+           let command = runtime.admit(candidate)
+        {
             return AgentModeViewModel.observationSnapshot(for: command.writer.session, candidate: candidate, subagentCounts: nil)
         }
         guard let window = window(withID: candidate.windowID) else {
@@ -1016,7 +1024,8 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         onChange: @escaping @MainActor () -> Void
     ) -> AgentSessionLinkObservationToken? {
         if let runtime = independentLinkRuntime(for: candidate.domainEndpoint),
-           let command = runtime.admit(candidate) {
+           let command = runtime.admit(candidate)
+        {
             let session = command.writer.session
             let publishers = [
                 session.$runState.map { _ in () }.eraseToAnyPublisher(),

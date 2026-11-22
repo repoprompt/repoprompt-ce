@@ -318,6 +318,37 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                     XCTAssertEqual(selected.objectValue?["status"]?.stringValue, "ok")
                     let selectedTree = try await invoke("get_file_tree", ["mode": .string("selected")])
                     XCTAssertTrue(selectedTree.objectValue?["tree"]?.stringValue?.contains("Witness.swift") == true, "\(selectedTree)")
+                    let linkRuntime = try XCTUnwrap(host.scope.linkExecution)
+                    let endpoint = try XCTUnwrap(linkRuntime.agentSessionLinkObserverEndpoint(tabID: writer.session.tabID))
+                    let candidate = try XCTUnwrap(windows.agentSessionLinkCandidate(for: endpoint, includeLocation: false))
+                    await ServerNetworkManager.shared.debugSeedConnectionRunRouting(
+                        connectionID: connectionID, runID: receipt.runID, purpose: .agentModeRun,
+                        windowID: host.routeID, registration: receipt
+                    )
+                    let question = Task { @MainActor in
+                        try await invoke("ask_user", ["question": .string("Continue the saved session?"), "timeout_seconds": .int(10)])
+                    }
+                    defer { question.cancel() }
+                    try await AsyncTestWait.waitUntil("the registered question is pending on the exact saved writer") {
+                        windows.agentSessionLinkPendingInteraction(for: candidate).interaction != nil
+                    }
+                    let interaction = try XCTUnwrap(windows.agentSessionLinkPendingInteraction(for: candidate).interaction)
+                    let payload = try AgentRunMCPToolService.parseResponsePayload(args: ["answers": .object(["response": .string("Continue")])])
+                    let wrong = await windows.agentSessionLinkRespondToPendingInteraction(
+                        for: candidate, request: .init(interactionID: UUID(), payload: payload), authorize: { true }
+                    )
+                    XCTAssertEqual(wrong, .interactionMismatch(currentInteractionID: interaction.id))
+                    let request = AgentSessionLinkInteractionResponseRequest(interactionID: interaction.id, payload: payload)
+                    let denied = await windows.agentSessionLinkRespondToPendingInteraction(for: candidate, request: request, authorize: { false })
+                    XCTAssertEqual(denied, .unavailable)
+                    XCTAssertEqual(windows.agentSessionLinkPendingInteraction(for: candidate).interaction?.id, interaction.id)
+                    let answered = await windows.agentSessionLinkRespondToPendingInteraction(for: candidate, request: request, authorize: { true })
+                    XCTAssertEqual(answered, .submitted(kind: .question, decision: "answered"))
+                    let response = try await question.value
+                    XCTAssertTrue(String(describing: response).contains("Continue"), "\(response)")
+                    XCTAssertNil(windows.agentSessionLinkPendingInteraction(for: candidate).interaction)
+                    let models = try await invoke("agent_manage", ["op": .string("list_agents"), "roles_only": .bool(true)])
+                    XCTAssertNotNil(models.objectValue)
                     let generation = try XCTUnwrap(receipt.routingWaitGeneration)
                     await MCPRoutingWaiter.notifyRouted(runID: receipt.runID, generation: generation)
                     await writer.session.agentTask?.value
@@ -331,8 +362,10 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                     let persisted = try await fixture.service.loadAgentSession(id: fixture.sessionID, for: workspace)
                     XCTAssertEqual(persisted?.organizationalParentID, parent)
                     let transcript = try XCTUnwrap(persisted).workingSourceItems()
-                    XCTAssertTrue(transcript.contains(where: { $0.kind == .assistant && $0.text.contains(assistantText) }),
-                                  "The new provider output must be present in the durable canonical transcript")
+                    XCTAssertTrue(
+                        transcript.contains(where: { $0.kind == .assistant && $0.text.contains(assistantText) }),
+                        "The new provider output must be present in the durable canonical transcript"
+                    )
                     let current = await runtime.workspaceStore.canonicalWorkspaceSnapshot(workspace.id)
                     let document = try XCTUnwrap(current?.document.documentBytes)
                     let unchanged = try JSONDecoder().decode(WorkspaceModel.self, from: document)
@@ -350,9 +383,8 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                 holdingPreparation = false
                 windows.endPreparedOversightPreparation(fixture.sessionID)
                 try await AsyncTestWait.waitUntil("ordinary saved-host completion retires its owner") {
-                    writer.scope.hasReleasedWriterClaims && host.route.isClosing
+                    writer.scope.hasReleasedWriterClaims && host.route.isClosing && writer.scope.retainedDrain == nil
                 }
-                XCTAssertNil(writer.scope.retainedDrain)
             }
         } catch {
             _ = await runtime.shutdown()

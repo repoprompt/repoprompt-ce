@@ -50,9 +50,9 @@ final class MCPFileToolProvider: MCPAppToolProviding {
 
     private func contentAuthority(_ authority: ReadAuthority) throws -> ContentReadAuthority {
         let dependencies = authority.dependencies
-        return .init(
+        return try .init(
             metadata: authority.metadata, lookupContext: authority.lookupContext,
-            store: try dependencies.context.requirePromptVM().workspaceFileContextStore,
+            store: dependencies.context.requirePromptVM().workspaceFileContextStore,
             isRunlessOneShotHint: authority.isRunlessOneShotHint,
             validate: { try await self.validate(authority) },
             readFile: dependencies.files.readFile,

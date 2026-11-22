@@ -82,7 +82,10 @@ final class MCPHostRouteResources {
     private var catalogTransitionTail: Task<Void, Never>?
     private(set) var catalogHandle: MCPDomainToolRegistrationHandle?
     private var catalog: MCPAppToolCatalogRegistration?
-    var usesHostCapabilities: Bool { catalog?.ownsHostInteractions == true }
+    var usesHostCapabilities: Bool {
+        catalog?.ownsHostInteractions == true
+    }
+
     private var runRouting: RunRouting?
     private(set) var providerContextSource: ProviderContextSource?
     /// Only an entered context/mapping producer retains its original physical cleanup adapter.
@@ -111,10 +114,22 @@ final class MCPHostRouteResources {
         fileprivate let policyID: UUID?
         fileprivate let tab: MCPTabContextSnapshot
 
-        var savedCarrierSessionID: UUID? { tab.savedCarrierSessionID }
-        var runID: UUID? { tab.runID }
-        var runAttemptIDAtBinding: UUID? { tab.runAttemptIDAtBinding }
-        var connectionID: UUID { registration.connectionID }
+        var savedCarrierSessionID: UUID? {
+            tab.savedCarrierSessionID
+        }
+
+        var runID: UUID? {
+            tab.runID
+        }
+
+        var runAttemptIDAtBinding: UUID? {
+            tab.runAttemptIDAtBinding
+        }
+
+        var connectionID: UUID {
+            registration.connectionID
+        }
+
         var writerAtBinding: AgentSessionRuntimeStore.WriterIdentity? {
             if case let .captured(identity) = tab.modelWriterAtBinding { return identity }
             return nil
