@@ -1946,6 +1946,7 @@ package actor ACPAgentSessionController {
             for await chunk in stderrChannel.stream {
                 await handleStderrChunk(chunk)
             }
+            await handleStderrEOF()
         }
     }
 
@@ -1973,23 +1974,30 @@ package actor ACPAgentSessionController {
     }
 
     private func handleStderrChunk(_ data: Data) {
-        stderrFramer.feed(data) { lineData in
-            guard
-                let trimmed = trimmedASCIIWhitespace(lineData),
-                let rawText = String(data: trimmed, encoding: .utf8),
-                !rawText.isEmpty
-            else { return }
-            let text = Self.strippingANSIEscapeSequences(from: rawText)
-            guard !text.isEmpty else { return }
-            stderrLineCount += 1
-            let disposition = provider.stderrLineDisposition(text)
-            guard disposition != .discard else { return }
-            lastStderrPreview = Self.truncatedDiagnosticPreview(text)
-            recordActivePromptStderrLine(text)
-            diagnose(.stderrLine(text))
-            guard disposition == .transcript else { return }
-            emit(.stream(AIStreamResult(type: "system", text: text)))
-        }
+        stderrFramer.feed(data) { handleStderrLine($0) }
+    }
+
+    private func handleStderrEOF() {
+        guard state != .closing, state != .closed else { return }
+        stderrFramer.flush { handleStderrLine($0) }
+    }
+
+    private func handleStderrLine(_ lineData: Data) {
+        guard
+            let trimmed = trimmedASCIIWhitespace(lineData),
+            let rawText = String(data: trimmed, encoding: .utf8),
+            !rawText.isEmpty
+        else { return }
+        let text = Self.strippingANSIEscapeSequences(from: rawText)
+        guard !text.isEmpty else { return }
+        stderrLineCount += 1
+        let disposition = provider.stderrLineDisposition(text)
+        guard disposition != .discard else { return }
+        lastStderrPreview = Self.truncatedDiagnosticPreview(text)
+        recordActivePromptStderrLine(text)
+        diagnose(.stderrLine(text))
+        guard disposition == .transcript else { return }
+        emit(.stream(AIStreamResult(type: "system", text: text)))
     }
 
     /// CLI providers log with terminal colors; ANSI escape sequences would render as raw
@@ -2387,21 +2395,47 @@ package actor ACPAgentSessionController {
     }
 
     private func handleProcessExit(_ exitCode: Int32, timedOut: Bool) async {
+        if state != .closing, state != .closed, let stderrConsumerTask {
+            // Process termination can overtake the final pipe data. Drain through the
+            // existing reader, but do not hang if a descendant inherited the stderr FD.
+            let completion = AsyncStream<Void>.makeStream()
+            let drain = Task {
+                await stderrConsumerTask.value
+                completion.continuation.finish()
+            }
+            let timeout = Task {
+                try? await Task.sleep(for: .milliseconds(250))
+                completion.continuation.finish()
+            }
+            for await _ in completion.stream {}
+            drain.cancel()
+            timeout.cancel()
+        }
         guard state != .closing, state != .closed else {
             finishEventsIfNeeded()
             return
         }
 
+        // EOF may be held open by a descendant even though the exited process's
+        // final unterminated diagnostic is already buffered by our reader.
+        handleStderrEOF()
+
+        var message = timedOut
+            ? "ACP process timed out."
+            : "ACP process exited unexpectedly with code \(exitCode)."
+        if let lastStderrPreview {
+            message += " Last stderr line: `\(lastStderrPreview)`."
+        }
         if state == .promptRunning || !didEmitTerminal {
-            let message = timedOut
-                ? "ACP process timed out."
-                : "ACP process exited unexpectedly with code \(exitCode)."
             emit(.stream(AIStreamResult(type: "error", text: message)))
             emitTerminal(state: .failed, errorText: message)
         }
 
-        failAllPromptSettlementWaiters(with: ControllerError.transportClosed)
-        failPendingRequests(with: ControllerError.transportClosed)
+        let failure: ControllerError = lastStderrPreview != nil
+            ? .requestFailed(message)
+            : .transportClosed
+        failAllPromptSettlementWaiters(with: failure)
+        failPendingRequests(with: failure)
         promptImagesSupported = false
         state = .failed
         await clearExpectedAgentPIDIfNeeded()

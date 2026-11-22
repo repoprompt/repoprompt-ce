@@ -165,6 +165,122 @@ final class ACPAgentSessionControllerHostTests: XCTestCase {
         await controller.shutdown()
     }
 
+    func testAntigravityUnexpectedExitSurfacesLastStderrDiagnosticWithoutTranscriptSystemEvents() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("AntigravityExitStderr-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let startupInfo = "I1121 13:38:11.713540 8556827392 main.py:80] Starting AGY ACP Server..."
+        let fatalError = "E1121 13:38:11.900000 8556827392 main.py:99] OAuth token refresh failed: invalid_grant"
+        let rawMarker = "raw-websocket-exit-payload"
+        let unterminatedError = "fatal: missing credentials without trailing newline"
+
+        let cases: [(name: String, scriptBody: String, exitCode: Int32, expectedStderr: String)] = [
+            (
+                name: "discarded-frame-after-error",
+                scriptBody: #"""
+                #!/bin/sh
+                printf '%s\n' '\#(startupInfo)' '\#(fatalError)' 'I1121 13:38:11.901000 8556827392 local_connection.py:42] RAW WS MSG: {"content":"\#(rawMarker)"}' >&2
+                exit 7
+                """#,
+                exitCode: 7,
+                expectedStderr: fatalError
+            ),
+            (
+                name: "unterminated-stderr-flushed-on-exit",
+                scriptBody: #"""
+                #!/bin/sh
+                printf '%s\n' '\#(startupInfo)' >&2
+                printf '%s' '\#(unterminatedError)' >&2
+                exit 9
+                """#,
+                exitCode: 9,
+                expectedStderr: unterminatedError
+            )
+        ]
+
+        for testCase in cases {
+            let script = directory.appendingPathComponent("agy-exit-\(testCase.name)")
+            try testCase.scriptBody.write(to: script, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
+
+            let provider = AntigravityACPAgentProvider(
+                executablePath: script.path,
+                harnessPath: nil,
+                installedRuntime: { nil },
+                prepareSessionHome: { directory },
+                toolNames: ACPToolNameResolution(
+                    isRepoPromptServerIdentifier: { _ in false },
+                    canonicalRepoPromptToolName: { _ in nil },
+                    isRepoPromptToolNameWithServerPrefix: { _ in false }
+                ),
+                includeRepoPromptMCPServer: false
+            )
+            let request = ACPRunRequest(agentKind: .antigravity, modelString: nil, workspacePath: directory.path, resumeSessionID: nil, attachments: [], taskLabelKind: nil)
+            final class StderrRecorder: @unchecked Sendable {
+                private let lock = NSLock()
+                private var storage: [String] = []
+                var lines: [String] {
+                    lock.withLock { storage }
+                }
+
+                func append(_ line: String) {
+                    lock.withLock { storage.append(line) }
+                }
+            }
+            let recordedDiagnostics = StderrRecorder()
+            let controller = try ACPAgentSessionController(
+                provider: provider,
+                runRequest: request,
+                host: RecordingHost(),
+                diagnosticSink: { event in
+                    if case let .stderrLine(line) = event {
+                        XCTAssertFalse(line.contains(rawMarker))
+                        recordedDiagnostics.append(line)
+                    }
+                },
+                requestTimeouts: .init(bootstrapSeconds: 5),
+                allowsProviderProcessLaunchForTesting: true
+            )
+
+            let events = await controller.events
+            let collected = Task { () -> [AIStreamResult] in
+                var results: [AIStreamResult] = []
+                for await event in events {
+                    if case let .stream(result) = event {
+                        results.append(result)
+                    }
+                }
+                return results
+            }
+
+            do {
+                _ = try await controller.bootstrap()
+                XCTFail("Expected unexpected exit for \(testCase.name)")
+            } catch {
+                let description = error.localizedDescription
+                XCTAssertTrue(description.contains("code \(testCase.exitCode)"), description)
+                XCTAssertTrue(description.contains(testCase.expectedStderr), description)
+                XCTAssertFalse(description.contains(rawMarker), description)
+            }
+
+            await controller.shutdown()
+            let results = await collected.value
+            XCTAssertFalse(results.contains { $0.type == "system" }, "Unexpected system events for \(testCase.name): \(results)")
+            XCTAssertTrue(
+                results.contains {
+                    $0.type == "error"
+                        && ($0.text?.contains("code \(testCase.exitCode)") == true)
+                        && ($0.text?.contains(testCase.expectedStderr) == true)
+                        && ($0.text?.contains(rawMarker) == false)
+                },
+                "Expected error event with stderr preview for \(testCase.name), got: \(results)"
+            )
+            XCTAssertTrue(recordedDiagnostics.lines.contains(startupInfo))
+            XCTAssertTrue(recordedDiagnostics.lines.contains(testCase.expectedStderr))
+        }
+    }
+
     func testRequiredHostRoutesLaunchAndReadsRegistryAtSelectionTime() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ACPHost-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
