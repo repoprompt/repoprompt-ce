@@ -4248,30 +4248,11 @@ final class MCPServerViewModel: ObservableObject {
         interval: Duration = .seconds(30),
         operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
-        let invocationContext = try service.captureInvocationContext(toolName: tool)
-        guard let connectionID else {
-            return try await operation()
-        }
-        let shouldSendProgress = await ServerNetworkManager.shared.supportsProgressNotifications(connectionID: connectionID)
-        guard shouldSendProgress else {
-            return try await operation()
-        }
-
-        return try await MCPToolHeartbeat.run(interval: interval) {
-            await MCPInvocationContextBridge.withInvocation(invocationContext) {
-                await ServerNetworkManager.shared.sendProgress(
-                    for: connectionID,
-                    tool: tool,
-                    kind: .heartbeat,
-                    stage: stage,
-                    message: message
-                )
-            }
-        } operation: {
-            try await MCPInvocationContextBridge.withInvocation(invocationContext) {
-                try await operation()
-            }
-        }
+        try await MCPToolHeartbeat.runProgress(
+            connectionID: connectionID, tool: tool, stage: stage, message: message,
+            invocation: service.captureInvocationContext(toolName: tool), interval: interval,
+            operation: operation
+        )
     }
 
     #if DEBUG

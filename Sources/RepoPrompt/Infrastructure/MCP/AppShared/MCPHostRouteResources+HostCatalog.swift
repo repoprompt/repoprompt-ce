@@ -49,7 +49,8 @@ extension MCPHostRouteResources {
         let history = MCPHistoryToolProvider(workspaceLocations: historyWorkspaceLocations)
         let hostTools: Set<String> = [
             MCPWindowToolName.askUser, MCPWindowToolName.manageSelection, MCPWindowToolName.agentSessionLink,
-            MCPWindowToolName.agentManage, MCPWindowToolName.manageWorktree, MCPWindowToolName.sessionAdmin
+            MCPWindowToolName.agentManage, MCPWindowToolName.manageWorktree, MCPWindowToolName.sessionAdmin,
+            MCPWindowToolName.becomeOverseer
         ]
         let fileTools = MCPFileReadResources.contentToolNames.union(MCPFileReadResources.toolNames)
         let binder = makeToolBinder(
@@ -99,6 +100,8 @@ extension MCPHostRouteResources {
                     return try await host.executeHostAskUser(args, invocation: invocation)
                 case MCPWindowToolName.agentSessionLink:
                     return try await host.executeHostSessionLink(args, invocation: invocation)
+                case MCPWindowToolName.becomeOverseer:
+                    return try await host.executeHostBecomeOverseer(args, invocation: invocation)
                 case MCPWindowToolName.agentManage:
                     return try await host.executeHostAgentManage(args, invocation: invocation)
                 case MCPWindowToolName.manageWorktree:
@@ -210,23 +213,33 @@ private extension AgentSessionRuntimeHost {
             requireTargetWindow: { throw SessionAdminMCPToolService.unavailableError },
             resolveObserverEndpoint: { _, _ in nil }, scopes: { bridge.delegationScopes },
             administration: { bridge.sessionAdministrationFrontDoor },
-            resolveCanonicalObserverEndpoint: { [weak self] metadata in
-                guard let self, let command = await hostInteractionCommand(metadata) else { return nil }
-                return scope.linkExecution?.agentSessionLinkObserverEndpoint(tabID: command.writer.session.tabID)
-            }
+            resolveCanonicalObserverEndpoint: { [weak self] in await self?.hostObserverEndpoint($0) }
+        ).execute(args: args)
+    }
+
+    private func hostObserverEndpoint(_ metadata: MCPRequestMetadata) async -> DomainAgentSessionLinkEndpointIdentity? {
+        guard let command = await hostInteractionCommand(metadata) else { return nil }
+        return scope.linkExecution?.agentSessionLinkObserverEndpoint(tabID: command.writer.session.tabID)
+    }
+
+    func executeHostBecomeOverseer(_ args: [String: Value], invocation: ToolInvocationContext) async throws -> Value {
+        try await BecomeOverseerMCPToolService(
+            captureRequestMetadata: { invocation.metadata },
+            resolveObserverEndpoint: { [weak self] in await self?.hostObserverEndpoint($0) }
         ).execute(args: args)
     }
 
     func executeHostSessionLink(_ args: [String: Value], invocation: ToolInvocationContext) async throws -> Value {
-        let resolve: (MCPRequestMetadata) async -> DomainAgentSessionLinkEndpointIdentity? = { [weak self] metadata in
-            guard let self, let command = await hostInteractionCommand(metadata) else { return nil }
-            return scope.linkExecution?.agentSessionLinkObserverEndpoint(tabID: command.writer.session.tabID)
-        }
+        let resolve: (MCPRequestMetadata) async -> DomainAgentSessionLinkEndpointIdentity? = { [weak self] in await self?.hostObserverEndpoint($0) }
         return try await AgentSessionLinkMCPToolService(
             toolName: MCPWindowToolName.agentSessionLink, captureRequestMetadata: { invocation.metadata },
             requireTargetWindow: { throw MCPError.invalidRequest("This Agent route has no presenter") },
-            resolveObserverEndpoint: { _, _ in nil }, withHeartbeat: { _, _, _, _, operation in try await operation() },
-            resolveCanonicalObserverEndpoint: resolve, resolveModelObserverEndpoint: resolve
+            resolveObserverEndpoint: { _, _ in nil }, withHeartbeat: { connectionID, tool, stage, message, operation in
+                try await MCPToolHeartbeat.runProgress(
+                    connectionID: connectionID, tool: tool, stage: stage, message: message,
+                    invocation: invocation, operation: operation
+                )
+            }, resolveCanonicalObserverEndpoint: resolve, resolveModelObserverEndpoint: resolve
         ).execute(args: args)
     }
 }

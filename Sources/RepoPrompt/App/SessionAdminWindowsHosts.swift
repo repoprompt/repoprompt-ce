@@ -278,20 +278,23 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         }
         manager.beginPreparedOversightPreparation(target)
         defer { manager.endPreparedOversightPreparation(target) }
-        let prepared = await manager.prepareSavedOversightTarget(target, isStillAuthorized: isStillAuthorized)
-        guard isStillAuthorized(), !Task.isCancelled else { return .revoked }
-        guard case let .success(writer) = prepared,
-              let host = writer.scope.executableHost, !host.route.isClosing
-        else {
-            let code = if case let .failure(reason) = prepared { reason.rawValue } else { "target_binding_changed" }
+        let command: AgentSessionRuntimeStore.Command
+        do {
+            guard let prepared = try await Self.exactPreparedCommand(
+                sessionID: target, preparation: preparation, isStillAuthorized: isStillAuthorized
+            ) else { throw SessionAdminHostError.sessionUnavailable }
+            command = prepared
+        } catch SessionAdminHostError.authorityEnded {
+            return .revoked
+        } catch {
+            guard isStillAuthorized(), !Task.isCancelled else { return .revoked }
+            let code = if case let SessionAdminHostError.refused(code, _, _) = error { code } else { "target_binding_changed" }
             return .failed("\(code): The exact saved target could not be prepared. Ask the user to check whether it was deleted, moved or has conflicting saved copies; nothing was linked.")
         }
-        // Re-read after hydration: no captured endpoint, deletion state or ambiguity claim earns a link.
-        let current = AgentSessionCarrierResolver.capture(windows: WindowStatesManager.shared.allWindows, sessionIDs: [target])
-        guard !current.ambiguousSessionIDs.contains(target),
-              let command = try? SessionAdminWindows.command(for: target), command.identity == writer.identity
-        else {
-            return .failed("target_ambiguous: Target ownership changed during preparation. Use session_admin inventory; nothing was linked.")
+        guard isStillAuthorized(), !Task.isCancelled else { return .revoked }
+        let writer = command.writer
+        guard command.isCurrent, let host = writer.scope.executableHost, !host.route.isClosing else {
+            return .failed("target_binding_changed: Target ownership changed during preparation. Use session_admin inventory; nothing was linked.")
         }
         let candidates = WindowStatesManager.shared.agentSessionLinkCandidates(
             forSessionIDs: [observer, target], includeLocation: false

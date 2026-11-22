@@ -57,9 +57,16 @@ extension AgentSessionRuntimeHost {
     func executeHostSelection(
         args: [String: Value], invocation: ToolInvocationContext, lease base: AgentHostWorkspaceResources.Lease
     ) async throws -> Value {
-        let op = args["op"]?.stringValue ?? "get"
-        let mode = args["mode"]?.stringValue ?? "full"
+        let op = (args["op"]?.stringValue ?? "get").lowercased()
+        let mode = (args["mode"]?.stringValue ?? "full").lowercased()
+        guard ["get", "clear", "set", "preview", "add", "remove", "promote", "demote"].contains(op) else {
+            throw MCPError.invalidParams("Unsupported op '\(op)' for manage_selection when tab context is active")
+        }
         guard ["full", "slices", "codemap_only"].contains(mode) else { throw MCPError.invalidParams("Unknown selection mode") }
+        let codeMapsDisabled = GlobalSettingsStore.shared.globalCodeMapsDisabled()
+        if codeMapsDisabled, mode == "codemap_only" || op == "demote" {
+            throw MCPError.invalidParams(MCPServerViewModel.codeMapsGloballyDisabledMCPMessage)
+        }
         guard let activation = workspaceActivation, let workspaceID = activation.key.owner.workspaceID else {
             throw MCPFileToolAuthorityFailure.unavailable
         }
@@ -74,14 +81,16 @@ extension AgentSessionRuntimeHost {
             await store.sessionBoundRootScopeValidationSnapshot(lookup.rootScope, expectedPhysicalRoots: projection.physicalRootRefs)
         } else { nil as WorkspaceSessionRootLifetimeSnapshot? }
         guard lookup.bindingProjection == nil || lookupLifetime != nil else { throw MCPFileToolAuthorityFailure.worktreeScopeUnavailable }
+        if op != "get" { _ = try await store.awaitAppliedIngress(rootScope: lookup.rootScope) }
+        try Task.checkCancellation()
         let physical = lookup.physicalizeSelection(tab.selection)
         let input = MCPServerViewModel.parseSavedOrVisibleSelectionInputs(
             rawPaths: args["paths"]?.arrayValue?.compactMap(\.stringValue) ?? [], slicesValue: args["slices"]
         )
         let paths = lookup.translateInputPaths(input.paths)
         let slices = input.sliceInputs.map { WorkspaceSelectionSliceInput(path: lookup.translateInputPath($0.path), ranges: $0.ranges) }
-        let selectionService = WorkspaceSelectionMutationService(store: store, codemapsGloballyDisabled: GlobalSettingsStore.shared.globalCodeMapsDisabled())
-        let selection = await computeSavedSelection(
+        let selectionService = WorkspaceSelectionMutationService(store: store, codemapsGloballyDisabled: codeMapsDisabled)
+        let selection = try await computeHostSelection(
             op: op, mode: mode, physical: physical, paths: paths, input: input, slices: slices,
             service: selectionService, rootScope: lookup.rootScope
         )
@@ -102,7 +111,8 @@ extension AgentSessionRuntimeHost {
             )
         }
         let files = next.selectedPaths.map { path in
-            ToolResultDTOs.SelectedFileInfo(path: path, tokens: 0, renderMode: next.slices[path] == nil ? "full" : "slice", ranges: nil, isAuto: false, codemapOrigin: nil, copyPreset: nil)
+            let ranges = next.slices[path]?.map(ToolResultDTOs.LineRangeDTO.init(range:))
+            return ToolResultDTOs.SelectedFileInfo(path: path, tokens: 0, renderMode: ranges == nil ? "full" : "slice", ranges: ranges, isAuto: false, codemapOrigin: nil, copyPreset: nil)
         } + next.manualCodemapPaths.map { path in
             ToolResultDTOs.SelectedFileInfo(path: path, tokens: 0, renderMode: "codemap", ranges: nil, isAuto: false, codemapOrigin: "manual", copyPreset: nil)
         }
@@ -112,13 +122,14 @@ extension AgentSessionRuntimeHost {
         ))
     }
 
-    private func computeSavedSelection(
+    private func computeHostSelection(
         op: String, mode: String, physical: StoredSelection, paths: [String], input: MCPServerViewModel.ManageSelectionInputs,
         slices: [WorkspaceSelectionSliceInput], service: WorkspaceSelectionMutationService, rootScope: WorkspaceLookupRootScope
-    ) async -> (selection: StoredSelection, invalid: [String]) {
+    ) async throws -> (selection: StoredSelection, invalid: [String]) {
         switch op {
         case "get": return (physical, [])
-        case "clear": return (.init(), [])
+        case "clear":
+            return mode == "codemap_only" ? (.init(selectedPaths: physical.selectedPaths, slices: physical.slices, codemapAutoEnabled: false), []) : (.init(), [])
         case "set", "preview":
             let result = await service.buildManageSelectionSet(
                 paths: paths, slices: slices, sliceErrors: input.sliceErrors, mode: mode, existing: physical, rootScope: rootScope
@@ -135,12 +146,18 @@ extension AgentSessionRuntimeHost {
             let result = await service.removePaths(existing: physical, paths: paths, rawPaths: input.paths, mode: mode, rootScope: rootScope)
             return (result.selection, result.invalidPaths)
         case "promote":
+            guard !paths.isEmpty, slices.isEmpty else {
+                throw MCPError.invalidParams("promote requires paths and does not support slices")
+            }
             let result = await service.promotePaths(existing: physical, paths: paths, rawPaths: input.paths, rootScope: rootScope)
             return (result.selection, result.invalidPaths)
         case "demote":
+            guard !paths.isEmpty, slices.isEmpty else {
+                throw MCPError.invalidParams("demote requires paths and does not support slices")
+            }
             let result = await service.demotePaths(existing: physical, paths: paths, rawPaths: input.paths, rootScope: rootScope)
             return (result.selection, result.invalidPaths)
-        default: return (physical, ["Unknown manage_selection operation: \(op)"])
+        default: throw MCPError.invalidParams("Unsupported op '\(op)' for manage_selection when tab context is active")
         }
     }
 

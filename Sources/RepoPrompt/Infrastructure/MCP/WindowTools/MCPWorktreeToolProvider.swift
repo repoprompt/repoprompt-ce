@@ -66,7 +66,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         physical = nil
         resolveSpawnParentSessionID = { _, _ in nil }
         resolveObserverEndpoint = { _, _ in nil }
-        hasManageGrant = { _, _ in nil }
+        hasManageGrant = { await Self.sessionLinkManageGrant(observerEndpoint: $0, targetSessionID: $1) }
         vcsService = .shared
         resolver = GitRepoTargetResolver()
     }
@@ -957,27 +957,9 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         }
 
         if let canonicalCommand {
-            guard let command = canonicalCommand(invocationContext) else { throw MCPFileToolAuthorityFailure.unavailable }
-            let sessionID = explicitSessionID ?? command.identity.sessionID
-            guard sessionID == command.identity.sessionID else { throw AgentSessionTargetOperationGuard.denialError(sessionID: sessionID) }
-            let admission = try await ExecutionAdmission(command).resolve()
-            let current: @MainActor () throws -> Void = {
-                guard canonicalCommand(invocationContext)?.identity == command.identity, !Task.isCancelled else {
-                    throw MCPFileToolAuthorityFailure.superseded
-                }
-                try admission.requireCurrent()
-            }
-            try current()
-            let invocation: AgentModeViewModel.WorktreeBindingMutationInvocationIdentity? = if let connectionID = metadata.connectionID,
-                                                                                               let runID = command.writer.session.runID, MCPClientIdentity.matches(metadata.clientName, AgentProviderKind.codexMCPClientID)
-            {
-                .init(connectionID: connectionID, sessionID: sessionID, runID: runID, provider: .codexExec)
-            } else { nil }
-            return BindingRequest(sessionID: sessionID, invocation: invocation, authority: .init(
-                revalidate: current, commit: { body in try current()
-                    try body()
-                }
-            ), admission: admission, agentModeVM: nil)
+            return try await resolveHostBindingRequest(
+                explicitSessionID: explicitSessionID, invocationContext: invocationContext, canonicalCommand: canonicalCommand
+            )
         }
         let dependencies = try physicalDependencies()
         let resolved: MCPResolvedTabContextSnapshot? = if explicitSessionID == nil {
@@ -1054,6 +1036,70 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         try await authority.revalidate()
         try admission.requireCurrent()
         return BindingRequest(sessionID: sessionID, invocation: invocation, authority: authority, admission: admission, agentModeVM: agentModeVM)
+    }
+
+    private func resolveHostBindingRequest(
+        explicitSessionID: UUID?, invocationContext: ToolInvocationContext,
+        canonicalCommand: @escaping @MainActor (ToolInvocationContext) -> AgentSessionRuntimeStore.Command?
+    ) async throws -> BindingRequest {
+        guard let origin = canonicalCommand(invocationContext) else { throw MCPFileToolAuthorityFailure.unavailable }
+        let originID = origin.identity.sessionID
+        let targetID = explicitSessionID ?? originID
+        // As for a physical route, direct bind/select operates within the originating scope.
+        // Cross-scope operations use session_admin and its separate scoped admission.
+        let target: AgentSessionRuntimeStore.Command? = if targetID == originID {
+            origin
+        } else if case let .unique(writer) = origin.writer.scope.resolveWriter(sessionID: targetID, expectedWorkspaceID: origin.identity.workspaceID),
+                  writer.scope === origin.writer.scope
+        {
+            try? writer.admitCommand().get()
+        } else { nil }
+        let endpoint = origin.writer.scope.linkExecution?.agentSessionLinkObserverEndpoint(tabID: origin.writer.session.tabID)
+        let authority = try await AgentSessionTargetOperationGuard.requireWorktreeBindingAuthority(
+            targetSessionID: targetID, caller: .agentSession(originID), resolveObserverEndpoint: { endpoint },
+            resolveTargetProvenance: { id in
+                guard let target else { return .unknown(targetSessionID: id) }
+                return AgentSessionTargetOperationGuard.provenance(for: id, loadedParentSessionID: target.writer.session.parentSessionID)
+            }, hasManageGrant: hasManageGrant
+        )
+        func requireOrigin() throws {
+            guard !Task.isCancelled, canonicalCommand(invocationContext)?.identity == origin.identity else {
+                throw MCPFileToolAuthorityFailure.superseded
+            }
+        }
+        try requireOrigin()
+        try await authority.revalidate()
+        try requireOrigin()
+        guard let target else { throw MCPError.invalidParams("The requested agent session is not currently available.") }
+        let admission: AgentSessionWorktreeRuntime.Admission
+        do {
+            admission = try await ExecutionAdmission(target).resolve()
+        } catch {
+            try await authority.revalidate()
+            try requireOrigin()
+            throw error
+        }
+        let current: @MainActor () throws -> Void = {
+            try requireOrigin()
+            try admission.requireCurrent()
+        }
+        try await authority.revalidate()
+        try current()
+        let metadata = invocationContext.metadata
+        let invocation: AgentModeViewModel.WorktreeBindingMutationInvocationIdentity? = if let connectionID = metadata.connectionID,
+                                                                                           let runID = origin.writer.session.runID, MCPClientIdentity.matches(metadata.clientName, AgentProviderKind.codexMCPClientID)
+        {
+            .init(connectionID: connectionID, sessionID: originID, runID: runID, provider: .codexExec)
+        } else { nil }
+        return BindingRequest(sessionID: targetID, invocation: invocation, authority: .init(
+            revalidate: {
+                try await authority.revalidate()
+                try current()
+            }, commit: { body in
+                try current()
+                try authority.commit(body)
+            }
+        ), admission: admission, agentModeVM: nil)
     }
 
     // MARK: - Repository and worktree resolution
