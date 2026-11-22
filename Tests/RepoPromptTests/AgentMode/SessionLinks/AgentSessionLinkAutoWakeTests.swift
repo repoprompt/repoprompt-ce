@@ -1005,12 +1005,12 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         XCTAssertFalse(AgentSessionRuntimeStore.shared.retainedExecutionHosts.contains { $0 === host })
     }
 
-    func testWindowRetirementStartsRetainedDrainBeforeWaiting() async throws {
+    func testAuthorizedRetirementStartsRetainedDrainBeforeWaiting() async throws {
         let (host, f, resources, provider, _, _, _) = try await hostStartupFixture()
         host.scope.retainExecutableHost()
         let outcome = AgentRunStartOutcomeRecorder()
         _ = try await host.scope.startup.start(
-            session: f.session, initialMessage: "Cancel on window retirement", startOutcome: outcome,
+            session: f.session, initialMessage: "Cancel on authorized retirement", startOutcome: outcome,
             claudeCoordinator: host.claudeCoordinator, links: f.runtime,
             environment: host.makeStartupEnvironment(resources: resources)
         )
@@ -1019,12 +1019,13 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         let fence = AgentRunStartStopFence(session: f.session)
         // Quit can fence first, before its shared-deadline driver begins observing.
         let quitDrain = host.beginFinalShutdown()
-        let drain = host.beginWindowRetirement()
+        let drain = host.beginAuthorizedRetirement()
         XCTAssertTrue(drain === quitDrain)
         XCTAssertFalse(fence.permitsStart(of: f.session))
-        XCTAssertTrue(host.beginWindowRetirement() === drain)
+        XCTAssertTrue(host.beginAuthorizedRetirement() === drain)
+        XCTAssertTrue(AppDelegate.hasUnsettledAgentExecution(), "The drain, not the presenter, owns the pending teardown")
         let result = await drain.wait(until: .now.advanced(by: .seconds(5)))
-        guard result == .released else { return XCTFail("Window retirement must complete: \(result)") }
+        guard result == .released else { return XCTFail("Authorized retirement must complete: \(result)") }
         await originalTask.value
         XCTAssertTrue(host.scope.hasReleasedWriterClaims)
         XCTAssertFalse(f.session.isDirty)

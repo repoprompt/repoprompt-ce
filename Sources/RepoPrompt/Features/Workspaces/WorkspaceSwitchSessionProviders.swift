@@ -84,6 +84,8 @@ final class ContextBuilderWorkspaceSwitchSessionProvider: WorkspaceSwitchSession
 
 @MainActor
 final class AgentModeWorkspaceSwitchSessionProvider: WorkspaceSwitchSessionProvider {
+    static let activityID = "agent-mode"
+
     private weak var agentModeViewModel: AgentModeViewModel?
 
     init(agentModeViewModel: AgentModeViewModel) {
@@ -94,7 +96,7 @@ final class AgentModeWorkspaceSwitchSessionProvider: WorkspaceSwitchSessionProvi
         let count = activeAgentCount()
         guard count > 0 else { return [] }
         return [WorkspaceSwitchSessionItem(
-            id: "agent-mode",
+            id: Self.activityID,
             count: count,
             singularLabel: "active agent session",
             pluralLabel: "active agent sessions"

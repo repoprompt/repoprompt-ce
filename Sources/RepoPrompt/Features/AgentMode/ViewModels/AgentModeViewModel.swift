@@ -1186,6 +1186,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     weak var preparedSessionRuntimes: (any PreparedAgentSessionRuntimeRegistry)?
     var providerSwitchExactOwnerProbe: (@MainActor (TabSession) -> Bool)?
     private var hasPreparedForWindowClose = false
+    private var hasDetachedClosingPresentation = false
     private var windowClosePreparationTask: Task<Void, Never>?
     private static let uiRefreshCoalesceDelayNanos: UInt64 = 75_000_000
     /// The restore service has already loaded and projected all metadata before
@@ -4632,7 +4633,38 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         cancellables.removeAll()
     }
 
+    /// Only an independent activation can keep its originating resources without a window.
+    func preservableExecutionHost() -> AgentSessionRuntimeHost? {
+        let host = runtimeHost
+        guard host.route.identity.kind == .independent, !host.scope.isRetiring,
+              host.workspaceActivation?.owns(scope: host.scope, route: host.route) == true
+        else { return nil }
+        return host
+    }
+
+    /// Withdraw this presenter before window teardown can suspend. The scope remains admitted.
+    func detachExecutionForWindowClose() -> AgentSessionRuntimeHost? {
+        guard !hasPreparedForWindowClose, !hasDetachedClosingPresentation,
+              let host = preservableExecutionHost()
+        else { return nil }
+        host.scope.retainExecutableHost()
+        hasDetachedClosingPresentation = true
+        detachRunPresentation()
+        cleanUpClosingPresentation()
+        return host
+    }
+
     func prepareForWindowClose() async {
+        if let task = windowClosePreparationTask {
+            await task.value
+            return
+        }
+        guard !hasPreparedForWindowClose, !hasDetachedClosingPresentation else { return }
+        if detachExecutionForWindowClose() == nil { await retireAndCancelRuntime() }
+    }
+
+    /// Quit and a non-preserving close explicitly retire the runtime. Do not reconsider detach.
+    func retireRuntimeForClosingOrQuit() async {
         await retireAndCancelRuntime()
     }
 
@@ -4657,10 +4689,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         guard !hasPreparedForWindowClose else { return }
         hasPreparedForWindowClose = true
-        // This legacy path retires its private runtime, not merely its presentation. Fence
-        // pending producers before the first await; final originating IO remains permitted.
-        // The independent-host cutover must detach presentation without invoking retirement.
-        let canonicalDrain = runtimeHost.workspaceActivation == nil ? nil : runtimeHost.beginWindowRetirement()
+        // Explicit retirement and the legacy owner fence producers before the first await.
+        // Final originating IO remains permitted.
+        let canonicalDrain = runtimeHost.workspaceActivation == nil ? nil : runtimeHost.beginAuthorizedRetirement()
         if canonicalDrain == nil { runtimeSessionStore.beginRetirement() }
         closeOracleBackgroundWindowAdmission()
         let task = Task<Void, Never> { @MainActor [weak self] in
@@ -4675,7 +4706,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         detachRunPresentation()
     }
 
-    private func performWindowClosePreparation(canonicalDrain: AgentSessionHostDrainRuntime?) async {
+    private func cleanUpClosingPresentation() {
         queuedWorkspaceSwitchOwner = nil
         unregisterObserverRegistrations()
         stopOpenCodeModelsSubscription()
@@ -4684,10 +4715,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         uiRefreshTask = nil
         pendingUIRefreshScopesByTabID.removeAll()
         pendingAssistantPresentationByTabID.removeAll()
-        workspaceSwitchProvider.cancelAllBackgroundCleanup()
         cancelSessionIndexRefresh()
         // Teardown drops the ephemeral restoration join/baseline; nothing publishes into a successor.
         sessionIndexStore.abandonSidebarRestore(owner: nil)
+    }
+
+    private func performWindowClosePreparation(canonicalDrain: AgentSessionHostDrainRuntime?) async {
+        cleanUpClosingPresentation()
+        workspaceSwitchProvider.cancelAllBackgroundCleanup()
         if let canonicalDrain {
             // The host retained the producer. A window wait is not a release receipt.
             _ = await canonicalDrain.wait(until: .now.advanced(by: .seconds(2)))
@@ -17572,6 +17607,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session: TabSession?,
         validateSubmissionToken: Bool = true
     ) -> String? {
+        if hasDetachedClosingPresentation { return "presentation_closed" }
         let liveHasLinkedSession = hasLinkedAgentSession(for: target.tabID)
         let liveSourceAgentSessionID = composerSourceAgentSessionID(tabID: target.tabID, session: session)
         let liveRunState = session?.runState ?? .idle

@@ -9,9 +9,9 @@ extension AgentSessionRuntimeHost {
         beginCancellationRetirement()
     }
 
-    /// Window close still cancels its owned runs. Keep the exact cancellation and final-save
-    /// producer retained if the presenter stops waiting for it.
-    func beginWindowRetirement() -> AgentSessionHostDrainRuntime {
+    /// An explicitly authorized retirement starts the original cancellation and final-save
+    /// producer independently of its waiter. Ordinary presentation close must not call this.
+    func beginAuthorizedRetirement() -> AgentSessionHostDrainRuntime {
         let drain = beginCancellationRetirement()
         drain.startIfNeeded()
         return drain

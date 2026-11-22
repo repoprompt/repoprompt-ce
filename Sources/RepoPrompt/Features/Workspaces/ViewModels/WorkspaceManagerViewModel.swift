@@ -3912,6 +3912,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     private var pendingSwitchConfirmationRequest: PendingSwitchConfirmationRequest?
     private let switchSessionRegistry = WorkspaceSwitchSessionRegistry()
+    private(set) weak var agentSwitchSessionProvider: AgentModeWorkspaceSwitchSessionProvider?
     private let switchTimingPolicy: WorkspaceSwitchTimingPolicy
     #if DEBUG
         private var workspaceSwitchPhaseDidChangeHandlerForTesting: ((WorkspaceSwitchPhase) -> Void)?
@@ -4042,6 +4043,9 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     func registerSwitchSessionProvider(_ provider: any WorkspaceSwitchSessionProvider) {
+        if let agentProvider = provider as? AgentModeWorkspaceSwitchSessionProvider {
+            agentSwitchSessionProvider = agentProvider
+        }
         switchSessionRegistry.register(provider)
     }
 
@@ -4051,8 +4055,8 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     @MainActor
-    func cancelActiveSessions() async {
-        await switchSessionRegistry.cancelActiveSessions()
+    func cancelActiveSessions(excluding provider: AgentModeWorkspaceSwitchSessionProvider? = nil) async {
+        await switchSessionRegistry.cancelActiveSessions(excluding: provider)
     }
 
     @MainActor

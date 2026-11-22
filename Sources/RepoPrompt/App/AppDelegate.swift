@@ -243,8 +243,16 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        // Keep the app running if we intentionally backgrounded the last window.
-        !MCPBackgroundModeCoordinator.shared.isBackgrounded
+        !MCPBackgroundModeCoordinator.shared.isBackgrounded && !Self.hasUnsettledAgentExecution()
+    }
+
+    /// Closing the last presenter is not Quit. A terminal run state does not acknowledge
+    /// provider teardown, durable save, recovery, or release of the originating resources.
+    static func hasUnsettledAgentExecution(store: AgentSessionRuntimeStore = .shared) -> Bool {
+        if store.retainedDrains.contains(where: { $0.outcome != .released }) { return true }
+        return store.retainedExecutionHosts.contains { host in
+            host.scope.sessions.values.contains { !host.scope.settlement(for: $0).isSettled }
+        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {

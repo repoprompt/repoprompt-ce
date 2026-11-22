@@ -1652,7 +1652,7 @@ class WindowStatesManager: ObservableObject {
                 group.addTask { @MainActor [window] in
                     await window.contextBuilderAgentViewModel.shutdownForAppTermination()
                     if !retainedHostIDs.contains(ObjectIdentifier(window.agentModeViewModel.runtimeHost)) {
-                        await window.agentModeViewModel.prepareForWindowClose()
+                        await window.agentModeViewModel.retireRuntimeForClosingOrQuit()
                     }
                 }
             }
