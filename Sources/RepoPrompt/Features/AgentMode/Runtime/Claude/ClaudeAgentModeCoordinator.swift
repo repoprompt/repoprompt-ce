@@ -1430,6 +1430,34 @@ final class ClaudeAgentModeCoordinator {
         )
     }
 
+    /// Private evidence about the previous input, not a live usage reading. The runner retains
+    /// at most one witness and may only use it for the native completion naming `inputID`.
+    struct OverflowInputEvidence {
+        let inputID: UUID
+        let writer: AgentSessionRuntimeStore.WriterReceipt
+        let intent: NativeSessionIntent
+        let installation: UUID
+        let controllerID: ObjectIdentifier
+        let conversation: String
+        let model: String
+        let compactBoundary: UUID?
+        let compactedAt: Date?
+        let withdrawnVouchRevision: UInt64
+    }
+
+    func overflowInputEvidenceIsCurrent(_ evidence: OverflowInputEvidence, for session: AgentTabSession) -> Bool {
+        !Task.isCancelled && evidence.writer.disposition(for: session) == .current
+            && intentIsCurrent(evidence.intent, for: session)
+            && session.selectedAgent == .claudeCode && session.selectedModelRaw == evidence.model
+            && session.providerSessionID == evidence.conversation
+            && session.claudeController.map { ObjectIdentifier($0) } == evidence.controllerID
+            && controllerListeners[session.tabID]?.hasInstallation(evidence.installation) == true
+            && session.claudeCompactBoundaryID == evidence.compactBoundary
+            && session.contextCompactedAt == evidence.compactedAt
+            && session.contextCountVouchRevision == evidence.withdrawnVouchRevision
+            && session.claudeAcceptedHostTurnIDs == [evidence.inputID]
+    }
+
     @discardableResult
     func sendClaudeNativeMessage(
         session: AgentTabSession,
@@ -1445,7 +1473,8 @@ final class ClaudeAgentModeCoordinator {
         providerLaunchInput: AgentProviderLaunchInput? = nil,
         routingLease: MCPBootstrapLease? = nil,
         inputResourcesAreCurrent callerResourcesAreCurrent: @escaping @MainActor () -> Bool = { true },
-        validateInputResources: (@MainActor () async -> Bool)? = nil
+        validateInputResources: (@MainActor () async -> Bool)? = nil,
+        overflowEvidence: (writer: AgentSessionRuntimeStore.WriterReceipt, accept: (OverflowInputEvidence) -> Void)? = nil
     ) async -> NativeSendOutcome {
         let inputResourcesAreCurrent = {
             callerResourcesAreCurrent() && providerLaunchInput?.isCurrent(for: session) != false
@@ -1464,14 +1493,17 @@ final class ClaudeAgentModeCoordinator {
         // controller is a transport retry of the *same* user turn, so every attempt must carry a
         // byte-equivalent oversight supplement rather than re-deciding per attempt.
         let promptDispatchID = AgentSessionLinkPromptDispatchID.claudeNativeSend(UUID())
-        func invalidateWakeUsageAfterSend(_ controller: any NativeAgentRuntimeControlling, previousVouch: UInt64) {
+        @discardableResult
+        func invalidateWakeUsageAfterSend(_ controller: any NativeAgentRuntimeControlling, previousVouch: UInt64) -> UInt64? {
             // A new count can arrive while the stdin call is suspended. Only retire the vouch
             // that existed before the write, never a newer provider reading.
             if session.contextCountVouchRevision == previousVouch,
                intentIsCurrent(intent, for: session), sessionOwnsClaudeController(controller, for: session)
             {
                 session.invalidateClaudeWakeUsage()
+                return session.contextCountVouchRevision
             }
+            return nil
         }
         /// A control command acts only on the conversation it was admitted for and never interrupts.
         /// A rebind, a fresh-start fallback after a failed resume (whose staged recovery handoff stays
@@ -2122,10 +2154,17 @@ final class ClaudeAgentModeCoordinator {
                 inputInbox?.beginInputHandoff()
                 defer { inputInbox?.endInputHandoff() }
                 inputAttemptChanged?(true)
+                let previousVouch = session.contextCountVouchRevision
+                let priorLoad = overflowEvidence == nil ? nil : AgentModeViewModel.observationContextLoad(for: session)
+                let priorConversation = session.providerSessionID
+                let priorModel = session.selectedModelRaw
+                let priorBoundary = session.claudeCompactBoundaryID
+                let priorCompactedAt = session.contextCompactedAt
+                let installation = controllerListeners[session.tabID]?.installationWitness
+                var withdrawnVouchRevision: UInt64?
                 let turnID: UUID
                 do {
-                    let previousVouch = session.contextCountVouchRevision
-                    defer { invalidateWakeUsageAfterSend(controller, previousVouch: previousVouch) }
+                    defer { withdrawnVouchRevision = invalidateWakeUsageAfterSend(controller, previousVouch: previousVouch) }
                     turnID = try await controller.sendUserMessage(providerBoundText, configuration: configurationProof)
                 }
                 session.oracleBackgroundAwareness.accept(oracle)
@@ -2155,7 +2194,20 @@ final class ClaudeAgentModeCoordinator {
                 // The returned provider turn ID is the acceptance signal. Acknowledge before the
                 // currency guard: even a locally superseded turn delivered this supplement.
                 hostCapabilities.acceptAgentSessionLinkPromptClaim(session, monitoring.dispatchContext, released.claim)
-                return await acceptSentTurn(turnID, controller: controller)
+                let outcome = await acceptSentTurn(turnID, controller: controller)
+                if outcome == .sent, let overflowEvidence, let installation, let withdrawnVouchRevision,
+                   let priorConversation, !priorConversation.isEmpty, priorLoad?.confidence == .exact,
+                   ClaudeOverflowRecoveryPolicy.historyIsNearLimit(used: priorLoad?.usedTokens, window: priorLoad?.windowTokens)
+                {
+                    let evidence = OverflowInputEvidence(
+                        inputID: turnID, writer: overflowEvidence.writer, intent: intent,
+                        installation: installation, controllerID: ObjectIdentifier(controller),
+                        conversation: priorConversation, model: priorModel, compactBoundary: priorBoundary,
+                        compactedAt: priorCompactedAt, withdrawnVouchRevision: withdrawnVouchRevision
+                    )
+                    if overflowInputEvidenceIsCurrent(evidence, for: session) { overflowEvidence.accept(evidence) }
+                }
+                return outcome
             } catch NativeAgentRuntimeControllerError.configurationNotCurrent,
                 NativeAgentRuntimeControllerError.cancelledBeforeWrite
             {
