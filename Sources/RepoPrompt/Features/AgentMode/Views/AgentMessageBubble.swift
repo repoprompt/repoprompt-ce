@@ -246,6 +246,55 @@ struct AgentTranscriptRow: View, @MainActor Equatable {
     let codexManagedLoginAction: CodexManagedLoginAction?
     @State private var showingRetainedContent = false
 
+    struct RetainedContent {
+        let input: String?
+        let output: String?
+        let fallbackText: String?
+        let isToolResult: Bool
+        let outputUnavailable: Bool
+
+        init(item: AgentChatItem, hydratedResult: String?) {
+            let summaryOnly = toolResultIsSummaryOnly(item)
+            input = item.toolArgsJSON.flatMap { $0.isEmpty ? nil : $0 }
+            if let hydratedResult, !hydratedResult.isEmpty {
+                output = hydratedResult
+            } else if !summaryOnly, let stored = item.toolResultJSON, !stored.isEmpty {
+                output = stored
+            } else {
+                output = nil
+            }
+            fallbackText = output == nil && !summaryOnly && !item.text.isEmpty ? item.text : nil
+            isToolResult = item.kind == .toolResult
+            outputUnavailable = summaryOnly && output == nil
+        }
+
+        var hasSections: Bool {
+            input != nil || output != nil || fallbackText != nil
+        }
+
+        var source: String? {
+            isToolResult ? output : input
+        }
+
+        var readableText: String {
+            var sections: [String] = []
+            if let input {
+                sections.append("Input\n\(ToolResultMarkdownRenderer.readableStructuredPayload(input))")
+            }
+            if let output {
+                sections.append("Output\n\(ToolResultMarkdownRenderer.readableResult(output))")
+            } else if let fallbackText {
+                let text = isToolResult ? ToolResultMarkdownRenderer.readableResult(fallbackText)
+                    : ToolResultMarkdownRenderer.readableStructuredPayload(fallbackText)
+                sections.append("\(isToolResult ? "Output" : "Text")\n\(text)")
+            }
+            if outputUnavailable {
+                sections.append("Full output was not retained or is unavailable.")
+            }
+            return sections.joined(separator: "\n\n")
+        }
+    }
+
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.inputs == rhs.inputs
             && lhs.agentModeVM === rhs.agentModeVM
@@ -297,11 +346,12 @@ struct AgentTranscriptRow: View, @MainActor Equatable {
         .environment(\.agentApprovalVisible, inputs.approvalVisible)
         .contextMenu {
             if isToolRow {
-                if !retainedSections.isEmpty {
+                let content = retainedContent
+                if content.hasSections {
                     Button("View Retained Content…") { showingRetainedContent = true }
-                    Button("Copy Content") { copyContent(readableRetainedContent) }
-                    if let sourceRetainedContent {
-                        Button("Copy Source") { copyContent(sourceRetainedContent) }
+                    Button("Copy Content") { copyContent(content.readableText) }
+                    if let source = content.source {
+                        Button("Copy Source") { copyContent(source) }
                     }
                 }
             } else if !inputs.item.text.isEmpty {
@@ -309,18 +359,20 @@ struct AgentTranscriptRow: View, @MainActor Equatable {
             }
         }
         .sheet(isPresented: $showingRetainedContent) {
+            let content = retainedContent
+            let readableText = content.readableText
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
                     Text("Retained Tool Content").font(.headline)
                     Spacer()
-                    Button("Copy Content") { copyContent(readableRetainedContent) }
-                    if let sourceRetainedContent {
-                        Button("Copy Source") { copyContent(sourceRetainedContent) }
+                    Button("Copy Content") { copyContent(readableText) }
+                    if let source = content.source {
+                        Button("Copy Source") { copyContent(source) }
                     }
                     Button("Done") { showingRetainedContent = false }
                         .keyboardShortcut(.defaultAction)
                 }
-                ToolScrollableMarkdownTextView(text: readableRetainedContent, maxHeight: 400)
+                ToolScrollableMarkdownTextView(text: readableText, maxHeight: 400)
             }
             .padding()
             .frame(minWidth: 620)
@@ -331,38 +383,8 @@ struct AgentTranscriptRow: View, @MainActor Equatable {
         inputs.item.kind == .toolCall || inputs.item.kind == .toolResult
     }
 
-    private var retainedSections: [(title: String, text: String)] {
-        let item = inputs.item
-        var sections: [(String, String)] = []
-        if let args = item.toolArgsJSON, !args.isEmpty { sections.append(("Input", args)) }
-        if let result = retainedResultSource {
-            sections.append(("Output", result))
-        } else if !item.text.isEmpty, !toolResultIsSummaryOnly(item) {
-            sections.append((item.kind == .toolResult ? "Output" : "Text", item.text))
-        }
-        return sections
-    }
-
-    private var readableRetainedContent: String {
-        var sections = retainedSections.map { "\($0.title)\n\(ToolResultMarkdownRenderer.readablePayload($0.text))" }
-        if toolResultIsSummaryOnly(inputs.item), retainedResultSource == nil {
-            sections.append("Full output was not retained or is unavailable.")
-        }
-        return sections.joined(separator: "\n\n")
-    }
-
-    private var retainedResultSource: String? {
-        if let hydrated = inputs.rawToolResultPayload, !hydrated.isEmpty { return hydrated }
-        guard !toolResultIsSummaryOnly(inputs.item),
-              let stored = inputs.item.toolResultJSON, !stored.isEmpty
-        else { return nil }
-        return stored
-    }
-
-    private var sourceRetainedContent: String? {
-        if inputs.item.kind == .toolResult { return retainedResultSource }
-        guard let args = inputs.item.toolArgsJSON, !args.isEmpty else { return nil }
-        return args
+    private var retainedContent: RetainedContent {
+        RetainedContent(item: inputs.item, hydratedResult: inputs.rawToolResultPayload)
     }
 
     private func copyContent(_ text: String) {

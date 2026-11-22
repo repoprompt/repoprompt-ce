@@ -280,13 +280,13 @@ final class ToolResultMarkdownRendererTests: XCTestCase {
         let output = ToolResultMarkdownRenderer.render(toolName: "read_file", argsJSON: nil, resultPayload: payload)
         XCTAssertEqual(output?.text, "## File Read\n\n```swift\nlet value = 1\n```")
         XCTAssertEqual(output?.isMarkdown, true)
-        XCTAssertEqual(ToolResultMarkdownRenderer.readablePayload(payload), output?.text)
+        XCTAssertEqual(ToolResultMarkdownRenderer.readableResult(payload), output?.text)
     }
 
     func testStructuredPayloadShowsReadableFieldsWithoutLosingNestedValues() {
         let payload = #"{"items":[{"ok":true,"value":1},null],"text":"line one\nline two"}"#
         XCTAssertEqual(
-            ToolResultMarkdownRenderer.readablePayload(payload),
+            ToolResultMarkdownRenderer.readableResult(payload),
             "items:\n  1:\n    ok: true\n    value: 1\n  2: null\ntext:\n  line one\n  line two"
         )
     }
@@ -297,17 +297,115 @@ final class ToolResultMarkdownRendererTests: XCTestCase {
           {"type":"text","text":"  "},
           {"type":"text","text":"## First"},
           {"type":"image","data":"dGVzdA==","mimeType":"image/png"},
+          {"type":"audio","data":"dGVzdA==","mimeType":"audio/wav"},
+          {"type":"resource","resource":{"uri":"file:///fixture","text":"embedded body"}},
+          {"type":"resource_link","uri":"file:///fixture","name":"fixture"},
           {"type":"text","text":"**Last**"}
         ]}
         """#
         let output = ToolResultMarkdownRenderer.render(toolName: "read_file", argsJSON: nil, resultPayload: payload)
         XCTAssertEqual(output?.text, "## First\n\n**Last**")
         XCTAssertEqual(output?.isMarkdown, true)
-        XCTAssertEqual(ToolResultMarkdownRenderer.readablePayload(payload), output?.text)
+        XCTAssertEqual(ToolResultMarkdownRenderer.readableResult(payload), output?.text)
+    }
+
+    func testBlankFirstBusinessContentPreservesFieldsShownInV110() {
+        let payload = #"{"total":2,"content":[{"text":" "},{"text":"first","documentID":"a"}],"next":"b"}"#
+        assertFieldProjection(payload, "content:\n  1:\n    text:  \n  2:\n    documentID: a\n    text: first\nnext: b\ntotal: 2", toolName: "custom_lookup")
+    }
+
+    func testBusinessContentImprovesOnV110FirstTextFallback() {
+        let payload = #"{"total":2,"content":[{"text":"first","documentID":"a"}],"next":"b"}"#
+        assertFieldProjection(payload, "content:\n  1:\n    documentID: a\n    text: first\nnext: b\ntotal: 2", toolName: "custom_lookup")
+    }
+
+    func testRejectedEnvelopePreservesTheWholeObject() {
+        let typedBusinessRecord = #"{"content":[{"type":"text","text":"first","documentID":"a"}]}"#
+        assertFieldProjection(typedBusinessRecord, "content:\n  1:\n    documentID: a\n    text: first\n    type: text")
+
+        let invalidMixedBlocks = #"{"content":[{"type":"text","text":"first"},{"type":"image","data":"invalid without MIME"}]}"#
+        assertFieldProjection(invalidMixedBlocks, "content:\n  1:\n    text: first\n    type: text\n  2:\n    data: invalid without MIME\n    type: image")
+
+        let wrapperWithSibling = #"{"Ok":{"content":[{"type":"text","text":"first"}]},"next":"b"}"#
+        assertFieldProjection(wrapperWithSibling, "Ok:\n  content:\n    1:\n      text: first\n      type: text\nnext: b")
+
+        let numericErrorFlag = #"{"content":[{"type":"text","text":"first"}],"isError":1}"#
+        assertFieldProjection(numericErrorFlag, "content:\n  1:\n    text: first\n    type: text\nisError: 1")
+    }
+
+    func testCanonicalStructuredContentWinsOverTextInBareAndWrappedResults() {
+        let bare = ###"{"content":[{"type":"text","text":"## Preview"}],"structuredContent":{"items":["canonical"],"total":1},"isError":false,"_meta":{"transport":"private"}}"###
+        let expected = "items:\n  1: canonical\ntotal: 1"
+        assertFieldProjection(bare, expected)
+        assertFieldProjection("{\"Ok\":\(bare)}", expected)
+    }
+
+    func testErrorResultUsesItsTextAndDoesNotBecomeAnEmptySuccess() {
+        let bare = #"{"content":[{"type":"text","text":"Failed to read"}],"isError":true}"#
+        XCTAssertEqual(ToolResultMarkdownRenderer.readableResult(bare), "Failed to read")
+        XCTAssertEqual(render("{\"Err\":\(bare)}")?.text, "Failed to read")
+        assertFieldProjection(#"{"content":[],"isError":true}"#, "Tool reported an error without text.")
+        assertFieldProjection(#"{"Err":{"content":[]}}"#, "Tool reported an error without text.")
+    }
+
+    func testEmptySuccessHasNoExpandedResultAndDoesNotShowEnvelopeInCopy() {
+        let empty = #"{"content":[],"isError":false}"#
+        XCTAssertNil(render(empty))
+        XCTAssertEqual(ToolResultMarkdownRenderer.readableResult(empty), "No result")
+    }
+
+    func testMarkdownViewCutoffUsesUTF8Bytes() throws {
+        let atLimit = String(repeating: "é", count: 8192)
+        let overLimit = atLimit + "x"
+        for (text, expected) in [(atLimit, true), (overLimit, false)] {
+            let payload = #"{"content":[{"type":"text","text":"\#(text)"}]}"#
+            let output = try XCTUnwrap(render(payload))
+            XCTAssertEqual(output.text, text)
+            XCTAssertEqual(output.usesMarkdownView, expected)
+        }
+    }
+
+    @MainActor
+    func testRetainedInputIsStructuredAndSourceIsUnmodified() {
+        // This input is byte-for-byte a valid envelope shape. Role, not shape, governs input.
+        let input = #"{"content":[{"type":"text","text":"first"}]}"#
+        let inputFields = "Input\ncontent:\n  1:\n    text: first\n    type: text"
+        let toolCall = AgentChatItem(kind: .toolCall, text: "", toolName: "custom_lookup", toolArgsJSON: input)
+        let call = AgentTranscriptRow.RetainedContent(item: toolCall, hydratedResult: nil)
+        XCTAssertEqual(call.readableText, inputFields)
+        XCTAssertEqual(call.source, input)
+
+        let output = " \n" + input + " \n"
+        let stored = AgentChatItem(kind: .toolResult, text: "", toolName: "custom_lookup", toolArgsJSON: input, toolResultJSON: output)
+        let storedResult = AgentTranscriptRow.RetainedContent(item: stored, hydratedResult: nil)
+        XCTAssertEqual(storedResult.readableText, inputFields + "\n\nOutput\nfirst")
+        XCTAssertEqual(storedResult.source, output)
+
+        var summary = stored
+        summary.toolResultJSON = #"{"summary_only":true,"status":"ok"}"#
+        let retained = AgentTranscriptRow.RetainedContent(item: summary, hydratedResult: nil)
+        XCTAssertNil(retained.source)
+        XCTAssertEqual(retained.readableText, inputFields + "\n\nFull output was not retained or is unavailable.")
+
+        let hydrated = AgentTranscriptRow.RetainedContent(item: summary, hydratedResult: output)
+        XCTAssertEqual(hydrated.readableText, storedResult.readableText)
+        XCTAssertEqual(hydrated.source, output)
+    }
+
+    private func render(_ payload: String) -> ToolResultMarkdownRenderer.Output? {
+        ToolResultMarkdownRenderer.render(toolName: "read_file", argsJSON: nil, resultPayload: payload)
+    }
+
+    private func assertFieldProjection(
+        _ payload: String, _ expected: String, toolName: String = "read_file", file: StaticString = #filePath, line: UInt = #line
+    ) {
+        let output = ToolResultMarkdownRenderer.render(toolName: toolName, argsJSON: nil, resultPayload: payload)
+        XCTAssertEqual(output, .init(text: expected, isMarkdown: false), file: file, line: line)
+        XCTAssertEqual(ToolResultMarkdownRenderer.readableResult(payload), expected, file: file, line: line)
     }
 
     func testPlainPayloadKeptLiteralInRetainedContent() {
         let payload = "  <tag>\n[not a link]  \n"
-        XCTAssertEqual(ToolResultMarkdownRenderer.readablePayload(payload), payload)
+        XCTAssertEqual(ToolResultMarkdownRenderer.readableResult(payload), payload)
     }
 }
