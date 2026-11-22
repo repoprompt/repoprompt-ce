@@ -2,6 +2,7 @@ import Foundation
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 import RepoPromptWorkspaceContext
+import RepoPromptWorkspaceCore
 
 /// Resource composition only: reads the existing domain authority and never owns another catalog.
 /// Legacy windows and future unpresented hosts use the same file-store construction and lease API.
@@ -62,7 +63,7 @@ struct AgentHostWorkspaceResources {
             guard await contexts.workspaceSnapshot(workspaceID) == snapshot else { throw Failure.contextChanged }
             guard await files.isRootRetentionCurrent(retention) else { throw Failure.rootsChanged }
             try Task.checkCancellation()
-            return Lease(resources: self, snapshot: snapshot, retention: retention)
+            return Lease(resources: self, snapshot: snapshot, roots: requestedRoots, retention: retention)
         } catch {
             await files.releaseRootRetention(retention)
             throw error
@@ -73,13 +74,15 @@ struct AgentHostWorkspaceResources {
     final class Lease {
         let resources: AgentHostWorkspaceResources
         let snapshot: DomainWorkspaceSnapshot
+        let roots: [WorkspaceRootRef]
         private let retention: WorkspaceFileContextStore.RootRetention
         private let rootOwner: Lease?
         private(set) var isReleased = false
 
-        fileprivate init(resources: AgentHostWorkspaceResources, snapshot: DomainWorkspaceSnapshot, retention: WorkspaceFileContextStore.RootRetention, rootOwner: Lease? = nil) {
+        fileprivate init(resources: AgentHostWorkspaceResources, snapshot: DomainWorkspaceSnapshot, roots: [WorkspaceRootRef], retention: WorkspaceFileContextStore.RootRetention, rootOwner: Lease? = nil) {
             self.resources = resources
             self.snapshot = snapshot
+            self.roots = roots
             self.retention = retention
             self.rootOwner = rootOwner
         }
@@ -118,7 +121,7 @@ struct AgentHostWorkspaceResources {
             guard await resources.contexts?.workspaceSnapshot(workspaceID) == current else { throw Failure.contextChanged }
             try Task.checkCancellation()
             guard rootsAreCurrent else { throw Failure.rootsChanged }
-            return Lease(resources: resources, snapshot: current, retention: retention, rootOwner: rootOwner ?? self)
+            return Lease(resources: resources, snapshot: current, roots: roots, retention: retention, rootOwner: rootOwner ?? self)
         }
 
         func release() async {

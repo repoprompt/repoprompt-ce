@@ -29,9 +29,10 @@ extension AgentSessionRuntimeHost {
 
     func makeHostFileReadResources(_ lease: AgentHostWorkspaceResources.Lease) -> MCPFileReadResources {
         .init(workspace: lease, settings: .shared, contentEffects: .init(
-            // This route has no advertised Git artifact grant. Ordinary exact paths still use
-            // the shared resolver and the run's canonical logical/physical root projection.
-            artifact: { _, _, _, _, _, _ in nil },
+            artifact: { [weak self] requested, translated, start, count, _, lookup in
+                guard let self else { throw MCPFileToolAuthorityFailure.superseded }
+                return try await readHostSelectedGitArtifact(requested: requested, translated: translated, start: start, count: count, lookup: lookup)
+            },
             selectRead: { [weak self] connection, snapshot, validateResources, lookup, reply, path, physical in
                 guard let self, let intent = AutoSliceSelection.readFileSelection(from: reply, fallbackPath: path) else { return nil }
                 let ranges: [LineRange]? = if case let .slice(entry) = intent { entry.ranges } else { nil }
@@ -55,7 +56,7 @@ extension AgentSessionRuntimeHost {
     }
 
     func executeHostSelection(
-        args: [String: Value], invocation: ToolInvocationContext, lease base: AgentHostWorkspaceResources.Lease
+        args: [String: Value], invocation: ToolInvocationContext
     ) async throws -> Value {
         let op = (args["op"]?.stringValue ?? "get").lowercased()
         let mode = (args["mode"]?.stringValue ?? "full").lowercased()
@@ -67,47 +68,67 @@ extension AgentSessionRuntimeHost {
         if codeMapsDisabled, mode == "codemap_only" || op == "demote" {
             throw MCPError.invalidParams(MCPServerViewModel.codeMapsGloballyDisabledMCPMessage)
         }
-        guard let activation = workspaceActivation, let workspaceID = activation.key.owner.workspaceID else {
-            throw MCPFileToolAuthorityFailure.unavailable
-        }
-        let connection = try route.fileReadConnection(metadata: invocation.metadata, workspaceID: workspaceID)
-        guard let original = hostFileCommand(connection) else { throw MCPFileToolAuthorityFailure.unavailable }
-        let lease = try await base.capture(workspaceID: workspaceID) { activation.executionTab(in: $0, command: original) != nil }
-        guard let tab = activation.executionTab(in: lease.snapshot, command: original) else { throw MCPFileToolAuthorityFailure.superseded }
-        let store = lease.resources.files
-        let roots = await store.rootRefs(scope: .visibleWorkspace)
-        let lookup = try await AgentWorkspaceLookupContextResolver.requiredLookupContext(source: connection.lookupSource, visibleRoots: roots, store: store)
-        let lookupLifetime = if let projection = lookup.bindingProjection {
-            await store.sessionBoundRootScopeValidationSnapshot(lookup.rootScope, expectedPhysicalRoots: projection.physicalRootRefs)
-        } else { nil as WorkspaceSessionRootLifetimeSnapshot? }
-        guard lookup.bindingProjection == nil || lookupLifetime != nil else { throw MCPFileToolAuthorityFailure.worktreeScopeUnavailable }
+        guard let activation = workspaceActivation else { throw MCPFileToolAuthorityFailure.unavailable }
+        let origin = try await captureHostFileInvocation(invocation)
+        let tab = origin.tab
+        let store = origin.lease.resources.files
+        let lookup = origin.lookup
         if op != "get" { _ = await store.awaitAppliedIngress(rootScope: lookup.rootScope) }
         try Task.checkCancellation()
         let physical = lookup.physicalizeSelection(tab.selection)
-        let input = MCPServerViewModel.parseSavedOrVisibleSelectionInputs(
+        var input = MCPServerViewModel.parseSavedOrVisibleSelectionInputs(
             rawPaths: args["paths"]?.arrayValue?.compactMap(\.stringValue) ?? [], slicesValue: args["slices"]
         )
+        let isArtifact = { (path: String) in path == "_git_data" || path.hasPrefix("_git_data/") }
+        let artifacts: MCPManageSelectionArtifactResolution?
+        if ["set", "add", "preview", "remove"].contains(op),
+           input.paths.contains(where: isArtifact) || input.sliceInputs.contains(where: { isArtifact($0.path) })
+        {
+            let capability = try await hostGitArtifactCapability(for: origin)
+            let resolved = await MCPManageSelectionArtifactResolver(store: store, registry: activation.gitArtifactAdvertisements).resolve(.init(
+                paths: input.paths, sliceInputs: input.sliceInputs, use: op == "remove" ? .remove : .insert, mode: mode,
+                physicalSelection: physical, identity: .init(workspaceID: origin.command.identity.workspaceID, tabID: tab.id),
+                capability: capability
+            ))
+            artifacts = resolved
+            input = .init(paths: resolved.ordinaryPaths, sliceInputs: resolved.ordinarySliceInputs, sliceErrors: input.sliceErrors, hadExplicitSliceSpec: input.hadExplicitSliceSpec)
+        } else { artifacts = nil }
         let paths = lookup.translateInputPaths(input.paths)
         let slices = input.sliceInputs.map { WorkspaceSelectionSliceInput(path: lookup.translateInputPath($0.path), ranges: $0.ranges) }
         let selectionService = WorkspaceSelectionMutationService(store: store, codemapsGloballyDisabled: codeMapsDisabled)
-        let selection = try await computeHostSelection(
+        var selection = try await computeHostSelection(
             op: op, mode: mode, physical: physical, paths: paths, input: input, slices: slices,
             service: selectionService, rootScope: lookup.rootScope
         )
+        if let artifacts {
+            selection.invalid += artifacts.invalidDiagnostics
+            if !artifacts.absolutePaths.isEmpty {
+                selection.selection = Self.applyHostArtifactSelection(paths: artifacts.absolutePaths, removing: op == "remove", to: selection.selection)
+            } else if paths.isEmpty, slices.isEmpty, !artifacts.invalidDiagnostics.isEmpty {
+                selection.selection = physical
+            }
+        }
         if args["strict"]?.boolValue == true, selection.selection == physical, !selection.invalid.isEmpty {
             throw MCPSelectionToolProvider.invalidOnlySelectionError(invalidPaths: selection.invalid, fallback: "No selection inputs resolved")
         }
         let validatesOrigin: @MainActor @Sendable () async -> Bool = {
-            guard await self.hostSelectionOriginIsCurrent(invocation, connection: connection, command: original) else { return false }
-            if let lookupLifetime, await !lookupLifetime.isCurrent() { return false }
-            return lease.rootsAreCurrent && self.hostFileCommand(connection)?.identity == original.identity
+            if let fence = artifacts?.fence {
+                let root = fence.capability.gitDataRoot
+                guard await store.exactRootRef(path: root.standardizedFullPath, kind: .workspaceGitData) == root,
+                      await SelectedGitDiffArtifactAuthorizationService().visibleRootCheckoutsAreCurrent(capability: fence.capability, store: store),
+                      fence.grantSnapshot.map({ activation.gitArtifactAdvertisements.isCurrent($0) }) ?? true
+                else { return false }
+            }
+            do { try await origin.requireCurrent()
+                return true
+            } catch { return false }
         }
-        guard await lease.isCurrent(), await validatesOrigin() else { throw MCPFileToolAuthorityFailure.superseded }
+        guard await validatesOrigin() else { throw MCPFileToolAuthorityFailure.superseded }
         let next = lookup.logicalizeSelection(selection.selection)
         if op != "preview", op != "get", next != tab.selection {
             _ = try await activation.commitHostSelection(
-                next, replacing: tab.selection, in: lease.snapshot, command: original,
-                connectionID: connection.connectionID, validatesOrigin: validatesOrigin
+                next, replacing: tab.selection, in: origin.lease.snapshot, command: origin.command,
+                connectionID: origin.connection.connectionID, validatesOrigin: validatesOrigin
             )
         }
         let files = next.selectedPaths.map { path in
@@ -120,6 +141,17 @@ extension AgentSessionRuntimeHost {
             files: files, totalTokens: nil, status: op == "preview" ? "preview" : "ok",
             invalidPaths: selection.invalid.isEmpty ? nil : selection.invalid, codemapAutoEnabled: next.codemapAutoEnabled
         ))
+    }
+
+    private static func applyHostArtifactSelection(paths: [String], removing: Bool, to selection: StoredSelection) -> StoredSelection {
+        var selected = selection.selectedPaths
+        let artifactPaths = Set(paths)
+        if removing { selected.removeAll(where: artifactPaths.contains) }
+        else { selected.append(contentsOf: paths.filter { !selection.selectedPaths.contains($0) }) }
+        return .init(
+            selectedPaths: selected, manualCodemapPaths: selection.manualCodemapPaths,
+            slices: selection.slices.filter { !artifactPaths.contains($0.key) }, codemapAutoEnabled: selection.codemapAutoEnabled
+        )
     }
 
     private func computeHostSelection(

@@ -6,6 +6,7 @@ import RepoPromptWorkspaceContext
 /// their leases; it does not mirror the workspace catalog or elect a session writer.
 @MainActor
 final class AgentSessionHostWorkspaceActivation {
+    let gitArtifactAdvertisements = MCPGitArtifactAdvertisementRegistry()
     struct Key: Equatable {
         let windowID: Int
         let owner: AgentWorkspaceSessionIndexStore.SessionIndexOwner
