@@ -466,11 +466,28 @@ final class WorkspaceActivityCoordinator {
                 failures[workspaceID] = timeoutReason
             }
         }
+        // Some exact owners no longer have a manager. The existing workspace deletion lease
+        // fences new activation while confirmed deletion joins their durable release.
+        for workspaceID in claimed.sorted(by: { $0.uuidString < $1.uuidString }) where failures[workspaceID] == nil {
+            guard deletionLeaseIDByWorkspaceID[workspaceID] == leaseID,
+                  let token = cancellationTokensByWorkspaceID[workspaceID], token.isActive,
+                  !Task.isCancelled, clock.now < deadline
+            else {
+                failures[workspaceID] = timeoutReason
+                continue
+            }
+            let released = await AgentSessionRuntimeHost.drainRetainedHostsForWorkspaceDeletion(token: token, until: deadline)
+            if !released || deletionLeaseIDByWorkspaceID[workspaceID] != leaseID || !token.isActive || Task.isCancelled || clock.now >= deadline {
+                failures[workspaceID] = "The workspace's Agent runtime has not finished saving and releasing its resources. Try deleting it again."
+            }
+        }
         for workspaceID in failures.keys {
             cancellationTokensByWorkspaceID[workspaceID]?.cancel()
         }
         for workspaceID in failures.keys where claimed.remove(workspaceID) != nil {
-            deletionLeaseIDByWorkspaceID.removeValue(forKey: workspaceID)
+            if deletionLeaseIDByWorkspaceID[workspaceID] == leaseID {
+                deletionLeaseIDByWorkspaceID.removeValue(forKey: workspaceID)
+            }
         }
         return DeletionClaim(
             lease: DeletionLease(id: leaseID, workspaceIDs: claimed),

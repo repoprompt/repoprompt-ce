@@ -92,6 +92,16 @@ final class AgentModeWorkspaceSwitchSessionProvider: WorkspaceSwitchSessionProvi
         self.agentModeViewModel = agentModeViewModel
     }
 
+    /// Admission and cancellation must agree about which active work survives a switch.
+    func preservedExecutionHost(workspaceID: UUID?) -> AgentSessionRuntimeHost? {
+        guard let workspaceID, let agentModeViewModel,
+              agentModeViewModel.canonicalWorkspaceHostPreparation != nil,
+              let host = agentModeViewModel.preservableExecutionHost(),
+              host.workspaceActivation?.key.owner.workspaceID == workspaceID
+        else { return nil }
+        return host
+    }
+
     func switchSessionItems() -> [WorkspaceSwitchSessionItem] {
         let count = activeAgentCount()
         guard count > 0 else { return [] }

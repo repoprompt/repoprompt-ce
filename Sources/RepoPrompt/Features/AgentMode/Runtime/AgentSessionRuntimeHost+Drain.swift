@@ -17,6 +17,30 @@ extension AgentSessionRuntimeHost {
         return drain
     }
 
+    /// Confirmed deletion must join exact detached owners too. A timeout does not transfer
+    /// authority to remove storage while an originating provider or writer is still draining.
+    static func drainRetainedHostsForWorkspaceDeletion(
+        token: WorkspaceDeletionCancellationToken, until deadline: ContinuousClock.Instant
+    ) async -> Bool {
+        guard token.isActive, !Task.isCancelled, ContinuousClock.now < deadline else { return false }
+        let store = AgentSessionRuntimeStore.shared
+        func retainedHosts() -> [AgentSessionRuntimeHost] {
+            (store.retainedExecutionHosts + store.retainedDrains.compactMap(\.scope.executableHost)).filter {
+                $0.route.identity.kind == .independent && $0.workspaceActivation?.key.owner.workspaceID == token.workspaceID
+            }
+        }
+        var seen = Set<ObjectIdentifier>()
+        let drains = retainedHosts().compactMap { host -> AgentSessionHostDrainRuntime? in
+            guard seen.insert(ObjectIdentifier(host)).inserted else { return nil }
+            if host.scope.hasReleasedWriterClaims { return host.scope.retainedDrain }
+            return host.beginAuthorizedRetirement()
+        }
+        for drain in drains {
+            guard token.isActive, !Task.isCancelled, await drain.wait(until: deadline) == .released else { return false }
+        }
+        return token.isActive && !Task.isCancelled && ContinuousClock.now < deadline && retainedHosts().isEmpty
+    }
+
     private func beginCancellationRetirement() -> AgentSessionHostDrainRuntime {
         let participants = scope.sessions.values.map { session in
             (

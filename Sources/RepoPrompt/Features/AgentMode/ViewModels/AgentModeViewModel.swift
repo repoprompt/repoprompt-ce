@@ -496,7 +496,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         Int
     ) async -> AsyncThrowingStream<AgentSessionSidebarBuildBatch, Error>
 
-    let runtimeHost: AgentSessionRuntimeHost
+    private(set) var runtimeHost: AgentSessionRuntimeHost
+    /// Only installed by composition with a fully registered independent executable route.
+    typealias CanonicalWorkspaceHostPreparation = @MainActor (
+        WorkspaceModel, SessionIndexOwner, AgentWorkspaceSessionIndexStore
+    ) async throws -> AgentSessionRuntimeHost
+    var canonicalWorkspaceHostPreparation: CanonicalWorkspaceHostPreparation?
+
     var runtimeSessionStore: AgentSessionRuntimeStore.Scope {
         runtimeHost.scope
     }
@@ -2135,10 +2141,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 runtimeSessionStore.presentation.detach(attachment)
             }
         }
-        guard !hasPreparedForWindowClose else { return }
-        runtimeSessionStore.installDetachedNotificationSink(routeID: windowID)
+        guard !hasPreparedForWindowClose, !hasDetachedClosingPresentation else { return }
+        let host = runtimeHost
+        host.scope.installDetachedNotificationSink(routeID: host.routeID)
         for (tabID, session) in sessions where previous[tabID] !== session {
-            runPresentationAttachments[ObjectIdentifier(session)] = runtimeSessionStore.presentation.attach(session, sink: .init(
+            let sink = AgentSessionPresentationRuntime.Sink(
                 activityChanged: { [weak self] session, isActive in
                     guard let self, sessions[session.tabID] === session else { return }
                     publishAgentRunActivity(tabID: session.tabID, session: session, isActive: isActive)
@@ -2243,8 +2250,43 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     }
                 },
                 isAvailable: { [weak self] in self != nil }
-            ))
+            )
+            let identity = ObjectIdentifier(session)
+            if let activation = host.workspaceActivation, let sessionID = session.activeAgentSessionID {
+                guard let destination = sessionIndexOwner,
+                      destination.workspaceID == activation.key.owner.workspaceID,
+                      !host.scope.presentation.hasPresenter(for: session),
+                      case let .unique(writer) = host.scope.resolveWriter(sessionID: sessionID),
+                      writer.scope === host.scope, writer.session === session
+                else { continue }
+                let writerIdentity = writer.identity
+                runPresentationAttachments[identity] = host.scope.presentation.attachCurrent(
+                    session, sink: sink, isDestinationCurrent: { [weak self, weak host, weak session] in
+                        guard let self, let host, let session, runtimeHost === host,
+                              !hasPreparedForWindowClose, !hasDetachedClosingPresentation,
+                              sessions[tabID] === session, sessionIndexStore.isOwnerCurrent(destination),
+                              host.workspaceActivation?.owns(scope: host.scope, route: host.route) == true,
+                              host.scope.holdsPresentationIncarnation(of: writerIdentity, session: session)
+                        else { return false }
+                        return true
+                    }, seed: { [weak self] session in
+                        self?.seedAttachedRunPresentation(session)
+                    }
+                )
+            } else {
+                runPresentationAttachments[identity] = host.scope.presentation.attach(session, sink: sink)
+            }
         }
+    }
+
+    private func seedAttachedRunPresentation(_ session: TabSession) {
+        let tabID = session.tabID
+        if session.runState.isActive { tabsWithActiveAgentRun.insert(tabID) }
+        else { tabsWithActiveAgentRun.remove(tabID) }
+        if session.mcpControlContext != nil { mcpControlledTabIDs.insert(tabID) }
+        else { mcpControlledTabIDs.remove(tabID) }
+        publishActiveAgentRunStartedAt(for: tabID, session: session)
+        publishDerivedTranscriptState(for: session)
     }
 
     private func detachRunPresentation() {
@@ -6759,20 +6801,31 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// Separate from presentation adoption: installation clears queuedWorkspaceSwitchOwner before
     /// teardown/discard. Readiness must stay withheld through that entire destructive slice.
     private var destructiveWorkspaceAdoptionOwner: SessionIndexOwner?
+    private var fencedLegacyAdoptionScope: AgentSessionRuntimeStore.Scope?
 
     var isAwaitingWorkspaceAdoption: Bool {
-        runtimeSessionStore.isAwaitingWorkspaceAdoption
+        if destructiveWorkspaceAdoptionOwner != nil || runtimeSessionStore.isAwaitingWorkspaceAdoption { return true }
+        // A refused destination preparation leaves the last owner intact, not authorized to
+        // serve the newly selected workspace through the old presenter.
+        guard let activation = runtimeHost.workspaceActivation else { return false }
+        return activation.key.owner.workspaceID != activeWorkspaceIDForSessionIndexOwnership
     }
 
     private func beginDestructiveWorkspaceAdoption(_ owner: SessionIndexOwner) {
         destructiveWorkspaceAdoptionOwner = owner
-        runtimeSessionStore.setWorkspaceAdoptionPending(true)
+        // Activation changes fence the presenter, not the independent owner's commands.
+        if runtimeHost.workspaceActivation == nil {
+            fencedLegacyAdoptionScope = runtimeSessionStore
+            runtimeSessionStore.setWorkspaceAdoptionPending(true)
+        }
     }
 
     private func finishDestructiveWorkspaceAdoption(_ owner: SessionIndexOwner) {
         guard destructiveWorkspaceAdoptionOwner == owner else { return }
         destructiveWorkspaceAdoptionOwner = nil
-        runtimeSessionStore.setWorkspaceAdoptionPending(false)
+        let fencedScope = fencedLegacyAdoptionScope
+        fencedLegacyAdoptionScope = nil
+        fencedScope?.setWorkspaceAdoptionPending(false)
     }
 
     private func clearQueuedWorkspaceSwitchOwner(_ owner: SessionIndexOwner) {
@@ -13125,6 +13178,36 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
+    private enum WorkspaceExecutionDestination {
+        case unowned
+        case blocked
+        case retained(AgentSessionRuntimeStore.Writer, AgentSessionRuntimeHost)
+    }
+
+    /// The workspace document names the carrier, but only the store can resolve its writer.
+    /// Conflict or incomplete ownership never authorizes a second writer.
+    private func workspaceExecutionDestination(_ workspace: WorkspaceModel) -> WorkspaceExecutionDestination {
+        guard let tabID = workspace.activeComposeTabID,
+              let sessionID = workspace.composeTabs.first(where: { $0.id == tabID })?.activeAgentSessionID
+        else { return .unowned }
+        switch runtimeSessionStore.resolveWriter(sessionID: sessionID, expectedWorkspaceID: workspace.id) {
+        case .unavailable(.absent): return .unowned
+        case .unavailable, .conflicting: return .blocked
+        case let .unique(writer):
+            guard let host = writer.scope.executableHost, host.route.identity.kind == .independent else {
+                return writer.scope === runtimeSessionStore ? .unowned : .blocked
+            }
+            guard writer.binding.tabID == tabID, writer.isCurrent, writer.session.hasLoadedPersistedState,
+                  writer.session.permitsBoundOperationAndSave, !host.scope.isRetiring,
+                  host.workspaceActivation?.key.owner.workspaceID == workspace.id,
+                  host.workspaceActivation?.owns(scope: host.scope, route: host.route) == true,
+                  host.route.hasCurrentModelCatalogRoute,
+                  host === runtimeHost || !host.scope.sessions.values.contains(where: { host.scope.presentation.hasPresenter(for: $0) })
+            else { return .blocked }
+            return .retained(writer, host)
+        }
+    }
+
     func handleWorkspaceSwitch(_ workspace: WorkspaceModel?) async {
         let owner = sessionIndexStore.receiveWorkspaceSwitchNotification(workspace)
         await handleWorkspaceSwitch(workspace, owner: owner)
@@ -13194,38 +13277,121 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let teardownStartMS = restorePerfRecorder.timestampMSIfEnabled()
             let teardownSessionCount = sessions.count
         #endif
-        let originatingCleanup = runtimeHost.workspaceSwitchCleanup
-        let oracleDrains = sessions.values.compactMap { runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).closeOracleBackground(for: $0) }
-        for drain in oracleDrains {
-            await drain.value
+        let outgoing = runtimeHost
+        let activityCoordinator = workspaceManager?.workspaceActivityCoordinator ?? WindowStatesManager.shared.workspaceActivityCoordinator
+        let activationLease: WorkspaceActivityCoordinator.ActivationLease?
+        if canonicalWorkspaceHostPreparation != nil, let workspace {
+            guard let lease = activityCoordinator.beginActivation(workspaceID: workspace.id) else {
+                activeSessionLoadInProgressTabID = nil
+                completeAgentSessionLinkDiscoveryEpoch(discoveryEpoch)
+                return
+            }
+            activationLease = lease
+        } else {
+            activationLease = nil
         }
-        guard sessionIndexStore.isOwnerCurrent(owner) else { return }
-        let discardContexts = sessions.values.map {
-            prepareWorkspaceSwitchSessionDiscard(
-                $0,
-                reason: "Cancelled due to workspace switch"
+        defer { if let activationLease { activityCoordinator.endActivation(activationLease) } }
+        let preservesOrigin = preservableExecutionHost() === outgoing
+        let originatingCleanup = outgoing.workspaceSwitchCleanup
+        var prepared: AgentSessionRuntimeHost?
+        var retainedWriter: AgentSessionRuntimeStore.Writer?
+        var destination: AgentSessionRuntimeHost?
+        func ownsCurrentPresentation() -> Bool {
+            !hasPreparedForWindowClose && !hasDetachedClosingPresentation && runtimeHost === outgoing
+                && sessionIndexStore.isOwnerCurrent(owner)
+                && sessionIndexStore.isWorkspaceActivationCurrent(owner, workspace: workspace)
+        }
+        func adoptionIsCurrent() -> Bool {
+            !Task.isCancelled && ownsCurrentPresentation()
+        }
+        func settleRefusedDestination() {
+            guard ownsCurrentPresentation() else { return }
+            workspaceSwitchInFlight = false
+            activeSessionLoadInProgressTabID = nil
+            completeAgentSessionLinkDiscoveryEpoch(discoveryEpoch)
+        }
+        func abandonPreparedDestination() {
+            // There are no admitted writers in an unpublished candidate. Release its exact
+            // activation and execution lease through the normal drain, without blocking adoption.
+            if let prepared, runtimeHost !== prepared { prepared.beginRetirement().startIfNeeded() }
+        }
+        if let workspace, let prepare = canonicalWorkspaceHostPreparation {
+            switch workspaceExecutionDestination(workspace) {
+            case let .retained(writer, host):
+                retainedWriter = writer
+                destination = host
+            case .blocked:
+                settleRefusedDestination()
+                return
+            case .unowned:
+                do {
+                    prepared = try await prepare(workspace, owner, sessionIndexStore)
+                    destination = prepared
+                } catch {
+                    settleRefusedDestination()
+                    return
+                }
+            }
+        } else if preservesOrigin, workspace != nil {
+            // A canonical host is never retargeted to cover for missing destination composition.
+            settleRefusedDestination()
+            return
+        }
+        func destinationIsCurrent() -> Bool {
+            guard let destination, let workspace else { return true }
+            let visible = workspaceManager?.activeWorkspace ?? workspace
+            guard visible.id == workspace.id else { return false }
+            if let retainedWriter {
+                guard case let .retained(currentWriter, currentHost) = workspaceExecutionDestination(visible) else { return false }
+                return currentHost === destination && currentWriter.identity == retainedWriter.identity
+            }
+            guard case .unowned = workspaceExecutionDestination(visible) else { return false }
+            return destination.workspaceActivation?.key.owner == owner
+                && destination.workspaceActivation?.isPresenterCurrent == true
+                && destination.route.hasCurrentModelCatalogRoute && destination.scope.sessions.isEmpty
+                && destination.scope.execution != nil && destination.scope.installedInteractions != nil
+                && destination.scope.persistence.composition != nil
+        }
+        guard adoptionIsCurrent(), destinationIsCurrent() else {
+            abandonPreparedDestination()
+            settleRefusedDestination()
+            return
+        }
+        let cleanupTargets: [WorkspaceSwitchSessionCleanupTarget]
+        if preservesOrigin {
+            cleanupTargets = []
+        } else {
+            let oracleDrains = sessions.values.compactMap {
+                outgoing.scope.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).closeOracleBackground(for: $0)
+            }
+            for drain in oracleDrains { await drain.value }
+            guard adoptionIsCurrent() else {
+                abandonPreparedDestination()
+                return
+            }
+            let discardContexts = sessions.values.map {
+                prepareWorkspaceSwitchSessionDiscard($0, reason: "Cancelled due to workspace switch")
+            }
+            for session in sessions.values where session.runState.isActive {
+                guard adoptionIsCurrent() else {
+                    abandonPreparedDestination()
+                    return
+                }
+                guard sessions[session.tabID] === session else { continue }
+                await cancelAgentRun(tabID: session.tabID, origin: .internalLifecycle)
+            }
+            guard adoptionIsCurrent() else {
+                abandonPreparedDestination()
+                return
+            }
+            // Finalize and remove the legacy owner's sessions in the same actor turn.
+            cleanupTargets = assembleWorkspaceSwitchCleanupTargets(
+                preparedContexts: discardContexts, reason: "Cancelled due to workspace switch"
             )
+            claudeCoordinator.detachAllClaudeToolTrackingHandlersForWorkspaceSwitch()
+            codexCoordinator.stop()
+            claudeCoordinator.stop()
         }
-        // Safe to iterate across the awaits: `sessions.values` is a
-        // copy-on-write snapshot taken when the iterator is created, so map
-        // mutations during the suspensions cannot invalidate it, and
-        // cancelAgentRun(tabID:) re-resolves the live map by tab ID.
-        for session in sessions.values where session.runState.isActive {
-            await cancelAgentRun(tabID: session.tabID, origin: .internalLifecycle)
-        }
-        // Ownership-transfer slice: from finalize through scheduleBackgroundCleanup
-        // this must stay one uninterrupted main-actor region with no await, so a
-        // successor can never install or observe state on a discarded session
-        // between handle capture and discard. Targets are assembled from the
-        // prepared contexts plus the map's current contents, so sessions
-        // admitted or replaced during the cancellation awaits are finalized too.
-        let cleanupTargets = assembleWorkspaceSwitchCleanupTargets(
-            preparedContexts: discardContexts,
-            reason: "Cancelled due to workspace switch"
-        )
-        claudeCoordinator.detachAllClaudeToolTrackingHandlersForWorkspaceSwitch()
-        codexCoordinator.stop()
-        claudeCoordinator.stop()
         #if DEBUG
             restorePerfRecorder.event(
                 "agentMode.workspaceSwitch.discardPrepared",
@@ -13238,28 +13404,27 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
             let clearStateStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
-        sessions.removeAll()
-        // Owner discard drops the discarded sessions' ephemeral presentation state (§4.1).
+        if !preservesOrigin { sessions.removeAll() }
+        // Clear the departing presenter's projection, not the retained execution state.
         transcriptPresentationRecordsByTabID.removeAll()
         persistedLoadAttemptByTabID.removeAll()
         persistedLoadProducerByTabID.removeAll()
         activeTranscriptPresentationScope = nil
         if workspace == nil {
             workspaceSwitchInFlight = false
-            clearBindings()
+            if !preservesOrigin { clearBindings() }
         }
         tabsWithActiveAgentRun.removeAll()
         mcpControlledTabIDs.removeAll()
-        tabDraftText.removeAll()
-        draftRestorationLedger.removeAll()
         sidebarObservedRunStateByTabID.removeAll()
-        originatingCleanup.scheduleBackgroundCleanup(
-            targets: cleanupTargets,
-            reason: "workspace_switch"
-        )
+        if !preservesOrigin {
+            tabDraftText.removeAll()
+            draftRestorationLedger.removeAll()
+            originatingCleanup.scheduleBackgroundCleanup(targets: cleanupTargets, reason: "workspace_switch")
+        }
         // No session created after this point belongs to this adoption's discard. Release only
         // our fence; an adoption queued during cancellation owns its own, newer fence.
-        finishDestructiveWorkspaceAdoption(owner)
+        if destination == nil { finishDestructiveWorkspaceAdoption(owner) }
         // End of the no-await ownership-transfer slice. The awaits below are
         // safe after discard: worktree release is keyed by session ID and does
         // not read `sessions`, and window-scope approval cleanup is
@@ -13267,15 +13432,35 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         for sessionID in Set(cleanupTargets.compactMap(\.boundSessionID)) {
             await releaseSessionWorktreeOwnership(sessionID: sessionID)
         }
-        await applyEditsApprovalStore.cleanupWindowScopes(
-            windowID: windowID,
-            reason: "Cancelled due to workspace switch"
-        )
+        if !preservesOrigin || outgoing.routeID != windowID {
+            await applyEditsApprovalStore.cleanupWindowScopes(
+                windowID: windowID,
+                reason: "Cancelled due to workspace switch"
+            )
+        }
         logAgentSessionDiscoveryAdoption(owner: owner, workspace: workspace, stage: 3)
-        guard sessionIndexStore.isWorkspaceActivationCurrent(owner, workspace: workspace),
-              sessionIndexStore.isOwnerCurrent(owner)
-        else {
+        guard adoptionIsCurrent(), destinationIsCurrent() else {
+            abandonPreparedDestination()
+            settleRefusedDestination()
             return
+        }
+        if preservesOrigin {
+            outgoing.scope.retainExecutableHost()
+            detachRunPresentation()
+        }
+        if let destination {
+            destination.scope.retainExecutableHost()
+            runtimeHost = destination
+            if preservesOrigin, outgoing !== destination, outgoing.scope.sessions.isEmpty,
+               outgoing.scope.saveQueue.inFlightSessionIDs.isEmpty, outgoing.scope.worktrees.pendingTransitions == 0
+            {
+                outgoing.beginRetirement().startIfNeeded()
+            }
+            finishDestructiveWorkspaceAdoption(owner)
+            synchronizeRunPresentationAttachments(previous: [:])
+            guard sessionIndexStore.isOwnerCurrent(owner), runtimeHost === destination,
+                  !hasDetachedClosingPresentation, !hasPreparedForWindowClose
+            else { return }
         }
         #if DEBUG
             restorePerfRecorder.event(

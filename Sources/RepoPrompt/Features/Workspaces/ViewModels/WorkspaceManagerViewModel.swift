@@ -6591,7 +6591,14 @@ class WorkspaceManagerViewModel: ObservableObject {
         operationID: UUID,
         silent: Bool
     ) async -> WorkspaceSwitchResult {
-        let snapshot = activeSessionSnapshot()
+        let activeSessions = activeSessionSnapshot()
+        let preservedAgentProvider = agentSwitchSessionProvider.flatMap { provider in
+            provider.preservedExecutionHost(workspaceID: activeWorkspaceID) == nil ? nil : provider
+        }
+        // Only count sessions this switch would end. Deletion still uses the complete snapshot.
+        let snapshot = WorkspaceSwitchSessionSnapshot(items: activeSessions.items.filter {
+            preservedAgentProvider == nil || $0.id != AgentModeWorkspaceSwitchSessionProvider.activityID
+        })
         if snapshot.hasActiveSessions {
             guard !silent else { return .blocked("Cannot switch workspaces while sessions are active.") }
             advanceWorkspaceSwitchOperation(operationID, to: .awaitingConfirmation)
@@ -6612,7 +6619,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             }
 
             advanceWorkspaceSwitchOperation(operationID, to: .cancellingSessions)
-            await cancelActiveSessions()
+            await cancelActiveSessions(excluding: preservedAgentProvider)
             if let cancellation = cancellationResult(
                 operationID: operationID,
                 targetWorkspace: newWorkspace,

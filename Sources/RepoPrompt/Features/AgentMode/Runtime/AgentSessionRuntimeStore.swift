@@ -604,6 +604,13 @@ final class AgentSessionRuntimeStore {
             identity.scopeID == id && holdsSlot(session: session, incarnationID: identity.incarnationID, binding: identity.binding)
         }
 
+        /// Presentation follows this installed object through an authorized same-object rebind.
+        /// This is not command admission and never follows a removed/reinstalled incarnation.
+        func holdsPresentationIncarnation(of writer: WriterIdentity, session: AgentTabSession) -> Bool {
+            writer.scopeID == id && sessions[session.tabID] === session
+                && liveClaimByTabID[session.tabID]?.incarnationID == writer.incarnationID
+        }
+
         func membership(of session: AgentTabSession) -> Membership? {
             guard !hasReleasedWriterClaims, sessions[session.tabID] === session,
                   let claim = liveClaimByTabID[session.tabID] else { return nil }

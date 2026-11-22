@@ -106,6 +106,41 @@ final class AgentSessionPresentationRuntime {
         return attachment
     }
 
+    /// Seed only the exact attachment that survives both authority checks. Projection hooks can
+    /// synchronously replace the destination; an obsolete candidate must not remove its successor.
+    func attachCurrent(
+        _ session: AgentTabSession,
+        sink: Sink,
+        isDestinationCurrent: @escaping @MainActor () -> Bool,
+        seed: @MainActor (AgentTabSession) -> Void
+    ) -> Attachment? {
+        guard isDestinationCurrent(), sink.isAvailable?() != false else { return nil }
+        var qualifiedSink = sink
+        qualifiedSink.isAvailable = { isDestinationCurrent() && sink.isAvailable?() != false }
+        let identity = ObjectIdentifier(session)
+        let incumbent = entries[identity]
+        let attachment = attach(session, sink: qualifiedSink)
+        func candidateIsCurrent() -> Bool {
+            qualifiedSink.isAvailable?() == true && entries[identity]?.attachment == attachment
+        }
+        func rollBackCandidate() {
+            let validIncumbent = incumbent?.session === session && incumbent?.sink.isAvailable?() != false
+            guard entries[identity]?.attachment == attachment else { return }
+            entries[identity] = validIncumbent ? incumbent : nil
+            refreshDetachedState()
+        }
+        guard candidateIsCurrent() else {
+            rollBackCandidate()
+            return nil
+        }
+        seed(session)
+        guard candidateIsCurrent() else {
+            rollBackCandidate()
+            return nil
+        }
+        return attachment
+    }
+
     func detach(_ attachment: Attachment) {
         guard entries[attachment.sessionIdentity]?.attachment == attachment else { return }
         entries.removeValue(forKey: attachment.sessionIdentity)

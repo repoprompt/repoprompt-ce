@@ -74,6 +74,73 @@ struct WindowStateComposition {
 enum WindowStateCompositionFactory {
     typealias AgentModeViewModelFactory = (Int, PromptViewModel, WorkspaceManagerViewModel, MCPServerViewModel) -> AgentModeViewModel
 
+    /// Prepare one unpublished visible activation. The independent catalog installer must be
+    /// supplied by the canonical execution composition, not borrowed from today's window route.
+    static func prepareVisibleAgentHost(
+        workspace: WorkspaceModel,
+        owner: AgentWorkspaceSessionIndexStore.SessionIndexOwner,
+        activations: AgentWorkspaceSessionIndexStore,
+        resources: AgentHostWorkspaceResources,
+        apiSettings: APISettingsViewModel,
+        settingsStore: GlobalSettingsStore,
+        runtime: MCPDomainRuntime,
+        installExecutionAndCatalog: @MainActor (AgentSessionRuntimeHost) async throws -> Void
+    ) async throws -> AgentSessionRuntimeHost {
+        guard !Task.isCancelled, owner.workspaceID == workspace.id, activations.latestSessionIndexOwner == owner,
+              let settings = APISettingsRuntimeLease.acquire(from: apiSettings)
+        else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
+        let leases = MCPHostRouteResources.LeaseOwner(
+            identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: runtime.routingCoordinator, runtime: runtime
+        )
+        guard let executionLease = leases.acquire(.execution) else {
+            settings.release()
+            throw AgentHostWorkspaceResources.Failure.authorityUnavailable
+        }
+        let route = leases.route
+        let authority = DomainWorkspaceAuthorityClient(
+            store: runtime.workspaceStore, windowID: route.identity.routeID,
+            metadataPathPolicy: runtime.configuration.metadataPathPolicy
+        )
+        let paths = AgentSessionRuntimeHost.makeSessionWorkspaceProviders { workspace.repoPaths.first }
+        let host = AgentSessionRuntimeHost(
+            route: route, executionRouteLease: executionLease,
+            workspacePath: paths.sessionWorkspacePath, runtimeWorkspacePaths: paths.codexRuntimeWorkspacePaths,
+            connectionPolicyInstaller: AgentSessionRuntimeHost.defaultConnectionPolicyInstaller,
+            modelRouterSettingsStore: settingsStore, catalogDiagnosticsSink: AppAgentSessionLinkCatalogEventSink(),
+            perfRecorder: AppAgentModePerfRecorder()
+        )
+        // This physical route is exclusive to the activation; the UI attaches to the scope,
+        // not the route. Disposal now waits for the one execution lease's acknowledgement.
+        await leases.requestTerminalDisposal()
+        do {
+            try Task.checkCancellation()
+            guard activations.latestSessionIndexOwner == owner else {
+                throw AgentHostWorkspaceResources.Failure.authorityUnavailable
+            }
+            let activation = try AgentSessionHostWorkspaceActivation(
+                windowID: host.routeID, authority: authority, activations: activations,
+                resources: AgentHostWorkspaceResources(files: resources.files, contexts: runtime.contextStore), settings: settings
+            )
+            try await host.installWorkspaceActivation(
+                activation, attachmentWorkspaceDirectory: FileManager.default.temporaryDirectory,
+                suppressesAttachmentPersistence: AppLaunchConfiguration.current.suppressesAgentSessionPersistence
+            )
+            try Task.checkCancellation()
+            guard activation.isPresenterCurrent else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
+            try await installExecutionAndCatalog(host)
+            try Task.checkCancellation()
+            guard activation.isPresenterCurrent, host.scope.sessions.isEmpty, host.scope.execution != nil,
+                  host.scope.linkExecution != nil, host.scope.installedInteractions != nil,
+                  host.scope.persistence.composition != nil, route.hasCurrentModelCatalogRoute
+            else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
+            return host
+        } catch {
+            host.beginRetirement().startIfNeeded()
+            if host.workspaceActivation == nil { settings.release() }
+            throw error
+        }
+    }
+
     static func make(
         windowID: Int,
         deferredInitialAgentSystemWorkspaceRefresh: Bool,
@@ -93,7 +160,8 @@ enum WindowStateCompositionFactory {
         modelRouterRuntime injectedModelRouterRuntime: AgentTaskRouterRuntime? = nil,
         agentModeViewModelFactory: AgentModeViewModelFactory? = nil,
         sessionRuntimeWorkspace: WorkspaceModel? = nil,
-        borrowedAPISettingsViewModel: APISettingsViewModel? = nil
+        borrowedAPISettingsViewModel: APISettingsViewModel? = nil,
+        installVisibleAgentExecutionAndCatalog: (@MainActor (AgentSessionRuntimeHost) async throws -> Void)? = nil
     ) -> WindowStateComposition {
         WorkspaceContextStartupInstrumentation.install(AppWorkspaceStartupEventRecorder())
         WorkspaceExternalReadWorkHooks.install(AppWorkspaceExternalReadWorkRecorder())
@@ -298,6 +366,15 @@ enum WindowStateCompositionFactory {
                 restorePerfRecorder: AppWorkspaceRestorePerfRecorder(),
                 perfRecorder: AppAgentModePerfRecorder()
             )
+        }
+        if sessionRuntimeWorkspace == nil, let domainRuntime, let installVisibleAgentExecutionAndCatalog {
+            agentModeViewModel.canonicalWorkspaceHostPreparation = { workspace, owner, activations in
+                try await prepareVisibleAgentHost(
+                    workspace: workspace, owner: owner, activations: activations,
+                    resources: workspaceResources, apiSettings: apiSettingsViewModel, settingsStore: settingsStore,
+                    runtime: domainRuntime, installExecutionAndCatalog: installVisibleAgentExecutionAndCatalog
+                )
+            }
         }
         agentModeViewModel.repromptService = .live(keyManager: keyManager)
         agentModeViewModel.preparedSessionRuntimes = WindowStatesManager.shared
