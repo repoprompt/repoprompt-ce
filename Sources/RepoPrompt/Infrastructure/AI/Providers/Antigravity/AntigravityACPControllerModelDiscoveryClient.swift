@@ -31,13 +31,16 @@ actor AntigravityACPControllerModelDiscoveryClient: AntigravityACPModelDiscovery
             guard let snapshot = await controller.currentDiscoveredSessionModels(), !snapshot.options.isEmpty else {
                 // Some versions omit models on load. Refresh in a new session next time.
                 retainedSessionIDByWorkspaceKey.removeValue(forKey: workspaceKey)
-                throw AIProviderError.invalidResponse(detail: "Antigravity ACP returned no selectable models.")
+                throw AntigravityACPModelPollingService.DiscoveryError.noModels
             }
             await retainVerifiedIdentity(controller.currentProviderSessionIdentity(), workspaceKey: workspaceKey)
             await controller.shutdown()
             return snapshot
         } catch {
             await controller.shutdown()
+            if ACPAgentSessionController.isAuthenticationRequired(error) {
+                throw AntigravityACPModelPollingService.DiscoveryError.signInRequired
+            }
             throw error
         }
     }

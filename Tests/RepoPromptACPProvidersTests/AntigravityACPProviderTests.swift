@@ -15,9 +15,14 @@ final class AntigravityACPProviderTests: XCTestCase {
         let model = AgentModelOption(rawValue: "retained-model", displayName: "Retained", description: nil, isPlaceholderDefault: false, isProviderDefault: false)
         _ = registry.updateDiscoveredModels(.init(options: [model], currentModelRaw: model.rawValue), for: .antigravity)
         let service = AntigravityACPModelPollingService(client: FailingClient(), registry: registry, logFailure: { _ in })
-        let success = await service.refreshNow(workspacePath: nil)
+        let outcome = await service.refreshNow(workspacePath: nil)
+        if case let .failed(error) = outcome {
+            XCTAssertEqual((error as NSError).domain, "fixture")
+            XCTAssertEqual((error as NSError).code, 1)
+        } else {
+            XCTFail("Expected discovery failure, got \(outcome)")
+        }
         let snapshot = await service.latestSnapshot()
-        XCTAssertFalse(success)
         XCTAssertEqual(snapshot?.models.options.map(\.rawValue), ["retained-model"])
         XCTAssertEqual(snapshot?.isLiveDiscovery, false)
         await service.shutdown()

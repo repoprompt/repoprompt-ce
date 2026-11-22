@@ -35,7 +35,7 @@ Non-goals (v1):
 | Delegate install | Lazy `center` getter in `NotificationService` sets `center.delegate = self` | Runs only on first access, inside an async `Task` after launch. |
 | Click routing | `NotificationService.userNotificationCenter(_:didReceive:…)` → `AgentSessionDeepLinkRoute.parse(notificationUserInfo:)` → `AppDeepLinkRouter.route(notificationRoute:)` | Only one route kind exists (`agent_session`, route v1). |
 | Route model | `App/AppDeepLinkRoute.swift` (`AgentSessionDeepLinkRoute`: `windowID?`, `workspaceID`, `tabID`, `sessionID?`; userInfo keys `rp_route_kind`, `rp_route_version`, `window_id`, `workspace_id`, `tab_id`, `session_id`) | The same route also has a `repoprompt-ce://agent/session?...` URL form. |
-| Router | `App/AppDeepLinkRouter.swift` → `WindowState.routeToAgentSession(_:)` (`App/WindowState.swift` ~1621) | Tries preferred windows, then fallback windows. Switches workspace if needed, restores a stashed tab, and hydrates the session via `AgentModeViewModel.activateRoutedAgentSession`. |
+| Router | `App/AppDeepLinkRouter.swift` → `WindowState.routeToAgentSession` | Checks for the exact active or stashed tab before focusing a window. Prefers a window already showing the workspace and requests at most one workspace switch. Restores a stashed tab and hydrates the session via `AgentModeViewModel.activateRoutedAgentSession`. |
 | Foreground behavior | `willPresent` → `completionHandler([])` | Nothing is ever shown while the app is active. The `notify*` methods also return early when `NSApp.isActive`. |
 
 ### 2.2 Current triggers
@@ -272,13 +272,13 @@ Request, thread, and summary identifiers:
    - With **no live windows**, which includes cold launch and background mode, it calls `MCPBackgroundModeCoordinator.shared.restore()` if the app is backgrounded. Otherwise it **enqueues `route.url`** in `WindowStatesManager.pendingURLs`. `registerWindowState` already drains `pendingURLs` through `AppDeepLinkRouter.route(url:)` after window restore, which fixes gap 5. The in-app `route(agentSession:)` keeps its no-queue contract. The notification path uses a new `route(notificationRoute:)` behavior that queues.
    - Otherwise it calls `AppDeepLinkRouter.route(agentSession:)`, which already handles window preference, workspace switch, stashed-tab restore, and session hydration.
 4. When the route carries an `interactionID`, `WindowState.routeToAgentSession` finishes by calling `agentModeViewModel.revealPendingNotificationInteraction(tabID:)`, which publishes a one-shot reveal request. `AgentModeView` pins that tab's transcript to its live bottom, where every pending card renders (`"pendingApproval"`, `"pendingAskUser"`, …), so the card is on screen and Return triggers its prominent button as today. The same path runs for URLs drained from `pendingURLs` after a cold launch, because `interaction_id` is part of the route URL. (Deferred: an in-app "already handled" toast when the interaction resolved before the click.)
-5. On non-`.routed` results (`sessionUnavailable`, `tabUnavailable`, `workspaceSwitchBlocked(message)`), activate the best window and surface the existing workspace-switch-blocked notice where applicable. Never switch workspaces behind the user's back while a run is active; `requestWorkspaceSwitch` already enforces this.
+5. If preflight cannot verify the exact route tab, leave all windows untouched. After choosing a window, keep the existing switch confirmation and blocked notice where applicable. A declined switch or later tab or session failure ends the route without trying another window.
 
 ### 6.2 Cold launch
 
 - **Install the delegate early.** Add `AppDelegate.applicationWillFinishLaunching` → `NotificationService.shared.installDelegate()`, which synchronously sets `UNUserNotificationCenter.current().delegate` when running from a `.app` bundle. This runs even under `suppressesNonessentialLaunchSideEffects`; only the *authorization prompt* stays suppressed.
 - **Register static categories at the same point.**
-- A response that arrives before any window exists is handled as in §6.1 step 3. The queued URL is drained once the restored window registers, and `routeToAgentSession` already awaits `workspaceManager.awaitInitialized()`.
+- A response that arrives before any window exists is handled as in §6.1 step 3. The queued URL is drained once the restored window registers, and `AppDeepLinkRouter` waits for workspace initialization and startup restore before checking the target tab.
 - **Launch sweep.** Once the delegate and categories are installed, remove every delivered `interaction`, `turn_*`, and `feedback` notification whose `rp_launch_id != currentLaunchID`. The launch that is processing the click keeps that response in memory, so removal does not affect it. Stale interaction notifications from a previous process disappear instead of offering dead buttons.
 
 ## 7. Action handling

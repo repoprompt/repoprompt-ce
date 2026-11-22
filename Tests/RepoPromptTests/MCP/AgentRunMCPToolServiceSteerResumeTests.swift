@@ -26,6 +26,8 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         // Delivery tasks and session observations hold the runtime weakly; the fixture owns it.
         defer { withExtendedLifetime(runtime) {} }
         runtime.test_suppressDecisionDelivery = false
+        var notice: String?
+        runtime.test_scopeDecision = { _, text in notice = text }
         let request = try runtime.requestScope(
             requesterSessionID: sessionID, requesterTabID: session.tabID,
             kind: .tree(rootSessionID: sessionID), capabilities: [.observe],
@@ -48,7 +50,13 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
             await MainActor.run { deliveredText != nil }
         }
         try await resumed.value
-        XCTAssertTrue(deliveredText?.contains("RepoPrompt delegation decision: granted") == true)
+        let expectedText = try XCTUnwrap(notice)
+        XCTAssertEqual(deliveredText, expectedText)
+        XCTAssertTrue(expectedText.hasPrefix("[RepoPrompt delegation decision: granted;"))
+        let row = try XCTUnwrap(session.items.last { $0.kind == .user })
+        let batch = try XCTUnwrap(AgentTranscriptRow.delegationBatch(for: row))
+        XCTAssertEqual(batch.decisions.count, 1)
+        XCTAssertEqual(batch.text, expectedText)
         XCTAssertEqual(viewModel.draftRuntime.text(for: session.tabID), "Keep my draft")
         XCTAssertNil(session.mcpControlContext)
     }

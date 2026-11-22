@@ -3515,7 +3515,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                         XCTAssertEqual(result, .startedRun)
                     } else {
                         let result = try await vm.submitDelegationDecision(
-                            "first idle decision",
+                            .init(decisions: [.init(outcome: "granted", targetSessionID: nil, text: "first idle decision")]),
                             tabID: session.tabID,
                             expectedSessionID: XCTUnwrap(session.activeAgentSessionID),
                             stopFence: .init(session: session)
@@ -3527,6 +3527,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     XCTAssertTrue(starts[0].contains(resident ? "resident assigned task" : "first idle decision"))
                     XCTAssertEqual(session.items.count, rows + 1)
                     XCTAssertNotNil(session.items.last?.dispatchedProviderText)
+                    XCTAssertEqual(session.items.last?.delegationDecisionBatch?.text, resident ? nil : "first idle decision")
                     XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .sending)
                     XCTAssertEqual(session.draftText, "untouched draft")
                     XCTAssertNil(session.activeComposerSubmitAttempt)

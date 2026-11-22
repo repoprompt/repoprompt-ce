@@ -165,6 +165,7 @@ conductor-portable-selftest:
 	python3 Scripts/test_conductor_job_timings.py
 	python3 Scripts/test_conductor_job_phases.py
 	python3 Scripts/test_conductor_cache_retry.py
+	python3 Scripts/test_conductor_storage_retention.py
 	python3 Scripts/test_conductor_heavy_admission.py
 	python3 Scripts/test_security_inventory.py
 

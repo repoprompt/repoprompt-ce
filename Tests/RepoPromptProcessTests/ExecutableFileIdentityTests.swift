@@ -4,7 +4,7 @@ import Foundation
 import XCTest
 
 final class ExecutableFileIdentityTests: XCTestCase {
-    func testPermitsHomebrewAdminGroupWritableDirectoryForCanonicalCellarAncestors() {
+    func testPermitsHomebrewAdminGroupWritableDirectoryForCanonicalInstallAncestors() {
         let effectiveUID: uid_t = 501
         let cases: [(canonicalPath: String, directoryPath: String, ownerUID: uid_t)] = [
             ("/opt/homebrew/Cellar/opencode/1.0/bin/opencode", "/opt/homebrew", 0),
@@ -12,7 +12,13 @@ final class ExecutableFileIdentityTests: XCTestCase {
             ("/opt/homebrew/Cellar/opencode/1.0/bin/opencode", "/opt/homebrew/Cellar/opencode/1.0/bin", 0),
             ("/usr/local/Cellar/opencode/1.0/bin/opencode", "/usr/local", 0),
             ("/usr/local/Cellar/opencode/1.0/bin/opencode", "/usr/local/Cellar", effectiveUID),
-            ("/usr/local/Cellar/opencode/1.0/bin/opencode", "/usr/local/Cellar/opencode/1.0/bin", 0)
+            ("/usr/local/Cellar/opencode/1.0/bin/opencode", "/usr/local/Cellar/opencode/1.0/bin", 0),
+            ("/opt/homebrew/Caskroom/antigravity-cli/1.5.13/.homebrew-command-wrappers/agy", "/opt/homebrew", 0),
+            ("/opt/homebrew/Caskroom/antigravity-cli/1.5.13/.homebrew-command-wrappers/agy", "/opt/homebrew/Caskroom", effectiveUID),
+            ("/opt/homebrew/Caskroom/antigravity-cli/1.5.13/.homebrew-command-wrappers/agy", "/opt/homebrew/Caskroom/antigravity-cli/1.5.13/.homebrew-command-wrappers", 0),
+            ("/usr/local/Caskroom/antigravity-cli/1.5.13/.homebrew-command-wrappers/agy", "/usr/local", 0),
+            ("/usr/local/Caskroom/antigravity-cli/1.5.13/.homebrew-command-wrappers/agy", "/usr/local/Caskroom", effectiveUID),
+            ("/usr/local/Caskroom/antigravity-cli/1.5.13/.homebrew-command-wrappers/agy", "/usr/local/Caskroom/antigravity-cli/1.5.13/.homebrew-command-wrappers", 0)
         ]
 
         for testCase in cases {
@@ -32,6 +38,7 @@ final class ExecutableFileIdentityTests: XCTestCase {
 
     func testPermitsHomebrewAdminGroupWritableDirectoryRejectsTrustBoundaryViolations() {
         let canonicalPath = "/opt/homebrew/Cellar/opencode/1.0/bin/opencode"
+        let caskPath = "/opt/homebrew/Caskroom/antigravity-cli/1.5.13/.homebrew-command-wrappers/agy"
         let effectiveUID: uid_t = 501
         let cases: [(name: String, canonicalPath: String, directoryPath: String, mode: mode_t, ownerUID: uid_t, groupGID: gid_t)] = [
             ("non-admin group", canonicalPath, "/opt/homebrew/Cellar", 0o775, 0, 20),
@@ -41,7 +48,15 @@ final class ExecutableFileIdentityTests: XCTestCase {
             ("prefix lookalike", "/opt/homebrew/Cellarish/opencode", "/opt/homebrew/Cellarish", 0o775, 0, 80),
             ("directory outside Cellar", canonicalPath, "/opt/homebrew/bin", 0o775, 0, 80),
             ("mismatched Homebrew root", canonicalPath, "/usr/local/Cellar", 0o775, 0, 80),
-            ("canonical target outside Cellar", "/opt/homebrew/bin/opencode", "/opt/homebrew", 0o775, 0, 80)
+            ("canonical target outside Cellar", "/opt/homebrew/bin/opencode", "/opt/homebrew", 0o775, 0, 80),
+            ("Caskroom non-admin group", caskPath, "/opt/homebrew/Caskroom", 0o775, 0, 20),
+            ("Caskroom untrusted owner", caskPath, "/opt/homebrew/Caskroom", 0o775, 502, 80),
+            ("Caskroom world writable", caskPath, "/opt/homebrew/Caskroom", 0o777, 0, 80),
+            ("Caskroom lookalike", "/opt/homebrew/Caskroomish/agy", "/opt/homebrew", 0o775, 0, 80),
+            ("Caskroom outside Homebrew", "/private/tmp/Caskroom/agy", "/private/tmp/Caskroom", 0o775, 0, 80),
+            ("Intel Caskroom mismatch", caskPath, "/usr/local/Caskroom", 0o775, 0, 80),
+            ("Cellar sibling of Caskroom", caskPath, "/opt/homebrew/Cellar", 0o775, 0, 80),
+            ("canonical target outside Caskroom", "/opt/homebrew/bin/agy", "/opt/homebrew", 0o775, 0, 80)
         ]
 
         for testCase in cases {
@@ -69,7 +84,7 @@ final class ExecutableFileIdentityTests: XCTestCase {
         try "#!/bin/sh\nexit 0\n".write(to: escapedExecutable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: escapedExecutable.path)
         try FileManager.default.setAttributes([.posixPermissions: 0o775], ofItemAtPath: escapedDirectory.path)
-        let canonicalEscapedDirectory = try XCTUnwrap(self.realpathString(escapedDirectory.path))
+        let canonicalEscapedDirectory = try XCTUnwrap(realpathString(escapedDirectory.path))
 
         let alias = trustedDirectory.appendingPathComponent("opencode")
         try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: escapedExecutable)
