@@ -2,6 +2,10 @@
   "version": 1,
   "description": "First-party SwiftPM target ownership and permitted direct target dependencies. External package products are checked by SwiftPM.",
   "modules": {
+    "CCodexZstdDecoder": {
+      "source_root": "Vendor/Zstandard",
+      "allowed_dependencies": []
+    },
     "CSwiftPCRE2": {
       "source_root": "Sources/CSwiftPCRE2",
       "allowed_dependencies": []
@@ -21,6 +25,7 @@
         "RepoPromptACPProviders",
         "RepoPromptCodexProvider",
         "RepoPromptAIContracts",
+        "CCodexZstdDecoder",
         "CSwiftPCRE2",
         "RepoPromptC",
         "RepoPromptCodeMapCore",
