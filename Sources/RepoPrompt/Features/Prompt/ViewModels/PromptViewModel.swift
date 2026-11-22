@@ -2435,6 +2435,10 @@ class PromptViewModel: ObservableObject {
 
     private var initialModelRefreshTask: Task<Void, Never>?
 
+    #if DEBUG
+        private(set) static var constructionCountForTesting = 0
+    #endif
+
     init(
         fileManager: WorkspaceFilesViewModel,
         aiQueriesService: AIQueriesService? = nil,
@@ -2446,6 +2450,9 @@ class PromptViewModel: ObservableObject {
         refreshAvailableModelsOnInit: Bool = true,
         perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     ) {
+        #if DEBUG
+            Self.constructionCountForTesting += 1
+        #endif
         self.fileManager = fileManager
         gitViewModel = GitViewModel(fileManager: fileManager)
         self.aiQueriesService = aiQueriesService

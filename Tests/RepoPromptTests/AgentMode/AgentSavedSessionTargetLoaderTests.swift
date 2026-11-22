@@ -1,6 +1,9 @@
 import Foundation
-@testable import RepoPromptApp
+import MCP
+import RepoPromptACPProviders
+@_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptMCPServer
 import XCTest
 
 @MainActor
@@ -197,9 +200,29 @@ final class AgentSavedSessionTargetLoaderTests: XCTestCase {
 
 @MainActor
 final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
-    func testProductionSavedTargetLoadsStashAndPersistsExactWriterPlacementWithoutWindow() async throws {
+    func testProductionSavedTargetRunsProviderAndRegisteredToolsAndPersistsWithoutWindow() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SavedHost-\(UUID())")
         defer { try? FileManager.default.removeItem(at: directory) }
+        let root = directory.appendingPathComponent("repo", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let file = root.appendingPathComponent("Witness.swift")
+        let source = "let savedHostNeedle = 42\n"
+        try source.write(to: file, atomically: true, encoding: .utf8)
+        let script = try AgentSessionLinkACPServerScript.write(to: directory)
+        let assistantText = "The saved host completed this controlled turn."
+        let provider = AgentSessionLinkCapturingACPProvider(
+            providerID: .openCode, commandPath: script.path, environment: ["ACP_ASSISTANT_TEXT_ON_PROMPT": assistantText]
+        )
+        provider.usesDefaultNormalizer = true
+        let keys = KeyManager()
+        let settings = APISettingsViewModel(aiQueriesService: AIQueriesService(keyManager: keys), keyManager: keys, loadStoredDataOnInit: false)
+        settings.isOpenCodeConnected = true
+        let providerEnvironment = AppSavedAgentSessionExecution.ProviderEnvironment(resources: .init(
+            headless: { _, _ in preconditionFailure("The saved target must use its restored ACP provider") },
+            acp: { _, _ in provider }, controller: {
+                try ACPAgentSessionController(provider: $0, runRequest: $1, allowsProviderProcessLaunchForTesting: true)
+            }
+        ), settings: settings)
         let runtime = MCPDomainRuntime(configuration: .init(
             mode: .app, profileIdentifier: "saved-host-\(UUID())", storageDirectory: directory,
             workspaceStorageDirectory: directory.appendingPathComponent("workspaces"),
@@ -215,17 +238,20 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                 let stash = StashedTab(tab: fixture.tab)
                 fixture.placement.workspace.composeTabs = [visible]
                 fixture.placement.workspace.stashedTabs = [stash]
+                fixture.placement.workspace.repoPaths = [root.path]
                 let workspace = fixture.placement.workspace
                 let authority = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: 101)
                 let created = try await authority.create(workspace, fileURL: directory.appendingPathComponent("saved.json"))
                 XCTAssertEqual(created.disposition, .applied)
-                try await fixture.save()
+                try await fixture.save(agentKind: "openCode", agentModel: "model-a")
 
                 let windows = WindowStatesManager.shared
                 let count = WindowState.windowCounter
+                let promptCount = PromptViewModel.constructionCountForTesting
+                let workspaceCount = WorkspaceManagerViewModel.constructionCountForTesting
                 windows.beginPreparedOversightPreparation(fixture.sessionID)
                 defer { windows.endPreparedOversightPreparation(fixture.sessionID) }
-                let loaded = await windows.prepareSavedOversightTarget(fixture.sessionID, isStillAuthorized: { true })
+                let loaded = await windows.prepareSavedOversightTarget(fixture.sessionID, providerEnvironment: providerEnvironment, isStillAuthorized: { true })
                 let writer = try loaded.get()
                 let host = try XCTUnwrap(writer.scope.executableHost)
                 do {
@@ -239,6 +265,62 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                     let reused = try await windows.prepareSavedOversightTarget(fixture.sessionID, isStillAuthorized: { true }).get()
                     XCTAssertEqual(reused.identity, writer.identity)
                     XCTAssertTrue(reused.scope.executableHost === host)
+                    XCTAssertEqual(writer.session.selectedAgent, .openCode)
+                    let message = "Continue the original saved chat"
+                    let start = AgentRunStartOutcomeRecorder()
+                    let command = try writer.admitCommand().get()
+                    _ = await host.startCanonicalRequest(command: command, message: message, options: .init(skipsSlashExpansion: true), outcome: start)
+                    XCTAssertTrue(start.outcome.didStart)
+                    let receipt = try await originatingPolicyReceipt(for: writer.session)
+                    let connectionID = UUID()
+                    let installation = await host.route.installPendingPolicy(receipt, connectionID: connectionID, clientName: nil, tabID: stash.tab.id)
+                    let token = try XCTUnwrap(installation?.token)
+                    let bindingIsCurrent = await host.route.canCommitPendingPolicy(receipt, token: token)
+                    XCTAssertTrue(bindingIsCurrent, "Handshake must accept the exact saved binding before dispatch")
+                    let metadata = MCPRequestMetadata(connectionID: connectionID, clientName: nil, windowID: host.routeID)
+                    let registration = try await runtime.routingCoordinator.currentRegistration(connectionID: connectionID)
+                    func invoke(_ name: String, _ arguments: [String: Value], grantingAccess: Bool = true) async throws -> Value {
+                        let resolution = try await runtime.domainHost.resolve(toolName: name, scope: .window(id: host.routeID))
+                        let invocationID = UUID()
+                        let security = DomainToolInvocationSecurityContext(
+                            principal: .init(
+                                principalID: UUID(), stableKey: "saved-route-witness", displayName: "Scripted provider",
+                                kind: .runScoped, assurance: grantingAccess ? .hostLaunchToken : .displayNameOnly, processID: nil, runID: receipt.runID,
+                                provider: "openCode", verifiedIdentityFingerprint: nil
+                            ),
+                            connectionID: connectionID, connectionGeneration: registration.generation, invocationID: invocationID,
+                            runtimeID: runtime.identity.runtimeID, runtimeGeneration: runtime.identity.lifecycleGeneration,
+                            workspaceID: workspace.id, authorizedCanonicalRoots: [root.path],
+                            ephemeralGrantedToolNames: grantingAccess ? [name] : []
+                        )
+                        let request = ToolInvocationContext.trustedLocal(toolName: name, metadata: metadata)
+                        return try await MCPInvocationContextBridge.withInvocation(request) {
+                            try await runtime.domainHost.invoke(.init(
+                                invocationID: invocationID, connectionID: connectionID, resolution: resolution,
+                                arguments: arguments, securityContext: security
+                            ))
+                        }
+                    }
+                    let read = try await invoke("read_file", ["path": .string(file.path)])
+                    XCTAssertTrue(read.objectValue?["content"]?.stringValue?.contains("savedHostNeedle") == true, "\(read)")
+                    let searched = try await invoke("file_search", ["pattern": .string("savedHostNeedle"), "mode": .string("content")])
+                    XCTAssertTrue(String(describing: searched).contains("Witness.swift"), "\(searched)")
+                    let select: [String: Value] = ["op": .string("set"), "paths": .array([.string(file.path)])]
+                    do {
+                        _ = try await invoke("manage_selection", select, grantingAccess: false)
+                        XCTFail("A route receipt is not permission to mutate selection")
+                    } catch DomainMutationPolicyError.principalUnverified {
+                        // The existing protected-mutation adapter must remain ahead of dispatch.
+                    }
+                    let selected = try await invoke("manage_selection", select)
+                    XCTAssertEqual(selected.objectValue?["status"]?.stringValue, "ok")
+                    let selectedTree = try await invoke("get_file_tree", ["mode": .string("selected")])
+                    XCTAssertTrue(selectedTree.objectValue?["tree"]?.stringValue?.contains("Witness.swift") == true, "\(selectedTree)")
+                    let generation = try XCTUnwrap(receipt.routingWaitGeneration)
+                    await MCPRoutingWaiter.notifyRouted(runID: receipt.runID, generation: generation)
+                    await writer.session.agentTask?.value
+                    XCTAssertEqual(provider.promptedMessages.count, 1)
+                    XCTAssertTrue(provider.promptedMessages.first?.userMessage.contains(message) == true)
                     let parent = UUID()
                     let placement = try XCTUnwrap(SessionAdminWindowsStructureHost().commitOrganizationalPlacement(
                         sessionID: fixture.sessionID, parentID: parent, delegationScopeID: nil
@@ -246,14 +328,19 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                     try await placement.persisted()
                     let persisted = try await fixture.service.loadAgentSession(id: fixture.sessionID, for: workspace)
                     XCTAssertEqual(persisted?.organizationalParentID, parent)
+                    let transcript = try XCTUnwrap(persisted).workingSourceItems()
+                    XCTAssertTrue(transcript.contains(where: { $0.kind == .assistant && $0.text.contains(assistantText) }),
+                                  "The new provider output must be present in the durable canonical transcript")
                     let current = await runtime.workspaceStore.canonicalWorkspaceSnapshot(workspace.id)
                     let document = try XCTUnwrap(current?.document.documentBytes)
                     let unchanged = try JSONDecoder().decode(WorkspaceModel.self, from: document)
                     XCTAssertEqual(unchanged.composeTabs, [visible])
                     XCTAssertEqual(unchanged.stashedTabs, [stash])
                     XCTAssertEqual(WindowState.windowCounter, count)
+                    XCTAssertEqual(PromptViewModel.constructionCountForTesting, promptCount)
+                    XCTAssertEqual(WorkspaceManagerViewModel.constructionCountForTesting, workspaceCount)
                 } catch {
-                    let drain = host.beginRetirement()
+                    let drain = host.beginFinalShutdown()
                     drain.startIfNeeded()
                     _ = await drain.wait(until: .now.advanced(by: .seconds(5)))
                     throw error
@@ -269,6 +356,17 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
             throw error
         }
         _ = await runtime.shutdown()
+    }
+
+    private func originatingPolicyReceipt(for session: AgentTabSession) async throws -> MCPRunRoutingCleanupReceipt {
+        var result: MCPRunRoutingCleanupReceipt?
+        try await AsyncTestWait.waitUntil("saved host provider registered its originating route") {
+            guard let runID = session.runID, let controller = session.acpController,
+                  let host = await controller.hostForRoutingHandoff(expectedRunID: runID) as? ACPAgentSessionAppHost else { return false }
+            result = host.test_originatingRoutingCleanupReceipt()
+            return result != nil
+        }
+        return try XCTUnwrap(result)
     }
 
     func testSavedHistoricalPayloadLoadsIntoCanonicalWriterWithoutWindowComposition() async throws {
@@ -552,14 +650,14 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
             scope.attachments.configuration = storage.attachmentConfiguration()
         }
 
-        func save() async throws {
+        func save(agentKind: String? = nil, agentModel: String? = nil) async throws {
             _ = try await service.saveAgentSession(.init(
                 id: sessionID, workspaceID: placement.workspace.id, composeTabID: tab.id, name: "Saved target",
                 items: [
                     AgentChatItem(kind: .user, text: "Saved request", sequenceIndex: 0),
                     AgentChatItem(kind: .assistant, text: "Saved response", sequenceIndex: 1)
                 ].map { AgentChatItemPersist(from: $0) },
-                lastRunState: "completed"
+                agentKind: agentKind, agentModel: agentModel, lastRunState: "completed"
             ), for: placement.workspace)
         }
 

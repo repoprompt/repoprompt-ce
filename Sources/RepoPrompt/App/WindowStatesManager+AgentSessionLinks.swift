@@ -352,7 +352,8 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
     }
 
     func prepareSavedOversightTarget(
-        _ target: UUID, isStillAuthorized: @escaping @MainActor () -> Bool
+        _ target: UUID, providerEnvironment: AppSavedAgentSessionExecution.ProviderEnvironment? = nil,
+        isStillAuthorized: @escaping @MainActor () -> Bool
     ) async -> Result<AgentSessionRuntimeStore.Writer, SavedOversightPreparationFailure> {
         let authorized: @MainActor () -> Bool = { [self] in
             !Task.isCancelled && !isTerminating && isStillAuthorized()
@@ -375,9 +376,9 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
             let lookup = try await AppSavedAgentSessionExecution.resolve(target, domain: domain, isStillAuthorized: authorized)
             let result = try await AppSavedAgentSessionExecution.compose(
                 target: lookup.target, catalog: lookup.catalog, domain: domain,
-                installRoute: { host, reads in
-                    try await host.registerSavedCatalog(fileReads: reads, service: WindowState.sharedMCPService)
-                }, isStillAuthorized: authorized
+                installRoute: { host in
+                    try await host.registerHostCatalog(service: WindowState.sharedMCPService)
+                }, providerEnvironment: providerEnvironment, isStillAuthorized: authorized
             )
             let writer = result.writer
             if result.source == .savedPayload, let runtime = writer.scope.linkExecution,

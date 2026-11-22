@@ -723,6 +723,7 @@ enum AgentSessionLinkACPServerScript {
     /// - `ACP_FAIL_METHOD`: rejects the named RPC after any response gate has released.
     /// - `ACP_DEVIN_FIXTURE` (`1`): advertises SWE-2 with medium/high/max thinking choices.
     /// - `ACP_USAGE_UPDATE_ON_PROMPT` (`used,size`): a `usage_update` during each prompt.
+    /// - `ACP_ASSISTANT_TEXT_ON_PROMPT`: emits one assistant text delta on a successful prompt.
     /// - `ACP_FOREIGN_ADVERTISE_AFTER_PROMPT` (comma list): a list for another session during each prompt.
     /// - `ACP_UNMATCHED_RESPONSE_ON_PROMPT`: a response with an unknown id during each prompt (a protocol
     ///   violation that fails the controller).
@@ -882,6 +883,11 @@ enum AgentSessionLinkACPServerScript {
                 if fail_marker and fail_marker in text:
                     respond_error(request.get("id"), "prompt rejected")
                 else:
+                    if os.environ.get("ACP_ASSISTANT_TEXT_ON_PROMPT"):
+                        notify_update(params.get("sessionId"), {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": os.environ["ACP_ASSISTANT_TEXT_ON_PROMPT"]}
+                        })
                     respond(request.get("id"), {
                         "stopReason": "end_turn",
                         "usage": {"inputTokens": 1, "outputTokens": 1}
