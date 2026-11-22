@@ -248,7 +248,8 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
 
     /// Closing the last presenter is not Quit. A terminal run state does not acknowledge
     /// provider teardown, durable save, recovery, or release of the originating resources.
-    static func hasUnsettledAgentExecution(store: AgentSessionRuntimeStore = .shared) -> Bool {
+    static func hasUnsettledAgentExecution(store: AgentSessionRuntimeStore? = nil) -> Bool {
+        let store = store ?? .shared
         if store.retainedDrains.contains(where: { $0.outcome != .released }) { return true }
         return store.retainedExecutionHosts.contains { host in
             host.scope.sessions.values.contains { !host.scope.settlement(for: $0).isSettled }
