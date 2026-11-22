@@ -37,8 +37,38 @@ final class AntigravityACPProviderTests: XCTestCase {
         let message = AntigravityACPModelPollingService.launchFailureMessage(for: result.error)
         XCTAssertEqual(
             message,
-            "Couldn't launch the Antigravity CLI. Executable directory is replaceable by another user (mode 775): /opt/homebrew/Caskroom"
+            "Couldn't launch the Antigravity CLI. Executable directory is replaceable by another user (mode 775): /opt/homebrew/Caskroom. Fix its permissions, then test again."
         )
+        await service.shutdown()
+    }
+
+    func testLaunchFailureMessageCoversLaunchPreflightAndSpawnFailures() {
+        XCTAssertEqual(
+            AntigravityACPModelPollingService.launchFailureMessage(
+                for: AIProviderError.invalidConfiguration(detail: "The installed Antigravity CLI is unavailable.")
+            ),
+            "Couldn't launch the Antigravity CLI. The installed Antigravity CLI is unavailable."
+        )
+        let spawnMessage = AntigravityACPModelPollingService.launchFailureMessage(
+            for: ProcessLauncherError.spawnFailed(errno: ENOENT)
+        )
+        XCTAssertEqual(
+            spawnMessage,
+            "Couldn't launch the Antigravity CLI. \(NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT)).localizedDescription)."
+        )
+    }
+
+    func testRefreshResultTreatsThrownCancellationAsNoFailure() async {
+        struct CancelledClient: AntigravityACPModelDiscoveryClient {
+            func discoverModels(workspacePath _: String?) async throws -> ACPDiscoveredSessionModels? {
+                throw CancellationError()
+            }
+        }
+        let registry = AgentACPModelRegistry(dependencies: .init(loadAll: { [:] }, load: { _ in nil }, save: { _, _ in }, remove: { _ in }, invalidate: { _ in }))
+        let service = AntigravityACPModelPollingService(client: CancelledClient(), registry: registry, logFailure: { _ in })
+        let result = await service.refreshNowWithResult(workspacePath: nil)
+        XCTAssertFalse(result.didSucceed)
+        XCTAssertNil(result.error)
         await service.shutdown()
     }
 

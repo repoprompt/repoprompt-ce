@@ -55,7 +55,9 @@ final class ExecutableFileIdentityTests: XCTestCase {
             ("Caskroom prefix lookalike", "/opt/homebrew/Caskroomish/antigravity", "/opt/homebrew/Caskroomish", 0o775, 0, 80),
             ("cask directory outside Caskroom", caskPath, "/opt/homebrew/bin", 0o775, 0, 80),
             ("cask mismatched Homebrew root", caskPath, "/usr/local/Caskroom", 0o775, 0, 80),
-            ("cask target does not permit Cellar", caskPath, "/opt/homebrew/Cellar", 0o775, 0, 80)
+            ("cask target does not permit Cellar", caskPath, "/opt/homebrew/Cellar", 0o775, 0, 80),
+            ("formula target does not permit Caskroom", canonicalPath, "/opt/homebrew/Caskroom", 0o775, 0, 80),
+            ("canonical target outside Caskroom", "/opt/homebrew/bin/agy", "/opt/homebrew/Caskroom", 0o775, 0, 80)
         ]
 
         for testCase in cases {

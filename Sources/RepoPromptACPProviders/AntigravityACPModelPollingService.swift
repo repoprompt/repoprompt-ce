@@ -200,12 +200,32 @@ package actor AntigravityACPModelPollingService {
     #endif
 
     /// Settings copy for a discovery failure caused by launching or trusting the CLI executable;
-    /// `nil` for other failures, which keep the sign-in guidance.
+    /// `nil` for other failures, which keep the sign-in guidance. On the discovery path,
+    /// `invalidConfiguration` comes only from launch preflight (runtime missing or unsupported).
     package static func launchFailureMessage(for error: (any Error)?) -> String? {
-        guard let error = error as? ExecutableFileIdentityError,
-              let description = error.errorDescription
-        else { return nil }
-        return "Couldn't launch the Antigravity CLI. \(description)"
+        let detail: String
+        var nextStep = ""
+        switch error {
+        case let identityError as ExecutableFileIdentityError:
+            guard let description = identityError.errorDescription else { return nil }
+            detail = description
+            switch identityError {
+            case .untrustedOwner, .untrustedWritableFile, .untrustedWritableDirectory:
+                nextStep = " Fix its permissions, then test again."
+            default:
+                break
+            }
+        case let launcherError as ProcessLauncherError:
+            let failure = launcherError.processLaunchFailure
+            detail = NSError(domain: failure.domain, code: failure.code).localizedDescription
+        case let providerError as AIProviderError:
+            guard case let .invalidConfiguration(configurationDetail) = providerError else { return nil }
+            detail = configurationDetail
+        default:
+            return nil
+        }
+        let sentence = detail.hasSuffix(".") ? detail : detail + "."
+        return "Couldn't launch the Antigravity CLI. \(sentence)\(nextStep)"
     }
 
     private func performRefresh() async -> RefreshResult {
@@ -226,10 +246,12 @@ package actor AntigravityACPModelPollingService {
                     await publishLiveReadinessWithoutModels()
                 }
                 return .succeeded
+            } catch is CancellationError {
+                return .failed(nil)
             } catch {
                 // Keep the last registry/cache snapshot when preflight or ACP discovery fails.
                 await recordFailure(error.localizedDescription)
-                return .failed(error)
+                return Task.isCancelled ? .failed(nil) : .failed(error)
             }
         }
         inFlightRefresh = task
