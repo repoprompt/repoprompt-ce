@@ -296,6 +296,12 @@ package protocol ACPDirectSessionModelProvider: Sendable {
     ) -> ACPDirectModelSelectionRequest
 }
 
+package enum ACPStderrLineDisposition {
+    case transcript
+    case diagnosticsOnly
+    case discard
+}
+
 package protocol ACPAgentProvider: Sendable {
     var providerID: ACPProviderID { get }
 
@@ -332,6 +338,9 @@ package protocol ACPAgentProvider: Sendable {
     /// event. Must be declared here (not only in the extension) so the controller's call
     /// through the existential dispatches to provider overrides.
     func shouldEmitStderrLine(_ line: String) -> Bool
+
+    /// Classifies stderr before any user-facing output or diagnostic buffer retains it.
+    func stderrLineDisposition(_ line: String) -> ACPStderrLineDisposition
 }
 
 package extension ACPAgentProvider {
@@ -354,9 +363,12 @@ package extension ACPAgentProvider {
     func cleanupLaunchArtifacts(for _: ACPLaunchConfiguration) async {}
 
     /// Whether a provider's stderr line should be surfaced into the transcript as a system
-    /// event. Default surfaces everything; providers with known-noisy background logging
-    /// can suppress specific patterns (diagnostics still record every line).
+    /// event. Providers can keep noisy background logs in diagnostics only.
     func shouldEmitStderrLine(_: String) -> Bool {
         true
+    }
+
+    func stderrLineDisposition(_ line: String) -> ACPStderrLineDisposition {
+        shouldEmitStderrLine(line) ? .transcript : .diagnosticsOnly
     }
 }
