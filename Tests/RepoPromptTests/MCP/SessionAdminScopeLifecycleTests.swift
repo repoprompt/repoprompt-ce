@@ -9124,11 +9124,24 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, windows: { [fixture.window] }, notifyCatalogChanged: { _ in })
                 runtime.test_suppressDecisionDelivery = false
                 if exhausted { runtime.test_decisionStartRetryDelay = .milliseconds(1) }
+                var notices: [String] = []
+                runtime.test_scopeDecision = { _, text in notices.append(text) }
+                let grantTarget = UUID()
                 let request = try runtime.requestScope(
-                    requesterSessionID: requesterID, requesterTabID: tab.id, kind: .session(targetSessionID: UUID()),
+                    requesterSessionID: requesterID, requesterTabID: tab.id, kind: .session(targetSessionID: grantTarget),
                     capabilities: [.observe], guardrails: .init(), reason: nil, idempotencyKey: nil
                 ).get()
                 _ = try runtime.approve(requestID: request.id).get()
+                let targets = [UUID(), UUID()]
+                for target in targets {
+                    runtime.notifyOverseeContinuation(
+                        sessionID: requesterID, tabID: tab.id, requestID: UUID(),
+                        result: "oversee target=\(target.uuidString); linked", outcome: "linked", targetSessionID: target
+                    )
+                }
+                let exactPayload = notices.joined(separator: "\n")
+                XCTAssertEqual(notices.count, 3)
+                XCTAssertFalse(try XCTUnwrap(notices.first).contains(grantTarget.uuidString))
                 if indeterminate {
                     try await AsyncTestWait.waitUntil("uncertain save flagged, never requeued") {
                         session.items.contains { $0.kind == .error && $0.text.contains("save is unconfirmed") } && runtime.test_pendingDecisionCount == 0
@@ -9144,6 +9157,19 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                     }
                     let rows = session.items.filter { $0.kind == .user }
                     XCTAssertEqual(rows.count, 1)
+                    let row = try XCTUnwrap(rows.first)
+                    let encoded = try JSONEncoder().encode(AgentTranscriptRequestAnchor(from: row))
+                    let restored = try JSONDecoder().decode(AgentTranscriptRequestAnchor.self, from: encoded).toItem()
+                    let batch = try XCTUnwrap(AgentTranscriptRow.delegationBatch(for: restored))
+                    XCTAssertEqual(batch.decisions.map(\.outcome), ["granted", "linked", "linked"])
+                    XCTAssertEqual(batch.decisions.compactMap(\.targetSessionID), [grantTarget] + targets)
+                    XCTAssertEqual(batch.decisions.map(\.text), notices)
+                    XCTAssertEqual(batch.text, exactPayload)
+                    XCTAssertEqual(row.text, exactPayload)
+                    let lookalike = AgentChatItem.user(exactPayload)
+                    let legacy = try JSONDecoder().decode(AgentTranscriptRequestAnchor.self, from: JSONEncoder().encode(AgentTranscriptRequestAnchor(from: lookalike))).toItem()
+                    XCTAssertNil(AgentTranscriptRow.delegationBatch(for: lookalike))
+                    XCTAssertNil(AgentTranscriptRow.delegationBatch(for: legacy))
                     XCTAssertEqual(starts, 0)
                     if exhausted {
                         try await AsyncTestWait.waitUntil("bounded retries visibly give up without another row") {
@@ -9157,6 +9183,8 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                     } else {
                         session.mcpFollowUpRunPending = false
                         try await AsyncTestWait.waitUntil("saved notice starts without another approval or append", timeout: 15) { await controller.sentCount == 1 }
+                        let sent = await controller.sentMessages
+                        XCTAssertEqual(sent, [exactPayload])
                         XCTAssertEqual(starts, 1)
                     }
                     XCTAssertEqual(session.items.filter { $0.kind == .user }.map(\.id), rows.map(\.id))
