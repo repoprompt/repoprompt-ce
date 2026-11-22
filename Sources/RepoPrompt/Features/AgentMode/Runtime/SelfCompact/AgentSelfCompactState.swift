@@ -46,6 +46,9 @@ struct AgentSelfCompactAttempt: Codable, Equatable {
     var compactDispatchStarted = false
     var admittedSupport: AgentSessionLinkCompactSupport?
     var compactProviderConversation: String?
+    /// Host maintenance never has a continuation note to carry, including after restore.
+    var claudeOverflowHoldID: UUID?
+    var claudePostCompactTokens: Int?
     var noteDispatchStarted = false
     var noteWasPrepended: Bool?
     var compactRunID: UUID?
@@ -101,6 +104,7 @@ struct AgentSelfCompactAttempt: Codable, Equatable {
 struct AgentSelfCompactSettlement: Codable, Equatable {
     enum Outcome: String, Codable {
         case noteAccepted
+        case compacted
         case cancelled
         case failed
         case completionUnverified
@@ -146,7 +150,7 @@ struct AgentSelfCompactSettlement: Codable, Equatable {
             noteDelivery: delivery,
             completionVerified: false,
             settledAt: date,
-            recoveryNote: attempt.note
+            recoveryNote: attempt.claudeOverflowHoldID == nil ? attempt.note : nil
         )
     }
 
@@ -343,7 +347,7 @@ struct AgentSelfCompactState: Codable, Equatable {
             noteDelivery: noteDelivery,
             completionVerified: completionVerified,
             settledAt: date,
-            recoveryNote: outcome == .noteAccepted ? nil : active.note
+            recoveryNote: outcome == .noteAccepted || active.claudeOverflowHoldID != nil ? nil : active.note
         )
         self.active = nil
     }
@@ -377,6 +381,10 @@ struct AgentSelfCompactState: Codable, Equatable {
     @discardableResult
     mutating func releaseForRuntimeTeardown() -> Bool {
         guard let attempt = active, !attempt.noteDispatchStarted else { return false }
+        if attempt.claudeOverflowHoldID != nil {
+            settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
+            return true
+        }
         switch attempt.phase {
         case .parked:
             return false
@@ -433,7 +441,8 @@ struct AgentSelfCompactState: Codable, Equatable {
 
     /// Reading the frame does not consume it; only final provider acknowledgment can do that.
     var parkedNote: (dispatchID: AgentSelfCompactionDispatchID, frame: String)? {
-        guard let attempt = active, attempt.phase == .parked, !attempt.noteDispatchStarted else { return nil }
+        guard let attempt = active, attempt.claudeOverflowHoldID == nil,
+              attempt.phase == .parked, !attempt.noteDispatchStarted else { return nil }
         return (.init(requestID: attempt.id, stage: .note), AgentSelfCompactNoteEnvelope.frame(attempt.note))
     }
 
@@ -446,7 +455,7 @@ struct AgentSelfCompactState: Codable, Equatable {
                 outcome: unverified ? .completionUnverified : nil,
                 completionVerified: unverified ? false : nil,
                 noteDelivery: active.phase == .parked ? .parked : nil,
-                recoveryNote: unverified ? active.note : nil
+                recoveryNote: unverified && active.claudeOverflowHoldID == nil ? active.note : nil
             )
         }
         guard let latest else { return nil }

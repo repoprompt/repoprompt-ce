@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 import RepoPromptClaudeCompatibleProvider
 import RepoPromptDomainRuntime
@@ -32,6 +33,18 @@ package typealias ClaudeCompatiblePluginAutoCompactWindow = RepoPromptClaudeComp
 /// helpers. This keeps lower-level Claude provider code from depending upward on
 /// Agent Mode's feature bridge while preserving a single package import point.
 package enum ClaudeCompatibleProviderRuntimeBridge {
+    package static func isSyntheticSizeRejection(_ payload: [String: Any]) -> Bool {
+        ClaudeSDKSizeFailure.isSyntheticRejection(payload)
+    }
+
+    package static func classifySizeFailure(_ payload: [String: Any], conversationID: String?) -> ClaudeTurnSizeFailure? {
+        guard let evidence = ClaudeSDKSizeFailure.classifyResult(payload),
+              let kind = ClaudeTurnSizeFailure.Kind(rawValue: evidence.kind.rawValue),
+              let source = ClaudeTurnSizeFailure.Source(rawValue: evidence.source.rawValue)
+        else { return nil }
+        return .init(kind: kind, source: source, inputTokens: evidence.inputTokens, limitTokens: evidence.limitTokens, conversationID: conversationID)
+    }
+
     package static func buildHeadlessArguments(
         runtimeConfig: ClaudeCompatiblePluginRuntimeConfig,
         mcpConfigPath: String?,

@@ -1,6 +1,23 @@
 import Combine
 import Foundation
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
 import RepoPromptDomainRuntime
+
+struct ClaudeContextAutoWakeHold: Equatable {
+    let id = UUID()
+    let provider: AgentProviderKind
+    let failure: ClaudeTurnSizeFailure
+    let conversationID: String?
+    var recoveryOriginAttemptID: UUID?
+
+    func blocks(provider: AgentProviderKind, conversationID: String?) -> Bool {
+        guard self.provider == provider else { return false }
+        // Unknown identity is not proof of a new conversation (e.g. during reconnect).
+        guard let held = self.conversationID, let conversationID else { return true }
+        return held == conversationID
+    }
+}
 
 /// Every oversight-subsystem value one exact `AgentTabSession` incarnation owns, in one place.
 ///
@@ -22,6 +39,8 @@ import RepoPromptDomainRuntime
 /// slot (see `pendingAutoWakeOwnsTransportBoundary`), so nothing may clear it except a path that can
 /// prove no transport call happened.
 struct AgentSessionOversightState {
+    /// Live admission policy only. A process/controller recycle does not clear the hold.
+    var claudeContextAutoWakeHold: ClaudeContextAutoWakeHold?
     /// Session-incarnation opt-in only. Never saved, restored, or cleared by ordinary unlink.
     var overseerActivation: AgentSessionOverseerActivation? {
         willSet {

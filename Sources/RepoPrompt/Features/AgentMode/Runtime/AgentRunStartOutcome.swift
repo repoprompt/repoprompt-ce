@@ -36,19 +36,22 @@ struct AgentProviderControlCommand: Equatable {
     let expectedProviderConversation: String
     let selfCompactDispatchID: AgentSelfCompactionDispatchID?
     let claudeWakeCompaction: ClaudeWakeCompactionAdmission?
+    let isClaudeOverflowRecovery: Bool
 
     static func compact(
         expectedBinding: AgentPersistentSessionBindingIdentity,
         expectedProviderConversation: String,
         selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
-        claudeWakeCompaction: ClaudeWakeCompactionAdmission? = nil
+        claudeWakeCompaction: ClaudeWakeCompactionAdmission? = nil,
+        isClaudeOverflowRecovery: Bool = false
     ) -> AgentProviderControlCommand {
         AgentProviderControlCommand(
             kind: .compact,
             expectedBinding: expectedBinding,
             expectedProviderConversation: expectedProviderConversation,
             selfCompactDispatchID: selfCompactDispatchID,
-            claudeWakeCompaction: claudeWakeCompaction
+            claudeWakeCompaction: claudeWakeCompaction,
+            isClaudeOverflowRecovery: isClaudeOverflowRecovery
         )
     }
 

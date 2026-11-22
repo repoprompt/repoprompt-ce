@@ -1342,6 +1342,33 @@ the interval is the one thing delaying a wake that would otherwise be accepted r
 omitted rather than shown as zero once elapsed. `agent_session_link` is unchanged: the interval and
 `Wake now` have no agent-facing surface.
 
+## Claude conversation size hold
+
+A correlated Claude size rejection installs a process-local hold before the run publishes idle.
+The hold names the provider and conversation, not its process, model, or last wake fingerprint.
+An unknown conversation identity does not prove a replacement. An output cap alone does not hold
+wakes. Status, exact attention, Wake now, and periodic wakes all obey the hold, including at the
+first physical acquisition. The hold does not change preferences, link authority, pending notices,
+or receipts. Explicit local input and maintenance remain available. Holds are not restored on app restart.
+
+A typed input-context refusal with a vouched context already at or above 90% can schedule one
+host-owned native `/compact` per live Claude conversation. The terminal scheduler requires the
+original failed attempt's accepted publication without a successor, exclusive binding ownership,
+and drained teardown/tools. The physical command also requires the exact idle provider
+conversation. The controller accepts an unkeyed `local_command: compact` result only in the
+uncontested command interval on that conversation; ordinary results still require their existing
+correlation. Release requires a correlated manual boundary with a positive `post_tokens` drop,
+a successful compact terminal and drained teardown/tools, and at least 20% of the vouched model
+window free. Only that request's hold can be released. The host sends no continuation prompt,
+replays no failed work, and does not touch consumed wake receipts. Newly eligible wake work can
+use the usual admission path.
+
+If recovery is unavailable or unverified, **Continue fresh in this session** stages a bounded
+handoff and retires only the Claude provider conversation. The next local composer message can
+start it with the existing session UUID, worktree, links, and grants. The saved handoff excludes
+prior prompts and tool activity. Pending fresh handoff inhibits Auto-wake, even after restore or
+failed dispatch, until the new local input is accepted. Fresh rollover is never automatic.
+
 ## Periodic idle wake
 
 Periodic waking is a separate, default-off observer-session preference, not notification admission

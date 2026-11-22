@@ -18,13 +18,16 @@ public struct ClaudeSDKNDJSONTranslator {
     private var toolNameByToolUseID: [String: String] = [:]
     private var invocationIDByToolUseID: [String: UUID] = [:]
     private let enableDebugLogging: Bool
+    private let defersSizeFailuresToTerminalOwner: Bool
     private let treatsToolResultErrorsAsHostOwned: @Sendable (String) -> Bool
 
     public init(
         enableDebugLogging: Bool = false,
+        defersSizeFailuresToTerminalOwner: Bool = false,
         treatsToolResultErrorsAsHostOwned: @escaping @Sendable (String) -> Bool = { _ in false }
     ) {
         self.enableDebugLogging = enableDebugLogging
+        self.defersSizeFailuresToTerminalOwner = defersSizeFailuresToTerminalOwner
         self.treatsToolResultErrorsAsHostOwned = treatsToolResultErrorsAsHostOwned
     }
 
@@ -73,6 +76,7 @@ public struct ClaudeSDKNDJSONTranslator {
         case "system":
             return parseSystemMessage(json)
         case "assistant", "message":
+            if defersSizeFailuresToTerminalOwner, ClaudeSDKSizeFailure.isSyntheticRejection(json) { return [Self.unrepresentedActivity] }
             return parseAssistantMessage(json)
         case "user":
             return parseUserMessage(json)
@@ -534,6 +538,7 @@ public struct ClaudeSDKNDJSONTranslator {
         }
 
         var results: [ClaudeProviderStreamResult] = []
+        let sizeFailure = defersSizeFailuresToTerminalOwner ? ClaudeSDKSizeFailure.classifyResult(json) : nil
         let resultErrors = extractResultErrorMessages(from: json)
         let shouldEmitResultError = isError
             || (resultSubtype?.contains("error") ?? false)
@@ -551,14 +556,16 @@ public struct ClaudeSDKNDJSONTranslator {
         {
             results.append(Self.unrepresentedActivity)
         }
-        if shouldEmitResultError,
+        if sizeFailure == nil, shouldEmitResultError,
            !shouldSuppressResultError,
            let errorMessage = resultErrors.first,
            !errorMessage.isEmpty
         {
             results.append(ClaudeProviderStreamResult(type: "error", text: errorMessage))
         }
-        if let finalText = json["result"] as? String, !finalText.isEmpty {
+        if sizeFailure == nil || sizeFailure?.kind == .generationContextLimit || sizeFailure?.kind == .outputLimit,
+           let finalText = json["result"] as? String, !finalText.isEmpty
+        {
             results.append(ClaudeProviderStreamResult(type: "final_content", text: finalText, contentMessageID: currentContentMessageID))
         }
         // Note: contextUsedTokens is intentionally nil here. Claude's result.usage is an aggregate

@@ -1179,6 +1179,28 @@ final class AgentTabSession: ObservableObject {
     /// Only an actual provider compact boundary advances this (not a `compacting` status).
     var claudeCompactBoundaryID: UUID?
 
+    /// A successful compact must not start a compact/wake loop if the conversation refills.
+    var claudeOverflowRecoveryAttemptedConversation: String?
+
+    var activeClaudeContextAutoWakeHold: ClaudeContextAutoWakeHold? {
+        guard let hold = oversight.claudeContextAutoWakeHold,
+              hold.blocks(provider: selectedAgent, conversationID: providerSessionID) else { return nil }
+        return hold
+    }
+
+    var claudeContextBlocksAutoWake: Bool {
+        activeClaudeContextAutoWakeHold != nil || pendingHandoff.awaitsLocalClaudeOverflowInput
+    }
+
+    /// Recovery may release only the hold it actually repaired.
+    @discardableResult
+    func clearClaudeContextAutoWakeHold(matching hold: ClaudeContextAutoWakeHold) -> Bool {
+        guard oversight.claudeContextAutoWakeHold == hold else { return false }
+        oversight.claudeContextAutoWakeHold = nil
+        noteMonitorObservationInputsChanged()
+        return true
+    }
+
     var providerCleanupHandle: ProviderConversationCleanupHandle?
     var providerTokenUsageByTurn: [AgentTokenUsagePersist] = []
     var automationTurnAudit: [AgentAutomationTurnAudit] = []
