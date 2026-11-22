@@ -49,7 +49,9 @@ final class AppDomainRuntimeCompositionTests: XCTestCase {
             _ = await runtime.shutdown()
             try? FileManager.default.removeItem(at: directory)
         }
-        let workspace = WorkspaceModel(name: "Original", repoPaths: [], customStoragePath: directory.appendingPathComponent("saved"))
+        let root = directory.appendingPathComponent("root")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let workspace = WorkspaceModel(name: "Original", repoPaths: [root.path], customStoragePath: directory.appendingPathComponent("saved"))
         let authority = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: 0)
         let created = try await authority.create(
             workspace, fileURL: runtime.configuration.workspaceStorageDirectory.appendingPathComponent("\(workspace.id.uuidString).json")
@@ -63,12 +65,17 @@ final class AppDomainRuntimeCompositionTests: XCTestCase {
             files: WorkspaceFileContextStore(codemapGraphIndexBuildLaunchPolicyForTesting: .disabled), contexts: runtime.contextStore
         )
         var candidate: AgentSessionRuntimeHost?
+        var candidateRootLease: AgentHostWorkspaceResources.Lease?
         do {
             _ = try await WindowStateCompositionFactory.prepareVisibleAgentHost(
                 workspace: workspace, owner: owner, activations: activations, resources: resources,
                 apiSettings: settings, settingsStore: .shared, runtime: runtime
-            ) { host in
+            ) { host, rootLease in
                 candidate = host
+                candidateRootLease = rootLease
+                XCTAssertEqual(rootLease.snapshot.document.workspaceID, workspace.id)
+                XCTAssertEqual(rootLease.snapshot.document.metadata.repoPaths, [root.path])
+                XCTAssertTrue(rootLease.rootsAreCurrent)
                 XCTAssertEqual(host.route.identity.kind, .independent)
                 XCTAssertTrue(host.route.isLeaseManaged)
                 XCTAssertTrue(host.workspaceActivation?.isPresenterCurrent == true)
@@ -81,6 +88,7 @@ final class AppDomainRuntimeCompositionTests: XCTestCase {
                 host.scope.hasReleasedWriterClaims && host.route.isClosing && host.scope.retainedDrain == nil
             }
             XCTAssertFalse(AgentSessionRuntimeStore.shared.retainedExecutionHosts.contains { $0 === host })
+            XCTAssertTrue(try XCTUnwrap(candidateRootLease).isReleased)
             XCTAssertEqual(activations.latestSessionIndexOwner, owner)
         }
     }

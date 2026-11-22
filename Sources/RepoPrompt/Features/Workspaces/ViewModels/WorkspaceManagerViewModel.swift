@@ -6604,7 +6604,10 @@ class WorkspaceManagerViewModel: ObservableObject {
             advanceWorkspaceSwitchOperation(operationID, to: .awaitingConfirmation)
             let confirmation = WorkspaceSwitchConfirmation(
                 targetWorkspaceName: newWorkspace.name,
-                items: snapshot.items
+                items: snapshot.items,
+                preservesActiveAgentExecution: preservedAgentProvider != nil && activeSessions.items.contains {
+                    $0.id == AgentModeWorkspaceSwitchSessionProvider.activityID && $0.count > 0
+                }
             )
             let approved = await requestSwitchConfirmation(confirmation, operationID: operationID)
             if let cancellation = cancellationResult(

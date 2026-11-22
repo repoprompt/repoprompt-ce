@@ -146,6 +146,7 @@ struct WorkspaceSwitchConfirmation: Identifiable {
     let id = UUID()
     let targetWorkspaceName: String
     let items: [WorkspaceSwitchSessionItem]
+    var preservesActiveAgentExecution = false
 
     private func summaryText() -> String {
         let parts = items
@@ -156,10 +157,13 @@ struct WorkspaceSwitchConfirmation: Identifiable {
 
     var message: String {
         let summary = summaryText()
+        let continuity = preservesActiveAgentExecution ? " Agent runs in the original workspace will continue." : ""
         if summary.isEmpty {
-            return "Switching workspaces will terminate any running sessions. Do you want to continue?"
+            return preservesActiveAgentExecution
+                ? "Switch to \"\(targetWorkspaceName)\"?\(continuity)"
+                : "Switching workspaces will terminate any running sessions. Do you want to continue?"
         }
-        return "Switching to \"\(targetWorkspaceName)\" will terminate \(summary). Do you want to continue?"
+        return "Switching to \"\(targetWorkspaceName)\" will terminate \(summary).\(continuity) Do you want to continue?"
     }
 
     var cancelMessage: String {

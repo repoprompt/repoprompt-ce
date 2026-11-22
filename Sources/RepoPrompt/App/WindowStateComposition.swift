@@ -73,6 +73,7 @@ struct WindowStateComposition {
 @MainActor
 enum WindowStateCompositionFactory {
     typealias AgentModeViewModelFactory = (Int, PromptViewModel, WorkspaceManagerViewModel, MCPServerViewModel) -> AgentModeViewModel
+    typealias VisibleAgentInstaller = @MainActor (AgentSessionRuntimeHost, AgentHostWorkspaceResources.Lease) async throws -> Void
 
     /// Prepare one unpublished visible activation. The independent catalog installer must be
     /// supplied by the canonical execution composition, not borrowed from today's window route.
@@ -84,7 +85,7 @@ enum WindowStateCompositionFactory {
         apiSettings: APISettingsViewModel,
         settingsStore: GlobalSettingsStore,
         runtime: MCPDomainRuntime,
-        installExecutionAndCatalog: @MainActor (AgentSessionRuntimeHost) async throws -> Void
+        installExecutionAndCatalog: VisibleAgentInstaller
     ) async throws -> AgentSessionRuntimeHost {
         guard !Task.isCancelled, owner.workspaceID == workspace.id, activations.latestSessionIndexOwner == owner,
               let settings = APISettingsRuntimeLease.acquire(from: apiSettings)
@@ -127,9 +128,14 @@ enum WindowStateCompositionFactory {
             )
             try Task.checkCancellation()
             guard activation.isPresenterCurrent else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
-            try await installExecutionAndCatalog(host)
+            let originalRoots = try await activation.retainVisibleFileResources()
+            try await installExecutionAndCatalog(host, originalRoots)
+            let current = await authority.canonicalWorkspaceSnapshot(workspace.id)
             try Task.checkCancellation()
-            guard activation.isPresenterCurrent, host.scope.sessions.isEmpty, host.scope.execution != nil,
+            guard let current, current.health != .removed,
+                  current.document.metadata.repoPaths == originalRoots.snapshot.document.metadata.repoPaths,
+                  activation.isPresenterCurrent, originalRoots.rootsAreCurrent,
+                  host.scope.sessions.isEmpty, host.scope.execution != nil,
                   host.scope.linkExecution != nil, host.scope.installedInteractions != nil,
                   host.scope.persistence.composition != nil, route.hasCurrentModelCatalogRoute
             else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
@@ -161,7 +167,7 @@ enum WindowStateCompositionFactory {
         agentModeViewModelFactory: AgentModeViewModelFactory? = nil,
         sessionRuntimeWorkspace: WorkspaceModel? = nil,
         borrowedAPISettingsViewModel: APISettingsViewModel? = nil,
-        installVisibleAgentExecutionAndCatalog: (@MainActor (AgentSessionRuntimeHost) async throws -> Void)? = nil
+        installVisibleAgentExecutionAndCatalog: VisibleAgentInstaller? = nil
     ) -> WindowStateComposition {
         WorkspaceContextStartupInstrumentation.install(AppWorkspaceStartupEventRecorder())
         WorkspaceExternalReadWorkHooks.install(AppWorkspaceExternalReadWorkRecorder())

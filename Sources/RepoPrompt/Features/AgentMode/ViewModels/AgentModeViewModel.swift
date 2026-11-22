@@ -4691,6 +4691,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         else { return nil }
         host.scope.retainExecutableHost()
         hasDetachedClosingPresentation = true
+        withdrawUnpublishedComposerSubmissionsForPresentationLoss()
         detachRunPresentation()
         cleanUpClosingPresentation()
         return host
@@ -13448,6 +13449,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return
         }
         if preservesOrigin {
+            withdrawUnpublishedComposerSubmissionsForPresentationLoss()
+            guard adoptionIsCurrent(), destinationIsCurrent() else {
+                abandonPreparedDestination()
+                settleRefusedDestination()
+                return
+            }
             outgoing.scope.retainExecutableHost()
             detachRunPresentation()
         }

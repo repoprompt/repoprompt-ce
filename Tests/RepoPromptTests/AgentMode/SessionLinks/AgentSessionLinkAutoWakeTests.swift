@@ -1032,6 +1032,73 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         XCTAssertTrue(provider.promptedMessages.isEmpty)
     }
 
+    func testDetachedPresentationPreservesDispatchedAttemptThroughDurableCommit() async throws {
+        var responseGate: AgentSessionLinkACPResponseGate?
+        let (host, f, resources, provider, _, _, authority) = try await hostStartupFixture(
+            canonicalWorkspace: true, boundCanonicalCarrier: true, makeResponseGate: { directory in
+                let gate = try AgentSessionLinkACPResponseGate(directory: directory)
+                responseGate = gate
+                return gate
+            }
+        )
+        let gate = try XCTUnwrap(responseGate)
+        defer { gate.release() }
+        host.scope.retainExecutableHost()
+        addTeardownBlock { @MainActor in
+            let drain = host.beginFinalShutdown()
+            _ = await AgentSessionHostDrainRuntime.shutdown([drain])
+        }
+        let session = f.session
+        let attachment = host.scope.presentation.attach(session, sink: .init(
+            activityChanged: { _, _ in }, refresh: { _, _, _ in }, turnComplete: { _ in }, turnFailed: { _, _ in }
+        ))
+        let outcome = AgentRunStartOutcomeRecorder()
+        let prompt = "Persist the admitted turn after detaching"
+        // The direct startup runtime consumes the row published by its caller.
+        let userItem = AgentChatItem.user(prompt, sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(userItem)
+        _ = try await host.scope.startup.start(
+            session: session, initialMessage: prompt, directStartOptions: .init(initialUserItemID: userItem.id), startOutcome: outcome,
+            claudeCoordinator: host.claudeCoordinator, links: f.runtime,
+            environment: host.makeStartupEnvironment(resources: resources)
+        )
+        XCTAssertTrue(outcome.outcome.didStart)
+        let task = try XCTUnwrap(session.agentTask)
+        try await routeScriptedHostProvider(session)
+        try await gate.waitUntilEntered()
+        let original = try host.scope.admit(session: session)
+        let attemptID = try XCTUnwrap(session.activeRunAttemptID)
+        let runID = try XCTUnwrap(session.runID)
+        let controller = try XCTUnwrap(session.acpController)
+
+        host.scope.presentation.detach(attachment)
+        XCTAssertFalse(host.scope.presentation.hasPresenter(for: session))
+        XCTAssertFalse(host.scope.isRetiring)
+        XCTAssertTrue(original.isCurrent)
+        XCTAssertEqual(try host.scope.admit(session: session).identity, original.identity)
+        XCTAssertEqual(session.runID, runID)
+        XCTAssertEqual(session.activeRunAttemptID, attemptID)
+        XCTAssertTrue(session.acpController === controller)
+        XCTAssertTrue(resources.isCurrent)
+        XCTAssertFalse(host.route.isClosing)
+        XCTAssertTrue(AppDelegate.hasUnsettledAgentExecution())
+
+        gate.release()
+        await task.value
+        XCTAssertFalse(session.runState.isActive)
+        XCTAssertEqual(session.lastTerminalCommitRevision?.ownership.attemptID, attemptID)
+        XCTAssertEqual(provider.promptedMessages.count, 1)
+        let canonical = await authority.canonicalWorkspaceSnapshot(f.endpoint.workspaceID)
+        let snapshot = try XCTUnwrap(canonical)
+        let workspace = try JSONDecoder().decode(WorkspaceModel.self, from: snapshot.document.documentBytes)
+        try await host.scope.persistence.flushSaveRequired(for: session.tabID, workspaceID: workspace.id).get()
+        let payload = try await AgentSessionDataService.shared.loadAgentSession(id: f.endpoint.sessionID, for: workspace)
+        let restored = try XCTUnwrap(payload)
+        XCTAssertEqual(restored.id, f.endpoint.sessionID)
+        let transcript = try XCTUnwrap(restored.transcript)
+        XCTAssertEqual(transcript.turns.compactMap { $0.request?.text }, [prompt])
+    }
+
     func testHostRetirementJoinsClosedControllerBeforeReleasingResources() async throws {
         let (host, f, resources, provider, _, _, _) = try await hostStartupFixture()
         let original = try host.scope.admit(session: f.session)
@@ -1514,7 +1581,9 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
     /// the external provider is scripted; startup is never intercepted or delegated to a VM.
     private func hostStartupFixture(
         canonicalWorkspace: Bool = false, boundCanonicalCarrier: Bool = false, canonicalInput: Bool = false,
-        registersProviderRoute: Bool = false, commandWillExecute: (@Sendable (DomainWorkspaceCommandEnvelope) async -> Void)? = nil
+        registersProviderRoute: Bool = false,
+        makeResponseGate: ((URL) throws -> AgentSessionLinkACPResponseGate)? = nil,
+        commandWillExecute: (@Sendable (DomainWorkspaceCommandEnvelope) async -> Void)? = nil
     ) async throws -> (
         AgentSessionRuntimeHost, Fixture, AgentSessionHostStartupResources,
         AgentSessionLinkCapturingACPProvider, AgentWorkspaceSessionIndexStore, @MainActor () async throws -> Void,
@@ -1532,7 +1601,11 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             try? FileManager.default.removeItem(at: directory)
         }
         let script = try AgentSessionLinkACPServerScript.write(to: directory)
-        let provider = AgentSessionLinkCapturingACPProvider(providerID: .openCode, commandPath: script.path)
+        let gate = try makeResponseGate?(directory)
+        let provider = AgentSessionLinkCapturingACPProvider(
+            providerID: .openCode, commandPath: script.path,
+            environment: gate.map { ["ACP_HOLD_METHOD": "session/prompt", "ACP_RESPONSE_GATE": $0.path] } ?? [:]
+        )
         let routeIdentity = MCPRouteIdentityAllocator.allocateHost()
         let route = if registersProviderRoute {
             MCPHostRouteResources(identity: routeIdentity, coordinator: domain.routingCoordinator, runtime: domain)

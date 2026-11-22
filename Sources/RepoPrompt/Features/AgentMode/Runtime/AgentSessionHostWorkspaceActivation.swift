@@ -107,6 +107,37 @@ final class AgentSessionHostWorkspaceActivation {
         return true
     }
 
+    /// A visible activation pins the originating workspace roots before registering its route.
+    /// No compose tab or saved carrier is required until a request captures its writer receipt.
+    func retainVisibleFileResources() async throws -> AgentHostWorkspaceResources.Lease {
+        guard savedTarget == nil, isPresenterCurrent, retainedRoots.isEmpty,
+              let workspaceID = key.owner.workspaceID,
+              let original = await authority.canonicalWorkspaceSnapshot(workspaceID), original.health != .removed,
+              isPresenterCurrent
+        else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
+        var rootIDs: [UUID] = []
+        for path in original.document.metadata.repoPaths {
+            try Task.checkCancellation()
+            guard isPresenterCurrent else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
+            // Join the file store's existing load. Abandoning this candidate must not cancel
+            // a root producer which also belongs to the workspace's visible file projection.
+            let root = try await resources.files.loadRoot(path: path, cancelUnderlyingLoadOnCallerCancellation: false)
+            rootIDs.append(root.id)
+        }
+        let lease = try await resources.acquire(workspaceID: workspaceID, rootIDs: rootIDs) { snapshot in
+            snapshot.document.metadata.repoPaths == original.document.metadata.repoPaths
+        }
+        guard await authority.canonicalWorkspaceSnapshot(workspaceID) == lease.snapshot,
+              isPresenterCurrent, retainedRoots.isEmpty, lease.rootsAreCurrent, !Task.isCancelled
+        else {
+            await lease.release()
+            throw AgentHostWorkspaceResources.Failure.contextChanged
+        }
+        rootLeases[Set(rootIDs)] = lease
+        retainedRoots.append(lease)
+        return lease
+    }
+
     func retainSavedFileResources(rootIDs: [UUID]) async throws -> AgentHostWorkspaceResources.Lease {
         guard let savedTarget, isCurrent else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
         let workspaceID = savedTarget.workspace.id
