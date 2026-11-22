@@ -55,6 +55,61 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
         XCTAssertFalse(runtime.redactedDiagnosticSummary.contains(temporaryDirectory.path))
     }
 
+    func testOnlyBundledAppServerOptsIntoRolloutCompression() throws {
+        let host = CodexAppServerAppLaunchHost(
+            computerUseRuntimeUnavailableMessage: { _ in nil },
+            processEnvironmentBuilder: { _ in fatalError("Unexpected environment lookup") },
+            runtimeStatePreparer: { _ in XCTFail("Unexpected state preparation") },
+            launchSnapshot: .init(selection: .bundled)
+        )
+        let setting = "features.local_thread_store_compression=true"
+        let configURL = temporaryDirectory.appendingPathComponent("config.toml")
+        for source in [CodexRuntimeAuthority.Source.bundled(target: "aarch64-apple-darwin"), .externalOverride] {
+            let runtime = CodexRuntimeAuthority.Runtime(
+                executableURL: temporaryDirectory.appendingPathComponent("codex"),
+                version: CodexRuntimeAuthority.bundledVersion,
+                source: source,
+                statePaths: .init(codexHome: temporaryDirectory, sqliteHome: temporaryDirectory)
+            )
+            let arguments = try host.baseProcessArguments(
+                runtime: runtime,
+                provisionsRepoPromptMCP: false,
+                featurePolicy: .defaultDisabled,
+                reasoningSummary: nil
+            )
+            if case .bundled = source {
+                XCTAssertEqual(Array(arguments.suffix(2)), ["-c", setting])
+            } else {
+                XCTAssertFalse(arguments.contains(setting))
+            }
+            XCTAssertFalse(FileManager.default.fileExists(atPath: configURL.path))
+        }
+    }
+
+    func testPersistedCommandRecoveryReadsCompressedRolloutUsingEitherPath() throws {
+        let plain = temporaryDirectory.appendingPathComponent("rollout-fixture.jsonl")
+        let compressed = plain.appendingPathExtension("zst")
+        // zstd -3 (stdin) of one response_item function_call to wait_agent with call_id fixture-call.
+        let frame = try XCTUnwrap(Data(base64Encoded: """
+        KLUv/QRYtQIAAkYTF5A3bbiN1Ws5keSdt5tI3b1IC83GcgoQgCRx5k3gimMJOLh80DJvXLx6gtviBy4f
+        cXVx5o0pwjV6DOVzlMiTi4lbtDMUJeMKly8h60IBACqFegJim7/c
+        """, options: .ignoreUnknownCharacters))
+        try frame.write(to: compressed)
+
+        for path in [plain.path, compressed.path] {
+            let signals = CodexNativeSessionController.loadPersistedCommandSignals(fromRolloutPath: path)
+            XCTAssertEqual(signals.outstandingBlockingNativeToolNameByCallID, ["fixture-call": "wait_agent"])
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: plain.path), "Reading must not materialize JSONL")
+
+        try Data(frame.dropLast()).write(to: compressed)
+        XCTAssertNil(CodexRolloutText.read(atPath: plain.path), "A truncated frame must not return partial text")
+
+        let newText = #"{"type":"session_meta"}"# + "\n"
+        try Data(newText.utf8).write(to: plain)
+        XCTAssertEqual(CodexRolloutText.read(atPath: compressed.path), newText)
+    }
+
     func testRuntimePrepareStateProjectsGlobalInstructionsIntoManagedCodexHome() throws {
         let resources = temporaryDirectory.appendingPathComponent("Resources", isDirectory: true)
         let support = temporaryDirectory.appendingPathComponent("Support", isDirectory: true)
@@ -159,7 +214,7 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
         let override = temporaryDirectory.appendingPathComponent("external/codex")
         try makeExecutable(at: override)
 
-        for supportedVersion in ["0.149.0", "0.153.3", "0.156.0"] {
+        for supportedVersion in ["0.155.0", "0.156.0", "0.170.0"] {
             let accepted = try CodexRuntimeAuthority.resolve(
                 resourcesURL: nil,
                 applicationSupportURL: temporaryDirectory,
@@ -176,13 +231,13 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
             resourcesURL: nil,
             applicationSupportURL: temporaryDirectory,
             explicitExecutableOverride: override.path,
-            externalVersionReader: { _ in "codex-cli 0.148.9" }
+            externalVersionReader: { _ in "codex-cli 0.154.9" }
         )
         XCTAssertEqual(
             failure(from: old),
             .externalOverrideTooOld(
-                actual: .init(major: 0, minor: 148, patch: 9),
-                minimum: .init(major: 0, minor: 149, patch: 0)
+                actual: .init(major: 0, minor: 154, patch: 9),
+                minimum: .init(major: 0, minor: 155, patch: 0)
             )
         )
         XCTAssertTrue(
@@ -193,13 +248,13 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
             resourcesURL: nil,
             applicationSupportURL: temporaryDirectory,
             explicitExecutableOverride: override.path,
-            externalVersionReader: { _ in "codex-cli 0.149.0-rc.1" }
+            externalVersionReader: { _ in "codex-cli 0.155.0-rc.1" }
         )
         XCTAssertEqual(
             failure(from: prerelease),
             .externalOverrideTooOld(
-                actual: .init(major: 0, minor: 149, patch: 0, prerelease: "rc.1"),
-                minimum: .init(major: 0, minor: 149, patch: 0)
+                actual: .init(major: 0, minor: 155, patch: 0, prerelease: "rc.1"),
+                minimum: .init(major: 0, minor: 155, patch: 0)
             )
         )
 

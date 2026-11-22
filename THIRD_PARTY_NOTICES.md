@@ -27,6 +27,12 @@ separate GStreamer, GLib, Opus, PCRE2/SLJIT, libffi, proxy-libintl, and zlib
 components. Their exact packaged notice, source provenance, and licences are
 copied as the `VOICE-*` files in [`ThirdPartyLicenses/codex/`](ThirdPartyLicenses/codex/).
 
+## Zstandard
+
+RepoPrompt CE includes the upstream Zstandard 1.5.7 single-file decoder under the
+BSD 3-Clause license. The copied license and source provenance are included under
+[`ThirdPartyLicenses/zstd/`](ThirdPartyLicenses/zstd/).
+
 ## UniversalCharsetDetection / uchardet
 
 RepoPrompt CE vendors UniversalCharsetDetection and uchardet source. Their

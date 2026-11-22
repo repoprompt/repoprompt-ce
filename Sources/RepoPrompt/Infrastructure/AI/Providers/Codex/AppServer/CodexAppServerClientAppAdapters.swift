@@ -144,7 +144,14 @@ struct CodexAppServerAppLaunchHost: CodexAppServerLaunchHost {
                 modelReasoningSummary: reasoningSummary
             ),
             featurePolicy: featurePolicy
-        )
+        ) + rolloutCompressionArguments(for: runtime)
+    }
+
+    private func rolloutCompressionArguments(for runtime: CodexProviderRuntime.Runtime) -> [String] {
+        // Opt the verified bundle into Codex's maintenance worker, not a Swift file migration.
+        // Custom executables can read the same store but retain their own feature configuration.
+        guard case .bundled = runtime.source else { return [] }
+        return ["-c", "features.local_thread_store_compression=true"]
     }
 
     func computerUseProcessArguments(runtime: CodexProviderRuntime.Runtime) throws -> [String] {
