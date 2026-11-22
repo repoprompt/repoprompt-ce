@@ -70,6 +70,7 @@ final class AppDomainRuntimeComposition: Sendable {
             // their fallback references cannot accidentally retain the first fixture's runtime.
             let network = ServerNetworkManager.shared
             _ = AppGlobalMCPServiceComposition.shared
+            _ = AgentSessionLinkRuntimeBridge.shared
             guard await !(network.isRunning()),
                   !WindowStatesManager.shared.allWindows.contains(where: \.mcpServer.windowToolsEnabled)
             else { throw RuntimeScopeError.ownersActive }

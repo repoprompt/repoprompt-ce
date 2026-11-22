@@ -231,12 +231,30 @@ enum AgentSessionTargetOperationGuard {
         hasManageGrant: ManageGrantResolver,
         authorizationEngine: OverseerAuthorizationEngine? = nil
     ) async throws -> WorktreeBindingAuthority {
-        let engine = authorizationEngine ?? .current
         let caller = await resolveCaller(
             metadata: metadata,
             targetWindow: targetWindow,
             resolveSpawnParentSessionID: resolveSpawnParentSessionID
         )
+        return try await requireWorktreeBindingAuthority(
+            targetSessionID: targetSessionID, caller: caller,
+            resolveObserverEndpoint: { await resolveObserverEndpoint(metadata, targetWindow) },
+            resolveTargetProvenance: resolveTargetProvenance, hasManageGrant: hasManageGrant,
+            authorizationEngine: authorizationEngine
+        )
+    }
+
+    /// The caller is derived by the transport owner before entering this overload. Its policy
+    /// and grant capture are shared by legacy physical and independently composed routes.
+    static func requireWorktreeBindingAuthority(
+        targetSessionID: UUID,
+        caller: DomainAgentSessionCallerIdentity,
+        resolveObserverEndpoint: () async -> DomainAgentSessionLinkEndpointIdentity?,
+        resolveTargetProvenance: TargetProvenanceResolver,
+        hasManageGrant: ManageGrantResolver,
+        authorizationEngine: OverseerAuthorizationEngine? = nil
+    ) async throws -> WorktreeBindingAuthority {
+        let engine = authorizationEngine ?? .current
         // Capture independent spawn-parent authority even if full access short-circuits admission.
         let parentSessionID: UUID? = if case let .agentSession(callerSessionID) = caller, callerSessionID != targetSessionID {
             await resolveTargetProvenance(targetSessionID).parentSessionID
@@ -248,7 +266,7 @@ enum AgentSessionTargetOperationGuard {
         // acquire a replacement link after a suspension.
         let manageAuthority: WorktreeBindingAuthority? = if case let .agentSession(callerSessionID) = caller,
                                                             callerSessionID != targetSessionID,
-                                                            let endpoint = await resolveObserverEndpoint(metadata, targetWindow),
+                                                            let endpoint = await resolveObserverEndpoint(),
                                                             endpoint.sessionID == callerSessionID
         {
             await hasManageGrant(endpoint, targetSessionID)

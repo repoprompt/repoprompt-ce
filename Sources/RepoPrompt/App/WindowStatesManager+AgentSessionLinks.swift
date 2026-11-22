@@ -99,7 +99,14 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
             case .released:
                 AgentSessionLinkRuntimeBridge.shared.dismissPersistenceWarnings(ids: [warningID])
             case .retained:
-                if let drain { self?.reportRetainedAgentHostDrain(drain) }
+                if let drain {
+                    self?.reportRetainedAgentHostDrain(drain)
+                    if let id = drain.scope.executableHost?.workspaceActivation?.savedCarrierSessionID,
+                       AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: id)
+                    {
+                        self?.schedulePreparedOversightCleanup()
+                    }
+                }
             case .cancelled, .timedOut:
                 break
             }
@@ -505,6 +512,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         guard !isTerminating,
               !preparedOversightWindows.isEmpty || !retiringPreparedOversightWindows.isEmpty
               || agentRuntimeStore.retainedExecutionHosts.contains(where: { $0.workspaceActivation?.savedCarrierSessionID != nil })
+              || agentRuntimeStore.retainedDrains.contains(where: { $0.scope.executableHost?.workspaceActivation?.savedCarrierSessionID != nil })
         else { return }
         preparedOversightCleanupDirty = true
         guard preparedOversightCleanupTask == nil else { return }
@@ -514,6 +522,13 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
                 preparedOversightCleanupDirty = false
                 // A durable tombstone is a new settlement fact, not a storage retry. It can
                 // release an owner whose earlier drain met an in-progress deletion.
+                for drain in agentRuntimeStore.retainedDrains {
+                    guard let id = drain.scope.executableHost?.workspaceActivation?.savedCarrierSessionID,
+                          AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: id) else { continue }
+                    preparedOversightPendingVisits.removeValue(forKey: id)
+                    canonicalDeferredVisitTickets.removeValue(forKey: id)
+                    drain.settleAfterDurableDeletion(sessionID: id)
+                }
                 for (id, owner) in retiringPreparedOversightWindows
                     where AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: id)
                     && !preparedOversightHandoffs.contains(id)

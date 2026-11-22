@@ -203,11 +203,10 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
     func testProductionSavedTargetRunsProviderAndRegisteredToolsAndPersistsWithoutWindow() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("SavedHost-\(UUID())")
         defer { try? FileManager.default.removeItem(at: directory) }
-        let root = directory.appendingPathComponent("repo", isDirectory: true)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let git = try ReviewGitRepositoryFixture(name: "SavedHost", parentDirectory: directory)
+        let root = try git.makeRepository(named: "repo", files: ["Witness.swift": "func savedHostNeedle() -> Int { 42 }\n"])
         let file = root.appendingPathComponent("Witness.swift")
-        let source = "let savedHostNeedle = 42\n"
-        try source.write(to: file, atomically: true, encoding: .utf8)
         let script = try AgentSessionLinkACPServerScript.write(to: directory)
         let assistantText = "The saved host completed this controlled turn."
         let provider = AgentSessionLinkCapturingACPProvider(
@@ -241,7 +240,7 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                 fixture.placement.workspace.repoPaths = [root.path]
                 let workspace = fixture.placement.workspace
                 let authority = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: 101)
-                let created = try await authority.create(workspace, fileURL: directory.appendingPathComponent("saved.json"))
+                let created = try await authority.create(workspace, fileURL: fixture.root.appendingPathComponent("saved.json"))
                 XCTAssertEqual(created.disposition, .applied)
                 try await fixture.save(agentKind: "openCode", agentModel: "model-a")
 
@@ -303,11 +302,26 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                             ))
                         }
                     }
+                    await ServerNetworkManager.shared.debugSeedConnectionRunRouting(
+                        connectionID: connectionID, runID: receipt.runID, purpose: .agentModeRun,
+                        windowID: host.routeID, registration: receipt
+                    )
                     let read = try await invoke("read_file", ["path": .string(file.path)])
                     XCTAssertTrue(read.objectValue?["content"]?.stringValue?.contains("savedHostNeedle") == true, "\(read)")
+                    let autoSelected = try await invoke("get_file_tree", ["mode": .string("selected")])
+                    XCTAssertTrue(autoSelected.objectValue?["tree"]?.stringValue?.contains("Witness.swift") == true, "\(autoSelected)")
+                    let structure = try await invoke("get_code_structure", ["paths": .array([.string(file.path)])])
+                    XCTAssertTrue(String(describing: structure).contains("Witness.swift"), "\(structure)")
+                    let worktrees = try await invoke("manage_worktree", ["op": .string("list")])
+                    XCTAssertEqual(worktrees.objectValue?["total_count"]?.intValue, 1, "\(worktrees)")
+                    let history = try await invoke("history", [
+                        "op": .string("list_sessions"), "workspace": .string(workspace.id.uuidString)
+                    ])
+                    XCTAssertTrue(String(describing: history).contains(fixture.sessionID.uuidString), "\(history)")
                     let searched = try await invoke("file_search", ["pattern": .string("savedHostNeedle"), "mode": .string("content")])
                     XCTAssertTrue(String(describing: searched).contains("Witness.swift"), "\(searched)")
-                    let select: [String: Value] = ["op": .string("set"), "paths": .array([.string(file.path)])]
+                    _ = try await invoke("manage_selection", ["op": .string("clear")])
+                    let select: [String: Value] = ["op": .string("SET"), "paths": .array([.string(file.path)])]
                     do {
                         _ = try await invoke("manage_selection", select, grantingAccess: false)
                         XCTFail("A route receipt is not permission to mutate selection")
@@ -321,10 +335,6 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                     let linkRuntime = try XCTUnwrap(host.scope.linkExecution)
                     let endpoint = try XCTUnwrap(linkRuntime.agentSessionLinkObserverEndpoint(tabID: writer.session.tabID))
                     let candidate = try XCTUnwrap(windows.agentSessionLinkCandidate(for: endpoint, includeLocation: false))
-                    await ServerNetworkManager.shared.debugSeedConnectionRunRouting(
-                        connectionID: connectionID, runID: receipt.runID, purpose: .agentModeRun,
-                        windowID: host.routeID, registration: receipt
-                    )
                     let question = Task { @MainActor in
                         try await invoke("ask_user", ["question": .string("Continue the saved session?"), "timeout_seconds": .int(10)])
                     }
@@ -391,6 +401,64 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
             throw error
         }
         _ = await runtime.shutdown()
+    }
+
+    func testDurableDeletionReleasesFailedSavedHostDrainWithoutResumingVisit() async throws {
+        let fixture = Fixture()
+        defer { fixture.cleanUp() }
+        try await CanonicalSavedWorkspaceFixture.run(fixture.placement.workspace) { workspace in
+            let service = AgentSessionDataService.shared
+            let file = try await service.saveAgentSession(.init(
+                id: fixture.sessionID, workspaceID: workspace.id, composeTabID: fixture.tab.id, name: "Saved target"
+            ), for: workspace)
+            let original = try Data(contentsOf: file)
+            let manager = WindowStatesManager.shared
+            manager.attachAgentSessionLinkBridge()
+            manager.beginPreparedOversightPreparation(fixture.sessionID)
+            var holding = true
+            @MainActor func releasePreparation() {
+                guard holding else { return }
+                holding = false
+                manager.endPreparedOversightPreparation(fixture.sessionID)
+            }
+            defer { releasePreparation() }
+            let writer = try await manager.prepareSavedOversightTarget(fixture.sessionID, isStillAuthorized: { true }).get()
+            let host = try XCTUnwrap(writer.scope.executableHost)
+            do {
+                try FileManager.default.removeItem(at: file)
+                try FileManager.default.createDirectory(at: file, withIntermediateDirectories: false)
+                writer.session.organizationalParentID = UUID()
+                writer.session.isDirty = true
+                releasePreparation()
+                try await AsyncTestWait.waitUntil("original saved host retains failed final save") {
+                    if case .retained? = writer.scope.retainedDrain?.outcome { return true }
+                    return false
+                }
+                let drain = try XCTUnwrap(writer.scope.retainedDrain)
+                XCTAssertFalse(host.route.isClosing)
+                manager.queuePreparedRuntimeVisit(fixture.sessionID) { XCTFail("A deleted transcript must not resume its visit") }
+                try FileManager.default.removeItem(at: file)
+                try original.write(to: file, options: .atomic)
+                XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
+                try await service.deleteAgentSession(id: fixture.sessionID, for: workspace)
+                manager.schedulePreparedOversightCleanup()
+                try await AsyncTestWait.waitUntil("physical deletion settles the original saved host") {
+                    drain.outcome == .released && writer.scope.retainedDrain == nil && host.route.isClosing
+                }
+                XCTAssertTrue(writer.scope.hasReleasedWriterClaims)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: file.path), "Retirement must never recreate a deleted payload")
+                XCTAssertTrue(AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: fixture.sessionID))
+            } catch {
+                releasePreparation()
+                if (try? file.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
+                    try? FileManager.default.removeItem(at: file)
+                }
+                let drain = host.beginFinalShutdown()
+                drain.attemptRecovery()
+                _ = await drain.wait(until: .now.advanced(by: .seconds(5)))
+                throw error
+            }
+        }
     }
 
     private func originatingPolicyReceipt(for session: AgentTabSession) async throws -> MCPRunRoutingCleanupReceipt {

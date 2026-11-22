@@ -138,6 +138,7 @@ final class AgentSessionHostDrainRuntime {
     private var participants: [Participant]
     /// Exact acknowledgements returned by Scope.releaseWriterClaim, not elected writers.
     private var releasedParticipants: Set<ObjectIdentifier> = []
+    private var acknowledgedDeletions: Set<UUID> = []
     private var retainedOwner: AnyObject?
     private var adapters: Adapters?
     private var releaseResources: (@MainActor () async -> Void)?
@@ -251,6 +252,17 @@ final class AgentSessionHostDrainRuntime {
     /// Automatic lifecycle entry starts an unstarted drain; it never retries a failure.
     func startIfNeeded() {
         guard task == nil, outcome == nil else { return }
+        attemptRecovery()
+    }
+
+    /// A committed deletion is a new durable acknowledgement, not a retry of the failed save.
+    /// It can release effects for the original object once, without following a new claimant.
+    func settleAfterDurableDeletion(sessionID: UUID) {
+        guard case .retained? = outcome,
+              AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: sessionID),
+              participants.contains(where: { $0.sessionID == sessionID && $0.membership?.isCurrent == true }),
+              acknowledgedDeletions.insert(sessionID).inserted else { return }
+        withdrawDeferredVisit(presenterID: sessionID)
         attemptRecovery()
     }
 

@@ -9464,8 +9464,61 @@ final class SessionAdminInventoryReadTests: XCTestCase {
         try await assertExactTargetFlow(placement: "historical", checksLookout: true)
     }
 
-    func testPreparedSavedOwnerIsReleasedAfterLinkRetirement() async throws {
-        try await assertExactTargetFlow(placement: "historical", retirement: "retire")
+    func testCanonicalSavedOwnerIsReleasedAfterLinkRetirement() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let observerID = UUID(), targetID = UUID()
+            let fixture = try await LoadedWindowFixture.make(activeID: observerID, parentID: nil)
+            do {
+                try fixture.installCarriers()
+                let original = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+                let observerTab = try XCTUnwrap(original.composeTabs.first)
+                let observerVM = fixture.window.agentModeViewModel
+                let observer = observerVM.session(for: observerTab.id)
+                _ = try XCTUnwrap(observerVM.test_installPersistentSessionBinding(sessionID: observerID, on: observer))
+                observer.hasLoadedPersistedState = true
+                observer.recordRestorationAuthoritative(.persistedPayloadApplied)
+                observer.selectedAgent = .claudeCode
+                let historical = ComposeTabState(name: "Historical carrier", activeAgentSessionID: UUID())
+                var workspace = original
+                workspace.composeTabs.append(historical)
+                workspace.customStoragePath = fixture.directory.appendingPathComponent("canonical-sessions")
+                try await CanonicalSavedWorkspaceFixture.run(workspace) { canonical in
+                    _ = try await AgentSessionDataService.shared.saveAgentSession(
+                        AgentSession(id: targetID, workspaceID: canonical.id, composeTabID: historical.id, name: "Saved historical target"),
+                        for: canonical
+                    )
+                    let manager = WindowStatesManager.shared
+                    manager.attachAgentSessionLinkBridge()
+                    let host = SessionAdminWindowsStructureHost()
+                    let windowCount = WindowState.windowCounter
+                    let result = await host.addLink(observer: observerID, target: targetID, isStillAuthorized: { true })
+                    guard case .linked = result else { throw SessionAdminHostError.invalid("Canonical saved link failed: \(result)") }
+                    let command = try XCTUnwrap(SessionAdminWindows.command(for: targetID))
+                    let executable = try XCTUnwrap(command.writer.scope.executableHost)
+                    XCTAssertEqual(executable.route.identity.kind, .independent)
+                    XCTAssertEqual(command.writer.session.tabID, historical.id)
+                    XCTAssertEqual(command.writer.session.activeAgentSessionID, targetID)
+                    XCTAssertEqual(WindowState.windowCounter, windowCount)
+                    XCTAssertEqual(fixture.window.promptManager.activeComposeTabID, observerTab.id)
+                    XCTAssertNil(observerVM.sessions[historical.id])
+                    manager.schedulePreparedOversightCleanup()
+                    await manager.preparedOversightCleanupTask?.value
+                    XCTAssertTrue(command.isCurrent, "A valid link must keep its original idle owner")
+                    let stopped = await host.stopLink(observer: observerID, target: targetID, isStillAuthorized: { true })
+                    guard case .stopped = stopped else { throw SessionAdminHostError.invalid("Canonical saved unlink failed: \(stopped)") }
+                    manager.schedulePreparedOversightCleanup()
+                    try await AsyncTestWait.waitUntil("unlink drains original saved host", timeout: 5) {
+                        executable.scope.hasReleasedWriterClaims && executable.scope.retainedDrain == nil && executable.route.isClosing
+                    }
+                    XCTAssertFalse(command.isCurrent)
+                    XCTAssertNil(try SessionAdminWindows.command(for: targetID))
+                }
+            } catch {
+                await fixture.cleanup()
+                throw error
+            }
+            await fixture.cleanup()
+        }
     }
 
     func testPreparedOwnerRetirementBlocksAdmissionAndResumesLatestVisitAfterDrain() async throws {
