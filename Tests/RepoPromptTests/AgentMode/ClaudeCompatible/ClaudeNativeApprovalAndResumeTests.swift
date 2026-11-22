@@ -3372,7 +3372,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
             let started = ContinuousClock.now
             try await feed(assistant("first-live"), f.controller)
             await until("hold the adoption gap", timeout: .seconds(120)) { resume != nil }
-            let busy = await f.harness.host.preparedOversightRuntimeIsBusy()
+            let busy = !f.harness.host.runtimeSessionStore.settlement(for: f.session).canJoinHostDrain
             XCTAssertTrue(busy)
             await f.controller.test_handleConfigurationStdoutChunk(bytes)
             await until("the whole burst is parked", timeout: .seconds(120)) { receivedCompletions == 2 }
@@ -3745,7 +3745,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         XCTAssertTrue(f.listener.isBusy)
         XCTAssertTrue(f.session.mcpFollowUpRunPending)
         XCTAssertEqual(f.harness.host.mcpRuntime.mcpSnapshot(for: f.session)?.status, .running)
-        let busy = await f.harness.host.preparedOversightRuntimeIsBusy()
+        let busy = !f.harness.host.runtimeSessionStore.settlement(for: f.session).canJoinHostDrain
         XCTAssertTrue(busy)
         let adoption = f.listener.adoptionTask
         await f.harness.host.cancelAgentRun(tabID: f.session.tabID)

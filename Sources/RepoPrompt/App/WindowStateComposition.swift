@@ -206,8 +206,6 @@ enum WindowStateCompositionFactory {
         codexModelPollingService: CodexModelPollingService = .shared,
         modelRouterRuntime injectedModelRouterRuntime: AgentTaskRouterRuntime? = nil,
         agentModeViewModelFactory: AgentModeViewModelFactory? = nil,
-        sessionRuntimeWorkspace: WorkspaceModel? = nil,
-        borrowedAPISettingsViewModel: APISettingsViewModel? = nil,
         visibleAgentProviderResources: AgentRunProviderComposition? = nil
     ) -> WindowStateComposition {
         WorkspaceContextStartupInstrumentation.install(AppWorkspaceStartupEventRecorder())
@@ -240,7 +238,7 @@ enum WindowStateCompositionFactory {
             ?? AIQueriesService(keyManager: keyManager)
 
         // 3) API Settings
-        let apiSettingsViewModel = borrowedAPISettingsViewModel ?? APISettingsViewModel(
+        let apiSettingsViewModel = APISettingsViewModel(
             aiQueriesService: aiQueriesService,
             keyManager: keyManager,
             loadStoredDataOnInit: loadStoredAPISettingsDataOnInit && automaticProviderModelDiscoveryEnabled,
@@ -258,23 +256,17 @@ enum WindowStateCompositionFactory {
             windowID: windowID,
             settingsManager: settingsManager,
             storedPromptPersistence: storedPromptPersistence,
-            // The borrowed API owner is already live. A second prompt's startup refresh reloads
-            // stored connection flags over it; it must not reset the canonical live connection.
-            refreshAvailableModelsOnInit: sessionRuntimeWorkspace == nil
-                && loadStoredAPISettingsDataOnInit && automaticProviderModelDiscoveryEnabled,
+            refreshAvailableModelsOnInit: loadStoredAPISettingsDataOnInit && automaticProviderModelDiscoveryEnabled,
             perfRecorder: AppAgentModePerfRecorder()
         )
 
-        // 7) Create the workspace manager with construction-time runtime persistence ownership.
-        // A nonvisual runtime shares MCP routing, but never owns or projects the visible workspace
-        // document. Its one-carrier snapshot is read-only placement, not a second workspace writer.
-        let domainWorkspaceClient = sessionRuntimeWorkspace == nil ? domainRuntime.map {
+        // 7) The workspace manager projects the domain's workspace authority into this presenter.
+        let domainWorkspaceClient = domainRuntime.map {
             DomainWorkspaceAuthorityClient(store: $0.workspaceStore, windowID: windowID, metadataPathPolicy: $0.configuration.metadataPathPolicy)
-        } : nil
+        }
         let workspaceManager = WorkspaceManagerViewModel(
             fileManager: workspaceFilesViewModel,
             promptViewModel: promptManager,
-            sessionRuntimeWorkspace: sessionRuntimeWorkspace,
             workspaceSearchService: workspaceSearchService,
             domainWorkspaceAuthorityClient: domainWorkspaceClient,
             switchTimingPolicy: workspaceSwitchTimingPolicy,
@@ -413,7 +405,7 @@ enum WindowStateCompositionFactory {
                 perfRecorder: AppAgentModePerfRecorder()
             )
         }
-        if sessionRuntimeWorkspace == nil, agentModeViewModelFactory == nil, let domainRuntime {
+        if agentModeViewModelFactory == nil, let domainRuntime {
             agentModeViewModel.canonicalWorkspaceHostPreparation = { workspace, owner, activations in
                 try await prepareVisibleAgentHost(
                     workspace: workspace, owner: owner, activations: activations,
@@ -434,7 +426,7 @@ enum WindowStateCompositionFactory {
             {
                 return writer.session === session && writer.isCurrent && activation.owns(scope: writer.scope, route: host.route)
             }
-            guard sessionRuntimeWorkspace != nil || domainRuntime == nil || agentModeViewModelFactory != nil else { return false }
+            guard domainRuntime == nil || agentModeViewModelFactory != nil else { return false }
             let census = AgentSessionCarrierResolver.capture(
                 windows: WindowStatesManager.shared.allWindows,
                 sessionIDs: [id],

@@ -45,7 +45,10 @@ extension MCPHostRouteResources {
         else {
             throw AgentHostWorkspaceResources.Failure.authorityUnavailable
         }
-        if usesHostCapabilities, await hasActiveCatalog() { return }
+        if usesHostCapabilities, await hasActiveCatalog() {
+            guard hasHostTransport(service) else { throw RegistrationFailure.differentCatalog }
+            return
+        }
         let history = MCPHistoryToolProvider(workspaceLocations: historyWorkspaceLocations)
         let hostTools: Set<String> = [
             MCPWindowToolName.askUser, MCPWindowToolName.manageSelection, MCPWindowToolName.agentSessionLink,
@@ -133,10 +136,12 @@ extension MCPHostRouteResources {
         do {
             _ = try await registerCatalog(MCPAppToolCatalogRegistration(
                 windowID: identity.routeID, providers: [], sharedBindings: bindings, runtime: binder,
-                hostInteractionAdapter: interactions
+                hostInteractionAdapter: interactions, hostTransport: service
             ))
         } catch RegistrationFailure.differentCatalog {
-            guard usesHostCapabilities, await hasActiveCatalog() else { throw RegistrationFailure.differentCatalog }
+            guard usesHostCapabilities, await hasActiveCatalog(), hasHostTransport(service) else {
+                throw RegistrationFailure.differentCatalog
+            }
         }
     }
 

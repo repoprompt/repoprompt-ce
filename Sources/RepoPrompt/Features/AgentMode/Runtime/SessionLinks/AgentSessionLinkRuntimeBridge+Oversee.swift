@@ -26,7 +26,25 @@ extension AgentSessionLinkRuntimeBridge {
         guard targetSessionID != observer.sessionID else {
             return refusal("link_refused", subreason: "self_monitor", detail: "A session cannot oversee itself. Choose a different target.")
         }
-        if let reason = await WindowStatesManager.shared.checkSavedOversightTarget(targetSessionID) {
+        let reason = message.map { "Oversee only this target, establish its link, and deliver the requested message: \($0)" }
+            ?? "Oversee only this target: view, manage and establish its link."
+        func replayIfRetained() async -> Value? {
+            guard let replay = scopes.retainedOverseeInitialOutcome(
+                requesterSessionID: observer.sessionID, targetSessionID: targetSessionID, reason: reason, idempotencyKey: idempotencyKey
+            ) else { return nil }
+            guard !Task.isCancelled, await revalidateObserver(endpoint: observer), !Task.isCancelled else {
+                return refusal("request_refused", subreason: "caller_changed", detail: "The requesting session's exact binding changed.")
+            }
+            switch replay {
+            case let .success(outcome): return outcome
+            case .failure:
+                return refusal("request_refused", subreason: "idempotency_conflict", detail: "The retained request is for a different target or instruction.")
+            }
+        }
+        if let replay = await replayIfRetained() { return replay }
+        let preparationFailure = await WindowStatesManager.shared.checkSavedOversightTarget(targetSessionID)
+        if let replay = await replayIfRetained() { return replay }
+        if let reason = preparationFailure {
             return refusal(
                 "target_not_preparable",
                 subreason: reason.rawValue,
@@ -40,9 +58,7 @@ extension AgentSessionLinkRuntimeBridge {
             requesterSessionID: observer.sessionID, requesterTabID: observer.tabID,
             kind: .session(targetSessionID: targetSessionID),
             capabilities: [.observe, .control, .restructure], guardrails: .init(),
-            reason: message == nil
-                ? "Oversee only this target: view, manage and establish its link."
-                : "Oversee only this target, establish its link, and deliver the requested message: \(message!)",
+            reason: reason,
             idempotencyKey: idempotencyKey, reusePendingOnly: true
         )
         guard case let .success(request) = requested else {
@@ -216,7 +232,7 @@ extension AgentSessionLinkRuntimeBridge {
         }
         func consentIsCurrent() -> Bool {
             scopes.reconcileGlobalAutoApprove()
-            return !Task.isCancelled && scopes.linkConsent.permits(
+            return !Task.isCancelled && exactOverseeRequesterIsCurrent(observer) && scopes.linkConsent.permits(
                 scopeID: scopeID, observer: observer.sessionID, target: targetSessionID, at: Date()
             )
         }
@@ -240,11 +256,36 @@ extension AgentSessionLinkRuntimeBridge {
             finish(interruptionCode(), subreason: "before_link", detail: "The current caller/consent fence refused linking; nothing delivered.")
             return
         }
+        let targetWriter: AgentSessionRuntimeStore.Writer
         do {
-            let outcome = try await sessionAdministrationFrontDoor.perform(AgentSessionAdministrationRequest(
+            // Only an approved continuation may materialize a saved writer. The session scope
+            // needs authoritative placement even when the target has no loaded UI index.
+            let owners = WindowStatesManager.shared
+            owners.beginPreparedOversightPreparation(targetSessionID)
+            defer { owners.endPreparedOversightPreparation(targetSessionID) }
+            let prepared = await owners.prepareSavedOversightTarget(targetSessionID, isStillAuthorized: consentIsCurrent)
+            guard consentIsCurrent(), await revalidateObserver(endpoint: observer), consentIsCurrent() else {
+                finish(interruptionCode(), subreason: "after_preparation", detail: "The exact caller or consent changed before linking. Nothing was delivered.")
+                return
+            }
+            switch prepared {
+            case let .success(writer): targetWriter = writer
+            case let .failure(reason):
+                finish("link_refused", subreason: reason.rawValue, detail: "The approved target could not be prepared. Nothing was delivered.")
+                return
+            }
+            guard targetWriter.isCurrent else {
+                finish("link_refused", subreason: "target_binding_changed", detail: "The prepared target changed before linking. Nothing was delivered.")
+                return
+            }
+            let request = AgentSessionAdministrationRequest(
                 operation: .adminLink, caller: .agentSession(observer.sessionID), callerTabID: observer.tabID,
                 scopeID: scopeID, targetSessionIDs: [targetSessionID], idempotencyKey: "oversee-link:\(requestID.uuidString)"
-            ))
+            )
+            let origin = AppSavedAgentSessionExecution.ApprovedLinkOrigin(observer: observer, target: targetWriter.identity)
+            let outcome: AgentSessionAdministrationOutcome = try await AppSavedAgentSessionExecution.approvedLinkOrigin.withValue(origin) {
+                try await sessionAdministrationFrontDoor.perform(request)
+            }
             guard case let .completed(value) = outcome,
                   case let .array(items) = value.objectValue?["items"],
                   case let .string(result) = items.first?.objectValue?["result"], ["linked", "already_linked"].contains(result)
@@ -275,12 +316,12 @@ extension AgentSessionLinkRuntimeBridge {
             finish(interruptionCode(), subreason: "before_delivery", detail: "The link committed but consent ended before delivery. Nothing was delivered; inspect scope_status before making a new task request.")
             return
         }
-        guard case let .success(target) = authorization else {
+        guard case let .success(target) = authorization, targetWriter.isCurrent else {
             finish("control_unavailable", subreason: "steer_authorization_refused", detail: "The link committed, but the current link/endpoint fence refused management. Nothing was delivered. Inspect scope_status and restore management before a new task request.")
             return
         }
         let before = await targetState(for: target.lease)
-        guard consentIsCurrent(), await revalidateObserver(endpoint: observer), consentIsCurrent() else {
+        guard consentIsCurrent(), await revalidateObserver(endpoint: observer), consentIsCurrent(), targetWriter.isCurrent else {
             finish(interruptionCode(), subreason: "delivery_entry", detail: "The link committed, but the final caller/consent fence refused delivery. Nothing was delivered. Inspect scope_status before a new task request.")
             return
         }

@@ -4,7 +4,15 @@ import RepoPromptACPProviders
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptMCPServer
+import RepoPromptSettingsCore
 import XCTest
+
+private actor SavedHostListenerProbe {
+    private(set) var startCount = 0
+    func start() {
+        startCount += 1
+    }
+}
 
 @MainActor
 final class AgentSavedSessionTargetLoaderTests: XCTestCase {
@@ -209,6 +217,16 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
         let file = root.appendingPathComponent("Witness.swift")
         let script = try AgentSessionLinkACPServerScript.write(to: directory)
         let assistantText = "The saved host completed this controlled turn."
+        let preferences = GlobalSettingsStore.shared
+        let previousAutoStart = preferences.mcpAutoStart()
+        preferences.setMCPAutoStart(false, commit: false)
+        defer { preferences.setMCPAutoStart(previousAutoStart, commit: false) }
+        let listener = SavedHostListenerProbe()
+        let transport = MCPService(
+            controller: ServerController(), hostBootstrapOperation: {},
+            controllerStartOperation: { await listener.start() }, controllerFullShutdownOperation: {}
+        )
+        addTeardownBlock { await transport.fullShutdown() }
         let provider = AgentSessionLinkCapturingACPProvider(
             providerID: .openCode, commandPath: script.path, environment: ["ACP_ASSISTANT_TEXT_ON_PROMPT": assistantText]
         )
@@ -221,7 +239,7 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
             acp: { _, _ in provider }, controller: {
                 try ACPAgentSessionController(provider: $0, runRequest: $1, allowsProviderProcessLaunchForTesting: true)
             }
-        ), settings: settings)
+        ), settings: settings, mcpTransport: transport)
         let runtime = MCPDomainRuntime(configuration: .init(
             mode: .app, profileIdentifier: "saved-host-\(UUID())", storageDirectory: directory,
             workspaceStorageDirectory: directory.appendingPathComponent("workspaces"),
@@ -266,6 +284,8 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                     XCTAssertEqual(reused.identity, writer.identity)
                     XCTAssertTrue(reused.scope.executableHost === host)
                     XCTAssertEqual(writer.session.selectedAgent, .openCode)
+                    let startsBeforeRun = await listener.startCount
+                    XCTAssertEqual(startsBeforeRun, 0, "Catalog registration and saved hydration do not start the listener")
                     let message = "Continue the original saved chat"
                     let start = AgentRunStartOutcomeRecorder()
                     let command = try writer.admitCommand().get()
@@ -273,6 +293,13 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                     XCTAssertTrue(start.outcome.didStart)
                     XCTAssertFalse(writer.scope.isRetiring)
                     let receipt = try await originatingPolicyReceipt(for: writer.session)
+                    let startsOnRun = await listener.startCount
+                    XCTAssertEqual(startsOnRun, 1, "First provider bootstrap brings up its exact registered transport")
+                    let stillReady = await host.route.ensureHostProviderTransport()
+                    XCTAssertTrue(stillReady)
+                    let startsOnReuse = await listener.startCount
+                    XCTAssertEqual(startsOnReuse, 1, "Another request joins the same listener")
+                    XCTAssertFalse(preferences.mcpAutoStart(), "Demand-driven bootstrap must not modify Auto Start")
                     let connectionID = UUID()
                     let installation = await host.route.installPendingPolicy(receipt, connectionID: connectionID, clientName: nil, tabID: stash.tab.id)
                     let token = try XCTUnwrap(installation?.token)
@@ -494,7 +521,7 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
             }
             let result = await f.load(originalColdWriter: writer)
             if replace {
-                await assertFailure(result, reason: .lookup(.changed), effects: .loadingClaimDisplaced)
+                assertFailure(result, reason: .lookup(.changed), effects: .loadingClaimDisplaced)
                 XCTAssertTrue(f.scope.sessions[f.tab.id] === successor)
                 XCTAssertFalse(successor.hasLoadedPersistedState)
                 XCTAssertTrue(successor.items.isEmpty)

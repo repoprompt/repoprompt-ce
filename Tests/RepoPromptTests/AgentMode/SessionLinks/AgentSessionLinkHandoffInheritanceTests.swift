@@ -5317,13 +5317,16 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 let workspaceIndex = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == workspaceID })
                 manager.workspaces[workspaceIndex].composeTabs.append(contentsOf: savedTabs)
                 for (id, tab) in zip(preparedIDs, preparedTabs) {
-                    let prepared = await first.viewModel.prepareSavedOversightSession(
-                        tabID: tab,
-                        sessionID: id,
-                        workspaceID: workspaceID,
-                        isStillAuthorized: { true }
-                    )
-                    XCTAssertTrue(prepared)
+                    // These seven nodes belong to the already composed legacy window; load
+                    // its ordinary bound tabs without invoking saved-target preparation.
+                    let session = first.viewModel.session(for: tab)
+                    if session.activeAgentSessionID == nil {
+                        _ = try XCTUnwrap(first.viewModel.test_installPersistentSessionBinding(sessionID: id, on: session))
+                    }
+                    let loaded = await first.viewModel.ensureSessionReady(tabID: tab, reconnectActiveProviders: false)
+                    XCTAssertTrue(loaded === session)
+                    XCTAssertEqual(loaded.activeAgentSessionID, id)
+                    XCTAssertTrue(loaded.permitsBoundOperationAndSave)
                 }
                 let preparedAt = clock.now
                 // An agreeing recovered catalog replica does not become a second payload writer.

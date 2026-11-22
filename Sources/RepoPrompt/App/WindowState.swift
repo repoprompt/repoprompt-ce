@@ -217,7 +217,7 @@ class WindowState: ObservableObject {
     // MARK: - Shared Services
 
     /// Single shared MCP service instance across all windows
-    static let sharedMCPService = MCPService()
+    static let sharedMCPService = AppGlobalMCPServiceComposition.transport
 
     // MARK: - Window identification
 
@@ -570,7 +570,6 @@ class WindowState: ObservableObject {
         if !manager.isTerminating, preservingOversightIntent {
             AgentSessionLinkRuntimeBridge.shared.noteOversightWindowClosing(windowID: windowID)
         }
-        if !isPreparedSessionOwner { manager.detachPreparedRuntimeCarriers(from: self) }
         isClosing = true
         if !manager.isTerminating, !isPreparedSessionOwner, preservingOversightIntent, !isRequestingWorkspaceDeletionClose,
            let host = agentModeViewModel.detachExecutionForWindowClose()
@@ -686,11 +685,11 @@ class WindowState: ObservableObject {
             await domainWorkspacePresentationBridge?.stopAndJoinForTesting()
         }
 
-        convenience init(domainRuntime: MCPDomainRuntime, visibleAgentProviderResources: AgentRunProviderComposition) {
+        convenience init(domainRuntime: MCPDomainRuntime, visibleAgentProviderResources: AgentRunProviderComposition, mcpTransport: MCPService) {
             self.init(
                 contextBuilderProviderFactory: nil, loadStoredAPISettingsDataOnInit: false,
                 codexModelPollingService: .shared, automaticProviderModelDiscoveryEnabled: false,
-                domainRuntimeOverride: domainRuntime, visibleAgentProviderResources: visibleAgentProviderResources
+                domainRuntimeOverride: domainRuntime, visibleAgentProviderResources: visibleAgentProviderResources, mcpTransport: mcpTransport
             )
         }
 
@@ -753,69 +752,9 @@ class WindowState: ObservableObject {
 
     #endif
 
-    #if DEBUG
-        /// Legacy fixture construction only. The production saved caller composes an executable host.
-        static func makePreparedSessionOwner(
-            workspace: WorkspaceModel,
-            borrowing source: WindowState,
-            agentModeViewModelFactory: WindowStateCompositionFactory.AgentModeViewModelFactory? = nil
-        ) -> WindowState {
-            guard let settingsLease = APISettingsRuntimeLease.acquire(from: source.apiSettingsViewModel) else {
-                preconditionFailure("Prepared owner requires live settings")
-            }
-            return WindowState(
-                contextBuilderProviderFactory: nil, loadStoredAPISettingsDataOnInit: false,
-                codexModelPollingService: .shared, domainRuntimeOverride: source.compositionDomainRuntime,
-                keyManager: source.keyManager,
-                agentModeViewModelFactory: agentModeViewModelFactory, sessionRuntimeWorkspace: workspace,
-                borrowedAPISettingsViewModel: source.apiSettingsViewModel,
-                managedSettingsLease: settingsLease
-            )
-        }
-    #endif
-
-    let isPreparedSessionOwner: Bool
-    private let compositionDomainRuntime: MCPDomainRuntime?
-    private var didReleaseManagedSettings = false
-    private let managedSettingsLease: APISettingsRuntimeLease?
-    private var preparedSessionTeardownTask: Task<Bool, Never>?
-    var isPreparedSessionTeardownInFlight: Bool {
-        preparedSessionTeardownTask != nil
-    }
-
-    /// Retire the private route and its provider/session work, not the app-wide MCP listener or
-    /// borrowed API settings. This owner has no window settings or placement document to persist.
-    @discardableResult
-    func tearDownPreparedSessionOwner() async -> Bool {
-        guard isPreparedSessionOwner else { return false }
-        if let preparedSessionTeardownTask { return await preparedSessionTeardownTask.value }
-        if didReleaseManagedSettings { return true }
-        agentModeViewModel.beginPreparedOversightRetirement()
-        beginClose()
-        let task = Task { @MainActor in
-            // beginClose cancels reconciliation; join it before releasing this private owner so a
-            // late root load cannot outlive failed-command cleanup and observe a removed repository.
-            await self.workspaceManager.awaitRootReconciliationShutdown()
-            guard await self.agentModeViewModel.finishPreparedOversightRuntime() else { return false }
-            await self.mcpServer.unregisterDomainRoutingWindow()
-            self.mcpServer.stopServiceObservation()
-            await self.promptManager.gitViewModel.shutdownForWindowClose()
-            self.aiQueriesService.cancelQuery()
-            guard self.agentModeViewModel.releasePreparedOversightWriterAfterDrain() else { return false }
-            // This adapter has no visible window. Retire its private roots/observers as well as
-            // the writer; do not leave metadata reconciliation running until eventual deallocation.
-            await self.workspaceFilesViewModel.unloadAllRootFolders()
-            if !self.didReleaseManagedSettings {
-                self.didReleaseManagedSettings = true
-                self.managedSettingsLease?.release()
-            }
-            return true
-        }
-        preparedSessionTeardownTask = task
-        let saved = await task.value
-        preparedSessionTeardownTask = nil
-        return saved
-    }
+    /// Compatibility for visible-presentation lifetime callers pending their census cleanup.
+    /// All WindowStates are now presenters; saved execution never constructs one.
+    let isPreparedSessionOwner = false
 
     private init(
         contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory?,
@@ -827,20 +766,15 @@ class WindowState: ObservableObject {
         domainRuntimeOverride: MCPDomainRuntime?,
         keyManager injectedKeyManager: KeyManager? = nil,
         agentModeViewModelFactory: WindowStateCompositionFactory.AgentModeViewModelFactory? = nil,
-        sessionRuntimeWorkspace: WorkspaceModel? = nil,
-        borrowedAPISettingsViewModel: APISettingsViewModel? = nil,
-        managedSettingsLease: APISettingsRuntimeLease? = nil,
-        visibleAgentProviderResources: AgentRunProviderComposition? = nil
+        visibleAgentProviderResources: AgentRunProviderComposition? = nil,
+        mcpTransport: MCPService? = nil
     ) {
-        self.managedSettingsLease = managedSettingsLease
-        isPreparedSessionOwner = sessionRuntimeWorkspace != nil
-        compositionDomainRuntime = domainRuntimeOverride
         // Assign a unique window ID
         windowID = WindowState.allocateWindowID()
         let manager = WindowStatesManager.shared
 
-        let claimedInitialRefreshDeferral = sessionRuntimeWorkspace == nil ? manager.claimInitialRefreshDeferralForNewWindow() : nil
-        let deferredInitialAgentSystemWorkspaceRefresh = sessionRuntimeWorkspace != nil || claimedInitialRefreshDeferral != nil
+        let claimedInitialRefreshDeferral = manager.claimInitialRefreshDeferralForNewWindow()
+        let deferredInitialAgentSystemWorkspaceRefresh = claimedInitialRefreshDeferral != nil
         claimedInitialRefreshDeferralID = claimedInitialRefreshDeferral?.id
         claimedInitialRefreshDeferralWaiterID = claimedInitialRefreshDeferral?.waiterID
 
@@ -851,7 +785,7 @@ class WindowState: ObservableObject {
         let composition = WindowStateCompositionFactory.make(
             windowID: windowID,
             deferredInitialAgentSystemWorkspaceRefresh: deferredInitialAgentSystemWorkspaceRefresh,
-            sharedMCPService: Self.sharedMCPService,
+            sharedMCPService: mcpTransport ?? Self.sharedMCPService,
             domainRuntime: domainRuntimeOverride,
             contextBuilderProviderFactory: contextBuilderProviderFactory,
             keyManager: injectedKeyManager,
@@ -861,8 +795,6 @@ class WindowState: ObservableObject {
             automaticProviderModelDiscoveryEnabled: automaticProviderModelDiscoveryEnabled,
             codexModelPollingService: codexModelPollingService,
             agentModeViewModelFactory: agentModeViewModelFactory,
-            sessionRuntimeWorkspace: sessionRuntimeWorkspace,
-            borrowedAPISettingsViewModel: borrowedAPISettingsViewModel,
             visibleAgentProviderResources: visibleAgentProviderResources
         )
         compositionSpan.end()
@@ -889,10 +821,6 @@ class WindowState: ObservableObject {
         chatDataService = composition.chatDataService
         workspaceManager = composition.workspaceManager
         domainWorkspacePresentationBridge = composition.domainWorkspacePresentationBridge
-
-        // A prepared session is deliberately absent from the UI window/restore registry. The
-        // ordinary run, save, endpoint and MCP owners above are retained without UI startup work.
-        if isPreparedSessionOwner { return }
 
         workspaceManager.isUnusedAutomaticChat = { [weak oracleViewModel] id in
             oracleViewModel?.isUnusedImplicitDefaultChat(id) == true

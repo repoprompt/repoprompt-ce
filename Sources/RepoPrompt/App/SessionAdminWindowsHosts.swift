@@ -82,52 +82,6 @@ enum SessionAdminWindows {
     }
 }
 
-/// A saved carrier witness, not a permission. Preparation borrows its workspace/tab in a private
-/// runtime composition; the real tab, stash and active workspace are never edited.
-@MainActor
-struct SavedOversightSessionLocation {
-    weak var window: WindowState?
-    let workspace: WorkspaceModel
-    let tab: ComposeTabState
-    let stashedTabID: UUID?
-    let entry: AgentSessionIndexEntry
-
-    var isCurrent: Bool {
-        guard let window,
-              let current = window.workspaceManager.workspace(withID: workspace.id) else { return false }
-        if window.workspaceManager.activeWorkspaceID == workspace.id,
-           let latest = window.agentModeViewModel.ownerValidatedSessionIndex[entry.id],
-           latest.tabID != entry.tabID || latest.parentSessionID != entry.parentSessionID
-           || latest.createdByOverseerSessionID != entry.createdByOverseerSessionID
-           || latest.organizationalParentID != entry.organizationalParentID
-           || latest.delegationScopeID != entry.delegationScopeID { return false }
-        let tabs = current.composeTabs.filter { $0.id == tab.id }
-        let stashes = current.stashedTabs.filter { $0.tab.id == tab.id }
-        // The target's carrier and provenance matter, not the other chat currently displayed
-        // in it. Stashing/unstashing is UI placement, not withdrawal of managed-task consent.
-        return tabs.count + stashes.count == 1
-    }
-
-    func agreesOnCarrierAndProvenance(with other: Self) -> Bool {
-        workspace.id == other.workspace.id && tab.id == other.tab.id
-            && entry.parentSessionID == other.entry.parentSessionID
-            && entry.createdByOverseerSessionID == other.entry.createdByOverseerSessionID
-            && entry.organizationalParentID == other.entry.organizationalParentID
-            && entry.delegationScopeID == other.entry.delegationScopeID
-    }
-
-    var runtimeWorkspace: WorkspaceModel {
-        var copy = workspace
-        var carrier = tab
-        carrier.name = entry.name
-        carrier.activeAgentSessionID = entry.id
-        copy.composeTabs = [carrier]
-        copy.stashedTabs = []
-        copy.activeComposeTabID = carrier.id
-        return copy
-    }
-}
-
 @MainActor
 final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
     /// Outcome of preparing a saved or never-visited session without opening its tab.
@@ -169,6 +123,12 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         sessionID: UUID, preparation: Preparation?, isStillAuthorized: @escaping @MainActor () -> Bool
     ) async throws -> AgentSessionRuntimeStore.Command? {
         guard isStillAuthorized(), !Task.isCancelled else { throw SessionAdminHostError.authorityEnded }
+        if let expected = AppSavedAgentSessionExecution.approvedLinkOrigin.get()?.target, expected.sessionID == sessionID {
+            guard let command = try SessionAdminWindows.command(for: sessionID), command.identity == expected else {
+                throw preparationRefusal(.changed)
+            }
+            return command
+        }
         if let command = try SessionAdminWindows.preparedCommand(for: sessionID, allowingPreparation: true) { return command }
         guard let preparation else { return nil }
         let outcome = await preparation(sessionID, isStillAuthorized)
@@ -278,6 +238,11 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         let initialObservers = WindowStatesManager.shared.agentSessionLinkCandidates(forSessionIDs: [observer], includeLocation: false)
         guard let initialObserver = initialObservers[observer]?.only?.domainEndpoint else {
             return .failed("observer_changed: The requesting session has no exact current binding; nothing was linked.")
+        }
+        if let origin = AppSavedAgentSessionExecution.approvedLinkOrigin.get(),
+           origin.observer != initialObserver || origin.target.sessionID != target
+        {
+            return .failed("observer_changed: The approved continuation lost its original bindings; nothing was linked.")
         }
         manager.beginPreparedOversightPreparation(target)
         defer { manager.endPreparedOversightPreparation(target) }
