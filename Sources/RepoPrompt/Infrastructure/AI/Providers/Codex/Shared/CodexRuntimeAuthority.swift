@@ -36,7 +36,9 @@ extension CodexProviderRuntime.Runtime {
 /// lookup are intentionally not runtime authorities.
 enum CodexRuntimeAuthority {
     static let bundledVersion = Version(major: 0, minor: 170, patch: 0)
-    static let minimumExternalVersion = Version(major: 0, minor: 149, patch: 0)
+    // Older runtimes do not participate in the rollout writer lock. Both runtime
+    // selections use the same managed home, including after a preference change.
+    static let minimumExternalVersion = Version(major: 0, minor: 155, patch: 0)
     static let externalExecutableOverrideEnvironmentKey = "REPOPROMPT_CODEX_EXECUTABLE"
 
     /// The persisted preference captured for this application process. Settings writes remain

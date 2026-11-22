@@ -66,7 +66,7 @@ var repoPromptAppDependencies: [Target.Dependency] = [
     "RepoPromptRegexCore",
     "RepoPromptWorkspaceCore",
     "RepoPromptShared",
-    "RepoPromptC", "CSwiftPCRE2",
+    "RepoPromptC", "CSwiftPCRE2", "CCodexZstdDecoder",
     "Sparkle",
     .product(name: "Logging", package: "swift-log"),
     .product(name: "KeyboardShortcuts", package: "KeyboardShortcuts"),
@@ -427,6 +427,7 @@ let package = Package(
             path: "Tests/RepoPromptMCPServerTests",
             swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
         ),
+        .target(name: "CCodexZstdDecoder", path: "Vendor/Zstandard"),
         .target(
             name: "RepoPromptApp",
             dependencies: repoPromptAppDependencies,
