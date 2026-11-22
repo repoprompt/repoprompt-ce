@@ -20,13 +20,16 @@ extension AgentSessionRuntimeHost {
     /// Confirmed deletion must join exact detached owners too. A timeout does not transfer
     /// authority to remove storage while an originating provider or writer is still draining.
     static func drainRetainedHostsForWorkspaceDeletion(
-        token: WorkspaceDeletionCancellationToken, until deadline: ContinuousClock.Instant
+        workspaceID: UUID, until deadline: ContinuousClock.Instant, isAdmitted: @MainActor () -> Bool
     ) async -> Bool {
-        guard token.isActive, !Task.isCancelled, ContinuousClock.now < deadline else { return false }
+        func canContinue() -> Bool {
+            !Task.isCancelled && ContinuousClock.now < deadline && isAdmitted()
+        }
+        guard canContinue() else { return false }
         let store = AgentSessionRuntimeStore.shared
         func retainedHosts() -> [AgentSessionRuntimeHost] {
             (store.retainedExecutionHosts + store.retainedDrains.compactMap(\.scope.executableHost)).filter {
-                $0.route.identity.kind == .independent && $0.workspaceActivation?.key.owner.workspaceID == token.workspaceID
+                $0.route.identity.kind == .independent && $0.workspaceActivation?.key.owner.workspaceID == workspaceID
             }
         }
         var seen = Set<ObjectIdentifier>()
@@ -36,9 +39,9 @@ extension AgentSessionRuntimeHost {
             return host.beginAuthorizedRetirement()
         }
         for drain in drains {
-            guard token.isActive, !Task.isCancelled, await drain.wait(until: deadline) == .released else { return false }
+            guard canContinue(), await drain.wait(until: deadline) == .released, canContinue() else { return false }
         }
-        return token.isActive && !Task.isCancelled && ContinuousClock.now < deadline && retainedHosts().isEmpty
+        return canContinue() && retainedHosts().isEmpty
     }
 
     /// Invoked only after the process-lifetime deletion fence commits. The caller can time out
@@ -55,7 +58,7 @@ extension AgentSessionRuntimeHost {
             return retiring
         }
         let drain = AgentSessionHostDrainRuntime.beginDeletion(scope: host.scope, session: writer.session, owner: host, adapters: host.drainAdapters())
-        WindowStatesManager.shared.observeAgentHostDrainRecovery(drain)
+        host.scope.persistence.observeRetainedVisibleDrain?(drain)
         host.prepareCancellation(drain: drain, sessions: [writer.session])
         drain.startIfNeeded()
         return drain

@@ -1629,9 +1629,13 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         case .sessionDeletion:
             return XCTFail("Single-session deletion must use the session data service.")
         case .workspaceDeletion:
+            let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+            let refused = await AgentSessionRuntimeHost.drainRetainedHostsForWorkspaceDeletion(workspaceID: workspaceID, until: deadline) { false }
+            XCTAssertFalse(refused)
+            XCTAssertTrue(fence.permitsStart(of: session), "A revoked deletion admission cannot cancel this attempt")
             let token = WorkspaceDeletionCancellationToken(workspaceID: workspaceID)
             let operation = Task {
-                await AgentSessionRuntimeHost.drainRetainedHostsForWorkspaceDeletion(token: token, until: .now.advanced(by: .seconds(5)))
+                await AgentSessionRuntimeHost.drainRetainedHostsForWorkspaceDeletion(workspaceID: workspaceID, until: deadline) { token.isActive }
             }
             try await AsyncTestWait.waitUntil("confirmed deletion fences the detached attempt") { !fence.permitsStart(of: session) }
             releaseProvider()

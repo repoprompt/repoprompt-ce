@@ -476,7 +476,9 @@ final class WorkspaceActivityCoordinator {
                 failures[workspaceID] = timeoutReason
                 continue
             }
-            let released = await AgentSessionRuntimeHost.drainRetainedHostsForWorkspaceDeletion(token: token, until: deadline)
+            let released = await AgentSessionRuntimeHost.drainRetainedHostsForWorkspaceDeletion(workspaceID: workspaceID, until: deadline) {
+                self.deletionLeaseIDByWorkspaceID[workspaceID] == leaseID && token.isActive
+            }
             if !released || deletionLeaseIDByWorkspaceID[workspaceID] != leaseID || !token.isActive || Task.isCancelled || clock.now >= deadline {
                 failures[workspaceID] = "The workspace's Agent runtime has not finished saving and releasing its resources. Try deleting it again."
             }
