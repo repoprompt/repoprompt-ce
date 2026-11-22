@@ -135,7 +135,7 @@ enum WindowStateCompositionFactory {
             else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
             return host
         } catch {
-            host.beginRetirement().startIfNeeded()
+            await host.discardUnpublishedVisibleCandidate()
             if host.workspaceActivation == nil { settings.release() }
             throw error
         }

@@ -104,14 +104,34 @@ final class AgentSessionRuntimeHost {
     /// existing exact drain, never onto presentation detach or Stop.
     func beginRetirement(adapters: AgentSessionHostDrainRuntime.Adapters) -> AgentSessionHostDrainRuntime {
         AgentSessionHostDrainRuntime.begin(scope: scope, owner: self, adapters: adapters, releaseResources: { [self] in
-            if let releaseExecutionRoute {
-                await workspaceActivation?.release()
-                await releaseExecutionRoute()
-            } else {
-                await route.close()
-                await workspaceActivation?.release()
-            }
+            await releaseOwnedResources()
         })
+    }
+
+    /// Only for a factory candidate that has never been published or admitted. Once the link
+    /// runtime exists, join its real effect producers even if the candidate has no sessions.
+    func discardUnpublishedVisibleCandidate() async {
+        precondition(scope.sessions.isEmpty && scope.retainedDrain == nil)
+        precondition(!AgentSessionRuntimeStore.shared.retainedExecutionHosts.contains { $0 === self })
+        if scope.linkExecution != nil {
+            beginRetirement().startIfNeeded()
+            return
+        }
+        scope.beginRetirement()
+        guard scope.releaseUnpublishedWriterClaims() else {
+            preconditionFailure("An unpublished candidate cannot own admitted effects")
+        }
+        await releaseOwnedResources()
+    }
+
+    private func releaseOwnedResources() async {
+        if let releaseExecutionRoute {
+            await workspaceActivation?.release()
+            await releaseExecutionRoute()
+        } else {
+            await route.close()
+            await workspaceActivation?.release()
+        }
     }
 
     /// The legacy launch projection is shared by the app composition root and injected fixtures.

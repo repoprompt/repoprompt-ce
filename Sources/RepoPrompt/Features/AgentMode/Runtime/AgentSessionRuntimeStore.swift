@@ -541,6 +541,15 @@ final class AgentSessionRuntimeStore {
             return true
         }
 
+        /// A never-published candidate rejected before it had a link runtime owns no link
+        /// effects. Verify that there is nothing admitted before releasing any of its resources.
+        func releaseUnpublishedWriterClaims() -> Bool {
+            guard sessions.isEmpty, linkExecution == nil, execution == nil,
+                  retainedDrain == nil, installedInteractions?.hasPendingEffects != true
+            else { return false }
+            return releaseWriterClaimsAfterDrain()
+        }
+
         /// Host-only full policy, after exact producer/provider/domain joins and final saves.
         /// Legacy prepared teardown continues to call the compatibility entry point above.
         @discardableResult
