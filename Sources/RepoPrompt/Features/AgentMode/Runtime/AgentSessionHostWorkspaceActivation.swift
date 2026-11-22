@@ -266,11 +266,17 @@ final class AgentSessionHostWorkspaceActivation {
             try Task.checkCancellation()
             try command.requireCurrent()
             guard current() else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
-            let refreshed = try await lease.capture(workspaceID: command.identity.workspaceID) {
-                self.executionTab(in: $0, command: command) != nil
+            let refreshed: AgentHostWorkspaceResources.Lease
+            do {
+                refreshed = try await lease.capture(workspaceID: command.identity.workspaceID) { _ in true }
+            } catch AgentHostWorkspaceResources.Failure.contextUnavailable {
+                try command.requireCurrent()
+                guard current() else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
+                throw AgentSessionWorktreeRuntime.TransitionError.stale
             }
             let document = try JSONDecoder().decode(WorkspaceModel.self, from: refreshed.snapshot.document.documentBytes)
-            guard current(), document.id == workspace.id, !document.isSystemWorkspace,
+            guard current(), self.executionTab(in: refreshed.snapshot, command: command) != nil,
+                  document.id == workspace.id, !document.isSystemWorkspace,
                   document.repoPaths == workspace.repoPaths, document.customStoragePath == workspace.customStoragePath
             else { throw AgentSessionWorktreeRuntime.TransitionError.stale }
             try command.requireCurrent()

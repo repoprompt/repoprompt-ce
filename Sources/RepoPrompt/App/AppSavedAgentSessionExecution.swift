@@ -15,10 +15,39 @@ enum AppSavedAgentSessionExecution {
     struct ApprovedLinkOrigin {
         let observer: DomainAgentSessionLinkEndpointIdentity
         let target: AgentSessionRuntimeStore.WriterIdentity
+        let hasCanonicalCarrier: Bool
     }
 
     /// Retain both admitted incarnations across the asynchronous administration call.
     static let approvedLinkOrigin = BoxedTaskLocal<ApprovedLinkOrigin?>(nil)
+
+    /// The admission continuation can read canonical bytes asynchronously; the membership
+    /// projector stays synchronous and joins this proof to the still-current exact writer.
+    static func captureApprovedLinkOrigin(
+        observer: DomainAgentSessionLinkEndpointIdentity, writer: AgentSessionRuntimeStore.Writer
+    ) async -> ApprovedLinkOrigin {
+        let hasCarrier = await hasApprovedLinkCarrier(for: writer)
+        return .init(observer: observer, target: writer.identity, hasCanonicalCarrier: hasCarrier)
+    }
+
+    static func hasApprovedLinkCarrier(for writer: AgentSessionRuntimeStore.Writer) async -> Bool {
+        let identity = writer.identity
+        guard let host = writer.scope.executableHost,
+              let snapshot = await AppDomainRuntimeComposition.shared.runtime.workspaceStore.canonicalWorkspaceSnapshot(identity.workspaceID),
+              snapshot.health != .removed, !Task.isCancelled, !host.route.isClosing,
+              (try? writer.admitCommand().get()) != nil else { return false }
+        let tabID = writer.session.tabID
+        if let activation = host.workspaceActivation {
+            return activation.isCurrent && activation.executionTab(
+                in: snapshot, workspaceID: identity.workspaceID, tabID: tabID, sessionID: identity.sessionID
+            ) != nil
+        }
+        // A legacy loaded writer still needs the exact persisted compose carrier, not
+        // a sidebar index entry that may be absent while its owner refreshes.
+        let matches = snapshot.contexts.filter { $0.metadata.identity.contextID == tabID && $0.health != .removed }
+        let tab = matches.first.flatMap { try? JSONDecoder().decode(ComposeTabState.self, from: $0.metadata.documentBytes) }
+        return matches.count == 1 && tab?.id == tabID && tab?.activeAgentSessionID == identity.sessionID
+    }
 
     struct ProviderEnvironment {
         let resources: AgentRunProviderComposition

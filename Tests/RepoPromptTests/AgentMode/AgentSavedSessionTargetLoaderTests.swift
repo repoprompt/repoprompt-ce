@@ -331,7 +331,9 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                                 ))
                             }
                         } catch let error as MCPFileToolAuthorityFailure {
-                            XCTFail("Registered \(name) \(arguments[\"op\"]?.stringValue ?? \"\") failed its file receipt: \(error)")
+                            let operation = arguments["op"]?.stringValue ?? ""
+                            let publishesArtifacts = arguments["artifacts"]?.boolValue == true
+                            XCTFail("Registered \(name) \(operation) (artifacts: \(publishesArtifacts)) failed its file receipt: \(error)")
                             throw error
                         }
                     }

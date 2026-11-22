@@ -9004,6 +9004,14 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 session.hasLoadedPersistedState = true
                 session.recordRestorationAuthoritative(.persistedPayloadApplied)
             }
+            for (fixture, id, parent) in [(observerFixture, caller, UUID?.none), (targetFixture, target, Optional(parent))] {
+                let vm = fixture.window.agentModeViewModel
+                let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+                vm.test_refreshSessionListCache(for: workspace)
+                await vm.test_waitForSessionListCacheRefresh()
+                let entry = try XCTUnwrap(vm.ownerValidatedSessionIndex[id], "The real sidecar must refresh the owning index")
+                XCTAssertEqual(entry.parentSessionID, parent)
+            }
             let observerTab = try XCTUnwrap(observerFixture.carriers?.composeTabs.first)
             let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(observerFixture.window.agentModeViewModel, tabID: observerTab.id)
             if revokeAfterLink {
@@ -9025,6 +9033,15 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                     authorization: .init(isCurrent: { true })
                 )
                 XCTAssertEqual(refusal, .failed(.childSession), "OFF: another parent's child is not linkable without applicable consent")
+            }
+            if global, ownChild, !revokeAfterLink {
+                // Exercise the admitted writer while an owner-current index lacks this row.
+                // The persisted carrier and writer remain exact; the sidebar is only a projection.
+                let vm = targetFixture.window.agentModeViewModel
+                let owner = try XCTUnwrap(vm.sessionIndexStore.sessionIndexOwner)
+                let workspace = try XCTUnwrap(targetFixture.window.workspaceManager.activeWorkspace)
+                vm.test_installSessionIndexSnapshot([:], owner: owner, latestOwner: owner, activeWorkspace: workspace)
+                XCTAssertNil(vm.ownerValidatedSessionIndex[target])
             }
             let key = UUID().uuidString
             let response = await bridge.requestTargetedOversight(observer: endpoint, targetSessionID: target, message: revokeAfterLink ? "must not dispatch" : nil, idempotencyKey: key)

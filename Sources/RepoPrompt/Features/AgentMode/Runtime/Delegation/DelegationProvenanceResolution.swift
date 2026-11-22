@@ -105,17 +105,17 @@ struct OpenWindowsDelegationProvenanceSource: DelegationProvenanceSource {
             let missingPlacement = metadata.isEmpty && carriers.sessionIDs.contains(id)
             let observed = runtime.compactMap { $0[id] }
             let ambiguous = carriers.ambiguousSessionIDs.contains(id) || observed.contains(.ambiguous)
-            // A canonical saved writer proves its own durable placement even when no open tab
-            // has an index for it. A disagreeing replica can veto but cannot supply this proof.
-            if let saved = canonicalSavedProvenance(for: id) {
+            // A canonical carrier and its exact writer prove placement even while the owning
+            // sidebar index is absent. A disagreeing replica can veto but cannot supply proof.
+            if let canonical = canonicalWriterProvenance(for: id, carriers: carriers) {
                 var workspaces = carriers.affectedWorkspaceIDs(for: id)
-                if ambiguous || placementConflict || workspaces.contains(where: { $0 != saved.workspaceID }) {
-                    if let workspaceID = saved.workspaceID { workspaces.insert(workspaceID) }
+                if ambiguous || placementConflict || workspaces.contains(where: { $0 != canonical.workspaceID }) {
+                    if let workspaceID = canonical.workspaceID { workspaces.insert(workspaceID) }
                     result.states[id] = .ambiguous
                     result.placementConflicts[id] = workspaces
                 } else {
                     result.states[id] = .unique
-                    result.records[id] = saved
+                    result.records[id] = canonical
                 }
                 continue
             }
@@ -152,11 +152,20 @@ struct OpenWindowsDelegationProvenanceSource: DelegationProvenanceSource {
         return result
     }
 
-    private func canonicalSavedProvenance(for id: UUID) -> DelegationSessionProvenance? {
+    private func canonicalWriterProvenance(for id: UUID, carriers: AgentSessionCarrierResolver.Snapshot) -> DelegationSessionProvenance? {
         guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: id),
-              let host = writer.scope.executableHost, host.workspaceActivation?.savedCarrierSessionID == id,
-              host.workspaceActivation?.isCurrent == true, (try? writer.admitCommand().get()) != nil
+              let host = writer.scope.executableHost, !host.route.isClosing, (try? writer.admitCommand().get()) != nil
         else { return nil }
+        let isSavedCarrier = host.workspaceActivation?.savedCarrierSessionID == id && host.workspaceActivation?.isCurrent == true
+        if !isSavedCarrier {
+            guard let origin = AppSavedAgentSessionExecution.approvedLinkOrigin.get(),
+                  origin.target == writer.identity, origin.hasCanonicalCarrier,
+                  carriers.rows.contains(where: {
+                      $0.sessionID == id && $0.workspaceID == writer.identity.workspaceID
+                          && $0.tab.id == writer.session.tabID && $0.tab.activeAgentSessionID == id && $0.stashedTabID == nil
+                          && $0.window.agentModeViewModel.sessions[$0.tab.id] === writer.session
+                  }) else { return nil }
+        }
         let session = writer.session
         let bindings = Set(session.worktreeBindings.map(\.worktreeID))
         return .init(
