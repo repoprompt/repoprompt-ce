@@ -267,23 +267,7 @@ class PromptViewModel: ObservableObject {
         case failed
     }
 
-    enum DurableBackgroundComposeTabCreationResult: Equatable {
-        case created(
-            ComposeTabState,
-            AgentAdmissionPersistenceReceipt,
-            AgentProvisionalAdmissionClaim
-        )
-        case rejected(
-            AgentAdmissionPersistenceReceipt,
-            AgentSessionLifecycleAuthority.RejectionReason
-        )
-        case recoveryRequired(
-            AgentProvisionalAdmissionIdentity,
-            AgentAdmissionPersistenceReceipt,
-            AgentSessionLifecycleAuthority.RejectionReason,
-            AgentAdmissionRecoveryOutcome
-        )
-    }
+    typealias DurableBackgroundComposeTabCreationResult = WorkspaceAgentFreshAdmission.Result
 
     typealias ComposeTabsWillCloseListener = @Sendable (_ tabIDs: Set<UUID>, _ reason: ComposeTabRemovalReason) async -> Void
     typealias ComposeTabsProjectionRemovalCallback = @MainActor (_ actualRemovedTabIDs: Set<UUID>) -> Void
@@ -3355,50 +3339,21 @@ class PromptViewModel: ObservableObject {
                     .workspaceChanged
                 )
             }
-            let workspaceTabs = manager.workspaces[index].composeTabs
-                + manager.workspaces[index].stashedTabs.map(\.tab)
-            guard !workspaceTabs.contains(where: { $0.activeAgentSessionID == sessionID }) else {
-                return .rejected(
-                    AgentAdmissionPersistenceReceipt(
-                        outcome: .rejected(reason: "session_already_bound"),
-                        commitEvidence: .none
-                    ),
-                    .sessionIdentityChanged
+            let preparation = WorkspaceAgentFreshAdmission.prepare(workspace: manager.workspaces[index], sessionID: sessionID) {
+                makeComposeTab(
+                    for: .blank, explicitName: name, workspaceIndex: index, manager: manager,
+                    freshAgentSessionID: sessionID
                 )
             }
-            guard let newTab = makeComposeTab(
-                for: .blank,
-                explicitName: name,
-                workspaceIndex: index,
-                manager: manager,
-                freshAgentSessionID: sessionID
-            ) else {
-                return .rejected(
-                    AgentAdmissionPersistenceReceipt(
-                        outcome: .rejected(reason: "workspace_changed"),
-                        commitEvidence: .none
-                    ),
-                    .workspaceChanged
-                )
+            let newTab: ComposeTabState
+            let recoveryClaim: AgentProvisionalAdmissionClaim
+            switch preparation {
+            case let .rejected(result): return result
+            case let .ready(tab, claim):
+                newTab = tab
+                recoveryClaim = claim
             }
-            guard !workspaceTabs.contains(where: { $0.id == newTab.id }) else {
-                return .rejected(
-                    AgentAdmissionPersistenceReceipt(
-                        outcome: .rejected(reason: "tab_identity_collision"),
-                        commitEvidence: .none
-                    ),
-                    .sessionIdentityChanged
-                )
-            }
-
-            let provisionalIdentity = AgentProvisionalAdmissionIdentity(
-                recoveryID: UUID(),
-                workspaceID: expectedWorkspaceID,
-                tabID: newTab.id,
-                sessionID: sessionID,
-                replacementTabID: UUID()
-            )
-            let recoveryClaim = AgentProvisionalAdmissionClaim(identity: provisionalIdentity)
+            let provisionalIdentity = recoveryClaim.identity
 
             let preAdmissionForegroundStoredTab = manager.workspaces[index].activeComposeTabID.flatMap { activeTabID in
                 manager.workspaces[index].composeTabs.first(where: { $0.id == activeTabID })
@@ -3440,76 +3395,19 @@ class PromptViewModel: ObservableObject {
                 .composeTabs.contains(where: {
                     $0.id == newTab.id && $0.activeAgentSessionID == sessionID
                 }) == true
-            let admissionDecision = lifecycleAuthority.decideDurableAdmission(
-                receipt: receipt,
-                targetWorkspaceID: expectedWorkspaceID,
-                bindingStillCurrent: bindingStillCurrent,
-                isCancelled: isCancelled
-            )
-            switch admissionDecision {
-            case .commit:
-                return .created(newTab, receipt, recoveryClaim)
-            case let .localRollback(reason):
-                await rollbackProvisionalAgentSessionTab(
-                    checkpoint: rollbackCheckpoint,
-                    manager: manager
-                )
-                recoveryClaim.markComplete()
-                if isCancelled {
-                    throw CancellationError()
-                }
-                return .rejected(receipt, reason)
-            case let .recoverWorkspace(reason):
-                guard recoveryClaim.beginWorkspaceRecovery() else {
-                    // A changed claim does not prove that the canonical identity was removed.
-                    // Preserve its evidence instead of authorizing a second allocation.
-                    return .recoveryRequired(provisionalIdentity, receipt, reason, .ownershipChanged)
-                }
-                let recoveryOutcome = await settleProvisionalAgentAdmissionRecovery(
-                    provisionalIdentity,
-                    claim: recoveryClaim,
-                    rollbackCheckpoint: rollbackCheckpoint,
-                    manager: manager
-                )
-                let shouldRollbackLocally: Bool
-                let requiresRecoveryEvidence: Bool
-                switch recoveryOutcome {
-                case .recovered, .alreadyRecovered, .localOnly:
-                    recoveryClaim.markWorkspaceRecovered()
-                    recoveryClaim.markComplete()
-                    shouldRollbackLocally = true
-                    requiresRecoveryEvidence = false
-                case .ownershipChanged:
-                    recoveryClaim.markComplete()
-                    shouldRollbackLocally = true
-                    requiresRecoveryEvidence = true
-                case .retryablePartial:
-                    shouldRollbackLocally = true
-                    requiresRecoveryEvidence = true
-                case .failed, .blockedManual:
-                    shouldRollbackLocally = false
-                    requiresRecoveryEvidence = true
-                }
-                await notifyAgentAdmissionRecoveryCompletedForTesting(
-                    provisionalIdentity,
-                    outcome: recoveryOutcome
-                )
-                if shouldRollbackLocally {
-                    await rollbackProvisionalAgentSessionTab(
-                        checkpoint: rollbackCheckpoint,
-                        manager: manager
+            return try await WorkspaceAgentFreshAdmission.settle(
+                tab: newTab, claim: recoveryClaim, receipt: receipt,
+                bindingStillCurrent: bindingStillCurrent, isCancelled: isCancelled, lifecycleAuthority: lifecycleAuthority,
+                rollbackProjection: {
+                    await self.rollbackProvisionalAgentSessionTab(checkpoint: rollbackCheckpoint, manager: manager)
+                }, recover: {
+                    await self.settleProvisionalAgentAdmissionRecovery(
+                        provisionalIdentity, claim: recoveryClaim, rollbackCheckpoint: rollbackCheckpoint, manager: manager
                     )
+                }, didRecover: {
+                    await self.notifyAgentAdmissionRecoveryCompletedForTesting(provisionalIdentity, outcome: $0)
                 }
-                if requiresRecoveryEvidence {
-                    // Cancellation cannot erase an unproven rollback. Callers must retain this
-                    // identity even when local projection removal has already completed.
-                    return .recoveryRequired(provisionalIdentity, receipt, reason, recoveryOutcome)
-                }
-                if isCancelled {
-                    throw CancellationError()
-                }
-                return .rejected(receipt, reason)
-            }
+            )
         }
     }
 
@@ -3540,99 +3438,13 @@ class PromptViewModel: ObservableObject {
         rollbackCheckpoint: ProvisionalAgentSessionTabRollbackCheckpoint,
         manager: WorkspaceManagerViewModel
     ) async -> AgentAdmissionRecoveryOutcome {
-        let outcome = await manager.recoverProvisionalAgentAdmission(identity)
-        switch outcome {
-        case .recovered, .alreadyRecovered, .localOnly, .ownershipChanged:
-            return outcome
-        case .retryablePartial:
-            retainProvisionalAgentAdmissionRecovery(
-                identity,
-                claim: claim,
-                rollbackCheckpoint: rollbackCheckpoint,
-                initialOutcome: outcome,
-                manager: manager,
-                start: .automatic
-            )
-        case let .failed(category):
-            if category.isRetryableAgentAdmissionRecoveryFailure {
-                retainProvisionalAgentAdmissionRecovery(
-                    identity,
-                    claim: claim,
-                    rollbackCheckpoint: rollbackCheckpoint,
-                    initialOutcome: outcome,
-                    manager: manager,
-                    start: .automatic
-                )
-            } else {
-                let blocked = AgentAdmissionRecoveryOutcome.blockedManual(category)
-                claim.markBlockedForManualRecovery(category)
-                manager.recordAgentAdmissionRecoveryBlocked(
-                    identity,
-                    category: category,
-                    attempts: 0
-                )
-                retainProvisionalAgentAdmissionRecovery(
-                    identity,
-                    claim: claim,
-                    rollbackCheckpoint: rollbackCheckpoint,
-                    initialOutcome: blocked,
-                    manager: manager,
-                    start: .blockedManual(category)
-                )
-                return blocked
-            }
-        case let .blockedManual(category):
-            claim.markBlockedForManualRecovery(category)
-            manager.recordAgentAdmissionRecoveryBlocked(
-                identity,
-                category: category,
-                attempts: 0
-            )
-            retainProvisionalAgentAdmissionRecovery(
-                identity,
-                claim: claim,
-                rollbackCheckpoint: rollbackCheckpoint,
-                initialOutcome: outcome,
-                manager: manager,
-                start: .blockedManual(category)
-            )
-            return outcome
-        }
-        return outcome
-    }
-
-    private func retainProvisionalAgentAdmissionRecovery(
-        _ identity: AgentProvisionalAdmissionIdentity,
-        claim: AgentProvisionalAdmissionClaim,
-        rollbackCheckpoint: ProvisionalAgentSessionTabRollbackCheckpoint,
-        initialOutcome: AgentAdmissionRecoveryOutcome,
-        manager: WorkspaceManagerViewModel,
-        start: AgentAdmissionRetainedRecoveryStart
-    ) {
-        manager.retainProvisionalAgentAdmissionRecovery(
-            recoveryID: identity.recoveryID,
-            workspaceID: identity.workspaceID,
-            sessionID: identity.sessionID,
-            reservationOwnerID: identity.recoveryID,
-            start: start
-        ) { [self, manager, claim] in
-            if case .blockedManual = claim.state {
-                guard claim.resumeBlockedWorkspaceRecovery() else {
-                    return .blockedManual(.durabilityUncertain)
-                }
-            }
-            var priorOutcome = initialOutcome
-            for attempt in 0 ..< 4 {
-                await waitForProvisionalAgentAdmissionRecoveryRetry(
-                    attempt: attempt,
-                    outcome: priorOutcome
-                )
-                let outcome: AgentAdmissionRecoveryOutcome
-                do {
-                    outcome = try await manager.withAgentSessionAdmission(
-                        workspaceID: identity.workspaceID,
-                        admissionID: UUID(),
-                        kind: .recovery,
+        await WorkspaceAgentAdmissionRecoveryRetention.settle(
+            claim: claim,
+            adapters: .init(
+                attempt: { await manager.recoverProvisionalAgentAdmission(identity) },
+                retryUnderLease: {
+                    try await manager.withAgentSessionAdmission(
+                        workspaceID: identity.workspaceID, admissionID: UUID(), kind: .recovery,
                         classifyOutcome: { result in
                             switch result {
                             case .recovered, .alreadyRecovered, .localOnly: .committed
@@ -3642,95 +3454,21 @@ class PromptViewModel: ObservableObject {
                     ) {
                         await manager.recoverProvisionalAgentAdmission(identity)
                     }
-                } catch {
-                    priorOutcome = .failed(.durabilityUncertain)
-                    continue
-                }
-                switch outcome {
-                case .recovered, .alreadyRecovered, .localOnly:
-                    claim.markWorkspaceRecovered()
-                    claim.markComplete()
-                    await rollbackProvisionalAgentSessionTab(
-                        checkpoint: rollbackCheckpoint,
-                        manager: manager
+                },
+                retain: { start, operation in
+                    manager.retainProvisionalAgentAdmissionRecovery(
+                        recoveryID: identity.recoveryID, workspaceID: identity.workspaceID, sessionID: identity.sessionID,
+                        reservationOwnerID: identity.recoveryID, start: start, operation: operation
                     )
-                    await notifyAgentAdmissionRecoveryCompletedForTesting(
-                        identity,
-                        outcome: outcome
-                    )
-                    return .complete(outcome)
-                case .ownershipChanged:
-                    claim.markComplete()
-                    await rollbackProvisionalAgentSessionTab(
-                        checkpoint: rollbackCheckpoint,
-                        manager: manager
-                    )
-                    await notifyAgentAdmissionRecoveryCompletedForTesting(
-                        identity,
-                        outcome: outcome
-                    )
-                    return .complete(outcome)
-                case .retryablePartial:
-                    await rollbackProvisionalAgentSessionTab(
-                        checkpoint: rollbackCheckpoint,
-                        manager: manager
-                    )
-                    priorOutcome = outcome
-                    continue
-                case let .failed(category):
-                    if category.isRetryableAgentAdmissionRecoveryFailure {
-                        priorOutcome = outcome
-                        continue
-                    }
-                    let blocked = AgentAdmissionRecoveryOutcome.blockedManual(category)
-                    claim.markBlockedForManualRecovery(category)
-                    manager.recordAgentAdmissionRecoveryBlocked(
-                        identity,
-                        category: category,
-                        attempts: attempt + 1
-                    )
-                    await notifyAgentAdmissionRecoveryCompletedForTesting(
-                        identity,
-                        outcome: blocked
-                    )
-                    return .blockedManual(category)
-                case let .blockedManual(category):
-                    claim.markBlockedForManualRecovery(category)
-                    manager.recordAgentAdmissionRecoveryBlocked(
-                        identity,
-                        category: category,
-                        attempts: attempt + 1
-                    )
-                    await notifyAgentAdmissionRecoveryCompletedForTesting(
-                        identity,
-                        outcome: outcome
-                    )
-                    return .blockedManual(category)
-                }
-            }
-            let blockedCategory: WorkspacePersistenceFailureCategory = switch priorOutcome {
-            case let .failed(category):
-                category
-            case .retryablePartial:
-                .durabilityUncertain
-            case let .blockedManual(category):
-                category
-            case .recovered, .alreadyRecovered, .localOnly, .ownershipChanged:
-                .durabilityUncertain
-            }
-            let blocked = AgentAdmissionRecoveryOutcome.blockedManual(blockedCategory)
-            claim.markBlockedForManualRecovery(blockedCategory)
-            manager.recordAgentAdmissionRecoveryBlocked(
-                identity,
-                category: blockedCategory,
-                attempts: 4
+                },
+                rollbackProjection: {
+                    await self.rollbackProvisionalAgentSessionTab(checkpoint: rollbackCheckpoint, manager: manager)
+                },
+                recordBlocked: { manager.recordAgentAdmissionRecoveryBlocked(identity, category: $0, attempts: $1) },
+                didRecover: { await self.notifyAgentAdmissionRecoveryCompletedForTesting(identity, outcome: $0) },
+                waitBeforeRetry: { await self.waitForProvisionalAgentAdmissionRecoveryRetry(attempt: $0, outcome: $1) }
             )
-            await notifyAgentAdmissionRecoveryCompletedForTesting(
-                identity,
-                outcome: blocked
-            )
-            return .blockedManual(blockedCategory)
-        }
+        )
     }
 
     @MainActor
@@ -3744,9 +3482,7 @@ class PromptViewModel: ObservableObject {
                 return
             }
         #endif
-        let exponent = min(attempt, 4)
-        let delayMilliseconds = min(2000, 100 * (1 << exponent))
-        try? await Task.sleep(for: .milliseconds(delayMilliseconds))
+        await WorkspaceAgentAdmissionRecoveryRetention.waitBeforeRetry(attempt: attempt)
     }
 
     @MainActor
