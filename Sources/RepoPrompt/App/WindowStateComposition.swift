@@ -172,6 +172,9 @@ enum WindowStateCompositionFactory {
             return tab.map { AgentSessionRestoreSupport.normalizedSessionTitle($0.name) }
         }
         host.scope.persistence.composition = persistence
+        host.scope.persistence.observeRetainedVisibleDrain = { drain in
+            WindowStatesManager.shared.observeAgentHostDrainRecovery(drain)
+        }
         let perf = AppAgentModePerfRecorder()
         host.scope.persistence.perfRecorder = perf
         try host.installHostRunExecution(
@@ -425,6 +428,13 @@ enum WindowStateCompositionFactory {
         agentModeViewModel.preparedSessionRuntimes = WindowStatesManager.shared
         agentModeViewModel.providerSwitchExactOwnerProbe = { session in
             guard let id = session.activeAgentSessionID else { return false }
+            if let binding = session.persistentSessionBindingIdentity,
+               case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: id, expectedWorkspaceID: binding.workspaceID),
+               let host = writer.scope.executableHost, let activation = host.workspaceActivation
+            {
+                return writer.session === session && writer.isCurrent && activation.owns(scope: writer.scope, route: host.route)
+            }
+            guard sessionRuntimeWorkspace != nil || domainRuntime == nil || agentModeViewModelFactory != nil else { return false }
             let census = AgentSessionCarrierResolver.capture(
                 windows: WindowStatesManager.shared.allWindows,
                 sessionIDs: [id],

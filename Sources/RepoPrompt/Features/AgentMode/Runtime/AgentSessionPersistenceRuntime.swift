@@ -123,6 +123,14 @@ final class AgentSessionPersistenceRuntime {
     let queue = AgentSessionSaveQueue()
     var composition: Composition?
     var presentation: Presentation?
+    var observeRetainedVisibleDrain: ((AgentSessionHostDrainRuntime) -> Void)?
+    private struct DetachedFinalSaveFailure {
+        let writer: AgentSessionRuntimeStore.WriterIdentity
+        let terminal: AgentRunTerminalCommitRevision
+        let message: String
+    }
+
+    private var detachedFinalSaveFailures: [UUID: DetachedFinalSaveFailure] = [:]
     var perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     var saver: Saver = { payload, workspace, count in
         try await AgentSessionDataService.shared.saveAgentSession(
@@ -214,9 +222,34 @@ final class AgentSessionPersistenceRuntime {
         }
     }
 
+    private func detachedFinalSaveFailure(for session: AgentTabSession) -> DetachedFinalSaveFailure? {
+        guard let failure = detachedFinalSaveFailures[session.tabID], session.isDirty, !session.runState.isActive,
+              session.lastTerminalCommitRevision == failure.terminal,
+              scope?.originatingWriter(identity: failure.writer, session: session) != nil
+        else { return nil }
+        return failure
+    }
+
+    /// A passive settlement signal may transfer a known failure, but never starts a save.
+    func retainDetachedFinalSaveFailureIfReady() {
+        guard !detachedFinalSaveFailures.isEmpty, let observeRetainedVisibleDrain, let scope,
+              let host = scope.executableHost, !scope.isRetiring, scope.saveQueue.inFlightSessionIDs.isEmpty,
+              scope.sessions.values.allSatisfy({ !scope.presentation.hasPresenter(for: $0) && scope.settlement(for: $0).canJoinHostDrain })
+        else { return }
+        for session in scope.sessions.values {
+            guard let failure = detachedFinalSaveFailure(for: session),
+                  let writer = scope.originatingWriter(identity: failure.writer, session: session), writer.isCurrent else { continue }
+            let drain = host.beginRetirement()
+            drain.retainObservedFinalSaveFailure(failure.message, for: writer)
+            observeRetainedVisibleDrain(drain)
+            return
+        }
+    }
+
     func scheduleSave(for tabID: UUID) {
         guard composition?.isSuppressed() == false else { return }
-        guard let session = sessions[tabID], session.creationState == nil else { return }
+        guard let session = sessions[tabID], session.creationState == nil,
+              detachedFinalSaveFailure(for: session) == nil else { return }
         session.saveRequestGeneration &+= 1
         guard !session.isInstallingHandoffWorktreeBindings else {
             // Handoff saves the destination explicitly once its inherited bindings are installed.
@@ -257,6 +290,7 @@ final class AgentSessionPersistenceRuntime {
                 if session.isDirty { scheduleSave(for: session) }
                 return
             }
+            guard detachedFinalSaveFailure(for: session) == nil else { return }
             _ = await saveSession(for: tabID)
         }
     }
@@ -477,6 +511,7 @@ final class AgentSessionPersistenceRuntime {
                 return .deferred("The originating writer changed before persistence could commit.")
             }
         }
+        let terminalAtSave = session.runState.isActive ? nil : session.lastTerminalCommitRevision
         let preparedWrite: AgentSessionSaveRuntime.PreparedWrite
         do {
             preparedWrite = try AgentSessionSaveRuntime.prepare(
@@ -548,6 +583,7 @@ final class AgentSessionPersistenceRuntime {
                 }
                 return .deferred("The session binding changed after persistence committed.")
             }
+            detachedFinalSaveFailures.removeValue(forKey: tabID)
             observingPhase?(.durablySaved(durableBindingToken))
             return .durablySaved(durableBindingToken)
         } catch {
@@ -560,6 +596,13 @@ final class AgentSessionPersistenceRuntime {
                 message: String(describing: error)
             )
             print("[AgentSessionPersistenceRuntime] Failed to save session: \(failure.message)")
+            if observeRetainedVisibleDrain != nil, !Task.isCancelled, writer.isCurrent, let scope,
+               !scope.isRetiring, !scope.presentation.hasPresenter(for: session),
+               let terminal = terminalAtSave, session.lastTerminalCommitRevision == terminal, !session.runState.isActive,
+               isSaveCommitTokenCurrent(saveToken, requireWorkspaceMatch: false, creationHandle: effectiveCreationSave?.handle)
+            {
+                detachedFinalSaveFailures[tabID] = .init(writer: writer.identity, terminal: terminal, message: failure.message)
+            }
             return .failed(failure)
         }
     }

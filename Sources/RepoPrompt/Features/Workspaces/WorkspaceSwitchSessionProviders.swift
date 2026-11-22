@@ -92,14 +92,11 @@ final class AgentModeWorkspaceSwitchSessionProvider: WorkspaceSwitchSessionProvi
         self.agentModeViewModel = agentModeViewModel
     }
 
-    /// Admission and cancellation must agree about which active work survives a switch.
-    func preservedExecutionHost(workspaceID: UUID?) -> AgentSessionRuntimeHost? {
-        guard let workspaceID, let agentModeViewModel,
-              agentModeViewModel.canonicalWorkspaceHostPreparation != nil,
-              let host = agentModeViewModel.preservableExecutionHost(),
-              host.workspaceActivation?.key.owner.workspaceID == workspaceID
-        else { return nil }
-        return host
+    /// Admission follows the exact executing host, not the workspace already selected by
+    /// the UI. A newer switch may supersede a destination whose host is still composing.
+    func preservedExecutionHost() -> AgentSessionRuntimeHost? {
+        guard let agentModeViewModel, agentModeViewModel.canonicalWorkspaceHostPreparation != nil else { return nil }
+        return agentModeViewModel.preservableExecutionHost()
     }
 
     func switchSessionItems() -> [WorkspaceSwitchSessionItem] {
@@ -119,8 +116,7 @@ final class AgentModeWorkspaceSwitchSessionProvider: WorkspaceSwitchSessionProvi
 
     func cancelSwitchSessions(for deletionToken: WorkspaceDeletionCancellationToken?) async {
         guard deletionToken?.isActive ?? true, let agentModeViewModel else { return }
-        // Window teardown starts the retained canonical drain, which owns these joins and
-        // cancellations. Ordinary workspace switches and explicit deletion keep their path.
+        // Independent window close is presentation-only; explicit deletion carries its own token.
         if deletionToken == nil, agentModeViewModel.workspaceManager?.isPreparingForWindowClose == true,
            agentModeViewModel.runtimeHost.workspaceActivation != nil
         {

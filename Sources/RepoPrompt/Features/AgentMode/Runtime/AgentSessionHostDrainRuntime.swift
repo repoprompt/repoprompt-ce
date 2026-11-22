@@ -255,6 +255,22 @@ final class AgentSessionHostDrainRuntime {
         attemptRecovery()
     }
 
+    /// Transfer an already failed, exact final save to this drain without starting a second write.
+    func retainObservedFinalSaveFailure(
+        _ message: String, for writer: AgentSessionRuntimeStore.Writer
+    ) {
+        guard task == nil, outcome == nil, writer.scope === scope,
+              let participant = participants.first(where: { $0.session === writer.session }),
+              let membership = participant.membership, membership.isCurrent, writer.ownsPersistentClaim
+        else { return }
+        let retained = Outcome.retained("Final save failed: \(message)")
+        sessionOutcomes[writer.session.tabID] = .init(
+            membership: membership.identity, sessionID: writer.identity.sessionID, outcome: retained
+        )
+        outcome = retained
+        recoveryObserver?(retained)
+    }
+
     /// A committed deletion is a new durable acknowledgement, not a retry of the failed save.
     /// It can release effects for the original object once, without following a new claimant.
     func settleAfterDurableDeletion(sessionID: UUID) {

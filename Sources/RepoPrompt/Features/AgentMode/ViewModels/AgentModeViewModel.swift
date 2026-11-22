@@ -7367,7 +7367,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let expectedVisibleID = workspaceManager?.activeAgentSessionID(forTabID: tabID)
             let expectedActivation = sessionIndexStore.latestSessionIndexOwner
             owners.queuePreparedRuntimeVisit(preparedVisitID, intent: intent) { [weak self] in
-                guard let self, !self.hasPreparedForWindowClose, let intent,
+                guard let self, !hasPreparedForWindowClose, !hasDetachedClosingPresentation, let intent,
                       sessionIndexStore.latestSessionIndexOwner == expectedActivation, workspaceManager?.activeWorkspaceID == workspace.id,
                       workspaceManager?.activeAgentSessionID(forTabID: tabID) == expectedVisibleID else { return }
                 if let resumePreparedVisit {
@@ -7379,6 +7379,18 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return .blockedByActiveDifferentSession
         }
         guard visitIsCurrent() else { return .blockedByActiveDifferentSession }
+        if qualifiesForVisit, canonicalWorkspaceHostPreparation != nil, isAwaitingWorkspaceAdoption,
+           destructiveWorkspaceAdoptionOwner == nil, queuedWorkspaceSwitchOwner == nil,
+           workspaceManager?.activeWorkspaceID == workspace.id,
+           !hasPreparedForWindowClose, !hasDetachedClosingPresentation
+        {
+            // The initial activation could not adopt while an exact drain owned the writer.
+            // The same explicit visit may now install the new host after durable release.
+            await handleWorkspaceSwitch(workspace)
+            guard visitIsCurrent(), !isAwaitingWorkspaceAdoption, !hasDetachedClosingPresentation,
+                  !hasPreparedForWindowClose, workspaceManager?.activeWorkspaceID == workspace.id
+            else { return .blockedByActiveDifferentSession }
+        }
         guard let sessionID else {
             guard !workspaceLink else { return .sessionNotFound }
             let session = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: true, visitIntent: intent)
@@ -13385,7 +13397,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let oracleDrains = sessions.values.compactMap {
                 outgoing.scope.interactions(routeID: outgoing.routeID, approvalStore: applyEditsApprovalStore).closeOracleBackground(for: $0)
             }
-            for drain in oracleDrains { await drain.value }
+            for drain in oracleDrains {
+                await drain.value
+            }
             guard adoptionIsCurrent() else {
                 abandonPreparedDestination()
                 return

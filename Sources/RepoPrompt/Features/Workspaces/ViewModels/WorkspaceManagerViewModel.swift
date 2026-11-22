@@ -6598,7 +6598,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     ) async -> WorkspaceSwitchResult {
         let activeSessions = activeSessionSnapshot()
         let preservedAgentProvider = agentSwitchSessionProvider.flatMap { provider in
-            provider.preservedExecutionHost(workspaceID: activeWorkspaceID) == nil ? nil : provider
+            provider.preservedExecutionHost() == nil ? nil : provider
         }
         // Only count sessions this switch would end. Deletion still uses the complete snapshot.
         let snapshot = WorkspaceSwitchSessionSnapshot(items: activeSessions.items.filter {
