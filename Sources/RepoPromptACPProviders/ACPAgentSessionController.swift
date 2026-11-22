@@ -7,6 +7,20 @@ import RepoPromptFoundation
 import RepoPromptMCPCore
 import RepoPromptProcess
 
+/// A provider process spawned but failed before completing the ACP `initialize` handshake.
+/// Thrown only by `ACPAgentSessionController.bootstrapMarkingPreHandshakeLaunchFailure()`.
+package struct ACPPreHandshakeLaunchError: LocalizedError {
+    package let underlying: any Error
+
+    package init(underlying: any Error) {
+        self.underlying = underlying
+    }
+
+    package var errorDescription: String? {
+        underlying.localizedDescription
+    }
+}
+
 package actor ACPAgentSessionController {
     /// A successful pipe write is not provider acceptance or turn completion. It only proves
     /// that retrying after a lost response could duplicate input. Independent of controller
@@ -324,6 +338,9 @@ package actor ACPAgentSessionController {
     }
 
     private var process: SpawnedProcess?
+    /// Bootstrap progress markers that distinguish a broken launch from a later sign-in failure.
+    private var didSpawnProviderProcess = false
+    private var didCompleteInitializeHandshake = false
     private var stdoutChannel: FileHandleChunkChannel?
     private var stderrChannel: FileHandleChunkChannel?
     private var stdoutConsumerTask: Task<Void, Never>?
@@ -623,6 +640,21 @@ package actor ACPAgentSessionController {
         return true
     }
 
+    /// Like `bootstrap()`, but wraps failures that happen after the provider process spawned and
+    /// before `initialize` completed in `ACPPreHandshakeLaunchError`. Such a process exited, hung,
+    /// or broke its pipes before speaking ACP, so callers can report a launch problem rather
+    /// than a sign-in problem. Earlier and later failures are rethrown unchanged.
+    package func bootstrapMarkingPreHandshakeLaunchFailure() async throws -> BootstrapResult {
+        do {
+            return try await bootstrap()
+        } catch {
+            guard !(error is CancellationError), didSpawnProviderProcess, !didCompleteInitializeHandshake else {
+                throw error
+            }
+            throw ACPPreHandshakeLaunchError(underlying: error)
+        }
+    }
+
     package func bootstrap() async throws -> BootstrapResult {
         guard state == .idle else {
             throw ControllerError.invalidState(expected: "idle", actual: state)
@@ -685,6 +717,7 @@ package actor ACPAgentSessionController {
             throw error
         }
         process = spawned
+        didSpawnProviderProcess = true
         do {
             try startReaders(stdout: spawned.stdout, stderr: spawned.stderr)
         } catch {
@@ -738,6 +771,7 @@ package actor ACPAgentSessionController {
             ]
         )
         diagnose(.phaseCompleted("initialize"))
+        didCompleteInitializeHandshake = true
         state = .initialized
 
         let authMethods = initializeResponse["authMethods"] as? [[String: Any]] ?? []

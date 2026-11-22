@@ -37,7 +37,7 @@ final class AntigravityACPProviderTests: XCTestCase {
         let message = AntigravityACPModelPollingService.launchFailureMessage(for: result.error)
         XCTAssertEqual(
             message,
-            "Couldn't launch the Antigravity CLI. Executable directory is replaceable by another user (mode 775): /opt/homebrew/Caskroom. Fix its permissions, then test again."
+            "Couldn't launch the Antigravity CLI. Executable directory is replaceable by another user (mode 775): /opt/homebrew/Caskroom. Check its ownership and permissions, then test again."
         )
         await service.shutdown()
     }
@@ -56,6 +56,29 @@ final class AntigravityACPProviderTests: XCTestCase {
             spawnMessage,
             "Couldn't launch the Antigravity CLI. \(NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT)).localizedDescription)."
         )
+    }
+
+    func testLaunchFailureMessageGivesSafeNextStepForOwnershipRejections() {
+        XCTAssertEqual(
+            AntigravityACPModelPollingService.launchFailureMessage(
+                for: ExecutableFileIdentityError.untrustedOwner("/opt/homebrew", 502)
+            ),
+            "Couldn't launch the Antigravity CLI. Executable launch path has an untrusted owner (uid 502): /opt/homebrew. Check its ownership and permissions, then test again."
+        )
+    }
+
+    func testLaunchFailureMessageExplainsPreHandshakeExit() {
+        struct TransportClosed: LocalizedError {
+            var errorDescription: String? {
+                "ACP transport closed unexpectedly."
+            }
+        }
+        XCTAssertEqual(
+            AntigravityACPModelPollingService.launchFailureMessage(for: ACPPreHandshakeLaunchError(underlying: TransportClosed())),
+            "Couldn't launch the Antigravity CLI. It stopped before completing the ACP handshake (ACP transport closed unexpectedly). Check the installation, then test again."
+        )
+        // The same transport failure after the handshake is not a launch failure.
+        XCTAssertNil(AntigravityACPModelPollingService.launchFailureMessage(for: TransportClosed()))
     }
 
     func testRefreshResultTreatsThrownCancellationAsNoFailure() async {

@@ -202,6 +202,7 @@ package actor AntigravityACPModelPollingService {
     /// Settings copy for a discovery failure caused by launching or trusting the CLI executable;
     /// `nil` for other failures, which keep the sign-in guidance. On the discovery path,
     /// `invalidConfiguration` comes only from launch preflight (runtime missing or unsupported).
+    /// A failure after `initialize` (authenticate, session/new, no models) keeps the sign-in copy.
     package static func launchFailureMessage(for error: (any Error)?) -> String? {
         let detail: String
         var nextStep = ""
@@ -211,7 +212,9 @@ package actor AntigravityACPModelPollingService {
             detail = description
             switch identityError {
             case .untrustedOwner, .untrustedWritableFile, .untrustedWritableDirectory:
-                nextStep = " Fix its permissions, then test again."
+                // The walk can name any ancestor, including system directories, and the
+                // remedy may be ownership rather than mode, so avoid prescribing a change.
+                nextStep = " Check its ownership and permissions, then test again."
             default:
                 break
             }
@@ -221,6 +224,11 @@ package actor AntigravityACPModelPollingService {
         case let providerError as AIProviderError:
             guard case let .invalidConfiguration(configurationDetail) = providerError else { return nil }
             detail = configurationDetail
+        case let handshakeError as ACPPreHandshakeLaunchError:
+            var reason = handshakeError.underlying.localizedDescription
+            if reason.hasSuffix(".") { reason.removeLast() }
+            detail = "It stopped before completing the ACP handshake (\(reason))"
+            nextStep = " Check the installation, then test again."
         default:
             return nil
         }

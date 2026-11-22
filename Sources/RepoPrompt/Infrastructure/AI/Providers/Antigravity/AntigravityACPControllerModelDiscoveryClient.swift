@@ -27,7 +27,7 @@ actor AntigravityACPControllerModelDiscoveryClient: AntigravityACPModelDiscovery
 
         let controller = try ACPAgentSessionController(provider: provider, runRequest: request)
         do {
-            _ = try await controller.bootstrap()
+            _ = try await controller.bootstrapMarkingPreHandshakeLaunchFailure()
             guard let snapshot = await controller.currentDiscoveredSessionModels(), !snapshot.options.isEmpty else {
                 // Some versions omit models on load. Refresh in a new session next time.
                 retainedSessionIDByWorkspaceKey.removeValue(forKey: workspaceKey)

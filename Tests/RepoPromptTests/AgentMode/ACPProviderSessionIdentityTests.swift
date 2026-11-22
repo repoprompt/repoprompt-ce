@@ -140,6 +140,71 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
         XCTAssertFalse(AgentSessionLinkPrompts.supportsQuietCheckIn(.devin), "F3 does not qualify Devin quiet/copy")
     }
 
+    func testBootstrapMarksExitBeforeInitializeAsLaunchFailure() async throws {
+        // Like a cask wrapper whose exec target is missing: spawn succeeds, then it exits.
+        // The underlying error races between a broken stdin pipe and a closed transport.
+        let underlying = try await preHandshakeLaunchFailureUnderlying(command: "/usr/bin/false", environment: [:])
+        XCTAssertNotNil(underlying)
+    }
+
+    func testBootstrapMarksInitializeTimeoutAsLaunchFailure() async throws {
+        let underlying = try await preHandshakeLaunchFailureUnderlying(
+            command: makeFakeACPServerScript().path,
+            environment: ["ACP_HANG_INITIALIZE": "1"]
+        )
+        XCTAssertEqual(underlying?.localizedDescription.hasPrefix("ACP request initialize timed out"), true, "\(String(describing: underlying))")
+    }
+
+    /// Runs bootstrap against `command` and returns the wrapped error, or `nil` after recording a
+    /// failure when bootstrap does not fail with `ACPPreHandshakeLaunchError`.
+    private func preHandshakeLaunchFailureUnderlying(command: String, environment: [String: String]) async throws -> (any Error)? {
+        let workspace = try makeTemporaryDirectory()
+        let provider = FakeACPProvider(providerID: .antigravity, commandPath: command, environment: environment)
+        let request = makeRunRequest(agentKind: .antigravity, workspacePath: workspace.path)
+        let controller = try ACPAgentSessionController(
+            provider: provider,
+            runRequest: request,
+            requestTimeouts: .init(bootstrapSeconds: 1, operationalSeconds: 1),
+            allowsProviderProcessLaunchForTesting: true
+        )
+        var underlying: (any Error)?
+        do {
+            _ = try await controller.bootstrapMarkingPreHandshakeLaunchFailure()
+            XCTFail("Expected bootstrap to fail")
+        } catch let error as ACPPreHandshakeLaunchError {
+            underlying = error.underlying
+        } catch {
+            XCTFail("Expected a pre-handshake launch failure, got \(error.localizedDescription)")
+        }
+        await controller.shutdown()
+        return underlying
+    }
+
+    func testBootstrapLeavesFailuresAfterInitializeHandshakeUnmarked() async throws {
+        let workspace = try makeTemporaryDirectory()
+        let provider = try FakeACPProvider(
+            providerID: .antigravity,
+            commandPath: makeFakeACPServerScript().path,
+            environment: ["ACP_FAIL_SESSION_NEW": "1"]
+        )
+        let request = makeRunRequest(agentKind: .antigravity, workspacePath: workspace.path)
+        let controller = try ACPAgentSessionController(
+            provider: provider,
+            runRequest: request,
+            requestTimeouts: .init(bootstrapSeconds: 5, operationalSeconds: 5),
+            allowsProviderProcessLaunchForTesting: true
+        )
+        do {
+            _ = try await controller.bootstrapMarkingPreHandshakeLaunchFailure()
+            XCTFail("Expected bootstrap to fail after initialize")
+        } catch {
+            // A CLI that answers initialize and then rejects the session keeps the sign-in copy.
+            XCTAssertFalse(error is ACPPreHandshakeLaunchError, "\(error)")
+            XCTAssertNil(AntigravityACPModelPollingService.launchFailureMessage(for: error))
+        }
+        await controller.shutdown()
+    }
+
     func testCursorNewSessionPublishesRuntimeIDAsVerifiedLoadID() async throws {
         let workspace = try makeTemporaryDirectory()
         let scriptURL = try makeFakeACPServerScript()
@@ -488,10 +553,15 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
             params = request.get("params") or {}
             record(method, params)
             if method == "initialize":
+                if os.environ.get("ACP_HANG_INITIALIZE") == "1":
+                    continue
                 if os.environ.get("ACP_BOOTSTRAP_UPDATE_PROBE") == "1":
                     probe_update(runtime_session_id, "before-initialize-reply")
                 respond(request.get("id"), {"agentCapabilities": {"loadSession": True, "promptCapabilities": json.loads(os.environ.get("ACP_PROMPT_CAPABILITIES", "{}"))}, "authMethods": []})
             elif method == "session/new":
+                if os.environ.get("ACP_FAIL_SESSION_NEW") == "1":
+                    respond(request.get("id"), error={"code": -32000, "message": "Not signed in"})
+                    continue
                 if os.environ.get("ACP_BOOTSTRAP_UPDATE_PROBE") == "1":
                     probe_update(runtime_session_id, "before-new-reply")
                 if os.environ.get("ACP_COMMAND"):
