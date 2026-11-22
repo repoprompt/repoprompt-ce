@@ -142,14 +142,15 @@ struct MCPFileReadResources {
                   handle.contextRevision == contextRevision, route.fileReadConnectionIsCurrent(connection)
             else { throw MCPFileToolAuthorityFailure.superseded }
             let store = lease.resources.files
-            let roots = await store.rootRefs(scope: .visibleWorkspace)
+            let usesRetainedRoots = hostExecutionTab != nil
+            let roots = if usesRetainedRoots { lease.roots } else { await store.rootRefs(scope: .visibleWorkspace) }
             guard Set(roots.map { ($0.fullPath as NSString).standardizingPath })
                 == Set(lease.snapshot.document.metadata.repoPaths.map { ($0 as NSString).standardizingPath })
             else {
                 throw MCPFileToolAuthorityFailure.mismatchedProjection
             }
             let lookup = try await AgentWorkspaceLookupContextResolver.requiredLookupContext(
-                source: source, visibleRoots: roots, store: store
+                source: source, visibleRoots: roots, store: store, usesRetainedRoots: usesRetainedRoots
             )
             let lifetime: WorkspaceSessionRootLifetimeSnapshot?
             if let projection = lookup.bindingProjection {
@@ -170,11 +171,11 @@ struct MCPFileReadResources {
                 let retained = if selectionReceipt.workspace != nil {
                     await lease.resources.contexts?.workspaceSnapshot(context.workspaceID) == expectedWorkspace
                 } else { await lease.isCurrent() }
+                let rootSetIsCurrent = if usesRetainedRoots { true } else { await Set(store.rootRefs(scope: .visibleWorkspace)) == Set(roots) }
                 guard refreshed.runtimeID == handle.runtimeID, refreshed.runtimeGeneration == handle.runtimeGeneration,
                       refreshed.connectionGeneration == handle.connectionGeneration, refreshed.bindingKind == handle.bindingKind,
                       refreshed.workspaceRevision == expectedWorkspace.revisions.workingRevision,
-                      refreshed.contextRevision == expectedContext, retained,
-                      await Set(store.rootRefs(scope: .visibleWorkspace)) == Set(roots)
+                      refreshed.contextRevision == expectedContext, retained, rootSetIsCurrent
                 else { throw MCPFileToolAuthorityFailure.superseded }
                 if let lifetime, await !lifetime.isCurrent() {
                     throw MCPFileToolAuthorityFailure.worktreeScopeUnavailable

@@ -384,6 +384,44 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                     let response = try await question.value
                     XCTAssertTrue(String(describing: response).contains("Continue"), "\(response)")
                     XCTAssertNil(windows.agentSessionLinkPendingInteraction(for: candidate).interaction)
+                    let editArgs: [String: Value] = [
+                        "path": .string(file.path), "search": .string("{ 42 }"), "replace": .string("{ 43 }"),
+                        "operation_id": .string("saved-host-edit-witness")
+                    ]
+                    do {
+                        _ = try await invoke("apply_edits", editArgs, grantingAccess: false)
+                        XCTFail("An unverified provider must not reach file mutation")
+                    } catch DomainMutationPolicyError.principalUnverified {}
+                    let interactions = try XCTUnwrap(host.scope.installedInteractions)
+                    let scope = ApplyEditsApprovalScope(windowID: host.routeID, tabID: stash.tab.id)
+                    await interactions.approvalStore.setAutoEditEnabled(false, for: scope, updateGlobalDefault: false)
+                    let editing = Task { @MainActor in try await invoke("apply_edits", editArgs) }
+                    defer { editing.cancel() }
+                    try await AsyncTestWait.waitUntil("apply_edits awaits the originating writer's approval") {
+                        writer.session.pendingApplyEditsReview != nil
+                    }
+                    XCTAssertTrue(try String(contentsOf: file, encoding: .utf8).contains("{ 42 }"))
+                    let review = try XCTUnwrap(writer.session.pendingApplyEditsReview)
+                    let applied = await interactions.submitApplyEditsReviewDecision(command: command, reviewID: review.id, decision: .accept)
+                    XCTAssertTrue(applied)
+                    let edited = try await editing.value
+                    XCTAssertEqual(edited.objectValue?["edits_applied"]?.intValue, 1, "\(edited)")
+                    XCTAssertEqual(edited.objectValue?["operation_id"]?.stringValue, "saved-host-edit-witness")
+                    XCTAssertTrue(try String(contentsOf: file, encoding: .utf8).contains("{ 43 }"))
+                    let status = try await invoke("git", ["op": .string("status")])
+                    XCTAssertEqual(status.objectValue?["status"]?.objectValue?["branch"]?.stringValue, "main", "\(status)")
+                    let diff = try await invoke("git", ["op": .string("diff"), "detail": .string("patches")])
+                    XCTAssertTrue(String(describing: diff).contains("{ 43 }"), "\(diff)")
+                    let published = try await invoke("git", ["op": .string("diff"), "artifacts": .bool(true), "scope": .string("selected")])
+                    let primary = try XCTUnwrap(published.objectValue?["primary_artifacts"]?.objectValue, "\(published)")
+                    let alias = try XCTUnwrap(primary["map"]?.stringValue)
+                    XCTAssertTrue(primary["auto_selected"]?.arrayValue?.contains(.string(alias)) == true, "\(published)")
+                    let removed = try await invoke("manage_selection", ["op": .string("remove"), "paths": .array([.string(alias)]), "strict": .bool(true)])
+                    XCTAssertFalse(String(describing: removed).contains(alias), "\(removed)")
+                    let repicked = try await invoke("manage_selection", ["op": .string("add"), "paths": .array([.string(alias)]), "strict": .bool(true)])
+                    XCTAssertTrue(String(describing: repicked).contains(alias), "\(repicked)")
+                    let artifact = try await invoke("read_file", ["path": .string(alias)])
+                    XCTAssertTrue(artifact.objectValue?["content"]?.stringValue?.contains("Witness.swift") == true, "\(artifact)")
                     let models = try await invoke("agent_manage", ["op": .string("list_agents"), "roles_only": .bool(true)])
                     XCTAssertNotNil(models.objectValue)
                     let generation = try XCTUnwrap(receipt.routingWaitGeneration)

@@ -240,7 +240,7 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
             return .failed("observer_changed: The requesting session has no exact current binding; nothing was linked.")
         }
         if let origin = AppSavedAgentSessionExecution.approvedLinkOrigin.get(),
-           (origin.observer != initialObserver || origin.target.sessionID != target)
+           origin.observer != initialObserver || origin.target.sessionID != target
         {
             return .failed("observer_changed: The approved continuation lost its original bindings; nothing was linked.")
         }

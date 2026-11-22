@@ -53,7 +53,7 @@ extension MCPHostRouteResources {
         let hostTools: Set<String> = [
             MCPWindowToolName.askUser, MCPWindowToolName.manageSelection, MCPWindowToolName.agentSessionLink,
             MCPWindowToolName.agentManage, MCPWindowToolName.manageWorktree, MCPWindowToolName.sessionAdmin,
-            MCPWindowToolName.becomeOverseer
+            MCPWindowToolName.becomeOverseer, MCPWindowToolName.applyEdits, MCPWindowToolName.git
         ]
         let fileTools = MCPFileReadResources.contentToolNames.union(MCPFileReadResources.toolNames)
         let binder = makeToolBinder(
@@ -88,17 +88,21 @@ extension MCPHostRouteResources {
                 if name == MCPWindowToolName.history { return try await history.execute(args: args) }
                 guard let origin = await canonicalHostInvocation(invocation.metadata) else { throw MCPFileToolAuthorityFailure.superseded }
                 let host = origin.host
-                if fileTools.contains(name) || name == MCPWindowToolName.manageSelection {
+                if name == MCPWindowToolName.manageSelection {
+                    return try await host.executeHostSelection(args: args, invocation: invocation)
+                }
+                if fileTools.contains(name) {
                     guard let lease = await host.workspaceActivation?.catalogFileLease else { throw MCPFileToolAuthorityFailure.superseded }
-                    if name == MCPWindowToolName.manageSelection {
-                        return try await host.executeHostSelection(args: args, invocation: invocation, lease: lease)
-                    }
                     guard let binding = await host.makeHostFileReadResources(lease).binding(named: name, route: self) else {
                         throw MCPFileToolAuthorityFailure.unavailable
                     }
                     return try await binding(args)
                 }
                 switch name {
+                case MCPWindowToolName.git:
+                    return try await host.executeHostGit(args, invocation: invocation)
+                case MCPWindowToolName.applyEdits:
+                    return try await host.executeHostApplyEdits(args, invocation: invocation)
                 case MCPWindowToolName.askUser:
                     return try await host.executeHostAskUser(args, invocation: invocation)
                 case MCPWindowToolName.agentSessionLink:
