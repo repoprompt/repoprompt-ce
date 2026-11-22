@@ -361,6 +361,12 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                     XCTAssertTrue(selectedTree.objectValue?["tree"]?.stringValue?.contains("Witness.swift") == true, "\(selectedTree)")
                     let linkRuntime = try XCTUnwrap(host.scope.linkExecution)
                     let endpoint = try XCTUnwrap(linkRuntime.agentSessionLinkObserverEndpoint(tabID: writer.session.tabID))
+                    XCTAssertEqual(host.route.registeredModelObserverEndpoint(
+                        registration: receipt, connectionID: connectionID, workspaceID: workspace.id, tabID: writer.session.tabID
+                    ), endpoint, "The active catalog must resolve the model observer from the bound saved host")
+                    XCTAssertNil(host.route.registeredModelObserverEndpoint(
+                        registration: receipt, connectionID: connectionID, workspaceID: UUID(), tabID: writer.session.tabID
+                    ), "A valid connection must not resolve an observer for another workspace")
                     let candidate = try XCTUnwrap(windows.agentSessionLinkCandidate(for: endpoint, includeLocation: false))
                     let question = Task { @MainActor in
                         try await invoke("ask_user", ["question": .string("Continue the saved session?"), "timeout_seconds": .int(10)])

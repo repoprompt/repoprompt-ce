@@ -37,6 +37,7 @@ final class MCPAppToolCatalogRegistration: WindowScopedService {
     let windowID: Int
     let runRouting: MCPHostRouteResources.RunRouting?
     let hostTransport: MCPService?
+    let hostModelEndpoint: (@MainActor (MCPRequestMetadata) -> MCPHostRouteResources.ModelEndpoint?)?
 
     private let providers: [any MCPAppToolProviding]
     private let sharedBindings: [MCPDomainToolBinding]
@@ -55,7 +56,8 @@ final class MCPAppToolCatalogRegistration: WindowScopedService {
         requiredToolNames: Set<String> = Set(MCPAppToolGroup.orderedToolNames),
         runRouting: MCPHostRouteResources.RunRouting? = nil,
         hostInteractionAdapter: DomainLongRunningInteractionAdapter? = nil,
-        hostTransport: MCPService? = nil
+        hostTransport: MCPService? = nil,
+        hostModelEndpoint: (@MainActor (MCPRequestMetadata) -> MCPHostRouteResources.ModelEndpoint?)? = nil
     ) {
         #if DEBUG || EDIT_FLOW_PERF
             let constructionState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPWindowToolCatalog.construction)
@@ -69,6 +71,7 @@ final class MCPAppToolCatalogRegistration: WindowScopedService {
         self.requiredToolNames = requiredToolNames
         self.hostInteractionAdapter = hostInteractionAdapter
         self.hostTransport = hostTransport
+        self.hostModelEndpoint = hostModelEndpoint
     }
 
     /// One complete app catalog for either a physical presentation or an executable host route.

@@ -1,34 +1,16 @@
 import Foundation
 import RepoPromptDomainRuntime
-import RepoPromptSettingsCore
 import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
-/// Resource composition only: reads the existing domain authority and never owns another catalog.
-/// Legacy windows and future unpresented hosts use the same file-store construction and lease API.
+/// Retains file roots for execution against the existing domain authority. The lease
+/// proves readable resources, not an Agent writer or permission to mutate a workspace.
 @MainActor
 struct AgentHostWorkspaceResources {
     enum Failure: Error { case authorityUnavailable, contextUnavailable, rootsChanged, contextChanged }
 
     let files: WorkspaceFileContextStore
     let contexts: DomainContextStore?
-
-    static func makeFiles(settingsStore: GlobalSettingsStore) -> WorkspaceFileContextStore {
-        #if DEBUG
-            WorkspaceFileContextStore(
-                startupFeatureFlags: .current(), enableCatalogShardShadowValidation: false,
-                nonGitCodeMapsEnabled: settingsStore.nonGitCodeMapsEnabled,
-                codeMapsGloballyDisabled: settingsStore.globalCodeMapsDisabled(),
-                restorePerfRecorder: AppWorkspaceRestorePerfRecorder(), perfRecorder: AppAgentModePerfRecorder()
-            )
-        #else
-            WorkspaceFileContextStore(
-                startupFeatureFlags: .current(), nonGitCodeMapsEnabled: settingsStore.nonGitCodeMapsEnabled,
-                codeMapsGloballyDisabled: settingsStore.globalCodeMapsDisabled(),
-                restorePerfRecorder: AppWorkspaceRestorePerfRecorder(), perfRecorder: AppAgentModePerfRecorder()
-            )
-        #endif
-    }
 
     /// Roots must already have been loaded through this store's ordinary bounded load API and
     /// cover the canonical workspace paths. An actually empty workspace needs no root retention.

@@ -46,11 +46,10 @@ extension MCPHostRouteResources {
               case let .captured(writer) = context.modelWriterAtBinding else { return nil }
         if registration.providerContextResolver != nil {
             let metadata = MCPRequestMetadata(connectionID: connectionID, clientName: nil, windowID: identity.routeID)
-            guard let invocation = canonicalHostInvocation(metadata), invocation.command.identity == writer,
-                  let endpoint = invocation.host.scope.linkExecution?.agentSessionLinkObserverEndpoint(tabID: tabID),
-                  endpoint.windowID == identity.routeID, endpoint.workspaceID == workspaceID, endpoint.sessionID == sessionID
-            else { return nil }
-            return endpoint
+            guard let model = resolveHostModelEndpoint(metadata), model.writer == writer,
+                  model.endpoint.windowID == identity.routeID, model.endpoint.workspaceID == workspaceID,
+                  model.endpoint.tabID == tabID, model.endpoint.sessionID == sessionID else { return nil }
+            return model.endpoint
         }
         guard let model = modelEndpointForTab?(tabID), model.writer == writer,
               model.endpoint.windowID == identity.routeID, model.endpoint.workspaceID == workspaceID,

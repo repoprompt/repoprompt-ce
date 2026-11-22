@@ -222,7 +222,7 @@ struct MCPFileReadResources {
                     metadata: invocationContext.metadata, lookupContext: lookup, store: store,
                     isRunlessOneShotHint: false, validate: validate,
                     readFile: { input, start, count, lookup in
-                        try await MCPServerViewModel.readStoreFile(
+                        try await MCPWorkspaceFileRead.readStoreFile(
                             input: input, startLine1Based: start, lineCount: count, lookupContext: lookup, store: store,
                             workspaceMessage: { await Self.workspaceMessage(store: store, path: $0) }
                         )
