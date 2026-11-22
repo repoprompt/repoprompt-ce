@@ -68,7 +68,7 @@ package struct ExecutableFileIdentity: Equatable {
 
     /// Revalidates identity and rejects launch paths that an untrusted local user can replace.
     /// Root and the current user are trusted globally; admin-group writes are trusted only for ACL-free
-    /// canonical Homebrew Cellar paths.
+    /// canonical Homebrew Cellar (formula) and Caskroom (cask) paths.
     package func validateForTrustedPathLaunch(atPath path: String) throws {
         try validate(atPath: path)
         try Self.validateTrustedOwnershipAndPermissions(atCanonicalPath: canonicalPath)
@@ -91,16 +91,18 @@ package struct ExecutableFileIdentity: Equatable {
         }
 
         let homebrewLocations = [
-            (prefix: "/opt/homebrew", cellar: "/opt/homebrew/Cellar"),
-            (prefix: "/usr/local", cellar: "/usr/local/Cellar")
+            (prefix: "/opt/homebrew", installRoot: "/opt/homebrew/Cellar"),
+            (prefix: "/opt/homebrew", installRoot: "/opt/homebrew/Caskroom"),
+            (prefix: "/usr/local", installRoot: "/usr/local/Cellar"),
+            (prefix: "/usr/local", installRoot: "/usr/local/Caskroom")
         ]
 
         return homebrewLocations.contains { location in
-            canonicalPath.hasPrefix(location.cellar + "/")
+            canonicalPath.hasPrefix(location.installRoot + "/")
                 && (
                     directoryPath == location.prefix
-                        || directoryPath == location.cellar
-                        || directoryPath.hasPrefix(location.cellar + "/")
+                        || directoryPath == location.installRoot
+                        || directoryPath.hasPrefix(location.installRoot + "/")
                 )
         }
     }

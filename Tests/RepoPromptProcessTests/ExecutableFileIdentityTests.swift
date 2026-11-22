@@ -12,7 +12,13 @@ final class ExecutableFileIdentityTests: XCTestCase {
             ("/opt/homebrew/Cellar/opencode/1.0/bin/opencode", "/opt/homebrew/Cellar/opencode/1.0/bin", 0),
             ("/usr/local/Cellar/opencode/1.0/bin/opencode", "/usr/local", 0),
             ("/usr/local/Cellar/opencode/1.0/bin/opencode", "/usr/local/Cellar", effectiveUID),
-            ("/usr/local/Cellar/opencode/1.0/bin/opencode", "/usr/local/Cellar/opencode/1.0/bin", 0)
+            ("/usr/local/Cellar/opencode/1.0/bin/opencode", "/usr/local/Cellar/opencode/1.0/bin", 0),
+            ("/opt/homebrew/Caskroom/antigravity/1.0/antigravity", "/opt/homebrew", 0),
+            ("/opt/homebrew/Caskroom/antigravity/1.0/antigravity", "/opt/homebrew/Caskroom", effectiveUID),
+            ("/opt/homebrew/Caskroom/antigravity/1.0/antigravity", "/opt/homebrew/Caskroom/antigravity/1.0", 0),
+            ("/usr/local/Caskroom/antigravity/1.0/antigravity", "/usr/local", 0),
+            ("/usr/local/Caskroom/antigravity/1.0/antigravity", "/usr/local/Caskroom", effectiveUID),
+            ("/usr/local/Caskroom/antigravity/1.0/antigravity", "/usr/local/Caskroom/antigravity/1.0", 0)
         ]
 
         for testCase in cases {
@@ -32,6 +38,7 @@ final class ExecutableFileIdentityTests: XCTestCase {
 
     func testPermitsHomebrewAdminGroupWritableDirectoryRejectsTrustBoundaryViolations() {
         let canonicalPath = "/opt/homebrew/Cellar/opencode/1.0/bin/opencode"
+        let caskPath = "/opt/homebrew/Caskroom/antigravity/1.0/antigravity"
         let effectiveUID: uid_t = 501
         let cases: [(name: String, canonicalPath: String, directoryPath: String, mode: mode_t, ownerUID: uid_t, groupGID: gid_t)] = [
             ("non-admin group", canonicalPath, "/opt/homebrew/Cellar", 0o775, 0, 20),
@@ -41,7 +48,14 @@ final class ExecutableFileIdentityTests: XCTestCase {
             ("prefix lookalike", "/opt/homebrew/Cellarish/opencode", "/opt/homebrew/Cellarish", 0o775, 0, 80),
             ("directory outside Cellar", canonicalPath, "/opt/homebrew/bin", 0o775, 0, 80),
             ("mismatched Homebrew root", canonicalPath, "/usr/local/Cellar", 0o775, 0, 80),
-            ("canonical target outside Cellar", "/opt/homebrew/bin/opencode", "/opt/homebrew", 0o775, 0, 80)
+            ("canonical target outside Cellar", "/opt/homebrew/bin/opencode", "/opt/homebrew", 0o775, 0, 80),
+            ("cask non-admin group", caskPath, "/opt/homebrew/Caskroom", 0o775, 0, 20),
+            ("cask untrusted owner", caskPath, "/opt/homebrew/Caskroom", 0o775, 502, 80),
+            ("cask world writable", caskPath, "/opt/homebrew/Caskroom", 0o777, 0, 80),
+            ("Caskroom prefix lookalike", "/opt/homebrew/Caskroomish/antigravity", "/opt/homebrew/Caskroomish", 0o775, 0, 80),
+            ("cask directory outside Caskroom", caskPath, "/opt/homebrew/bin", 0o775, 0, 80),
+            ("cask mismatched Homebrew root", caskPath, "/usr/local/Caskroom", 0o775, 0, 80),
+            ("cask target does not permit Cellar", caskPath, "/opt/homebrew/Cellar", 0o775, 0, 80)
         ]
 
         for testCase in cases {

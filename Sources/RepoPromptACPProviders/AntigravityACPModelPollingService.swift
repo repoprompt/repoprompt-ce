@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptAIContracts
+import RepoPromptProcess
 
 package protocol AntigravityACPModelDiscoveryClient: Sendable {
     func discoverModels(workspacePath: String?) async throws -> ACPDiscoveredSessionModels?
@@ -10,6 +11,22 @@ package protocol AntigravityACPModelDiscoveryClient: Sendable {
 /// polling behavior: poll only while subscribed, coalesce refreshes, keep the last good
 /// snapshot on failure, and warm the persisted registry before live discovery completes.
 package actor AntigravityACPModelPollingService {
+    package enum RefreshResult {
+        case succeeded
+        /// `nil` when the refresh was skipped or cancelled rather than failing.
+        case failed((any Error)?)
+
+        package var didSucceed: Bool {
+            if case .succeeded = self { return true }
+            return false
+        }
+
+        package var error: (any Error)? {
+            if case let .failed(error) = self { return error }
+            return nil
+        }
+    }
+
     package struct Snapshot: Equatable {
         package let models: ACPDiscoveredSessionModels
         package let fetchedAt: Date
@@ -22,7 +39,7 @@ package actor AntigravityACPModelPollingService {
     private let intervalNanos: UInt64
 
     private var pollingTask: Task<Void, Never>?
-    private var inFlightRefresh: Task<Bool, Never>?
+    private var inFlightRefresh: Task<RefreshResult, Never>?
     private var continuations: [UUID: AsyncStream<Snapshot>.Continuation] = [:]
     #if DEBUG
         private var testRefreshNowInFlightJoinObservers: [UUID: AsyncStream<Void>.Continuation] = [:]
@@ -105,7 +122,12 @@ package actor AntigravityACPModelPollingService {
 
     @discardableResult
     package func refreshNow(workspacePath: String?) async -> Bool {
-        guard !isShutdown else { return false }
+        await refreshNowWithResult(workspacePath: workspacePath).didSucceed
+    }
+
+    /// Like `refreshNow`, but keeps the discovery error so callers can report launch failures.
+    package func refreshNowWithResult(workspacePath: String?) async -> RefreshResult {
+        guard !isShutdown else { return .failed(nil) }
         preferredWorkspacePath = normalizedWorkspacePath(workspacePath)
         if let existing = inFlightRefresh {
             #if DEBUG
@@ -177,28 +199,37 @@ package actor AntigravityACPModelPollingService {
         }
     #endif
 
-    private func performRefresh() async -> Bool {
-        guard !isShutdown else { return false }
+    /// Settings copy for a discovery failure caused by launching or trusting the CLI executable;
+    /// `nil` for other failures, which keep the sign-in guidance.
+    package static func launchFailureMessage(for error: (any Error)?) -> String? {
+        guard let error = error as? ExecutableFileIdentityError,
+              let description = error.errorDescription
+        else { return nil }
+        return "Couldn't launch the Antigravity CLI. \(description)"
+    }
+
+    private func performRefresh() async -> RefreshResult {
+        guard !isShutdown else { return .failed(nil) }
         if let existing = inFlightRefresh {
             return await existing.value
         }
 
         let workspacePath = preferredWorkspacePath
-        let task = Task<Bool, Never> { [weak self, workspacePath] in
-            guard let self else { return false }
+        let task = Task<RefreshResult, Never> { [weak self, workspacePath] in
+            guard let self else { return .failed(nil) }
             do {
                 let discovered = try await client.discoverModels(workspacePath: workspacePath)
-                guard !Task.isCancelled else { return false }
+                guard !Task.isCancelled else { return .failed(nil) }
                 if let discovered {
                     await applyRefreshResult(discovered)
                 } else {
                     await publishLiveReadinessWithoutModels()
                 }
-                return true
+                return .succeeded
             } catch {
                 // Keep the last registry/cache snapshot when preflight or ACP discovery fails.
                 await recordFailure(error.localizedDescription)
-                return false
+                return .failed(error)
             }
         }
         inFlightRefresh = task

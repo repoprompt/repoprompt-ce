@@ -2,6 +2,7 @@ import Foundation
 import RepoPromptACPProviders
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
+import RepoPromptProcess
 import XCTest
 
 final class AntigravityACPProviderTests: XCTestCase {
@@ -21,6 +22,32 @@ final class AntigravityACPProviderTests: XCTestCase {
         XCTAssertEqual(snapshot?.models.options.map(\.rawValue), ["retained-model"])
         XCTAssertEqual(snapshot?.isLiveDiscovery, false)
         await service.shutdown()
+    }
+
+    func testRefreshResultCarriesLaunchTrustFailureForSettingsMessage() async {
+        struct UntrustedLaunchClient: AntigravityACPModelDiscoveryClient {
+            func discoverModels(workspacePath _: String?) async throws -> ACPDiscoveredSessionModels? {
+                throw ExecutableFileIdentityError.untrustedWritableDirectory("/opt/homebrew/Caskroom", 0o40775)
+            }
+        }
+        let registry = AgentACPModelRegistry(dependencies: .init(loadAll: { [:] }, load: { _ in nil }, save: { _, _ in }, remove: { _ in }, invalidate: { _ in }))
+        let service = AntigravityACPModelPollingService(client: UntrustedLaunchClient(), registry: registry, logFailure: { _ in })
+        let result = await service.refreshNowWithResult(workspacePath: nil)
+        XCTAssertFalse(result.didSucceed)
+        let message = AntigravityACPModelPollingService.launchFailureMessage(for: result.error)
+        XCTAssertEqual(
+            message,
+            "Couldn't launch the Antigravity CLI. Executable directory is replaceable by another user (mode 775): /opt/homebrew/Caskroom"
+        )
+        await service.shutdown()
+    }
+
+    func testLaunchFailureMessageIgnoresNonLaunchFailures() {
+        XCTAssertNil(AntigravityACPModelPollingService.launchFailureMessage(for: nil))
+        XCTAssertNil(AntigravityACPModelPollingService.launchFailureMessage(
+            for: AIProviderError.invalidResponse(detail: "Antigravity ACP returned no selectable models.")
+        ))
+        XCTAssertNil(AntigravityACPModelPollingService.launchFailureMessage(for: NSError(domain: "fixture", code: 1)))
     }
 
     private var toolNames: ACPToolNameResolution {

@@ -1936,13 +1936,14 @@ public class APISettingsViewModel: ObservableObject {
         isTestingAntigravity = true
         defer { isTestingAntigravity = false }
         antigravityError = nil
-        let discovered = await AntigravityACPModelPollingService.shared.refreshNow(workspacePath: nil)
+        let result = await AntigravityACPModelPollingService.shared.refreshNowWithResult(workspacePath: nil)
         guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
-        isAntigravityConnected = discovered
-        if discovered {
+        isAntigravityConnected = result.didSucceed
+        if result.didSucceed {
             startAntigravityModelsSubscriptionIfNeeded()
         } else {
-            antigravityError = "No models received. Confirm your Google sign-in, then test again."
+            antigravityError = AntigravityACPModelPollingService.launchFailureMessage(for: result.error)
+                ?? "No models received. Confirm your Google sign-in, then test again."
         }
         refreshDirectConnectedCLIProviders()
         await updateAvailableModels()
