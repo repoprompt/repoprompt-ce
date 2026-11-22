@@ -180,7 +180,7 @@ final class AgentSessionRuntimeHost {
         connectionPolicyInstaller: @escaping AgentRunExecutionContracts.ConnectionPolicyInstaller,
         modelRouterSettingsStore: GlobalSettingsStore,
         catalogDiagnosticsSink: any AgentSessionLinkCatalogEventSink,
-        perfRecorder: any AgentModePerfRecording
+        perfRecorder: any AgentModePerfRecording, providerResources: AgentRunProviderComposition? = nil
     ) {
         precondition(route.isLeaseManaged == (executionRouteLease != nil), "A leased route requires an execution lease")
         let releaseExecutionRoute = executionRouteLease?.transferToExecutionHost(on: route)
@@ -193,7 +193,7 @@ final class AgentSessionRuntimeHost {
         runToolCanceller = { tools.cancelActiveToolsForRun(runID: $0, reason: $1) }
         let providerBindingService = AgentModeProviderBindingService()
         self.providerBindingService = providerBindingService
-        providerResources = .live()
+        self.providerResources = providerResources ?? .live()
         codexCoordinator = CodexAgentModeCoordinator(
             windowID: routeID,
             routingOwner: route.identity.kind == .independent ? route : nil,

@@ -4861,6 +4861,10 @@ class WorkspaceManagerViewModel: ObservableObject {
     /// UI placement. Its session file still uses the normal session persistence owner.
     private(set) var isSessionRuntimeProjection = false
 
+    #if DEBUG
+        private(set) static var constructionCountForTesting = 0
+    #endif
+
     init(
         fileManager: WorkspaceFilesViewModel,
         promptViewModel: PromptViewModel,
@@ -4879,6 +4883,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         workspaceSaveTracer = WorkspaceSaveTracer(restorePerfRecorder: restorePerfRecorder)
         workspaceDiskWriter.policy.installRestorePerfRecorder(restorePerfRecorder)
         #if DEBUG
+            Self.constructionCountForTesting += 1
             let initStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
         self.fileManager = fileManager

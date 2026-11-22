@@ -17,9 +17,13 @@ final class AgentSessionHostWorkspaceActivation {
     private let resources: AgentHostWorkspaceResources
     private let settings: APISettingsRuntimeLease
     private let savedTarget: AgentSavedSessionTargetLoader.Target?
-    var savedCarrierSessionID: UUID? { savedTarget?.entry.id }
+    var savedCarrierSessionID: UUID? {
+        savedTarget?.entry.id
+    }
+
     private var savedSelection: StoredSelection?
     private var rootLeases: [Set<UUID>: AgentHostWorkspaceResources.Lease] = [:]
+    private(set) var catalogFileLease: AgentHostWorkspaceResources.Lease?
     private var retainedRoots: [AgentHostWorkspaceResources.Lease] = []
     private(set) var isReleased = false
     private struct HostBinding {
@@ -124,42 +128,70 @@ final class AgentSessionHostWorkspaceActivation {
             let root = try await resources.files.loadRoot(path: path, cancelUnderlyingLoadOnCallerCancellation: false)
             rootIDs.append(root.id)
         }
-        let lease = try await resources.acquire(workspaceID: workspaceID, rootIDs: rootIDs) { snapshot in
-            snapshot.document.metadata.repoPaths == original.document.metadata.repoPaths
+        guard isPresenterCurrent else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
+        let lease = try await retainHostFileResources(rootIDs: rootIDs)
+        guard lease.snapshot.document.metadata.repoPaths == original.document.metadata.repoPaths,
+              isPresenterCurrent, lease.rootsAreCurrent, !Task.isCancelled
+        else { throw AgentHostWorkspaceResources.Failure.contextChanged }
+        return lease
+    }
+
+    /// Lease the exact activation's workspace roots, before any tab or writer is selected.
+    /// A saved activation additionally proves its historical carrier against canonical bytes.
+    @discardableResult
+    func retainHostFileResources(rootIDs: [UUID]) async throws -> AgentHostWorkspaceResources.Lease {
+        guard let workspaceID = key.owner.workspaceID, isCurrent, catalogFileLease == nil else {
+            throw AgentHostWorkspaceResources.Failure.authorityUnavailable
         }
-        guard await authority.canonicalWorkspaceSnapshot(workspaceID) == lease.snapshot,
-              isPresenterCurrent, retainedRoots.isEmpty, lease.rootsAreCurrent, !Task.isCancelled
+        let lease = try await resources.acquire(workspaceID: workspaceID, rootIDs: rootIDs) { snapshot in
+            guard let savedTarget else { return true }
+            guard let workspace = try? JSONDecoder().decode(WorkspaceModel.self, from: snapshot.document.documentBytes) else { return false }
+            return savedTarget.carrier(in: workspace) != nil
+        }
+        guard await authority.canonicalWorkspaceSnapshot(workspaceID) == lease.snapshot, isCurrent,
+              !Task.isCancelled, catalogFileLease == nil
         else {
             await lease.release()
             throw AgentHostWorkspaceResources.Failure.contextChanged
         }
+        catalogFileLease = lease
         rootLeases[Set(rootIDs)] = lease
         retainedRoots.append(lease)
         return lease
     }
 
-    func retainSavedFileResources(rootIDs: [UUID]) async throws -> AgentHostWorkspaceResources.Lease {
-        guard let savedTarget, isCurrent else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
-        let workspaceID = savedTarget.workspace.id
-        let lease = try await resources.acquire(workspaceID: workspaceID, rootIDs: rootIDs) { snapshot in
-            guard let workspace = try? JSONDecoder().decode(WorkspaceModel.self, from: snapshot.document.documentBytes) else { return false }
-            return savedTarget.carrier(in: workspace) != nil
-        }
-        guard await authority.canonicalWorkspaceSnapshot(workspaceID) == lease.snapshot, isCurrent, !Task.isCancelled else {
-            await lease.release()
-            throw AgentHostWorkspaceResources.Failure.contextChanged
-        }
-        rootLeases[Set(rootIDs)] = lease
-        retainedRoots.append(lease)
-        return lease
-    }
-
-    func commitSavedSelection(_ selection: StoredSelection, replacing previous: StoredSelection, command: AgentSessionRuntimeStore.Command) throws {
+    func commitHostSelection(
+        _ selection: StoredSelection, replacing previous: StoredSelection,
+        in snapshot: DomainWorkspaceSnapshot, command: AgentSessionRuntimeStore.Command,
+        connectionID: UUID, validatesOrigin: @escaping @MainActor @Sendable () async -> Bool
+    ) async throws -> DomainWorkspaceSnapshot? {
+        guard await authority.canonicalWorkspaceSnapshot(command.identity.workspaceID) == snapshot,
+              await validatesOrigin() else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
         try command.requireCurrent()
-        guard !Task.isCancelled, savedCarrierSessionID == command.identity.sessionID, isCurrent,
-              hostBinding?.scope === command.writer.scope else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
-        guard savedSelection == previous else { throw AgentHostWorkspaceResources.Failure.contextChanged }
-        savedSelection = selection
+        guard !Task.isCancelled, isCurrent, hostBinding?.scope === command.writer.scope,
+              executionTab(in: snapshot, command: command)?.selection == previous
+        else { throw AgentHostWorkspaceResources.Failure.contextChanged }
+        guard selection != previous else { return nil }
+        if savedTarget != nil {
+            // Historical execution cannot publish a selection into a different displayed chat.
+            savedSelection = selection
+            return nil
+        }
+        let tabID = command.writer.session.tabID
+        guard let context = snapshot.contexts.first(where: { $0.metadata.identity.contextID == tabID }),
+              var workspace = try? JSONDecoder().decode(WorkspaceModel.self, from: snapshot.document.documentBytes),
+              let index = workspace.composeTabs.firstIndex(where: { $0.id == tabID && $0.activeAgentSessionID == command.identity.sessionID })
+        else { throw AgentHostWorkspaceResources.Failure.contextChanged }
+        workspace.composeTabs[index].selection = selection
+        let document = try DomainWorkspaceDocument.decode(documentBytes: JSONEncoder().encode(workspace), fileURL: snapshot.document.fileURL)
+        let outcome = await authority.store.replaceWorkingContext(
+            document: document, workspaceRevision: snapshot.revisions.workingRevision, contextRevision: context.revisions.workingRevision,
+            connectionID: connectionID, validatesOrigin: validatesOrigin
+        )
+        // Report the actual commit receipt. A rebind after durable IO cannot roll it back.
+        guard outcome.errorCode == nil, let after = outcome.workspace,
+              after.document.contentDigest == document.contentDigest else { throw AgentHostWorkspaceResources.Failure.contextChanged }
+        return after
     }
 
     var modelAvailability: AgentModelCatalog.AvailabilityContext? {
@@ -321,6 +353,7 @@ final class AgentSessionHostWorkspaceActivation {
         guard !isReleased else { return }
         isReleased = true
         let retained = retainedRoots
+        catalogFileLease = nil
         rootLeases.removeAll()
         retainedRoots.removeAll()
         for lease in retained {

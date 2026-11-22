@@ -20,7 +20,8 @@ extension AgentSessionRuntimeHost {
         guard attemptID != nil || idleStartup != nil else { return nil }
         let stopFence = AgentRunStartStopFence(session: session)
         let bindings = session.worktreeBindings
-        let sessionID = command.identity.sessionID
+        let writerIdentity = command.identity
+        let sessionID = writerIdentity.sessionID
         let context = DomainContextIdentity(workspaceID: workspaceID, contextID: session.tabID)
         let routeID = route.identity.routeID
         let isCurrent: @MainActor @Sendable () -> Bool = { [weak self, weak activation, weak session] in
@@ -50,6 +51,8 @@ extension AgentSessionRuntimeHost {
                 worktreeBindings: bindings, explicitlyBound: false
             )
             snapshot.savedCarrierSessionID = activation.savedCarrierSessionID
+            snapshot.runAttemptIDAtBinding = attemptID
+            snapshot.modelWriterAtBinding = .captured(writerIdentity)
             return .init(snapshot: snapshot, isCurrent: isCurrent, validateCarrier: { [weak activation] in
                 guard isCurrent(), let latest = await activation?.authority.canonicalWorkspaceSnapshot(workspaceID),
                       latest.health != .removed else { return false }

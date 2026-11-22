@@ -82,6 +82,10 @@ final class MCPHostRouteResources {
     private var catalogTransitionTail: Task<Void, Never>?
     private(set) var catalogHandle: MCPDomainToolRegistrationHandle?
     private var catalog: MCPAppToolCatalogRegistration?
+    var usesHostCapabilities: Bool {
+        catalog?.ownsHostInteractions == true
+    }
+
     private var runRouting: RunRouting?
     private(set) var providerContextSource: ProviderContextSource?
     /// Only an entered context/mapping producer retains its original physical cleanup adapter.
@@ -97,6 +101,7 @@ final class MCPHostRouteResources {
         return current.windowID == original.windowID && current.workspaceID == original.workspaceID
             && current.tabID == original.tabID && current.runID == original.runID
             && current.savedCarrierSessionID == original.savedCarrierSessionID
+            && current.runAttemptIDAtBinding == original.runAttemptIDAtBinding
             && current.readFileAutoSelectionGeneration == original.readFileAutoSelectionGeneration
             && current.routeOwnerIdentity == original.routeOwnerIdentity
             && current.fileToolAuthoritySourceIdentity == original.fileToolAuthoritySourceIdentity
@@ -109,9 +114,22 @@ final class MCPHostRouteResources {
         fileprivate let policyID: UUID?
         fileprivate let tab: MCPTabContextSnapshot
 
-        var savedCarrierSessionID: UUID? { tab.savedCarrierSessionID }
-        var runID: UUID? { tab.runID }
-        var connectionID: UUID { registration.connectionID }
+        var savedCarrierSessionID: UUID? {
+            tab.savedCarrierSessionID
+        }
+
+        var runID: UUID? {
+            tab.runID
+        }
+
+        var runAttemptIDAtBinding: UUID? {
+            tab.runAttemptIDAtBinding
+        }
+
+        var connectionID: UUID {
+            registration.connectionID
+        }
+
         var writerAtBinding: AgentSessionRuntimeStore.WriterIdentity? {
             if case let .captured(identity) = tab.modelWriterAtBinding { return identity }
             return nil
@@ -124,13 +142,13 @@ final class MCPHostRouteResources {
 
     /// Capture the current connection before selection or domain reads can suspend, and use its
     /// bound tab for the entire invocation. The route's active presentation is irrelevant here.
-    func fileReadConnection(metadata: MCPRequestMetadata, workspaceID: UUID) throws -> FileReadConnection {
+    func fileReadConnection(metadata: MCPRequestMetadata, workspaceID expectedWorkspaceID: UUID? = nil) throws -> FileReadConnection {
         guard !isClosing, let connectionID = metadata.connectionID,
               let retained = connections[connectionID],
               let routed = runRouteBindings.tabContextByConnectionID[connectionID],
               metadata.windowID == identity.routeID,
               routed.windowID == identity.routeID, routed.routeOwnerIdentity == ObjectIdentifier(self),
-              routed.workspaceID == workspaceID,
+              let workspaceID = routed.workspaceID, expectedWorkspaceID.map({ $0 == workspaceID }) ?? true,
               runRouteBindings.connectionIDToRunID[connectionID].map({ $0 == routed.runID }) ?? true,
               metadata.tabContextHint.map({ $0.tabID == routed.tabID && ($0.workspaceID == nil || $0.workspaceID == workspaceID) }) ?? true
         else { throw MCPFileToolAuthorityFailure.unavailable }

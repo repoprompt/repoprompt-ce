@@ -10,11 +10,13 @@ import RepoPromptWorkspaceCore
 extension AgentSessionRuntimeHost {
     /// Route registration contributes the original writer incarnation; workspace/tab identifiers
     /// alone are insufficient when the carrier displays another transcript.
-    func savedFileCommand(_ connection: MCPHostRouteResources.FileReadConnection) -> AgentSessionRuntimeStore.Command? {
-        guard let sessionID = connection.savedCarrierSessionID, let runID = connection.runID,
-              workspaceActivation?.savedCarrierSessionID == sessionID,
+    func hostFileCommand(_ connection: MCPHostRouteResources.FileReadConnection) -> AgentSessionRuntimeStore.Command? {
+        guard let sessionID = connection.lookupSource.activeAgentSessionID, let runID = connection.runID,
+              let activation = workspaceActivation, activation.owns(scope: scope, route: route),
+              activation.savedCarrierSessionID == connection.savedCarrierSessionID,
               route.fileReadConnectionIsCurrent(connection),
               let session = scope.sessions[connection.context.contextID], session.runID == runID,
+              connection.runAttemptIDAtBinding.map({ $0 == session.activeRunAttemptID }) ?? true,
               let command = try? scope.admit(session: session, expectedWorkspaceID: connection.context.workspaceID),
               command.identity == connection.writerAtBinding, command.identity.sessionID == sessionID,
               connection.lookupSource.worktreeBindingState.bindings == session.worktreeBindings else { return nil }
@@ -25,17 +27,17 @@ extension AgentSessionRuntimeHost {
         return command
     }
 
-    func makeSavedFileReadResources(_ lease: AgentHostWorkspaceResources.Lease) -> MCPFileReadResources {
+    func makeHostFileReadResources(_ lease: AgentHostWorkspaceResources.Lease) -> MCPFileReadResources {
         .init(workspace: lease, settings: .shared, contentEffects: .init(
             // This route has no advertised Git artifact grant. Ordinary exact paths still use
             // the shared resolver and the run's canonical logical/physical root projection.
             artifact: { _, _, _, _, _, _ in nil },
-            selectRead: { [weak self] connection, lookup, reply, path, physical in
-                guard let self, let intent = AutoSliceSelection.readFileSelection(from: reply, fallbackPath: path) else { return }
+            selectRead: { [weak self] connection, snapshot, validateResources, lookup, reply, path, physical in
+                guard let self, let intent = AutoSliceSelection.readFileSelection(from: reply, fallbackPath: path) else { return nil }
                 let ranges: [LineRange]? = if case let .slice(entry) = intent { entry.ranges } else { nil }
-                try await applySavedReadSelection(connection, lookup: lookup, files: [physical], slices: ranges.map { [physical: $0] } ?? [:])
-            }, selectSearch: { [weak self] connection, lookup, mode, lines, reply, paths in
-                guard let self, !paths.isEmpty else { return }
+                return try await applyHostReadSelection(connection, snapshot: snapshot, validateResources: validateResources, lookup: lookup, files: [physical], slices: ranges.map { [physical: $0] } ?? [:])
+            }, selectSearch: { [weak self] connection, snapshot, validateResources, lookup, mode, lines, reply, paths in
+                guard let self, !paths.isEmpty else { return nil }
                 var slices: [String: [LineRange]] = [:]
                 if AutoSliceSelection.shouldSliceFileSearch(mode: mode, contextLines: lines) {
                     let ranges = Dictionary(uniqueKeysWithValues: AutoSliceSelection.searchEntries(from: reply.contentMatchGroups).map { ($0.path, $0.ranges) })
@@ -44,15 +46,15 @@ extension AgentSessionRuntimeHost {
                         if let lines = ranges[projected] { slices[path] = lines }
                     }
                 }
-                try await applySavedReadSelection(connection, lookup: lookup, files: paths, slices: slices)
+                return try await applyHostReadSelection(connection, snapshot: snapshot, validateResources: validateResources, lookup: lookup, files: paths, slices: slices)
             }
-        ), savedExecutionTab: { [weak self] snapshot, connection in
-            guard let self, let command = savedFileCommand(connection) else { return nil }
+        ), hostExecutionTab: { [weak self] snapshot, connection in
+            guard let self, let command = hostFileCommand(connection) else { return nil }
             return workspaceActivation?.executionTab(in: snapshot, command: command)
         })
     }
 
-    func executeSavedSelection(
+    func executeHostSelection(
         args: [String: Value], invocation: ToolInvocationContext, lease base: AgentHostWorkspaceResources.Lease
     ) async throws -> Value {
         let op = args["op"]?.stringValue ?? "get"
@@ -62,7 +64,7 @@ extension AgentSessionRuntimeHost {
             throw MCPFileToolAuthorityFailure.unavailable
         }
         let connection = try route.fileReadConnection(metadata: invocation.metadata, workspaceID: workspaceID)
-        guard let original = savedFileCommand(connection) else { throw MCPFileToolAuthorityFailure.unavailable }
+        guard let original = hostFileCommand(connection) else { throw MCPFileToolAuthorityFailure.unavailable }
         let lease = try await base.capture(workspaceID: workspaceID) { activation.executionTab(in: $0, command: original) != nil }
         guard let tab = activation.executionTab(in: lease.snapshot, command: original) else { throw MCPFileToolAuthorityFailure.superseded }
         let store = lease.resources.files
@@ -86,14 +88,18 @@ extension AgentSessionRuntimeHost {
         if args["strict"]?.boolValue == true, selection.selection == physical, !selection.invalid.isEmpty {
             throw MCPSelectionToolProvider.invalidOnlySelectionError(invalidPaths: selection.invalid, fallback: "No selection inputs resolved")
         }
-        if let lookupLifetime, await !lookupLifetime.isCurrent() { throw MCPFileToolAuthorityFailure.worktreeScopeUnavailable }
-        guard await ServerNetworkManager.shared.validateToolInvocationContext(invocation, expectedWindowID: routeID, expectedServerViewModelIdentity: ObjectIdentifier(route)),
-              await lease.isCurrent(), savedFileCommand(connection)?.identity == original.identity else {
-            throw MCPFileToolAuthorityFailure.superseded
+        let validatesOrigin: @MainActor @Sendable () async -> Bool = {
+            guard await self.hostSelectionOriginIsCurrent(invocation, connection: connection, command: original) else { return false }
+            if let lookupLifetime, await !lookupLifetime.isCurrent() { return false }
+            return lease.rootsAreCurrent && self.hostFileCommand(connection)?.identity == original.identity
         }
+        guard await lease.isCurrent(), await validatesOrigin() else { throw MCPFileToolAuthorityFailure.superseded }
         let next = lookup.logicalizeSelection(selection.selection)
-        if op != "preview" && op != "get" && next != tab.selection {
-            try activation.commitSavedSelection(next, replacing: tab.selection, command: original)
+        if op != "preview", op != "get", next != tab.selection {
+            _ = try await activation.commitHostSelection(
+                next, replacing: tab.selection, in: lease.snapshot, command: original,
+                connectionID: connection.connectionID, validatesOrigin: validatesOrigin
+            )
         }
         let files = next.selectedPaths.map { path in
             ToolResultDTOs.SelectedFileInfo(path: path, tokens: 0, renderMode: next.slices[path] == nil ? "full" : "slice", ranges: nil, isAuto: false, codemapOrigin: nil, copyPreset: nil)
@@ -138,22 +144,36 @@ extension AgentSessionRuntimeHost {
         }
     }
 
-    private func applySavedReadSelection(
-        _ connection: MCPHostRouteResources.FileReadConnection, lookup: WorkspaceLookupContext,
+    private func hostSelectionOriginIsCurrent(
+        _ invocation: ToolInvocationContext, connection: MCPHostRouteResources.FileReadConnection,
+        command: AgentSessionRuntimeStore.Command
+    ) async -> Bool {
+        guard await ServerNetworkManager.shared.validateToolInvocationContext(
+            invocation, expectedWindowID: routeID, expectedServerViewModelIdentity: ObjectIdentifier(route)
+        ) else { return false }
+        return !Task.isCancelled && hostFileCommand(connection)?.identity == command.identity
+    }
+
+    private func applyHostReadSelection(
+        _ connection: MCPHostRouteResources.FileReadConnection, snapshot: DomainWorkspaceSnapshot,
+        validateResources: MCPFileReadResources.ReadResourceCheck, lookup: WorkspaceLookupContext,
         files: [String], slices additions: [String: [LineRange]]
-    ) async throws {
+    ) async throws -> DomainWorkspaceSnapshot? {
         guard let invocation = MCPInvocationContextBridge.current,
               invocation.connectionID == connection.connectionID,
-              let original = savedFileCommand(connection), let activation = workspaceActivation else {
+              let original = hostFileCommand(connection), let activation = workspaceActivation
+        else {
             throw MCPFileToolAuthorityFailure.superseded
         }
         let purpose = await ServerNetworkManager.shared.runPurpose(for: connection.connectionID)
-        guard AutoSliceSelection.shouldApply(purpose: purpose, hasVirtualContext: true) else { return }
-        guard await ServerNetworkManager.shared.validateToolInvocationContext(
-            invocation, expectedWindowID: routeID, expectedServerViewModelIdentity: ObjectIdentifier(route)
-        ), let workspace = await activation.authority.canonicalWorkspaceSnapshot(connection.context.workspaceID),
-              savedFileCommand(connection)?.identity == original.identity,
-              let tab = activation.executionTab(in: workspace, command: original) else {
+        guard AutoSliceSelection.shouldApply(purpose: purpose, hasVirtualContext: true) else { return nil }
+        let validatesOrigin: @MainActor @Sendable () async -> Bool = {
+            guard await self.hostSelectionOriginIsCurrent(invocation, connection: connection, command: original) else { return false }
+            do { try await validateResources() }
+            catch { return false }
+            return self.hostFileCommand(connection)?.identity == original.identity
+        }
+        guard await validatesOrigin(), let tab = activation.executionTab(in: snapshot, command: original) else {
             throw MCPFileToolAuthorityFailure.superseded
         }
         let selection = lookup.physicalizeSelection(tab.selection)
@@ -175,6 +195,9 @@ extension AgentSessionRuntimeHost {
             selectedPaths: selected, manualCodemapPaths: selection.manualCodemapPaths,
             slices: slices, codemapAutoEnabled: selection.codemapAutoEnabled
         ))
-        try activation.commitSavedSelection(next, replacing: tab.selection, command: original)
+        return try await activation.commitHostSelection(
+            next, replacing: tab.selection, in: snapshot, command: original,
+            connectionID: connection.connectionID, validatesOrigin: validatesOrigin
+        )
     }
 }

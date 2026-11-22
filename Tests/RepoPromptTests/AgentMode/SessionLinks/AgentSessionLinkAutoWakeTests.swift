@@ -1193,6 +1193,57 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             return nil
         }
         let originatingContextSource = host.originatingContextSource
+        let initialSnapshot = await authority.canonicalWorkspaceSnapshot(f.endpoint.workspaceID)
+        let initial = try XCTUnwrap(initialSnapshot)
+        var initialWorkspace = try JSONDecoder().decode(WorkspaceModel.self, from: initial.document.documentBytes)
+        let firstIndex = try XCTUnwrap(initialWorkspace.composeTabs.firstIndex { $0.id == session.tabID })
+        let secondIndex = try XCTUnwrap(initialWorkspace.composeTabs.firstIndex { $0.id != session.tabID })
+        let secondID = UUID()
+        initialWorkspace.composeTabs[firstIndex].selection = .init(selectedPaths: ["First.swift"])
+        initialWorkspace.composeTabs[secondIndex].selection = .init(selectedPaths: ["Second.swift"])
+        initialWorkspace.composeTabs[secondIndex].activeAgentSessionID = secondID
+        let prepared = try await authority.replaceWorkingFailClosed(
+            initialWorkspace, fileURL: initial.document.fileURL, expectedWorkspaceRevision: initial.revisions.workingRevision
+        )
+        XCTAssertEqual(prepared.disposition, .applied)
+        let secondTabID = initialWorkspace.composeTabs[secondIndex].id
+        let second = host.scope.makeSession(tabID: secondTabID)
+        second.installPersistentSessionBinding(.init(tabID: secondTabID, sessionID: secondID, workspaceID: f.endpoint.workspaceID))
+        second.hasLoadedPersistedState = true
+        second.recordRestorationAuthoritative(.persistedPayloadApplied)
+        let secondRunID = UUID()
+        second.installRunID(secondRunID)
+        second.beginRunAttempt(source: "provider.route.other")
+        func worktree(_ name: String) -> AgentSessionWorktreeBinding {
+            .init(
+                id: name,
+                repositoryID: "route-fixture",
+                repoKey: "root",
+                logicalRootPath: "/workspace",
+                worktreeID: name,
+                worktreeRootPath: "/workspace-\(name)",
+                source: "test"
+            )
+        }
+        session.worktreeBindings = [worktree("first")]
+        second.worktreeBindings = [worktree("second")]
+        host.scope.replaceSessions([session.tabID: session, secondTabID: second])
+        let secondPolicy = await network.installClientConnectionPolicy(
+            for: clientName, windowID: host.routeID, restrictedTools: [], runID: secondRunID,
+            purpose: .agentModeRun, routingOwner: route, originatingContextSource: originatingContextSource
+        )
+        let secondReceipt = try XCTUnwrap(secondPolicy)
+        addTeardownBlock { await network.cleanupRunRoutingState(ownedBy: secondReceipt) }
+        let secondConnection = UUID()
+        let secondInstallation = await route.installPendingPolicy(secondReceipt, connectionID: secondConnection, clientName: clientName, tabID: nil)
+        let secondToken = try XCTUnwrap(secondInstallation?.token)
+        let secondCommit = await route.canCommitPendingPolicy(secondReceipt, token: secondToken)
+        XCTAssertTrue(secondCommit)
+        let secondContext = try XCTUnwrap(route.runRouteBindings.tabContextByConnectionID[secondConnection])
+        XCTAssertEqual(secondContext.tabID, secondTabID)
+        XCTAssertEqual(secondContext.activeAgentSessionID, secondID)
+        XCTAssertEqual(secondContext.selection.selectedPaths, ["Second.swift"])
+        XCTAssertEqual(secondContext.worktreeBindings.map(\.worktreeID), ["second"])
         func installPolicy() async -> MCPRunRoutingCleanupReceipt? {
             await network.installClientConnectionPolicy(
                 for: clientName, windowID: host.routeID, restrictedTools: [],
@@ -1227,6 +1278,8 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         XCTAssertEqual(bound.routeOwnerIdentity, ObjectIdentifier(route))
         XCTAssertEqual(bound.promptText, "Exact canonical prompt")
         XCTAssertEqual(bound.activeAgentSessionID, f.endpoint.sessionID)
+        XCTAssertEqual(bound.selection.selectedPaths, ["First.swift"])
+        XCTAssertEqual(bound.worktreeBindings.map(\.worktreeID), ["first"])
         let canCommit = await route.canCommitPendingPolicy(receipt, token: installed.token)
         XCTAssertTrue(canCommit)
         let coordinator = try XCTUnwrap(route.coordinator)
@@ -1240,6 +1293,11 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         XCTAssertEqual(staleRollback, .supersededBySameConnection)
         await network.cleanupRunRoutingState(ownedBy: original)
         XCTAssertEqual(route.runRouteBindings.connectionID(forRunID: runID), connection)
+        XCTAssertEqual(route.runRouteBindings.connectionID(forRunID: secondRunID), secondConnection)
+        let otherRegistration = try XCTUnwrap(routing.connections.first { $0.registration.connectionID == secondConnection }?.registration)
+        let otherContext = try await coordinator.resolveReadContext(connection: otherRegistration)
+        XCTAssertEqual(otherContext.context, DomainContextIdentity(workspaceID: f.endpoint.workspaceID, contextID: secondTabID))
+        XCTAssertEqual(otherContext.bindingKind, .runScoped(runID: secondRunID))
 
         let current = await authority.canonicalWorkspaceSnapshot(f.endpoint.workspaceID)
         let snapshot = try XCTUnwrap(current)
@@ -1258,6 +1316,9 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         let replacement = await route.installPendingPolicy(receipt, connectionID: UUID(), clientName: clientName, tabID: session.tabID)
         XCTAssertNil(replacement)
         await network.cleanupRunRoutingState(ownedBy: receipt)
+        let stillAdmitted = await route.canCommitPendingPolicy(secondReceipt, token: secondToken)
+        XCTAssertTrue(stillAdmitted)
+        XCTAssertEqual(route.runRouteBindings.connectionID(forRunID: secondRunID), secondConnection)
     }
 
     func testHostInputCompositionRetainsCanonicalCaptureWithoutPresenterOrWriterRenewal() async throws {

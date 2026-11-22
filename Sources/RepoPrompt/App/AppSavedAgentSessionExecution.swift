@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptInstrumentation
 import RepoPromptSettingsCore
 import RepoPromptWorkspaceContext
 
@@ -8,7 +9,12 @@ import RepoPromptWorkspaceContext
 @MainActor
 enum AppSavedAgentSessionExecution {
     typealias Target = AgentSavedSessionTargetLoader.Target
-    typealias InstallRoute = (AgentSessionRuntimeHost, MCPFileReadResources) async throws -> Void
+    typealias InstallRoute = (AgentSessionRuntimeHost) async throws -> Void
+
+    struct ProviderEnvironment {
+        let resources: AgentRunProviderComposition
+        let settings: APISettingsViewModel
+    }
 
     struct Lookup {
         let target: Target
@@ -52,16 +58,44 @@ enum AppSavedAgentSessionExecution {
         ))
     }
 
+    static func hydrateOriginal(
+        _ writer: AgentSessionRuntimeStore.Writer, lookup: Lookup,
+        isStillAuthorized: @escaping @MainActor () -> Bool
+    ) async throws -> AgentSavedSessionTargetLoader.RuntimeLoad {
+        guard let host = writer.scope.executableHost, !host.route.isClosing,
+              writer.identity.workspaceID == lookup.target.workspace.id else { throw AgentSavedSessionTargetLoader.Failure.changed }
+        let workspace = lookup.target.workspace
+        let storage = AgentSessionStorageInputs(
+            workspaceID: workspace.id, workspaceWithID: { $0 == workspace.id ? workspace : nil },
+            displayName: { _ in lookup.target.entry.name }, isSuppressed: { AppLaunchConfiguration.current.suppressesAgentSessionPersistence },
+            attachmentWorkspaceDirectory: { FileManager.default.temporaryDirectory }
+        )
+        let availability = host.workspaceActivation?.modelAvailability ?? makeProviderSettings().agentModeAvailabilityContext
+        return try await AgentSavedSessionTargetLoader.loadRuntime(
+            sessionID: writer.identity.sessionID, scope: writer.scope, catalog: lookup.catalog, storage: storage,
+            selection: { AgentSessionHydrationRuntime.selection(for: $0, availability: availability, codexDynamicModels: nil) },
+            codexPolicy: { host.codexCoordinator.selectionPolicy(forModelRaw: $0.modelRaw, includeGlobalFallback: true) },
+            isStillAuthorized: { isStillAuthorized() && !host.route.isClosing }, originalColdWriter: writer
+        ).get()
+    }
+
     static func compose(
         target: Target, catalog: AgentSavedSessionTargetLoader.Catalog,
-        domain: MCPDomainRuntime, installRoute: InstallRoute,
-        isStillAuthorized: @escaping @MainActor () -> Bool
+        domain: MCPDomainRuntime, installRoute: InstallRoute, providerEnvironment: ProviderEnvironment?,
+        rootProbeCheckpoint: WorkspaceRootDirectoryProbe.Checkpoint?, isStillAuthorized: @escaping @MainActor () -> Bool
     ) async throws -> AgentSavedSessionTargetLoader.RuntimeLoad {
         try Task.checkCancellation()
         guard isStillAuthorized(), !AppLaunchConfiguration.current.suppressesAgentSessionPersistence else {
             throw AgentHostWorkspaceResources.Failure.authorityUnavailable
         }
 
+        let workspace = target.workspace
+        if !workspace.repoPaths.isEmpty {
+            let failure = try await WorkspaceRootDirectoryProbe().run(paths: workspace.repoPaths, attemptID: UUID(), checkpoint: rootProbeCheckpoint)
+            try Task.checkCancellation()
+            guard isStillAuthorized() else { throw AgentSavedSessionTargetLoader.Failure.changed }
+            if let failure { throw AgentSavedSessionTargetLoader.Failure.rootsUnavailable(failure) }
+        }
         let owner = MCPHostRouteResources.LeaseOwner(
             identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: domain.routingCoordinator, runtime: domain
         )
@@ -70,13 +104,13 @@ enum AppSavedAgentSessionExecution {
         let settings = GlobalSettingsStore.shared
         let diagnostics = AppAgentSessionLinkCatalogEventSink()
         let perf = AppAgentModePerfRecorder()
-        let workspace = target.workspace
         let paths = AgentSessionRuntimeHost.makeSessionWorkspaceProviders { workspace.repoPaths.first }
         let host = AgentSessionRuntimeHost(
             route: route, executionRouteLease: routeLease,
             workspacePath: paths.sessionWorkspacePath, runtimeWorkspacePaths: paths.codexRuntimeWorkspacePaths,
             connectionPolicyInstaller: AgentSessionRuntimeHost.defaultConnectionPolicyInstaller,
-            modelRouterSettingsStore: settings, catalogDiagnosticsSink: diagnostics, perfRecorder: perf
+            modelRouterSettingsStore: settings, catalogDiagnosticsSink: diagnostics, perfRecorder: perf,
+            providerResources: providerEnvironment?.resources
         )
         // A saved carrier does not attach a presenter to this physical route. Disposal is
         // requested exactly once, and waits for the transferred execution lease's release.
@@ -98,8 +132,7 @@ enum AppSavedAgentSessionExecution {
         let resources = AgentHostWorkspaceResources(files: files, contexts: domain.contextStore)
         let index = AgentWorkspaceSessionIndexStore()
         index.receiveWorkspaceSwitchNotification(workspace)
-        let keys = KeyManager()
-        let providerSettings = APISettingsViewModel(aiQueriesService: AIQueriesService(keyManager: keys), keyManager: keys)
+        let providerSettings = providerEnvironment?.settings ?? makeProviderSettings()
         let loaded: AgentSavedSessionTargetLoader.RuntimeLoad
         do {
             guard let settingsLease = APISettingsRuntimeLease.acquire(from: providerSettings) else {
@@ -118,19 +151,24 @@ enum AppSavedAgentSessionExecution {
             for path in workspace.repoPaths {
                 try Task.checkCancellation()
                 guard isStillAuthorized() else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
-                let root = try await files.loadRoot(path: path, cancelUnderlyingLoadOnCallerCancellation: true)
-                rootIDs.append(root.id)
+                do {
+                    let root = try await files.loadRoot(path: path, cancelUnderlyingLoadOnCallerCancellation: true)
+                    rootIDs.append(root.id)
+                } catch {
+                    guard isStillAuthorized(), !Task.isCancelled else { throw AgentSavedSessionTargetLoader.Failure.changed }
+                    throw AgentSavedSessionTargetLoader.Failure.rootsUnavailable(.loadFailed)
+                }
             }
             guard let activation = host.workspaceActivation, isStillAuthorized() else {
                 throw AgentHostWorkspaceResources.Failure.authorityUnavailable
             }
-            let rootLease = try await activation.retainSavedFileResources(rootIDs: rootIDs)
-            try host.installSavedRunExecution(sessionTitle: target.entry.name, settings: settings, perf: perf, diagnostics: diagnostics)
-            try await installRoute(host, host.makeSavedFileReadResources(rootLease))
+            try await activation.retainHostFileResources(rootIDs: rootIDs)
+            try host.installHostRunExecution(sessionTitle: { _ in target.entry.name }, settings: settings, perf: perf, diagnostics: diagnostics)
+            try await installRoute(host)
             var catalog = catalog
             let validateCatalog = catalog.validateCanonicalTarget
             catalog.validateCanonicalTarget = { candidate in
-                if let validateCatalog, !(await validateCatalog(candidate)) { return false }
+                if let validateCatalog, await !validateCatalog(candidate) { return false }
                 guard candidate.workspace.id == workspace.id, candidate.entry.id == target.entry.id,
                       candidate.tab.id == target.tab.id, candidate.stashedTabID == target.stashedTabID,
                       let current = await canonicalStorage.readWorkspace(workspace.id)
@@ -155,19 +193,26 @@ enum AppSavedAgentSessionExecution {
         host.scope.retainExecutableHost()
         return loaded
     }
+
+    private static func makeProviderSettings() -> APISettingsViewModel {
+        let keys = KeyManager()
+        return APISettingsViewModel(aiQueriesService: AIQueriesService(keyManager: keys), keyManager: keys)
+    }
 }
 
 extension AgentSessionRuntimeHost {
-    fileprivate func installSavedRunExecution(
-        sessionTitle title: String, settings: GlobalSettingsStore,
-        perf: AppAgentModePerfRecorder, diagnostics: AppAgentSessionLinkCatalogEventSink
+    /// Shared execution composition for app-resident canonical hosts. Installation needs no
+    /// session, window, or presenter; each request supplies its original host resources.
+    func installHostRunExecution(
+        sessionTitle: @escaping @MainActor (AgentTabSession) -> String, settings: GlobalSettingsStore,
+        perf: any AgentModePerfRecording, diagnostics: any AgentSessionLinkCatalogEventSink
     ) throws {
         let links = try installCanonicalLinkExecution(skillCatalog: AgentSkillCatalog(), perfRecorder: perf, diagnostics: diagnostics)
         let enable: AgentRunExecutionContracts.MCPServerEnabler = { [route] in await route.hasActiveCatalog() }
         installCodexRuntime(codexCoordinator, routeID: routeID, approvalStore: .shared, links: links, mcpServerEnabler: enable, modelRouterSettingsStore: settings)
         let input = makeCanonicalInputEnvironment()
         claudeCoordinator.installHostCapabilities(
-            makeClaudeCapabilities(links: links, inputEnvironmentForSession: input, sessionTitle: { _ in title }),
+            makeClaudeCapabilities(links: links, inputEnvironmentForSession: input, sessionTitle: sessionTitle),
             providerBindingService: providerBindingService
         )
         let tools = route.toolExecutionRuntime
@@ -185,7 +230,7 @@ extension AgentSessionRuntimeHost {
         )
         scope.installExecution(makeExecution(
             dependencies: dependencies, inputEnvironmentForSession: input,
-            sessionTitle: { _ in title }, prepareLaunch: { nil }, perfRecorder: perf
+            sessionTitle: sessionTitle, prepareLaunch: { nil }, perfRecorder: perf
         ))
     }
 }

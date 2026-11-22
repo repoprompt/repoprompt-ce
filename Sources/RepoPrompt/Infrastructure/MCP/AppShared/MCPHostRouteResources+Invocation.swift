@@ -44,7 +44,7 @@ extension MCPHostRouteResources {
                 throw MCPError.internalError("Independent reads require their provider-managed freshness contract")
             }
             let origin = captureIndependentOrigin?(context)
-            if captureIndependentOrigin != nil, (independentHostTools.contains(name) || independentFileReads.contains(name)), origin == nil {
+            if captureIndependentOrigin != nil, independentHostTools.contains(name) || independentFileReads.contains(name), origin == nil {
                 throw ServerNetworkManager.ToolDispatchAdmissionError.windowTerminal
             }
             return try await executeIndependentReadInvocation(
