@@ -4503,7 +4503,30 @@ private actor MonitorRemovalConnection: MCPServerConnection {
     func sendProgress(tool _: String, kind _: RepoPromptProgressKind, stage _: String, message _: String) async {}
 }
 
-actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
+actor MonitorFakeNativeController: NativeAgentRuntimeControlling, MCPRunRoutingCleanupRetaining {
+    private var ownedRouting: MCPRunRoutingCleanupReceipt?
+    private var routeInstallation: Task<Void, Error>?
+    private var connectOwnedRoute: (@MainActor @Sendable (MCPRunRoutingCleanupReceipt) async throws -> Void)?
+
+    func installOwnedRouteConnector(_ connect: @escaping @MainActor @Sendable (MCPRunRoutingCleanupReceipt) async throws -> Void) {
+        connectOwnedRoute = connect
+    }
+
+    func retainRoutingCleanup(_ receipt: MCPRunRoutingCleanupReceipt) -> Bool {
+        guard let connectOwnedRoute, !receipt.isConsumed else { return false }
+        if ownedRouting == receipt { return true }
+        let previous = ownedRouting
+        let pending = routeInstallation
+        guard previous == nil || previous?.routeOwner === receipt.routeOwner else { return false }
+        ownedRouting = receipt
+        routeInstallation = Task {
+            _ = await pending?.result
+            if let previous { await ServerNetworkManager.shared.cleanupRunRoutingState(ownedBy: previous) }
+            try await connectOwnedRoute(receipt)
+        }
+        return true
+    }
+
     func emit(_ event: NativeAgentRuntimeEvent) {
         continuation?.yield(event)
     }
@@ -4617,6 +4640,7 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
         if rejectResume, existingSessionID != nil {
             throw NativeAgentRuntimeControllerError.processNotRunning
         }
+        try await routeInstallation?.value
         return NativeAgentRuntimeSessionRef(sessionID: existingSessionID ?? "monitor-native-session")
     }
 
@@ -4699,6 +4723,12 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
         configuration.replaceProcess()
         shutdownCount += 1
         continuation?.finish()
+        let installation = routeInstallation
+        let receipt = ownedRouting
+        routeInstallation = nil
+        ownedRouting = nil
+        _ = await installation?.result
+        if let receipt { await ServerNetworkManager.shared.cleanupRunRoutingState(ownedBy: receipt) }
     }
 
     func respondToPermissionRequest(id: String, decision: AgentApprovalDecision) async {

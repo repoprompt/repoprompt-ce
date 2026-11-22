@@ -1194,9 +1194,34 @@ public class APISettingsViewModel: ObservableObject {
         }
     }
 
-    // A non-visual managed runtime leases this same live settings owner. Closing the source
-    // window withdraws only its UI lease; subscriptions stay process-owned until the last
-    // managed runtime settles. No availability snapshot or replacement settings loader is used.
+    /// A fresh independent runtime must not decide that a provider is disconnected before
+    /// the normal settings load and cached-provider validation have had a chance to settle.
+    /// The deadline bounds admission, not Keychain or a provider probe that is already running.
+    func awaitInitialAgentProviderSettings(until deadline: ContinuousClock.Instant) async -> Bool {
+        guard let initialLoadTask, !Task.isCancelled else { return false }
+        let (completion, signal) = AsyncStream<Bool>.makeStream(bufferingPolicy: .bufferingOldest(1))
+        let ready = Task {
+            await initialLoadTask.value
+            signal.yield(!initialLoadTask.isCancelled)
+            signal.finish()
+        }
+        let timer = Task {
+            do { try await Task.sleep(until: deadline, clock: .continuous) } catch { return }
+            signal.finish()
+        }
+        defer {
+            ready.cancel()
+            timer.cancel()
+            signal.finish()
+        }
+        var events = completion.makeAsyncIterator()
+        let completed = await events.next() == true && !Task.isCancelled && ContinuousClock.now < deadline
+        if !completed { initialLoadTask.cancel() }
+        return completed && hasLoadedStoredData && isContextBuilderProviderValidationComplete
+    }
+
+    // Leases keep the exact captured settings owner active. Closing a window releases its UI
+    // ownership, but subscriptions remain active while a runtime holds a lease.
     private(set) var managedRuntimeLeaseCount = 0
     private var windowCloseRequested = false
 

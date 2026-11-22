@@ -401,14 +401,16 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
             }
             #if DEBUG
                 let rootProbeCheckpoint = test_savedHostRootProbeCheckpoint
+                let environment = providerEnvironment ?? test_savedHostProviderEnvironments[target]
             #else
                 let rootProbeCheckpoint: WorkspaceRootDirectoryProbe.Checkpoint? = nil
+                let environment = providerEnvironment
             #endif
             let result = try await AppSavedAgentSessionExecution.compose(
                 target: lookup.target, catalog: lookup.catalog, domain: domain,
                 installRoute: { host in
                     try await host.registerHostCatalog(service: WindowState.sharedMCPService)
-                }, providerEnvironment: providerEnvironment, rootProbeCheckpoint: rootProbeCheckpoint, isStillAuthorized: authorized
+                }, providerEnvironment: environment, rootProbeCheckpoint: rootProbeCheckpoint, isStillAuthorized: authorized
             )
             let writer = result.writer
             if result.source == .savedPayload, let runtime = writer.scope.linkExecution,

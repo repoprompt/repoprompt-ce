@@ -112,6 +112,7 @@ extension AgentSessionRuntimeHost {
         let links = scope.linkExecution
         let execution = scope.execution
         let coordinator = codexCoordinator
+        let claudeCoordinator = claudeCoordinator
         let tools = route.toolExecutionRuntime
         return beginRetirement(adapters: .init(
             managedInput: links.map { .managedInput($0) },
@@ -143,7 +144,7 @@ extension AgentSessionRuntimeHost {
                     await terminal.waitForCompletion()
                     await agentTask?.value
                     await provider?.dispose()
-                    await claude?.shutdown()
+                    if let claude { await claudeCoordinator.finishControllerForHostDrain(claude, session: session) }
                     await acp?.shutdown()
                     await codexRetirement?.waitForCompletion()
                     if let runID { try await tools.awaitNoActiveToolExecutions(runID: runID) }

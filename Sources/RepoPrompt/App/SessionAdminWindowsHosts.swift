@@ -133,7 +133,7 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
     /// Outcome of preparing a saved or never-visited session without opening its tab.
     enum ForkPreparation {
         case loaded(AgentSessionRuntimeStore.Writer)
-        case ready, missing, ambiguous, changed, unreadable
+        case ready, missing, ambiguous, changed, unreadable, providerSettingsUnavailable
         case rootsUnavailable(WorkspaceRootReadinessFailure.Availability)
     }
 
@@ -150,6 +150,7 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         case .failure(.ambiguous): .ambiguous
         case .failure(.changed): .changed
         case .failure(.unreadable): .unreadable
+        case .failure(.providerSettingsUnavailable): .providerSettingsUnavailable
         case let .failure(.rootsUnavailable(reason)): .rootsUnavailable(reason)
         }
     }
@@ -191,6 +192,7 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         case .missing: "target_missing"
         case .ambiguous: "target_ambiguous"
         case .unreadable: "target_unreadable"
+        case .providerSettingsUnavailable: "provider_settings_unavailable"
         case .rootsUnavailable: "workspace_not_ready"
         }
         let next: Value? = if case .missing = reason {
@@ -205,7 +207,8 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         case .missing: "The source session was not found in any loaded workspace. Check its ID with session_admin inventory."
         case .ambiguous: "The source session is open in more than one place. Close the duplicate tab, then retry."
         case .changed: "The source session moved or changed while being prepared. Retry fork."
-        case .unreadable: "The source session's saved transcript could not be read, so it cannot be forked."
+        case .unreadable: "The source session's saved transcript could not be read."
+        case .providerSettingsUnavailable: "The target's provider settings did not become ready. Retry after confirming that the provider is connected."
         case let .rootsUnavailable(reason): "The target session's workspace roots are not ready (\(reason.rawValue)). Reconcile the workspace roots and retry."
         }
     }

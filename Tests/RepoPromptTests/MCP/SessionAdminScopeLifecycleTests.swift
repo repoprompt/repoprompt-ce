@@ -9621,6 +9621,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             let realCatalog = placement == "current"
             let network = ServerNetworkManager.shared
             var connections: [UUID: PersistentMCPTestEndpoint] = [:]
+            var targetRoutingConnections: [UUID: UUID] = [:]
             var registrations: [MCPDomainToolRegistrationHandle] = []
             var registeredWindows: Set<Int> = []
             var connectionTasks: [Task<Void, Never>] = []
@@ -9634,6 +9635,36 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 }
             }
             if realCatalog { try await AppGlobalMCPServiceComposition.shared.ensureRegistered() }
+            await network.setEnabled(true)
+            await controller.installOwnedRouteConnector { receipt in
+                // Only the requester is a real socket peer; using the same XCTest PID for both
+                // controllers lets that peer consume the fake target's one-shot policy.
+                if targetRoutingConnections[receipt.policyID] != nil { return }
+                XCTAssertTrue(receipt.usesExplicitProviderContext)
+                let route = try XCTUnwrap(receipt.routeOwner)
+                let resolution = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: targetID)
+                let writer: AgentSessionRuntimeStore.Writer? = if case let .unique(writer) = resolution { writer } else { nil }
+                let target = try XCTUnwrap(writer)
+                XCTAssertTrue(target.scope.executableHost?.route === route)
+                let connectionID = UUID()
+                do {
+                    let installed = await route.installPendingPolicy(receipt, connectionID: connectionID, clientName: nil, tabID: target.session.tabID)
+                    let token = try XCTUnwrap(installed?.token)
+                    let canCommit = await route.canCommitPendingPolicy(receipt, token: token)
+                    _ = try XCTUnwrap(canCommit ? token : nil, "The fake transport must retain the originating policy")
+                    await network.debugSeedConnectionRunRouting(
+                        connectionID: connectionID, runID: receipt.runID, purpose: .agentModeRun,
+                        windowID: route.identity.routeID, registration: receipt
+                    )
+                    let generation = try XCTUnwrap(receipt.routingWaitGeneration)
+                    targetRoutingConnections[receipt.policyID] = connectionID
+                    await MCPRoutingWaiter.notifyRouted(runID: receipt.runID, generation: generation)
+                } catch {
+                    await network.cleanupRunRoutingState(ownedBy: receipt)
+                    await network.debugRemoveConnection(connectionID)
+                    throw error
+                }
+            }
             addTeardownBlock { @MainActor in
                 for task in connectionTasks {
                     await task.value
@@ -9644,6 +9675,9 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                     await network.debugRemoveConnection(connection.connectionID)
                     await network.clearExpectedAgentPID(getpid(), for: AgentProviderKind.claudeMCPClientID, runID: runID)
                     await network.clearClientConnectionPolicy(for: AgentProviderKind.claudeMCPClientID, runID: runID)
+                }
+                for connectionID in targetRoutingConnections.values {
+                    await network.debugRemoveConnection(connectionID)
                 }
                 for handle in registrations {
                     await AppDomainRuntimeComposition.shared.unregister(handle)
@@ -9709,8 +9743,9 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                     return vm
                 }
             }
-            let observerFixture = try await LoadedWindowFixture.make(activeID: requesterID, parentID: nil, agentFactory: providerFactory(observerController, catalogPeer: true, onStart: {}), processRuntime: realCatalog ? AppDomainRuntimeComposition.shared.runtime : nil)
-            let targetFixture = try await LoadedWindowFixture.make(activeID: targetID, parentID: nil, agentFactory: providerFactory(controller, onStart: { providerStarts += 1 }), processRuntime: realCatalog ? AppDomainRuntimeComposition.shared.runtime : nil)
+            let appRuntime = AppDomainRuntimeComposition.shared.runtime
+            let observerFixture = try await LoadedWindowFixture.make(activeID: requesterID, parentID: nil, agentFactory: providerFactory(observerController, catalogPeer: true, onStart: {}), processRuntime: appRuntime)
+            let targetFixture = try await LoadedWindowFixture.make(activeID: targetID, parentID: nil, processRuntime: appRuntime)
             addTeardownBlock { @MainActor in
                 await targetFixture.cleanup()
                 await observerFixture.cleanup()
@@ -9728,41 +9763,30 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(observerVM, tabID: observerTab.id)
             var targetVM = targetFixture.window.agentModeViewModel
             let manager = WindowStatesManager.shared
-            let originalPreparedFactory = manager.test_preparedOversightOwnerFactory
-            var backgroundWorkspacePreparations = 0
             var sourceWorkspacePreparations = 0
-            manager.test_preparedOversightOwnerFactory = { workspace, source in
-                XCTAssertTrue(source === targetFixture.window, "Exact saved carrier must borrow its owning window's runtime context")
-                XCTAssertTrue(source.apiSettingsViewModel.isClaudeCodeConnected, "Source connection must remain available")
-                let owner = WindowState.makePreparedSessionOwner(
-                    workspace: workspace, borrowing: source,
-                    agentModeViewModelFactory: providerFactory(controller, onStart: { providerStarts += 1 })
-                )
-                XCTAssertTrue(owner.apiSettingsViewModel === source.apiSettingsViewModel)
-                XCTAssertTrue(owner.promptManager.apiSettingsViewModel === source.apiSettingsViewModel)
-                XCTAssertTrue(owner.agentModeViewModel.promptManager === owner.promptManager)
-                owner.workspaceManager.setWorkspaceSavePreparationDidFinishHandlerForTesting { _, _, _ in
-                    backgroundWorkspacePreparations += 1
+            let keys = KeyManager()
+            let targetSettings = APISettingsViewModel(aiQueriesService: AIQueriesService(keyManager: keys), keyManager: keys, loadStoredDataOnInit: false)
+            targetSettings.isClaudeCodeConnected = true
+            manager.test_savedHostProviderEnvironments[targetID] = .init(
+                resources: .live(), settings: targetSettings,
+                claudeControllerFactory: { _, _, _, _ in
+                    providerStarts += 1
+                    return controller
                 }
-                XCTAssertTrue(owner.agentModeViewModel.agentAvailabilityContext.claudeCodeAvailable, "Nonvisual composition must use the same connection authority")
-                return owner
-            }
+            )
             addTeardownBlock { @MainActor in
-                for id in Array(manager.preparedOversightWindows.keys) where id == targetID {
-                    if let owner = manager.preparedOversightWindows.removeValue(forKey: id) {
-                        owner.beginClose()
-                        await owner.tearDownPreparedSessionOwner()
-                    }
-                    manager.preparedOversightCarrierSubscriptions.removeValue(forKey: id)
-                    manager.preparedOversightLocations.removeValue(forKey: id)
-                    manager.preparedOversightOwnerLocations.removeValue(forKey: id)
+                manager.test_savedHostProviderEnvironments.removeValue(forKey: targetID)
+                if case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: targetID),
+                   let host = writer.scope.executableHost, host.route.identity.kind == .independent
+                {
+                    let drain = host.beginFinalShutdown()
+                    drain.startIfNeeded()
+                    _ = await drain.wait(until: .now.advanced(by: .seconds(15)))
                 }
-                manager.test_preparedOversightOwnerFactory = originalPreparedFactory
             }
-            targetFixture.window.apiSettingsViewModel.isClaudeCodeConnected = true
             observerFixture.window.apiSettingsViewModel.isClaudeCodeConnected = true
             try await AsyncTestWait.waitUntil("in-memory Claude availability", timeout: 5) {
-                targetFixture.window.apiSettingsViewModel.agentAvailability.claudeCodeAvailable
+                targetSettings.agentAvailability.claudeCodeAvailable
                     && observerFixture.window.apiSettingsViewModel.agentAvailability.claudeCodeAvailable
             }
             let targetTab = try XCTUnwrap(targetFixture.carriers?.composeTabs.first)
@@ -9955,6 +9979,11 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 }
                 addTeardownBlock { @MainActor in bridge.test_afterTargetedDelivery = nil }
             }
+            @MainActor func canonicalWriter() throws -> AgentSessionRuntimeStore.Writer {
+                let resolution = AgentSessionRuntimeStore.shared.resolveWriter(workspaceID: workspace.id, sessionID: targetID)
+                let writer: AgentSessionRuntimeStore.Writer? = if case let .unique(writer) = resolution { writer } else { nil }
+                return try XCTUnwrap(writer, "Expected the saved target's canonical writer")
+            }
             let granted = try bridge.delegationScopes.approve(
                 requestID: requestID, presentedWindowID: endpoint.windowID,
                 presentedTabID: endpoint.tabID, presentedSessionID: requesterID
@@ -9977,21 +10006,20 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 decisions.contains { $0.contains("task_delivered") || $0.contains("refused") || $0.contains("failed") || $0.contains("not_dispatched") }
             }
             guard decisions.contains(where: { $0.contains("task_delivered") }) else {
-                let failedVM = manager.preparedOversightWindows[targetID]?.agentModeViewModel ?? targetVM
-                let failed = failedVM.sessions[targetTab.id]
-                return XCTFail("\(placement): source-connected=\(targetFixture.window.apiSettingsViewModel.isClaudeCodeConnected), availability=\(failedVM.agentAvailabilityContext.claudeCodeAvailable), starts=\(providerStarts), agent=\(String(describing: failed?.selectedAgent)), state=\(String(describing: failed?.runState)), admission=\(String(describing: failed?.operationAdmissionFailureMessage)), items=\(String(describing: failed?.items.map(\.text))), decisions=\(decisions)")
+                let failed = try? canonicalWriter().session
+                return XCTFail("\(placement): availability=\(targetSettings.agentAvailability.claudeCodeAvailable), starts=\(providerStarts), agent=\(String(describing: failed?.selectedAgent)), state=\(String(describing: failed?.runState)), admission=\(String(describing: failed?.operationAdmissionFailureMessage)), items=\(String(describing: failed?.items.map(\.text))), decisions=\(decisions)")
             }
-            if placement != "current" {
-                let preparedOwner = try XCTUnwrap(manager.preparedOversightWindows[targetID])
-                XCTAssertTrue(preparedOwner.isPreparedSessionOwner)
-                XCTAssertNil(preparedOwner.nsWindow)
-                XCTAssertFalse(manager.allWindows.contains { $0 === preparedOwner })
-                targetVM = preparedOwner.agentModeViewModel
-            }
+            let writer = try canonicalWriter()
+            let targetSession = writer.session
+            let targetHost = try XCTUnwrap(writer.scope.executableHost)
+            XCTAssertEqual(targetHost.route.identity.kind, .independent)
+            XCTAssertFalse(manager.allWindows.contains { $0.windowID == targetHost.routeID })
+            XCTAssertEqual(writer.identity.workspaceID, workspace.id)
+            XCTAssertEqual(targetSession.tabID, targetTab.id)
             do {
                 try await AsyncTestWait.waitUntil("assigned task reaches the provider", timeout: 15) { await controller.sentCount == 1 }
             } catch {
-                return XCTFail("Provider dispatch did not settle: starts=\(providerStarts), state=\(String(describing: targetVM.sessions[targetTab.id]?.runState)), items=\(String(describing: targetVM.sessions[targetTab.id]?.items.map(\.text))), decisions=\(decisions)")
+                return XCTFail("Provider dispatch did not settle: starts=\(providerStarts), state=\(targetSession.runState), items=\(targetSession.items.map(\.text)), decisions=\(decisions)")
             }
             var lookoutRows: [AgentSessionStatusCensus.Row] = []
             let lookout = checksLookout ? AgentSessionStatusCensus.appCensus(isEnabled: { true }) : nil
@@ -10003,7 +10031,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 let witnessed = try XCTUnwrap(lookoutRows.first { $0.sample.candidate.sessionID == targetID })
                 XCTAssertEqual(witnessed.sample.status?.status, .running)
                 XCTAssertEqual(witnessed.sample.outcome, .running)
-                XCTAssertTrue(manager.preparedOversightWindows[targetID]?.windowID == witnessed.sample.candidate.windowID)
+                XCTAssertEqual(targetHost.routeID, witnessed.sample.candidate.windowID)
                 XCTAssertEqual(providerStarts, startsBefore, "Looking never dispatches a provider")
                 XCTAssertEqual(manager.allWindows.map(\.windowID), windowIDsBefore)
                 XCTAssertEqual(targetFixture.window.promptManager.activeComposeTabID, selectedBefore)
@@ -10050,17 +10078,16 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             let link = await bridge.delegationActiveLink(observerSessionID: requesterID, targetSessionID: targetID)
             XCTAssertEqual(link?.sourceScopeID, granted.id)
             if placement != "current" {
-                XCTAssertEqual(backgroundWorkspacePreparations, 0, "A background runtime never prepares a workspace save")
                 XCTAssertEqual(sourceWorkspacePreparations, 0, "Preparing/running a hidden target must not enlist its UI workspace writer")
                 XCTAssertEqual(try Data(contentsOf: sourceWorkspaceURL), sourceWorkspaceBytesBefore, "Only the exact session payload may be saved; source UI placement bytes stay untouched")
             }
-            XCTAssertTrue(targetVM.sessions[targetTab.id]?.permitsBoundOperationAndSave == true)
+            XCTAssertTrue(targetSession.permitsBoundOperationAndSave)
             XCTAssertFalse(decisions.contains { $0.contains("target_idle_with_new_activity") }, "Dispatch alone is not a reply")
             if longWatch {
                 try await AsyncTestWait.waitUntil("the first 60-second watch expires while the task stays running") {
                     decisions.contains { $0.contains("task_still_pending") }
                 }
-                XCTAssertTrue(targetVM.sessions[targetTab.id]?.runState.isActive == true)
+                XCTAssertTrue(targetSession.runState.isActive)
                 XCTAssertGreaterThan(watchClockReads, 1)
             }
             if let duringRun, duringRun.hasSuffix("-active") {
@@ -10191,7 +10218,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 return
             }
             if let duringRun {
-                XCTAssertTrue(targetVM.sessions[targetTab.id]?.runState.isActive == true)
+                XCTAssertTrue(targetSession.runState.isActive)
                 switch duringRun {
                 case "switch":
                     let index = try XCTUnwrap(targetFixture.window.workspaceManager.workspaces.firstIndex { $0.id == workspace.id })
@@ -10229,8 +10256,9 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 }
                 manager.schedulePreparedOversightCleanup()
                 await manager.preparedOversightCleanupTask?.value
-                XCTAssertNotNil(manager.preparedOversightWindows[targetID], "Placement must not retire an accepted run")
-                XCTAssertTrue(targetVM.sessions[targetTab.id]?.runState.isActive == true)
+                XCTAssertEqual(try canonicalWriter().identity, writer.identity, "Placement must not retire or replace an accepted run")
+                XCTAssertFalse(targetHost.scope.isRetiring)
+                XCTAssertTrue(targetSession.runState.isActive)
                 let live = await bridge.delegationActiveLink(observerSessionID: requesterID, targetSessionID: targetID)
                 XCTAssertEqual(live?.sourceScopeID, granted.id)
                 let intents = await bridge.oversightInventory(includeLocation: false).persisted
@@ -10244,8 +10272,6 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             case .cancelled: "target_cancelled_with_new_activity"
             }
             await controller.completeLastTurn(text: "Hi!", status: terminalStatus)
-            // The fake has no MCP peer: the real native bootstrap lease's 10-second routing
-            // deadline settles before its buffered provider events are consumed.
             try await AsyncTestWait.waitUntil("target completion resumes requester automatically", timeout: 25) {
                 decisions.contains { $0.contains(terminalNotice) }
             }
@@ -10270,7 +10296,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 targetVM = targetFixture.window.agentModeViewModel
                 _ = try controlWriterIdentity(for: XCTUnwrap(targetVM.sessions[targetTab.id]))
             }
-            XCTAssertTrue(targetVM.sessions[targetTab.id]?.items.contains { $0.kind == .assistant && $0.text.contains("Hi!") } == true)
+            XCTAssertTrue(targetSession.items.contains { $0.kind == .assistant && $0.text.contains("Hi!") })
             do {
                 try await AsyncTestWait.waitUntil("approval and result actually reach the requester provider without user input", timeout: 30) {
                     await observerController.completeLastTurn()
@@ -10286,19 +10312,21 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             XCTAssertTrue(resumed.contains { $0.contains("RepoPrompt delegation decision") })
             if checksConnectionChanges {
                 let disconnected = AgentRunStartOutcomeRecorder()
-                targetFixture.window.apiSettingsViewModel.isClaudeCodeConnected = false
-                _ = await targetVM.startAgentRun(tabID: targetTab.id, initialMessage: "must not start while disconnected", startOutcome: disconnected)
+                targetSettings.isClaudeCodeConnected = false
+                let command = try writer.admitCommand().get()
+                _ = await targetHost.startCanonicalRequest(command: command, message: "must not start while disconnected", options: .init(), outcome: disconnected)
                 guard case let .startFailed(reason) = disconnected.outcome else { return XCTFail("Disconnected connection must refuse startup") }
                 XCTAssertTrue(reason?.contains("Claude Code is not connected") == true)
                 let disconnectedSentCount = await controller.sentCount
                 XCTAssertEqual(disconnectedSentCount, 1)
-                targetFixture.window.apiSettingsViewModel.isClaudeCodeConnected = true
+                targetSettings.isClaudeCodeConnected = true
                 let reconnected = AgentRunStartOutcomeRecorder()
-                _ = await targetVM.startAgentRun(tabID: targetTab.id, initialMessage: "say hi after reconnect", startOutcome: reconnected)
+                let resumedCommand = try writer.admitCommand().get()
+                _ = await targetHost.startCanonicalRequest(command: resumedCommand, message: "say hi after reconnect", options: .init(), outcome: reconnected)
                 XCTAssertTrue(reconnected.outcome.didStart)
                 try await AsyncTestWait.waitUntil("same canonical owner observes reconnect and starts") { await controller.sentCount == 2 }
                 await controller.completeLastTurn(text: "Hi again!")
-                try await AsyncTestWait.waitUntil("reconnected turn settles", timeout: 25) { targetVM.sessions[targetTab.id]?.runState.isActive == false }
+                try await AsyncTestWait.waitUntil("reconnected turn settles", timeout: 25) { !targetSession.runState.isActive }
             }
             weak var backgroundOwner = manager.preparedOversightWindows[targetID]
             weak var backgroundRuntime = manager.preparedOversightWindows[targetID]?.agentModeViewModel
@@ -10331,13 +10359,12 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                     XCTAssertNotNil(manager.preparedOversightWindows[targetID], "UI binding changes do not withdraw live consent")
                     _ = bridge.delegationScopes.revoke(scopeID: granted.id)
                 case "retire-during-visit", "retire-save-failure":
-                    let owner = try XCTUnwrap(manager.preparedOversightWindows[targetID])
-                    let ownedSession = try XCTUnwrap(targetVM.sessions[targetTab.id])
+                    let ownedSession = targetSession
                     var release: CheckedContinuation<Void, Never>?
                     var holdNextSave = true
                     var failNextSave = retirement == "retire-save-failure"
                     defer { release?.resume() }
-                    targetVM.test_setAgentSessionSaver { payload, borrowedWorkspace, counts in
+                    targetHost.scope.persistence.saver = { payload, borrowedWorkspace, counts in
                         if holdNextSave {
                             holdNextSave = false
                             await withCheckedContinuation { release = $0 }
@@ -10352,8 +10379,9 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                     _ = bridge.delegationScopes.revoke(scopeID: granted.id)
                     manager.schedulePreparedOversightCleanup()
                     try await AsyncTestWait.waitUntil("retiring owner is held inside final storage") { release != nil }
-                    XCTAssertNil(manager.preparedOversightWindows[targetID])
-                    XCTAssertTrue(manager.retiringPreparedOversightWindows[targetID] === owner)
+                    let drain = try XCTUnwrap(targetHost.scope.retainedDrain)
+                    XCTAssertTrue(targetHost.scope.isRetiring)
+                    XCTAssertFalse((try? writer.admitCommand().get()) != nil, "Retiring writer must not admit new commands")
                     XCTAssertTrue(manager.hasPreparedRuntime(targetID))
                     let prematureVisit = await manager.releasePreparedOversightOwnerForVisit(sessionID: targetID)
                     XCTAssertFalse(prematureVisit)
@@ -10371,20 +10399,24 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                     XCTAssertTrue(visits.isEmpty)
                     release?.resume()
                     release = nil
-                    await manager.preparedOversightCleanupTask?.value
+                    let outcome = await drain.wait(until: .now.advanced(by: .seconds(5)))
                     if retirement == "retire-save-failure" {
+                        guard case .retained = outcome else { return XCTFail("Expected recoverable failure; got \(outcome)") }
                         XCTAssertTrue(visits.isEmpty, "Failed durability must not run the queued visit")
                         XCTAssertTrue(manager.hasPreparedRuntime(targetID))
                         XCTAssertTrue(ownedSession.isDirty)
-                        XCTAssertTrue(manager.retiringPreparedOversightWindows[targetID] === owner)
-                        let retried = await manager.releasePreparedOversightOwnerForVisit(sessionID: targetID)
-                        XCTAssertTrue(retried, "An explicit visit retries the actual final save")
+                        XCTAssertTrue(targetHost.scope.retainedDrain === drain)
+                        let ordinaryVisit = await manager.releasePreparedOversightOwnerForVisit(sessionID: targetID)
+                        XCTAssertFalse(ordinaryVisit, "Visiting is not permission to retry the final save")
+                        await manager.retryRetainedAgentHostDrain(warningID: WindowStatesManager.agentHostRecoveryWarningPrefix + drain.recoveryID.uuidString)
+                    } else {
+                        XCTAssertEqual(outcome, .released)
                     }
-                    XCTAssertEqual(visits, retirement == "retire-save-failure" ? [] : ["latest"], "An explicit retry owns its activation and supersedes a queued visit")
+                    try await AsyncTestWait.waitUntil("settled canonical writer resumes only the latest visit") { visits == ["latest"] }
                     XCTAssertNil(manager.preparedOversightPendingVisits[targetID])
                     XCTAssertFalse(ownedSession.isDirty)
-                    XCTAssertNil(manager.retiringPreparedOversightWindows[targetID])
-                    XCTAssertTrue(owner.agentModeViewModel.sessions.isEmpty, "Retained presentation cannot retain a writer claim")
+                    XCTAssertNil(targetHost.scope.retainedDrain)
+                    XCTAssertTrue(targetHost.scope.hasReleasedWriterClaims, "A retained presentation cannot retain a writer claim")
                 case "handoff-save-failure":
                     let owner = try XCTUnwrap(manager.preparedOversightWindows[targetID])
                     let ownedSession = try XCTUnwrap(targetVM.sessions[targetTab.id])
