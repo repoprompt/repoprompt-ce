@@ -3674,33 +3674,72 @@ actor ServerNetworkManager: MCPServerConnectionHost {
     /// recomputes against its full routed endpoint before a notification is emitted. A duplicate
     /// incarnation therefore receives no catalog grant from the incarnation the user linked.
     ///
+    private struct AgentSessionRelistRecipient {
+        let connectionID: UUID
+        let runID: UUID
+        let routeID: Int
+        let tabID: UUID
+        let routeOwner: MCPHostRouteResources?
+        let policyID: UUID?
+        let admissionRevision: UUID
+        let routingGeneration: UInt64?
+        let lifecycleGeneration: UInt64?
+    }
+
+    private func isCurrentAgentSessionRelistRecipient(_ recipient: AgentSessionRelistRecipient) -> Bool {
+        let connectionID = recipient.connectionID
+        guard !connectionsBeingRemoved.contains(connectionID), runIDByConnectionID[connectionID] == recipient.runID,
+              connectionLifecycleGenerationByID[connectionID] == recipient.lifecycleGeneration,
+              runRoutingAuthorityGenerationByRunID[recipient.runID] == recipient.routingGeneration,
+              let state = runPolicyStateByRunID[recipient.runID], state.admissionRevision == recipient.admissionRevision,
+              state.cleanupReceipt?.policyID == recipient.policyID else { return false }
+        if let receipt = state.cleanupReceipt, !ownsRunRegistration(receipt) { return false }
+        return recipient.routeOwner?.identity.kind != .independent
+            || runCleanupOwnershipByConnectionID[connectionID]?.policyID == recipient.policyID
+    }
+
     /// - Parameter forceRelist: relist even when every link fact is unchanged. Delegation-scope
     ///   changes alter `session_admin` eligibility without touching any link fact.
     func notifyToolListChangedForAgentSession(_ sessionID: UUID, forceRelist: Bool = false) async {
-        let candidateRunIDs = runPolicyStateByRunID.compactMap { runID, state -> (UUID, Int, UUID)? in
-            guard state.purpose == .agentModeRun, let tabID = state.tabID else { return nil }
-            return (runID, state.windowID, tabID)
+        let candidates = runIDByConnectionID.compactMap { connectionID, runID -> AgentSessionRelistRecipient? in
+            guard let state = runPolicyStateByRunID[runID], state.purpose == .agentModeRun,
+                  let tabID = state.tabID else { return nil }
+            let recipient = AgentSessionRelistRecipient(
+                connectionID: connectionID, runID: runID, routeID: state.windowID, tabID: tabID,
+                routeOwner: state.cleanupReceipt?.routeOwner, policyID: state.cleanupReceipt?.policyID,
+                admissionRevision: state.admissionRevision, routingGeneration: runRoutingAuthorityGenerationByRunID[runID],
+                lifecycleGeneration: connectionLifecycleGenerationByID[connectionID]
+            )
+            return isCurrentAgentSessionRelistRecipient(recipient) ? recipient : nil
         }
-        guard !candidateRunIDs.isEmpty else { return }
-        let matchingRunIDs: Set<UUID> = await MainActor.run {
-            var result: Set<UUID> = []
-            for (runID, windowID, tabID) in candidateRunIDs {
-                guard let window = WindowStatesManager.shared.window(withID: windowID),
-                      window.agentModeViewModel.sessions[tabID]?.activeAgentSessionID == sessionID
-                else { continue }
-                result.insert(runID)
+        guard !candidates.isEmpty else { return }
+        let matching = await MainActor.run {
+            candidates.filter { recipient in
+                if let owner = recipient.routeOwner, owner.identity.kind == .independent {
+                    let bindings = owner.runRouteBindings
+                    guard owner.identity.routeID == recipient.routeID, !owner.isClosing,
+                          bindings.connectionID(forRunID: recipient.runID) == recipient.connectionID,
+                          bindings.cleanupOwnership(for: recipient.connectionID)?.policyID == recipient.policyID,
+                          let context = bindings.tabContextByConnectionID[recipient.connectionID],
+                          context.runID == recipient.runID, context.tabID == recipient.tabID else { return false }
+                    return context.activeAgentSessionID == sessionID
+                }
+                return WindowStatesManager.shared.window(withID: recipient.routeID)?
+                    .agentModeViewModel.sessions[recipient.tabID]?.activeAgentSessionID == sessionID
             }
-            return result
         }
-        guard !matchingRunIDs.isEmpty else { return }
-        for (connectionID, runID) in runIDByConnectionID
-            where matchingRunIDs.contains(runID) && !connectionsBeingRemoved.contains(connectionID)
-        {
+        for recipient in matching {
+            guard isCurrentAgentSessionRelistRecipient(recipient) else { continue }
+            let connectionID = recipient.connectionID
+            let runID = recipient.runID
             let initialRevision = runCatalogObservationByRunID[runID]?.projectionRevision ?? 0
             let snapshot = await liveSessionLinkGrantSnapshot(connectionID: connectionID)
             let routeToken = snapshot?.routeToken
+            guard isCurrentAgentSessionRelistRecipient(recipient),
+                  routeToken.map({ $0.observerEndpoint.sessionID == sessionID }) ?? true else { continue }
             let computedSurface = await expectedSessionLinkCatalogSurface(connectionID: connectionID, snapshot: snapshot)
-            if routeToken != nil, !isCurrentCatalogRouteToken(routeToken) { continue }
+            guard isCurrentAgentSessionRelistRecipient(recipient),
+                  routeToken == nil || isCurrentCatalogRouteToken(routeToken) else { continue }
             let observation = runCatalogObservationByRunID[runID]
             if (observation?.projectionRevision ?? 0) > initialRevision {
                 // A newer owner already published during shaping. Its expected fingerprint covers
@@ -3742,7 +3781,9 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                 returnedSurface: observation?.routeToken == routeToken ? observation?.returnedSurface : nil,
                 supersedesWaiters: false
             )
-            await notifyToolListChanged(connectionID: connectionID)
+            if isCurrentAgentSessionRelistRecipient(recipient) {
+                await notifyToolListChanged(connectionID: connectionID)
+            }
         }
     }
 
@@ -9960,6 +10001,8 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             restrictedTools: Set<String>,
             additionalTools: Set<String>?,
             purpose: MCPRunPurpose,
+            taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
+            allowsAgentExternalControlTools: Bool = false,
             updatedAt: Date = Date()
         ) {
             seedRunPolicyState(
@@ -9970,6 +10013,8 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                 restrictedTools: restrictedTools,
                 additionalTools: additionalTools,
                 purpose: purpose,
+                taskLabelKind: taskLabelKind,
+                allowsAgentExternalControlTools: allowsAgentExternalControlTools,
                 updatedAt: updatedAt
             )
         }

@@ -508,6 +508,9 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
     func agentSessionLinkRunFacts(
         for candidate: AgentSessionLinkEndpointCandidate, capturedStatus: DomainAgentSessionLinkStatus
     ) -> AgentRunQuietFacts? {
+        if let runtime = independentLinkRuntime(for: candidate.domainEndpoint) {
+            return runtime.agentSessionLinkRunFacts(for: candidate, capturedStatus: capturedStatus)
+        }
         guard !isTerminating, let window = modelRoutingWindow(withID: candidate.windowID), !window.isClosing else { return nil }
         return window.agentModeViewModel.agentSessionLinkRunFacts(for: candidate, capturedStatus: capturedStatus)
     }
@@ -946,6 +949,9 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
     }
 
     func agentSessionLinkLocalInputSnapshot(for endpoint: DomainAgentSessionLinkEndpointIdentity, includeRecords: Bool) -> AgentSessionLinkRetainedLocalInputIndex.Snapshot? {
+        if let runtime = independentLinkRuntime(for: endpoint) {
+            return runtime.agentSessionLinkLocalInputSnapshot(for: endpoint, includeRecords: includeRecords)
+        }
         guard !isTerminating, let window = modelRoutingWindow(withID: endpoint.windowID), !window.isClosing else { return nil }
         return window.agentModeViewModel.agentSessionLinkLocalInputSnapshot(for: endpoint, includeRecords: includeRecords)
     }
