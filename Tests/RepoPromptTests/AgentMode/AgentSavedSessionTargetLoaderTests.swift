@@ -769,6 +769,67 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
         _ = await runtime.shutdown()
     }
 
+    func testIndependentModelCatalogRetainsIdleRouteWithoutAdmittingToolBodies() async throws {
+        let fixture = Fixture()
+        defer { fixture.cleanUp() }
+        try await CanonicalSavedWorkspaceFixture.run(fixture.placement.workspace) { workspace in
+            try await fixture.save()
+            let manager = WindowStatesManager.shared
+            manager.beginPreparedOversightPreparation(fixture.sessionID)
+            defer { manager.endPreparedOversightPreparation(fixture.sessionID) }
+            let writer = try await manager.prepareSavedOversightTarget(fixture.sessionID, isStillAuthorized: { true }).get()
+            let host = try XCTUnwrap(writer.scope.executableHost)
+            let session = writer.session
+            let route = host.route
+            let runID = UUID()
+            let connectionID = UUID()
+            session.installRunID(runID)
+            let first = session.beginRunAttempt(source: "catalog-witness")
+            defer {
+                session.endCurrentRunAttempt(source: "catalog-witness-cleanup")
+                session.clearRunID(ifCurrent: runID)
+            }
+            let resolve = try XCTUnwrap(host.captureProviderContext(runID: runID, tabID: session.tabID))
+            let registration = MCPRunRoutingCleanupReceipt(
+                managerIdentity: ObjectIdentifier(manager), policyID: UUID(), runID: runID, routeID: route.identity.routeID,
+                routingAuthorityGeneration: 1, routingWaitGeneration: nil, routeOwner: route,
+                providerContextResolver: resolve, usesExplicitProviderContext: true
+            )
+            let installed = await route.installPendingPolicy(registration, connectionID: connectionID, clientName: nil, tabID: session.tabID)
+            let token = try XCTUnwrap(installed?.token)
+            let committed = await route.canCommitPendingPolicy(registration, token: token)
+            XCTAssertTrue(committed)
+            let metadata = MCPRequestMetadata(connectionID: connectionID, clientName: nil, windowID: route.identity.routeID)
+            let captured = try route.fileReadConnection(metadata: metadata)
+            let endpoint = try XCTUnwrap(host.scope.linkExecution?.agentSessionLinkObserverEndpoint(tabID: session.tabID))
+            @MainActor func catalogObserver() -> DomainAgentSessionLinkEndpointIdentity? {
+                route.registeredModelObserverEndpoint(
+                    registration: registration, connectionID: connectionID, workspaceID: workspace.id, tabID: session.tabID
+                )
+            }
+            XCTAssertEqual(catalogObserver(), endpoint)
+            XCTAssertEqual(route.canonicalHostInvocation(metadata)?.command.identity, writer.identity)
+
+            XCTAssertTrue(session.endRunAttempt(ifCurrent: first, source: "catalog-witness-idle"))
+            session.runState = .idle
+            XCTAssertEqual(catalogObserver(), endpoint, "The idle process retains only its exact model observer")
+            XCTAssertNil(route.canonicalHostInvocation(metadata), "An idle catalog read must not authorize an old tool body")
+
+            let next = session.beginRunAttempt(source: "catalog-witness-successor")
+            XCTAssertNotEqual(first.attemptID, next.attemptID)
+            XCTAssertNil(catalogObserver(), "An old mapping must not observe a different active attempt")
+            XCTAssertNil(route.canonicalHostInvocation(metadata))
+            XCTAssertTrue(route.renewAdoptedProviderAttempt(
+                runID: runID, tabID: session.tabID, writer: writer.identity, attemptID: next.attemptID, receipts: [registration]
+            ))
+            XCTAssertFalse(route.fileReadConnectionIsCurrent(captured), "Renewal revokes the previous attempt's receipt")
+            XCTAssertEqual(catalogObserver(), endpoint)
+            XCTAssertEqual(route.canonicalHostInvocation(metadata)?.command.identity, writer.identity)
+            await route.consumeCleanup(registration)
+            XCTAssertNil(catalogObserver())
+        }
+    }
+
     func testDurableDeletionReleasesFailedSavedHostDrainWithoutResumingVisit() async throws {
         let fixture = Fixture()
         defer { fixture.cleanUp() }

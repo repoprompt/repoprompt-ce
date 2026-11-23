@@ -28,15 +28,20 @@ extension MCPHostRouteResources {
     /// A connection's immutable writer receipt, not the presentation or a tab-only lookup,
     /// identifies the activation. A same-ID replacement cannot use the old registration.
     func canonicalHostInvocation(_ metadata: MCPRequestMetadata) -> HostInvocation? {
+        guard let (host, connection) = canonicalHostConnection(metadata),
+              let command = host.hostFileCommand(connection) else { return nil }
+        return .init(host: host, command: command)
+    }
+
+    private func canonicalHostConnection(_ metadata: MCPRequestMetadata) -> (AgentSessionRuntimeHost, FileReadConnection)? {
         guard identity.kind == .independent, let connection = try? fileReadConnection(metadata: metadata),
               let original = connection.writerAtBinding,
               case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
                   sessionID: original.sessionID, expectedWorkspaceID: original.workspaceID
               ), writer.identity == original,
-              let host = writer.scope.executableHost, host.route === self,
-              let command = host.hostFileCommand(connection)
+              let host = writer.scope.executableHost, host.route === self
         else { return nil }
-        return .init(host: host, command: command)
+        return (host, connection)
     }
 
     fileprivate func registerHostCapabilities(service: MCPService, workspaceID: UUID) async throws {
@@ -146,11 +151,8 @@ extension MCPHostRouteResources {
             _ = try await registerCatalog(MCPAppToolCatalogRegistration(
                 windowID: identity.routeID, providers: [], sharedBindings: bindings, runtime: binder,
                 hostInteractionAdapter: interactions, hostTransport: service, hostModelEndpoint: { [weak self] metadata in
-                    guard let invocation = self?.canonicalHostInvocation(metadata),
-                          let endpoint = invocation.host.scope.linkExecution?.agentSessionLinkObserverEndpoint(
-                              tabID: invocation.command.writer.session.tabID
-                          ) else { return nil }
-                    return .init(endpoint: endpoint, writer: invocation.command.identity)
+                    guard let (host, connection) = self?.canonicalHostConnection(metadata) else { return nil }
+                    return host.hostCatalogObserver(connection)
                 }
             ))
         } catch RegistrationFailure.differentCatalog {
