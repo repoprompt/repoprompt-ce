@@ -4827,7 +4827,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         await session.disposeProviderIfPresent()
                         await codexCoordinator.shutdownCodexSession(session)
                         let sessionID = boundSessionID(for: session.tabID)
-                        await cleanupMCPRunRoutingIfPresent(
+                        await cleanupLegacyMCPRunRoutingIfPresent(
                             boundSessionID: sessionID,
                             liveSession: session,
                             reason: "managed_codex_logout"
@@ -4885,7 +4885,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         await codexCoordinator.shutdownCodexSession(session)
         await claudeCoordinator.shutdownClaudeSession(session)
         let sessionID = boundSessionID(for: session.tabID)
-        await cleanupMCPRunRoutingIfPresent(
+        await cleanupLegacyMCPRunRoutingIfPresent(
             boundSessionID: sessionID,
             liveSession: session,
             reason: "window_close"
@@ -5499,7 +5499,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let retiredRunID = session.runID
             claudeCoordinator.prepareForConversationResetSync(session)
             if let retiredRunID {
-                Task { await self.cleanupMCPRunRoutingIfPresent(boundSessionID: previousSessionID, liveSession: nil, explicitRunID: retiredRunID, reason: "claudeNative.rebind") }
+                Task { await self.cleanupLegacyMCPRunRoutingIfPresent(boundSessionID: previousSessionID, liveSession: nil, explicitRunID: retiredRunID, reason: "claudeNative.rebind") }
             }
         }
         if invalidateAsyncWork {
@@ -10605,7 +10605,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             session.derivedTranscriptRefreshTask = nil
             session.pendingDerivedTranscriptRefreshReason = nil
             await mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
-            await cleanupMCPRunRoutingIfPresent(
+            await cleanupLegacyMCPRunRoutingIfPresent(
                 boundSessionID: sessionID,
                 liveSession: session,
                 reason: "provisional_admission_recovery"
@@ -12744,15 +12744,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         ))
     }
 
-    private func cleanupMCPRunRoutingIfPresent(
+    private func cleanupLegacyMCPRunRoutingIfPresent(
         boundSessionID: UUID?,
         liveSession: TabSession?,
         explicitRunID: UUID? = nil,
         reason: String
     ) async {
         _ = boundSessionID
-        guard let runID = explicitRunID ?? liveSession?.runID else { return }
-        await runtimeHost.cleanupRunRouting(.legacyWindow(runID: runID), reason: reason)
+        let host = runtimeHost
+        // Originating controllers or bootstrap rollback consume independent registrations. A late
+        // presenter discard carries only a run ID and cannot clean an independent host or successor.
+        guard host.route.identity.kind == .legacyWindow,
+              let runID = explicitRunID ?? liveSession?.runID else { return }
+        await host.cleanupRunRouting(.legacyWindow(runID: runID), reason: reason)
     }
 
     func removeSessionIndex(sessionID: UUID) {
@@ -14111,7 +14115,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 await claudeCoordinator.shutdownClaudeSession(session)
             }
             if sessions[tabID] == nil {
-                await cleanupMCPRunRoutingIfPresent(
+                await cleanupLegacyMCPRunRoutingIfPresent(
                     boundSessionID: boundID,
                     liveSession: capturedSession,
                     reason: "compose_tab_close"
@@ -18619,7 +18623,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
             guard let session = sessions[tabID], session.activeAgentSessionID == sessionID else { continue }
             await cleanUpDeletedSessionRuntime(session)
-            await cleanupMCPRunRoutingIfPresent(
+            await cleanupLegacyMCPRunRoutingIfPresent(
                 boundSessionID: sessionID,
                 liveSession: session,
                 reason: reason
@@ -18705,7 +18709,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             removePendingUIRefresh(for: tabID)
             providerCleanupOutcome = await cleanUpDeletedSessionRuntime(session)
         }
-        await cleanupMCPRunRoutingIfPresent(
+        await cleanupLegacyMCPRunRoutingIfPresent(
             boundSessionID: sessionID,
             liveSession: liveSession,
             reason: "session_delete"
@@ -19912,7 +19916,7 @@ extension AgentModeViewModel: WorkspaceSwitchSessionProviderDelegate {
         explicitRunID: UUID?,
         reason: String
     ) async {
-        await cleanupMCPRunRoutingIfPresent(
+        await cleanupLegacyMCPRunRoutingIfPresent(
             boundSessionID: boundSessionID,
             liveSession: liveSession,
             explicitRunID: explicitRunID,

@@ -1368,6 +1368,13 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         }
 
         if explicitStop {
+            // A delayed presenter discard, even with this run ID, has no independent cleanup
+            // receipt. It must not precede the originating provider's explicit Stop authority.
+            await agent.cleanupMCPRunRoutingForDiscardedSession(
+                boundSessionID: sessionID, liveSession: session, explicitRunID: runID, reason: "late presenter discard"
+            )
+            XCTAssertFalse(routingReceipt.isConsumed)
+            try assertOriginalAttempt()
             let stopFence = AgentRunStartStopFence(session: session)
             let target = agent.makeRunCancelTarget(tabID: tab.id, session: session)
             let stop = Task { await agent.cancelAgentRun(target: target) }
