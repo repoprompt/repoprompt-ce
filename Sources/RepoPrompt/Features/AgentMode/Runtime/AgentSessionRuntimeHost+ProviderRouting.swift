@@ -5,19 +5,38 @@ extension AgentSessionRuntimeHost {
     /// Route registration contributes the original writer incarnation; workspace/tab identifiers
     /// alone are insufficient when the carrier displays another transcript.
     func hostFileCommand(_ connection: MCPHostRouteResources.FileReadConnection) -> AgentSessionRuntimeStore.Command? {
+        guard let command = hostBoundRouteCommand(connection), let runID = connection.runID,
+              connection.runAttemptIDAtBinding.map({ $0 == command.writer.session.activeRunAttemptID }) ?? true
+        else { return nil }
+        let session = command.writer.session
+        if let origin = AgentSelfMCPCallOrigin.current {
+            guard origin.runID == runID, origin.runAttemptID == session.activeRunAttemptID,
+                  scope.linkExecution?.agentSessionLinkObserverEndpoint(tabID: session.tabID) == origin.endpoint else { return nil }
+        }
+        return command
+    }
+
+    /// Idle catalog discovery persists on the same registered process. This projection
+    /// cannot become an invocation command or bless an already-started successor attempt.
+    func hostCatalogObserver(_ connection: MCPHostRouteResources.FileReadConnection) -> MCPHostRouteResources.ModelEndpoint? {
+        guard let command = hostBoundRouteCommand(connection) else { return nil }
+        let session = command.writer.session
+        let matchesAttempt = connection.runAttemptIDAtBinding.map { $0 == session.activeRunAttemptID } ?? true
+        guard matchesAttempt || (session.activeRunAttemptID == nil && !session.runState.isActive),
+              let endpoint = scope.linkExecution?.agentSessionLinkObserverEndpoint(tabID: session.tabID)
+        else { return nil }
+        return .init(endpoint: endpoint, writer: command.identity)
+    }
+
+    private func hostBoundRouteCommand(_ connection: MCPHostRouteResources.FileReadConnection) -> AgentSessionRuntimeStore.Command? {
         guard let sessionID = connection.lookupSource.activeAgentSessionID, let runID = connection.runID,
               let activation = workspaceActivation, activation.owns(scope: scope, route: route),
               activation.savedCarrierSessionID == connection.savedCarrierSessionID,
               route.fileReadConnectionIsCurrent(connection),
               let session = scope.sessions[connection.context.contextID], session.runID == runID,
-              connection.runAttemptIDAtBinding.map({ $0 == session.activeRunAttemptID }) ?? true,
               let command = try? scope.admit(session: session, expectedWorkspaceID: connection.context.workspaceID),
               command.identity == connection.writerAtBinding, command.identity.sessionID == sessionID,
               connection.lookupSource.worktreeBindingState.bindings == session.worktreeBindings else { return nil }
-        if let origin = AgentSelfMCPCallOrigin.current {
-            guard origin.runID == runID, origin.runAttemptID == session.activeRunAttemptID,
-                  scope.linkExecution?.agentSessionLinkObserverEndpoint(tabID: session.tabID) == origin.endpoint else { return nil }
-        }
         return command
     }
 
