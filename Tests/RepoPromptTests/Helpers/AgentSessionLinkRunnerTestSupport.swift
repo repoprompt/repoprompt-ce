@@ -693,10 +693,10 @@ final class AgentSessionLinkACPResponseGate {
         }
     }
 
-    func release() {
+    func release(consumers: Int = 1) {
         guard !released else { return }
         released = true
-        try? handle.write(contentsOf: Data([1]))
+        try? handle.write(contentsOf: Data(repeating: 1, count: consumers))
     }
 
     deinit {

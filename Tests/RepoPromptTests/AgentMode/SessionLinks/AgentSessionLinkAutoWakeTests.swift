@@ -1401,7 +1401,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             try assertOriginalAttempt()
             try await assertExplicitDetachedShutdown(
                 .workspaceDeletion, host: host, session: session, attemptID: attemptID, workspaceID: workspace.id,
-                releaseProvider: gate.release
+                releaseProvider: { gate.release() }
             )
             suspension.release()
             try await switching.value
@@ -1506,7 +1506,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             if let detachedShutdown {
                 try await assertExplicitDetachedShutdown(
                     detachedShutdown, host: host, session: session, attemptID: attemptID, workspaceID: workspace.id,
-                    releaseProvider: gate.release
+                    releaseProvider: { gate.release() }
                 )
                 XCTAssertEqual(provider.promptedMessages.count, 1)
                 return
@@ -1515,7 +1515,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                 try await assertVisibleSaveRecovery(
                     destination: failedSaveDestination, host: host, session: session, workspace: workspace,
                     runtime: runtime, providerResources: providerResources, transport: transport, prompt: prompt,
-                    releaseProvider: gate.release
+                    releaseProvider: { gate.release() }
                 )
                 XCTAssertEqual(provider.promptedMessages.count, 1)
                 return
@@ -1561,7 +1561,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             XCTAssertTrue(incoming.agentModeViewModel.tabsWithActiveAgentRun.contains(tab.id))
             try assertOriginalAttempt()
             if switchWorkspace {
-                try await assertSwitchDuringFinalSave(host: host, session: session, in: incoming, to: second, releaseProvider: gate.release)
+                try await assertSwitchDuringFinalSave(host: host, session: session, in: incoming, to: second, releaseProvider: { gate.release() })
             } else {
                 gate.release()
             }

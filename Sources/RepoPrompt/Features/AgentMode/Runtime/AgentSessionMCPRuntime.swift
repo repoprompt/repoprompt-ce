@@ -1449,7 +1449,34 @@ final class AgentSessionMCPRuntime {
         let runID: UUID
     }
 
+    /// Stages immutable launch data for this exact control activation. A later review never
+    /// falls back to the child's own selection if provenance was unavailable at launch.
     @discardableResult
+    func stageAgentRunOracleReviewSource(
+        _ source: AgentRunOracleReviewSource, session: AgentTabSession,
+        sessionID: UUID, workspaceID: UUID, expectedParentSessionID: UUID?
+    ) throws {
+        guard scope?.sessions[session.tabID] === session, session.activeAgentSessionID == sessionID,
+              let context = session.mcpControlContext, context.sessionID == sessionID
+        else { throw AgentRunOracleReviewUnavailableReason.targetActivationMismatch }
+        let failure: AgentRunOracleReviewUnavailableReason? = if source.workspaceID != workspaceID {
+            .targetWorkspaceMismatch
+        } else if session.parentSessionID != expectedParentSessionID {
+            .parentSessionMismatch
+        } else {
+            nil
+        }
+        mcpRemoveAgentRunOracleReviewContexts(sessionID: sessionID)
+        pendingAgentRunOracleReviewContextsBySessionID[sessionID] = PendingAgentRunOracleReviewContext(
+            source: source,
+            target: AgentRunOracleReviewTargetSnapshot(
+                tabID: session.tabID, workspaceID: workspaceID, agentSessionID: sessionID,
+                activationID: context.activationID, expectedParentSessionID: expectedParentSessionID,
+                worktreeBindings: session.worktreeBindings, validationFailure: failure
+            )
+        )
+    }
+
     func mcpBindPendingAgentRunOracleReviewContext(
         tabID: UUID,
         runID: UUID

@@ -36,6 +36,8 @@ final class AgentSessionRuntimeHost {
     let claudeCoordinator: ClaudeAgentModeCoordinator
     let providerBindingService: AgentModeProviderBindingService
     let providerResources: AgentRunProviderComposition
+    let modelRouterSettingsStore: GlobalSettingsStore
+    let claudeControllerFactory: ClaudeAgentModeCoordinator.ClaudeControllerFactory?
     private(set) lazy var workspaceSwitchCleanup = AgentModeWorkspaceSwitchCleanupProvider(
         codexCoordinator: codexCoordinator, claudeCoordinator: claudeCoordinator
     )
@@ -188,6 +190,8 @@ final class AgentSessionRuntimeHost {
         precondition(executionRouteLease == nil || releaseExecutionRoute != nil, "Transfer the execution lease synchronously at acquisition")
         self.route = route
         self.releaseExecutionRoute = releaseExecutionRoute
+        self.modelRouterSettingsStore = modelRouterSettingsStore
+        self.claudeControllerFactory = claudeControllerFactory
         let routeID = route.identity.routeID
         let tools = route.toolExecutionRuntime
         runRoutingCleaner = Self.cleanRunRouting
@@ -537,6 +541,8 @@ final class AgentSessionRuntimeHost {
             self.codexCoordinator = codexCoordinator
             self.claudeCoordinator = claudeCoordinator
             self.providerResources = providerResources
+            modelRouterSettingsStore = .shared
+            claudeControllerFactory = nil
             providerBindingService = AgentModeProviderBindingService()
             scope.installExecutableHost(self)
             codexCoordinator.setActiveAgentRunWaitDrain(activeAgentRunWaitDrain ?? makeChildAgentRunWaitDrain())

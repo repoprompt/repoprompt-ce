@@ -555,6 +555,7 @@ extension AgentSessionLinkExecutionRuntime {
         stopFence: AgentRunStartStopFence,
         providerSwitchPreparation: ProviderSwitchSendPreparation? = nil,
         linkReference: DomainAgentSessionLinkReference? = nil,
+        directStartOptions: AgentDirectRunStartOptions? = nil,
         dispatchIsCurrent: @MainActor () -> Bool
     ) async -> AgentSessionLinkSendTransactionOutcome {
         guard let owner = scope, !owner.hasReleasedWriterClaims, !owner.isRetiring else {
@@ -667,7 +668,7 @@ extension AgentSessionLinkExecutionRuntime {
             session: liveSession, tabID: tabID, claim: claim, savedItemID: userItem.id,
             acceptedAt: Date(), providerMessage: providerMessage, stopFence: stopFence,
             providerSwitchPreparation: switchPreparation,
-            managedStart: managedStart,
+            managedStart: managedStart, directStartOptions: directStartOptions,
             dispatchIsCurrent: dispatchIsCurrent
         )
     }
@@ -678,6 +679,7 @@ extension AgentSessionLinkExecutionRuntime {
         stopFence: AgentRunStartStopFence,
         providerSwitchPreparation: ProviderSwitchSendPreparation? = nil,
         managedStart: LinkStartedAttempt? = nil,
+        directStartOptions: AgentDirectRunStartOptions? = nil,
         dispatchIsCurrent: @MainActor () -> Bool
     ) async -> AgentSessionLinkSendTransactionOutcome {
         let persistedOnly = AgentSessionLinkSendDelivery(
@@ -755,12 +757,13 @@ extension AgentSessionLinkExecutionRuntime {
             allowsStartup: { managedStart?.isRevoked != true },
             attemptStarted: { managedStart?.ownership = $0 }
         )
+        var options = directStartOptions ?? AgentDirectRunStartOptions(ignoresPendingHandoff: true)
+        options.stopFence = stopFence
+        if directStartOptions != nil { options.initialUserItemID = savedItemID }
         _ = await startAgentRun(
             command: command,
             initialMessage: dispatchedProviderMessage,
-            directStartOptions: AgentDirectRunStartOptions(
-                ignoresPendingHandoff: true, stopFence: stopFence
-            ),
+            directStartOptions: options,
             startOutcome: startRecorder,
             providerSwitchPreparation: providerSwitchPreparation
         )
