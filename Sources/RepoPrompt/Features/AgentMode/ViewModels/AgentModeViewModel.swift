@@ -3832,7 +3832,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     #if DEBUG
                         defer { self.test_afterWorkspaceSwitchAdoptionCompleted?(owner) }
                     #endif
-                    await Self.$performingWorkspaceAdoptionFor.withValue(ObjectIdentifier(self)) {
+                    await Self.performingWorkspaceAdoptionFor.withValue(ObjectIdentifier(self)) {
                         #if DEBUG
                             await self.test_beforeWorkspaceSwitchAdoption?(owner)
                         #endif
@@ -6752,7 +6752,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
-    @TaskLocal private static var performingWorkspaceAdoptionFor: ObjectIdentifier?
+    private static let performingWorkspaceAdoptionFor = BoxedTaskLocal<ObjectIdentifier?>(nil)
     private var workspaceAdoption: WorkspaceAdoption?
 
     var isAwaitingWorkspaceAdoption: Bool {
@@ -6812,7 +6812,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if let settled = adoption.result {
             result = settled
         } else {
-            guard Self.performingWorkspaceAdoptionFor != ObjectIdentifier(self) else { return false }
+            guard Self.performingWorkspaceAdoptionFor.get() != ObjectIdentifier(self) else { return false }
             result = await adoption.wait()
         }
         guard case let .ready(host) = result else { return false }
@@ -9281,26 +9281,33 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
             let createdTabID = creation.tabID
             defer { provisionalParentSessionIDBySessionID.removeValue(forKey: intendedSessionID) }
-            // The registry retains the durable recovery claim even if cancellation arrives while the
-            // newly published tab is being hydrated into this view model.
+            // Capture the published writer now, before a cancellable hydration wait. Recovery
+            // must remove this incarnation and its artifacts, never a replacement binding.
+            let publishedFreshSession = creation.freshSession
+            let publishedLifecycleIdentity: AgentSessionLifecycleAuthority.Identity? = publishedFreshSession.flatMap { handle in
+                guard freshSessionCreationIsCurrent(handle) else { return nil }
+                return agentSessionLifecycleIdentity(tabID: createdTabID, expectedSessionID: intendedSessionID)
+            }
             var provisionalTarget = MCPSessionTarget(
                 tabID: createdTabID,
                 sessionID: intendedSessionID,
                 origin: .createdNewTab,
+                lifecycleIdentity: publishedLifecycleIdentity,
                 recoveryClaim: creation.recoveryClaim,
                 discardAuthorityID: discardAuthorityID,
-                creationHandle: creation.freshSession
+                creationHandle: publishedFreshSession
             )
             registerOutstandingProvisionalMCPSessionTarget(provisionalTarget)
-            let publishedFreshSession = creation.freshSession
             do {
                 #if DEBUG
                     await test_afterDurableChildTabCreation?()
                 #endif
+                try Task.checkCancellation()
                 guard let publishedFreshSession, freshSessionCreationIsCurrent(publishedFreshSession) else {
                     throw MCPError.invalidParams("The fresh Agent session binding changed during creation.")
                 }
                 let hydrated = await ensureSessionReady(tabID: createdTabID)
+                try Task.checkCancellation()
                 guard hydrated === publishedFreshSession.session,
                       freshSessionCreationIsCurrent(publishedFreshSession)
                 else { throw MCPError.invalidParams("The fresh Agent session binding changed during hydration.") }
@@ -10592,30 +10599,46 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                   expectedSessionID: sessionID
               ) == runtimeIdentity.lifecycleIdentity
         else { return }
-        mcpRuntime.mcpRemoveAgentRunOracleReviewContexts(sessionID: sessionID)
-        if session.activeAgentSessionID == sessionID {
-            if session.runState.isActive {
-                await runService.cancelRun(
-                    tabID: target.tabID,
-                    session: session,
-                    intent: .runtimeShutdown,
-                    completion: .terminalTeardownCompleted
-                )
-            }
-            cancelPersistedLoad(for: session)
-            session.cancelEphemeralRuntimeState()
-            session.derivedTranscriptRefreshGeneration &+= 1
-            session.derivedTranscriptRefreshTask?.cancel()
-            session.derivedTranscriptRefreshTask = nil
-            session.pendingDerivedTranscriptRefreshReason = nil
-            await mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
-            await cleanupLegacyMCPRunRoutingIfPresent(
-                boundSessionID: sessionID,
-                liveSession: session,
-                reason: "provisional_admission_recovery"
-            )
-            sessions.removeValue(forKey: target.tabID)
+        let originatingScope = runtimeSessionStore
+        let originatingMCP = mcpRuntime
+        let runAttempt = session.activeRunOwnership
+        func stillOwnsRuntime() -> Bool {
+            runtimeSessionStore === originatingScope && sessions[target.tabID] === session
+                && agentSessionLifecycleIdentity(tabID: target.tabID, expectedSessionID: sessionID) == runtimeIdentity.lifecycleIdentity
+                && (session.activeRunOwnership == nil || session.activeRunOwnership == runAttempt)
         }
+        originatingMCP.mcpRemoveAgentRunOracleReviewContexts(sessionID: sessionID)
+        if session.runState.isActive {
+            await runService.cancelRun(
+                tabID: target.tabID,
+                session: session,
+                intent: .runtimeShutdown,
+                completion: .terminalTeardownCompleted
+            )
+            guard stillOwnsRuntime() else { return }
+        }
+        cancelPersistedLoad(for: session)
+        session.cancelEphemeralRuntimeState()
+        session.derivedTranscriptRefreshGeneration &+= 1
+        session.derivedTranscriptRefreshTask?.cancel()
+        session.derivedTranscriptRefreshTask = nil
+        session.pendingDerivedTranscriptRefreshReason = nil
+        guard stillOwnsRuntime() else { return }
+        if let context = session.mcpControlContext, context.sessionID == sessionID {
+            _ = await originatingMCP.deactivateControlContext(
+                session: session, expectedContext: context,
+                approvalStore: applyEditsApprovalStore, cleanupRegistration: true
+            )
+            guard stillOwnsRuntime() else { return }
+        }
+        await cleanupLegacyMCPRunRoutingIfPresent(
+            boundSessionID: sessionID,
+            liveSession: session,
+            reason: "provisional_admission_recovery"
+        )
+        guard stillOwnsRuntime() else { return }
+        sessions.removeValue(forKey: target.tabID)
+        guard runtimeSessionStore === originatingScope, sessions[target.tabID] == nil else { return }
         if pendingTabIDForLoad == target.tabID {
             pendingTabIDForLoad = nil
         }
@@ -13062,7 +13085,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         _ workspace: WorkspaceModel?,
         owner: SessionIndexOwner
     ) async {
-        await Self.$performingWorkspaceAdoptionFor.withValue(ObjectIdentifier(self)) {
+        await Self.performingWorkspaceAdoptionFor.withValue(ObjectIdentifier(self)) {
             await performWorkspaceAdoption(workspace, owner: owner)
         }
     }
