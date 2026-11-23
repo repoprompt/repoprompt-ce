@@ -3940,21 +3940,25 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     // after the initiating admission rolls it back.
                     return nil
                 }
-                let liveSession: AgentTabSession? = sessionID.flatMap { expectedSessionID in
-                    if runtimeHost.workspaceActivation == nil, let local = sessions[tab.id],
-                       local.activeAgentSessionID == expectedSessionID, !local.qualifiedRestorationReadiness.isCreating
-                    {
-                        return local
-                    }
-                    guard !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: expectedSessionID),
-                          !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: expectedSessionID),
-                          case let .unique(writer) = runtimeSessionStore.resolveWriter(sessionID: expectedSessionID, expectedWorkspaceID: workspace.id),
+                let liveSession: AgentTabSession?
+                if let sessionID, runtimeHost.workspaceActivation == nil, let local = sessions[tab.id],
+                   local.activeAgentSessionID == sessionID, !local.qualifiedRestorationReadiness.isCreating
+                {
+                    liveSession = local
+                } else if let sessionID, !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: sessionID),
+                          !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: sessionID),
+                          case let .unique(writer) = runtimeSessionStore.resolveWriter(sessionID: sessionID, expectedWorkspaceID: workspace.id),
                           writer.session.tabID == tab.id, !writer.scope.isRetiring,
                           !writer.session.qualifiedRestorationReadiness.isCreating,
                           let activation = writer.scope.executableHost?.workspaceActivation,
                           activation.isCurrent, activation.savedCarrierSessionID == nil
-                    else { return nil }
-                    return writer.session
+                {
+                    // Writer discovery is global; stale carrier repair is not. Even a pin in
+                    // this window's selected workspace cannot override the actual presenter.
+                    guard activation.lifecycleProjectionOwner === sessionIndexStore else { return nil }
+                    liveSession = writer.session
+                } else {
+                    liveSession = nil
                 }
                 let isLive = liveSession != nil
                 // Every window mirrors the catalog, but a cold pin in an inactive workspace
@@ -13321,6 +13325,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             guard sessionIndexStore.isOwnerCurrent(owner), runtimeHost === destination,
                   !hasDetachedClosingPresentation, !hasPreparedForWindowClose
             else { return }
+            destination.workspaceActivation?.recordLifecycleProjectionOwner(sessionIndexStore, owner: owner)
         }
         #if DEBUG
             restorePerfRecorder.event(

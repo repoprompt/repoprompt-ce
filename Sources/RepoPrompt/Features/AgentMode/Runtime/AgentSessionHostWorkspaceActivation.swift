@@ -27,6 +27,7 @@ final class AgentSessionHostWorkspaceActivation {
     private(set) var catalogFileLease: AgentHostWorkspaceResources.Lease?
     private var retainedRoots: [AgentHostWorkspaceResources.Lease] = []
     private(set) var isReleased = false
+    private(set) weak var lifecycleProjectionOwner: AgentWorkspaceSessionIndexStore?
     private struct HostBinding {
         weak var scope: AgentSessionRuntimeStore.Scope?
         let hostIdentity: ObjectIdentifier
@@ -125,6 +126,16 @@ final class AgentSessionHostWorkspaceActivation {
               host.routeID == authority.windowID, !host.route.isClosing
         else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
         hostBinding = HostBinding(scope: host.scope, hostIdentity: ObjectIdentifier(host))
+    }
+
+    /// Assign local projection repair to the last qualified presenter. A passive mirror may
+    /// observe this writer, but cannot use it to republish that mirror's old carrier fields.
+    func recordLifecycleProjectionOwner(
+        _ presenter: AgentWorkspaceSessionIndexStore, owner: AgentWorkspaceSessionIndexStore.SessionIndexOwner
+    ) {
+        guard isCurrent, savedTarget == nil, owner.workspaceID == key.owner.workspaceID,
+              presenter.isOwnerCurrent(owner) else { return }
+        lifecycleProjectionOwner = presenter
     }
 
     func owns(scope: AgentSessionRuntimeStore.Scope, route: MCPHostRouteResources) -> Bool {

@@ -6185,6 +6185,9 @@ import XCTest
                 XCTAssertEqual(restored.activeAgentSessionID, sessionID)
                 XCTAssertTrue(restored.qualifiedRestorationReadiness.isAuthoritative)
                 XCTAssertEqual(owner.agentModeViewModel.ownerValidatedSessionIndex[sessionID]?.tabID, target.id)
+                let ownerHost = owner.agentModeViewModel.runtimeHost
+                XCTAssertTrue(ownerHost.scope.sessions[target.id] === restored)
+                XCTAssertFalse(mirror.agentModeViewModel.runtimeHost === ownerHost)
                 XCTAssertNotEqual(mirror.workspaceManager.activeWorkspaceID, selected.id)
                 XCTAssertEqual(mirror.workspaceManager.workspace(withID: selected.id)?.composeTabs.last?.isPinned, true)
                 let originalMirrorVersion = mirror.workspaceManager.debugStateVersionForWorkspace(selected.id)
@@ -6205,15 +6208,17 @@ import XCTest
                     let record = try XCTUnwrap(catalog.workspaces.first { $0.document.workspaceID == selected.id })
                     let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: record.document.documentBytes)
                     let disk = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: record.document.fileURL))
-                    for workspace in try [canonical, disk, XCTUnwrap(owner.workspaceManager.workspace(withID: selected.id)), XCTUnwrap(mirror.workspaceManager.workspace(withID: selected.id))] {
-                        XCTAssertEqual(workspace.composeTabs.contains { $0.id == target.id }, !archived)
-                        XCTAssertEqual(workspace.stashedTabs.contains { $0.tab.id == target.id }, archived)
+                    let ownerProjection = try XCTUnwrap(owner.workspaceManager.workspace(withID: selected.id))
+                    let mirrorProjection = try XCTUnwrap(mirror.workspaceManager.workspace(withID: selected.id))
+                    for (source, workspace) in [("canonical", canonical), ("disk", disk), ("owner", ownerProjection), ("mirror", mirrorProjection)] {
+                        XCTAssertEqual(workspace.composeTabs.contains { $0.id == target.id }, !archived, source)
+                        XCTAssertEqual(workspace.stashedTabs.contains { $0.tab.id == target.id }, archived, source)
                         let carrier = try XCTUnwrap(
                             workspace.composeTabs.first { $0.id == target.id }
                                 ?? workspace.stashedTabs.first { $0.tab.id == target.id }?.tab
                         )
-                        XCTAssertFalse(carrier.isPinned)
-                        XCTAssertEqual(carrier.activeAgentSessionID, sessionID)
+                        XCTAssertFalse(carrier.isPinned, source)
+                        XCTAssertEqual(carrier.activeAgentSessionID, sessionID, source)
                     }
                     XCTAssertEqual(organizer.state(of: sessionID)?.isArchived, archived)
                     XCTAssertEqual(
