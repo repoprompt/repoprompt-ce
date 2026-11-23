@@ -551,6 +551,40 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                     )
                     let childGeneration = try XCTUnwrap(childReceipt.routingWaitGeneration)
                     await MCPRoutingWaiter.notifyRouted(runID: childReceipt.runID, generation: childGeneration)
+                    let launchedID = launched.command.identity.sessionID
+                    let readTargets = try await spawn.captureReadTargets([launchedID], operation: .runWait)
+                    let childReadAccess = spawn.readAccess(for: readTargets, operation: .runWait)
+                    let childCursor = try XCTUnwrap(childReadAccess.waitCursor(launchedID))
+                    XCTAssertEqual(childCursor.registration, launched.command.writer.session.mcpControlContext?.registration)
+                    let activeChild = await childReadAccess.snapshot(launchedID)
+                    XCTAssertEqual(activeChild.parentSessionID, fixture.sessionID)
+                    XCTAssertEqual(activeChild.status, .running)
+                    try await spawn.requireReadTargets(readTargets, operation: .runWait)
+                    let waitScope = try XCTUnwrap(spawn.beginReadWait(for: readTargets, timeoutSeconds: 2))
+                    let tools = host.route.toolExecutionRuntime
+                    let childWait = Task {
+                        defer {
+                            tools.endAgentRunWaitScope(waitScope.token, completion: .init(
+                                reason: .cancelled, result: "interrupted_by_steering", winnerSessionID: nil,
+                                pendingSessionIDs: [launchedID], errorDescription: nil
+                            ))
+                        }
+                        return await AgentRunSessionStore.waitUntilInteresting(cursor: childCursor, timeoutSeconds: 2)
+                    }
+                    let didDrain = await tools.wakeAndDrainAgentRunWaitersOwnedByActiveRun(
+                        runID: receipt.runID, source: "independent-child-witness", steeringMessage: "Parent received new input",
+                        timeoutSeconds: 1, steeringOriginRunID: { receipt.runID }, publicationForSessionID: { _ in
+                            XCTFail("An independently hosted child wait must not fall back to the parent's scope")
+                            return nil
+                        }
+                    )
+                    XCTAssertTrue(didDrain)
+                    let disposition = await childWait.value
+                    let receivedWake = if case let .noteworthySnapshot(wake) = disposition { wake } else { nil as AgentRunSessionStore.NoteworthyWake? }
+                    let wake = try XCTUnwrap(receivedWake, "Child wait did not receive the exact steering wake: \(disposition)")
+                    XCTAssertEqual(wake.reason, .steeringRequested)
+                    XCTAssertEqual(wake.snapshot.sessionID, launchedID)
+                    XCTAssertEqual(wake.steeringOriginRunID, receipt.runID)
                     promptGate.release(consumers: 2)
                     await launched.command.writer.session.agentTask?.value
                     await writer.session.agentTask?.value
