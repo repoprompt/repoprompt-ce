@@ -86,6 +86,9 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
     var agentReasoningEffortRaw: String?
     var acpModelParameterSelections: [ACPModelParameterSelection]
     var lastRunStateRaw: String?
+    var originWorkflowID: String?
+    var originWorkflowDisplayName: String?
+    var lastRunStartedAt: Date?
     var autoEditEnabled: Bool
     /// Deliberately **not** listed in `lacksTranscriptDerivedFields`: this is session configuration,
     /// not a transcript-derived completeness signal, so a record missing it is not stale.
@@ -193,6 +196,9 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         coveredTurnDurationSeconds: Int = 0,
         interActiveIntervalGapSeconds: [Int] = [],
         toolCallCount: Int = 0,
+        originWorkflowID: String? = nil,
+        originWorkflowDisplayName: String? = nil,
+        lastRunStartedAt: Date? = nil,
         transcriptTurnCount: Int = 0
     ) {
         self.id = id
@@ -210,6 +216,9 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         self.agentReasoningEffortRaw = agentReasoningEffortRaw
         self.acpModelParameterSelections = ACPModelParameterSelection.normalized(acpModelParameterSelections)
         self.lastRunStateRaw = lastRunStateRaw
+        self.originWorkflowID = originWorkflowID
+        self.originWorkflowDisplayName = originWorkflowDisplayName
+        self.lastRunStartedAt = lastRunStartedAt
         self.autoEditEnabled = autoEditEnabled
         self.autoWakeOnOversightUpdates = autoWakeOnOversightUpdates
         self.agentSessionLinkAutoWakeTargetSessionIDs = agentSessionLinkAutoWakeTargetSessionIDs
@@ -253,6 +262,9 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         case agentReasoningEffortRaw
         case acpModelParameterSelections
         case lastRunStateRaw
+        case originWorkflowID
+        case originWorkflowDisplayName
+        case lastRunStartedAt
         case autoEditEnabled
         case autoWakeOnOversightUpdates
         case agentSessionLinkAutoWakeTargetSessionIDs
@@ -302,6 +314,9 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             ) ?? []
         )
         lastRunStateRaw = try container.decodeIfPresent(String.self, forKey: .lastRunStateRaw)
+        originWorkflowID = try container.decodeIfPresent(String.self, forKey: .originWorkflowID)
+        originWorkflowDisplayName = try container.decodeIfPresent(String.self, forKey: .originWorkflowDisplayName)
+        lastRunStartedAt = try container.decodeIfPresent(Date.self, forKey: .lastRunStartedAt)
         autoEditEnabled = try container.decodeIfPresent(Bool.self, forKey: .autoEditEnabled) ?? true
         let wakePreferences = try AgentSessionWakePreferences(from: decoder)
         autoWakeOnOversightUpdates = wakePreferences.autoWakeOnOversightUpdates
@@ -358,7 +373,10 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             hasUnknownConversationContent: hasUnknownConversationContent,
             isMCPOriginated: isMCPOriginated,
             worktreeBindingSummaries: worktreeBindingSummaries,
-            activeWorktreeMergeSummaries: activeWorktreeMergeSummaries
+            activeWorktreeMergeSummaries: activeWorktreeMergeSummaries,
+            originWorkflowID: originWorkflowID,
+            originWorkflowDisplayName: originWorkflowDisplayName,
+            lastRunStartedAt: lastRunStartedAt
         )
     }
 
@@ -397,6 +415,9 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             && agentReasoningEffortRaw == other.agentReasoningEffortRaw
             && acpModelParameterSelections == other.acpModelParameterSelections
             && lastRunStateRaw == other.lastRunStateRaw
+            && originWorkflowID == other.originWorkflowID
+            && originWorkflowDisplayName == other.originWorkflowDisplayName
+            && lastRunStartedAt == other.lastRunStartedAt
             && autoEditEnabled == other.autoEditEnabled
             && autoWakeOnOversightUpdates == other.autoWakeOnOversightUpdates
             && agentSessionLinkAutoWakeTargetSessionIDs == other.agentSessionLinkAutoWakeTargetSessionIDs
@@ -476,6 +497,9 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             coveredTurnDurationSeconds: durationPrimitives.coveredSeconds,
             interActiveIntervalGapSeconds: durationPrimitives.gapSeconds,
             toolCallCount: computedToolCallCount,
+            originWorkflowID: session.originWorkflowID,
+            originWorkflowDisplayName: session.originWorkflowDisplayName,
+            lastRunStartedAt: session.lastRunStartedAt,
             transcriptTurnCount: turns.count
         )
     }

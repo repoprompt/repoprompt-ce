@@ -29,6 +29,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
             RunLoop.main.perform(inModes: [.common, .modalPanel]) { NSApp.terminate(nil) }
         }
     )
+    private var remoteGatewayController: RemoteGatewayController?
     private let dockMenuController = DockMenuController()
     /// The app delegate retains signal routing so its Dispatch sources remain active for the
     /// entire application lifetime.
@@ -203,6 +204,9 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         // Start the runtime and publish both application-scoped MCP services before
         // any connection can report a complete catalog. Readiness is observation-only.
         startGlobalMCPServiceRegistration()
+        let remoteGateway = WindowStatesManager.shared.remoteGatewayController
+        remoteGateway.configure(windowStatesManager: WindowStatesManager.shared)
+        remoteGatewayController = remoteGateway
         if !launchConfiguration.suppressesNonessentialLaunchSideEffects {
             // Request notification authorization
             Task {
@@ -285,6 +289,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         // window, and an unfrozen bridge would treat that cascade as ordinary lifecycle and delete
         // exactly the saved oversight the next launch is supposed to restore.
         AgentSessionLinkRuntimeBridge.shared.freezeForTermination()
+        remoteGatewayController?.stop()
     }
 
     private func prepareForTermination() async {
@@ -332,6 +337,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         // Idempotent and synchronous only. Correctness comes from the write-through store and the
         // bounded `.terminateLater` settlement above, never from work attempted here.
         AgentSessionLinkRuntimeBridge.shared.freezeForTermination()
+        remoteGatewayController?.stop()
         if !AppLaunchConfiguration.current.suppressesWindowPersistence {
             WindowStatesManager.shared.persistWindowSession(reason: "appWillTerminate")
         }

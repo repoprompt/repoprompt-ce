@@ -5,6 +5,31 @@ import RepoPromptInstrumentation
 import XCTest
 
 final class CodexNativeSessionControllerInterruptTests: XCTestCase {
+    func testNativeDeveloperNoteMatchesApprovedBytes() throws {
+        let fixture = try XCTUnwrap(Bundle.module.url(forResource: "CodexNativeDeveloperNote", withExtension: "txt"))
+        XCTAssertEqual(Data(AgentModePrompts.codexNativeDeveloperNote().utf8), try Data(contentsOf: fixture))
+    }
+
+    func testThreadBindingsKeepBaseAndDeveloperInstructionsSeparate() async throws {
+        let note = AgentModePrompts.codexNativeDeveloperNote()
+        for useNote in [false, true] {
+            let controller = CodexNativeSessionController(
+                client: CodexAppServerClient(), runID: UUID(), tabID: UUID(), windowID: 1,
+                workspacePaths: .uniform(NSTemporaryDirectory()), options: .agentModeDefault(),
+                requestExecutor: { method, params, _ in
+                    XCTAssertEqual(params?["developerInstructions"] as? String, useNote ? note : nil)
+                    XCTAssertEqual(params?["baseInstructions"] as? String, method == "thread/start" && !useNote ? "legacy" : nil)
+                    return ["thread": ["id": "thread"]]
+                }
+            )
+            _ = try await controller.test_startThreadBinding(baseInstructions: "legacy", developerInstructions: useNote ? note : nil)
+            _ = try await controller.test_resumeThreadBinding(
+                existing: .init(conversationID: "thread", rolloutPath: nil, model: nil, reasoningEffort: nil),
+                developerInstructions: useNote ? note : nil
+            )
+        }
+    }
+
     func testActiveTurnMismatchParserMatrix() {
         let rows: [(description: String, expectedTurnID: String?)] = [
             ("turn/interrupt failed: expected active turn id `turn-old` but found `turn-new`", "turn-new"),

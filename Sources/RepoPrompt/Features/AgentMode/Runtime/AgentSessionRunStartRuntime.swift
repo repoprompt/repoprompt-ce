@@ -40,6 +40,7 @@ final class AgentSessionRunStartRuntime {
         attachments: [AgentFileAttachment] = [],
         taggedFileAttachments: [AgentTaggedFileAttachment] = [],
         codexFallbackContext: AgentTabSession.CodexFallbackSubmissionContext? = nil,
+        appliedWorkflow: AgentWorkflowDefinition? = nil,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
         directStartOptions: AgentDirectRunStartOptions = .default,
         startOutcome: AgentRunStartOutcomeRecorder? = nil,
@@ -409,7 +410,10 @@ final class AgentSessionRunStartRuntime {
         AgentSessionProviderInputRuntime.recordTaggedFileFailures(taggedFileFailures, session: session, scope: owner)
         candidateTransferred = true
         claudeEventsTransferred = true
-        return await environment.composition().startRun(
+        let wasActiveBeforeStart = session.runState.isActive
+        let startedAt = Date()
+        let outcomeRecorder = startOutcome ?? AgentRunStartOutcomeRecorder()
+        let outcome = await environment.composition().startRun(
             tabID: tabID,
             session: session,
             origin: command,
@@ -421,12 +425,22 @@ final class AgentSessionRunStartRuntime {
             autoEffortSelection: autoEffortSelection,
             providerControlCommand: directStartOptions.providerControlCommand,
             selfCompactDispatchID: directStartOptions.selfCompactDispatchID,
-            startOutcome: startOutcome,
+            startOutcome: outcomeRecorder,
             stopFence: stopFence,
             localComposerCandidate: directStartOptions.localComposerCandidate,
             initialUserItemID: directStartOptions.initialUserItemID,
             preparedClaudeEvents: preparedClaudeEvents
         )
+        if writer.isCurrent, session.recordRunMetadataIfAccepted(
+            wasActiveBeforeStart: wasActiveBeforeStart,
+            dispatchAccepted: outcomeRecorder.outcome.didStart,
+            workflow: appliedWorkflow,
+            startedAt: startedAt
+        ) {
+            owner.presentation.bindingChanged(session)
+            owner.persistence.scheduleSave(for: session)
+        }
+        return outcome
     }
 
     /// Accepted steering has a runtime-owned producer even when its presentation detaches.

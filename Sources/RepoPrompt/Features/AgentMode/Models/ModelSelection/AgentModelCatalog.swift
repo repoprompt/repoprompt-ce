@@ -1862,13 +1862,15 @@ enum AgentModelCatalog {
 
     // MARK: - Discovery Internals
 
-    private static func discoveryAgent(
+    static func discoveryAgent(
         _ agent: AgentProviderKind,
-        availability: AvailabilityContext
+        availability: AvailabilityContext,
+        modelOptions: [AgentModelOption]? = nil,
+        preferredModelRaw: String? = nil
     ) -> DiscoveryAgent {
         let available = isAgentAvailable(agent, availability: availability)
-        let agentOptions = options(for: agent, availability: availability)
-        let defaultRaw = available ? defaultModelRaw(for: agent, availability: availability) : nil
+        let agentOptions = modelOptions ?? options(for: agent, availability: availability)
+        let defaultRaw = available ? preferredModelRaw ?? defaultModelRaw(for: agent, availability: availability) : nil
 
         let models: [DiscoveryModel] = if agent == .codexExec {
             codexDiscoveryModels(
@@ -1946,7 +1948,10 @@ enum AgentModelCatalog {
             }
             // Use the first option's metadata for family-level fields
             let representative = group.options.first
-            let allEfforts = group.options.compactMap { CodexModelSpecifier(raw: $0.rawValue).reasoningEffort }
+            let allEfforts = Set(group.options.flatMap { option in
+                option.supportedReasoningEfforts
+                    + [CodexModelSpecifier(raw: option.rawValue).reasoningEffort].compactMap(\.self)
+            })
             let defaultEffort = representative?.defaultReasoningEffort
                 ?? group.options.first(where: \.isProviderDefault)
                 .flatMap { CodexModelSpecifier(raw: $0.rawValue).reasoningEffort }
@@ -1968,7 +1973,7 @@ enum AgentModelCatalog {
                 available: true,
                 tags: allTags,
                 contextWindowTokens: nil,
-                supportedReasoningEfforts: allEfforts.isEmpty ? [] : CodexReasoningEffort.displayOrder.filter(allEfforts.contains),
+                supportedReasoningEfforts: CodexReasoningEffort.displayOrder.filter(allEfforts.contains),
                 defaultReasoningEffort: defaultEffort,
                 startTargets: targets
             ))

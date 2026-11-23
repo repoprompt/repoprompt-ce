@@ -212,9 +212,13 @@ final class AgentTabSession: ObservableObject {
     }
 
     var transcript: AgentTranscript = .empty {
-        didSet { localInputCanonicalCommitPending = true }
+        didSet {
+            localInputCanonicalCommitPending = true
+            remoteTranscriptMutationRevision &+= 1
+        }
     }
 
+    private(set) var remoteTranscriptMutationRevision: UInt64 = 0
     var baseTranscriptProjection: AgentTranscriptProjection = .empty
     var fullTranscriptProjection: AgentTranscriptProjection = .empty
     var workingTranscriptProjection: AgentTranscriptProjection = .empty
@@ -365,6 +369,39 @@ final class AgentTabSession: ObservableObject {
     }
 
     var activeAgentRunStartedAt: Date?
+    /// Durable identity of the workflow applied to the first accepted run.
+    var originWorkflowID: String?
+    var originWorkflowDisplayName: String?
+    /// Durable start time of the most recently accepted run. Do not derive
+    /// this from `activeAgentRunStartedAt`, which is cleared at run end.
+    var lastRunStartedAt: Date?
+
+    @discardableResult
+    func recordRunMetadataIfAccepted(
+        wasActiveBeforeStart: Bool,
+        dispatchAccepted: Bool,
+        workflow: AgentWorkflowDefinition?,
+        startedAt: Date
+    ) -> Bool {
+        guard !wasActiveBeforeStart, dispatchAccepted else { return false }
+        return recordAcceptedRunMetadata(workflow: workflow, startedAt: startedAt)
+    }
+
+    @discardableResult
+    func recordAcceptedRunMetadata(
+        workflow: AgentWorkflowDefinition?,
+        startedAt: Date = Date()
+    ) -> Bool {
+        let previous = (originWorkflowID, originWorkflowDisplayName, lastRunStartedAt)
+        if lastRunStartedAt == nil, let workflow {
+            originWorkflowID = workflow.id
+            originWorkflowDisplayName = workflow.displayName
+        }
+        lastRunStartedAt = startedAt
+        return previous.0 != originWorkflowID
+            || previous.1 != originWorkflowDisplayName
+            || previous.2 != lastRunStartedAt
+    }
 
     /// Last Auto Effort service choice submitted for this tab, plus a transient in-flight indication.
     /// Neither changes the user's manual model/effort selection or persisted session state.
