@@ -6281,23 +6281,41 @@ import XCTest
                     await manager.awaitInitialized()
                     await manager.awaitInitialWorkspaceActivationCompletion()
                     try await f.awaitCaughtUpWithCatalogBaseline(window)
+                    let workspace = try XCTUnwrap(manager.workspace(withID: Fixture.aardvarkID))
+                    let vm = window.agentModeViewModel
                     if inactiveLiveSession {
-                        XCTAssertNotEqual(manager.activeWorkspaceID, Fixture.aardvarkID)
-                        let session = AgentTabSession(tabID: target.id)
-                        window.agentModeViewModel.test_installLiveSession(session)
-                        _ = try XCTUnwrap(window.agentModeViewModel.test_installPersistentSessionBinding(
-                            sessionID: sessionID, on: session
-                        ))
+                        let payload = AgentSession(
+                            id: sessionID, workspaceID: workspace.id, composeTabID: target.id, name: target.name,
+                            autoWakeOnOversightUpdates: false
+                        )
+                        _ = try await AgentSessionDataService.shared.saveAgentSession(payload, for: workspace)
+                    }
+                    let opened = await manager.requestWorkspaceSwitch(to: workspace, silent: true)
+                    XCTAssertTrue(opened.didSwitch)
+                    let adopted = await vm.awaitWorkspaceRuntimeAdoption(expectedWorkspaceID: workspace.id)
+                    let host = try XCTUnwrap(adopted ? vm.runtimeHost : nil)
+                    f.ownAgentHostForCleanup(host)
+                    if inactiveLiveSession {
+                        let session = await vm.ensureSessionReady(tabID: target.id, reconnectActiveProviders: false, expectedWorkspaceID: workspace.id)
+                        XCTAssertEqual(session.activeAgentSessionID, sessionID)
+                        XCTAssertTrue(session.permitsBoundOperationAndSave)
                         XCTAssertFalse(session.runState.isActive, "An idle live owner still needs protection during workspace teardown")
-                        XCTAssertTrue(try window.agentModeViewModel.authoritativeLiveSession(for: sessionID) === session)
+                        let other = try XCTUnwrap(manager.workspace(withID: Fixture.requestedID))
+                        let switched = await manager.requestWorkspaceSwitch(to: other, saveState: false, silent: true)
+                        XCTAssertTrue(switched.didSwitch)
+                        let otherReady = await vm.awaitWorkspaceRuntimeAdoption(expectedWorkspaceID: other.id)
+                        XCTAssertTrue(otherReady)
+                        XCTAssertNotEqual(manager.activeWorkspaceID, Fixture.aardvarkID)
+                        XCTAssertFalse(host === vm.runtimeHost)
+                        XCTAssertTrue(host.scope.sessions[target.id] === session)
+                        XCTAssertFalse(host.scope.presentation.hasPresenter(for: session))
                     } else {
-                        manager.activeWorkspace = manager.workspace(withID: Fixture.aardvarkID)
                         XCTAssertNotEqual(
                             manager.activeWorkspace?.activeComposeTabID,
                             target.id,
                             "Every cold pin in the owned workspace is protected, not only the selected tab"
                         )
-                        XCTAssertNil(try window.agentModeViewModel.authoritativeLiveSession(for: sessionID))
+                        XCTAssertNil(try vm.authoritativeLiveSession(for: sessionID))
                     }
                     let originalVersion = manager.debugStateVersionForWorkspace(Fixture.aardvarkID)
                     let before = await f.runtime.workspaceStore.snapshot()
@@ -7449,6 +7467,15 @@ import XCTest
             let gate = Gate()
             gates.append(gate)
             return gate
+        }
+
+        func ownAgentHostForCleanup(_ host: AgentSessionRuntimeHost) {
+            ownedJoins.append {
+                guard !host.scope.hasReleasedWriterClaims else { return }
+                let drain = host.beginAuthorizedRetirement()
+                let result = await drain.wait(until: .now.advanced(by: .seconds(5)))
+                XCTAssertEqual(result, .released)
+            }
         }
 
         func startOwned<Value>(_ operation: @escaping @MainActor () async -> Value) -> Task<Value, Never> {

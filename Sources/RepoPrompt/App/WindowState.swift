@@ -2350,6 +2350,7 @@ class WindowState: ObservableObject {
                 sessionID: target,
                 workspace: activeWorkspace,
                 workspaceLink: workspaceLink,
+                restoringStashedCarrier: tabIsStashed && !tabIsActive,
                 visitIntent: visitIntent,
                 resumePreparedVisit: resume
             )

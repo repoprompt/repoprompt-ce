@@ -40,7 +40,7 @@ extension AgentModeViewModel {
         return MCPResidentTarget(
             session: session,
             endpoint: endpoint,
-            window: WindowStatesManager.shared.window(withID: endpoint.windowID)
+            window: WindowStatesManager.shared.window(withID: windowID)
         )
     }
 
@@ -54,11 +54,13 @@ extension AgentModeViewModel {
     private func mcpActivationTargetIsCurrent(
         _ target: MCPResidentTarget, ownership: MCPActivationOwnership = .resident
     ) -> Bool {
+        // The execution endpoint names the retained host route. Resident entry points also
+        // require their own physical presentation witness; neither ID can substitute for the other.
         guard !WindowStatesManager.shared.isTerminating,
-              target.endpoint.windowID == windowID,
+              target.endpoint.windowID == runtimeHost.routeID,
               let current = try? authoritativeLiveSession(for: target.endpoint.sessionID)
         else { return false }
-        let registered = WindowStatesManager.shared.window(withID: target.endpoint.windowID)
+        let registered = WindowStatesManager.shared.window(withID: windowID)
         if let admittedWindow = target.window {
             guard registered === admittedWindow, !admittedWindow.isClosing,
                   admittedWindow.agentModeViewModel === self else { return false }

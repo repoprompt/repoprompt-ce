@@ -3949,10 +3949,26 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return workspaces.flatMap { workspace in
             workspace.composeTabs.compactMap { tab in
                 let sessionID = tab.activeAgentSessionID
-                let liveSession = sessionID.flatMap { expectedSessionID in
-                    sessions[tab.id]?.activeAgentSessionID == expectedSessionID
-                        ? sessions[tab.id]
-                        : nil
+                if let sessionID, workspaceManager?.hasActiveProvisionalAgentSession(workspaceID: workspace.id, sessionID: sessionID) == true {
+                    // A projection observed during first-save cannot repair an unpublished row
+                    // after the initiating admission rolls it back.
+                    return nil
+                }
+                let liveSession: AgentTabSession? = sessionID.flatMap { expectedSessionID in
+                    if runtimeHost.workspaceActivation == nil, let local = sessions[tab.id],
+                       local.activeAgentSessionID == expectedSessionID, !local.qualifiedRestorationReadiness.isCreating
+                    {
+                        return local
+                    }
+                    guard !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: expectedSessionID),
+                          !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: expectedSessionID),
+                          case let .unique(writer) = runtimeSessionStore.resolveWriter(sessionID: expectedSessionID, expectedWorkspaceID: workspace.id),
+                          writer.session.tabID == tab.id, !writer.scope.isRetiring,
+                          !writer.session.qualifiedRestorationReadiness.isCreating,
+                          let activation = writer.scope.executableHost?.workspaceActivation,
+                          activation.isCurrent, activation.savedCarrierSessionID == nil
+                    else { return nil }
+                    return writer.session
                 }
                 let isLive = liveSession != nil
                 // Every window mirrors the catalog, but a cold pin in an inactive workspace
@@ -7335,6 +7351,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         sessionID: UUID?,
         workspace: WorkspaceModel,
         workspaceLink: Bool = false,
+        restoringStashedCarrier: Bool = false,
         visitIntent: UUID? = nil,
         resumePreparedVisit: (@MainActor (UUID) async -> Void)? = nil
     ) async -> AgentRouteSessionActivationResult {
@@ -7397,11 +7414,37 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         let routeOwner = sessionIndexStore.latestSessionIndexOwner
         let routeHost = runtimeHost
-        func routeActivationIsCurrent() -> Bool {
+        func routeActivationIsCurrent(requiresActiveCarrier: Bool = true) -> Bool {
             !Task.isCancelled && !isAwaitingWorkspaceAdoption && !hasPreparedForWindowClose && !hasDetachedClosingPresentation
-                && workspaceManager?.activeWorkspaceID == workspace.id && sessionIndexStore.latestSessionIndexOwner == routeOwner
-                && runtimeHost === routeHost
-                && (canonicalWorkspaceHostPreparation == nil || workspaceManager?.activeWorkspace?.composeTabs.contains { $0.id == tabID } == true)
+                && workspaceManager?.activeWorkspaceID == workspace.id && workspaceManager?.isSwitchingWorkspace == false
+                && sessionIndexStore.latestSessionIndexOwner == routeOwner && runtimeHost === routeHost
+                && (
+                    !requiresActiveCarrier || canonicalWorkspaceHostPreparation == nil
+                        || workspaceManager?.activeWorkspace?.composeTabs.contains { $0.id == tabID } == true
+                )
+        }
+        if restoringStashedCarrier, canonicalWorkspaceHostPreparation != nil, let sessionID {
+            /// The router restores this carrier only after the old writer settles. This first
+            /// check reads the durable binding but does not install a session in the active host.
+            func stashedCarrierIsCurrent() -> Bool {
+                guard routeActivationIsCurrent(requiresActiveCarrier: false), visitIsCurrent(),
+                      owners?.hasPreparedRuntime(sessionID) != true,
+                      !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: sessionID),
+                      !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: sessionID),
+                      let current = workspaceManager?.activeWorkspace, current.customStoragePath == workspace.customStoragePath,
+                      !current.composeTabs.contains(where: { $0.id == tabID }),
+                      current.stashedTabs.filter({ $0.tab.id == tabID }).map(\.tab.activeAgentSessionID) == [sessionID],
+                      case .unavailable(.absent) = routeHost.scope.resolveWriter(sessionID: sessionID, expectedWorkspaceID: workspace.id)
+                else { return false }
+                return true
+            }
+            guard stashedCarrierIsCurrent() else { return .blockedByActiveDifferentSession }
+            guard let saved = try? await dataService.loadAgentSession(id: sessionID, for: workspace),
+                  saved.id == sessionID else { return .sessionNotFound }
+            guard stashedCarrierIsCurrent() else { return .blockedByActiveDifferentSession }
+            if let storedWorkspaceID = saved.workspaceID, storedWorkspaceID != workspace.id { return .sessionWorkspaceMismatch }
+            if let storedTabID = saved.composeTabID, storedTabID != tabID { return .sessionTabMismatch }
+            return .ready
         }
         guard routeActivationIsCurrent() else { return .blockedByActiveDifferentSession }
         guard let sessionID else {
