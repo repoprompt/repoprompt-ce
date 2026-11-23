@@ -7825,6 +7825,26 @@ final class SessionAdminDeferredOutcomeTests: XCTestCase {
 
 @MainActor
 final class SessionAdminInventoryReadTests: XCTestCase {
+    func testLoadedInventoryWorkspaceUsesItsOwnRuntimeStorage() async throws {
+        try await WorkspaceAuthorityRootTestFixture.withFixture { foreign in
+            let id = UUID()
+            let fixture = try await LoadedWindowFixture.make(activeID: id, parentID: nil)
+            do {
+                let workspace = try XCTUnwrap(fixture.carriers)
+                let persisted = try await fixture.persistActiveCarriers()
+                let root = fixture.runtime.configuration.workspaceStorageDirectory.resolvingSymlinksInPath()
+                let foreignRoot = foreign.storage.resolvingSymlinksInPath()
+                XCTAssertEqual(persisted.resolvingSymlinksInPath().deletingLastPathComponent().deletingLastPathComponent(), root)
+                XCTAssertNotEqual(root, foreignRoot)
+                XCTAssertEqual(workspace.composeTabs.map(\.activeAgentSessionID), [id])
+            } catch {
+                await fixture.cleanup()
+                throw error
+            }
+            await fixture.cleanup()
+        }
+    }
+
     private final class Flag {
         var value: Bool
         init(_ value: Bool) {
@@ -8715,10 +8735,23 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 await window.workspaceManager.awaitInitialized()
                 let active = ComposeTabState(name: "Loaded", activeAgentSessionID: activeID)
                 let stashed = stashedID.map { ComposeTabState(name: "Stashed", activeAgentSessionID: $0) }
-                // Use a durably published fixture so both windows can resolve its canonical
-                // workspace after activation; no caller-local replacement is treated as truth.
-                let creation = try window.workspaceManager.createPersistentWorkspace(name: "Inventory loaded \(activeID)", repoPaths: [])
-                var workspace = try await creation.publishedWorkspace()
+                // Publish the blank workspace through this fixture's own runtime. The
+                // presentation creation API derives a new path from process-wide preferences,
+                // which may still describe another test fixture's workspace storage.
+                var blank = WorkspaceModel(name: "Inventory loaded \(activeID)", repoPaths: [], isSavedWorkspace: true)
+                let root = runtime.configuration.workspaceStorageDirectory
+                let manager = window.workspaceManager
+                let file = manager.workspaceFileURL(for: blank, baseRoot: root)
+                blank.customStoragePath = file.deletingLastPathComponent()
+                let authority = DomainWorkspaceAuthorityClient(
+                    store: runtime.workspaceStore, windowID: window.windowID, metadataPathPolicy: runtime.configuration.metadataPathPolicy
+                )
+                let published = try await authority.create(blank, fileURL: file)
+                _ = try XCTUnwrap(published.disposition == .applied ? published : nil, "Fixture creation failed: \(published.diagnostic ?? "")")
+                let projection = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
+                let refreshed = await projection.refreshForAgentAdmission()
+                XCTAssertTrue(refreshed)
+                var workspace = try XCTUnwrap(manager.workspace(withID: blank.id))
                 workspace.composeTabs = [active]
                 workspace.stashedTabs = stashed.map { [StashedTab(tab: $0)] } ?? []
                 workspace.activeComposeTabID = active.id
