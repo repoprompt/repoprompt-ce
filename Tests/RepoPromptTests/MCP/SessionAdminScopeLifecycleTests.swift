@@ -8684,7 +8684,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
         static func make(
             activeID: UUID, parentID: UUID?, stashedID: UUID? = nil,
             agentFactory: WindowStateCompositionFactory.AgentModeViewModelFactory? = nil,
-            processRuntime: MCPDomainRuntime? = nil
+            processRuntime: MCPDomainRuntime? = nil, commitCarriersBeforeActivation: Bool = false
         ) async throws -> LoadedWindowFixture {
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent("inventory-loaded-\(UUID())")
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -8722,8 +8722,37 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 workspace.composeTabs = [active]
                 workspace.stashedTabs = stashed.map { [StashedTab(tab: $0)] } ?? []
                 workspace.activeComposeTabID = active.id
+                if commitCarriersBeforeActivation {
+                    fixture.carriers = workspace
+                    let authority = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: window.windowID)
+                    let saved = try await authority.save(
+                        workspace, fileURL: window.workspaceManager.workspaceFileURL(for: workspace),
+                        expectedWorkspaceRevision: nil, expectedContentDigest: nil
+                    )
+                    guard saved.disposition == .applied else { throw DomainWorkspaceAuthorityOperationError(outcome: saved) }
+                    _ = try await AgentSessionDataService.shared.saveAgentSession(
+                        AgentSession(
+                            id: activeID, workspaceID: workspace.id, composeTabID: active.id, name: "Targeted child",
+                            agentKind: AgentProviderKind.claudeCode.rawValue, agentModel: "", parentSessionID: parentID,
+                            isMCPOriginated: parentID != nil
+                        ), for: workspace
+                    )
+                    let projection = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
+                    let refreshed = await projection.refreshForAgentAdmission()
+                    XCTAssertTrue(refreshed)
+                }
                 let switched = await window.workspaceManager.reactivateWorkspaceAfterReplacement(workspace, reason: "inventoryLoadedTreeTest")
                 XCTAssertEqual(switched, .switched)
+                if commitCarriersBeforeActivation {
+                    let vm = window.agentModeViewModel
+                    let adopted = await vm.awaitWorkspaceRuntimeAdoption(expectedWorkspaceID: workspace.id)
+                    XCTAssertTrue(adopted)
+                    let session = await vm.ensureSessionReady(tabID: active.id, expectedWorkspaceID: workspace.id)
+                    XCTAssertTrue(session.permitsBoundOperationAndSave)
+                    XCTAssertEqual(session.activeAgentSessionID, activeID)
+                    XCTAssertEqual(session.parentSessionID, parentID)
+                    return fixture
+                }
                 // Activation reloads the manager's canonical projection; it does not publish
                 // arbitrary fields from the caller's local workspace value. Install carriers
                 // after activation has settled, rather than assuming that value was accepted.
@@ -8971,13 +9000,15 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             let parent = ownChild ? caller : UUID()
             var fullAccess = global
             let appRuntime = AppDomainRuntimeComposition.shared.runtime
-            let observerFixture = try await LoadedWindowFixture.make(activeID: caller, parentID: nil, processRuntime: appRuntime)
-            let targetFixture = try await LoadedWindowFixture.make(activeID: target, parentID: parent, processRuntime: appRuntime)
-            addTeardownBlock { @MainActor in await targetFixture.cleanup()
-                await observerFixture.cleanup()
-            }
-            try observerFixture.installCarriers()
-            try targetFixture.installCarriers()
+            let observerFixture = try await LoadedWindowFixture.make(
+                activeID: caller, parentID: nil, processRuntime: appRuntime, commitCarriersBeforeActivation: true
+            )
+            addTeardownBlock { @MainActor in await observerFixture.cleanup() }
+            let targetFixture = try await LoadedWindowFixture.make(
+                activeID: target, parentID: parent, processRuntime: appRuntime, commitCarriersBeforeActivation: true
+            )
+            addTeardownBlock { @MainActor in await targetFixture.cleanup() }
+            WindowStatesManager.shared.attachAgentSessionLinkBridge()
             let bridge = AgentSessionLinkRuntimeBridge.shared
             let previousGlobal = bridge.delegationScopes.isGlobalAutoApproveEnabled
             bridge.delegationScopes.isGlobalAutoApproveEnabled = { fullAccess }
@@ -8990,19 +9021,6 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                     bridge.delegationScopes.revoke(scopeID: scope.id)
                 }
                 bridge.delegationScopes.isGlobalAutoApproveEnabled = previousGlobal
-            }
-            for (fixture, id, parent) in [(observerFixture, caller, UUID?.none), (targetFixture, target, Optional(parent))] {
-                _ = try await fixture.persistActiveCarriers()
-                let vm = fixture.window.agentModeViewModel
-                let tab = try XCTUnwrap(fixture.carriers?.composeTabs.first)
-                let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
-                let payload = AgentSession(id: id, workspaceID: workspace.id, composeTabID: tab.id, name: "Targeted child", agentKind: "claudeCode", agentModel: "", parentSessionID: parent, isMCPOriginated: parent != nil)
-                _ = try await AgentSessionDataService.shared.saveAgentSession(payload, for: workspace)
-                let session = vm.session(for: tab.id)
-                _ = try XCTUnwrap(vm.test_installPersistentSessionBinding(sessionID: id, on: session, updateWorkspaceMetadata: true))
-                session.parentSessionID = parent
-                session.hasLoadedPersistedState = true
-                session.recordRestorationAuthoritative(.persistedPayloadApplied)
             }
             for (fixture, id, parent) in [(observerFixture, caller, UUID?.none), (targetFixture, target, Optional(parent))] {
                 let vm = fixture.window.agentModeViewModel
