@@ -290,13 +290,12 @@ import XCTest
                     // waits at the gate. No file deletion is invoked.
                     let token = try registry.beginDurableDeletion(sessionID: endpoint.sessionID)
                     defer { registry.didFailDurableDeletion(token) }
-                    _ = try await provider.listTools()
-                    let beforeCommitProjection = await manager.debugRunCatalogProjection(for: runID)
-                    let beforeCommit = try XCTUnwrap(beforeCommitProjection)
-                    let beforeCommitRoute = try XCTUnwrap(beforeCommit.routeToken)
-                    let supportBeforeCommit = await manager.hasCurrentReturnedTool(AgentSessionLinkExecutionRuntime.selfNoopCatalogDefinition, routeToken: beforeCommitRoute, projectionRevision: beforeCommit.projectionRevision)
-                    XCTAssertTrue(supportBeforeCommit)
-                    XCTAssertTrue(vm.linkExecutionRuntime.selfNoopHintIsCurrent(for: observer))
+                    let during = try await provider.listTools()
+                    XCTAssertFalse(during.contains(MCPWindowToolName.selfNoop), "The canonical writer is already suspended during deletion")
+                    let supportBeforeCommit = await manager.hasCurrentReturnedTool(AgentSessionLinkExecutionRuntime.selfNoopCatalogDefinition, routeToken: route, projectionRevision: prior.projectionRevision)
+                    XCTAssertFalse(supportBeforeCommit)
+                    XCTAssertFalse(vm.linkExecutionRuntime.selfNoopHintIsCurrent(for: observer))
+                    let deletionInProgressRevision = ServerNetworkManager.catalogAdvertisementRevision
                     let deletion = Task { @MainActor in await registry.didCommitDurableDeletion(token) }
                     guard await gate.waitUntilEntered() else {
                         gate.release()
@@ -307,7 +306,7 @@ import XCTest
                         XCTAssertTrue(registry.isPermanentlyDeleted(sessionID: endpoint.sessionID))
                         XCTAssertNil(vm.agentSessionLinkBootstrapState(for: endpoint))
                         let currentInputs = await manager.debugCurrentRunCatalogOfferInputs(for: runID)
-                        let retained = await manager.hasCurrentReturnedTool(AgentSessionLinkExecutionRuntime.selfNoopCatalogDefinition, routeToken: beforeCommitRoute, projectionRevision: beforeCommit.projectionRevision)
+                        let retained = await manager.hasCurrentReturnedTool(AgentSessionLinkExecutionRuntime.selfNoopCatalogDefinition, routeToken: route, projectionRevision: prior.projectionRevision)
                         // Sample the independent physical fence before a fresh list can replace
                         // the observation. Acquisition admits ordinary owed work, not quiet permission.
                         let reserved = try XCTUnwrap(vm.agentSessionLinkPromptClaimStore.pendingClaim(dispatchID: dispatchID, observerSessionID: endpoint.sessionID))
@@ -315,16 +314,21 @@ import XCTest
                         let hintCurrent = vm.linkExecutionRuntime.selfNoopHintIsCurrent(for: observer)
                         let acquired = vm.linkExecutionRuntime.agentSessionLinkAcquirePhysicalDispatch(for: observer, dispatchID: dispatchID)
                         vm.linkExecutionRuntime.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: observer, dispatchID: dispatchID)
-                        print("DELETION_RETAINED_OFFER inputsUnchanged=\(currentInputs == beforeCommit.offerInputs) serverProof=\(retained) mirrorHint=\(hintCurrent) physicalAcquisition=\(acquired)")
-                        XCTAssertFalse(retained, "A committed deletion changes advertisement eligibility before asynchronous authority cleanup")
-                        XCTAssertNotEqual(currentInputs, beforeCommit.offerInputs)
+                        XCTAssertNotEqual(ServerNetworkManager.catalogAdvertisementRevision, deletionInProgressRevision, "Commit must publish its own eligibility change before asynchronous cleanup")
+                        XCTAssertFalse(retained, "A committed deletion cannot resurrect the earlier offer")
+                        XCTAssertNotEqual(currentInputs, prior.offerInputs)
                         XCTAssertFalse(hintCurrent)
                         XCTAssertTrue(acquired, "Ordinary acquisition remains independent of quiet eligibility")
                         XCTAssertTrue(frames.userMessages.isEmpty)
                         XCTAssertTrue(codex.startedTurns.isEmpty)
                         let names = try await provider.listTools()
                         XCTAssertFalse(names.contains(MCPWindowToolName.becomeOverseer), "A fresh actual list must reflect the committed tombstone")
-                        XCTAssertTrue(names.contains(MCPWindowToolName.selfNoop), "Cleanup has not yet revoked the outbound link")
+                        XCTAssertFalse(names.contains(MCPWindowToolName.selfNoop), "An existing outbound link does not bypass the suspended writer")
+                        let linksAwaitingCleanup = await AppDomainRuntimeComposition.shared.runtime.agentSessionLinkAuthority.links(forObserver: endpoint.sessionID)
+                        XCTAssertTrue(
+                            linksAwaitingCleanup.items.contains { $0.linkID == link.linkID && $0.generation == link.generation },
+                            "Absence from the catalog must precede cleanup of the original outbound link"
+                        )
                         XCTAssertNotEqual(Set(names), try Set(XCTUnwrap(prior.returnedCatalog).keys))
                     } catch {
                         gate.release()
@@ -351,18 +355,14 @@ import XCTest
                     let oldSupport = await manager.hasCurrentReturnedTool(AgentSessionLinkExecutionRuntime.selfNoopCatalogDefinition, routeToken: route, projectionRevision: prior.projectionRevision)
                     XCTAssertFalse(oldSupport, "Beginning deletion changes bootstrap eligibility before cleanup")
                     XCTAssertFalse(vm.linkExecutionRuntime.selfNoopHintIsCurrent(for: observer))
-                    _ = try await provider.listTools()
-                    let duringProjection = await manager.debugRunCatalogProjection(for: runID)
-                    let during = try XCTUnwrap(duringProjection)
-                    let duringRoute = try XCTUnwrap(during.routeToken)
-                    let currentSupport = await manager.hasCurrentReturnedTool(AgentSessionLinkExecutionRuntime.selfNoopCatalogDefinition, routeToken: duringRoute, projectionRevision: during.projectionRevision)
-                    XCTAssertTrue(currentSupport)
+                    let suspended = try await provider.listTools()
+                    XCTAssertFalse(suspended.contains(MCPWindowToolName.selfNoop), "An actual list cannot renew an offer while the exact writer is suspended")
                     let inProgress = ServerNetworkManager.catalogAdvertisementRevision
                     registry.didFailDurableDeletion(token)
                     XCTAssertNil(registry.state(forSessionID: endpoint.sessionID))
                     XCTAssertNotEqual(ServerNetworkManager.catalogAdvertisementRevision, inProgress)
-                    let afterFailure = await manager.hasCurrentReturnedTool(AgentSessionLinkExecutionRuntime.selfNoopCatalogDefinition, routeToken: duringRoute, projectionRevision: during.projectionRevision)
-                    XCTAssertFalse(afterFailure, "Failure restores eligibility but cannot resurrect an earlier offer")
+                    let afterFailure = await manager.hasCurrentReturnedTool(AgentSessionLinkExecutionRuntime.selfNoopCatalogDefinition, routeToken: route, projectionRevision: prior.projectionRevision)
+                    XCTAssertFalse(afterFailure, "Failure restores eligibility but cannot resurrect the pre-deletion offer")
                     XCTAssertFalse(vm.linkExecutionRuntime.selfNoopHintIsCurrent(for: observer))
                     _ = try await provider.listTools()
                     XCTAssertTrue(vm.linkExecutionRuntime.selfNoopHintIsCurrent(for: observer))
