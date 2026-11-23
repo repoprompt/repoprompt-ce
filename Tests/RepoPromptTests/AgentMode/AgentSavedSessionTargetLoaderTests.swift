@@ -227,8 +227,13 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
             controllerStartOperation: { await listener.start() }, controllerFullShutdownOperation: {}
         )
         addTeardownBlock { await transport.fullShutdown() }
+        let promptGate = try AgentSessionLinkACPResponseGate(directory: directory)
+        defer { promptGate.release() }
         let provider = AgentSessionLinkCapturingACPProvider(
-            providerID: .openCode, commandPath: script.path, environment: ["ACP_ASSISTANT_TEXT_ON_PROMPT": assistantText]
+            providerID: .openCode, commandPath: script.path, environment: [
+                "ACP_ASSISTANT_TEXT_ON_PROMPT": assistantText,
+                "ACP_HOLD_METHOD": "session/prompt", "ACP_RESPONSE_GATE": promptGate.path
+            ]
         )
         provider.usesDefaultNormalizer = true
         let keys = KeyManager()
@@ -341,6 +346,11 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                         connectionID: connectionID, runID: receipt.runID, purpose: .agentModeRun,
                         windowID: host.routeID, registration: receipt
                     )
+                    // Finish bootstrap at the real connection boundary. Keep the controlled
+                    // provider turn open explicitly, not by racing its routing deadline.
+                    let generation = try XCTUnwrap(receipt.routingWaitGeneration)
+                    await MCPRoutingWaiter.notifyRouted(runID: receipt.runID, generation: generation)
+                    try await promptGate.waitUntilEntered()
                     let read = try await invoke("read_file", ["path": .string(file.path)])
                     XCTAssertTrue(read.objectValue?["content"]?.stringValue?.contains("savedHostNeedle") == true, "\(read)")
                     let autoSelected = try await invoke("get_file_tree", ["mode": .string("selected")])
@@ -469,8 +479,7 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                     }
                     let models = try await invoke("agent_manage", ["op": .string("list_agents"), "roles_only": .bool(true)])
                     XCTAssertNotNil(models.objectValue)
-                    let generation = try XCTUnwrap(receipt.routingWaitGeneration)
-                    await MCPRoutingWaiter.notifyRouted(runID: receipt.runID, generation: generation)
+                    promptGate.release()
                     await writer.session.agentTask?.value
                     XCTAssertEqual(provider.promptedMessages.count, 1)
                     XCTAssertTrue(provider.promptedMessages.first?.userMessage.contains(message) == true)
