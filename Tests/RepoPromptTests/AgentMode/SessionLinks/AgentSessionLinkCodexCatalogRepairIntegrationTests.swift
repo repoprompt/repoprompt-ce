@@ -1582,17 +1582,17 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 XCTAssertTrue(after.contains(MCPWindowToolName.agentSessionLink))
                 XCTAssertTrue(after.contains(MCPWindowToolName.becomeOverseer), "Targeted bootstrap remains discoverable in the continuing flow")
                 if w3Ring {
-                    try await w3RegisteredRing(window: window, first: observer, second: target, firstConnection: connection, firstProvider: provider, provenReprompt: w3Reprompt)
+                    try await w3RegisteredRing(window: window, first: observer, second: target, firstConnection: connection, firstProvider: provider, firstPolicy: heldPolicy, provenReprompt: w3Reprompt)
                     await cleanup()
                     return
                 }
                 if let w2Probe {
                     switch w2Probe {
                     case let .repeatDisplay(tools):
-                        try await w2RegisteredTerminal(window: window, session: observer, connection: connection, runID: runID, delayed: false, nativeResult: true, closing: true, leading: false, cancel: false, w4BaselineTools: tools)
+                        try await w2RegisteredTerminal(window: window, session: observer, connection: connection, runID: runID, delayed: false, nativeResult: true, closing: true, leading: false, cancel: false, w4BaselineTools: tools, admittedPolicy: heldPolicy)
                         let turnID = try XCTUnwrap(observer.transcript.turns.last?.id)
                         XCTAssertTrue(observer.items.contains { $0.quietCheckInWakeID != nil }, "W1 must already hold a real terminal certificate")
-                        try await w2RegisteredTerminal(window: window, session: observer, connection: connection, runID: runID, delayed: true, nativeResult: true, closing: true, leading: false, cancel: false, w4Display: true, w4Repeat: true)
+                        try await w2RegisteredTerminal(window: window, session: observer, connection: connection, runID: runID, delayed: true, nativeResult: true, closing: true, leading: false, cancel: false, w4Display: true, w4Repeat: true, admittedPolicy: heldPolicy)
                         XCTAssertEqual(observer.transcript.turns.last?.id, turnID, "W2 continues the same canonical turn")
                     case .coldCatalogOverlap:
                         try await w3ColdCatalogOverlap(window: window, session: observer, target: target, connection: connection, provider: provider)
@@ -1603,7 +1603,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     case let .inactiveBaseline(stale):
                         try await w3InactiveBaseline(window: window, session: observer, connection: connection, provider: provider, stale: stale)
                     case let .reprompt(phase):
-                        try await w2RegisteredTerminal(window: window, session: observer, connection: connection, runID: runID, delayed: false, nativeResult: true, closing: false, leading: false, cancel: false, repromptPhase: phase)
+                        try await w2RegisteredTerminal(window: window, session: observer, connection: connection, runID: runID, delayed: false, nativeResult: true, closing: false, leading: false, cancel: false, repromptPhase: phase, admittedPolicy: heldPolicy)
                     case .undeclared:
                         // This control sends no MCP command. Settle its setup attempt before the
                         // terminal helper samples the one ordinary close it intends to measure.
@@ -1613,7 +1613,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                         }
                         try await w2RegisteredTerminal(window: window, session: observer, connection: connection, runID: runID, delayed: false, nativeResult: false, closing: false, leading: false, cancel: false, w3Undeclared: true)
                     case let .terminal(delayed, nativeResult, closing, leading, cancel, corrupt):
-                        try await w2RegisteredTerminal(window: window, session: observer, connection: connection, runID: runID, delayed: delayed, nativeResult: nativeResult, closing: closing, leading: leading, cancel: cancel, corrupt: corrupt, w4Display: w4Display)
+                        try await w2RegisteredTerminal(window: window, session: observer, connection: connection, runID: runID, delayed: delayed, nativeResult: nativeResult, closing: closing, leading: leading, cancel: cancel, corrupt: corrupt, w4Display: w4Display, admittedPolicy: heldPolicy)
                     case let .hint(withdraw, replaced, ordinaryCandidate):
                         try await w2CatalogProof(window: window, session: observer, provider: provider, endpoint: endpoint, route: route, runID: runID, withdraw: withdraw, replaced: replaced, ordinaryCandidate: ordinaryCandidate)
                     case .lateAttention:
@@ -1625,7 +1625,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     return
                 }
                 if let w0fProvider {
-                    try await w0fRepairControls(manager: manager, provider: provider, window: window, observer: observer, endpoint: endpoint, route: route, runID: runID, kind: w0fProvider, codex: codex, codexRecorder: codexRecorder)
+                    try await w0fRepairControls(manager: manager, provider: provider, window: window, observer: observer, endpoint: endpoint, route: route, runID: runID, kind: w0fProvider, codex: codex, codexRecorder: codexRecorder, admittedPolicy: heldPolicy)
                     await cleanup()
                     return
                 }
@@ -2153,7 +2153,8 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
         func w2RegisteredTerminal(
             window: WindowState, session: AgentTabSession, connection: PersistentMCPTestEndpoint,
             runID: UUID, delayed: Bool, nativeResult: Bool, closing: Bool, leading: Bool, cancel: Bool,
-            w3Owner: AgentRunOwnership? = nil, w3Undeclared: Bool = false, w3Reprompt: Bool = false, corrupt: Bool = false, repromptPhase: String? = nil, expectOrdinary: Bool = false, w3Provider: HeldDiscoveryProvider? = nil, scaleControl: Bool? = nil, scaleDiagnostic: Bool = false, unqualifiedOrigin: Bool = false, w4Display: Bool = false, w4Repeat: Bool = false, w4BaselineTools: Int = 0
+            w3Owner: AgentRunOwnership? = nil, w3Undeclared: Bool = false, w3Reprompt: Bool = false, corrupt: Bool = false, repromptPhase: String? = nil, expectOrdinary: Bool = false, w3Provider: HeldDiscoveryProvider? = nil, scaleControl: Bool? = nil, scaleDiagnostic: Bool = false, unqualifiedOrigin: Bool = false, w4Display: Bool = false, w4Repeat: Bool = false, w4BaselineTools: Int = 0,
+            admittedPolicy: MCPRunRoutingCleanupReceipt? = nil, fixtureInitialOwner: AgentRunOwnership? = nil
         ) async throws {
             let vm = window.agentModeViewModel
             let manager = ServerNetworkManager.shared
@@ -2168,6 +2169,14 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 phaseStart = now
             }
             vm.test_initializeRunService()
+            if admittedPolicy != nil, w3Owner == nil, fixtureInitialOwner == nil, let setupAttempt = session.activeRunOwnership {
+                // The catalog probe only establishes the socket. Do not let replacing that
+                // synthetic setup account for an extra ordinary terminal in this control.
+                guard session.endRunAttempt(ifCurrent: setupAttempt, source: "fixture catalog setup settled") else {
+                    XCTFail("Only the exact setup attempt may yield the terminal fixture")
+                    throw CancellationError()
+                }
+            }
             let openingFacts = try XCTUnwrap(session.quietLedger.facts)
             if w3Owner == nil, !w4Repeat {
                 session.appendItem(.user("routine fixture origin", sequenceIndex: session.nextSequenceIndex))
@@ -2206,7 +2215,10 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 XCTAssertEqual(snapshot.archivedBlocks, repeatBaseline.archivedBlocks, "Repeat W2 publication \(repeatPublications): archived blocks/summaries")
             } : nil
             defer { repeatSubscription?.cancel() }
-            let owner = w3Owner ?? session.beginRunAttempt(source: "W2.registered-native-terminal")
+            let owner = w3Owner ?? fixtureInitialOwner ?? session.beginRunAttempt(source: "W2.registered-native-terminal")
+            if let admittedPolicy {
+                try renewFixtureAttempt(owner, session: session, host: deliveryHost, connectionID: connection.connectionID, policy: admittedPolicy)
+            }
             let attemptStart = try XCTUnwrap(session.quietLedger.startKey(owner: owner))
             let openingTerminalRevision = session.lastTerminalCommitRevision
             let preparedRevision = session.sourceItemsRevision
@@ -2515,7 +2527,8 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     let revision = session.lastTerminalCommitRevision
                     await vm.cancelAgentRun(tabID: session.tabID, completion: .terminalPublished)
                     XCTAssertEqual(session.lastTerminalCommitRevision, revision, "Duplicate Stop must not create a second terminal revision")
-                    XCTAssertEqual(session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: 1))
+                    let expectedThrough = openingFacts.settledThrough + 1
+                    XCTAssertEqual(session.quietLedger.facts, .init(settledThrough: expectedThrough, ordinaryThrough: expectedThrough))
                 }
                 if closing {
                     XCTAssertTrue(session.items.contains { $0.text.contains("allowed closing output after accepted body") }, "Buffered output survives terminal/cancellation settlement")
@@ -3088,13 +3101,15 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
         func w3RegisteredRing(
             window: WindowState, first: AgentTabSession, second: AgentTabSession,
             firstConnection: PersistentMCPTestEndpoint, firstProvider: HeldDiscoveryProvider,
-            provenReprompt: Bool
+            firstPolicy: MCPRunRoutingCleanupReceipt?, provenReprompt: Bool
         ) async throws {
             let vm = window.agentModeViewModel
             vm.test_initializeRunService()
             let bridge = AgentSessionLinkRuntimeBridge.shared
             let authority = AppDomainRuntimeComposition.shared.runtime.agentSessionLinkAuthority
             let manager = ServerNetworkManager.shared
+            let origin = vm.runtimeHost
+            let routingOwner = origin.workspaceActivation == nil ? nil : origin.route
             let firstKind = first.selectedAgent
             second.selectedAgent = firstKind == .claudeCode ? .codexExec : .claudeCode
             let secondRun = UUID()
@@ -3102,6 +3117,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             let secondClient = second.selectedAgent == .claudeCode ? AgentProviderKind.claudeMCPClientID : AgentProviderKind.codexMCPClientID
             let secondProvider = HeldDiscoveryProvider()
             var secondConnection: PersistentMCPTestEndpoint?
+            var secondPolicy: MCPRunRoutingCleanupReceipt?
             var reverseGrant: DomainAgentSessionLinkReference?
             var frameGate: TestReleaseFence?
             var gatedRefresh: Task<Void, Never>?
@@ -3191,8 +3207,12 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     await secondConnection.connectionManager.stop()
                     await manager.debugRemoveConnection(secondConnection.connectionID)
                 }
-                await manager.clearClientConnectionPolicy(for: secondClient, windowID: window.windowID, runID: secondRun)
-                await manager.cleanupRunRoutingState(for: secondRun, windowID: window.windowID)
+                if let secondPolicy {
+                    await manager.cleanupRunRoutingState(ownedBy: secondPolicy)
+                } else {
+                    await manager.clearClientConnectionPolicy(for: secondClient, windowID: origin.routeID, runID: secondRun)
+                    await manager.cleanupRunRoutingState(for: secondRun, windowID: origin.routeID)
+                }
             }
             do {
                 for session in peers {
@@ -3207,13 +3227,20 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 let links = try await authority.links(forObserver: XCTUnwrap(second.activeAgentSessionID))
                 let reverse = try XCTUnwrap(links.items.first)
                 reverseGrant = .init(linkID: reverse.linkID, generation: reverse.generation)
-                await manager.installClientConnectionPolicy(
-                    for: secondClient, windowID: window.windowID,
+                if routingOwner != nil {
+                    _ = try XCTUnwrap(firstPolicy, "Both reciprocal providers must have their own registration")
+                    _ = second.beginRunAttempt(source: "W3 reciprocal catalog setup")
+                }
+                let registration = await manager.installClientConnectionPolicy(
+                    for: secondClient, windowID: origin.routeID,
                     restrictedTools: AgentModeMCPToolPolicy.restrictedTools, oneShot: true,
                     reason: "W3 assembled reciprocal fake route", ttl: 60, tabID: second.tabID,
                     runID: secondRun, additionalTools: nil, purpose: .agentModeRun,
-                    taskLabelKind: nil, allowsAgentExternalControlTools: false
+                    taskLabelKind: nil, allowsAgentExternalControlTools: false,
+                    routingOwner: routingOwner,
+                    originatingContextSource: routingOwner == nil ? nil : origin.originatingContextSource
                 )
+                if routingOwner != nil { secondPolicy = try XCTUnwrap(registration) }
                 let connection = try await PersistentMCPTestEndpoint.make(
                     label: "w3-reciprocal-provider", networkManager: manager, clientName: secondClient,
                     requiredToolNames: [MCPWindowToolName.selfNoop]
@@ -3221,6 +3248,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 secondConnection = connection
                 await secondProvider.attach(connection)
                 let connections = [firstConnection, connection]
+                let policies = [firstPolicy, secondPolicy]
                 let providers = [firstProvider, secondProvider]
                 for (index, session) in peers.enumerated() {
                     if session.selectedAgent == .claudeCode {
@@ -3243,11 +3271,14 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 // passive queue/facts value. Real registered calls are vetoed by leading text.
                 for (index, session) in peers.enumerated() {
                     let before = try XCTUnwrap(session.quietLedger.facts)
+                    // On an independent route the actual initial attempt already admitted
+                    // to this socket is the first measured ordinary turn, not a prior close.
+                    let seedAttempt = try policies[index].map { _ in try XCTUnwrap(session.activeRunOwnership) }
                     session.runState = .running
                     try await w2RegisteredTerminal(
                         window: window, session: session, connection: connections[index],
                         runID: XCTUnwrap(session.runID), delayed: false, nativeResult: true,
-                        closing: false, leading: true, cancel: false
+                        closing: false, leading: true, cancel: false, admittedPolicy: policies[index], fixtureInitialOwner: seedAttempt
                     )
                     await bridge.test_settleTargetPublications()
                     let seed = try await recordClose(session, before: before, label: "initial-ordinary-debt")
@@ -3273,7 +3304,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                         try await w2RegisteredTerminal(
                             window: window, session: first, connection: firstConnection,
                             runID: XCTUnwrap(first.runID), delayed: false, nativeResult: true,
-                            closing: false, leading: true, cancel: false
+                            closing: false, leading: true, cancel: false, admittedPolicy: firstPolicy
                         )
                         await bridge.test_settleTargetPublications()
                         let control = try await recordClose(first, before: before, label: "ordinary-close-control")
@@ -3300,6 +3331,9 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     let delivered = try XCTUnwrap(claim.passive?.receipt.deliveredStatuses.first { $0.reference == entry.reference && $0.targetEndpoint == entry.targetEndpoint })
                     XCTAssertEqual(delivered.changeSequence, entry.changeSequence)
                     let owner = session.beginRunAttempt(source: "W3.assembled-physical")
+                    if let policy = policies[index] {
+                        try renewFixtureAttempt(owner, session: session, host: origin, connectionID: connections[index].connectionID, policy: policy)
+                    }
                     if session.selectedAgent == .claudeCode {
                         await providers[index].attach(connections[index])
                         session.claudeController = providers[index]
@@ -3715,11 +3749,30 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             return try XCTUnwrap(projection)
         }
 
+        /// These controls simulate decoded successor events instead of driving the native
+        /// turn listener. Admit that attempt on the original real socket through the same
+        /// exact writer and policy check, never by changing the captured context directly.
+        private func renewFixtureAttempt(
+            _ owner: AgentRunOwnership, session: AgentTabSession, host: AgentSessionRuntimeHost,
+            connectionID: UUID, policy: MCPRunRoutingCleanupReceipt
+        ) throws {
+            guard session.isCurrentRunAttemptForCurrentBinding(owner),
+                  let sessionID = session.activeAgentSessionID, let runID = session.runID,
+                  case let .unique(writer) = host.scope.resolveWriter(sessionID: sessionID), writer.session === session,
+                  host.route.runRouteBindings.connectionID(forRunID: runID) == connectionID,
+                  host.route.renewAdoptedProviderAttempt(runID: runID, tabID: session.tabID, writer: writer.identity, attemptID: owner.attemptID, receipts: [policy])
+            else {
+                XCTFail("The simulated successor must renew the exact provider registration")
+                throw CancellationError()
+            }
+        }
+
         func w0fRepairControls(
             manager: ServerNetworkManager, provider: HeldDiscoveryProvider, window: WindowState,
             observer: AgentTabSession, endpoint: DomainAgentSessionLinkEndpointIdentity,
             route: AgentSessionLinkRunCatalogRouteToken, runID: UUID, kind: AgentProviderKind,
-            codex: LifecycleNoopCodexController, codexRecorder: LifecycleRecorder
+            codex: LifecycleNoopCodexController, codexRecorder: LifecycleRecorder,
+            admittedPolicy: MCPRunRoutingCleanupReceipt?
         ) async throws {
             // The held connection was admitted to this attempt. A second attempt before the
             // positive list would test stale-route denial, not catalog convergence on the wire.
@@ -3786,6 +3839,9 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             let foreign = AgentSessionLinkRunCatalogRouteToken(runID: runID, observerEndpoint: endpoint, connectionID: UUID(), routingAuthorityGeneration: route.routingAuthorityGeneration, connectionLifecycleGeneration: route.connectionLifecycleGeneration)
             let foreignSupport = await manager.hasCurrentReturnedTool(Self.w0fTool(), routeToken: foreign, projectionRevision: positive.projectionRevision)
             XCTAssertFalse(foreignSupport)
+            if let admittedPolicy {
+                try renewFixtureAttempt(successor, session: observer, host: window.agentModeViewModel.runtimeHost, connectionID: route.connectionID, policy: admittedPolicy)
+            }
 
             // Equivalent absent/suppressed and ambiguous returned catalogs. The healthy idle Codex
             // controller must not even open a cycle; ordinary delivery remains available.
