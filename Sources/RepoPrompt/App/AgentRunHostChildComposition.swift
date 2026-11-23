@@ -9,7 +9,7 @@ import RepoPromptWorkspaceContext
 @MainActor
 enum AgentRunHostChildComposition {
     static func compose(
-        from parent: AgentRunHostAdmission,
+        from parent: AgentRunHostAdmission, childSessionID: UUID,
         displayName: @escaping @MainActor (UUID) -> String
     ) async throws -> AgentSessionRuntimeHost {
         let workspace = try await parent.canonicalWorkspace()
@@ -34,7 +34,7 @@ enum AgentRunHostChildComposition {
         await routeResources.owner.requestTerminalDisposal()
         do {
             try await parent.requireCurrent()
-            let activation = try parent.activation.makeChildActivation(routeID: child.routeID, workspace: workspace)
+            let activation = try parent.activation.makeChildActivation(routeID: child.routeID, workspace: workspace, childSessionID: childSessionID)
             let storage = AgentSessionStorageInputs(
                 workspaceID: workspace.id, workspaceWithID: { $0 == workspace.id ? workspace : nil },
                 displayName: { displayName($0) }, isSuppressed: { AppLaunchConfiguration.current.suppressesAgentSessionPersistence },
@@ -112,7 +112,7 @@ final class AgentRunHostChildCreation {
         let allocation = AgentSessionCreationClaim(workspaceID: source.workspaceID)
         let pending = PendingWriter()
         let title = CarrierTitle()
-        let host = try await AgentRunHostChildComposition.compose(from: source) { _ in title.value }
+        let host = try await AgentRunHostChildComposition.compose(from: source, childSessionID: allocation.sessionID) { _ in title.value }
         guard let activation = host.workspaceActivation else {
             host.beginRetirement().startIfNeeded()
             throw MCPFileToolAuthorityFailure.unavailable
@@ -170,58 +170,15 @@ final class AgentRunHostChildCreation {
         }
     }
 
-    /// Reuse the tool's existing worktree planner and binding transition, but read from the
-    /// originating parent's pinned roots. The child cannot be rebound to a presented workspace.
     func prepareWorktree(
         _ request: AgentMCPStartWorktreeCoordinator.Request, from source: AgentRunHostAdmission,
         expiry: AgentRunStartExpiry? = nil
     ) async throws -> String? {
-        let workspace = try await source.canonicalWorkspace()
-        guard let activation = host.workspaceActivation, let lease = activation.catalogFileLease,
-              source.workspaceID == command.identity.workspaceID, lease.roots == source.rootLease.roots
-        else { throw MCPFileToolAuthorityFailure.superseded }
-        let writer = command.writer
-        let session = writer.session
-        let fallbackPath = workspace.repoPaths.first
-        func requireCurrent() async throws {
-            try expiry?.throwIfExpired()
-            let snapshot = try await source.canonicalSnapshot()
-            try command.requireCurrent()
-            guard claim.state == .provisional, stopFence.permitsStart(of: session),
-                  source.sourceIsCurrent, lease.rootsAreCurrent, host.workspaceActivation === activation,
-                  activation.owns(scope: host.scope, route: host.route),
-                  snapshot.document.metadata.repoPaths == workspace.repoPaths,
-                  activation.executionTab(in: snapshot, command: command) != nil
-            else { throw MCPFileToolAuthorityFailure.superseded }
-        }
-        try await requireCurrent()
-        if !request.hasExplicitWorktreeArgs, request.inheritParentWorktreeBindings {
-            let inherited = source.connection.lookupSource.worktreeBindings
-            _ = try await host.scope.worktrees.transition(
-                inherited, command: command, intent: .initialSend,
-                revalidateAuthority: requireCurrent
-            )
-        }
-        let coordinator = AgentMCPStartWorktreeCoordinator(
-            operationName: "agent_run.start", vcsService: .shared, gitTargetResolver: .init(),
-            startupPhaseEventSink: AppWorktreeStartupPhaseEventSink()
-        )
-        try await coordinator.prepare(request: request, authority: .init(
-            sessionID: command.identity.sessionID, files: lease.resources.files,
-            requireCurrent: requireCurrent, roots: { (fallbackPath, lease.roots) }, primaryRoot: { fallbackPath },
-            bindings: { session.worktreeBindings }, transition: { bindings, context, hints in
-                _ = try await self.host.scope.worktrees.transition(
-                    bindings, command: self.command, intent: .initialSend, startupContext: context,
-                    initializationHintsByBindingID: hints, revalidateAuthority: requireCurrent
-                )
-            },
-            // Canonical transitions publish the root projection with the binding. If those
-            // exact roots did not survive, refuse rather than installing an unfenced fallback.
-            materialize: { _ in false }
-        ))
-        try await requireCurrent()
-        return try AgentWorktreeRuntimeWorkspaceResolver.effectiveWorkspacePath(
-            bindings: session.worktreeBindings, fallbackWorkspacePath: fallbackPath
+        try await AgentRunHostStartTransaction.prepareWorktree(
+            request, from: source, host: host, command: command, stopFence: stopFence, expiry: expiry,
+            requireTarget: {
+                guard self.claim.state == .provisional else { throw MCPFileToolAuthorityFailure.superseded }
+            }
         )
     }
 
@@ -299,5 +256,78 @@ final class AgentRunHostChildCreation {
         }
         guard host.scope.sessions.isEmpty else { return }
         host.beginRetirement().startIfNeeded()
+    }
+}
+
+extension AgentRunHostStartTransaction {
+    /// The child, whether fresh or restored, receives inherited roots only from this source.
+    static func prepareWorktree(
+        _ request: AgentMCPStartWorktreeCoordinator.Request, from source: AgentRunHostAdmission,
+        host: AgentSessionRuntimeHost, command: AgentSessionRuntimeStore.Command, stopFence: AgentRunStartStopFence,
+        expiry: AgentRunStartExpiry? = nil,
+        validatesCarrier: @escaping @MainActor (DomainWorkspaceSnapshot) -> Bool = { _ in true },
+        proposedParentID: UUID? = nil,
+        requireTarget: @escaping @MainActor () throws -> Void
+    ) async throws -> String? {
+        let workspace = try await source.canonicalWorkspace()
+        func canonicalPaths(_ paths: [String]) -> Set<String> {
+            Set(paths.map { ($0 as NSString).standardizingPath })
+        }
+        // Each independently restored target owns a different file store. Match canonical
+        // paths, not store-local IDs; both exact leases must still survive every await.
+        guard let activation = host.workspaceActivation, let lease = activation.catalogFileLease,
+              source.workspaceID == command.identity.workspaceID,
+              canonicalPaths(lease.roots.map(\.fullPath)) == canonicalPaths(source.rootLease.roots.map(\.fullPath))
+        else { throw MCPFileToolAuthorityFailure.superseded }
+        let writer = command.writer
+        let session = writer.session
+        let fallbackPath = workspace.repoPaths.first
+        func requireCurrent() async throws {
+            try expiry?.throwIfExpired()
+            let snapshot = try await source.canonicalSnapshot()
+            try command.requireCurrent()
+            try requireTarget()
+            guard stopFence.permitsStart(of: session),
+                  source.sourceIsCurrent, lease.rootsAreCurrent, host.workspaceActivation === activation,
+                  activation.owns(scope: host.scope, route: host.route),
+                  snapshot.document.metadata.repoPaths == workspace.repoPaths,
+                  activation.executionTab(in: snapshot, command: command) != nil, validatesCarrier(snapshot)
+            else { throw MCPFileToolAuthorityFailure.superseded }
+        }
+        try await requireCurrent()
+        if !request.hasExplicitWorktreeArgs, request.inheritParentWorktreeBindings {
+            let inherited = source.connection.lookupSource.worktreeBindings
+            guard (session.parentSessionID ?? proposedParentID) == source.source.identity.sessionID else {
+                throw MCPError.invalidParams("agent_run.start could not confirm the routed parent for worktree inheritance.")
+            }
+            if session.worktreeBindings.isEmpty {
+                _ = try await host.scope.worktrees.transition(
+                    inherited, command: command, intent: .initialSend, revalidateAuthority: requireCurrent
+                )
+            } else if session.worktreeBindings != inherited {
+                throw MCPError.invalidParams("agent_run.start child worktree bindings conflict with the routed source.")
+            }
+        }
+        let coordinator = AgentMCPStartWorktreeCoordinator(
+            operationName: "agent_run.start", vcsService: .shared, gitTargetResolver: .init(),
+            startupPhaseEventSink: AppWorktreeStartupPhaseEventSink()
+        )
+        try await coordinator.prepare(request: request, authority: .init(
+            sessionID: command.identity.sessionID, files: lease.resources.files,
+            requireCurrent: requireCurrent, roots: { (fallbackPath, lease.roots) }, primaryRoot: { fallbackPath },
+            bindings: { session.worktreeBindings }, transition: { bindings, context, hints in
+                _ = try await host.scope.worktrees.transition(
+                    bindings, command: command, intent: .initialSend, startupContext: context,
+                    initializationHintsByBindingID: hints, revalidateAuthority: requireCurrent
+                )
+            },
+            // Canonical transitions publish the root projection with the binding. If those
+            // exact roots did not survive, refuse rather than installing an unfenced fallback.
+            materialize: { _ in false }
+        ))
+        try await requireCurrent()
+        return try AgentWorktreeRuntimeWorkspaceResolver.effectiveWorkspacePath(
+            bindings: session.worktreeBindings, fallbackWorkspacePath: fallbackPath
+        )
     }
 }

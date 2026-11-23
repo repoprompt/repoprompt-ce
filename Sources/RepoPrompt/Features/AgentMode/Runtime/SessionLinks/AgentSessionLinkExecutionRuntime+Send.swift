@@ -556,6 +556,8 @@ extension AgentSessionLinkExecutionRuntime {
         providerSwitchPreparation: ProviderSwitchSendPreparation? = nil,
         linkReference: DomainAgentSessionLinkReference? = nil,
         directStartOptions: AgentDirectRunStartOptions? = nil,
+        audit: (@MainActor (AgentChatItem) -> AgentAutomationTurnAudit)? = nil,
+        revalidateBeforeDispatch: (@MainActor () async throws -> Void)? = nil,
         dispatchIsCurrent: @MainActor () -> Bool
     ) async -> AgentSessionLinkSendTransactionOutcome {
         guard let owner = scope, !owner.hasReleasedWriterClaims, !owner.isRetiring else {
@@ -635,6 +637,7 @@ extension AgentSessionLinkExecutionRuntime {
         let anchorRollback = owner.turnTiming.recordAgentTurnUserAnchor(for: liveSession, userItem: userItem)
         switchPreparation = switchPreparation?.accepting(userItem.id, session: liveSession)
         liveSession.appendItem(userItem)
+        if let audit { liveSession.appendAutomationAudit(audit(userItem)) }
         updateBindingsFromSession(liveSession)
         requestUIRefresh(tabID: tabID, urgent: true)
 
@@ -669,7 +672,7 @@ extension AgentSessionLinkExecutionRuntime {
             acceptedAt: Date(), providerMessage: providerMessage, stopFence: stopFence,
             providerSwitchPreparation: switchPreparation,
             managedStart: managedStart, directStartOptions: directStartOptions,
-            dispatchIsCurrent: dispatchIsCurrent
+            revalidateBeforeDispatch: revalidateBeforeDispatch, dispatchIsCurrent: dispatchIsCurrent
         )
     }
 
@@ -680,6 +683,7 @@ extension AgentSessionLinkExecutionRuntime {
         providerSwitchPreparation: ProviderSwitchSendPreparation? = nil,
         managedStart: LinkStartedAttempt? = nil,
         directStartOptions: AgentDirectRunStartOptions? = nil,
+        revalidateBeforeDispatch: (@MainActor () async throws -> Void)? = nil,
         dispatchIsCurrent: @MainActor () -> Bool
     ) async -> AgentSessionLinkSendTransactionOutcome {
         let persistedOnly = AgentSessionLinkSendDelivery(
@@ -696,6 +700,16 @@ extension AgentSessionLinkExecutionRuntime {
         }
         defer { withExtendedLifetime(owner) {} }
         if Task.isCancelled {
+            releaseComposerSubmitClaim(claim)
+            return .delivered(persistedOnly)
+        }
+
+        // A canonical external session start must re-read its originating carrier after the
+        // write, not merely keep its live writer. Refusal here preserves the accepted input.
+        do {
+            try await revalidateBeforeDispatch?()
+            try Task.checkCancellation()
+        } catch {
             releaseComposerSubmitClaim(claim)
             return .delivered(persistedOnly)
         }

@@ -148,6 +148,37 @@ struct AgentRunHostAdmission {
         }
     }
 
+    func executeAgentRun(_ args: [String: Value]) async throws -> Value {
+        switch try makeHostToolService().resolveOperation(args) {
+        case .start: try await executeCanonicalStart(args)
+        case .poll: try await executeControlRead(args, poll: true)
+        case .wait: try await executeControlRead(args, poll: false)
+        case .cancel: try await executeControlCancellation(args)
+        case .steer: try await executeControlSteer(args)
+        case .respond: try await executeControlResponse(args)
+        }
+    }
+
+    func autoEffortPolicy(for targetHost: AgentSessionRuntimeHost, command: AgentSessionRuntimeStore.Command) -> AgentAutoEffortTurnPolicy {
+        .init(
+            modelRouterSettingsStore: targetHost.modelRouterSettingsStore,
+            modelRouterRuntime: WindowStatesManager.shared.modelRouterRuntime,
+            codexCoordinator: targetHost.codexCoordinator, claudeCoordinator: targetHost.claudeCoordinator,
+            ownsSession: { $0 === command.writer.session && command.isCurrent }
+        )
+    }
+
+    func captureContinuationProviderEnvironment() throws -> AppSavedAgentSessionExecution.ProviderEnvironment {
+        guard sourceIsCurrent, let providerSettings = activation.providerSettings,
+              let transport = host.route.hostProviderTransport
+        else { throw MCPFileToolAuthorityFailure.superseded }
+        return .init(
+            resources: host.providerResources, settings: providerSettings,
+            claudeControllerFactory: host.claudeControllerFactory, mcpTransport: transport,
+            modelRouterSettings: host.modelRouterSettingsStore
+        )
+    }
+
     func requireSpawnSource() throws {
         try Task.checkCancellation()
         guard sourceIsCurrent else { throw MCPFileToolAuthorityFailure.superseded }

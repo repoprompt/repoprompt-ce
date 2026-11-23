@@ -584,6 +584,15 @@ final class MCPHostRouteResources {
         domainRuntime.identity
     }
 
+    var agentRunSessionStore: DomainAgentRunSessionStore {
+        domainRuntime.agentSessionStore
+    }
+
+    var hostProviderTransport: MCPService? {
+        guard !isClosing, catalogHandle != nil else { return nil }
+        return catalog?.hostTransport
+    }
+
     /// A child uses the same process authority and listener, but an independent execution
     /// lease and route. This does not issue a child writer or rebind the caller's connection.
     func makeChildExecutionRoute() -> (owner: LeaseOwner, transport: MCPService)? {

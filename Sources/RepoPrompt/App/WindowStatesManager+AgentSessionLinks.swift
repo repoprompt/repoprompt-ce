@@ -64,7 +64,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
             case .retained:
                 if let drain {
                     self?.reportRetainedAgentHostDrain(drain)
-                    if let id = drain.scope.executableHost?.workspaceActivation?.savedCarrierSessionID,
+                    if let id = drain.scope.executableHost?.workspaceActivation?.retainedCarrierSessionID,
                        AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: id)
                     {
                         self?.schedulePreparedOversightCleanup()
@@ -90,7 +90,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
     }
 
     func hasPreparedRuntime(_ sessionID: UUID) -> Bool {
-        canonicalSavedHost(sessionID) != nil || agentRuntimeStore.hasRetiringWriter(sessionID: sessionID)
+        canonicalRetainedHost(sessionID) != nil || agentRuntimeStore.hasRetiringWriter(sessionID: sessionID)
     }
 
     func claimPreparedRuntimeVisit(_ sessionID: UUID) -> Bool {
@@ -289,9 +289,36 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         }
     }
 
-    private func canonicalSavedHost(_ sessionID: UUID) -> AgentSessionRuntimeHost? {
+    /// Observe the same saved-host lifetime after a child finishes its configured first write.
+    /// This does not take ownership of presentation or release controls before their own expiry.
+    func retainChildControl(_ command: AgentSessionRuntimeStore.Command, host: AgentSessionRuntimeHost) {
+        let session = command.writer.session
+        let id = command.identity.sessionID
+        guard command.isCurrent, command.writer.scope === host.scope, canonicalRetainedHost(id) === host,
+              let control = session.mcpControlContext, control.sessionID == id,
+              let runtime = host.scope.linkExecution, let endpoint = runtime.agentSessionLinkObserverEndpoint(tabID: session.tabID),
+              let candidate = runtime.agentSessionLinkRuntimeCandidate(
+                  for: endpoint, displayName: host.scope.persistence.composition?.displayName(session.tabID) ?? "Agent Session"
+              ) else { return }
+        host.retainControlRegistration(control.registration) { [weak self] in
+            self?.schedulePreparedOversightCleanup()
+        }
+        if preparedOversightRunObservations[id] == nil {
+            preparedOversightRunObservations[id] = agentSessionLinkInstallObservation(for: candidate) { [weak self] in
+                self?.schedulePreparedOversightCleanup()
+            }
+        }
+        notifyAgentSessionLinkTopologyChanged()
+        schedulePreparedOversightCleanup()
+    }
+
+    private func canonicalRetainedHost(_ sessionID: UUID) -> AgentSessionRuntimeHost? {
         guard case let .unique(writer) = agentRuntimeStore.resolveWriter(sessionID: sessionID),
-              let host = writer.scope.executableHost, host.workspaceActivation?.savedCarrierSessionID == sessionID else { return nil }
+              let host = writer.scope.executableHost, let activation = host.workspaceActivation,
+              activation.retainedCarrierSessionID == sessionID else { return nil }
+        // The creation transaction owns disposal until configured persistence admits a normal
+        // command. An unconnected provisional tab is not an idle retained child.
+        guard activation.savedCarrierSessionID == sessionID || (try? writer.admitCommand().get()) != nil else { return nil }
         return host
     }
 
@@ -318,7 +345,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
     /// A UI visit may take over an idle saved runtime, but never creates a second writer or
     /// cancels an accepted managed task. Active ownership is the ordinary binding-transition block.
     func releasePreparedOversightOwnerForVisit(sessionID: UUID, preparingReplacement: Bool = false) async -> Bool {
-        if let host = canonicalSavedHost(sessionID) {
+        if let host = canonicalRetainedHost(sessionID) {
             guard !preparingReplacement, preparedOversightPreparationInFlight[sessionID] == nil,
                   let session = host.scope.sessions.values.first(where: { $0.activeAgentSessionID == sessionID }),
                   host.scope.settlement(for: session).canJoinHostDrain else { return false }
@@ -332,8 +359,8 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
     /// committed live links retain an owner; a saved intent alone does not keep a revoked run alive.
     func schedulePreparedOversightCleanup() {
         guard !isTerminating,
-              agentRuntimeStore.retainedExecutionHosts.contains(where: { $0.workspaceActivation?.savedCarrierSessionID != nil })
-              || agentRuntimeStore.retainedDrains.contains(where: { $0.scope.executableHost?.workspaceActivation?.savedCarrierSessionID != nil })
+              agentRuntimeStore.retainedExecutionHosts.contains(where: { $0.workspaceActivation?.retainedCarrierSessionID != nil })
+              || agentRuntimeStore.retainedDrains.contains(where: { $0.scope.executableHost?.workspaceActivation?.retainedCarrierSessionID != nil })
         else { return }
         preparedOversightCleanupDirty = true
         guard preparedOversightCleanupTask == nil else { return }
@@ -344,7 +371,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
                 // A durable tombstone is a new settlement fact, not a storage retry. It can
                 // release an owner whose earlier drain met an in-progress deletion.
                 for drain in agentRuntimeStore.retainedDrains {
-                    guard let id = drain.scope.executableHost?.workspaceActivation?.savedCarrierSessionID,
+                    guard let id = drain.scope.executableHost?.workspaceActivation?.retainedCarrierSessionID,
                           AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: id) else { continue }
                     preparedOversightPendingVisits.removeValue(forKey: id)
                     canonicalDeferredVisitTickets.removeValue(forKey: id)
@@ -359,9 +386,9 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
                     } ?? true
                 }.flatMap { [$0.observerSessionID, $0.targetSessionID] })
                 for host in agentRuntimeStore.retainedExecutionHosts {
-                    guard let id = host.workspaceActivation?.savedCarrierSessionID,
+                    guard let id = host.workspaceActivation?.retainedCarrierSessionID,
                           preparedOversightPreparationInFlight[id] == nil,
-                          canonicalSavedHost(id) === host, !host.scope.isRetiring,
+                          canonicalRetainedHost(id) === host, !host.scope.isRetiring,
                           let session = host.scope.sessions.values.first(where: { $0.activeAgentSessionID == id }) else { continue }
                     let pairs = inventory.persisted.filter { $0.targetSessionID == id || $0.observerSessionID == id }
                     for pair in pairs where pair.targetSessionID == id {
@@ -374,7 +401,10 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
                     let deleted = AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: id)
                     let destructive = deleted || revoked
                     let visitPending = preparedOversightPendingVisits[id] != nil
-                    let naturallyUnowned = !retained.contains(id) && pairs.isEmpty
+                    let hasControlOwner = host.retainedControlRegistration.map {
+                        $0 == session.mcpControlContext?.registration
+                    } ?? false
+                    let naturallyUnowned = !hasControlOwner && !retained.contains(id) && pairs.isEmpty
                     if destructive || ((visitPending || naturallyUnowned) && host.scope.settlement(for: session).canJoinHostDrain) {
                         _ = startSavedHostRetirement(host, sessionID: id, destructive: destructive)
                     }
@@ -412,7 +442,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         independentLinkCandidates().compactMap { candidate in
             guard let runtime = independentLinkRuntime(for: candidate.domainEndpoint),
                   let command = runtime.admit(candidate), let host = command.writer.scope.executableHost,
-                  let activation = host.workspaceActivation, activation.savedCarrierSessionID == candidate.sessionID
+                  let activation = host.workspaceActivation, activation.retainedCarrierSessionID == candidate.sessionID
             else { return nil }
             let session = command.writer.session
             var sample = AgentSessionStatusCensus.Sample(

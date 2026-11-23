@@ -42,6 +42,29 @@ final class AgentSessionRuntimeHost {
         codexCoordinator: codexCoordinator, claudeCoordinator: claudeCoordinator
     )
     private(set) var workspaceActivation: AgentSessionHostWorkspaceActivation?
+    private(set) var retainedControlRegistration: AgentRunSessionStore.Registration?
+
+    func retainControlRegistration(
+        _ registration: AgentRunSessionStore.Registration,
+        onReleased: @escaping @MainActor @Sendable () -> Void
+    ) {
+        guard workspaceActivation?.retainedCarrierSessionID == registration.sessionID,
+              retainedControlRegistration != registration else { return }
+        retainedControlRegistration = registration
+        let release: @MainActor @Sendable (AgentRunSessionStore.Registration) -> Void = { [weak self] registration in
+            guard let self, retainedControlRegistration == registration else { return }
+            retainedControlRegistration = nil
+            onReleased()
+        }
+        let store = route.agentRunSessionStore
+        Task {
+            let observing = await store.observeRegistrationEnd(registration) { registration in
+                await release(registration)
+            }
+            if !observing { release(registration) }
+        }
+    }
+
     private(set) lazy var originatingContextSource: MCPHostRouteResources.ProviderContextSource = { [weak self] runID, tabID in
         self?.captureProviderContext(runID: runID, tabID: tabID)
     }

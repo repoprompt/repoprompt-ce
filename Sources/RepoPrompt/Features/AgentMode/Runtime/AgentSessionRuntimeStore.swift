@@ -85,6 +85,11 @@ final class AgentSessionRuntimeStore {
             identity = command.identity
         }
 
+        func currentExecutableHost(for session: AgentTabSession) -> AgentSessionRuntimeHost? {
+            guard disposition(for: session) == .current else { return nil }
+            return scope?.executableHost
+        }
+
         func disposition(for session: AgentTabSession) -> Disposition {
             guard let writer = scope?.originatingWriter(identity: identity, session: session) else {
                 return .claimLost
