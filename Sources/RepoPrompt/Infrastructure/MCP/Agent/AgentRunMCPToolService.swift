@@ -599,7 +599,7 @@ struct AgentRunMCPToolService {
             return result.value
         }
         return try await waitForInterestingState(
-            sessionID: result.sessionID, agentModeVM: agentModeVM, metadata: result.metadata,
+            sessionID: result.sessionID, read: windowReadAccess(agentModeVM), metadata: result.metadata,
             timeoutSeconds: timeoutSeconds, stage: "starting",
             message: "Waiting for the started run to finish or request input...",
             workflow: workflow, initialDelivery: result.delivery
@@ -1235,18 +1235,24 @@ struct AgentRunMCPToolService {
                 args["timeout"],
                 capturedDefaultWaitSeconds: capturedDefaultWaitSeconds
             )
-        let initialSnapshot = await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
+        let read = windowReadAccess(agentModeVM)
+        return try await executeResolvedWait(sessionID: sessionID, read: read, metadata: metadata, timeoutSeconds: timeoutSeconds)
+    }
+
+    func executeResolvedWait(
+        sessionID: UUID, read: RunReadAccess, metadata: RequestMetadata, timeoutSeconds: TimeInterval
+    ) async throws -> Value {
+        let initialSnapshot = await read.snapshot(sessionID)
         if initialSnapshot.isActionableForMCPWait || timeoutSeconds <= 0 {
             return decoratedRunValue(snapshot: initialSnapshot)
         }
         return try await waitForInterestingState(
             sessionID: sessionID,
-            agentModeVM: agentModeVM,
+            read: read,
             metadata: metadata,
             timeoutSeconds: timeoutSeconds,
             stage: "waiting",
-            message: "Waiting for the agent run to finish or request input...",
-            liveSnapshot: initialSnapshot
+            message: "Waiting for the agent run to finish or request input..."
         )
     }
 
@@ -1279,7 +1285,14 @@ struct AgentRunMCPToolService {
             args["timeout"],
             capturedDefaultWaitSeconds: capturedDefaultWaitSeconds
         )
-        let initialSnapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, agentModeVM: agentModeVM)
+        return try await executeResolvedWaitAny(sessionIDs: sessionIDs, read: windowReadAccess(agentModeVM), metadata: metadata, timeoutSeconds: timeoutSeconds)
+    }
+
+    func executeResolvedWaitAny(
+        sessionIDs: [UUID], read: RunReadAccess, metadata: RequestMetadata, timeoutSeconds: TimeInterval
+    ) async throws -> Value {
+        precondition(sessionIDs.count > 1, "Single-session waits must use the single-session response shape")
+        let initialSnapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, read: read)
 
         if let ready = initialSnapshots.first(where: { isInterestingSnapshot($0) }) {
             return decoratedMultiWaitValue(
@@ -1310,7 +1323,7 @@ struct AgentRunMCPToolService {
             ) {
                 try await waitForAnyInterestingState(
                     sessionIDs: sessionIDs,
-                    agentModeVM: agentModeVM,
+                    read: read,
                     timeoutSeconds: timeoutSeconds,
                     initialSnapshots: initialSnapshots,
                     waitConsumerParentRunID: waitScopeRegistration?.parentRunID
@@ -1324,7 +1337,7 @@ struct AgentRunMCPToolService {
         } catch is CancellationError {
             if let value = await waitAnyCancellationValueIfActionable(
                 sessionIDs: sessionIDs,
-                agentModeVM: agentModeVM,
+                read: read,
                 fallbackSnapshots: initialSnapshots
             ) {
                 let completion = waitScopeCompletion(from: value, fallbackSessionIDs: sessionIDs)
@@ -1776,14 +1789,13 @@ struct AgentRunMCPToolService {
             if timeout > 0 {
                 return try await waitForInterestingState(
                     sessionID: sessionID,
-                    agentModeVM: agentModeVM,
+                    read: windowReadAccess(agentModeVM),
                     metadata: metadata,
                     timeoutSeconds: timeout,
                     stage: "steering",
                     message: "Waiting for the steered run to finish or request input...",
                     workflow: workflow,
-                    initialDelivery: delivery,
-                    liveSnapshot: snapshot.status == .running ? snapshot : nil
+                    initialDelivery: delivery
                 )
             }
         }
@@ -1967,19 +1979,32 @@ struct AgentRunMCPToolService {
         )
     }
 
-    private func waitForInterestingState(
+    struct RunReadAccess {
+        let waitCursor: @MainActor @Sendable (UUID) -> AgentRunSessionStore.WaitCursor?
+        let snapshot: @MainActor @Sendable (UUID) async -> AgentRunMCPSnapshot
+        let unavailable: @MainActor @Sendable (UUID) -> AgentRunMCPSnapshot?
+    }
+
+    private func windowReadAccess(_ agentModeVM: AgentModeViewModel) -> RunReadAccess {
+        RunReadAccess(
+            waitCursor: { agentModeVM.mcpRuntime.waitCursor(sessionID: $0) },
+            snapshot: { await currentSnapshot(sessionID: $0, agentModeVM: agentModeVM) },
+            unavailable: { unavailableControlReadSnapshot(sessionID: $0, agentModeVM: agentModeVM) }
+        )
+    }
+
+    func waitForInterestingState(
         sessionID: UUID,
-        agentModeVM: AgentModeViewModel,
+        read: RunReadAccess,
         metadata: RequestMetadata,
         timeoutSeconds: TimeInterval,
         stage: String,
         message: String,
         workflow: AgentWorkflowDefinition? = nil,
-        initialDelivery: AgentModeViewModel.MCPInstructionDispatch? = nil,
-        liveSnapshot _: AgentRunMCPSnapshot? = nil
+        initialDelivery: AgentModeViewModel.MCPInstructionDispatch? = nil
     ) async throws -> Value {
-        guard let initialCursor = agentModeVM.mcpRuntime.waitCursor(sessionID: sessionID) else {
-            if let unavailable = unavailableControlReadSnapshot(sessionID: sessionID, agentModeVM: agentModeVM) {
+        guard let initialCursor = read.waitCursor(sessionID) else {
+            if let unavailable = read.unavailable(sessionID) {
                 var object = unavailable.asObject()
                 object["_meta"] = .object(["wait_result": .string("unavailable")])
                 return .object(object)
@@ -2005,7 +2030,7 @@ struct AgentRunMCPToolService {
                     }
                     let remaining = Self.timeInterval(from: clock.now.duration(to: deadline))
                     guard remaining > 0 else {
-                        let value = await timedOutWaitValue(sessionID: sessionID, agentModeVM: agentModeVM)
+                        let value = await timedOutWaitValue(sessionID: sessionID, read: read)
                         let result = Self.waitResult(from: value) ?? "timed_out"
                         completionBox.set(AgentRunWaitScopeCompletion(
                             reason: result == "startup_pending" ? .startupPending : .timedOut,
@@ -2065,13 +2090,13 @@ struct AgentRunMCPToolService {
                                 pendingSessionIDs: [sessionID],
                                 errorDescription: nil
                             ))
-                            return await supersededWaitValue(sessionID: sessionID, agentModeVM: agentModeVM)
+                            return await supersededWaitValue(sessionID: sessionID, read: read)
                         }
                         cursor = .init(registration: cursor.registration, epoch: epoch)
                     case let .terminalPublicationRejected(_, reason):
                         throw MCPError.internalError("The agent run terminal state could not be published: \(reason)")
                     case .timedOut:
-                        let value = await timedOutWaitValue(sessionID: sessionID, agentModeVM: agentModeVM)
+                        let value = await timedOutWaitValue(sessionID: sessionID, read: read)
                         let result = Self.waitResult(from: value) ?? "timed_out"
                         completionBox.set(AgentRunWaitScopeCompletion(
                             reason: result == "startup_pending" ? .startupPending : .timedOut,
@@ -2099,7 +2124,7 @@ struct AgentRunMCPToolService {
             if error is CancellationError,
                let resolution = await cancelledSingleWaitResolutionIfActionable(
                    sessionID: sessionID,
-                   agentModeVM: agentModeVM
+                   read: read
                )
             {
                 if let waitScopeRegistration {
@@ -2108,7 +2133,7 @@ struct AgentRunMCPToolService {
                 return try await finalDecoratedSingleWaitValue(
                     from: resolution.rawValue,
                     sessionID: sessionID,
-                    agentModeVM: agentModeVM,
+                    read: read,
                     workflow: workflow,
                     initialDelivery: initialDelivery
                 )
@@ -2132,7 +2157,7 @@ struct AgentRunMCPToolService {
         return try await finalDecoratedSingleWaitValue(
             from: snapshot,
             sessionID: sessionID,
-            agentModeVM: agentModeVM,
+            read: read,
             workflow: workflow,
             initialDelivery: initialDelivery
         )
@@ -2140,9 +2165,9 @@ struct AgentRunMCPToolService {
 
     private func timedOutWaitValue(
         sessionID: UUID,
-        agentModeVM: AgentModeViewModel
+        read: RunReadAccess
     ) async -> Value {
-        let snapshot = await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
+        let snapshot = await read.snapshot(sessionID)
         var object = snapshot.asObject()
         object["_meta"] = .object([
             "wait_result": .string(snapshot.isStartupPendingForMCPWait ? "startup_pending" : "timed_out")
@@ -2156,9 +2181,9 @@ struct AgentRunMCPToolService {
 
     private func supersededWaitValue(
         sessionID: UUID,
-        agentModeVM: AgentModeViewModel
+        read: RunReadAccess
     ) async -> Value {
-        let snapshot = await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
+        let snapshot = await read.snapshot(sessionID)
         var object = snapshot.asObject()
         object["_meta"] = .object([
             "wake_reason": .string("superseded_turn"),
@@ -2192,9 +2217,9 @@ struct AgentRunMCPToolService {
 
     private func cancelledSingleWaitResolutionIfActionable(
         sessionID: UUID,
-        agentModeVM: AgentModeViewModel
+        read: RunReadAccess
     ) async -> CancelledSingleWaitResolution? {
-        let snapshot = await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
+        let snapshot = await read.snapshot(sessionID)
         guard snapshot.status != .expired, snapshot.isActionableForMCPWait else { return nil }
         let value = snapshot.toValue()
         return CancelledSingleWaitResolution(
@@ -2206,7 +2231,7 @@ struct AgentRunMCPToolService {
     private func finalDecoratedSingleWaitValue(
         from rawValue: Value,
         sessionID: UUID,
-        agentModeVM: AgentModeViewModel,
+        read: RunReadAccess,
         workflow: AgentWorkflowDefinition?,
         initialDelivery: AgentModeViewModel.MCPInstructionDispatch?
     ) async throws -> Value {
@@ -2216,7 +2241,7 @@ struct AgentRunMCPToolService {
         if let object = rawValue.objectValue {
             resolvedSnapshot = try snapshot(from: object)
         } else {
-            resolvedSnapshot = await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
+            resolvedSnapshot = await read.snapshot(sessionID)
         }
         let decorated = decoratedRunValue(
             snapshot: resolvedSnapshot,
@@ -2240,10 +2265,10 @@ struct AgentRunMCPToolService {
 
     private func waitAnyCancellationValueIfActionable(
         sessionIDs: [UUID],
-        agentModeVM: AgentModeViewModel,
+        read: RunReadAccess,
         fallbackSnapshots: [AgentRunMCPSnapshot]
     ) async -> Value? {
-        let freshSnapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, agentModeVM: agentModeVM)
+        let freshSnapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, read: read)
         let snapshots = freshSnapshots.isEmpty ? fallbackSnapshots : freshSnapshots
         guard !snapshots.isEmpty else { return nil }
 
@@ -2262,13 +2287,13 @@ struct AgentRunMCPToolService {
 
     private func waitAnySteeringInterruptValue(
         sessionIDs: [UUID],
-        agentModeVM: AgentModeViewModel,
+        read: RunReadAccess,
         wake: AgentRunSessionStore.NoteworthyWake,
         latestSnapshots: [AgentRunMCPSnapshot],
         waitConsumerParentRunID: UUID?
     ) async -> Value {
         let triggeringSnapshot = wake.snapshot
-        let freshSnapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, agentModeVM: agentModeVM)
+        let freshSnapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, read: read)
         var snapshots = freshSnapshots.isEmpty ? latestSnapshots : freshSnapshots
         if snapshots.isEmpty {
             snapshots = [triggeringSnapshot]
@@ -2349,17 +2374,17 @@ struct AgentRunMCPToolService {
 
     private nonisolated func waitForAnyInterestingState(
         sessionIDs: [UUID],
-        agentModeVM: AgentModeViewModel,
+        read: RunReadAccess,
         timeoutSeconds: TimeInterval,
         initialSnapshots: [AgentRunMCPSnapshot],
         waitConsumerParentRunID: UUID?
     ) async throws -> Value {
         let cursors = await MainActor.run {
-            sessionIDs.compactMap { agentModeVM.mcpRuntime.waitCursor(sessionID: $0) }
+            sessionIDs.compactMap { read.waitCursor($0) }
         }
         guard !cursors.isEmpty else {
             for sessionID in sessionIDs {
-                if let unavailable = await unavailableControlReadSnapshot(sessionID: sessionID, agentModeVM: agentModeVM) {
+                if let unavailable = await read.unavailable(sessionID) {
                     return decoratedMultiWaitValue(
                         snapshot: unavailable, sessionIDs: sessionIDs, result: "unavailable",
                         pendingSessionIDs: sessionIDs
@@ -2378,7 +2403,7 @@ struct AgentRunMCPToolService {
             fallbackSessionID: sessionIDs[0],
             timeoutSeconds: timeoutSeconds
         )
-        let snapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, agentModeVM: agentModeVM)
+        let snapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, read: read)
         switch result.disposition {
         case let .actionable(snapshot):
             return decoratedMultiWaitValue(
@@ -2391,7 +2416,7 @@ struct AgentRunMCPToolService {
         case let .steeringInterrupted(wake):
             return await waitAnySteeringInterruptValue(
                 sessionIDs: sessionIDs,
-                agentModeVM: agentModeVM,
+                read: read,
                 wake: wake,
                 latestSnapshots: snapshots,
                 waitConsumerParentRunID: waitConsumerParentRunID
@@ -2425,7 +2450,7 @@ struct AgentRunMCPToolService {
         case .cancelled:
             if let value = await waitAnyCancellationValueIfActionable(
                 sessionIDs: sessionIDs,
-                agentModeVM: agentModeVM,
+                read: read,
                 fallbackSnapshots: snapshots
             ) {
                 return value
@@ -2590,7 +2615,7 @@ struct AgentRunMCPToolService {
             return try await finalDecoratedSingleWaitValue(
                 from: rawValue,
                 sessionID: sessionID,
-                agentModeVM: agentModeVM,
+                read: windowReadAccess(agentModeVM),
                 workflow: nil,
                 initialDelivery: nil
             )
@@ -3343,11 +3368,11 @@ struct AgentRunMCPToolService {
         return try optionalBool(in: object, key: key)
     }
 
-    private func collectCurrentSnapshots(sessionIDs: [UUID], agentModeVM: AgentModeViewModel) async -> [AgentRunMCPSnapshot] {
+    private func collectCurrentSnapshots(sessionIDs: [UUID], read: RunReadAccess) async -> [AgentRunMCPSnapshot] {
         var snapshots: [AgentRunMCPSnapshot] = []
         snapshots.reserveCapacity(sessionIDs.count)
         for sessionID in sessionIDs {
-            await snapshots.append(currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM))
+            await snapshots.append(read.snapshot(sessionID))
         }
         return snapshots
     }
