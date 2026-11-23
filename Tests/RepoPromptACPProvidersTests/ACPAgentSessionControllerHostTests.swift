@@ -476,6 +476,145 @@ final class ACPAgentSessionControllerHostTests: XCTestCase {
         }
     }
 
+    func testDevinStderrStaysOutOfTheTranscriptButReachesDiagnostics() async throws {
+        let warning = "2026-10-01T16:04:15.144229Z  WARN run_acp_server: [MCP] environment variable 'MISSING' is not set"
+        let directory = try makeStderrFixtureDirectory()
+        let diagnostics = StderrDiagnosticRecorder()
+        let controller = try makeDevinStderrController(
+            directory: directory,
+            sessionNew: ["print(\(Self.pythonLiteral(warning)), file=sys.stderr, flush=True)"],
+            diagnostics: diagnostics
+        )
+        let collected = await collectStreamResults(from: controller)
+
+        _ = try await controller.bootstrap()
+        try await controller.prompt(AgentMessage(systemPrompt: "", userMessage: "hi", resumeSessionID: nil), request: makeDevinStderrRequest(directory))
+        for _ in 0 ..< 500 where !diagnostics.lines.contains(warning) {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        await controller.shutdown()
+        let results = await collected.value
+
+        XCTAssertEqual(diagnostics.lines, [warning])
+        XCTAssertFalse(results.contains { $0.type == "system" }, "Process stderr must never become transcript content")
+        XCTAssertFalse(results.compactMap(\.text).joined().contains(warning))
+    }
+
+    func testDevinProcessFailureKeepsTheFinalUnterminatedStderrLine() async throws {
+        let directory = try makeStderrFixtureDirectory()
+        let controller = try makeDevinStderrController(
+            directory: directory,
+            sessionNew: ["sys.stderr.write('permission denied while reading test config')", "sys.stderr.flush()", "os._exit(7)"]
+        )
+        let collected = await collectStreamResults(from: controller)
+
+        do {
+            _ = try await controller.bootstrap()
+            XCTFail("session/new never completes; the process exited")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("permission denied while reading test config"), error.localizedDescription)
+            XCTAssertTrue(error.localizedDescription.contains("code 7"), error.localizedDescription)
+        }
+        await controller.shutdown()
+        let results = await collected.value
+        XCTAssertFalse(results.contains { $0.type == "system" })
+    }
+
+    func testDevinProcessFailureDoesNotWaitForADescendantHoldingStderrOpen() async throws {
+        let directory = try makeStderrFixtureDirectory()
+        let controller = try makeDevinStderrController(
+            directory: directory,
+            sessionNew: [
+                "if os.fork() == 0:",
+                "    time.sleep(8)",
+                "    os._exit(0)",
+                "os.write(sys.stderr.fileno(), b'permission denied while reading test config')",
+                "os._exit(7)"
+            ]
+        )
+        let collected = await collectStreamResults(from: controller)
+        let started = ContinuousClock.now
+
+        do {
+            _ = try await controller.bootstrap()
+            XCTFail("session/new never completes; the process exited")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("permission denied while reading test config"), error.localizedDescription)
+            XCTAssertTrue(error.localizedDescription.contains("code 7"), error.localizedDescription)
+        }
+        XCTAssertLessThan(ContinuousClock.now - started, .seconds(6), "Failure must not wait for the descendant's stderr EOF")
+        await controller.shutdown()
+        _ = await collected.value
+    }
+
+    private func makeStderrFixtureDirectory() throws -> URL {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ACPDevinStderr-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        return directory
+    }
+
+    private func makeDevinStderrRequest(_ directory: URL) -> ACPRunRequest {
+        ACPRunRequest(agentKind: .devin, modelString: nil, workspacePath: directory.path, resumeSessionID: nil, attachments: [], taskLabelKind: nil)
+    }
+
+    private func makeDevinStderrController(
+        directory: URL,
+        sessionNew: [String],
+        diagnostics: StderrDiagnosticRecorder? = nil
+    ) throws -> ACPAgentSessionController {
+        let script = directory.appendingPathComponent("server.py")
+        let body = sessionNew.map { "        \($0)" }.joined(separator: "\n")
+        try """
+        import json, os, sys, time
+        for line in sys.stdin:
+            request = json.loads(line)
+            if 'id' not in request: continue
+            method = request.get('method')
+            reply = {'jsonrpc': '2.0', 'id': request['id'], 'result': {}}
+            if method == 'initialize':
+                reply['result'] = {'agentCapabilities': {}}
+            elif method == 'session/new':
+        \(body)
+                reply['result'] = {'sessionId': 'devin-session'}
+            elif method == 'session/prompt':
+                reply['result'] = {'stopReason': 'end_turn'}
+            print(json.dumps(reply), flush=True)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        var provider = FixtureProvider(
+            providerID: .devin,
+            script: script.path,
+            observations: directory.appendingPathComponent("requests.jsonl").path
+        )
+        provider.stderrDisposition = .diagnosticsOnly
+        let controller = try ACPAgentSessionController(
+            provider: provider,
+            runRequest: makeDevinStderrRequest(directory),
+            host: RecordingHost(allowsDiagnostics: true),
+            diagnosticSink: { event in
+                if case let .stderrLine(line) = event { diagnostics?.append(line) }
+            },
+            allowsProviderProcessLaunchForTesting: true
+        )
+        addTeardownBlock { await controller.shutdown() }
+        return controller
+    }
+
+    private func collectStreamResults(from controller: ACPAgentSessionController) async -> Task<[AIStreamResult], Never> {
+        let events = await controller.events
+        return Task {
+            var results: [AIStreamResult] = []
+            for await event in events {
+                if case let .stream(result) = event { results.append(result) }
+            }
+            return results
+        }
+    }
+
+    private static func pythonLiteral(_ text: String) -> String {
+        String(decoding: (try? JSONEncoder().encode(text)) ?? Data("\"\"".utf8), as: UTF8.self)
+    }
+
     private func terminalEvent(in events: AsyncStream<NormalizedAgentRuntimeEvent>) async -> (state: AgentSessionRunState, errorText: String?)? {
         for await event in events {
             if case let .terminal(state, errorText) = event { return (state, errorText) }
@@ -518,6 +657,8 @@ private struct FixtureProvider: ACPAgentProvider, ACPDirectSessionModelProvider 
     var promptError: String?
     /// Classifies prompt errors with Devin's shipped rules.
     var promptErrorClassifier: DevinACPAgentProvider?
+    /// Overrides the default stderr classification, as Devin does.
+    var stderrDisposition: ACPStderrLineDisposition?
 
     func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
         .supported
@@ -556,6 +697,10 @@ private struct FixtureProvider: ACPAgentProvider, ACPDirectSessionModelProvider 
 
     func normalizeError(_ error: Error) -> Error {
         error
+    }
+
+    func stderrLineDisposition(_ line: String) -> ACPStderrLineDisposition {
+        stderrDisposition ?? (shouldEmitStderrLine(line) ? .transcript : .diagnosticsOnly)
     }
 
     func sessionPreservingPromptFailure(forResponseError error: [String: Any]) -> ACPSessionPreservingPromptFailure? {
@@ -928,5 +1073,18 @@ final class ACPCLIProviderExecutionTests: XCTestCase {
             print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
         """#.write(to: script, atomically: true, encoding: .utf8)
         return (directory, observations, FixtureProvider(providerID: consumer.providerID, script: script.path, observations: observations.path, emitsFixtureText: true))
+    }
+}
+
+private final class StderrDiagnosticRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [String] = []
+
+    var lines: [String] {
+        lock.withLock { recorded }
+    }
+
+    func append(_ line: String) {
+        lock.withLock { recorded.append(line) }
     }
 }

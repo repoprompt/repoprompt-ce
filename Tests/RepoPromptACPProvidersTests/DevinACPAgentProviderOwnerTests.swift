@@ -54,27 +54,18 @@ final class DevinACPAgentProviderOwnerTests: XCTestCase {
         }
     }
 
-    func testRoutineInfoStderrIsHiddenWhileActionableOutputRemainsVisible() throws {
+    func testProcessStderrIsDiagnosticOnly() throws {
         let (provider, _) = try makeProvider()
 
-        XCTAssertFalse(provider.shouldEmitStderrLine(
-            "2026-09-14T09:52:20.134260Z  INFO chisel: elapsed_since_main_ms=4 logging initialized"
-        ))
-        XCTAssertFalse(provider.shouldEmitStderrLine(
-            "2026-09-14T09:52:20Z INFO chisel: logging initialized"
-        ))
-        XCTAssertTrue(provider.shouldEmitStderrLine("2026-09-14T09:52:20Z ERROR chisel: startup failed"))
-        XCTAssertFalse(provider.shouldEmitStderrLine(
-            "2026-09-15T11:10:05.047288Z  WARN message_forest: MessageChain tree duplication: system prefix changed"
-        ))
-        XCTAssertFalse(provider.shouldEmitStderrLine(
-            "2026-09-17T09:10:27.520189Z  WARN windsurf_api_client::remote_config: remote config revalidation failed, keeping last-good value: error sending request for url (https://unleash.codeium.com/api/client/features): operation timed out"
-        ))
-        XCTAssertFalse(provider.shouldEmitStderrLine(
-            "2026-09-17T09:11:36Z WARN windsurf_api_client::remote_config: remote config revalidation failed, keeping last-good value: error decoding response body"
-        ))
-        XCTAssertTrue(provider.shouldEmitStderrLine("2026-09-14T09:52:20Z  WARN chisel: retrying"))
-        XCTAssertTrue(provider.shouldEmitStderrLine("permission denied while reading config"))
+        for line in [
+            "2026-09-14T09:52:20Z INFO chisel: logging initialized",
+            "2026-09-14T09:52:20Z ERROR chisel: startup failed",
+            "2026-09-14T09:52:20Z  WARN chisel: retrying",
+            "permission denied while reading config"
+        ] {
+            XCTAssertFalse(provider.shouldEmitStderrLine(line), line)
+            XCTAssertEqual(provider.stderrLineDisposition(line), .diagnosticsOnly, line)
+        }
     }
 
     func testInjectedLaunchPoliciesPreserveOrderingProjectionAndCleanupArtifact() async throws {
