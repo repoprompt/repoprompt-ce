@@ -283,7 +283,15 @@ extension AgentSessionLinkRuntimeBridge {
                 operation: .adminLink, caller: .agentSession(observer.sessionID), callerTabID: observer.tabID,
                 scopeID: scopeID, targetSessionIDs: [targetSessionID], idempotencyKey: "oversee-link:\(requestID.uuidString)"
             )
-            let origin = AppSavedAgentSessionExecution.ApprovedLinkOrigin(observer: observer, target: targetWriter.identity)
+            let origin = await AppSavedAgentSessionExecution.captureApprovedLinkOrigin(observer: observer, writer: targetWriter)
+            guard consentIsCurrent() else {
+                finish(interruptionCode(), subreason: "before_link", detail: "The caller or consent changed before linking. Nothing was delivered.")
+                return
+            }
+            guard targetWriter.isCurrent else {
+                finish("link_refused", subreason: "target_binding_changed", detail: "The prepared target changed before linking. Nothing was delivered.")
+                return
+            }
             let outcome: AgentSessionAdministrationOutcome = try await AppSavedAgentSessionExecution.approvedLinkOrigin.withValue(origin) {
                 try await sessionAdministrationFrontDoor.perform(request)
             }

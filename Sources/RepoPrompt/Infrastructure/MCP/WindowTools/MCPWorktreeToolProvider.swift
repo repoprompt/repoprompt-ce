@@ -351,7 +351,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
 
         let logicalRoot = try await logicalRoot(for: context)
         let logicalRootPath = logicalRoot.standardizedFullPath
-        var mutationRootMappings = try await context.lookupContext.domainMutationPhysicalRootMappings(
+        var mutationRootMappings = await context.lookupContext.domainMutationPhysicalRootMappings(
             store: discovery.store
         )
         mutationRootMappings.append(

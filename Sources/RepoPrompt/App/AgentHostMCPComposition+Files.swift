@@ -20,7 +20,12 @@ extension AgentSessionRuntimeHost {
         let command: AgentSessionRuntimeStore.Command
         let connection: MCPHostRouteResources.FileReadConnection
         let selectionCommit: HostSelectionCommitReceipt
-        let requireCurrent: @MainActor @Sendable () async throws -> Void
+        let currentWorkspace: @MainActor @Sendable () async throws -> DomainWorkspaceSnapshot
+
+        var requireCurrent: @MainActor @Sendable () async throws -> Void {
+            let read = currentWorkspace
+            return { _ = try await read() }
+        }
     }
 
     func captureHostFileInvocation(_ invocation: ToolInvocationContext) async throws -> HostFileInvocation {
@@ -45,25 +50,31 @@ extension AgentSessionRuntimeHost {
             guard lifetime != nil else { throw MCPFileToolAuthorityFailure.worktreeScopeUnavailable }
         } else { lifetime = nil }
         let selectionCommit = HostSelectionCommitReceipt()
-        let requireCurrent: @MainActor @Sendable () async throws -> Void = { [weak self] in
+        let originalPaths = Set(lease.roots.map { ($0.fullPath as NSString).standardizingPath })
+        let currentWorkspace: @MainActor @Sendable () async throws -> DomainWorkspaceSnapshot = { [weak self] in
             try Task.checkCancellation()
-            let workspaceIsCurrent = if let committed = selectionCommit.snapshot {
-                await lease.resources.contexts?.workspaceSnapshot(command.identity.workspaceID) == committed
-            } else { await lease.isCurrent() }
-            guard let self, workspaceIsCurrent,
+            guard let self, await lease.retainedRootsAreCurrent(),
                   await ServerNetworkManager.shared.validateToolInvocationContext(
                       invocation, expectedWindowID: routeID, expectedServerViewModelIdentity: ObjectIdentifier(route)
                   ) else { throw MCPFileToolAuthorityFailure.superseded }
             if let lifetime, await !lifetime.isCurrent() { throw MCPFileToolAuthorityFailure.worktreeScopeUnavailable }
-            guard lease.rootsAreCurrent, hostFileCommand(connection)?.identity == command.identity,
-                  activation.executionTab(in: selectionCommit.snapshot ?? lease.snapshot, command: command)?.selection
-                  == (selectionCommit.selection ?? tab.selection)
-            else {
-                throw MCPFileToolAuthorityFailure.superseded
-            }
+            // Presentation can publish a different read overlay or save unrelated fields when
+            // leaving this workspace. Neither changes the admitted execution incarnation.
+            guard let current = await activation.authority.canonicalWorkspaceSnapshot(command.identity.workspaceID),
+                  !Task.isCancelled, lease.rootsAreCurrent, workspaceActivation === activation,
+                  hostFileCommand(connection)?.identity == command.identity,
+                  current.health != .removed, !lease.snapshot.health.acceptsMutations || current.health.acceptsMutations,
+                  current.document.fileURL == lease.snapshot.document.fileURL,
+                  Set(current.document.metadata.repoPaths.map { ($0 as NSString).standardizingPath }) == originalPaths,
+                  activation.executionTab(in: current, command: command)?.selection == (selectionCommit.selection ?? tab.selection)
+            else { throw MCPFileToolAuthorityFailure.superseded }
+            // isCurrent() also checks disk before this last authority read. The lifetime
+            // generation check below closes the extra suspension without replacing roots.
+            if let lifetime, !lifetime.isGenerationCurrent() { throw MCPFileToolAuthorityFailure.worktreeScopeUnavailable }
+            return current
         }
-        try await requireCurrent()
-        return .init(lease: lease, tab: tab, lookup: lookup, command: command, connection: connection, selectionCommit: selectionCommit, requireCurrent: requireCurrent)
+        _ = try await currentWorkspace()
+        return .init(lease: lease, tab: tab, lookup: lookup, command: command, connection: connection, selectionCommit: selectionCommit, currentWorkspace: currentWorkspace)
     }
 
     func executeHostApplyEdits(_ args: [String: Value], invocation: ToolInvocationContext) async throws -> Value {
@@ -113,8 +124,9 @@ extension AgentSessionRuntimeHost {
                     manualCodemapPaths: selection.manualCodemapPaths, slices: slices, codemapAutoEnabled: selection.codemapAutoEnabled
                 ))
                 do {
+                    let current = try await origin.currentWorkspace()
                     _ = try await activation.commitHostSelection(
-                        updated, replacing: origin.tab.selection, in: origin.lease.snapshot, command: origin.command,
+                        updated, replacing: origin.tab.selection, in: current, command: origin.command,
                         connectionID: origin.connection.connectionID, validatesOrigin: {
                             do { try await requireCurrent()
                                 return true

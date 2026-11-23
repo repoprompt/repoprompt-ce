@@ -1742,7 +1742,7 @@ final class MCPServerViewModel: ObservableObject {
         MCPAppPhysicalCapabilityAdapters.Selection(
             workspaceSearch: workspaceSearch,
             parseManageSelectionInputs: { [weak self] rawPaths, slicesValue in
-                guard let self else {
+                guard self != nil else {
                     return MCPSelectionArguments.Inputs(paths: [], sliceInputs: [], sliceErrors: [], hadExplicitSliceSpec: false)
                 }
                 return MCPSelectionArguments.parse(rawPaths: rawPaths, slicesValue: slicesValue)

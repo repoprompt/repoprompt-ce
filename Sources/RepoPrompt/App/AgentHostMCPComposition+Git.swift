@@ -59,18 +59,19 @@ extension AgentSessionRuntimeHost {
                 try await requireCurrent()
                 return root
             }, commitArtifacts: { candidates in
-                try await requireCurrent()
+                let current = try await origin.currentWorkspace()
                 let merge = WorkspaceGitDiffArtifactSelectionService().mergePrimaryArtifacts(existing: origin.tab.selection, candidates: candidates)
-                origin.selectionCommit.snapshot = try await activation.commitHostSelection(
-                    merge.selection, replacing: origin.tab.selection, in: snapshot, command: origin.command,
+                let committed = try await activation.commitHostSelection(
+                    merge.selection, replacing: origin.tab.selection, in: current, command: origin.command,
                     connectionID: origin.connection.connectionID, validatesOrigin: {
                         do { try await requireCurrent()
                             return true
                         } catch { return false }
                     }
                 )
+                origin.selectionCommit.snapshot = committed ?? current
                 origin.selectionCommit.selection = merge.selection
-                let revision = (origin.selectionCommit.snapshot ?? snapshot).revisions.workingRevision
+                let revision = (committed ?? current).revisions.workingRevision
                 return .init(aliases: merge.newlyAddedArtifacts.compactMap(\.clientAlias), selectionRevision: revision)
             }, advertiseArtifacts: { artifacts, expectedRevision in
                 try await requireCurrent()

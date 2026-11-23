@@ -153,6 +153,45 @@ final class WorkspaceAgentAdmissionCoordinator: @unchecked Sendable {
         }
     #endif
 
+    /// Holds the existing workspace admission lease across canonical preparation and the
+    /// mutation. Presenter refresh is optional; it may not substitute a different workspace.
+    @MainActor
+    func withAdmission<T>(
+        workspaceID: UUID,
+        admissionID: UUID,
+        kind: WorkspaceAgentAdmissionTiming.Kind,
+        classifyOutcome: (T) -> WorkspaceAgentAdmissionTiming.Outcome,
+        classifyError: (Error) -> WorkspaceAgentAdmissionTiming.Outcome,
+        timing: WorkspaceAgentAdmissionTiming,
+        prepare: () async throws -> Void = {},
+        operation: () async throws -> T
+    ) async throws -> T {
+        timing.configure(workspaceID: workspaceID, admissionID: admissionID, kind: kind)
+        var outcome = WorkspaceAgentAdmissionTiming.Outcome.threw
+        defer { timing.finish(outcome: outcome) }
+        do {
+            let lease = try await acquire(
+                workspaceID: workspaceID,
+                admissionID: admissionID
+            )
+            timing.acquired()
+            defer {
+                // Stop measuring before release; emit only after releasing the admission lease.
+                timing.end()
+                lease.release()
+            }
+            try Task.checkCancellation()
+            try await prepare()
+            try Task.checkCancellation()
+            let result = try await operation()
+            outcome = Task.isCancelled ? .cancelled : classifyOutcome(result)
+            return result
+        } catch {
+            outcome = error is CancellationError || Task.isCancelled ? .cancelled : classifyError(error)
+            throw error
+        }
+    }
+
     func acquire(workspaceID: UUID, admissionID: UUID) async throws -> Lease {
         try Task.checkCancellation()
 

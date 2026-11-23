@@ -107,8 +107,9 @@ extension AgentSessionRuntimeHost {
         guard await validatesOrigin() else { throw MCPFileToolAuthorityFailure.superseded }
         let next = lookup.logicalizeSelection(selection.selection)
         if op != "preview", op != "get", next != tab.selection {
+            let current = try await origin.currentWorkspace()
             _ = try await activation.commitHostSelection(
-                next, replacing: tab.selection, in: origin.lease.snapshot, command: origin.command,
+                next, replacing: tab.selection, in: current, command: origin.command,
                 connectionID: origin.connection.connectionID, validatesOrigin: validatesOrigin
             )
         }

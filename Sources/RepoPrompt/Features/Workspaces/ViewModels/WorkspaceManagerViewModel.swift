@@ -185,7 +185,7 @@ final class WorkspaceFileDecodeCache: @unchecked Sendable {
         )
     }
 
-    fileprivate static func decodeWorkspace(
+    static func decodeWorkspace(
         documentBytes: Data
     ) throws -> (workspace: WorkspaceModel, normalizationRequiresSave: Bool) {
         let digest = Data(SHA256.hash(data: documentBytes))
@@ -1925,10 +1925,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     private var pollTimerSaveTaskID: UUID?
     /// The workspace the running poll save was scheduled for (it may no longer be active).
     private var pollTimerSaveWorkspaceID: UUID?
-    private enum AgentAdmissionRecoveryMutation: Hashable {
-        case removeTab
-        case clearBinding
-    }
+    private typealias AgentAdmissionRecoveryMutation = WorkspaceAgentAdmissionDocument.RecoveryMutation
 
     private struct AgentAdmissionRecoveryKey: Hashable {
         let identity: AgentProvisionalAdmissionIdentity
@@ -11593,7 +11590,7 @@ class WorkspaceManagerViewModel: ObservableObject {
               !Task.isCancelled, !isPreparingForWindowClose,
               activeWorkspaceID == identity.workspaceID,
               let local = workspace(withID: identity.workspaceID), !local.isEphemeral,
-              Self.provisionalAdmissionProjection(in: local, identity: identity).containsIdentity,
+              WorkspaceAgentAdmissionDocument.recoveryProjection(in: local, identity: identity).containsIdentity,
               let provisionalTab = local.composeTabs.first(where: { $0.id == identity.tabID }),
               let client = domainWorkspaceAuthorityClient,
               let refresh = domainCatalogRefreshAwaiter,
@@ -11602,7 +11599,7 @@ class WorkspaceManagerViewModel: ObservableObject {
               let canonicalBefore = try? Self.decodeDomainWorkspaceProjection(
                   documentBytes: before.document.documentBytes, fileURL: before.document.fileURL
               ),
-              case .absent = Self.provisionalAdmissionProjection(in: canonicalBefore, identity: identity)
+              case .absent = WorkspaceAgentAdmissionDocument.recoveryProjection(in: canonicalBefore, identity: identity)
         else { return receipt }
         timing?.begin(.catalogRefresh)
         let didRefresh = await refresh()
@@ -11618,7 +11615,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         // An own save may have settled while projection was awaited. Exact canonical evidence
         // is stronger than the lost response; do not publish the same identity again.
-        if Self.provisionalAdmissionProjection(in: canonicalAfter, identity: identity).containsIdentity {
+        if WorkspaceAgentAdmissionDocument.recoveryProjection(in: canonicalAfter, identity: identity).containsIdentity {
             let evidence: AgentAdmissionPersistenceCommitEvidence = after.revisions.dirtyRevision == nil
                 ? .saved(revision: after.revisions.savedRevision, digest: after.document.contentDigest)
                 : .canonicalWorking(revision: after.revisions.workingRevision, digest: after.document.contentDigest)
@@ -11627,9 +11624,9 @@ class WorkspaceManagerViewModel: ObservableObject {
         guard !Task.isCancelled, !isPreparingForWindowClose,
               activeWorkspaceID == identity.workspaceID,
               after.revisions.dirtyRevision == nil,
-              case .absent = Self.provisionalAdmissionProjection(in: canonicalAfter, identity: identity),
+              case .absent = WorkspaceAgentAdmissionDocument.recoveryProjection(in: canonicalAfter, identity: identity),
               let current = workspace(withID: identity.workspaceID),
-              Self.provisionalAdmissionProjection(in: current, identity: identity).containsIdentity,
+              WorkspaceAgentAdmissionDocument.recoveryProjection(in: current, identity: identity).containsIdentity,
               current.composeTabs.first(where: { $0.id == identity.tabID }) == provisionalTab,
               let baseline = fullDocumentWriteBaseline(workspaceID: identity.workspaceID),
               baseline.workingRevision == after.revisions.workingRevision,
@@ -11669,7 +11666,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                documentBytes: snapshot.document.documentBytes,
                fileURL: snapshot.document.fileURL
            ),
-           Self.provisionalAdmissionProjection(in: canonical, identity: identity).containsIdentity
+           WorkspaceAgentAdmissionDocument.recoveryProjection(in: canonical, identity: identity).containsIdentity
         {
             let evidence: AgentAdmissionPersistenceCommitEvidence = if snapshot.revisions.dirtyRevision == nil {
                 .saved(
@@ -11692,7 +11689,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                   documentBytes: data,
                   fileURL: workspaceFileURL(for: workspace)
               ),
-              Self.provisionalAdmissionProjection(in: persisted, identity: identity).containsIdentity,
+              WorkspaceAgentAdmissionDocument.recoveryProjection(in: persisted, identity: identity).containsIdentity,
               let document = try? DomainWorkspaceDocument.decode(
                   documentBytes: data,
                   fileURL: workspaceFileURL(for: workspace)
@@ -11760,19 +11757,6 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
     }
 
-    private enum ProvisionalAdmissionProjection {
-        case absent(WorkspaceModel)
-        case removed(WorkspaceModel)
-        case conflict
-
-        var containsIdentity: Bool {
-            if case .removed = self {
-                return true
-            }
-            return false
-        }
-    }
-
     private struct InMemoryAdmissionRemoval {
         let workspaceIndex: Int
         let stateVersion: Int
@@ -11790,74 +11774,12 @@ class WorkspaceManagerViewModel: ObservableObject {
         case replace(WorkspaceModel)
     }
 
-    private static func provisionalAdmissionProjection(
-        in workspace: WorkspaceModel,
-        identity: AgentProvisionalAdmissionIdentity,
-        mutation: AgentAdmissionRecoveryMutation = .removeTab,
-        modificationDate: Date = Date()
-    ) -> ProvisionalAdmissionProjection {
-        guard workspace.id == identity.workspaceID else { return .conflict }
-        let matchingTabIndices = workspace.composeTabs.indices.filter {
-            workspace.composeTabs[$0].id == identity.tabID
-        }
-        guard matchingTabIndices.count <= 1 else { return .conflict }
-        guard !workspace.stashedTabs.contains(where: {
-            $0.tab.id == identity.tabID || $0.tab.activeAgentSessionID == identity.sessionID
-        }) else { return .conflict }
-
-        guard let tabIndex = matchingTabIndices.first else {
-            guard !workspace.composeTabs.contains(where: {
-                $0.activeAgentSessionID == identity.sessionID
-            }) else { return .conflict }
-            return mutation == .removeTab ? .absent(workspace) : .conflict
-        }
-        if mutation == .clearBinding,
-           workspace.composeTabs[tabIndex].activeAgentSessionID == nil,
-           !workspace.composeTabs.enumerated().contains(where: { index, tab in
-               index != tabIndex && tab.activeAgentSessionID == identity.sessionID
-           })
-        {
-            return .absent(workspace)
-        }
-        guard workspace.composeTabs[tabIndex].activeAgentSessionID == identity.sessionID,
-              !workspace.composeTabs.enumerated().contains(where: { index, tab in
-                  index != tabIndex && tab.activeAgentSessionID == identity.sessionID
-              })
-        else { return .conflict }
-
-        var recovered = workspace
-        switch mutation {
-        case .removeTab:
-            let removedWasActive = recovered.activeComposeTabID == identity.tabID
-            recovered.composeTabs.remove(at: tabIndex)
-            if recovered.composeTabs.isEmpty {
-                let replacement = ComposeTabState(id: identity.replacementTabID)
-                recovered.composeTabs = [replacement]
-                recovered.activeComposeTabID = replacement.id
-            } else if removedWasActive {
-                let fallbackIndex = min(tabIndex, recovered.composeTabs.count - 1)
-                recovered.activeComposeTabID = recovered.composeTabs[fallbackIndex].id
-            }
-        case .clearBinding:
-            recovered.composeTabs[tabIndex].activeAgentSessionID = nil
-            recovered.composeTabs[tabIndex].lastModified = modificationDate
-        }
-        recovered.dateModified = modificationDate
-
-        var structuralExpectation = workspace
-        structuralExpectation.composeTabs = recovered.composeTabs
-        structuralExpectation.activeComposeTabID = recovered.activeComposeTabID
-        structuralExpectation.dateModified = recovered.dateModified
-        guard structuralExpectation == recovered else { return .conflict }
-        return .removed(recovered)
-    }
-
     private func prepareProvisionalAdmissionRemovalFromMemory(
         _ identity: AgentProvisionalAdmissionIdentity,
         mutation: AgentAdmissionRecoveryMutation
     ) -> PreparedInMemoryAdmissionRemoval? {
         guard let index = workspaceIndex(for: identity.workspaceID) else { return nil }
-        let projection = Self.provisionalAdmissionProjection(
+        let projection = WorkspaceAgentAdmissionDocument.recoveryProjection(
             in: workspaces[index],
             identity: identity,
             mutation: mutation
@@ -11880,7 +11802,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 live.composeTabs = promptViewModel.currentComposeTabs
                 live.stashedTabs = promptViewModel.currentStashedTabs
                 live.activeComposeTabID = promptViewModel.activeComposeTabID
-                switch Self.provisionalAdmissionProjection(
+                switch WorkspaceAgentAdmissionDocument.recoveryProjection(
                     in: live,
                     identity: identity,
                     mutation: mutation
@@ -12011,399 +11933,83 @@ class WorkspaceManagerViewModel: ObservableObject {
             }
         #endif
 
-        await drainWorkingCommitsForAdmissionRecovery(workspaceID: identity.workspaceID)
-        var removal: InMemoryAdmissionRemoval?
-        for _ in 0 ..< 3 {
-            guard let snapshot = await domainWorkspaceAuthorityClient.canonicalWorkspaceSnapshot(identity.workspaceID) else {
-                if let owned = agentAdmissionRecoveryWorkingCommits[key] {
-                    return .retryablePartial(owned)
-                }
-                return .failed(.durabilityUncertain)
-            }
-            guard snapshot.health.acceptsMutations else {
-                return .failed(.authorityReadOnly)
-            }
-            guard let canonical = try? Self.decodeDomainWorkspaceProjection(
-                documentBytes: snapshot.document.documentBytes,
-                fileURL: snapshot.document.fileURL
-            ) else {
-                return .failed(.unrecoverableDocument)
-            }
-            let canonicalProjection = Self.provisionalAdmissionProjection(
-                in: canonical,
-                identity: identity,
-                mutation: mutation,
-                modificationDate: canonical.dateModified
+        #if DEBUG
+            let hooks = WorkspaceAgentAdmissionRecovery.Hooks(
+                allowWorkingSave: { await self.agentAdmissionRecoveryWorkingCommitHandlerForTesting?(identity.workspaceID, $0) ?? true },
+                observeSaveResponse: { await self.agentAdmissionRecoverySaveResponseHandlerForTesting?(identity.workspaceID, $0) ?? true },
+                allowReplacementPreparation: { self.agentAdmissionRecoveryReplacementPreparationHandlerForTesting?(identity.workspaceID) ?? true },
+                interceptReplacement: { await self.agentAdmissionRecoveryReplacementDispatchHandlerForTesting?(identity.workspaceID, $0) },
+                observeReplacementResponse: { await self.agentAdmissionRecoveryReplacementResponseHandlerForTesting?(identity.workspaceID, $0) ?? true },
+                allowCanonicalRead: { await self.agentAdmissionRecoveryPostReplacementCanonicalReadHandlerForTesting?(identity.workspaceID) ?? true }
             )
-            if let owned = agentAdmissionRecoveryWorkingCommits[key] {
-                let stillOwned = switch canonicalProjection {
-                case .absent:
-                    owned.revision == snapshot.revisions.workingRevision
-                        && owned.digest == snapshot.document.contentDigest
-                case .removed:
-                    snapshot.revisions.workingRevision &+ 1 == owned.revision
-                case .conflict:
-                    false
-                }
-                guard stillOwned else {
-                    agentAdmissionRecoveryWorkingCommits.removeValue(forKey: key)
-                    if case .conflict = canonicalProjection {
-                        return terminalRecoveryOutcomeForCanonicalConflict(
-                            identity,
-                            mutation: mutation,
-                            removal: removal,
-                            canonical: canonical,
-                            snapshot: snapshot
-                        )
-                    }
-                    return .ownershipChanged
-                }
-            }
-            switch canonicalProjection {
-            case .conflict:
-                return terminalRecoveryOutcomeForCanonicalConflict(
-                    identity,
-                    mutation: mutation,
-                    removal: removal,
-                    canonical: canonical,
-                    snapshot: snapshot
-                )
-            case .absent:
-                if removal == nil,
-                   agentAdmissionRecoveryWorkingCommits[key] == nil
-                {
-                    guard let applied = removeProvisionalAdmissionFromMemory(
-                        identity,
-                        mutation: mutation
-                    ) else {
-                        return .ownershipChanged
-                    }
-                    removal = applied
-                    await drainWorkingCommitsForAdmissionRecovery(workspaceID: identity.workspaceID)
-                }
-                if snapshot.revisions.dirtyRevision == nil {
-                    reconcileRecoveredAdmission(
-                        identity,
-                        mutation: mutation,
-                        removal: removal,
-                        snapshot: snapshot
-                    )
-                    agentAdmissionRecoveryWorkingCommits.removeValue(forKey: key)
-                    return .alreadyRecovered(
-                        revision: snapshot.revisions.savedRevision,
-                        digest: snapshot.document.contentDigest
+        #else
+            let hooks = WorkspaceAgentAdmissionRecovery.Hooks()
+        #endif
+        return await WorkspaceAgentAdmissionRecovery.recover(
+            identity: identity, mutation: mutation,
+            store: domainWorkspaceAuthorityClient.store,
+            origin: .appPresentation(windowID: domainWorkspaceAuthorityClient.windowID),
+            decode: { try Self.decodeDomainWorkspaceProjection(documentBytes: $0.documentBytes, fileURL: $0.fileURL) },
+            workingCommit: .init(
+                read: { self.agentAdmissionRecoveryWorkingCommits[key] },
+                record: { self.retainAgentAdmissionRecoveryWorkingCommit($0, for: key) },
+                forget: { self.agentAdmissionRecoveryWorkingCommits.removeValue(forKey: key) }
+            ),
+            projection: .init(
+                drainWrites: { await self.drainWorkingCommitsForAdmissionRecovery(workspaceID: identity.workspaceID) },
+                remove: { self.removeProvisionalAdmissionFromMemory(identity, mutation: mutation) },
+                prepareWrite: { self.prepareAdmissionRecoveryProjectionWrite(workspaceID: identity.workspaceID, snapshot: $0) },
+                observeOutcome: { self.applyDomainAuthorityOutcome($0, workspaceID: identity.workspaceID) },
+                reconcile: {
+                    self.reconcileRecoveredAdmission(identity, mutation: mutation, removal: $0, snapshot: $1)
+                },
+                resolveConflict: {
+                    self.terminalRecoveryOutcomeForCanonicalConflict(
+                        identity, mutation: mutation, removal: $0, canonical: $1, snapshot: $2
                     )
                 }
-                guard let owned = agentAdmissionRecoveryWorkingCommits[key],
-                      owned.revision == snapshot.revisions.workingRevision,
-                      owned.digest == snapshot.document.contentDigest
-                else { return .ownershipChanged }
-                #if DEBUG
-                    if await agentAdmissionRecoveryWorkingCommitHandlerForTesting?(
-                        identity.workspaceID,
-                        owned
-                    ) == false {
-                        return .retryablePartial(owned)
-                    }
-                #endif
-                let saveOutcome = await saveRecoveryOwnedWorkingDocument(
-                    client: domainWorkspaceAuthorityClient,
-                    workspaceID: identity.workspaceID,
-                    expectedRevision: owned.revision
-                )
-                #if DEBUG
-                    let responseArrived = await agentAdmissionRecoverySaveResponseHandlerForTesting?(
-                        identity.workspaceID,
-                        saveOutcome
-                    ) ?? true
-                #else
-                    let responseArrived = true
-                #endif
-                if responseArrived {
-                    applyDomainAuthorityOutcome(saveOutcome, workspaceID: identity.workspaceID)
-                }
-                guard let final = await domainWorkspaceAuthorityClient.canonicalWorkspaceSnapshot(identity.workspaceID)
-                else { return .retryablePartial(owned) }
-                if final.revisions.dirtyRevision == nil,
-                   final.document.contentDigest == owned.digest
-                {
-                    reconcileRecoveredAdmission(
-                        identity,
-                        mutation: mutation,
-                        removal: removal,
-                        snapshot: final
-                    )
-                    agentAdmissionRecoveryWorkingCommits.removeValue(forKey: key)
-                    return .recovered(
-                        revision: final.revisions.savedRevision,
-                        digest: final.document.contentDigest
-                    )
-                }
-                if final.revisions.workingRevision == owned.revision,
-                   final.document.contentDigest == owned.digest
-                {
-                    return .retryablePartial(owned)
-                }
-                continue
-            case let .removed(recovered):
-                let recoveryWriteBaseline = fullDocumentWriteBaseline(workspaceID: identity.workspaceID).flatMap { baseline in
-                    baseline.workingRevision == snapshot.revisions.workingRevision
-                        && baseline.contentDigest == snapshot.document.contentDigest
-                        && baseline.fileURL == snapshot.document.fileURL ? baseline : nil
-                }
-                #if DEBUG
-                    guard agentAdmissionRecoveryReplacementPreparationHandlerForTesting?(
-                        identity.workspaceID
-                    ) != false else {
-                        return .failed(.persistenceFailure)
-                    }
-                #endif
-                let replacementDocument: DomainWorkspaceDocument
-                do {
-                    replacementDocument = try Self.recoveryDomainWorkspaceDocument(
-                        for: recovered,
-                        fileURL: snapshot.document.fileURL
-                    )
-                } catch {
-                    return .failed(.persistenceFailure)
-                }
-                if removal == nil {
-                    guard let applied = removeProvisionalAdmissionFromMemory(
-                        identity,
-                        mutation: mutation
-                    ) else {
-                        return .ownershipChanged
-                    }
-                    removal = applied
-                    await drainWorkingCommitsForAdmissionRecovery(workspaceID: identity.workspaceID)
-                }
-                let anticipated = AgentAdmissionRecoveryWorkingCommit(
-                    revision: snapshot.revisions.workingRevision &+ 1,
-                    digest: replacementDocument.contentDigest
-                )
-                if let retained = agentAdmissionRecoveryWorkingCommits[key],
-                   retained != anticipated
-                {
-                    agentAdmissionRecoveryWorkingCommits.removeValue(forKey: key)
-                    return .ownershipChanged
-                }
-                retainAgentAdmissionRecoveryWorkingCommit(anticipated, for: key)
-                let replacementOperationID = UUID()
-                if let recoveryWriteBaseline,
-                   fullDocumentWriteBaseline(workspaceID: identity.workspaceID) == recoveryWriteBaseline
-                {
-                    // This patch owns only the provisional identity. It may carry forward an
-                    // adopted ancestor, but cannot bless unrelated unprojected canonical bytes.
-                    try? registerPendingFullDocumentWrite(
-                        recovered, baseline: recoveryWriteBaseline,
-                        operationIDs: [replacementOperationID], permitsLocalDescendants: true
-                    )
-                }
-                defer { pendingFullDocumentWrites.removeValue(forKey: replacementOperationID) }
-                #if DEBUG
-                    let injectedReplacementOutcome = await agentAdmissionRecoveryReplacementDispatchHandlerForTesting?(
-                        identity.workspaceID,
-                        snapshot.revisions.workingRevision
-                    )
-                #else
-                    let injectedReplacementOutcome: DomainCommandOutcome? = nil
-                #endif
-                let replacementOutcome = if let injectedReplacementOutcome {
-                    injectedReplacementOutcome
-                } else {
-                    await replaceRecoveryWorkingDocument(
-                        client: domainWorkspaceAuthorityClient,
-                        document: replacementDocument,
-                        expectedRevision: snapshot.revisions.workingRevision,
-                        operationID: replacementOperationID
-                    )
-                }
-                #if DEBUG
-                    let replacementResponseArrived = await agentAdmissionRecoveryReplacementResponseHandlerForTesting?(
-                        identity.workspaceID,
-                        replacementOutcome
-                    ) ?? true
-                #else
-                    let replacementResponseArrived = true
-                #endif
-                if replacementResponseArrived {
-                    applyDomainAuthorityOutcome(replacementOutcome, workspaceID: identity.workspaceID)
-                }
-
-                #if DEBUG
-                    let shouldReadCanonical = await agentAdmissionRecoveryPostReplacementCanonicalReadHandlerForTesting?(
-                        identity.workspaceID
-                    ) ?? true
-                #else
-                    let shouldReadCanonical = true
-                #endif
-                guard shouldReadCanonical,
-                      let working = await domainWorkspaceAuthorityClient.canonicalWorkspaceSnapshot(identity.workspaceID),
-                      let workingModel = try? Self.decodeDomainWorkspaceProjection(
-                          documentBytes: working.document.documentBytes,
-                          fileURL: working.document.fileURL
-                      )
-                else { return .retryablePartial(anticipated) }
-                switch Self.provisionalAdmissionProjection(
-                    in: workingModel,
-                    identity: identity,
-                    mutation: mutation,
-                    modificationDate: workingModel.dateModified
-                ) {
-                case .conflict:
-                    return terminalRecoveryOutcomeForCanonicalConflict(
-                        identity,
-                        mutation: mutation,
-                        removal: removal,
-                        canonical: workingModel,
-                        snapshot: working
-                    )
-                case .removed:
-                    guard working.revisions == snapshot.revisions,
-                          working.document.contentDigest == snapshot.document.contentDigest
-                    else { return .ownershipChanged }
-                    return .retryablePartial(anticipated)
-                case .absent:
-                    guard working.document.contentDigest == anticipated.digest,
-                          working.revisions.workingRevision == anticipated.revision
-                    else { return .ownershipChanged }
-                }
-
-                if pendingFullDocumentWriteMatches(
-                    operationID: replacementOperationID, workspaceID: identity.workspaceID,
-                    workingRevision: working.revisions.workingRevision, digest: working.document.contentDigest
-                ) {
-                    // A lost response can be resolved by this existing exact canonical read;
-                    // an anticipated revision alone is never evidence of an accepted write.
-                    applyDomainAuthorityBaseline(
-                        workspaceID: identity.workspaceID, revisions: working.revisions,
-                        digest: working.document.contentDigest, health: working.health,
-                        catalogRevision: domainWorkspaceCatalogRevision
-                    )
-                    adoptFullDocumentBaseline(
-                        workspaceID: identity.workspaceID, revisions: working.revisions,
-                        digest: working.document.contentDigest, fileURL: working.document.fileURL
-                    )
-                }
-                if working.revisions.dirtyRevision == nil {
-                    reconcileRecoveredAdmission(
-                        identity,
-                        mutation: mutation,
-                        removal: removal,
-                        snapshot: working
-                    )
-                    agentAdmissionRecoveryWorkingCommits.removeValue(forKey: key)
-                    return .recovered(
-                        revision: working.revisions.savedRevision,
-                        digest: working.document.contentDigest
-                    )
-                }
-                let owned = anticipated
-                #if DEBUG
-                    if await agentAdmissionRecoveryWorkingCommitHandlerForTesting?(
-                        identity.workspaceID,
-                        owned
-                    ) == false {
-                        return .retryablePartial(owned)
-                    }
-                #endif
-
-                let saveOutcome = await saveRecoveryOwnedWorkingDocument(
-                    client: domainWorkspaceAuthorityClient,
-                    workspaceID: identity.workspaceID,
-                    expectedRevision: owned.revision
-                )
-                #if DEBUG
-                    let responseArrived = await agentAdmissionRecoverySaveResponseHandlerForTesting?(
-                        identity.workspaceID,
-                        saveOutcome
-                    ) ?? true
-                #else
-                    let responseArrived = true
-                #endif
-                if responseArrived {
-                    applyDomainAuthorityOutcome(saveOutcome, workspaceID: identity.workspaceID)
-                }
-                guard let final = await domainWorkspaceAuthorityClient.canonicalWorkspaceSnapshot(identity.workspaceID)
-                else { return .retryablePartial(owned) }
-                if final.revisions.dirtyRevision == nil,
-                   final.document.contentDigest == owned.digest
-                {
-                    reconcileRecoveredAdmission(
-                        identity,
-                        mutation: mutation,
-                        removal: removal,
-                        snapshot: final
-                    )
-                    agentAdmissionRecoveryWorkingCommits.removeValue(forKey: key)
-                    return .recovered(
-                        revision: final.revisions.savedRevision,
-                        digest: final.document.contentDigest
-                    )
-                }
-                if final.revisions.workingRevision == owned.revision,
-                   final.document.contentDigest == owned.digest
-                {
-                    return .retryablePartial(owned)
-                }
-            }
-        }
-        return .failed(.authorityRevisionConflict)
-    }
-
-    private static func recoveryDomainWorkspaceDocument(
-        for workspace: WorkspaceModel,
-        fileURL: URL
-    ) throws -> DomainWorkspaceDocument {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        let bytes = try encoder.encode(workspace)
-        return try DomainWorkspaceDocument.decode(documentBytes: bytes, fileURL: fileURL)
-    }
-
-    private func replaceRecoveryWorkingDocument(
-        client: DomainWorkspaceAuthorityClient,
-        document: DomainWorkspaceDocument,
-        expectedRevision: UInt64,
-        operationID: UUID
-    ) async -> DomainCommandOutcome {
-        let envelope = DomainWorkspaceCommandEnvelope(
-            operationID: operationID,
-            expectedWorkspaceRevision: expectedRevision,
-            conflictRecoveryPolicy: .failClosed,
-            origin: .appPresentation(windowID: client.windowID),
-            command: .replaceWorkingDocument(document)
+            ),
+            hooks: hooks
         )
-        let first = await client.store.execute(envelope)
-        guard first.disposition == .failed,
-              first.errorCode == .lockTimedOut || first.errorCode == .cancelled,
-              !Task.isCancelled
-        else { return first }
-        await Task.yield()
-        return await client.store.execute(envelope)
     }
 
-    /// Recovery has already fenced the canonical revision and digest. Submitting only the save
-    /// command preserves that working document byte-for-byte and cannot create a newer revision.
-    private func saveRecoveryOwnedWorkingDocument(
-        client: DomainWorkspaceAuthorityClient,
+    private func prepareAdmissionRecoveryProjectionWrite(
         workspaceID: UUID,
-        expectedRevision: UInt64
-    ) async -> DomainCommandOutcome {
-        let envelope = DomainWorkspaceCommandEnvelope(
-            operationID: UUID(),
-            expectedWorkspaceRevision: expectedRevision,
-            conflictRecoveryPolicy: .failClosed,
-            origin: .appPresentation(windowID: client.windowID),
-            command: .saveWorkspaceDocument(workspaceID: workspaceID)
+        snapshot: DomainWorkspaceSnapshot
+    ) -> WorkspaceAgentAdmissionRecovery.ProjectionWrite {
+        let baseline = fullDocumentWriteBaseline(workspaceID: workspaceID).flatMap { baseline in
+            baseline.workingRevision == snapshot.revisions.workingRevision
+                && baseline.contentDigest == snapshot.document.contentDigest
+                && baseline.fileURL == snapshot.document.fileURL ? baseline : nil
+        }
+        return .init(
+            register: { recovered, operationID in
+                if let baseline, self.fullDocumentWriteBaseline(workspaceID: workspaceID) == baseline {
+                    // Only carry forward an adopted ancestor, not unrelated unprojected bytes.
+                    try? self.registerPendingFullDocumentWrite(
+                        recovered, baseline: baseline,
+                        operationIDs: [operationID], permitsLocalDescendants: true
+                    )
+                }
+                return { self.pendingFullDocumentWrites.removeValue(forKey: operationID) }
+            },
+            didReadCanonical: { working, operationID in
+                guard self.pendingFullDocumentWriteMatches(
+                    operationID: operationID, workspaceID: workspaceID,
+                    workingRevision: working.revisions.workingRevision, digest: working.document.contentDigest
+                ) else { return }
+                // Only exact canonical evidence resolves a lost response.
+                self.applyDomainAuthorityBaseline(
+                    workspaceID: workspaceID, revisions: working.revisions,
+                    digest: working.document.contentDigest, health: working.health,
+                    catalogRevision: self.domainWorkspaceCatalogRevision
+                )
+                self.adoptFullDocumentBaseline(
+                    workspaceID: workspaceID, revisions: working.revisions,
+                    digest: working.document.contentDigest, fileURL: working.document.fileURL
+                )
+            }
         )
-        let first = await client.store.execute(envelope)
-        guard first.disposition == .failed,
-              first.errorCode == .lockTimedOut || first.errorCode == .cancelled,
-              !Task.isCancelled
-        else { return first }
-        await Task.yield()
-        return await client.store.execute(envelope)
     }
 
     private func reconcileRecoveredAdmission(
@@ -12424,7 +12030,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                documentBytes: snapshot.document.documentBytes,
                fileURL: snapshot.document.fileURL
            ),
-           case .absent = Self.provisionalAdmissionProjection(
+           case .absent = WorkspaceAgentAdmissionDocument.recoveryProjection(
                in: canonical,
                identity: identity,
                mutation: mutation
@@ -12630,7 +12236,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         } catch {
             return .failed(.unrecoverableDocument)
         }
-        switch Self.provisionalAdmissionProjection(
+        switch WorkspaceAgentAdmissionDocument.recoveryProjection(
             in: persisted,
             identity: identity,
             mutation: mutation
@@ -12672,7 +12278,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             }
             guard verified.id == identity.workspaceID,
                   verified == recoveredPersisted,
-                  case .absent = Self.provisionalAdmissionProjection(
+                  case .absent = WorkspaceAgentAdmissionDocument.recoveryProjection(
                       in: verified,
                       identity: identity,
                       mutation: mutation
@@ -13087,32 +12693,15 @@ class WorkspaceManagerViewModel: ObservableObject {
         operation: @MainActor () async throws -> T
     ) async throws -> T {
         let timing = injectedTiming ?? makeAgentAdmissionTiming()
-        timing.configure(workspaceID: workspaceID, admissionID: admissionID, kind: kind)
-        var outcome = WorkspaceAgentAdmissionTiming.Outcome.threw
-        defer { timing.finish(outcome: outcome) }
-        do {
-            let lease = try await workspaceAgentAdmissionCoordinator.acquire(
-                workspaceID: workspaceID,
-                admissionID: admissionID
-            )
-            timing.acquired()
-            defer {
-                // Stop measuring before release; emit only after releasing the admission lease.
-                timing.end()
-                lease.release()
-            }
-            try Task.checkCancellation()
-            if refreshCanonicalState {
-                try await refreshCanonicalWorkspaceForAgentAdmission(workspaceID: workspaceID, timing: timing)
-            }
-            try Task.checkCancellation()
-            let result = try await operation()
-            outcome = Task.isCancelled ? .cancelled : classifyOutcome(result)
-            return result
-        } catch {
-            outcome = error is CancellationError || Task.isCancelled ? .cancelled : classifyError(error)
-            throw error
-        }
+        return try await workspaceAgentAdmissionCoordinator.withAdmission(
+            workspaceID: workspaceID, admissionID: admissionID, kind: kind,
+            classifyOutcome: classifyOutcome, classifyError: classifyError, timing: timing,
+            prepare: {
+                if refreshCanonicalState {
+                    try await self.refreshCanonicalWorkspaceForAgentAdmission(workspaceID: workspaceID, timing: timing)
+                }
+            }, operation: operation
+        )
     }
 
     func reserveProvisionalAgentSession(

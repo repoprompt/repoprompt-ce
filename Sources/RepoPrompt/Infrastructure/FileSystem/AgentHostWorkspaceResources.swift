@@ -75,11 +75,17 @@ struct AgentHostWorkspaceResources {
             !isReleased && retention.rootLifetimesAreCurrent && (rootOwner?.rootsAreCurrent ?? true)
         }
 
+        /// The same retained roots can outlive a presentation/document revision. Mutation
+        /// callers must prove their canonical carrier separately, never reacquire replacement roots.
+        func retainedRootsAreCurrent() async -> Bool {
+            guard rootsAreCurrent, await resources.files.isRootRetentionCurrent(retention) else { return false }
+            return rootsAreCurrent
+        }
+
         func isCurrent() async -> Bool {
             guard rootsAreCurrent,
-                  await resources.contexts?.workspaceSnapshot(snapshot.document.workspaceID) == snapshot,
-                  await resources.files.isRootRetentionCurrent(retention) else { return false }
-            return rootsAreCurrent
+                  await resources.contexts?.workspaceSnapshot(snapshot.document.workspaceID) == snapshot else { return false }
+            return await retainedRootsAreCurrent()
         }
 
         /// A request captures fresh canonical bytes while borrowing this activation's existing
