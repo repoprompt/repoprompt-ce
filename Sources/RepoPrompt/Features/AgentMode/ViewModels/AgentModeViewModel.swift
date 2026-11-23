@@ -9651,8 +9651,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) throws {
         guard let session = sessions[targetTabID],
               session.activeAgentSessionID == targetSessionID,
-              let controlContext = session.mcpControlContext,
-              controlContext.sessionID == targetSessionID
+              session.mcpControlContext?.sessionID == targetSessionID
         else {
             throw AgentRunOracleReviewUnavailableReason.targetActivationMismatch
         }
@@ -9660,29 +9659,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             throw AgentRunOracleReviewUnavailableReason.targetWorkspaceMismatch
         }
 
-        // Target conversation lineage is independent from packaging-source provenance. A
-        // top-level child may delegate a non-Agent compose tab (or an explicitly targeted Agent
-        // tab) without making that source session its conversation parent.
-        let validationFailure: AgentRunOracleReviewUnavailableReason? = if source.workspaceID != targetWorkspaceID {
-            .targetWorkspaceMismatch
-        } else if session.parentSessionID != expectedParentSessionID {
-            .parentSessionMismatch
-        } else {
-            nil
-        }
-
-        mcpRuntime.mcpRemoveAgentRunOracleReviewContexts(sessionID: targetSessionID)
-        pendingAgentRunOracleReviewContextsBySessionID[targetSessionID] = PendingAgentRunOracleReviewContext(
-            source: source,
-            target: AgentRunOracleReviewTargetSnapshot(
-                tabID: targetTabID,
-                workspaceID: targetWorkspaceID,
-                agentSessionID: targetSessionID,
-                activationID: controlContext.activationID,
-                expectedParentSessionID: expectedParentSessionID,
-                worktreeBindings: session.worktreeBindings,
-                validationFailure: validationFailure
-            )
+        try mcpRuntime.stageAgentRunOracleReviewSource(
+            source, session: session, sessionID: targetSessionID,
+            workspaceID: targetWorkspaceID, expectedParentSessionID: expectedParentSessionID
         )
     }
 

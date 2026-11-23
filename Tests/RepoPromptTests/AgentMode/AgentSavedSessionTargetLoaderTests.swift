@@ -228,7 +228,7 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
         )
         addTeardownBlock { await transport.fullShutdown() }
         let promptGate = try AgentSessionLinkACPResponseGate(directory: directory)
-        defer { promptGate.release() }
+        defer { promptGate.release(consumers: 2) }
         let provider = AgentSessionLinkCapturingACPProvider(
             providerID: .openCode, commandPath: script.path, environment: [
                 "ACP_ASSISTANT_TEXT_ON_PROMPT": assistantText,
@@ -278,6 +278,7 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                 let writer = try loaded.get()
                 let host = try XCTUnwrap(writer.scope.executableHost)
                 var originalFileReceipt: AgentSessionRuntimeHost.HostFileInvocation?
+                var acceptedChild: AgentRunHostChildCreation?
                 do {
                     XCTAssertEqual(writer.session.tabID, stash.tab.id)
                     XCTAssertEqual(writer.session.items.map(\.text), ["Saved request", "Saved response"])
@@ -520,10 +521,51 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                     let recoveredWorkspace = try await spawn.canonicalWorkspace()
                     XCTAssertEqual(recoveredWorkspace.composeTabs, [visible])
                     XCTAssertEqual(recoveredWorkspace.lastSearchQuery, "flushed while leaving A")
-                    promptGate.release()
+                    let reviewSource = await spawn.captureOracleReviewSource()
+                    let launched = try await AgentRunHostChildCreation.publish(from: spawn, name: "Accepted child")
+                    acceptedChild = launched
+                    let childMessage = "Run the independent child witness"
+                    let childOutcome = try await launched.start(
+                        from: spawn, message: childMessage,
+                        selection: .init(resolved: .init(agentRaw: "openCode", modelRaw: "model-a", taskLabelKind: .pair, modelParameterSelections: []), routedTarget: nil),
+                        parameters: [], workflow: nil, reviewSource: reviewSource,
+                        expiry: .init(toolName: "agent_run", budgetSeconds: 10)
+                    )
+                    XCTAssertEqual(childOutcome.delivery, .startedRun)
+                    XCTAssertEqual(childOutcome.snapshot.sessionID, launched.command.identity.sessionID)
+                    XCTAssertEqual(childOutcome.snapshot.parentSessionID, fixture.sessionID)
+                    XCTAssertTrue(spawn.sourceIsCurrent, "Starting the child does not rebind its caller")
+                    // The scripted ACP provider does not connect its own MCP client. Complete
+                    // the child's handshake independently, with its issued policy and route.
+                    let childReceipt = try await originatingPolicyReceipt(for: launched.command.writer.session)
+                    let childConnectionID = UUID()
+                    let childInstallation = await launched.host.route.installPendingPolicy(
+                        childReceipt, connectionID: childConnectionID, clientName: nil, tabID: launched.command.writer.session.tabID
+                    )
+                    let childToken = try XCTUnwrap(childInstallation?.token)
+                    let childBindingIsCurrent = await launched.host.route.canCommitPendingPolicy(childReceipt, token: childToken)
+                    XCTAssertTrue(childBindingIsCurrent)
+                    await ServerNetworkManager.shared.debugSeedConnectionRunRouting(
+                        connectionID: childConnectionID, runID: childReceipt.runID, purpose: .agentModeRun,
+                        windowID: launched.host.routeID, registration: childReceipt
+                    )
+                    let childGeneration = try XCTUnwrap(childReceipt.routingWaitGeneration)
+                    await MCPRoutingWaiter.notifyRouted(runID: childReceipt.runID, generation: childGeneration)
+                    promptGate.release(consumers: 2)
+                    await launched.command.writer.session.agentTask?.value
                     await writer.session.agentTask?.value
-                    XCTAssertEqual(provider.promptedMessages.count, 1)
-                    XCTAssertTrue(provider.promptedMessages.first?.userMessage.contains(message) == true)
+                    XCTAssertEqual(provider.promptedMessages.count, 2)
+                    XCTAssertTrue(provider.promptedMessages.contains { $0.userMessage.contains(message) })
+                    XCTAssertTrue(provider.promptedMessages.contains { $0.userMessage.contains(childMessage) })
+                    let childDrain = launched.host.beginFinalShutdown()
+                    childDrain.startIfNeeded()
+                    let childSettlement = await childDrain.wait(until: .now.advanced(by: .seconds(5)))
+                    XCTAssertEqual(childSettlement, .released)
+                    let durableChild = try await fixture.service.loadAgentSession(id: launched.command.identity.sessionID, for: workspace)
+                    XCTAssertEqual(durableChild?.parentSessionID, fixture.sessionID)
+                    let childRows = try XCTUnwrap(durableChild).workingSourceItems()
+                    XCTAssertTrue(childRows.contains { $0.kind == .assistant && $0.text.contains(assistantText) }, "Missing durable child reply: \(childRows.map(\.text))")
+                    acceptedChild = nil
                     let parent = UUID()
                     let placement = try XCTUnwrap(SessionAdminWindowsStructureHost().commitOrganizationalPlacement(
                         sessionID: fixture.sessionID, parentID: parent, delegationScopeID: nil
@@ -539,13 +581,25 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                     let current = await runtime.workspaceStore.canonicalWorkspaceSnapshot(workspace.id)
                     let document = try XCTUnwrap(current?.document.documentBytes)
                     let unchanged = try JSONDecoder().decode(WorkspaceModel.self, from: document)
-                    XCTAssertEqual(unchanged.composeTabs, [visible])
+                    XCTAssertEqual(unchanged.composeTabs.count, 2)
+                    XCTAssertEqual(unchanged.composeTabs.first, visible)
+                    XCTAssertEqual(unchanged.composeTabs.last?.activeAgentSessionID, launched.command.identity.sessionID)
+                    XCTAssertEqual(unchanged.activeComposeTabID, departingWorkspace.activeComposeTabID)
                     XCTAssertEqual(unchanged.stashedTabs, [stash])
                     XCTAssertEqual(unchanged.lastSearchQuery, "flushed while leaving A")
                     XCTAssertEqual(WindowState.windowCounter, count)
                     XCTAssertEqual(PromptViewModel.constructionCountForTesting, promptCount)
                     XCTAssertEqual(WorkspaceManagerViewModel.constructionCountForTesting, workspaceCount)
                 } catch {
+                    promptGate.release(consumers: 2)
+                    if let acceptedChild {
+                        await acceptedChild.discardIfProvisional()
+                        if !acceptedChild.host.scope.hasReleasedWriterClaims {
+                            let childDrain = acceptedChild.host.beginFinalShutdown()
+                            childDrain.startIfNeeded()
+                            _ = await childDrain.wait(until: .now.advanced(by: .seconds(5)))
+                        }
+                    }
                     let drain = host.beginFinalShutdown()
                     drain.startIfNeeded()
                     _ = await drain.wait(until: .now.advanced(by: .seconds(5)))

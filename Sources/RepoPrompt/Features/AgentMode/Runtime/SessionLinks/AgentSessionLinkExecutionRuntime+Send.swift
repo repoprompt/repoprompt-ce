@@ -553,6 +553,7 @@ extension AgentSessionLinkExecutionRuntime {
         delegationDecisionBatch: AgentDelegationDecisionBatch? = nil,
         stopFence: AgentRunStartStopFence,
         providerSwitchPreparation: ProviderSwitchSendPreparation? = nil,
+        directStartOptions: AgentDirectRunStartOptions? = nil,
         dispatchIsCurrent: @MainActor () -> Bool
     ) async -> AgentSessionLinkSendTransactionOutcome {
         guard let owner = scope, !owner.hasReleasedWriterClaims, !owner.isRetiring else {
@@ -648,7 +649,7 @@ extension AgentSessionLinkExecutionRuntime {
         return await startPersistedNoncomposerTurn(
             session: liveSession, tabID: tabID, claim: claim, savedItemID: userItem.id,
             acceptedAt: Date(), providerMessage: providerMessage, stopFence: stopFence,
-            providerSwitchPreparation: switchPreparation,
+            providerSwitchPreparation: switchPreparation, directStartOptions: directStartOptions,
             dispatchIsCurrent: dispatchIsCurrent
         )
     }
@@ -658,6 +659,7 @@ extension AgentSessionLinkExecutionRuntime {
         savedItemID: UUID, acceptedAt: Date, providerMessage: String,
         stopFence: AgentRunStartStopFence,
         providerSwitchPreparation: ProviderSwitchSendPreparation? = nil,
+        directStartOptions: AgentDirectRunStartOptions? = nil,
         dispatchIsCurrent: @MainActor () -> Bool
     ) async -> AgentSessionLinkSendTransactionOutcome {
         let persistedOnly = AgentSessionLinkSendDelivery(
@@ -732,12 +734,13 @@ extension AgentSessionLinkExecutionRuntime {
         // The run service's `nil` return is "not a Codex native send", not "started", so the
         // recorder is what distinguishes a Claude/ACP/headless pre-start failure from success.
         let startRecorder = AgentRunStartOutcomeRecorder()
+        var options = directStartOptions ?? AgentDirectRunStartOptions(ignoresPendingHandoff: true)
+        options.stopFence = stopFence
+        if directStartOptions != nil { options.initialUserItemID = savedItemID }
         _ = await startAgentRun(
             command: command,
             initialMessage: dispatchedProviderMessage,
-            directStartOptions: AgentDirectRunStartOptions(
-                ignoresPendingHandoff: true, stopFence: stopFence
-            ),
+            directStartOptions: options,
             startOutcome: startRecorder,
             providerSwitchPreparation: providerSwitchPreparation
         )

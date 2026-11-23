@@ -113,6 +113,41 @@ struct AgentRunHostAdmission {
         return selection
     }
 
+    /// Capture from the admitted carrier before child publication or routing can suspend.
+    /// A review-source failure is recorded with the true parent, never the child or a presenter.
+    func captureOracleReviewSource() async -> AgentRunOracleReviewSource {
+        let sessionID = source.identity.sessionID
+        let tabID = source.writer.session.tabID
+        let runID = connection.runID
+        do {
+            let origin = try await host.captureHostFileInvocation(invocation)
+            guard origin.command.identity == source.identity else { throw MCPFileToolAuthorityFailure.superseded }
+            let snapshot = origin.lease.snapshot
+            let workspace = try JSONDecoder().decode(WorkspaceModel.self, from: snapshot.document.documentBytes)
+            let directory = WorkspaceSessionSidecarMigration.workspaceDirectory(for: workspace, root: host.route.workspaceStorageDirectory)
+            let bindings = connection.lookupSource.worktreeBindings
+            let reviewGitContext = await FrozenPromptGitReviewContext.make(
+                workspaceID: workspaceID, workspaceDirectoryPath: directory.path,
+                workspaceRootPaths: snapshot.document.metadata.repoPaths, tabID: tabID, sessionID: sessionID,
+                bindings: bindings, base: "HEAD", store: origin.lease.resources.files
+            )
+            try await origin.requireCurrent()
+            return .captured(.init(
+                sourceTabID: tabID, workspaceID: workspaceID,
+                sourceSelectionRevision: snapshot.contexts.first(where: { $0.metadata.identity.contextID == tabID })?.revisions.workingRevision
+                    ?? snapshot.revisions.workingRevision,
+                promptText: origin.tab.promptText, selection: origin.tab.selection,
+                lookupContext: origin.lookup, reviewGitContext: reviewGitContext,
+                sourceAgentSessionID: sessionID, sourceAgentRunID: runID, sourceWorktreeBindings: bindings
+            ))
+        } catch {
+            return .unavailable(.init(
+                delegationID: UUID(), sourceTabID: tabID, workspaceID: workspaceID,
+                sourceAgentSessionID: sessionID, sourceAgentRunID: runID, reason: .sourceCaptureFailed(error.localizedDescription)
+            ))
+        }
+    }
+
     func requireSpawnSource() throws {
         try Task.checkCancellation()
         guard sourceIsCurrent else { throw MCPFileToolAuthorityFailure.superseded }

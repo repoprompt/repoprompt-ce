@@ -9,6 +9,47 @@ enum AgentExternalMCPRunStarter {
         let delivery: AgentModeViewModel.MCPInstructionDispatch
     }
 
+    /// The caller supplies the originally admitted runtime and its producer-specific adapters.
+    /// The pending-start fence and configured-save/dispatch ordering cannot vary by presenter.
+    struct PendingStartActions {
+        let ownerIsCurrent: @MainActor () -> Bool
+        let configure: @MainActor () async throws -> Void
+        let prepareRequestBinding: @MainActor () async throws -> Void
+        let commitConfiguration: @MainActor () async throws -> Void
+        let dispatch: @MainActor (_ requirePendingStart: @escaping @MainActor () throws -> Void) async throws -> AgentModeViewModel.MCPInstructionDispatch
+        let snapshot: @MainActor () async -> AgentRunMCPSnapshot
+    }
+
+    static func finishPendingStart(
+        sessionID: UUID, tabID: UUID, session: AgentTabSession?, ownedActivation: AgentMCPControlContext,
+        originalStopFence: AgentRunStartStopFence? = nil, expiry: AgentRunStartExpiry?, actions: PendingStartActions
+    ) async throws -> StartOutcome {
+        try expiry?.recordActivation(sessionID: sessionID, tabID: tabID)
+        guard let session, session.activeAgentSessionID == sessionID,
+              session.mcpControlContext == ownedActivation, session.mcpFollowUpRunPending
+        else {
+            throw MCPError.invalidParams("The pending agent start was withdrawn or replaced during activation.")
+        }
+        let stop = originalStopFence ?? AgentRunStartStopFence(session: session)
+        let requirePendingStart: @MainActor () throws -> Void = {
+            guard actions.ownerIsCurrent(), session.activeAgentSessionID == sessionID,
+                  session.mcpControlContext == ownedActivation, stop.permitsStart(of: session)
+            else {
+                throw MCPError.invalidParams("The pending agent start was withdrawn or replaced before dispatch.")
+            }
+        }
+        try await actions.configure()
+        try await actions.prepareRequestBinding()
+        try Task.checkCancellation()
+        try requirePendingStart()
+        if let expiry, expiry.expiredBeforeActivation { throw expiry.timeoutError }
+        try await actions.commitConfiguration()
+        try Task.checkCancellation()
+        try requirePendingStart()
+        let delivery = try await actions.dispatch(requirePendingStart)
+        return await .init(snapshot: actions.snapshot(), delivery: delivery)
+    }
+
     typealias RequestMetadata = MCPRequestMetadata
     typealias BindCurrentRequestToTab = (_ tabID: UUID, _ metadata: MCPRequestMetadata, _ startExpiry: AgentRunStartExpiry?) async throws -> Void
     typealias DispatchInstruction = @MainActor (
@@ -180,93 +221,64 @@ enum AgentExternalMCPRunStarter {
         // All failures after activation may clean up only this exact inactive producer.
         let activatedSession = agentModeVM.session(for: target.tabID, createIfNeeded: false)
         do {
-            try startExpiry?.recordActivation(sessionID: sessionID, tabID: target.tabID)
-            guard let activatedSession,
-                  activatedSession.activeAgentSessionID == sessionID,
-                  activatedSession.mcpControlContext == ownedActivation,
-                  activatedSession.mcpFollowUpRunPending
-            else {
-                throw MCPError.invalidParams("The pending agent start was withdrawn or replaced during activation.")
-            }
-            let pendingStartFence = AgentRunStartStopFence(session: activatedSession)
-            func requirePendingStart() throws {
-                guard agentModeVM.session(for: target.tabID, createIfNeeded: false) === activatedSession,
-                      activatedSession.activeAgentSessionID == sessionID,
-                      activatedSession.mcpControlContext == ownedActivation,
-                      pendingStartFence.permitsStart(of: activatedSession)
-                else {
-                    throw MCPError.invalidParams("The pending agent start was withdrawn or replaced before dispatch.")
-                }
-            }
-            if let oracleReviewSource {
-                try agentModeVM.mcpStageAgentRunOracleReviewSource(
-                    oracleReviewSource,
-                    targetTabID: target.tabID,
-                    targetSessionID: sessionID,
-                    expectedParentSessionID: expectedParentSessionID
+            let outcome = try await finishPendingStart(
+                sessionID: sessionID, tabID: target.tabID, session: activatedSession,
+                ownedActivation: ownedActivation, expiry: startExpiry, actions: .init(
+                    ownerIsCurrent: { agentModeVM.session(for: target.tabID, createIfNeeded: false) === activatedSession },
+                    configure: {
+                        if let oracleReviewSource {
+                            try agentModeVM.mcpStageAgentRunOracleReviewSource(
+                                oracleReviewSource, targetTabID: target.tabID,
+                                targetSessionID: sessionID, expectedParentSessionID: expectedParentSessionID
+                            )
+                        }
+                        try await agentModeVM.mcpConfigureSession(
+                            tabID: target.tabID, agentRaw: agentRaw, modelRaw: resolvedModel,
+                            reasoningEffortRaw: resolvedEffort, requireInactiveRunState: true, creationHandle: target.creationHandle
+                        )
+                    }, prepareRequestBinding: {
+                        switch bindingDisposition {
+                        case .preserveCallerBinding:
+                            #if DEBUG
+                                agentModeVM.perfRecorder.event("mcp.routing.externalRunStarterPreservedCallerBinding", tabID: target.tabID, fields: [
+                                    "sessionID": sessionID.uuidString,
+                                    "connectionID": metadata.connectionID?.uuidString ?? "nil",
+                                    "windowID": metadata.windowID.map(String.init) ?? "nil"
+                                ])
+                            #endif
+                        case let .applyRequestBindingPolicy(bindCurrentRequestToTab):
+                            try await bindCurrentRequestToTab(target.tabID, metadata, startExpiry)
+                            #if DEBUG
+                                agentModeVM.perfRecorder.event("mcp.routing.externalRunStarterBoundRequest", tabID: target.tabID, fields: [
+                                    "sessionID": sessionID.uuidString,
+                                    "connectionID": metadata.connectionID?.uuidString ?? "nil",
+                                    "windowID": metadata.windowID.map(String.init) ?? "nil"
+                                ])
+                            #endif
+                        }
+                    }, commitConfiguration: {
+                        guard await agentModeVM.commitConfiguredSessionCreation(target: target) else {
+                            throw MCPError.internalError("Failed to persist the configured agent session before starting it.")
+                        }
+                    }, dispatch: { requirePendingStart in
+                        if let dispatchInstruction {
+                            return try await dispatchInstruction(sessionID, target.tabID, message, workflow, agentModeVM)
+                        }
+                        return try await agentModeVM.mcpDispatchInstruction(
+                            sessionID: sessionID, text: message, allowStartingRun: true, workflow: workflow,
+                            preserveRoutedInitialEffort: preserveRoutedInitialEffort, validateInitialStart: requirePendingStart
+                        )
+                    }, snapshot: { await resolveInitialSnapshot(sessionID: sessionID, agentModeVM: agentModeVM) }
                 )
-            }
-            try await agentModeVM.mcpConfigureSession(
-                tabID: target.tabID,
-                agentRaw: agentRaw,
-                modelRaw: resolvedModel,
-                reasoningEffortRaw: resolvedEffort,
-                requireInactiveRunState: true,
-                creationHandle: target.creationHandle
             )
-            switch bindingDisposition {
-            case .preserveCallerBinding:
-                #if DEBUG
-                    agentModeVM.perfRecorder.event("mcp.routing.externalRunStarterPreservedCallerBinding", tabID: target.tabID, fields: [
-                        "sessionID": sessionID.uuidString,
-                        "connectionID": metadata.connectionID?.uuidString ?? "nil",
-                        "windowID": metadata.windowID.map(String.init) ?? "nil"
-                    ])
-                #endif
-            case let .applyRequestBindingPolicy(bindCurrentRequestToTab):
-                try await bindCurrentRequestToTab(target.tabID, metadata, startExpiry)
-                #if DEBUG
-                    agentModeVM.perfRecorder.event("mcp.routing.externalRunStarterBoundRequest", tabID: target.tabID, fields: [
-                        "sessionID": sessionID.uuidString,
-                        "connectionID": metadata.connectionID?.uuidString ?? "nil",
-                        "windowID": metadata.windowID.map(String.init) ?? "nil"
-                    ])
-                #endif
-            }
-
-            try Task.checkCancellation()
-            try requirePendingStart()
-            if let startExpiry, startExpiry.expiredBeforeActivation {
-                throw startExpiry.timeoutError
-            }
-            guard await agentModeVM.commitConfiguredSessionCreation(target: target) else {
-                throw MCPError.internalError("Failed to persist the configured agent session before starting it.")
-            }
-            try Task.checkCancellation()
-            try requirePendingStart()
-
-            let delivery: AgentModeViewModel.MCPInstructionDispatch = if let dispatchInstruction {
-                try await dispatchInstruction(sessionID, target.tabID, message, workflow, agentModeVM)
-            } else {
-                try await agentModeVM.mcpDispatchInstruction(
-                    sessionID: sessionID,
-                    text: message,
-                    allowStartingRun: true,
-                    workflow: workflow,
-                    preserveRoutedInitialEffort: preserveRoutedInitialEffort,
-                    validateInitialStart: requirePendingStart
-                )
-            }
-
-            let snapshot = await resolveInitialSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
             #if DEBUG
                 agentModeVM.perfRecorder.event("mcp.routing.externalRunStarterDispatched", tabID: target.tabID, fields: [
                     "sessionID": sessionID.uuidString,
                     "connectionID": metadata.connectionID?.uuidString ?? "nil",
-                    "snapshotStatus": snapshot.status.rawValue
+                    "snapshotStatus": outcome.snapshot.status.rawValue
                 ])
             #endif
-            return StartOutcome(snapshot: snapshot, delivery: delivery)
+            return outcome
         } catch {
             agentModeVM.failSessionCreation(
                 target.creationHandle,
@@ -289,17 +301,24 @@ enum AgentExternalMCPRunStarter {
         sessionID: UUID,
         agentModeVM: AgentModeViewModel
     ) async -> AgentRunMCPSnapshot {
-        guard let registration = agentModeVM.mcpRuntime.registration(sessionID: sessionID) else {
-            return .expired(sessionID: sessionID)
+        await resolveInitialSnapshot(sessionID: sessionID, registration: agentModeVM.mcpRuntime.registration(sessionID: sessionID)) {
+            agentModeVM.mcpSnapshot(registration: $0)
         }
-        if let liveSnapshot = agentModeVM.mcpSnapshot(registration: registration) {
+    }
+
+    static func resolveInitialSnapshot(
+        sessionID: UUID, registration: AgentRunSessionStore.Registration?,
+        live: @MainActor (AgentRunSessionStore.Registration) -> AgentRunMCPSnapshot?
+    ) async -> AgentRunMCPSnapshot {
+        guard let registration else { return .expired(sessionID: sessionID) }
+        if let liveSnapshot = live(registration) {
             return liveSnapshot
         }
         if let storedSnapshot = await AgentRunSessionStore.snapshot(for: registration) {
             return storedSnapshot
         }
         await Task.yield()
-        if let liveSnapshot = agentModeVM.mcpSnapshot(registration: registration) {
+        if let liveSnapshot = live(registration) {
             return liveSnapshot
         }
         if let storedSnapshot = await AgentRunSessionStore.snapshot(for: registration) {
