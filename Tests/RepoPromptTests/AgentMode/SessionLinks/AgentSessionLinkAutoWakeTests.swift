@@ -2,6 +2,7 @@ import Combine
 import Foundation
 import MCP
 import RepoPromptACPProviders
+import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
@@ -1004,6 +1005,32 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         XCTAssertFalse(AgentSessionRuntimeStore.shared.retainedExecutionHosts.contains { $0 === host })
     }
 
+    func testWindowRetirementStartsRetainedDrainBeforeWaiting() async throws {
+        let (host, f, resources, provider, _, _, _) = try await hostStartupFixture()
+        host.scope.retainExecutableHost()
+        let outcome = AgentRunStartOutcomeRecorder()
+        _ = try await host.scope.startup.start(
+            session: f.session, initialMessage: "Cancel on window retirement", startOutcome: outcome,
+            claudeCoordinator: host.claudeCoordinator, links: f.runtime,
+            environment: host.makeStartupEnvironment(resources: resources)
+        )
+        XCTAssertTrue(outcome.outcome.didStart)
+        let originalTask = try XCTUnwrap(f.session.agentTask)
+        let fence = AgentRunStartStopFence(session: f.session)
+        // Quit can fence first, before its shared-deadline driver begins observing.
+        let quitDrain = host.beginFinalShutdown()
+        let drain = host.beginWindowRetirement()
+        XCTAssertTrue(drain === quitDrain)
+        XCTAssertFalse(fence.permitsStart(of: f.session))
+        XCTAssertTrue(host.beginWindowRetirement() === drain)
+        let result = await drain.wait(until: .now.advanced(by: .seconds(5)))
+        guard result == .released else { return XCTFail("Window retirement must complete: \(result)") }
+        await originalTask.value
+        XCTAssertTrue(host.scope.hasReleasedWriterClaims)
+        XCTAssertFalse(f.session.isDirty)
+        XCTAssertTrue(provider.promptedMessages.isEmpty)
+    }
+
     func testHostRetirementJoinsClosedControllerBeforeReleasingResources() async throws {
         let (host, f, resources, provider, _, _, _) = try await hostStartupFixture()
         let original = try host.scope.admit(session: f.session)
@@ -1732,6 +1759,73 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         }
     }
 
+    func testWindowFreeClaudeWakeCompactionReservesOnceWithoutPayingTheWake() async throws {
+        for behavior in ["verified", "unverified", "stop"] {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("ClaudeWakeCompact-\(UUID())")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let workspace = WorkspaceModel(name: "Claude wake maintenance", repoPaths: [], customStoragePath: root)
+            let conversation = "monitor-native-session"
+            var starts: [String] = []
+            let f = try fixture(workspace: workspace, start: { session, text, outcome in
+                starts.append(text)
+                let saved = try? await AgentSessionDataService.shared.loadAgentSession(id: XCTUnwrap(session.activeAgentSessionID), for: workspace)
+                XCTAssertEqual(saved?.claudeWakeCompactionSpentConversation, conversation)
+                XCTAssertEqual(saved?.effectiveItemCount, 0, "Maintenance must not record a user turn or a delivered lane update")
+                outcome?.recordAccepted()
+                outcome?.claudeWakeCompactionTask = Task { @MainActor [weak outcome] in
+                    await Task.yield()
+                    XCTAssertNotNil(session.activeComposerSubmitAttempt, "Start acceptance cannot release the native producer's composer claim")
+                    outcome?.claudeWakeCompactionVerified = behavior == "verified"
+                    session.invalidateClaudeWakeUsage()
+                }
+            })
+            let session = f.session
+            session.selectedAgent = .claudeCode
+            session.providerSessionID = conversation
+            session.claudeController = MonitorFakeNativeController()
+            session.runState = .completed
+            _ = f.scope.usage.ingestNonCodexUsageReport(
+                promptTokens: nil, completionTokens: nil, contextUsedTokens: 850_000,
+                modelContextWindow: 900_000, session: session
+            )
+            let lane = AgentSessionLinkAutoWakeTests.laneSnapshot(observerEndpoint: f.endpoint)
+            f.runtime.agentSessionLinkPublishPassiveStatusNotices(lane, to: f.endpoint)
+            session.oversight.autoWakeOnUpdates = true
+            let attempt = AgentSessionLinkAutoWakeAttempt(
+                wakeID: UUID(), observerEndpoint: f.endpoint, queueEpoch: lane.queueEpoch,
+                queueRevision: lane.queueRevision, wakeFingerprint: lane.wakeEligibilityFingerprint,
+                admissionBasis: .routineStatusOrOverflow, attemptedFingerprint: nil,
+                physicalOutcome: .notAttempted, phase: .scheduled, task: nil
+            )
+            session.oversight.pendingAutoWake = attempt
+            f.scope.persistence.saver = { payload, workspace, count in
+                let url = try await AgentSessionDataService.shared.saveAgentSession(payload, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count)
+                if behavior == "stop" { session.stopState.invalidateScheduledStarts() }
+                return url
+            }
+            let before = f.runtime.agentSessionLinkPassiveNoticesBySessionID[f.endpoint.sessionID]
+            let result = await f.runtime.agentSessionLinkPrepareClaudeWake(attempt, session: session)
+            switch (behavior, result) {
+            case ("verified", .recheckAfterCompaction), ("unverified", .withholdWake), ("stop", .withholdWake): break
+            default: XCTFail("Unexpected maintenance disposition for \(behavior)")
+            }
+            XCTAssertEqual(starts, behavior == "stop" ? [] : ["/compact"])
+            XCTAssertEqual(f.runtime.agentSessionLinkPassiveNoticesBySessionID[f.endpoint.sessionID], before)
+            XCTAssertEqual(session.oversight.pendingAutoWake?.wakeID, attempt.wakeID)
+            XCTAssertTrue(session.items.isEmpty)
+            XCTAssertNil(session.activeComposerSubmitAttempt)
+            _ = f.scope.usage.ingestNonCodexUsageReport(
+                promptTokens: nil, completionTokens: nil, contextUsedTokens: 890_000,
+                modelContextWindow: 900_000, session: session
+            )
+            if case .unchanged = await f.runtime.agentSessionLinkPrepareClaudeWake(attempt, session: session) {} else {
+                XCTFail("Another high reading must not mint another command")
+            }
+            XCTAssertEqual(starts.count, behavior == "stop" ? 0 : 1)
+            session.saveDebounceTask?.cancel()
+        }
+    }
+
     func testWindowFreePartialSendWriteRequiresDurableCompensationAndRestoresAnchors() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("M9SendRollback-\(UUID())")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -2227,6 +2321,62 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         }
         retained.removeAll()
         super.tearDown()
+    }
+
+    func testClaudeSizeHoldBlocksChangedStatusAttentionAndWakeNowUntilConversationChanges() throws {
+        let fixture = try makeFixture()
+        fixture.session.selectedAgent = .claudeCode
+        fixture.session.providerSessionID = "overfull"
+        let failure = ClaudeTurnSizeFailure(kind: .inputContextRejected, source: .localCLIRejection, conversationID: "overfull")
+        fixture.session.oversight.claudeContextAutoWakeHold = .init(provider: .claudeCode, failure: failure, conversationID: "overfull")
+        try publishInventory(fixture, revision: 1)
+        fixture.session.oversight.autoWakeOnUpdates = true
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 2, laneIndices: [0], attentionRequests: [Self.attentionRequest(0)])
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+        let runtime = fixture.viewModel.linkExecutionRuntime
+        XCTAssertEqual(runtime.agentSessionLinkRequestManualWakeNow(for: endpoint), .refused(.claudeSizeFailure))
+        fixture.session.providerSessionID = nil // Controller retirement is not proof of recovery.
+        XCTAssertEqual(runtime.agentSessionLinkRequestManualWakeNow(for: endpoint), .refused(.claudeSizeFailure))
+        fixture.session.providerSessionID = "fresh"
+        XCTAssertEqual(runtime.agentSessionLinkRequestManualWakeNow(for: endpoint), .scheduled, "The held conversation did not consume pending updates")
+    }
+
+    func testClearingChatReleasesTheClaudeSizeHold() throws {
+        let fixture = try makeFixture()
+        fixture.session.selectedAgent = .claudeCode
+        fixture.session.providerSessionID = "overfull"
+        let failure = ClaudeTurnSizeFailure(kind: .inputContextRejected, source: .localCLIRejection, conversationID: "overfull")
+        fixture.session.oversight.claudeContextAutoWakeHold = .init(provider: .claudeCode, failure: failure, conversationID: "overfull")
+
+        fixture.viewModel.clearChat(tabID: fixture.tabID)
+
+        XCTAssertNil(fixture.session.providerSessionID)
+        XCTAssertNil(fixture.session.oversight.claudeContextAutoWakeHold)
+        XCTAssertFalse(fixture.session.claudeContextBlocksAutoWake)
+    }
+
+    func testClaudeSizeHoldFencesPreparedPeriodicWakeAtPhysicalAcquisition() throws {
+        let (fixture, clock, endpoint) = try periodicFixture()
+        _ = try reservePeriodic(fixture, clock: clock, endpoint: endpoint)
+        var attempt = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        let dispatchID = AgentSessionLinkPromptDispatchID.headlessRun(runID: UUID())
+        attempt.periodicProducerDispatchID = dispatchID
+        attempt.phase = .preparingDispatch
+        fixture.session.oversight.pendingAutoWake = attempt
+        fixture.session.selectedAgent = .claudeCode
+        fixture.session.providerSessionID = "overfull"
+        fixture.session.oversight.claudeContextAutoWakeHold = .init(
+            provider: .claudeCode,
+            failure: .init(kind: .generationContextLimit, source: .resultStopReason, conversationID: "overfull"),
+            conversationID: "overfull"
+        )
+        let runtime = fixture.viewModel.linkExecutionRuntime
+        XCTAssertFalse(runtime.agentSessionLinkPeriodicWakeIsEligible(fixture.session, endpoint: endpoint, requiresReadyCatalog: false))
+        XCTAssertFalse(runtime.agentSessionLinkAcquireAutoWakePhysicalDispatch(for: fixture.session, dispatchID: dispatchID))
+        XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.wakeID, attempt.wakeID)
     }
 
     func testScheduledWakeDuringWorktreeCommitAdmissionCannotDispatchOrChangeBinding() async throws {

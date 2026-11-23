@@ -53,6 +53,7 @@ enum AgentSessionPayloadBuilder {
             delegationScopeID: session.delegationScopeID,
             pendingHandoffProviderSwitchDelivery: session.pendingHandoff.providerSwitchDelivery,
             pendingHandoffPayload: session.pendingHandoff.payload,
+            pendingHandoffAwaitsLocalClaudeOverflowInput: session.pendingHandoff.awaitsLocalClaudeOverflowInput ? true : nil,
             pendingHandoffCreatedAt: session.pendingHandoff.createdAt,
             pendingHandoffSourceItemID: session.pendingHandoff.sourceItemID,
             pendingHandoffDefersProviderLockUntilSend: session.pendingHandoff.defersProviderLockUntilSend,
@@ -119,6 +120,7 @@ enum AgentSessionPayloadBuilder {
         payload.worktreeMergeOperations = session.worktreeMergeOperations
         payload.pendingHandoffProviderSwitchDelivery = session.pendingHandoff.providerSwitchDelivery
         payload.pendingHandoffPayload = session.pendingHandoff.payload
+        payload.pendingHandoffAwaitsLocalClaudeOverflowInput = session.pendingHandoff.awaitsLocalClaudeOverflowInput ? true : nil
         payload.pendingHandoffCreatedAt = session.pendingHandoff.createdAt
         payload.pendingHandoffSourceItemID = session.pendingHandoff.sourceItemID
         payload.pendingHandoffDefersProviderLockUntilSend = session.pendingHandoff.defersProviderLockUntilSend
@@ -143,6 +145,7 @@ enum AgentSessionPayloadBuilder {
         agentSession.codexReasoningEffort = session.codexReasoningEffort
         agentSession.codexContextWindow = session.codexContextUsage?.modelContextWindow
         agentSession.contextWindowCapacity = session.contextWindowCapacity
+        agentSession.claudeWakeCompactionSpentConversation = session.claudeWakeCompactionSpentConversation
         agentSession.codexLastTotalTokens = session.codexContextUsage?.lastTotalTokens
         agentSession.codexTotalTotalTokens = session.codexContextUsage?.totalTotalTokens
     }

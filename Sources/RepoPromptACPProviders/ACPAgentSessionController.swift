@@ -146,6 +146,12 @@ package actor ACPAgentSessionController {
         }
     }
 
+    package nonisolated static func isAuthenticationRequired(_ error: any Error) -> Bool {
+        // ACP reserves -32000 for authentication-required responses.
+        guard case let ControllerError.requestFailed(_, code) = error else { return false }
+        return code == -32000
+    }
+
     private enum JSONRPCID: Hashable {
         case string(String)
         case int(Int)
@@ -1976,10 +1982,12 @@ package actor ACPAgentSessionController {
             let text = Self.strippingANSIEscapeSequences(from: rawText)
             guard !text.isEmpty else { return }
             stderrLineCount += 1
+            let disposition = provider.stderrLineDisposition(text)
+            guard disposition != .discard else { return }
             lastStderrPreview = Self.truncatedDiagnosticPreview(text)
             recordActivePromptStderrLine(text)
             diagnose(.stderrLine(text))
-            guard provider.shouldEmitStderrLine(text) else { return }
+            guard disposition == .transcript else { return }
             emit(.stream(AIStreamResult(type: "system", text: text)))
         }
     }

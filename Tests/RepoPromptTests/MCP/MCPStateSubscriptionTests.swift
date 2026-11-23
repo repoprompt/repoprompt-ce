@@ -106,6 +106,149 @@ private actor RouteHistoryScanner: HistorySessionScanning {
 /// view model can be deallocated once observation stops.
 final class MCPStateSubscriptionTests: XCTestCase {
     @MainActor
+    func testCanonicalReceiptsKeepTheirOwnContextsOnSharedPhysicalRoute() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        let route = MCPHostRouteResources(identity: .legacyWindow(42), coordinator: nil, runtime: runtime)
+        addTeardownBlock { await route.close() }
+
+        let runID = UUID()
+        let manager = ServerNetworkManager.shared
+        func registration(workspaceID: UUID) async throws -> MCPRunRoutingCleanupReceipt {
+            let snapshot = MCPTabContextSnapshot(
+                tabID: UUID(), windowID: route.identity.routeID, workspaceID: workspaceID,
+                promptText: "", selection: .init(), selectedMetaPromptIDs: [], tabName: "Epoch",
+                runID: runID, explicitlyBound: true
+            )
+            let issued = await manager.installClientConnectionPolicy(
+                for: "epoch-\(workspaceID)", windowID: route.identity.routeID, restrictedTools: [],
+                tabID: snapshot.tabID, runID: runID, purpose: .agentModeRun, routingOwner: route,
+                originatingContextSource: { _, _ in
+                    { .init(snapshot: snapshot, isCurrent: { true }, validateCarrier: { true }) }
+                }
+            )
+            let receipt = try XCTUnwrap(issued)
+            addTeardownBlock { await manager.cleanupRunRoutingState(ownedBy: receipt) }
+            return receipt
+        }
+
+        let workspaceA = UUID()
+        let workspaceB = UUID()
+        let predecessor = try await registration(workspaceID: workspaceA)
+        let connectionA = UUID()
+        let admittedA = await route.installPendingPolicy(predecessor, connectionID: connectionA, clientName: nil, tabID: nil)
+        let successor = try await registration(workspaceID: workspaceB)
+        XCTAssertNotEqual(predecessor.policyID, successor.policyID)
+        let connectionB = UUID()
+        let admittedB = await route.installPendingPolicy(successor, connectionID: connectionB, clientName: nil, tabID: nil)
+        XCTAssertEqual(admittedA?.workspaceID, workspaceA)
+        XCTAssertEqual(admittedB?.workspaceID, workspaceB)
+
+        let predecessorToken = try XCTUnwrap(admittedA?.token)
+        let staleRollback = route.rollbackPendingPolicy(predecessor, token: predecessorToken, clientName: nil)
+        guard case .supersededByOtherConnection? = staleRollback else {
+            return XCTFail("Stale predecessor must not roll back the successor")
+        }
+        await manager.cleanupRunRoutingState(ownedBy: predecessor)
+        await manager.cleanupRunRoutingState(ownedBy: predecessor)
+        let survivingPolicies = await manager.debugPendingPolicySnapshot(for: "epoch-\(workspaceB)")
+        XCTAssertEqual(survivingPolicies.map(\.runID), [runID])
+        XCTAssertNil(route.runRouteBindings.tabContextByConnectionID[connectionA])
+        XCTAssertEqual(route.runRouteBindings.tabContextByConnectionID[connectionB]?.workspaceID, workspaceB)
+        XCTAssertEqual(route.runRouteBindings.connectionIDByRunID[runID], connectionB)
+        XCTAssertFalse(route.isClosing)
+
+        let successorToken = try XCTUnwrap(admittedB?.token)
+        let rollback = route.rollbackPendingPolicy(successor, token: successorToken, clientName: nil)
+        if case .restored? = rollback {} else {
+            XCTFail("The originating canonical adapter must roll back the installation")
+        }
+        XCTAssertNil(route.runRouteBindings.tabContextByConnectionID[connectionB])
+        await route.consumeCleanup(successor)
+    }
+
+    @MainActor
+    func testOriginatingContextRefusalDoesNotConsultRouteDefault() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        let route = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: nil, runtime: runtime)
+        addTeardownBlock { await route.close() }
+        route.installProviderContextSource { _, _ in
+            XCTFail("An explicit originating source must never fall back to the route default")
+            return nil
+        }
+        let admission = route.admitProviderContext(runID: UUID(), tabID: nil, originatingContextSource: { _, _ in nil })
+        guard case .refused = admission else { return XCTFail("An unavailable originating context must fail closed") }
+    }
+
+    @MainActor
+    func testHostDrainReleasesOnlyItsExecutionLease() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        let owner = MCPHostRouteResources.LeaseOwner(
+            identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: runtime.routingCoordinator, runtime: runtime
+        )
+        let predecessor = try XCTUnwrap(owner.acquire(.execution))
+        let successor = try XCTUnwrap(owner.acquire(.execution))
+        func makeHost(_ lease: MCPHostRouteResources.LeaseOwner.Lease) -> AgentSessionRuntimeHost {
+            AgentSessionRuntimeHost(
+                route: owner.route, executionRouteLease: lease,
+                workspacePath: { _ in nil }, runtimeWorkspacePaths: { _ in throw AgentHostWorkspaceResources.Failure.authorityUnavailable },
+                connectionPolicyInstaller: AgentSessionRuntimeHost.defaultConnectionPolicyInstaller,
+                modelRouterSettingsStore: .shared, catalogDiagnosticsSink: AppAgentSessionLinkCatalogEventSink(),
+                perfRecorder: AppAgentModePerfRecorder()
+            )
+        }
+        let hostA = makeHost(predecessor)
+        let hostB = makeHost(successor)
+        XCTAssertNil(predecessor.transferToExecutionHost(on: owner.route))
+        await owner.requestTerminalDisposal()
+        await predecessor.release()
+        await successor.release()
+        XCTAssertFalse(owner.route.isClosing, "The acquiring callers no longer have release authority")
+
+        for (host, closesRoute) in [(hostA, false), (hostB, true)] {
+            let drain = host.beginRetirement(adapters: .init(
+                managedInput: AgentSessionHostDrainTestEffects.empty, selfCompact: AgentSessionHostDrainTestEffects.empty,
+                captureProvider: { _ in throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
+            ))
+            drain.attemptRecovery()
+            let outcome = await drain.wait(until: .now.advanced(by: .seconds(5)))
+            XCTAssertEqual(outcome, .released)
+            XCTAssertEqual(owner.route.isClosing, closesRoute)
+        }
+    }
+
+    @MainActor
+    func testPhysicalRouteDisposalWaitsForSuccessorEpochExecutionLease() async throws {
+        let runtime = try await makeHistoryRouteRuntime()
+        let owner = MCPHostRouteResources.LeaseOwner(
+            identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: runtime.routingCoordinator, runtime: runtime
+        )
+        let route = owner.route
+        let presentation = try XCTUnwrap(owner.acquire(.presentation))
+        let predecessor = try XCTUnwrap(owner.acquire(.execution))
+        let registered = await route.ensureRegistered(workspaceID: nil, contextID: nil, revision: 0)
+        let descriptor = try XCTUnwrap(registered)
+        let successor = try XCTUnwrap(owner.acquire(.execution))
+
+        await predecessor.release()
+        XCTAssertFalse(route.isClosing)
+        await owner.requestTerminalDisposal()
+        XCTAssertNil(owner.acquire(.presentation))
+        XCTAssertNil(owner.acquire(.execution))
+        await presentation.release()
+        await predecessor.release()
+        XCTAssertFalse(route.isClosing)
+        let retained = await runtime.routingCoordinator.snapshot()
+        XCTAssertTrue(retained.windows.contains { $0.windowID == descriptor.windowID && $0.generation == descriptor.generation })
+
+        await successor.release()
+        XCTAssertTrue(route.isClosing)
+        XCTAssertNil(route.descriptor)
+        await owner.requestTerminalDisposal()
+        let closed = await runtime.routingCoordinator.snapshot()
+        XCTAssertFalse(closed.windows.contains { $0.windowID == descriptor.windowID })
+    }
+
+    @MainActor
     func testModelEndpointRefusesWriterReacquisitionOnTheSameBinding() async throws {
         let server = makeServerViewModel(service: makeService())
         let manager = try XCTUnwrap(server.workspaceManager)
@@ -520,8 +663,8 @@ final class MCPStateSubscriptionTests: XCTestCase {
                     let request = ToolInvocationContext.trustedLocal(toolName: name, metadata: .init(connectionID: fixture.connectionID, clientName: nil, windowID: fixture.route.identity.routeID))
                     do {
                         _ = try await MCPInvocationContextBridge.withInvocation(request) { try await tool.binding([:]) }
-                        XCTFail("Unmigrated \(name) must retain its physical-owner check")
-                    } catch let error as MCPError { XCTAssertEqual(error, .internalError("Window deallocated while executing \(name)"))
+                        XCTFail("Unmigrated \(name) must not enter physical-window execution")
+                    } catch let error as MCPError { XCTAssertEqual(error, .invalidRequest("Tool \(name) is not supported by the independent Agent session route"))
                     } catch DomainMutationPolicyError.principalMissing {
                         XCTAssertTrue(["file_actions", "apply_edits"].contains(name), "Protected mutation admission remains in front of physical dispatch")
                     }
@@ -868,9 +1011,9 @@ final class MCPStateSubscriptionTests: XCTestCase {
             XCTAssertEqual(route.toolExecutionRuntime.activeExecutionCount, 0)
             do {
                 _ = try await invokeRegistered(readFile, routeID: route.identity.routeID)
-                XCTFail("Unmigrated file capabilities must still require their real physical owner")
+                XCTFail("Unmigrated file capabilities must not enter physical-window execution")
             } catch let error as MCPError {
-                XCTAssertEqual(error, .internalError("Window deallocated while executing read_file"))
+                XCTAssertEqual(error, .invalidRequest("Tool read_file is not supported by the independent Agent session route"))
             }
             route.closeDomainAdmission()
             do {

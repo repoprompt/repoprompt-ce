@@ -759,6 +759,11 @@ struct AgentMonitorPopoverView: View {
             .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
             .foregroundStyle(.secondary)
             .lineLimit(2)
+            if pending.wakeNowRefusal == .claudeSizeFailure {
+                Text(AgentMonitorWakeNowRefusal.claudeSizeFailure.message)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+                    .foregroundStyle(.secondary)
+            }
             if !pending.groups.isEmpty {
                 DisclosureGroup(
                     AgentMonitorPendingUpdatesCopy.detailsLabel,

@@ -24,6 +24,7 @@ final class AgentSessionRuntimeHost {
     nonisolated static let childAgentRunWaitDrainTimeoutSeconds: TimeInterval = 2.0
 
     let route: MCPHostRouteResources
+    private let releaseExecutionRoute: (@MainActor () async -> Void)?
     var routeID: Int {
         route.identity.routeID
     }
@@ -35,6 +36,9 @@ final class AgentSessionRuntimeHost {
     let claudeCoordinator: ClaudeAgentModeCoordinator
     let providerBindingService: AgentModeProviderBindingService
     let providerResources: AgentRunProviderComposition
+    private(set) lazy var workspaceSwitchCleanup = AgentModeWorkspaceSwitchCleanupProvider(
+        codexCoordinator: codexCoordinator, claudeCoordinator: claudeCoordinator
+    )
     private(set) var workspaceActivation: AgentSessionHostWorkspaceActivation?
 
     /// Install immutable activation/resource ownership before making any visible session. A
@@ -100,8 +104,13 @@ final class AgentSessionRuntimeHost {
     /// existing exact drain, never onto presentation detach or Stop.
     func beginRetirement(adapters: AgentSessionHostDrainRuntime.Adapters) -> AgentSessionHostDrainRuntime {
         AgentSessionHostDrainRuntime.begin(scope: scope, owner: self, adapters: adapters, releaseResources: { [self] in
-            await route.close()
-            await workspaceActivation?.release()
+            if let releaseExecutionRoute {
+                await workspaceActivation?.release()
+                await releaseExecutionRoute()
+            } else {
+                await route.close()
+                await workspaceActivation?.release()
+            }
         })
     }
 
@@ -144,6 +153,7 @@ final class AgentSessionRuntimeHost {
 
     init(
         route: MCPHostRouteResources,
+        executionRouteLease: MCPHostRouteResources.LeaseOwner.Lease? = nil,
         workspacePath: @escaping (AgentTabSession) throws -> String?,
         runtimeWorkspacePaths: @escaping (AgentTabSession) throws -> CodexRuntimeWorkspacePaths,
         connectionPolicyInstaller: @escaping AgentRunExecutionContracts.ConnectionPolicyInstaller,
@@ -151,7 +161,11 @@ final class AgentSessionRuntimeHost {
         catalogDiagnosticsSink: any AgentSessionLinkCatalogEventSink,
         perfRecorder: any AgentModePerfRecording
     ) {
+        precondition(route.isLeaseManaged == (executionRouteLease != nil), "A leased route requires an execution lease")
+        let releaseExecutionRoute = executionRouteLease?.transferToExecutionHost(on: route)
+        precondition(executionRouteLease == nil || releaseExecutionRoute != nil, "Transfer the execution lease synchronously at acquisition")
         self.route = route
+        self.releaseExecutionRoute = releaseExecutionRoute
         let routeID = route.identity.routeID
         let tools = route.toolExecutionRuntime
         runRoutingCleaner = Self.cleanRunRouting
@@ -484,7 +498,9 @@ final class AgentSessionRuntimeHost {
             runRoutingCleaner: @escaping RunRoutingCleaner, runToolCanceller: @escaping RunToolCanceller,
             activeAgentRunWaitDrain: CodexAgentRunWaitDrain? = nil
         ) {
+            precondition(!route.isLeaseManaged, "Inject leased hosts through the production initializer")
             self.route = route
+            releaseExecutionRoute = nil
             self.runRoutingCleaner = runRoutingCleaner
             self.runToolCanceller = runToolCanceller
             self.codexCoordinator = codexCoordinator

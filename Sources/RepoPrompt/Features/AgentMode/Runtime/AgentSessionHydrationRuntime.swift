@@ -309,12 +309,14 @@ enum AgentSessionHydrationRuntime {
             sourceItemID: persisted.pendingHandoffSourceItemID,
             defersProviderLockUntilSend: persisted.pendingHandoffDefersProviderLockUntilSend,
             isStagedForSend: false,
+            awaitsLocalClaudeOverflowInput: persisted.pendingHandoffAwaitsLocalClaudeOverflowInput == true && persisted.pendingHandoffPayload?.isEmpty == false,
             executionLocationFailure: persisted.pendingHandoffExecutionLocationFailure,
             providerSwitchDelivery: persisted.pendingHandoffProviderSwitchDelivery
         )
         session.selfCompactState = persisted.selfCompactState ?? .init()
         session.selfCompactPersistenceWarning = persisted.selfCompactPersistenceWarning
         session.contextWindowCapacity = persisted.contextWindowCapacity
+        session.claudeWakeCompactionSpentConversation = persisted.claudeWakeCompactionSpentConversation
         session.claudeAutoCompactWindowTokens = nil
         restoreCodexMetadata(from: persisted, to: session)
         switch session.selectedAgent {

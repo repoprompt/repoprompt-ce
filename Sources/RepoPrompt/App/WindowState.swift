@@ -2307,34 +2307,34 @@ class WindowState: ObservableObject {
     }
 
     @MainActor
-    func routeToAgentSession(_ route: AgentSessionDeepLinkRoute) async -> AgentSessionRouteResult {
-        await waitForWorkspaceInitializationForRouting()
-
-        guard let targetWorkspace = workspaceManager.workspace(withID: route.workspaceID) else {
-            return .workspaceUnavailable
+    func routeToAgentSession(_ route: AgentSessionDeepLinkRoute, validatedWorkspace: WorkspaceModel) async -> AgentSessionRouteResult {
+        let departure = workspaceManager.activeWorkspaceID
+        func canNavigate() -> Bool {
+            !Task.isCancelled && !isClosing && !hasUnfinishedRestoreExecution && workspaceManager.isInitialized
+                && !workspaceManager.isSwitchingWorkspace && workspaceManager.activeWorkspaceSwitch == nil
         }
+        guard canNavigate(), validatedWorkspace.id == route.workspaceID else { return .workspaceUnavailable }
+        let workspace = departure == route.workspaceID ? workspaceManager.activeWorkspace : validatedWorkspace
+        guard let workspace, workspace.id == route.workspaceID,
+              !workspace.composeTabsDecodeWasLossy else { return .workspaceUnavailable }
+        guard AppDeepLinkRouter.containsAgentDeepLinkTab(route.tabID, in: workspace) else { return .tabUnavailable }
 
-        NSApplication.shared.activate(ignoringOtherApps: true)
-        if let window = nsWindow {
-            window.makeKeyAndOrderFront(nil)
-        } else {
-            focusWindowIfPossible()
-        }
-
-        if workspaceManager.activeWorkspaceID != route.workspaceID {
-            let switchResult = await requestAgentDeepLinkWorkspaceSwitch(to: targetWorkspace)
+        focusWindowIfPossible()
+        guard canNavigate(), workspaceManager.activeWorkspaceID == departure else { return .workspaceUnavailable }
+        if departure != route.workspaceID {
+            let switchResult = await requestAgentDeepLinkWorkspaceSwitch(to: workspace)
             if !switchResult.didSwitch {
                 return .workspaceSwitchBlocked(switchResult.message)
             }
         }
 
+        guard canNavigate(), workspaceManager.activeWorkspaceID == route.workspaceID else { return .workspaceUnavailable }
         let result = await navigateAgentDeepLinkTab(route.tabID, sessionID: route.sessionID, workspaceID: route.workspaceID)
         guard result == .routed else { return result }
-        if let window = nsWindow {
-            window.makeKeyAndOrderFront(nil)
-        } else {
-            focusWindowIfPossible()
-        }
+        guard canNavigate(), let activeWorkspace = workspaceManager.activeWorkspace,
+              activeWorkspace.id == route.workspaceID else { return .workspaceUnavailable }
+        guard AppDeepLinkRouter.containsAgentDeepLinkTab(route.tabID, in: activeWorkspace) else { return .tabUnavailable }
+        focusWindowIfPossible()
         if route.interactionID != nil {
             agentModeViewModel.notificationAttention.revealRequests.send(route.tabID)
         }
@@ -2354,12 +2354,21 @@ class WindowState: ObservableObject {
             return .tabUnavailable
         }
 
+        let visitRegistry = workspaceLink || workspaceManager.isSessionRuntimeProjection ? nil : agentModeViewModel.preparedSessionRuntimes
+        let visitIntent = sessionID.flatMap { visitRegistry?.beginRuntimeVisitIntent($0) }
+        func visitIsCurrent() -> Bool {
+            guard let sessionID, let visitRegistry else { return true }
+            return visitRegistry.isRuntimeVisitIntentCurrent(sessionID, intent: visitIntent)
+        }
+
+        guard visitIsCurrent() else { return .blockedByActiveDifferentSession }
         if let sessionID {
             let activationResult = await agentModeViewModel.activateRoutedAgentSession(
                 tabID: tabID,
                 sessionID: sessionID,
                 workspace: activeWorkspace,
-                workspaceLink: workspaceLink
+                workspaceLink: workspaceLink,
+                visitIntent: visitIntent
             )
             guard activationResult == .ready else {
                 return agentSessionRouteResult(for: activationResult)
@@ -2369,6 +2378,7 @@ class WindowState: ObservableObject {
         if workspaceLink, isClosing || Task.isCancelled || workspaceManager.activeWorkspaceID != workspaceID || workspaceManager.isSwitchingWorkspace {
             return .workspaceUnavailable
         }
+        guard visitIsCurrent() else { return .blockedByActiveDifferentSession }
         if tabIsStashed {
             guard await promptManager.restoreStashedComposeTab(containingTabID: tabID) != nil else {
                 return .tabUnavailable
@@ -2386,10 +2396,12 @@ class WindowState: ObservableObject {
             return .workspaceUnavailable
         }
         if workspaceLink { return .routed }
+        guard visitIsCurrent() else { return .blockedByActiveDifferentSession }
         let finalActivationResult = await agentModeViewModel.activateRoutedAgentSession(
             tabID: tabID,
             sessionID: sessionID,
-            workspace: finalWorkspace
+            workspace: finalWorkspace,
+            visitIntent: visitIntent
         )
         guard finalActivationResult == .ready else {
             return agentSessionRouteResult(for: finalActivationResult)
@@ -2407,14 +2419,6 @@ class WindowState: ObservableObject {
     func isAgentSessionVisible(tabID: UUID, sessionID: UUID?) -> Bool {
         guard !isClosing, isCurrentlyFocused else { return false }
         return agentModeViewModel.isAgentSessionDisplayed(tabID: tabID, sessionID: sessionID)
-    }
-
-    @MainActor
-    private func waitForWorkspaceInitializationForRouting() async {
-        guard !workspaceManager.isInitialized else {
-            return
-        }
-        await workspaceManager.awaitInitialized()
     }
 
     private func agentSessionRouteResult(for activationResult: AgentRouteSessionActivationResult) -> AgentSessionRouteResult {
@@ -3171,7 +3175,11 @@ class WindowState: ObservableObject {
 
     func tearDown() async {
         beginClose()
-        if !WindowStatesManager.shared.isTerminating { await agentModeViewModel.joinOracleBackgroundWindowDrain() }
+        // The retained host drain joins its own Oracle producers. Waiting here would delay
+        // starting that drain and skip its bounded observation when the window closes.
+        if !WindowStatesManager.shared.isTerminating, agentModeViewModel.runtimeHost.workspaceActivation == nil {
+            await agentModeViewModel.joinOracleBackgroundWindowDrain()
+        }
         // Join cancelled startup before saves/root drains so it cannot publish or hydrate late.
         await workspaceManager.awaitInitialWorkspaceActivationCompletion()
         await workspaceManager.awaitPostSwitchGitDataLoadShutdown()
@@ -3198,7 +3206,10 @@ class WindowState: ObservableObject {
         // a long-lived subscription, so explicit cancellation is required to bound closed-window
         // memory and prevent stale windows from multiplying catalog snapshot work.
         domainWorkspacePresentationBridge?.stop()
-        await mcpServer.unregisterDomainRoutingWindow()
+        // A shared route belongs to the lease owner, not this teardown. In particular a
+        // timed-out retirement waiter must not revoke routing needed by the retained host.
+        let routeDisposalIsLeased = mcpServer.routeResources.isLeaseManaged
+        if !routeDisposalIsLeased { await mcpServer.unregisterDomainRoutingWindow() }
         mcpServer.stopServiceObservation()
 
         // App-level termination already coordinates agent/session and MCP shutdown.
@@ -3213,8 +3224,8 @@ class WindowState: ObservableObject {
         await agentModeViewModel.prepareForWindowClose()
         WorkspaceApprovalManager.shared.cancelPending(forWindowID: windowID)
 
-        // Stop the local MCP server
-        await mcpServer.stopServer()
+        // Shared-route terminal disposal belongs to its lease owner, after both users release.
+        if !routeDisposalIsLeased { await mcpServer.stopServer() }
 
         // Cancel any ongoing AI query
         aiQueriesService.cancelQuery()

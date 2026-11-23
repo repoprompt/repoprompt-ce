@@ -8023,7 +8023,7 @@ final class CodexNativeSessionController {
     }
 
     static func loadPersistedCommandSignals(fromRolloutPath path: String) -> PersistedCommandSignals {
-        guard let contents = try? String(contentsOfFile: path, encoding: .utf8), !contents.isEmpty else {
+        guard let contents = CodexRolloutText.read(atPath: path), !contents.isEmpty else {
             return PersistedCommandSignals()
         }
 

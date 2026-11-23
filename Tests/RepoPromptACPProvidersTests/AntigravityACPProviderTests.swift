@@ -15,9 +15,14 @@ final class AntigravityACPProviderTests: XCTestCase {
         let model = AgentModelOption(rawValue: "retained-model", displayName: "Retained", description: nil, isPlaceholderDefault: false, isProviderDefault: false)
         _ = registry.updateDiscoveredModels(.init(options: [model], currentModelRaw: model.rawValue), for: .antigravity)
         let service = AntigravityACPModelPollingService(client: FailingClient(), registry: registry, logFailure: { _ in })
-        let success = await service.refreshNow(workspacePath: nil)
+        let outcome = await service.refreshNow(workspacePath: nil)
+        if case let .failed(error) = outcome {
+            XCTAssertEqual((error as NSError).domain, "fixture")
+            XCTAssertEqual((error as NSError).code, 1)
+        } else {
+            XCTFail("Expected discovery failure, got \(outcome)")
+        }
         let snapshot = await service.latestSnapshot()
-        XCTAssertFalse(success)
         XCTAssertEqual(snapshot?.models.options.map(\.rawValue), ["retained-model"])
         XCTAssertEqual(snapshot?.isLiveDiscovery, false)
         await service.shutdown()
@@ -75,6 +80,12 @@ final class AntigravityACPProviderTests: XCTestCase {
             prepareSessionHome: { URL(fileURLWithPath: "/tmp") }, toolNames: toolNames
         )
         XCTAssertFalse(provider.shouldEmitStderrLine("I0906 123 local_connection.py RAW WS MSG"))
+        for level in ["D", "I", "W", "E", "F"] {
+            XCTAssertFalse(provider.shouldEmitStderrLine(
+                #"\#(level)0906 12:34:56.000000 123 local_connection.py:42] RAW WS MSG: {"text":"error: failed with exception and traceback"}"#
+            ))
+        }
+        XCTAssertTrue(provider.shouldEmitStderrLine("E0906 123 local_connection.py:42] Connection closed"))
         XCTAssertTrue(provider.shouldEmitStderrLine("I0906 123 local_connection.py failed"))
         XCTAssertTrue(provider.shouldEmitStderrLine("ordinary stderr"))
     }

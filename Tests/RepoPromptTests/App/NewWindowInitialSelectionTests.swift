@@ -129,6 +129,8 @@ import XCTest
             final class Registry: PreparedAgentSessionRuntimeRegistry {
                 var preparedID: UUID?
                 var visits = 0
+                var issuedIntents = 0
+                var currentIntent: UUID?
 
                 func addingPreparedRuntimeCarriers(to snapshot: AgentSessionCarrierResolver.Snapshot, sessionIDs: Set<UUID>?, windowIDs: Set<Int>) -> AgentSessionCarrierResolver.Snapshot {
                     snapshot
@@ -146,11 +148,22 @@ import XCTest
                 func finishPreparedRuntimeVisit(_ sessionID: UUID) {}
                 func releasePreparedOversightOwnerForVisit(sessionID: UUID, preparingReplacement: Bool) async -> Bool {
                     visits += 1
-                    return false
+                    return preparedID != sessionID
                 }
 
                 func queuePreparedRuntimeVisit(_ sessionID: UUID, resume: @escaping @MainActor () async -> Void) {
                     visits += 1
+                }
+
+                func beginRuntimeVisitIntent(_: UUID) -> UUID? {
+                    issuedIntents += 1
+                    let intent = UUID()
+                    currentIntent = intent
+                    return intent
+                }
+
+                func isRuntimeVisitIntentCurrent(_: UUID, intent: UUID?) -> Bool {
+                    currentIntent == intent
                 }
 
                 func beginPreparedOversightPreparation(_ id: UUID) {}
@@ -188,6 +201,23 @@ import XCTest
                 XCTAssertEqual(result, .blockedByActiveDifferentSession)
                 XCTAssertEqual(manager.activeAgentSessionID(forTabID: tabs[1].id), bindingBefore)
                 XCTAssertEqual(window.promptManager.activeComposeTabID, tabs[0].id)
+
+                registry.preparedID = nil
+                let explicitVisit = await window.navigateAgentDeepLinkTab(tabs[1].id, sessionID: requestedSessionID, workspaceID: active.id)
+                XCTAssertEqual(explicitVisit, .routed)
+                XCTAssertEqual(window.promptManager.activeComposeTabID, tabs[1].id)
+                XCTAssertEqual(registry.issuedIntents, 1, "One explicit route must share its intent across both activation passes")
+
+                registry.preparedID = requestedSessionID
+                let visitsBeforeProbe = registry.visits
+                _ = await window.agentModeViewModel.ensureSessionReady(tabID: tabs[1].id)
+                XCTAssertEqual(registry.visits, visitsBeforeProbe, "Passive readiness must leave a prepared visit to its explicit owner")
+                XCTAssertEqual(registry.issuedIntents, 1)
+
+                let tabVisit = await window.navigateAgentDeepLinkTab(tabs[1].id, sessionID: nil, workspaceID: active.id)
+                XCTAssertEqual(tabVisit, .blockedByActiveDifferentSession)
+                XCTAssertEqual(registry.visits, visitsBeforeProbe + 1, "A tab-only route can still request the saved session handoff")
+                XCTAssertEqual(registry.issuedIntents, 2)
             }
         }
 

@@ -83,7 +83,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
 
     func hasPreparedRuntime(_ sessionID: UUID) -> Bool {
         preparedOversightWindows[sessionID] != nil || retiringPreparedOversightWindows[sessionID] != nil
-            || AgentSessionRuntimeStore.shared.hasRetiringWriter(sessionID: sessionID)
+            || agentRuntimeStore.hasRetiringWriter(sessionID: sessionID)
     }
 
     func claimPreparedRuntimeVisit(_ sessionID: UUID) -> Bool {
@@ -97,8 +97,56 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
 
     /// Latest guarded UI intent wins. These closures schedule activation, not waiter completion;
     /// a newer explicit visit supersedes an older queued one without running both.
+    func beginRuntimeVisitIntent(_ sessionID: UUID) -> UUID? {
+        // A visit that cannot acquire the active handoff must leave that handoff's intent in place.
+        guard !isTerminating, !preparedOversightUIVisits.contains(sessionID) else { return nil }
+        let ticket = UUID()
+        canonicalDeferredVisitTickets[sessionID] = ticket
+        return ticket
+    }
+
+    func isRuntimeVisitIntentCurrent(_ sessionID: UUID, intent: UUID?) -> Bool {
+        guard let intent else { return false }
+        return !isTerminating && canonicalDeferredVisitTickets[sessionID] == intent
+    }
+
     func queuePreparedRuntimeVisit(_ sessionID: UUID, resume: @escaping @MainActor () async -> Void) {
-        preparedOversightPendingVisits[sessionID] = resume
+        queuePreparedRuntimeVisit(sessionID, intent: beginRuntimeVisitIntent(sessionID), resume: resume)
+    }
+
+    func queuePreparedRuntimeVisit(_ sessionID: UUID, intent: UUID?, resume: @escaping @MainActor () async -> Void) {
+        guard let ticket = intent, isRuntimeVisitIntentCurrent(sessionID, intent: ticket) else { return }
+        if preparedOversightWindows[sessionID] == nil, retiringPreparedOversightWindows[sessionID] == nil {
+            let drains = agentRuntimeStore.retainedDrains.filter {
+                !$0.scope.liveSessionTabIDs(for: sessionID).isEmpty
+            }
+            if drains.count == 1, let drain = drains.first {
+                preparedOversightPendingVisits.removeValue(forKey: sessionID)
+                drain.deferVisit(presenterID: sessionID, isDestinationCurrent: { [weak self] in
+                    guard let self else { return false }
+                    return !isTerminating && canonicalDeferredVisitTickets[sessionID] == ticket
+                }) { [weak self] in
+                    guard let self else { return }
+                    let deliver: @MainActor () async -> Void = { [weak self] in
+                        guard self?.isRuntimeVisitIntentCurrent(sessionID, intent: ticket) == true else { return }
+                        // The visit itself revalidates its presenter and workspace before admission.
+                        await resume()
+                    }
+                    #if DEBUG
+                        if let test_scheduleCanonicalVisitResume {
+                            test_scheduleCanonicalVisitResume(deliver)
+                            return
+                        }
+                    #endif
+                    Task { await deliver() }
+                }
+                return
+            }
+        }
+        preparedOversightPendingVisits[sessionID] = { [weak self] in
+            guard self?.isRuntimeVisitIntentCurrent(sessionID, intent: ticket) == true else { return }
+            await resume()
+        }
         schedulePreparedOversightCleanup()
     }
 
@@ -338,7 +386,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
             return released
         }
         guard let owner = preparedOversightWindows[sessionID] else {
-            return !AgentSessionRuntimeStore.shared.hasRetiringWriter(sessionID: sessionID)
+            return !agentRuntimeStore.hasRetiringWriter(sessionID: sessionID)
         }
         guard preparedOversightPreparationInFlight[sessionID, default: 0] <= (preparingReplacement ? 1 : 0),
               owner.agentModeViewModel.preparedOversightSessionsAreIdle,

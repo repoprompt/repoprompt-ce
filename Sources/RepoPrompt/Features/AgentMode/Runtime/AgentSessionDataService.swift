@@ -180,6 +180,7 @@ actor AgentSessionDataService {
         let codexMcpSessionKey: String?
         /// Decoded leniently: one malformed capacity must not fail the header of an otherwise valid file.
         let contextWindowCapacity: LenientContextWindowCapacity?
+        let claudeWakeCompactionSpentConversation: String?
         let parentSessionID: UUID?
         let createdByOverseerSessionID: UUID?
         let organizationalParentID: UUID?
@@ -188,6 +189,7 @@ actor AgentSessionDataService {
         let worktreeMergeOperations: [AgentSessionWorktreeMergeOperation]?
         let pendingHandoffProviderSwitchDelivery: AgentProviderSwitchDelivery?
         let pendingHandoffPayload: String?
+        let pendingHandoffAwaitsLocalClaudeOverflowInput: Bool?
         let pendingHandoffCreatedAt: Date?
         let pendingHandoffSourceItemID: UUID?
         let pendingHandoffDefersProviderLockUntilSend: Bool?
@@ -1528,12 +1530,14 @@ actor AgentSessionDataService {
                 codexTotalTotalTokens: header.codexTotalTotalTokens,
                 codexMcpSessionKey: header.codexMcpSessionKey,
                 contextWindowCapacity: header.contextWindowCapacity?.value,
+                claudeWakeCompactionSpentConversation: header.claudeWakeCompactionSpentConversation,
                 parentSessionID: header.parentSessionID,
                 createdByOverseerSessionID: header.createdByOverseerSessionID,
                 organizationalParentID: header.organizationalParentID,
                 delegationScopeID: header.delegationScopeID,
                 pendingHandoffProviderSwitchDelivery: header.pendingHandoffProviderSwitchDelivery,
                 pendingHandoffPayload: header.pendingHandoffPayload,
+                pendingHandoffAwaitsLocalClaudeOverflowInput: header.pendingHandoffAwaitsLocalClaudeOverflowInput,
                 pendingHandoffCreatedAt: header.pendingHandoffCreatedAt,
                 pendingHandoffSourceItemID: header.pendingHandoffSourceItemID,
                 pendingHandoffDefersProviderLockUntilSend: header.pendingHandoffDefersProviderLockUntilSend ?? false,

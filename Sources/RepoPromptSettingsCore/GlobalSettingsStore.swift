@@ -1391,6 +1391,17 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         return true
     }
 
+    /// Zero disables proactive compaction. Invalid persisted values fall back to the default.
+    package func claudeWakeCompactionThresholdPercent() -> Int {
+        let percent = scalarPreferences.agentMode?.claudeWakeCompactionThresholdPercent ?? 80
+        return percent == 0 || (70 ... 90).contains(percent) ? percent : 80
+    }
+
+    package func setClaudeWakeCompactionThresholdPercent(_ percent: Int) {
+        guard percent == 0 || (70 ... 90).contains(percent) else { return }
+        updateAgentModeScalar(commit: true) { $0.claudeWakeCompactionThresholdPercent = percent }
+    }
+
     package func agentSessionHandoffInstructions() -> String {
         scalarPreferences.agentMode?.agentSessionHandoffInstructions ?? ""
     }

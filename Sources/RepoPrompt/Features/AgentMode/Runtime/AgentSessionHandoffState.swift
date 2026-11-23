@@ -12,6 +12,7 @@ struct AgentPendingHandoffState: Equatable {
     /// until the destination tab successfully sends its first real user turn.
     var defersProviderLockUntilSend: Bool = false
     var isStagedForSend: Bool = false
+    var awaitsLocalClaudeOverflowInput = false
     /// Durable failure/preparation marker; ordinary send cleanup must never clear it.
     var executionLocationFailure: String?
     /// Nil retains the existing fork/resume-recovery delivery policy.
@@ -30,6 +31,7 @@ struct AgentPendingHandoffState: Equatable {
         sourceItemID = nil
         defersProviderLockUntilSend = false
         isStagedForSend = false
+        awaitsLocalClaudeOverflowInput = false
         providerSwitchDelivery = nil
         providerSwitchDispatch = nil
     }

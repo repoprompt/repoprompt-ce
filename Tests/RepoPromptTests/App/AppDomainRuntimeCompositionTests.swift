@@ -11,6 +11,29 @@ import SQLite3
 import XCTest
 
 final class AppDomainRuntimeCompositionTests: XCTestCase {
+    @MainActor
+    func testWindowCompositionInstallsLinkExecutionInItsHostScope() throws {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        defer { GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false) }
+
+        let composition = WindowStateCompositionFactory.make(
+            windowID: -2890,
+            deferredInitialAgentSystemWorkspaceRefresh: true,
+            sharedMCPService: MCPService(),
+            loadStoredAPISettingsDataOnInit: false,
+            automaticProviderModelDiscoveryEnabled: false
+        )
+        let presenter = composition.agentModeViewModel
+        XCTAssertTrue(presenter.workspaceSwitchProvider === presenter.runtimeHost.workspaceSwitchCleanup)
+        let scope = presenter.runtimeHost.scope
+        // Inspect the scope before asking presentation for its projection.
+        let installed = try XCTUnwrap(scope.linkExecution)
+        XCTAssertNotNil(scope.worktrees.terminalContinuationLauncher)
+        XCTAssertTrue(presenter.linkExecutionRuntime === installed)
+        XCTAssertTrue(scope.linkExecution === installed)
+    }
+
     func testCollectLegacyRuntimeDefaultsSerializesBooleanScalarFragments() throws {
         for value in [true, false] {
             let (defaults, suiteName) = try makeIsolatedDefaults()

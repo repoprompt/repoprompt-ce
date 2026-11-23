@@ -24,6 +24,13 @@ extension AgentSessionLinkExecutionRuntime {
             currentReferences: Set(snapshot.autoWakeLanes.map(\.reference))
         )
 
+        // A held conversation cannot reserve even a parked attempt. Retraction uses the
+        // existing tombstone rules; the canonical queue remains owned by the reducer.
+        if session.claudeContextBlocksAutoWake {
+            cancelAgentSessionLinkAutoWake(for: endpoint, reason: .eligibilityLost)
+            return
+        }
+
         if let attempt = session.oversight.pendingAutoWake,
            attempt.isPeriodic,
            attempt.observerEndpoint == endpoint
@@ -321,7 +328,11 @@ extension AgentSessionLinkExecutionRuntime {
 
             agentSelfCompactSettleStaleParkedNote(session)
             if attempt.isPeriodic {
-                await agentSessionLinkRunPeriodicAttempt(attempt, session: session)
+                switch await agentSessionLinkPrepareClaudeWake(attempt, session: session) {
+                case .unchanged: await agentSessionLinkRunPeriodicAttempt(attempt, session: session)
+                case .recheckAfterCompaction: continue
+                case .withholdWake: cancelWakeAfterClaudeMaintenance(wakeID: wakeID, endpoint: endpoint, session: session)
+                }
                 return
             }
             guard let route = agentSessionLinkAutoWakeRoute(session, refusalPhase: attempt.phase) else {
@@ -366,6 +377,15 @@ extension AgentSessionLinkExecutionRuntime {
             ) else {
                 cancelAgentSessionLinkAutoWake(for: endpoint, reason: .eligibilityLost)
                 return
+            }
+            if route == .idleFollowUp, let current = session.oversight.pendingAutoWake {
+                switch await agentSessionLinkPrepareClaudeWake(current, session: session) {
+                case .unchanged: break
+                case .recheckAfterCompaction: continue
+                case .withholdWake:
+                    cancelWakeAfterClaudeMaintenance(wakeID: wakeID, endpoint: endpoint, session: session)
+                    return
+                }
             }
             // Reserve the exact rendered lane batch before provider preparation. Budget omission,
             // receipt competition, revocation, and membership drift therefore remain definite
@@ -457,6 +477,17 @@ extension AgentSessionLinkExecutionRuntime {
                 endpoint: endpoint
             )
             return
+        }
+    }
+
+    private func cancelWakeAfterClaudeMaintenance(
+        wakeID: UUID, endpoint: DomainAgentSessionLinkEndpointIdentity, session: TabSession
+    ) {
+        guard agentSessionLinkAutoWakeSession(for: endpoint) === session,
+              session.oversight.pendingAutoWake?.wakeID == wakeID else { return }
+        cancelAgentSessionLinkAutoWake(for: endpoint, reason: .requiredClaimUnavailable)
+        if session.oversight.periodicIdleWakeEnabled {
+            agentSessionLinkReconcilePeriodicWake(for: endpoint)
         }
     }
 
@@ -1249,6 +1280,7 @@ extension AgentSessionLinkExecutionRuntime {
         session: TabSession,
         endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> AgentMonitorWakeNowRefusal? {
+        if session.claudeContextBlocksAutoWake { return .claudeSizeFailure }
         guard let snapshot = agentSessionLinkCurrentPassiveSnapshot(for: endpoint),
               snapshot.isDeliverable,
               snapshot.hasDeliverableContent
@@ -1745,6 +1777,7 @@ extension AgentSessionLinkExecutionRuntime {
 
     /// First refusing predicate, shared by routing and its bounded release-safe diagnostic.
     private func agentSessionLinkAutoWakeRouteRefusal(_ session: TabSession) -> AutoWakeRouteRefusal? {
+        guard !session.claudeContextBlocksAutoWake else { return .claudeSizeFailure }
         guard !session.bindingTransitionInProgress else { return .bindingTransitionInProgress }
         guard session.permitsBoundOperationAndSave else { return .hasLoadedPersistedState }
         guard !session.terminalCommitInProgress else { return .terminalCommitInProgress }
@@ -2144,6 +2177,7 @@ extension AgentSessionLinkExecutionRuntime {
         _ attempt: AgentSessionLinkAutoWakeAttempt,
         session: TabSession
     ) -> Bool {
+        guard !session.claudeContextBlocksAutoWake else { return false }
         if attempt.isPeriodic {
             return agentSessionLinkPeriodicWakeIsEligible(session, endpoint: attempt.observerEndpoint, requiresReadyCatalog: false)
         }

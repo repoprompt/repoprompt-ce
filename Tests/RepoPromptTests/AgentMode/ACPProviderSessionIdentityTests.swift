@@ -5,6 +5,7 @@ import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptProcess
+import RepoPromptProviderQuota
 import RepoPromptSettingsCore
 import XCTest
 
@@ -25,10 +26,40 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
         let empty = AntigravityACPModelPollingService(client: Client(models: .init(options: [], currentModelRaw: nil)), registry: registry, logFailure: { _ in })
         let refreshed = await empty.refreshNow(workspacePath: nil)
         let latest = await empty.latestSnapshot()
-        XCTAssertTrue(refreshed)
+        XCTAssertEqual(refreshed.connectionError, "No models received. Confirm your Google sign-in, then test again.")
         XCTAssertEqual(latest?.models.options.map(\.rawValue), ["antigravity-fixture"])
         XCTAssertEqual(latest?.isLiveDiscovery, true)
         await empty.shutdown()
+    }
+
+    func testAntigravitySurfacesTypedTrustAndSpawnFailuresWithoutSignInHint() async {
+        struct Client: AntigravityACPModelDiscoveryClient {
+            let error: any Error
+            func discoverModels(workspacePath _: String?) async throws -> ACPDiscoveredSessionModels? {
+                throw error
+            }
+        }
+        let registry = AgentACPModelRegistry(dependencies: .init(loadAll: { [:] }, load: { _ in nil }, save: { _, _ in }, remove: { _ in }, invalidate: { _ in }))
+        let directory = "/opt/homebrew/Caskroom"
+        let trustError = ExecutableFileIdentityError.untrustedWritableDirectory(directory, 0o775)
+        let service = AntigravityACPModelPollingService(client: Client(error: trustError), registry: registry, logFailure: { _ in })
+        let outcome = await service.refreshNow(workspacePath: nil)
+        XCTAssertEqual(outcome.connectionError, trustError.localizedDescription)
+        XCTAssertEqual(AntigravityCLIUsageSource.launchFailure(for: trustError).message, trustError.localizedDescription)
+        await service.shutdown()
+
+        let spawnError = ProcessLauncherError.spawnFailed(errno: Int32(EACCES))
+        let expected = "Could not start Antigravity: \(NSError(domain: NSPOSIXErrorDomain, code: Int(EACCES)).localizedDescription)"
+        XCTAssertEqual(AntigravityACPModelPollingService.RefreshOutcome.failed(spawnError).connectionError, expected)
+        XCTAssertEqual(AntigravityCLIUsageSource.launchFailure(for: spawnError).message, expected)
+    }
+
+    func testAntigravitySignInHintDoesNotExposeUnclassifiedProviderErrors() {
+        typealias Outcome = AntigravityACPModelPollingService.RefreshOutcome
+        XCTAssertEqual(Outcome.signInRequired.connectionError, "No models received. Confirm your Google sign-in, then test again.")
+        let unrelated = AIProviderError.invalidResponse(detail: "raw provider data")
+        XCTAssertEqual(Outcome.failed(unrelated).connectionError, "Antigravity could not complete model discovery. Try again.")
+        XCTAssertNil(Outcome.cancelled.connectionError)
     }
 
     func testAntigravityPropagatesSessionHomePreparationFailure() {

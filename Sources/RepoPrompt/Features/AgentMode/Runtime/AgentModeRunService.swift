@@ -335,6 +335,10 @@ final class AgentModeRunService {
             return .completed(session.selectedAgent == .codexExec ? .preDispatchRejected(message: message) : nil)
         }
         let selectedAgent = session.selectedAgent
+        guard providerControlCommand?.claudeWakeCompaction?.isCurrent(for: session) != false else {
+            startOutcome?.recordStartFailure(message: nil)
+            return .completed(nil)
+        }
         if let selfCompactDispatchID {
             guard session.selfCompactState.active?.id == selfCompactDispatchID.requestID,
                   selfCompactDispatchID.stage == .note

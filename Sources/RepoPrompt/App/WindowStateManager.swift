@@ -570,7 +570,10 @@ class WindowStatesManager: ObservableObject {
     private(set) var isTerminating = false
 
     /// Prevent accidental secondary instances
-    private init(windowSessionFileURL: URL = WindowSessionStore.sessionFileURL()) {
+    let agentRuntimeStore: AgentSessionRuntimeStore
+
+    private init(windowSessionFileURL: URL = WindowSessionStore.sessionFileURL(), agentRuntimeStore: AgentSessionRuntimeStore? = nil) {
+        self.agentRuntimeStore = agentRuntimeStore ?? .shared
         windowSessionWriter = WindowSessionDiskWriter(fileURL: windowSessionFileURL)
         modelRouterRuntime.usageBalancer = providerQuotaRuntime.usageAdvisor
         autoRestoreWorkspacesEnabled = UserDefaults.standard.object(forKey: WindowStatesManager.autoRestoreDefaultsKey) as? Bool ?? false
@@ -624,6 +627,10 @@ class WindowStatesManager: ObservableObject {
     var preparedOversightConsentPairs: [UUID: Set<AgentSessionOversightIntent>] = [:]
     var preparedOversightRunObservations: [UUID: AgentSessionLinkObservationToken] = [:]
     var preparedOversightPendingVisits: [UUID: @MainActor () async -> Void] = [:]
+    var canonicalDeferredVisitTickets: [UUID: UUID] = [:]
+    #if DEBUG
+        var test_scheduleCanonicalVisitResume: ((@escaping @MainActor () async -> Void) -> Void)?
+    #endif
     var sessionRuntimeWindows: [WindowState] {
         guard !preparedOversightWindows.isEmpty else { return allWindows }
         return allWindows + preparedOversightWindows.compactMap { id, owner in
@@ -1491,8 +1498,8 @@ class WindowStatesManager: ObservableObject {
     #if DEBUG
         /// A test-owned manager whose session snapshots go to `windowSessionFileURL`, never to the
         /// shared Application Support session file.
-        static func makeForTesting(windowSessionFileURL: URL) -> WindowStatesManager {
-            WindowStatesManager(windowSessionFileURL: windowSessionFileURL)
+        static func makeForTesting(windowSessionFileURL: URL, agentRuntimeStore: AgentSessionRuntimeStore? = nil) -> WindowStatesManager {
+            WindowStatesManager(windowSessionFileURL: windowSessionFileURL, agentRuntimeStore: agentRuntimeStore)
         }
 
         func setTerminatingForTesting(_ isTerminating: Bool) {
@@ -1607,7 +1614,8 @@ class WindowStatesManager: ObservableObject {
     func shutdownAllAgentSessions() async {
         // Snapshot executable owners before any presenter close can clear membership. These
         // hosts include detached epochs that no longer occur in the window/prepared census.
-        let store = AgentSessionRuntimeStore.shared
+        canonicalDeferredVisitTickets.removeAll()
+        let store = agentRuntimeStore
         var seenHosts: Set<ObjectIdentifier> = []
         let retainedHosts = (store.retainedExecutionHosts + store.retainedDrains.compactMap(\.scope.executableHost)).filter {
             seenHosts.insert(ObjectIdentifier($0)).inserted

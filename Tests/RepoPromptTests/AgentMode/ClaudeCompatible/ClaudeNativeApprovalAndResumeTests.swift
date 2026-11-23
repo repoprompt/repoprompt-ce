@@ -2824,6 +2824,281 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         await h.host.claudeCoordinator.shutdownClaudeSession(session)
     }
 
+    func testClaudeSizeFailureCommitsOneErrorAndHoldsTheFailedConversation() async throws {
+        let (h, session, controller, _) = try await spyFixture()
+        let conversation = "overfull-conversation"
+        session.providerSessionID = conversation
+        let providerID = UUID()
+        await controller.setTurnInFlight(true)
+        await controller.emit(.providerTurnStarted(turnID: providerID))
+        await until("provider starts") { session.runState == .running }
+        let failure = ClaudeTurnSizeFailure(kind: .inputContextRejected, source: .localCLIRejection, conversationID: conversation)
+        await controller.emit(.turnCompleted(turnID: providerID, status: .claudeSizeFailure(failure)))
+        await until("typed size rejection settles") { session.runState == .failed && session.agentTask == nil }
+        XCTAssertEqual(session.lastTerminalCommitRevision?.failureReason, .contextExhausted)
+        XCTAssertEqual(session.activeClaudeContextAutoWakeHold?.failure, failure)
+        let errors = session.items.filter { $0.kind == .error }
+        XCTAssertEqual(errors.count, 1)
+        XCTAssertTrue(try XCTUnwrap(errors.first).text.contains("Auto-wake is paused"))
+        await h.host.claudeCoordinator.shutdownClaudeSession(session)
+    }
+
+    private func reportOverflowFixtureLoad(_ used: Int, to session: AgentTabSession) {
+        _ = AgentSessionUsageRuntime().ingestNonCodexUsageReport(
+            promptTokens: nil, completionTokens: nil, contextUsedTokens: used,
+            modelContextWindow: 100_000, session: session
+        )
+    }
+
+    private func startOverflowFixtureRun(_ h: AgentSessionLinkRunnerHarness, session: AgentTabSession, execution: AgentModeRunService) async throws {
+        try await h.host.test_composeRunService(execution).startRun(
+            tabID: session.tabID, session: session, origin: h.startCommand(for: session),
+            initialUserMessage: "oversized input", initialMessageForRun: "oversized input", attachments: []
+        )
+    }
+
+    func testOverflowOriginUsesOnlyTheExactAcceptedInputsPriorOccupancy() async throws {
+        for behavior in ["exact", "unknown", "low", "fresh-low", "fresh-withdrawn", "fresh-during-write", "compact-signal", "compact-boundary", "replace-before-write", "grouped-input", "steer", "throw"] {
+            let replacement = behavior == "replace-before-write" ? MonitorFakeNativeController() : nil
+            let (h, session, controller, listener) = try await spyFixture(replacement: replacement)
+            let conversation = try XCTUnwrap(session.providerSessionID)
+            let failure = ClaudeTurnSizeFailure(kind: .inputContextRejected, source: .localCLIRejection, conversationID: conversation)
+            if behavior != "unknown" { reportOverflowFixtureLoad(behavior == "low" ? 20000 : 95000, to: session) }
+            if behavior == "throw" { await controller.setFailSendAfterRecord(true) }
+            let installation = listener.installationWitness
+            let sendGate = Gate()
+            defer { sendGate.open() }
+            if behavior == "fresh-during-write" { await controller.setSendSuspension { await sendGate.wait() } }
+            if replacement != nil {
+                let coordinator = h.host.claudeCoordinator
+                let oldSettings = try XCTUnwrap(coordinator.test_controllerLaunchSettings(for: session))
+                coordinator.test_setControllerLaunchSettings(.init(
+                    runtimeVariant: oldSettings.runtimeVariant, workspacePath: "/retired-claude-fixture",
+                    permissionMode: oldSettings.permissionMode, allowNativeBashTool: oldSettings.allowNativeBashTool,
+                    mcpStrictMode: oldSettings.mcpStrictMode
+                ), for: session)
+            }
+            try await startOverflowFixtureRun(h, session: session, execution: h.service)
+            if behavior == "fresh-during-write" {
+                await until("ordinary send suspended before returning its ID") { sendGate.isWaiting }
+                XCTAssertTrue(session.claudeExpectedTurnIDs.isEmpty)
+                reportOverflowFixtureLoad(20000, to: session)
+                sendGate.open()
+            }
+            if behavior == "throw" {
+                await until("refused write settles") { session.agentTask == nil }
+                XCTAssertNil(session.activeClaudeContextAutoWakeHold)
+                let count = await controller.sentCount
+                XCTAssertEqual(count, 1, "An attempted write that throws cannot stamp a witness")
+                await h.host.claudeCoordinator.shutdownClaudeSession(session)
+                continue
+            }
+            await until("ordinary input is registered") { session.claudeExpectedTurnIDs.count == 1 }
+            let input = try XCTUnwrap(session.claudeExpectedTurnIDs.first)
+            let attempt = try XCTUnwrap(session.activeRunAttemptID)
+            XCTAssertEqual(AgentModeViewModel.observationContextLoad(for: session)?.usedTokens, behavior == "fresh-during-write" ? 20000 : nil, behavior)
+            if let replacement {
+                XCTAssertTrue(session.claudeController === replacement)
+                let next = await h.host.claudeCoordinator.test_installEventListener(for: session)
+                XCTAssertNotNil(next)
+                XCTAssertFalse(next?.hasInstallation(installation) ?? true)
+            }
+            switch behavior {
+            case "fresh-low", "fresh-withdrawn":
+                reportOverflowFixtureLoad(20000, to: session)
+                XCTAssertEqual(AgentModeViewModel.observationContextLoad(for: session)?.usedTokens, 20000)
+                if behavior == "fresh-withdrawn" { session.invalidateClaudeWakeUsage() }
+            case "compact-signal", "compact-boundary":
+                let estimator = ClaudeContextUsageEstimator(tokenEstimator: { _ in 0 }, contextUsageBuilder: { _, _ in nil })
+                if behavior == "compact-signal" { estimator.ingestStatusSignal("Compacting context", session: session) }
+                else { estimator.ingestSystemSignal("Context compacted", session: session) }
+            case "steer":
+                try queueSteer("replacement instruction", in: session, service: h.service)
+                await controller.setTurnInFlight(true)
+                await controller.setInterruptedTurnID(input)
+                let accepted = await h.service.submitQueuedClaudeSteeringIfSupported(session: session)
+                XCTAssertTrue(accepted)
+                await until("replacement input accepted") { session.claudeAcceptedHostTurnIDs.count == 2 }
+            default:
+                break
+            }
+            if behavior == "grouped-input" {
+                await controller.emit(.turnsCompleted(turnIDs: [input, UUID()], status: .claudeSizeFailure(failure)))
+            } else {
+                await (replacement ?? controller).completeLastTurn(status: .claudeSizeFailure(failure))
+            }
+            await until("ordinary terminal finishes") { session.agentTask == nil }
+            XCTAssertEqual(session.lastTerminalCommitRevision?.failureReason, .contextExhausted, behavior)
+            XCTAssertNotNil(session.activeClaudeContextAutoWakeHold, behavior)
+            XCTAssertEqual(session.activeClaudeContextAutoWakeHold?.recoveryOriginAttemptID, behavior == "exact" ? attempt : nil, behavior)
+            await h.host.claudeCoordinator.shutdownClaudeSession(session)
+        }
+    }
+
+    func testCapturedClaudeOverflowRunsOneNativeMaintenanceWriteOnlyAfterToolsDrain() async throws {
+        try await assertCapturedOverflowRecovery(keyed: false)
+    }
+
+    func testKeyedClaudeOverflowRunsOneNativeMaintenanceWriteOnlyAfterToolsDrain() async throws {
+        try await assertCapturedOverflowRecovery(keyed: true)
+    }
+
+    private func assertCapturedOverflowRecovery(keyed: Bool) async throws {
+        let runID = UUID(), tabID = UUID()
+        let conversation = "application-proof-session"
+        let settings = ClaudeAgentModeCoordinator.ControllerLaunchSettings(
+            runtimeVariant: .standard, workspacePath: nil, permissionMode: nil,
+            allowNativeBashTool: nil, mcpStrictMode: nil
+        )
+        let adapter = try XCTUnwrap(ClaudeAgentModeCoordinator.test_makeDefaultController(
+            runID: runID, tabID: tabID, windowID: 1, launchSettings: settings
+        ) as? ClaudeCompatibleNativeSessionAdapter)
+        let native = await adapter.test_processController()
+        let controller = try XCTUnwrap(native)
+        let writes = ClaudeNativeApprovalAndResumeTests.WrittenLines()
+        await controller.test_installConfigurationTransport(write: { writes.append($0) })
+        let h = AgentSessionLinkRunnerHarness(
+            headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() },
+            claudeControllerFactory: { _, _, _, _ in adapter }, initialWorkspaceTabID: tabID
+        )
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("ClaudeOverflow-\(UUID())")
+        let manager = try XCTUnwrap(h.host.workspaceManager)
+        var workspace = try XCTUnwrap(manager.activeWorkspace)
+        workspace.ephemeralFlag = false
+        workspace.customStoragePath = root
+        manager.workspaces = [workspace]
+        manager.activeWorkspace = workspace
+        h.host.test_setSuppressesAgentSessionPersistence(false)
+        let session = try h.makeBoundSession(agent: .claudeCode, tabID: tabID)
+        let coordinator = h.host.claudeCoordinator
+        session.installRunID(runID)
+        session.providerSessionID = conversation
+        session.runState = .completed
+        let ready = await coordinator.test_ensureClaudeNativeSession(
+            session: session, intent: .reconnect(runID: runID, providerSessionID: conversation, currency: session.persistentBindingTransitionToken())
+        )
+        XCTAssertEqual(ready, .ready)
+        let installed = await coordinator.test_installEventListener(for: session)
+        let listener = try XCTUnwrap(installed)
+        addTeardownBlock {
+            await coordinator.shutdownClaudeSession(session)
+            try? FileManager.default.removeItem(at: root)
+        }
+        defer { session.saveDebounceTask?.cancel() }
+        var initObserved = false
+        var terminalInputIDs: [UUID]?
+        var terminalStatus: NativeAgentRuntimeTurnStatus?
+        listener.test_onReceive = { event in
+            switch event {
+            case .runtimeInit: initObserved = true
+            case let .turnCompleted(id, status): (terminalInputIDs, terminalStatus) = ([id], status)
+            case let .turnsCompleted(ids, status): (terminalInputIDs, terminalStatus) = (ids, status)
+            default: break
+            }
+        }
+        defer { listener.test_onReceive = nil }
+        try await feed([
+            "type": "system", "subtype": "init", "claude_code_version": "2.1.330",
+            "session_id": conversation, "capabilities": keyed ? ["msg_lifecycle_v1"] : []
+        ], controller)
+        await until("native init observed before seeding occupancy") { initObserved }
+
+        let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
+        let links = h.host.linkExecutionRuntime
+        var toolsAreActive = true
+        var checkedDrain = false
+        links.activeMCPToolProbe = { id in
+            guard id == runID else { return false }
+            checkedDrain = true
+            return toolsAreActive
+        }
+        defer { links.activeMCPToolProbe = { _ in false } }
+        seedCompletedOverflowFixtureTurn(session)
+        let sendGate = Gate()
+        defer { sendGate.open() }
+        await controller.test_setBeforeConfigurationSend { await sendGate.wait() }
+        try await startOverflowFixtureRun(h, session: session, execution: service)
+        await until("native send reaches the configured write boundary") { sendGate.isWaiting }
+        let priorLoad = AgentModeViewModel.observationContextLoad(for: session)
+        XCTAssertEqual(priorLoad?.usedTokens, 95000)
+        XCTAssertEqual(priorLoad?.windowTokens, 100_000)
+        XCTAssertEqual(priorLoad?.confidence, .exact)
+        await controller.test_setBeforeConfigurationSend {}
+        sendGate.open()
+        await until("native user write is accepted") { session.claudeExpectedTurnIDs.count == 1 }
+        let input = try XCTUnwrap(session.claudeExpectedTurnIDs.first)
+        let origin = session.activeRunAttemptID
+        XCTAssertEqual(session.runID, runID)
+        try await feedCapturedOverflow(to: controller, conversation: conversation, answering: keyed ? input : nil)
+        await until("native rejection terminal commits") { session.agentTask == nil }
+        XCTAssertEqual(terminalInputIDs, [input])
+        XCTAssertEqual(terminalStatus, .claudeSizeFailure(.init(kind: .inputContextRejected, source: .localCLIRejection, conversationID: conversation)))
+        let hold = try XCTUnwrap(session.activeClaudeContextAutoWakeHold)
+        XCTAssertEqual(hold.recoveryOriginAttemptID, origin)
+        guard hold.recoveryOriginAttemptID == origin else { return }
+        await until("real link scheduler reaches the originating drain") { checkedDrain }
+        XCTAssertEqual(session.items.count(where: { $0.kind == .error }), 1)
+        XCTAssertNil(AgentModeViewModel.observationContextLoad(for: session)?.usedTokens)
+        XCTAssertEqual(writes.count, 1, "No maintenance before the original tools drain")
+
+        toolsAreActive = false
+        await until("one native compact write is accepted") { writes.count == 2 && session.claudeExpectedTurnIDs.count == 1 }
+        let compact = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(writes.line(at: 1))) as? [String: Any])
+        let message = try XCTUnwrap(compact["message"] as? [String: Any])
+        let content = try XCTUnwrap(message["content"] as? [[String: Any]])
+        XCTAssertEqual(content.compactMap { $0["text"] as? String }, ["/compact"])
+        try await feed([
+            "type": "system", "subtype": "compact_boundary", "session_id": conversation,
+            "compact_metadata": ["trigger": "manual", "pre_tokens": 95000, "post_tokens": 10000]
+        ], controller)
+        try await feed([
+            "type": "result", "subtype": "success", "session_id": conversation,
+            "local_command": "compact", "queued_turn_count": 0, "is_error": false
+        ], controller)
+        await until("maintenance and its settlement drain") { session.agentTask == nil && !links.hasPendingSelfCompactEffects(for: session) }
+        XCTAssertEqual(session.selfCompactState.latest?.outcome, .compacted)
+        XCTAssertEqual(session.selfCompactState.latest?.noteDelivery, .notSent)
+        XCTAssertNil(session.activeClaudeContextAutoWakeHold)
+        XCTAssertNil(AgentModeViewModel.observationContextLoad(for: session)?.usedTokens)
+        XCTAssertEqual(writes.count, 2, "No rejected text replay or continuation write")
+
+        seedCompletedOverflowFixtureTurn(session)
+        try await startOverflowFixtureRun(h, session: session, execution: service)
+        await until("second ordinary input accepted") { writes.count == 3 && session.claudeExpectedTurnIDs.count == 1 }
+        let second = try XCTUnwrap(session.claudeExpectedTurnIDs.first)
+        XCTAssertNotEqual(second, input)
+        try await feedCapturedOverflow(to: controller, conversation: conversation, answering: keyed ? second : nil)
+        await until("second rejection settles") { session.runState == .failed && session.agentTask == nil }
+        XCTAssertNotNil(session.activeClaudeContextAutoWakeHold)
+        XCTAssertNil(session.activeClaudeContextAutoWakeHold?.recoveryOriginAttemptID)
+        XCTAssertFalse(links.hasPendingSelfCompactEffects(for: session))
+        XCTAssertEqual(writes.count, 3, "No second compact in the same conversation")
+    }
+
+    private func seedCompletedOverflowFixtureTurn(_ session: AgentTabSession) {
+        // The previous turn completed with real measured usage. Result accounting rebuilds
+        // the display snapshot from those completed usage rows, not an in-progress accumulator.
+        XCTAssertTrue(AgentSessionUsageRuntime().ingestNonCodexTurnFinalization(
+            promptTokens: 95000, completionTokens: 120, contextUsedTokens: 95000,
+            modelContextWindow: 100_000, session: session
+        ))
+        XCTAssertEqual(session.providerTokenUsageByTurn.last?.contextUsedTokens, 95000)
+    }
+
+    private func feedCapturedOverflow(to controller: ClaudeNativeProcessSessionController, conversation: String, answering input: UUID?) async throws {
+        let repo = (0 ..< 5).reduce(URL(fileURLWithPath: #filePath)) { url, _ in url.deletingLastPathComponent() }
+        let fixture = repo.appendingPathComponent("Packages/RepoPromptAgentProviders/Tests/RepoPromptClaudeCompatibleProviderTests/Fixtures/claude-cli-2.1.330-prompt-too-long.fixture.ndjson")
+        let lines = try Data(contentsOf: fixture).split(separator: 10)
+        XCTAssertEqual(lines.count, 2)
+        for line in lines {
+            var frame = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(line)) as? [String: Any])
+            frame["session_id"] = conversation
+            // The capture is legacy/unkeyed; adapt only identity for the keyed test transport.
+            if let input, frame["type"] as? String == "result" { frame["user_message_uuid"] = input.uuidString }
+            try await feed(frame, controller)
+        }
+    }
+
     func testLateApprovalCancellationDoesNotReopenWaitingStateAfterSteer() async throws {
         let (h, session, controller, listener) = try await spyFixture()
         let providerID = UUID()

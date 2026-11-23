@@ -17862,7 +17862,8 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     nonisolated static func decodeDomainWorkspaceProjection(
         documentBytes: Data,
-        fileURL: URL
+        fileURL: URL,
+        preserveUnreadableDocument: Bool = true
     ) throws -> WorkspaceModel {
         #if DEBUG
             let workspace = try WorkspaceProjectionDecodeDiagnostics.measure(inputBytes: documentBytes.count) {
@@ -17873,11 +17874,13 @@ class WorkspaceManagerViewModel: ObservableObject {
         #endif
         // The domain authority re-writes this document from the projected value, so the original
         // bytes must be preserved here, before any projection consumer can commit a lossy copy.
-        WorkspaceUnreadableDocumentBackup.preserveIfNeeded(
-            documentBytes: documentBytes,
-            documentURL: fileURL,
-            droppedComposeTabCount: workspace.composeTabsDroppedDuringDecode
-        )
+        if preserveUnreadableDocument {
+            WorkspaceUnreadableDocumentBackup.preserveIfNeeded(
+                documentBytes: documentBytes,
+                documentURL: fileURL,
+                droppedComposeTabCount: workspace.composeTabsDroppedDuringDecode
+            )
+        }
         return workspace
     }
 

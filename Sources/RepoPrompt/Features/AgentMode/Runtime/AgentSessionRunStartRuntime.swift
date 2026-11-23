@@ -61,6 +61,14 @@ final class AgentSessionRunStartRuntime {
               !owner.isRetiring, !owner.hasReleasedWriterClaims,
               let originalMembership = owner.membership(of: session) else { return nil }
         defer { withExtendedLifetime(owner) {} }
+        func overflowInputIsAllowed() -> Bool {
+            !session.pendingHandoff.awaitsLocalClaudeOverflowInput || directStartOptions.localComposerCandidate != nil
+        }
+        guard overflowInputIsAllowed() else {
+            let message = "Send a new message in the composer to continue the fresh Claude conversation."
+            startOutcome?.recordStartFailure(message: message)
+            return .failed(message: message)
+        }
         let tabID = session.tabID
         var writer: AgentSessionRuntimeStore.Writer?
         if let sessionID = session.activeAgentSessionID {
@@ -90,7 +98,7 @@ final class AgentSessionRunStartRuntime {
         }
         func isCurrent() -> Bool {
             guard owner.sessions[tabID] === session, !owner.isRetiring, !owner.hasReleasedWriterClaims,
-                  resourcesAreCurrent() else { return false }
+                  overflowInputIsAllowed(), resourcesAreCurrent() else { return false }
             if let writer { return writer.isCurrent }
             // A blank draft has no persistent Writer yet. Its slot still has exact provenance:
             // preparation must not adopt a remove/re-add of the same unbound object.
@@ -294,7 +302,8 @@ final class AgentSessionRunStartRuntime {
                 && inputSources.allSatisfy { $0.isCurrent() }
         }
         func runInputIsCurrent() -> Bool {
-            periodicStartIsCurrent() && stopFence.permitsStart(of: session) && command.isCurrent && resourcesAreCurrent()
+            directStartOptions.providerControlCommand?.claudeWakeCompaction?.isCurrent(for: session) != false
+                && periodicStartIsCurrent() && stopFence.permitsStart(of: session) && command.isCurrent && resourcesAreCurrent()
                 && session.operationAdmissionFailureMessage == nil && inputSources.allSatisfy { $0.isCurrent() }
         }
         guard await owner.mcp.prepareWaitTrackingForRunStart(session: session, stopFence: stopFence) else { return nil }
@@ -305,6 +314,7 @@ final class AgentSessionRunStartRuntime {
         // the rendered lane claim the supplement path attaches.
         let switchMessages: (user: String, initial: String)?
         if session.pendingHandoff.providerSwitchDelivery != nil {
+            guard directStartOptions.providerControlCommand?.claudeWakeCompaction == nil else { return nil }
             switchMessages = await links.prepareProviderSwitchHandoverForSend(providerSwitchPreparation, session: session, stopFence: stopFence)
             guard inputIsCurrent() else { return nil }
             guard switchMessages != nil else {

@@ -29,6 +29,7 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         var updatedAt: Date?
         var usedTokens: Int?
         var awaitingPostCompactionUsage = false
+        var claudeWakePressure: ClaudeWakeContextPressure.Presentation?
         var estimatedTranscriptTokens: Int?
         var contextWindowTokens: Int?
         var usageSource: UsageSource = .unavailable
@@ -133,6 +134,7 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
     func update(
         snapshot transcriptSnapshot: AgentTranscriptAnalyticsSnapshot,
         codexUsage: AgentContextUsage?,
+        claudeWakePressure: ClaudeWakeContextPressure.Presentation? = nil,
         liveSelectedFileCount: Int? = nil,
         liveSelectionSummary: AgentContextSelectionSummary? = nil,
         selectedAgent: AgentProviderKind? = nil,
@@ -193,6 +195,7 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         updateContextSnapshot(
             estimatedTranscriptTokens: transcriptSnapshot.estimatedTranscriptTokens,
             codexUsage: codexUsage,
+            claudeWakePressure: claudeWakePressure,
             liveSelectedFileCount: liveSelectedFileCount,
             liveSelectionSummary: liveSelectionSummary,
             selectedAgent: selectedAgent ?? transcriptSnapshot.selectedAgent,
@@ -203,6 +206,7 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
     private func updateContextSnapshot(
         estimatedTranscriptTokens: Int?,
         codexUsage: AgentContextUsage?,
+        claudeWakePressure: ClaudeWakeContextPressure.Presentation? = nil,
         liveSelectedFileCount: Int?,
         liveSelectionSummary: AgentContextSelectionSummary?,
         selectedAgent: AgentProviderKind?,
@@ -213,6 +217,7 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         next.updatedAt = lastUpdatedAt
         next.observedReadFileCount = observedReadFiles.count
         next.estimatedTranscriptTokens = estimatedTranscriptTokens
+        next.claudeWakePressure = claudeWakePressure
 
         let toolTotalTokens = latestWorkspaceContext?.value.tokenStats?.total ?? latestManageSelection?.value.tokenStats?.total
         next.tokenStatsTotal = toolTotalTokens

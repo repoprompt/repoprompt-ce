@@ -144,6 +144,8 @@ final class AgentSessionHostDrainRuntime {
     private var shutdownPreparationFinished = false
     private var observations: Set<AnyCancellable> = []
     private var waiters: [UUID: CheckedContinuation<Outcome, Never>] = [:]
+    private var deferredVisits: [UUID: @MainActor () -> Void] = [:]
+    private var dispatchingDeferredVisits = false
     private(set) var outcome: Outcome?
     /// Diagnostic receipts only; authority remains with the scope's exact membership.
     private(set) var sessionOutcomes: [UUID: SessionOutcome] = [:]
@@ -216,6 +218,33 @@ final class AgentSessionHostDrainRuntime {
         withdrawScheduledStarts()
     }
 
+    /// One pending visit per presenter. The destination check runs at the release boundary,
+    /// not when the visit is queued. Registering a visit never retries a failed save.
+    /// Capture presenters weakly and withdraw on teardown, since recovery can be deferred.
+    func deferVisit(
+        presenterID: UUID, isDestinationCurrent: @escaping @MainActor () -> Bool,
+        resume: @escaping @MainActor () -> Void
+    ) {
+        let visit: @MainActor () -> Void = {
+            if isDestinationCurrent() { resume() }
+        }
+        if outcome == .released, !dispatchingDeferredVisits {
+            visit()
+        } else {
+            deferredVisits[presenterID] = visit
+        }
+    }
+
+    func withdrawDeferredVisit(presenterID: UUID) {
+        deferredVisits.removeValue(forKey: presenterID)
+    }
+
+    /// Automatic lifecycle entry starts an unstarted drain; it never retries a failure.
+    func startIfNeeded() {
+        guard task == nil, outcome == nil else { return }
+        attemptRecovery()
+    }
+
     /// A failed attempt is retried only by this explicit action, never a timer or inventory read.
     func attemptRecovery() {
         guard outcome != .released else { return }
@@ -252,6 +281,11 @@ final class AgentSessionHostDrainRuntime {
                 releasedParticipants.removeAll()
                 retainedOwner = nil
                 scope.acknowledgeDrain()
+                dispatchingDeferredVisits = true
+                while let presenterID = deferredVisits.keys.first {
+                    deferredVisits.removeValue(forKey: presenterID)?()
+                }
+                dispatchingDeferredVisits = false
             }
         }
     }
