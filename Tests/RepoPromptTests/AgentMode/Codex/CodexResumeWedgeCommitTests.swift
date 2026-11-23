@@ -1456,9 +1456,12 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
         let activationID = try XCTUnwrap(session.pendingCodexComputerUseActivation?.id)
         var flags: [Bool] = []
+        var replacement: WedgeFakeCodexController?
         let coordinator = makeComputerUseCoordinator(fixture: fixture) { runID, enabled in
             flags.append(enabled)
-            return WedgeFakeCodexController(runID: runID, responses: [.success("armed-cu-thread")])
+            let controller = WedgeFakeCodexController(runID: runID, responses: [.success("armed-cu-thread")])
+            replacement = controller
+            return controller
         }
 
         let ensure = Task { await coordinator.ensureCodexNativeSession(session: session) }
@@ -1476,6 +1479,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertTrue(session.isCodexComputerUseArmed, "Arming must survive the transient retirement fence")
         XCTAssertEqual(session.pendingCodexComputerUseActivation?.id, activationID)
         XCTAssertEqual(flags, [true], "The replacement controller must activate Computer Use")
+        XCTAssertEqual(replacement?.developerInstructionAttempts, [AgentModePrompts.codexNativeDeveloperNote()])
         XCTAssertEqual(session.codexControllerFeatureState?.computerUseEnabled, true)
         XCTAssertEqual(controller.shutdownCount, 1)
         XCTAssertFalse(session.items.contains { $0.kind == .error && $0.text == CodexComputerUseWorkflow.ineligibleMessage })
@@ -2857,6 +2861,12 @@ final class WedgeFakeCodexController: CodexSessionControllerPassiveStubDefaults,
     private let lock = NSLock()
     private var responses: [Response]
     private var existingIDs: [String?] = []
+    private var developerNotes: [String?] = []
+
+    var developerInstructionAttempts: [String?] {
+        lock.withLock { developerNotes }
+    }
+
     private var active = false
     private var turnCount = 0
     private var compactions = 0
@@ -2988,13 +2998,32 @@ final class WedgeFakeCodexController: CodexSessionControllerPassiveStubDefaults,
 
     func startOrResume(
         existing: CodexNativeSessionController.SessionRef?,
+        baseInstructions: String,
+        model: String?,
+        reasoningEffort: String?,
+        serviceTier: String?
+    ) async throws -> CodexNativeSessionController.SessionRef {
+        try await startOrResume(
+            existing: existing,
+            baseInstructions: baseInstructions,
+            developerInstructions: nil,
+            model: model,
+            reasoningEffort: reasoningEffort,
+            serviceTier: serviceTier
+        )
+    }
+
+    func startOrResume(
+        existing: CodexNativeSessionController.SessionRef?,
         baseInstructions _: String,
+        developerInstructions: String?,
         model: String?,
         reasoningEffort: String?,
         serviceTier _: String?
     ) async throws -> CodexNativeSessionController.SessionRef {
         let response = lock.withLock { () -> Response? in
             existingIDs.append(existing?.conversationID)
+            developerNotes.append(developerInstructions)
             startupRoutingPolicies.append(routingCleanup?.policyID)
             return responses.isEmpty ? nil : responses.removeFirst()
         }

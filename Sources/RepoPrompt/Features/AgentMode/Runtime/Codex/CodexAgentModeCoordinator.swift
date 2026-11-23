@@ -3965,6 +3965,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         controller: (any CodexSessionControlling)?,
         existingRef: CodexNativeSessionController.SessionRef?,
         baseInstructions: String,
+        developerInstructions: String?,
         model: String?,
         reasoningEffort: String?,
         serviceTier: String?,
@@ -3983,6 +3984,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             let ref = try await controller.startOrResume(
                 existing: existingRef,
                 baseInstructions: baseInstructions,
+                developerInstructions: developerInstructions,
                 model: model,
                 reasoningEffort: reasoningEffort,
                 serviceTier: serviceTier
@@ -4004,6 +4006,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 let ref = try await controller.startOrResume(
                     existing: nil,
                     baseInstructions: baseInstructions,
+                    developerInstructions: developerInstructions,
                     model: model,
                     reasoningEffort: reasoningEffort,
                     serviceTier: serviceTier
@@ -7088,6 +7091,9 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             taskLabelKind: session.mcpControlContext?.taskLabelKind,
             codeMapsDisabled: GlobalSettingsStore.shared.globalCodeMapsDisabled()
         )
+        let developerInstructions = session.mcpControlContext?.taskLabelKind == nil && session.parentSessionID == nil
+            ? AgentModePrompts.codexNativeDeveloperNote()
+            : nil
         let resumeCandidate = Self.codexResumeCandidate(
             for: session,
             skipResumeWhenNoPriorCodexHistory: skipResumeWhenNoPriorCodexHistory
@@ -7101,6 +7107,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 controller: startController,
                 existingRef: existingRef,
                 baseInstructions: basePrompt,
+                developerInstructions: developerInstructions,
                 model: selection.model,
                 reasoningEffort: selection.reasoningEffort,
                 serviceTier: selection.serviceTier,
@@ -7182,6 +7189,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                             controller: recoveredController,
                             existingRef: existingRef,
                             baseInstructions: basePrompt,
+                            developerInstructions: developerInstructions,
                             model: selection.model,
                             reasoningEffort: selection.reasoningEffort,
                             serviceTier: selection.serviceTier,

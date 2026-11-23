@@ -543,7 +543,10 @@ let package = Package(
             name: "RepoPromptTests",
             dependencies: repoPromptTestDependencies,
             path: "Tests/RepoPromptTests",
-            resources: [.copy("Fixtures/AgentTranscriptSpanAssemblyReference.json")],
+            resources: [
+                .copy("Fixtures/AgentTranscriptSpanAssemblyReference.json"),
+                .copy("Fixtures/CodexNativeDeveloperNote.txt")
+            ],
             swiftSettings: repoPromptTestSwiftSettings
         )
     ],
