@@ -28,7 +28,6 @@ final class RemoteGatewayController: NSObject, ObservableObject {
     private weak var windowStatesManager: WindowStatesManager?
     private var controlService: (any RemoteAgentControlService)?
     private let pairingManager = RemotePairingManager()
-    private lazy var notificationRelay = RemoteNotificationRelay(pairingManager: pairingManager)
     private let irohIdentityStore = RemoteIrohIdentityStore()
     let availabilityController = RemoteAvailabilityController()
     private let replayBuffer = RemoteEventReplayBuffer(capacity: 512)
@@ -37,6 +36,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
     private let transcriptRevisionEpoch = UUID()
 
     private var irohGeneration: UInt64 = 0
+    private var commandGeneration: UInt64 = 0
     private var isStarting = false
     private var eventPollTask: Task<Void, Never>?
     private var lastPublishedSnapshot: RemoteSnapshot?
@@ -54,14 +54,6 @@ final class RemoteGatewayController: NSObject, ObservableObject {
             self?.lastSuccessfulRequestAt = Date()
         }
     )
-    var notificationRelayConfigured: Bool {
-        notificationRelay.isConfigured
-    }
-
-    var notificationRegistrationAvailable: Bool {
-        pairingManager.registeredNotification != nil
-    }
-
     override init() {
         isEnabled = UserDefaults.standard.bool(forKey: Self.enabledKey)
         isPaired = pairingManager.isPaired
@@ -92,7 +84,8 @@ final class RemoteGatewayController: NSObject, ObservableObject {
     }
 
     func refreshPairingAdvertisement() {
-        guard let server = irohAdapter.currentAddress else { return }
+        guard isEnabled, isRunning, !pairingManager.isPaired,
+              let server = irohAdapter.currentAddress else { return }
         do {
             let advertisement = try pairingManager.issueAdvertisement(server: server)
             pairingCode = Self.makePairingCode(for: advertisement)
@@ -109,6 +102,9 @@ final class RemoteGatewayController: NSObject, ObservableObject {
             ) ?? .observe
         }
         set {
+            if newValue < defaultAuthority {
+                commandGeneration &+= 1
+            }
             if !RemoteAuthorizationState(defaultLevel: newValue).allows(.control) {
                 controlService?.clearAttachmentUploads()
             }
@@ -141,7 +137,6 @@ final class RemoteGatewayController: NSObject, ObservableObject {
             )
             guard irohGeneration == generation, isEnabled else { return }
             isRunning = true
-            refreshPairingAdvertisement()
             startEventPolling()
         } catch {
             guard irohGeneration == generation else { return }
@@ -152,6 +147,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
     }
 
     func stop() {
+        commandGeneration &+= 1
         controlService?.clearAttachmentUploads()
         eventPollTask?.cancel()
         eventPollTask = nil
@@ -173,10 +169,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
             lastSnapshotAt: lastSnapshotAt,
             lastEventCursor: replayBuffer.latestCursor(),
             pairedDevice: pairingManager.isPaired,
-            notificationRegistration: notificationRegistrationAvailable,
-            notificationRelayConfigured: notificationRelayConfigured,
-            notificationLastAttemptAt: notificationRelay.lastAttemptAt,
-            notificationLastError: notificationRelay.lastError,
+            notificationRegistration: false,
             irohState: irohDiagnostics.state,
             irohEndpointID: irohDiagnostics.endpointID,
             irohPath: irohDiagnostics.path,
@@ -198,11 +191,12 @@ final class RemoteGatewayController: NSObject, ObservableObject {
     func revokePairedDevice() {
         do {
             try pairingManager.revokeDevice()
+            commandGeneration &+= 1
             controlService?.clearAttachmentUploads()
             irohAdapter.revokePeerSessions()
             isPaired = false
             lastError = nil
-            refreshPairingAdvertisement()
+            pairingCode = nil
         } catch {
             isPaired = pairingManager.isPaired
             lastError = error.localizedDescription
@@ -216,7 +210,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
     private func makeRoutingServices() -> RemoteGatewayRoutingServices {
         RemoteGatewayRoutingServices(
             authorize: { [unowned self] context in
-                pairingManager.isAuthorizedIroh(
+                isEnabled && isRunning && pairingManager.isAuthorizedIroh(
                     authorizationHeader: context.authorizationHeader,
                     deviceID: context.deviceID,
                     authenticatedPeerEndpointID: context.endpointID
@@ -228,11 +222,12 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                     // Delete the durable credential first. Only then invalidate
                     // Iroh sessions and publish the unpaired UI state.
                     try pairingManager.revokeDevice()
+                    commandGeneration &+= 1
                     controlService?.clearAttachmentUploads()
                     irohAdapter.revokePeerSessions()
                     isPaired = false
                     lastError = nil
-                    refreshPairingAdvertisement()
+                    pairingCode = nil
                     Self.unpairLogger.info("Durable credential revocation succeeded; Iroh sessions invalidated")
                     return .success
                 } catch {
@@ -295,21 +290,14 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                     desktopInstanceID: pairingManager.desktopInstanceID
                 )
             },
-            registerNotifications: { [unowned self] registration in
-                do {
-                    try pairingManager.registerNotifications(registration)
-                    return .success
-                } catch {
-                    return .failed
-                }
-            },
             authorizationState: { [unowned self] in
                 authorizationState
             },
-            execute: { [unowned self] command in
+            commandGeneration: { [unowned self] in commandGeneration },
+            execute: { [unowned self] command, authorizeDispatch in
                 guard let controlService else { return .unavailable }
                 do {
-                    return try await .success(controlService.execute(command))
+                    return try await .success(controlService.execute(command, authorizeDispatch: authorizeDispatch))
                 } catch let error as RemoteAgentControlServiceError {
                     return .rejected(error.localizedDescription)
                 } catch {
@@ -324,6 +312,9 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                 return try await readService.imageAttachment(request)
             },
             pairIroh: { [unowned self] request, peerEndpointID in
+                guard isEnabled, isRunning, !pairingManager.isPaired else {
+                    return .failure(RemoteGatewayError.pairingUnavailable)
+                }
                 do {
                     let response = try pairingManager.pairIroh(
                         request: request,
@@ -331,7 +322,10 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                         serverEndpointID: irohAdapter.currentAddress?.endpointID ?? "",
                         desktop: desktopSummary
                     )
+                    commandGeneration &+= 1
+                    controlService?.clearAttachmentUploads()
                     isPaired = true
+                    pairingCode = nil
                     return .success(response)
                 } catch {
                     return .failure(error)
@@ -358,7 +352,9 @@ final class RemoteGatewayController: NSObject, ObservableObject {
     /// state changes observable to a reconnecting phone.
     private func publishLiveStateChanges() async {
         guard isRunning else { return }
+        let generation = irohGeneration
         let current = await snapshot()
+        guard generation == irohGeneration, !Task.isCancelled else { return }
         availabilityController.update(snapshot: current)
         guard let previous = lastPublishedSnapshot else {
             lastPublishedSnapshot = current
@@ -451,9 +447,6 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                 sessionID: session.sessionID,
                 payload: .session(session)
             ))
-            if let category = Self.notificationCategory(old: old, current: session) {
-                _ = await notificationRelay.deliver(category: category, sessionID: session.sessionID)
-            }
         }
 
         let oldAttention = Dictionary(uniqueKeysWithValues: previous.attentionItems.map { ($0.id, $0) })
@@ -475,9 +468,11 @@ final class RemoteGatewayController: NSObject, ObservableObject {
         }
 
         for event in RemoteEventCoalescer.coalesce(pendingEvents) {
+            guard generation == irohGeneration, !Task.isCancelled else { return }
             _ = await publish(event)
         }
 
+        guard generation == irohGeneration, !Task.isCancelled else { return }
         lastPublishedSnapshot = current
     }
 
@@ -566,15 +561,13 @@ final class RemoteGatewayController: NSObject, ObservableObject {
         lastSnapshotAt = Date()
         let authorization = authorizationState
         guard let window = windowStatesManager?.allWindows.first else {
-            let snapshot = await RemoteSnapshot(
+            return await RemoteSnapshot(
                 desktop: desktopSummary,
                 connection: .init(state: .connected, transport: "iroh"),
                 authorization: authorization,
                 eventCursor: replayBuffer.latestCursor(),
                 transcriptRevisionEpoch: transcriptRevisionEpoch
             )
-            availabilityController.update(snapshot: snapshot)
-            return snapshot
         }
         let windows = windowStatesManager?.allWindows ?? [window]
         let contexts = windows.map {
@@ -590,24 +583,24 @@ final class RemoteGatewayController: NSObject, ObservableObject {
             ),
             workflowCatalog: DesktopRemoteCatalogService(agentModes: contexts.map(\.agentMode))
         )
-        let snapshot = await builder.build(
+        return await builder.build(
             desktop: desktopSummary,
             connection: .init(state: .connected, transport: "iroh", lastConnectedAt: Date()),
             authorization: authorization,
             eventCursor: replayBuffer.latestCursor(),
             transcriptRevisionEpoch: transcriptRevisionEpoch
         )
-        availabilityController.update(snapshot: snapshot)
-        return snapshot
     }
 }
 
 enum RemoteGatewayError: LocalizedError {
     case configurationUnavailable
+    case pairingUnavailable
 
     var errorDescription: String? {
         switch self {
         case .configurationUnavailable: "Remote gateway configuration is unavailable."
+        case .pairingUnavailable: "Enable Remote and generate a pairing code on your Mac."
         }
     }
 }

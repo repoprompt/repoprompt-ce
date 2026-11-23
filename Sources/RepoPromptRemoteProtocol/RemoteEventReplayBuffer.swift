@@ -23,7 +23,7 @@ public enum RemoteEventSubscriptionResult: Sendable {
 /// Bounded, in-memory event history for a single desktop instance.
 ///
 /// The gateway owns one buffer and uses it for reconnects. If a mobile cursor is
-/// older than the retained range, the caller must send a complete authoritative
+/// outside the retained range, the caller must send a complete authoritative
 /// snapshot before resuming live events.
 public actor RemoteEventReplayBuffer {
     public let capacity: Int
@@ -88,6 +88,7 @@ public actor RemoteEventReplayBuffer {
         desktopInstanceID: String
     ) -> RemoteEventReplayResult {
         guard let cursor else { return .events(events) }
+        guard cursor <= latestCursor() else { return .snapshotRequired }
         guard let first = events.first else { return .events([]) }
         guard cursor >= first.sequence - 1 else { return .snapshotRequired }
 

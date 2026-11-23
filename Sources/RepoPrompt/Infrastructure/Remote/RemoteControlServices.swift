@@ -511,19 +511,23 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
         return projectInteraction(
             agentMode.mcpRuntime.mcpPendingInteraction(for: session),
             createdAt: session.lastActivityAt,
-            supportsPlainApproval: session.pendingApproval?.supportsPlainApprove ?? true
+            supportsPlainApproval: session.pendingApproval?.supportsPlainApprove ?? true,
+            macOnlyApprovalID: session.pendingWorktreeMergeReview?.id ?? session.pendingPermissionsRequest?.id
         )
     }
 
     static func projectInteraction(
         _ interaction: AgentRunMCPSnapshot.Interaction?,
         createdAt: Date,
-        supportsPlainApproval: Bool = true
+        supportsPlainApproval: Bool = true,
+        macOnlyApprovalID: UUID? = nil
     ) -> RemoteInteractionSummary? {
         guard let interaction, interaction.kind != .instruction else { return nil }
         let isApproval = interaction.kind == .approval || interaction.kind == .hookApproval
         let isSecret = interaction.fields.contains { $0.isSecret == true }
-        let unavailableReason: String? = if interaction.kind == .hookApproval {
+        let unavailableReason: String? = if interaction.id == macOnlyApprovalID {
+            "Review this decision on your Mac."
+        } else if interaction.kind == .hookApproval {
             "Review hook trust and discovery on your Mac."
         } else if interaction.kind == .mcpElicitation {
             "Review the MCP request on your Mac."
@@ -535,13 +539,14 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
             nil
         }
         let details = interaction.details.map { "\($0.label): \($0.value)" }
-        let prompt = ([interaction.prompt ?? interaction.fields.first?.prompt].compactMap(\.self) + details)
-            .joined(separator: "\n\n")
+        let prompt = unavailableReason == nil
+            ? ([interaction.prompt ?? interaction.fields.first?.prompt].compactMap(\.self) + details).joined(separator: "\n\n")
+            : nil
         return RemoteInteractionSummary(
             id: interaction.id.uuidString,
             kind: isApproval ? .approval : (isSecret ? .secretInput : .question),
-            title: interaction.title,
-            prompt: prompt.isEmpty ? nil : prompt,
+            title: unavailableReason == nil ? interaction.title : "Review on your Mac",
+            prompt: prompt?.isEmpty == false ? prompt : nil,
             requiresSecureEntry: isSecret,
             responseUnavailableReason: unavailableReason,
             createdAt: createdAt

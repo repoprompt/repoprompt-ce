@@ -214,7 +214,7 @@ final class RemoteGatewayRouterTests: XCTestCase {
         )
         let router = makeRouter(
             authorizationState: { RemoteAuthorizationState(defaultLevel: .control) },
-            execute: { request in
+            execute: { request, _ in
                 XCTAssertEqual(request, command)
                 return .success(serviceResponse)
             },
@@ -234,12 +234,53 @@ final class RemoteGatewayRouterTests: XCTestCase {
         XCTAssertEqual(decoded.resolvedToolCatalog, catalog)
     }
 
+    func testDispatchAuthorizationChecksLiveStateAndCannotBeRestoredForAnOldCommand() async {
+        var authorized = true
+        var generation: UInt64 = 0
+        var authority = RemoteAuthorityLevel.control
+        let router = makeRouter(
+            authorize: { _ in authorized },
+            authorizationState: { RemoteAuthorizationState(defaultLevel: authority) },
+            commandGeneration: { generation },
+            execute: { _, authorizeDispatch in
+                XCTAssertNotNil(try? authorizeDispatch())
+                authorized = false
+                XCTAssertNil(try? authorizeDispatch())
+                authorized = true
+                authority = .respond
+                XCTAssertNil(try? authorizeDispatch())
+                generation += 1
+                authority = .control
+                XCTAssertNil(try? authorizeDispatch())
+                return .rejected("Remote access changed")
+            }
+        )
+        let response = await router.route(
+            .command(.init(operation: .startRun), endpoint: .commands),
+            context: .testPeer(authorizationHeader: "Bearer valid")
+        )
+        XCTAssertEqual(response.status, 409)
+    }
+
+    func testRemoteApprovalPolicyAllowsOneTimeResponseButKeepsPersistentAndMergeDecisionsOnMac() throws {
+        let request = AgentApprovalRequest(
+            requestID: .acp("permission"), method: "session/request_permission", kind: .commandExecution,
+            threadID: "thread", turnID: "turn", itemID: "item", plainApproveAvailable: true
+        )
+        let validate = WindowRemoteAgentControlService.requireRemoteInteractionResolution
+        XCTAssertNoThrow(try validate(.approval(request: request, decision: .accept)))
+        XCTAssertNoThrow(try validate(.approval(request: request, decision: .decline)))
+        XCTAssertThrowsError(try validate(.approval(request: request, decision: .acceptForSession)))
+        XCTAssertThrowsError(try validate(.worktreeMerge(reviewID: UUID(), decision: .accept)))
+    }
+
     func testCommandAuthorityMatrix() {
         let expected: [(RemoteCommandOperation, RemoteAuthorityLevel)] = [
             (.respond, .respond),
             (.startRun, .control),
             (.configureSession, .control),
-            (.configureTools, .control),
+            (.configureTools, .danger),
+            (.uploadAttachment, .control),
             (.followUp, .control),
             (.steer, .control),
             (.cancel, .control),
@@ -253,43 +294,33 @@ final class RemoteGatewayRouterTests: XCTestCase {
         }
     }
 
-    func testNotificationRegistrationRetainsObserveLevelBehaviorAndCursor() async throws {
+    func testNotificationRegistrationIsUnavailableEvenWithDangerAuthority() async throws {
         let registration = RemoteNotificationRegistration(platform: .apns, deviceToken: "token")
         let command = RemoteCommandRequest(
             operation: .registerNotifications,
             notificationRegistration: registration
         )
-        var registered: RemoteNotificationRegistration?
         var executeCalls = 0
         let router = makeRouter(
-            authorizationState: { RemoteAuthorizationState(defaultLevel: .observe) },
-            registerNotifications: { value in
-                registered = value
-                return .success
-            },
-            execute: { _ in
+            authorizationState: { RemoteAuthorizationState(defaultLevel: .danger) },
+            execute: { _, _ in
                 executeCalls += 1
                 return .failed
-            },
-            eventCursor: { 55 }
+            }
         )
 
         let response = await router.route(
             .command(command, endpoint: .commands),
             context: .testPeer(authorizationHeader: "Bearer valid")
         )
-        let decoded = try JSONDecoder().decode(RemoteCommandResponse.self, from: json(from: response))
-
-        XCTAssertEqual(response.status, 200)
-        XCTAssertEqual(registered, registration)
-        XCTAssertEqual(decoded.eventCursor, 55)
-        XCTAssertEqual(decoded.message, "Notification registration saved.")
+        XCTAssertEqual(response.status, 503)
+        XCTAssertEqual(try error(from: response).code, "notifications_unavailable")
         XCTAssertEqual(executeCalls, 0)
     }
 
     func testContextBuilderEndpointRejectsOtherOperationsBeforeExecution() async throws {
         var executeCalls = 0
-        let router = makeRouter(execute: { _ in
+        let router = makeRouter(execute: { _, _ in
             executeCalls += 1
             return .failed
         })
@@ -365,8 +396,8 @@ final class RemoteGatewayRouterTests: XCTestCase {
         authorizationState: @escaping () -> RemoteAuthorizationState = {
             RemoteAuthorizationState(defaultLevel: .control)
         },
-        registerNotifications: @escaping (RemoteNotificationRegistration) -> RemoteGatewayRegistrationResult = { _ in .failed },
-        execute: @escaping (RemoteCommandRequest) async -> RemoteGatewayCommandResult = { _ in .unavailable },
+        commandGeneration: @escaping () -> UInt64 = { 0 },
+        execute: @escaping (RemoteCommandRequest, @escaping RemoteDispatchAuthorization) async -> RemoteGatewayCommandResult = { _, _ in .unavailable },
         eventCursor: @escaping () async -> UInt64 = { 0 },
         imageAttachment: @escaping (RemoteImageAttachmentRequest) async throws -> RemoteImageAttachmentChunk? = { _ in nil },
         pairIroh: @escaping (RemoteIrohPairingRequest, String) -> Result<RemoteIrohPairingResponse, Error> = { _, _ in
@@ -381,8 +412,8 @@ final class RemoteGatewayRouterTests: XCTestCase {
             history: { _ in nil },
             transcript: { _ in .unavailable },
             replay: replay,
-            registerNotifications: registerNotifications,
             authorizationState: authorizationState,
+            commandGeneration: commandGeneration,
             execute: execute,
             eventCursor: eventCursor,
             imageAttachment: imageAttachment,
@@ -824,7 +855,7 @@ final class RemoteMutationBehaviorTests: XCTestCase {
 
         for operation in RemoteMutationFailurePolicy.mutationOperations {
             do {
-                _ = try await service.execute(RemoteCommandRequest(operation: operation))
+                _ = try await service.execute(RemoteCommandRequest(operation: operation), authorizeDispatch: {})
                 XCTFail("Incomplete \(operation.rawValue) request must be rejected.")
             } catch let error as RemoteAgentControlServiceError {
                 XCTAssertFalse(error.localizedDescription.isEmpty)
@@ -854,7 +885,7 @@ final class RemoteMutationBehaviorTests: XCTestCase {
         let service = WindowRemoteAgentControlService(windowStatesManager: WindowStatesManager.shared)
 
         do {
-            _ = try await service.execute(request)
+            _ = try await service.execute(request, authorizeDispatch: {})
             XCTFail("A terminal session must not accept cancellation.")
         } catch let error as RemoteAgentControlServiceError {
             guard case .commandRejected = error else {
@@ -931,7 +962,7 @@ final class RemoteMutationBehaviorTests: XCTestCase {
                 submissionID: submissionID, attachmentID: attachmentID, fileName: "notes.txt",
                 fileSize: bytes.count, offset: 0, bytes: bytes
             )
-        ))
+        ), authorizeDispatch: {})
         XCTAssertTrue(upload.accepted)
         let response = try await service.execute(.init(
             commandID: submissionID,
@@ -940,7 +971,7 @@ final class RemoteMutationBehaviorTests: XCTestCase {
             message: "Exercise the Remote launch path.",
             agentID: "claudeCode",
             attachmentIDs: [attachmentID]
-        ))
+        ), authorizeDispatch: {})
 
         XCTAssertTrue(response.accepted)
         let sessionID = try XCTUnwrap(response.sessionID)
