@@ -99,10 +99,6 @@ import XCTest
 
         private func exerciseRunner(_ kind: AgentProviderKind, catalogBeforeSend: Bool, retainedOffer: RetainedOfferCase? = nil) async throws {
             let reusesConnection = retainedOffer != nil
-            let codexDebugKey = "enableCodexDebugLogging"
-            let previousCodexDebug = UserDefaults.standard.object(forKey: codexDebugKey)
-            if kind == .codexExec { UserDefaults.standard.set(true, forKey: codexDebugKey) }
-            defer { UserDefaults.standard.set(previousCodexDebug, forKey: codexDebugKey) }
             let manager = ServerNetworkManager.shared
             try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
             let window = WindowState(domainRuntime: AppDomainRuntimeComposition.shared.runtime)
@@ -475,6 +471,7 @@ import XCTest
                     try vm.test_claudeCoordinator.test_setControllerLaunchSettings(.init(runtimeVariant: .standard, workspacePath: vm.effectiveWorkspacePath(for: observer), permissionMode: permission.effectiveMode, allowNativeBashTool: runtime.allowNativeBashTool, mcpStrictMode: runtime.mcpStrictMode), for: observer)
                 } else {
                     window.apiSettingsViewModel.isCodexConnected = true
+                    codex.expectRouting(runID: runID, routeID: exactRouteID, owner: origin.route)
                     observer.codexController = codex
                     observer.codexNeedsReconnect = true
                     observer.codexControllerPermissionProfile = observer.permissionProfile
