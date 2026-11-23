@@ -9938,6 +9938,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         agentRaw: String?,
         modelRaw: String?,
         reasoningEffortRaw: String?,
+        validateDispatch: (@MainActor () throws -> Void)? = nil,
         workspaceAuthority: MCPWorkspaceTargetAuthority? = nil
     ) async throws -> AgentSessionResolvedConfiguration {
         if let existing = sessions[tabID],
@@ -10003,6 +10004,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             modelRaw: requestedModel.id,
             reasoningEffortRaw: requestedEffort,
             requireInactiveRunState: true,
+            validateDispatch: validateDispatch,
             workspaceAuthority: workspaceAuthority
         )
         let resolvedModel = Self.discoveryModel(matching: session.selectedModelRaw, in: discoveryAgent)
@@ -10067,6 +10069,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         modelParameterSelections: [ACPModelParameterSelection] = [],
         requireInactiveRunState: Bool = false,
         expectedTarget: PersistentBindingTransitionToken? = nil,
+        validateDispatch: (@MainActor () throws -> Void)? = nil,
         workspaceAuthority: MCPWorkspaceTargetAuthority? = nil,
         creationHandle: AgentSessionCreationHandle? = nil
     ) async throws {
@@ -10077,6 +10080,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let expectedSessionID = session.activeAgentSessionID
         let configurationBindingToken = session.currentRestorationBindingToken
         func requireConfigurationAdmission() throws {
+            try validateDispatch?()
             try requireSessionConfigurationAdmission(session, creationHandle: creationHandle)
             guard sessions[tabID] === session,
                   session.currentRestorationBindingToken == configurationBindingToken
@@ -11642,12 +11646,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         kind: AgentRunMCPSnapshot.Interaction.Kind,
         interactionID: UUID,
         payload: MCPInteractionResponsePayload,
-        command: AgentSessionRuntimeStore.Command
+        command: AgentSessionRuntimeStore.Command,
+        validateResolution: ((AgentPendingInteractionResolution) throws -> Void)? = nil
     ) throws {
         let session = command.writer.session
         let resolution = try interactionRuntime.mcpPendingInteractionResolution(
             for: session, kind: kind, interactionID: interactionID, payload: payload
         )
+        try validateResolution?(resolution)
         try interactionRuntime.applyPendingInteractionResolution(resolution, command: command)
         mcpRuntime.handleObservedMCPStateChange(for: session)
     }

@@ -48,8 +48,7 @@ returning them.
 ## Authorization
 
 The desktop remains the authorization boundary. `RemoteAuthorizationState`
-models the default device authority and an optional temporary/session-scoped
-grant. Mobile controls may be hidden or disabled for usability, but the desktop
+models the default device authority. Mobile controls may be hidden or disabled for usability, but the desktop
 must evaluate the required authority again when it executes each command.
 
 The levels are intentionally ordered:
@@ -57,9 +56,11 @@ The levels are intentionally ordered:
 | Level | Meaning |
 | --- | --- |
 | `observe` | Read state, transcripts, and history |
-| `respond` | Answer questions, approve lower-risk interactions, send follow-ups |
-| `control` | Start, steer, cancel, resume, workflows, and Context Builder |
-| `danger` | High-risk, destructive, unrestricted, or cleanup actions |
+| `respond` | Answer supported questions and accept, decline, or cancel one-time approvals |
+| `control` | Start, follow up, steer, cancel, resume, configure a chat, and run Context Builder |
+| `danger` | Also change desktop-wide Codex tool settings |
+
+Worktree merges, permission grants, and persistent or amended approvals require review on the Mac, even at `danger`.
 
 Secret interactions are represented by `RemoteInteractionSummary` only as a
 pending secure-entry prompt. No answer value is present in a snapshot, event,
@@ -78,8 +79,7 @@ RemoteGatewayController
   ├── desktop-enforced authorization
   ├── snapshot projection
   ├── authenticated Iroh read and command streams
-  ├── resumable event stream and replay buffer
-  └── encrypted notification envelope + configurable relay client
+  └── resumable event stream and replay buffer
         │
         ▼
 shared typed RepoPrompt control services
@@ -94,8 +94,8 @@ uses `RemoteSnapshotBuilder`, `WindowRemoteReadService`, and
 The command boundary rechecks authorization before dispatching Agent Mode
 start, follow-up, steer, response, cancel, and resume operations.
 
-Enabling Remote starts the Iroh gateway. Pairing codes are short-lived and
-single-use. The Mac stores the Iroh endpoint secret and the paired-device
+Enabling Remote starts the Iroh gateway. Generate a pairing code explicitly on
+an unpaired Mac. Codes are short-lived and single-use. The Mac stores the Iroh endpoint secret and the paired-device
 credential in its signed secure-storage domain. Unpairing revokes the stored
 credential before clearing the live connection.
 
@@ -152,14 +152,16 @@ Iroh reconnect after a network change and a CE restart. Only one device credenti
 pairing in iOS and revoke it in CE before re-pairing, and confirm the old
 credential is rejected.
 
-Optional local push comes last. Run the relay with APNs sandbox credentials
-(`APNS_PRODUCTION` unset) and configure the Mac-side relay URL as
-`http://127.0.0.1:8787/v1/notify`. The Mac, not the phone, resolves loopback;
-push remains only an attention signal followed by authoritative Iroh resync.
-This path does not cover production APNs, FCM, or deployed relay operations.
-Simulator, physical-device, Iroh path, Keychain-persistence, and APNs
-acceptance remain environment-dependent and are not established by these
-documentation steps.
+The gateway currently rejects push registration with `notifications_unavailable`
+and does not deliver previously registered notifications. Re-enabling delivery
+requires Mac-owned relay selection, including redirect policy. Simulator,
+physical-device, Iroh path, and Keychain-persistence acceptance remain
+unverified by these documentation steps.
+
+Release acceptance also requires an organization-controlled Iroh artifact
+with provenance tying the archive checksum to reviewed source and Cargo.lock,
+and a reviewed inventory and license texts for the linked dependencies in the
+app's Legal resources. The SwiftPM checksum check alone is not that evidence.
 
 ## Delivery order
 
@@ -173,9 +175,9 @@ documentation steps.
    question, plan, and review flows now use the desktop window-tool service;
    richer raw command/reasoning/file/worktree details are now available only
    through the explicit detail request.
-5. Register iOS notification tokens and forward only encrypted, sanitized
-   envelopes through a configured APNs/FCM-compatible relay; the phone always
-   reconnects to the desktop for authoritative state.
+5. Future: register iOS notification tokens and forward only encrypted, sanitized
+   envelopes through a Mac-owned relay. The phone reconnects to the desktop for
+   authoritative state.
 
 ## Current owner inventory
 

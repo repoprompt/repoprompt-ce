@@ -97,7 +97,10 @@ enum RemoteWorkspaceActivationPlanner {
 
 @MainActor
 protocol RemoteAgentControlService: AnyObject {
-    func execute(_ request: RemoteCommandRequest) async throws -> RemoteCommandResponse
+    func execute(
+        _ request: RemoteCommandRequest,
+        authorizeDispatch: @escaping RemoteDispatchAuthorization
+    ) async throws -> RemoteCommandResponse
     func clearAttachmentUploads()
 }
 
@@ -120,12 +123,16 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
         uploadExpiry = nil
     }
 
-    func execute(_ request: RemoteCommandRequest) async throws -> RemoteCommandResponse {
+    func execute(
+        _ request: RemoteCommandRequest,
+        authorizeDispatch: @escaping RemoteDispatchAuthorization
+    ) async throws -> RemoteCommandResponse {
         do {
             guard RemoteProtocol.supports(request.protocolVersion) else {
                 throw RemoteAgentControlServiceError.unsupportedProtocol(request.protocolVersion)
             }
 
+            try authorizeDispatch()
             let files: [RemoteAttachmentUploads.File]
             if let ids = request.attachmentIDs {
                 guard [.startRun, .followUp, .resume].contains(request.operation) else {
@@ -149,19 +156,19 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
                 }
                 return RemoteCommandResponse(commandID: request.commandID, accepted: true)
             case .startRun:
-                return try await start(request, files: files)
+                return try await start(request, files: files, authorizeDispatch: authorizeDispatch)
             case .configureSession:
-                return try await configureSession(request)
+                return try await configureSession(request, authorizeDispatch: authorizeDispatch)
             case .configureTools:
-                return try await configureTools(request)
+                return try await configureTools(request, authorizeDispatch: authorizeDispatch)
             case .followUp, .steer, .resume:
-                return try await continueRun(request, files: files)
+                return try await continueRun(request, files: files, authorizeDispatch: authorizeDispatch)
             case .respond:
-                return try await respond(request)
+                return try await respond(request, authorizeDispatch: authorizeDispatch)
             case .cancel:
-                return try await cancel(request)
+                return try await cancel(request, authorizeDispatch: authorizeDispatch)
             case .contextBuilder:
-                return try await contextBuilder(request)
+                return try await contextBuilder(request, authorizeDispatch: authorizeDispatch)
             case .registerNotifications:
                 throw RemoteAgentControlServiceError.commandRejected(
                     "Notification registration must be handled by the Remote gateway."
@@ -191,10 +198,10 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
 
     private func start(
         _ request: RemoteCommandRequest,
-        files: [RemoteAttachmentUploads.File]
+        files: [RemoteAttachmentUploads.File],
+        authorizeDispatch: @escaping RemoteDispatchAuthorization
     ) async throws -> RemoteCommandResponse {
         let workspaceID = try parseWorkspaceID(request.workspaceID)
-        let context = try await activateWorkspace(workspaceID)
         let message = try requiredMessage(request.message, allowsEmpty: !files.isEmpty)
         let workflow: AgentWorkflowDefinition?
         if let workflowID = request.workflowID {
@@ -207,6 +214,8 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
         } else {
             workflow = nil
         }
+        let context = try await activateWorkspace(workspaceID, authorizeDispatch: authorizeDispatch)
+        try authorizeDispatch()
         let target = try await context.agentMode.mcpResolveOrCreateSessionTarget(
             tabID: nil,
             sessionID: nil,
@@ -226,6 +235,7 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
                 reasoningEffortRaw: request.reasoningEffort
             )
             try context.agentMode.requireCurrentMCPWorkspaceTarget(target, expectedWorkspaceID: workspaceID)
+            try authorizeDispatch()
             let attachments = try await importAttachments(files, sessionID: sessionID, workspaceID: workspaceID, in: context)
             _ = try await AgentExternalMCPRunStarter.startPreservingCallerBinding(
                 target: target,
@@ -238,6 +248,7 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
                 taskLabelKind: .pair,
                 workflow: workflow,
                 remoteAttachments: attachments,
+                validateDispatch: authorizeDispatch,
                 workspaceAuthority: .init(
                     target: target, expectedWorkspaceID: workspaceID, allowMatchingControlledSession: false
                 )
@@ -281,14 +292,19 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
         }
     }
 
-    private func configureTools(_ request: RemoteCommandRequest) async throws -> RemoteCommandResponse {
+    private func configureTools(
+        _ request: RemoteCommandRequest,
+        authorizeDispatch: RemoteDispatchAuthorization
+    ) async throws -> RemoteCommandResponse {
         guard let mutation = request.toolMutation else {
             throw RemoteAgentControlServiceError.commandRejected("A tool setting mutation is required.")
         }
 
         let context: WindowContext
         if let sessionID = request.sessionID {
-            context = try await contextForSession(sessionID, requestedWorkspaceID: request.workspaceID)
+            context = try await contextForSession(
+                sessionID, requestedWorkspaceID: request.workspaceID, authorizeDispatch: authorizeDispatch
+            )
             let target = try await context.agentMode.mcpResolveOrCreateSessionTarget(
                 tabID: nil,
                 sessionID: sessionID,
@@ -305,7 +321,7 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
                 )
             }
         } else {
-            context = try await activateWorkspace(parseWorkspaceID(request.workspaceID))
+            context = try await activateWorkspace(parseWorkspaceID(request.workspaceID), authorizeDispatch: authorizeDispatch)
         }
 
         if let manager = windowStatesManager,
@@ -317,6 +333,7 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
                 "Tool controls are locked during an active Codex run."
             )
         }
+        try authorizeDispatch()
         let updatedBinding = try context.agentMode.mcpApplyRemoteCodexToolMutation(
             settingID: mutation.settingID,
             enabled: mutation.enabled,
@@ -335,14 +352,19 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
         )
     }
 
-    private func configureSession(_ request: RemoteCommandRequest) async throws -> RemoteCommandResponse {
+    private func configureSession(
+        _ request: RemoteCommandRequest,
+        authorizeDispatch: @escaping RemoteDispatchAuthorization
+    ) async throws -> RemoteCommandResponse {
         let sessionID = try requiredSessionID(request.sessionID)
         guard request.agentID != nil || request.modelID != nil || request.reasoningEffort != nil else {
             throw RemoteAgentControlServiceError.commandRejected(
                 "Choose an agent, model, or reasoning effort to configure."
             )
         }
-        let context = try await contextForSession(sessionID, requestedWorkspaceID: request.workspaceID)
+        let context = try await contextForSession(
+            sessionID, requestedWorkspaceID: request.workspaceID, authorizeDispatch: authorizeDispatch
+        )
         let expectedWorkspaceID = try workspaceID(for: context, fallback: request.workspaceID)
         let target = try await context.agentMode.mcpResolveOrCreateSessionTarget(
             tabID: nil,
@@ -358,6 +380,7 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
             agentRaw: request.agentID,
             modelRaw: request.modelID,
             reasoningEffortRaw: request.reasoningEffort,
+            validateDispatch: authorizeDispatch,
             workspaceAuthority: .init(
                 target: target,
                 expectedWorkspaceID: expectedWorkspaceID,
@@ -389,10 +412,13 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
 
     private func continueRun(
         _ request: RemoteCommandRequest,
-        files: [RemoteAttachmentUploads.File]
+        files: [RemoteAttachmentUploads.File],
+        authorizeDispatch: @escaping RemoteDispatchAuthorization
     ) async throws -> RemoteCommandResponse {
         let sessionID = try requiredSessionID(request.sessionID)
-        let context = try await contextForSession(sessionID, requestedWorkspaceID: request.workspaceID)
+        let context = try await contextForSession(
+            sessionID, requestedWorkspaceID: request.workspaceID, authorizeDispatch: authorizeDispatch
+        )
         let expectedWorkspaceID = try workspaceID(for: context, fallback: request.workspaceID)
         let target = try await context.agentMode.mcpResolveOrCreateSessionTarget(
             tabID: nil,
@@ -408,6 +434,7 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
         if !files.isEmpty, session.runState.isActive || session.instructionContinuation != nil {
             throw RemoteAgentControlServiceError.commandRejected("Wait for the current run to finish before sending attachments.")
         }
+        try authorizeDispatch()
         let attachments = try await importAttachments(files, sessionID: sessionID, workspaceID: expectedWorkspaceID, in: context)
         try context.agentMode.requireCurrentMCPWorkspaceTarget(target, expectedWorkspaceID: expectedWorkspaceID)
         if let resident = try context.agentMode.mcpResidentTarget(sessionID: sessionID) {
@@ -417,7 +444,8 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
                 workflow: nil,
                 remoteAttachments: attachments,
                 windowIsAvailable: {
-                    context.window.windowID == resident.endpoint.windowID
+                    (try? authorizeDispatch()) != nil
+                        && context.window.windowID == resident.endpoint.windowID
                         && !context.window.isClosing && !WindowStatesManager.shared.isTerminating
                 }
             )
@@ -443,7 +471,8 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
                 sessionID: sessionID,
                 text: message,
                 allowStartingRun: true,
-                remoteAttachments: attachments
+                remoteAttachments: attachments,
+                validateInitialStart: authorizeDispatch
             )
         } catch {
             if let activatedContext {
@@ -462,10 +491,15 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
         )
     }
 
-    private func respond(_ request: RemoteCommandRequest) async throws -> RemoteCommandResponse {
+    private func respond(
+        _ request: RemoteCommandRequest,
+        authorizeDispatch: RemoteDispatchAuthorization
+    ) async throws -> RemoteCommandResponse {
         let sessionID = try requiredSessionID(request.sessionID)
         let interactionID = try requiredInteractionID(request.interactionID)
-        let context = try await contextForSession(sessionID, requestedWorkspaceID: request.workspaceID)
+        let context = try await contextForSession(
+            sessionID, requestedWorkspaceID: request.workspaceID, authorizeDispatch: authorizeDispatch
+        )
         let expectedWorkspaceID = try workspaceID(for: context, fallback: request.workspaceID)
         let target = try await context.agentMode.mcpResolveOrCreateSessionTarget(
             tabID: nil,
@@ -519,11 +553,13 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
         else {
             throw RemoteAgentControlServiceError.sessionNotFound
         }
+        try authorizeDispatch()
         try context.agentMode.applyBoundInteractionResponse(
             kind: interaction.kind,
             interactionID: interactionID,
             payload: payload,
-            command: command
+            command: command,
+            validateResolution: Self.requireRemoteInteractionResolution
         )
         return try await response(
             request: request,
@@ -533,9 +569,23 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
         )
     }
 
-    private func cancel(_ request: RemoteCommandRequest) async throws -> RemoteCommandResponse {
+    static func requireRemoteInteractionResolution(_ resolution: AgentPendingInteractionResolution) throws {
+        switch resolution {
+        case .askUser, .askUserSkip, .userInput, .approval(_, .accept), .approval(_, .decline), .approval(_, .cancel):
+            return
+        case .mcpElicitation, .worktreeMerge, .permissions, .approval:
+            throw RemoteAgentControlServiceError.commandRejected("Review this decision on your Mac.")
+        }
+    }
+
+    private func cancel(
+        _ request: RemoteCommandRequest,
+        authorizeDispatch: RemoteDispatchAuthorization
+    ) async throws -> RemoteCommandResponse {
         let sessionID = try requiredSessionID(request.sessionID)
-        let context = try await contextForSession(sessionID, requestedWorkspaceID: request.workspaceID)
+        let context = try await contextForSession(
+            sessionID, requestedWorkspaceID: request.workspaceID, authorizeDispatch: authorizeDispatch
+        )
         let expectedWorkspaceID = try workspaceID(for: context, fallback: request.workspaceID)
         let target = try await context.agentMode.mcpResolveOrCreateSessionTarget(
             tabID: nil,
@@ -558,6 +608,7 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
             tabID: target.tabID,
             session: session
         )
+        try authorizeDispatch()
         guard await context.agentMode.cancelAgentRun(target: cancelTarget) else {
             throw RemoteAgentControlServiceError.commandRejected(
                 "The run changed before cancellation could be applied."
@@ -571,9 +622,11 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
         )
     }
 
-    private func contextBuilder(_ request: RemoteCommandRequest) async throws -> RemoteCommandResponse {
+    private func contextBuilder(
+        _ request: RemoteCommandRequest,
+        authorizeDispatch: RemoteDispatchAuthorization
+    ) async throws -> RemoteCommandResponse {
         let workspaceID = try parseWorkspaceID(request.workspaceID)
-        let context = try await activateWorkspace(workspaceID)
         let instructions = try requiredMessage(request.message)
         let responseType = request.contextBuilderResponseType?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -584,6 +637,7 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
             )
         }
 
+        let context = try await activateWorkspace(workspaceID, authorizeDispatch: authorizeDispatch)
         let tool = await context.window.mcpServer.windowMCPTools.first {
             $0.name == MCPWindowToolName.contextBuilder
         }
@@ -597,6 +651,10 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
             arguments["export_response"] = .bool(true)
         }
 
+        try authorizeDispatch()
+        guard !context.window.isClosing, context.workspaceManager.activeWorkspaceID == workspaceID else {
+            throw RemoteAgentControlServiceError.commandRejected("The workspace changed before Context Builder could start.")
+        }
         let value = try await tool(arguments)
         guard let object = value.objectValue else {
             throw RemoteAgentControlServiceError.commandRejected("Context Builder returned an invalid result.")
@@ -621,7 +679,10 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
         )
     }
 
-    private func activateWorkspace(_ workspaceID: UUID) async throws -> WindowContext {
+    private func activateWorkspace(
+        _ workspaceID: UUID,
+        authorizeDispatch: RemoteDispatchAuthorization
+    ) async throws -> WindowContext {
         guard let manager = windowStatesManager else {
             throw RemoteAgentControlServiceError.workspaceNotOpen
         }
@@ -640,6 +701,7 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
                 throw RemoteAgentControlServiceError.workspaceNotFound
             }
             if window.workspaceManager.activeWorkspaceID != workspaceID {
+                try authorizeDispatch()
                 let result = await window.workspaceManager.switchWorkspace(to: workspace, saveState: true, reason: "remote_command")
                 guard result.didSwitch || window.workspaceManager.activeWorkspaceID == workspaceID else {
                     throw RemoteAgentControlServiceError.commandRejected(
@@ -650,11 +712,13 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
             return WindowContext(window: window)
         case .openNewWindow:
             do {
+                try authorizeDispatch()
                 let newWindow = try await manager.openNewMainWindow()
                 await newWindow.workspaceManager.awaitInitialized()
                 guard let workspace = newWindow.workspaceManager.workspace(withID: workspaceID) else {
                     throw RemoteAgentControlServiceError.workspaceNotFound
                 }
+                try authorizeDispatch()
                 let result = await newWindow.workspaceManager.requestWorkspaceSwitch(to: workspace, saveState: true)
                 guard result.didSwitch || newWindow.workspaceManager.activeWorkspaceID == workspaceID else {
                     throw RemoteAgentControlServiceError.commandRejected(
@@ -676,10 +740,11 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
 
     private func contextForSession(
         _ sessionID: UUID,
-        requestedWorkspaceID: String?
+        requestedWorkspaceID: String?,
+        authorizeDispatch: RemoteDispatchAuthorization
     ) async throws -> WindowContext {
         if let requestedWorkspaceID, let workspaceID = UUID(uuidString: requestedWorkspaceID) {
-            let context = try await activateWorkspace(workspaceID)
+            let context = try await activateWorkspace(workspaceID, authorizeDispatch: authorizeDispatch)
             if await canResolveSession(sessionID, in: context) {
                 return context
             }
