@@ -918,13 +918,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     var modelRouterRuntime: AgentTaskRouterRuntime?
-    struct StagedTaskRoutingResult {
-        let candidates: [AgentTaskRoutingCandidateBuilder.Candidate]
-        let outcome: DecisionOutcome
-        var judgmentRequested = false
-        var effortFallback = false
-        var usageBalancingReason: String?
-    }
+    typealias StagedTaskRoutingResult = AgentTaskRoutingPolicy.StagedTaskRoutingResult
 
     struct FreshTaskRoutingOwnership {
         let requestID: UUID

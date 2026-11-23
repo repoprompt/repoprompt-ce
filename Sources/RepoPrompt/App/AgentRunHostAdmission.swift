@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptMCPServer
 
@@ -67,6 +68,24 @@ struct AgentRunHostAdmission {
             && activation.executionTab(in: snapshot, command: source) != nil
             && Set(snapshot.document.metadata.repoPaths.map { ($0 as NSString).standardizingPath })
             == Set(rootLease.roots.map { ($0.fullPath as NSString).standardizingPath })
+    }
+
+    func routeSubagentTargetIfEnabled(
+        task: String, baseline: AgentRoutingExecutableTarget?, allowUsageBalance: Bool
+    ) async throws -> AgentRoutingExecutableTarget? {
+        try await requireCurrent()
+        guard let initialAvailability = activation.modelAvailability else { throw MCPFileToolAuthorityFailure.superseded }
+        let policy = AgentTaskRoutingPolicy(
+            modelRouterSettingsStore: host.modelRouterSettingsStore,
+            modelRouterRuntime: WindowStatesManager.shared.modelRouterRuntime,
+            availability: { activation.modelAvailability ?? initialAvailability },
+            workspaceID: { workspaceID }
+        )
+        let selection = try await policy.routeSubagentTargetIfEnabled(
+            task: task, surface: .general, baseline: baseline, allowUsageBalance: allowUsageBalance
+        )
+        try await requireCurrent()
+        return selection
     }
 
     func requireSpawnSource() throws {
