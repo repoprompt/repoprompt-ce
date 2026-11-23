@@ -2727,6 +2727,22 @@ final class AgentRunStartBudgetTests: XCTestCase {
         var resumed = XCTestExpectation(description: "unused completion")
         var noNextChild = XCTestExpectation(description: "unused next child")
         noNextChild.isInverted = true
+        // This tests the budget, not the machine's configured Explore role. Keep the
+        // headless branch reachable even when the configured provider is interactive-only.
+        let settings = GlobalSettingsStore.shared
+        let previousRoles = settings.mcpAgentRoleOverrides(scope: .global)
+        let apiSettings = fixture.window.apiSettingsViewModel
+        let wasClaudeConnected = apiSettings.isClaudeCodeConnected
+        apiSettings.isClaudeCodeConnected = true
+        defer { apiSettings.isClaudeCodeConnected = wasClaudeConnected }
+        let availability = apiSettings.agentModeAvailabilityContext
+        let provider = AgentProviderKind.claudeCode
+        var roles = previousRoles ?? [:]
+        roles[AgentModelCatalog.TaskLabelKind.explore.rawValue] = AgentModelSelectionID(
+            agentRaw: provider.rawValue, modelRaw: AgentModelCatalog.defaultModelRaw(for: provider, availability: availability)
+        ).rawValue
+        settings.updateMCPAgentRoleOverrides(roles, scope: .global, commit: false)
+        defer { settings.updateMCPAgentRoleOverrides(previousRoles, scope: .global, commit: false) }
         var explore = AgentExploreMCPToolService(
             toolName: "agent_explore",
             captureRequestMetadata: { .init(connectionID: nil, clientName: "start-budget-tests", windowID: fixture.window.windowID) },
