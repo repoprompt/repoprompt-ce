@@ -612,6 +612,8 @@ final class CodexNativeSessionController {
         var rolloutPath: String?
         var model: String?
         var reasoningEffort: String?
+        /// How the thread's base instructions were chosen at start; nil when unknown.
+        var instructionMode: CodexThreadInstructionMode?
     }
 
     enum ThreadGoalStatus: String, Equatable {
@@ -912,6 +914,7 @@ final class CodexNativeSessionController {
         let existing: SessionRef?
         let baseInstructions: String
         let developerInstructions: String?
+        let instructionMode: CodexThreadInstructionMode?
         let model: String?
         let reasoningEffort: String?
         let serviceTier: String?
@@ -945,6 +948,65 @@ final class CodexNativeSessionController {
 
     private static func supportsBoundedThreadSnapshots(_ version: CodexRuntimeAuthority.Version) -> Bool {
         version >= CodexRuntimeAuthority.Version(major: 0, minor: 164, patch: 0)
+    }
+
+    /// Oldest runtime validated to start threads on Codex's own model instructions. This is a
+    /// behavioral floor, not a wire requirement: `developerInstructions` and `baseInstructions`
+    /// predate it and are enforced by the app-server schema gate. Newer runtimes stay eligible so a
+    /// routine Codex bump cannot silently revert new threads to RepoPrompt's replacement base.
+    static let nativeModelInstructionsMinimumVersion = CodexRuntimeAuthority.Version(major: 0, minor: 170, patch: 0)
+
+    static func supportsNativeModelInstructions(_ version: CodexRuntimeAuthority.Version) -> Bool {
+        version >= nativeModelInstructionsMinimumVersion
+    }
+
+    /// Codex uses a provided `developerInstructions` value instead of the configured
+    /// `developer_instructions`, so RepoPrompt appends the configured value to its note.
+    static func composeDeveloperInstructions(note: String, configured: String?) -> String {
+        guard let configured = configured?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !configured.isEmpty
+        else { return note }
+        return note + "\n\n" + configured
+    }
+
+    static func configuredDeveloperInstructions(fromConfigRead result: [String: Any]) -> String? {
+        (result["config"] as? [String: Any])?["developer_instructions"] as? String
+    }
+
+    struct ThreadInstructionResolution: Equatable {
+        let mode: CodexThreadInstructionMode?
+        /// RepoPrompt's note for this bind, before configured developer instructions are appended.
+        let developerInstructions: String?
+    }
+
+    /// Decides one bind's instruction mode and developer note.
+    ///
+    /// A new thread uses Codex's own base instructions when the coordinator offers the note and the
+    /// runtime meets the validated floor. A resume keeps the mode the thread started with, because
+    /// app-server never rebases a resumed thread; the coordinator offers the note from that mode.
+    /// Conversations saved before modes were recorded keep #1833's bundled-runtime condition, with
+    /// the floor instead of its exact pin, so external legacy threads do not gain a duplicate note.
+    static func resolveThreadInstructions(
+        existing: SessionRef?,
+        offeredDeveloperInstructions: String?,
+        isBundledRuntime: Bool,
+        runtimeVersion: CodexRuntimeAuthority.Version
+    ) -> ThreadInstructionResolution {
+        guard let existing else {
+            let usesNativeBase = offeredDeveloperInstructions != nil && supportsNativeModelInstructions(runtimeVersion)
+            return ThreadInstructionResolution(
+                mode: usesNativeBase ? .native : .legacy,
+                developerInstructions: usesNativeBase ? offeredDeveloperInstructions : nil
+            )
+        }
+        guard let mode = existing.instructionMode else {
+            let mayCarryNote = isBundledRuntime && supportsNativeModelInstructions(runtimeVersion)
+            return ThreadInstructionResolution(
+                mode: nil,
+                developerInstructions: mayCarryNote ? offeredDeveloperInstructions : nil
+            )
+        }
+        return ThreadInstructionResolution(mode: mode, developerInstructions: offeredDeveloperInstructions)
     }
 
     private static var snapshotTurnPageParams: [String: Any] {
@@ -985,7 +1047,9 @@ final class CodexNativeSessionController {
     }
 
     var currentSessionReference: SessionRef? {
-        activeSessionReference
+        guard var reference = activeSessionReference else { return nil }
+        reference.instructionMode = threadBindingContext?.instructionMode
+        return reference
     }
 
     private let inboundStreamInstallationMutex = AsyncMutex()
@@ -2067,13 +2131,15 @@ final class CodexNativeSessionController {
                 #endif
                 throw error
             }
-            let resolvedDeveloperInstructions: String? = if case .bundled = runtime.source,
-                                                            runtime.version == .init(major: 0, minor: 170, patch: 0)
-            {
-                developerInstructions
-            } else {
-                nil
-            }
+            let isBundledRuntime = if case .bundled = runtime.source { true } else { false }
+            let threadInstructions = Self.resolveThreadInstructions(
+                existing: existing,
+                offeredDeveloperInstructions: developerInstructions,
+                isBundledRuntime: isBundledRuntime,
+                runtimeVersion: runtime.version
+            )
+            let instructionMode = threadInstructions.mode
+            let requestedDeveloperInstructions = threadInstructions.developerInstructions
             // Fail closed before any process launch or thread request: a child that expects
             // RepoPrompt MCP tools must not start without them. The gate runs only for tool-expecting
             // children; those with no expected client name skip provisioning. A throw here lands in the
@@ -2172,6 +2238,9 @@ final class CodexNativeSessionController {
             }
 
             let configOverrides = try await runtimeConfigOverrides()
+            let resolvedDeveloperInstructions = try await developerInstructionsPreservingConfigured(
+                requestedDeveloperInstructions
+            )
             let result: [String: Any]
             #if DEBUG
                 let threadPhase: AgentPerfCodexLifecyclePhase = resumeThreadID == nil
@@ -2211,17 +2280,19 @@ final class CodexNativeSessionController {
                 throw error
             }
 
-            let sessionRef = try await eventHandlingMutex.withLock {
+            var sessionRef = try await eventHandlingMutex.withLock {
                 try ensureBindingCanComplete()
                 let sessionRef = applyThreadResponse(result, fallbackEffort: reasoningEffort)
                 await finishBindingAndDrainBufferedInbound()
                 return sessionRef
             }
+            sessionRef.instructionMode = instructionMode
             try markStartOrResumeSucceeded()
             threadBindingContext = ThreadBindingContext(
                 existing: existing,
                 baseInstructions: baseInstructions,
                 developerInstructions: resolvedDeveloperInstructions,
+                instructionMode: instructionMode,
                 model: model,
                 reasoningEffort: reasoningEffort,
                 serviceTier: serviceTier
@@ -3305,6 +3376,33 @@ final class CodexNativeSessionController {
                 computerUseEnabled: computerUseRequiresUserReview && computerUseAcceptedClientPath != nil,
                 capabilities: computerUseRequiresUserReview ? .computerUse : options.capabilitiesProvider()
             )
+        }
+    }
+
+    /// Appends the effective configured `developer_instructions` to RepoPrompt's note. A failed read
+    /// keeps the note alone rather than failing the bind.
+    private static let configReadTimeout: TimeInterval = 5
+
+    private func developerInstructionsPreservingConfigured(_ note: String?) async throws -> String? {
+        guard let note else { return nil }
+        var params: [String: Any] = ["includeLayers": false]
+        if let executionDirectory = workspacePaths.executionDirectory { params["cwd"] = executionDirectory }
+        do {
+            let config = try await performRequest(
+                method: "config/read",
+                params: params,
+                timeout: min(options.requestTimeout ?? Self.configReadTimeout, Self.configReadTimeout)
+            )
+            return Self.composeDeveloperInstructions(
+                note: note,
+                configured: Self.configuredDeveloperInstructions(fromConfigRead: config)
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            try Task.checkCancellation()
+            Self.logger.notice("Codex config/read failed (\(String(describing: type(of: error)), privacy: .public)); sending the RepoPrompt developer note without configured developer instructions")
+            return note
         }
     }
 
@@ -5299,6 +5397,10 @@ final class CodexNativeSessionController {
 
         func test_configureSnapshotRuntime(version: CodexRuntimeAuthority.Version) {
             usesBoundedThreadSnapshots = Self.supportsBoundedThreadSnapshots(version)
+        }
+
+        func test_developerInstructionsPreservingConfigured(_ note: String?) async throws -> String? {
+            try await developerInstructionsPreservingConfigured(note)
         }
 
         func test_startThreadBinding(baseInstructions: String = "", developerInstructions: String? = nil) async throws -> [String: Any] {

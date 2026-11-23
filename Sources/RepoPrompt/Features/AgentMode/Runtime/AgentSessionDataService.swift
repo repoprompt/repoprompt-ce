@@ -141,6 +141,15 @@ actor AgentSessionDataService {
         }
     }
 
+    /// Unknown or malformed modes decode as nil so one bad value cannot fail the header.
+    private struct LenientCodexInstructionMode: Decodable {
+        let value: CodexThreadInstructionMode?
+
+        init(from decoder: Decoder) throws {
+            value = (try? String(from: decoder)).flatMap(CodexThreadInstructionMode.init(rawValue:))
+        }
+    }
+
     private struct AgentSessionHeader: Decodable {
         let id: UUID
         let serializationVersion: Int?
@@ -169,6 +178,7 @@ actor AgentSessionDataService {
         let periodicIdleWakeIntervalSeconds: Int?
         let codexConversationID: String?
         let codexRolloutPath: String?
+        let codexInstructionMode: LenientCodexInstructionMode?
         let codexModel: String?
         let codexReasoningEffort: String?
         let codexContextWindow: Int?
@@ -1508,6 +1518,7 @@ actor AgentSessionDataService {
                 periodicIdleWakeIntervalSeconds: header.periodicIdleWakeIntervalSeconds ?? AgentSessionLinkPeriodicWakeInterval.defaultSeconds,
                 codexConversationID: header.codexConversationID,
                 codexRolloutPath: header.codexRolloutPath,
+                codexInstructionMode: header.codexInstructionMode?.value,
                 codexModel: header.codexModel,
                 codexReasoningEffort: header.codexReasoningEffort,
                 codexContextWindow: header.codexContextWindow,

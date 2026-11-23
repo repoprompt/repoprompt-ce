@@ -263,6 +263,8 @@ struct AgentSession: Codable, Identifiable {
     /// Codex native session identifiers (v2 thread and rollout path)
     var codexConversationID: String?
     var codexRolloutPath: String?
+    /// How the Codex conversation's base instructions were chosen; nil when unknown.
+    var codexInstructionMode: CodexThreadInstructionMode?
 
     /// Codex native session metadata
     var codexModel: String?
@@ -357,6 +359,7 @@ struct AgentSession: Codable, Identifiable {
         automationTurnAudit: [AgentAutomationTurnAudit] = [],
         codexConversationID: String? = nil,
         codexRolloutPath: String? = nil,
+        codexInstructionMode: CodexThreadInstructionMode? = nil,
         codexModel: String? = nil,
         codexReasoningEffort: String? = nil,
         codexContextWindow: Int? = nil,
@@ -411,6 +414,7 @@ struct AgentSession: Codable, Identifiable {
         self.automationTurnAudit = AgentAutomationTurnAudit.retain(automationTurnAudit)
         self.codexConversationID = codexConversationID
         self.codexRolloutPath = codexRolloutPath
+        self.codexInstructionMode = codexInstructionMode
         self.codexModel = codexModel
         self.codexReasoningEffort = codexReasoningEffort
         self.codexContextWindow = codexContextWindow
@@ -467,6 +471,7 @@ struct AgentSession: Codable, Identifiable {
         case automationTurnAudit
         case codexConversationID
         case codexRolloutPath
+        case codexInstructionMode
         case codexModel
         case codexReasoningEffort
         case codexContextWindow
@@ -533,6 +538,9 @@ struct AgentSession: Codable, Identifiable {
         )
         codexConversationID = try container.decodeIfPresent(String.self, forKey: .codexConversationID)
         codexRolloutPath = try container.decodeIfPresent(String.self, forKey: .codexRolloutPath)
+        // Lenient: an unrecognized mode is treated as unknown rather than failing the session.
+        let rawInstructionMode: String? = try? container.decodeIfPresent(String.self, forKey: .codexInstructionMode)
+        codexInstructionMode = rawInstructionMode.flatMap(CodexThreadInstructionMode.init(rawValue:))
         codexModel = try container.decodeIfPresent(String.self, forKey: .codexModel)
         codexReasoningEffort = try container.decodeIfPresent(String.self, forKey: .codexReasoningEffort)
         codexContextWindow = try container.decodeIfPresent(Int.self, forKey: .codexContextWindow)

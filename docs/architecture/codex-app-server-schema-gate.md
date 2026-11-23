@@ -64,8 +64,8 @@ requirement.
 The initial projection covers:
 
 - the client requests RPCE sends for initialization, model discovery, hook discovery, hook-trust
-  config writes, thread lifecycle, goals, turns, interruption, steering, compaction, and the optional
-  memory-mode setting;
+  config writes, the effective-config read that preserves configured developer instructions, thread
+  lifecycle, goals, turns, interruption, steering, compaction, and the optional memory-mode setting;
 - request fields RPCE always or conditionally emits, including nested initialize metadata, turn-input
   variants, sandbox-policy variants, and detection of newly required upstream fields;
 - incoming parameter and response paths RPCE reads, with explicit required, optional, conditional,

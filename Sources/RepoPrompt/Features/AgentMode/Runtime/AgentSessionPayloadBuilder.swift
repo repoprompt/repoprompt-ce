@@ -128,6 +128,7 @@ enum AgentSessionPayloadBuilder {
     ) {
         agentSession.codexConversationID = session.codexConversationID
         agentSession.codexRolloutPath = session.codexRolloutPath
+        agentSession.codexInstructionMode = session.codexInstructionMode
         agentSession.providerCleanupHandle = ProviderConversationCleanupHandle.resolved(
             provider: session.selectedAgent.rawValue,
             explicit: session.providerCleanupHandle,
