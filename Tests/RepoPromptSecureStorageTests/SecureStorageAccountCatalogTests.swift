@@ -36,14 +36,12 @@ final class SecureStorageAccountCatalogTests: XCTestCase {
                 "rp.agent.permissions.grokBuild.v1",
                 "rp.agent.permissions.antigravity.v1",
                 "rp.agent.permissions.devin.v1",
-                "com.repoprompt.ce.remote.tls.v2",
-                "com.repoprompt.ce.remote.tls",
                 "com.repoprompt.ce.remote.iroh-identity.v1",
                 "com.repoprompt.ce.remote.device",
                 "com.repoprompt.ce.remote.notifications"
             ]
         )
-        XCTAssertEqual(Set(SecureStorageAccountCatalog.allAccounts.map(\.identifier)).count, 33)
+        XCTAssertEqual(Set(SecureStorageAccountCatalog.allAccounts.map(\.identifier)).count, 31)
     }
 
     func testDecisionsAccountIsIsolatedAndIncludedInRepairInventory() {

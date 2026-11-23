@@ -428,7 +428,7 @@ final class SecureStorageIdentityMigrationTests: XCTestCase {
         XCTAssertEqual(migrationAccounts.count, 24)
         XCTAssertFalse(migrationAccounts.contains(.jevRouterAPIKey))
         XCTAssertTrue(runtimeAccounts.contains(.jevRouterAPIKey))
-        XCTAssertEqual(runtimeAccounts.count, 33)
+        XCTAssertEqual(runtimeAccounts.count, 31)
         XCTAssertTrue(runtimeAccounts.contains(.remotePairedDevice))
         XCTAssertFalse(migrationAccounts.contains(.remotePairedDevice))
         XCTAssertTrue(runtimeAccounts.contains(.openAIDecisionsRouterAPIKey))
