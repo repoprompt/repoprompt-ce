@@ -1148,11 +1148,26 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
     }
 
     func testLastWindowCloseKeepsOriginatingAskUserPendingAndAnswerable() async throws {
-        try await runVisibleLifetimeWitness(switchWorkspace: false, holdQuestion: true)
+        try await runVisibleLifetimeWitness(switchWorkspace: false, heldTool: .question)
     }
 
     func testWorkspaceSwitchKeepsOriginatingAskUserPendingAndAnswerable() async throws {
-        try await runVisibleLifetimeWitness(switchWorkspace: true, holdQuestion: true)
+        try await runVisibleLifetimeWitness(switchWorkspace: true, heldTool: .question)
+    }
+
+    func testLastWindowCloseKeepsOriginatingProtectedFileEditAndGit() async throws {
+        try await runVisibleLifetimeWitness(switchWorkspace: false, heldTool: .fileEdit)
+    }
+
+    func testWorkspaceSwitchKeepsOriginatingProtectedFileEditAndGit() async throws {
+        try await runVisibleLifetimeWitness(switchWorkspace: true, heldTool: .fileEdit)
+    }
+
+    private enum VisibleHeldTool: Equatable {
+        case question, fileEdit
+
+        static let uneditedSource = "func visibleHostWitness() -> Int { 42 }\n"
+        static let editedSource = "func visibleHostWitness() -> Int { 43 }\n"
     }
 
     private enum DetachedShutdown {
@@ -1162,11 +1177,23 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
     private func runVisibleLifetimeWitness(
         switchWorkspace: Bool, failFinalSave: Bool = false, leaveOtherWindowOpen: Bool = false,
         holdFirstSave: Bool = false, explicitStop: Bool = false, detachedShutdown: DetachedShutdown? = nil,
-        revokeLinkStartedRun: Bool = false, revokeDuringLinkSave: Bool = false, holdQuestion: Bool = false
+        revokeLinkStartedRun: Bool = false, revokeDuringLinkSave: Bool = false, heldTool: VisibleHeldTool? = nil
     ) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("VisibleAgentLifetime-\(UUID())")
-        let root = directory.appendingPathComponent("original-root")
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let gitFixture = heldTool == .fileEdit ? try ReviewGitRepositoryFixture(name: "VisibleHost", parentDirectory: directory) : nil
+        defer { gitFixture?.cleanup() }
+        let root: URL
+        let otherRoot: URL?
+        if let gitFixture {
+            root = try gitFixture.makeRepository(named: "original-root", files: ["Witness.swift": VisibleHeldTool.uneditedSource])
+            let decoy = directory.appendingPathComponent("other-root", isDirectory: true)
+            try gitFixture.write(VisibleHeldTool.uneditedSource, to: "Witness.swift", at: decoy)
+            otherRoot = decoy
+        } else {
+            root = directory.appendingPathComponent("original-root")
+            otherRoot = nil
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        }
         let runtime = MCPDomainRuntime(configuration: .init(
             mode: .app, profileIdentifier: "visible-agent-\(UUID())", storageDirectory: directory,
             workspaceStorageDirectory: directory.appendingPathComponent("workspaces"),
@@ -1205,7 +1232,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         if revokeLinkStartedRun { siblingTab.activeAgentSessionID = UUID() }
         workspace.composeTabs = detachedShutdown == .sessionDeletion || revokeLinkStartedRun ? [tab, siblingTab] : [tab]
         workspace.activeComposeTabID = tab.id
-        let second = WorkspaceModel(name: "Other", repoPaths: [], customStoragePath: directory.appendingPathComponent("second"))
+        let second = WorkspaceModel(name: "Other", repoPaths: otherRoot.map { [$0.path] } ?? [], customStoragePath: directory.appendingPathComponent("second"))
         let authority = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: 0)
         for workspace in [workspace, second] {
             let result = try await authority.create(
@@ -1313,9 +1340,14 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         XCTAssertTrue(started.isRunning, "The originating provider demand starts transport with Auto Start off")
         XCTAssertFalse(GlobalSettingsStore.shared.mcpAutoStart())
         let attemptID = try XCTUnwrap(session.activeRunAttemptID)
-        let answerQuestion = holdQuestion ? try await holdVisibleQuestion(
-            runtime: runtime, host: host, session: session, workspaceID: workspace.id, roots: [root.path], receipt: routingReceipt
-        ) : nil
+        let completeHeldTool: (@MainActor () async throws -> Void)? = if let heldTool {
+            try await holdVisibleTool(
+                heldTool, runtime: runtime, host: host, session: session, workspaceID: workspace.id,
+                root: root, otherRoot: otherRoot, receipt: routingReceipt
+            )
+        } else {
+            nil
+        }
 
         func assertOriginalAttempt() throws {
             XCTAssertEqual(try host.scope.admit(session: session).identity, command.identity)
@@ -1364,8 +1396,16 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             XCTAssertFalse(host.scope.presentation.hasPresenter(for: session))
             addVisibleLifetimeHostCleanup(agent.runtimeHost)
             try assertOriginalAttempt()
-            try await answerQuestion?()
+            if let otherRoot {
+                let visible = await window.workspaceFilesViewModel.workspaceFileContextStore.rootRefs(scope: .visibleWorkspace)
+                XCTAssertEqual(visible.map(\.standardizedFullPath), [otherRoot.standardizedFileURL.path])
+            }
+            try await completeHeldTool?()
             try await activateVisibleLifetimeWorkspace(workspace, in: window)
+            if otherRoot != nil {
+                let visible = await window.workspaceFilesViewModel.workspaceFileContextStore.rootRefs(scope: .visibleWorkspace)
+                XCTAssertEqual(visible.map(\.id), rootIDs)
+            }
             try await assertSupersededVisibleAdoption(workspace, other: second, in: window, retains: host)
             incoming = window
         } else if let otherWindow {
@@ -1383,7 +1423,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             XCTAssertFalse(host.scope.presentation.hasPresenter(for: session))
             XCTAssertFalse(AppDelegate.shouldTerminateAfterLastWindowClosed(isBackgrounded: false))
             try assertOriginalAttempt()
-            try await answerQuestion?()
+            try await completeHeldTool?()
             if let revocation {
                 let fence = AgentRunStartStopFence(session: session)
                 let revoke = Task { await revocation.bridge.revokeLink(linkID: revocation.reference.linkID, generation: revocation.reference.generation) }
@@ -1508,9 +1548,9 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(record?.transcript).turns.compactMap { $0.request?.text }, [prompt])
     }
 
-    private func holdVisibleQuestion(
-        runtime: MCPDomainRuntime, host: AgentSessionRuntimeHost, session: AgentTabSession,
-        workspaceID: UUID, roots: Set<String>, receipt: MCPRunRoutingCleanupReceipt
+    private func holdVisibleTool(
+        _ heldTool: VisibleHeldTool, runtime: MCPDomainRuntime, host: AgentSessionRuntimeHost, session: AgentTabSession,
+        workspaceID: UUID, root: URL, otherRoot: URL?, receipt: MCPRunRoutingCleanupReceipt
     ) async throws -> @MainActor () async throws -> Void {
         let connectionID = UUID()
         let installation = await host.route.installPendingPolicy(receipt, connectionID: connectionID, clientName: nil, tabID: session.tabID)
@@ -1522,37 +1562,43 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             connectionID: connectionID, runID: receipt.runID, purpose: .agentModeRun,
             windowID: host.routeID, registration: receipt
         )
+        let principalID = UUID()
+        func invoke(_ tool: String, _ args: [String: Value]) async throws -> Value {
+            let resolution = try await runtime.domainHost.resolve(toolName: tool, scope: .window(id: host.routeID))
+            let invocationID = UUID()
+            let security = DomainToolInvocationSecurityContext(
+                principal: .init(
+                    principalID: principalID, stableKey: "visible-tool-witness", displayName: "Scripted provider",
+                    kind: .runScoped, assurance: .hostLaunchToken, processID: nil, runID: receipt.runID,
+                    provider: "openCode", verifiedIdentityFingerprint: nil
+                ),
+                connectionID: connectionID, connectionGeneration: registration.generation, invocationID: invocationID,
+                runtimeID: runtime.identity.runtimeID, runtimeGeneration: runtime.identity.lifecycleGeneration,
+                workspaceID: workspaceID, authorizedCanonicalRoots: [root.path], ephemeralGrantedToolNames: [tool]
+            )
+            let context = ToolInvocationContext.trustedLocal(toolName: tool, metadata: .init(connectionID: connectionID, clientName: nil, windowID: host.routeID))
+            var invocationResult: Value?
+            try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
+                invocationResult = try await MCPInvocationContextBridge.withInvocation(context) {
+                    try await runtime.domainHost.invoke(.init(
+                        invocationID: invocationID, connectionID: connectionID, resolution: resolution, arguments: args, securityContext: security
+                    ))
+                }
+            }
+            return try XCTUnwrap(invocationResult)
+        }
+
+        if heldTool == .fileEdit {
+            return try await holdVisibleFileEdit(host: host, session: session, root: root, otherRoot: otherRoot, invoke: invoke)
+        }
         let executor = try XCTUnwrap(host.scope.linkExecution)
         let endpoint = try XCTUnwrap(executor.agentSessionLinkObserverEndpoint(tabID: session.tabID))
         let windows = WindowStatesManager.shared
         let candidate = try XCTUnwrap(windows.agentSessionLinkCandidate(for: endpoint, includeLocation: false))
-        let tool = "ask_user"
-        let resolution = try await runtime.domainHost.resolve(toolName: tool, scope: .window(id: host.routeID))
-        let invocationID = UUID()
-        let security = DomainToolInvocationSecurityContext(
-            principal: .init(
-                principalID: UUID(), stableKey: "visible-question-witness", displayName: "Scripted provider",
-                kind: .runScoped, assurance: .hostLaunchToken, processID: nil, runID: receipt.runID,
-                provider: "openCode", verifiedIdentityFingerprint: nil
-            ),
-            connectionID: connectionID, connectionGeneration: registration.generation, invocationID: invocationID,
-            runtimeID: runtime.identity.runtimeID, runtimeGeneration: runtime.identity.lifecycleGeneration,
-            workspaceID: workspaceID, authorizedCanonicalRoots: roots, ephemeralGrantedToolNames: [tool]
-        )
-        let context = ToolInvocationContext.trustedLocal(toolName: tool, metadata: .init(connectionID: connectionID, clientName: nil, windowID: host.routeID))
         var earlyResult: Result<Value, Error>?
         let question = Task<Value, Error> { @MainActor in
             do {
-                var invocationResult: Value?
-                try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
-                    invocationResult = try await MCPInvocationContextBridge.withInvocation(context) {
-                        try await runtime.domainHost.invoke(.init(
-                            invocationID: invocationID, connectionID: connectionID, resolution: resolution,
-                            arguments: ["question": .string("Continue the originating turn?"), "timeout_seconds": .int(30)], securityContext: security
-                        ))
-                    }
-                }
-                let response = try XCTUnwrap(invocationResult)
+                let response = try await invoke("ask_user", ["question": .string("Continue the originating turn?"), "timeout_seconds": .int(30)])
                 earlyResult = .success(response)
                 return response
             } catch {
@@ -1581,6 +1627,72 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             XCTAssertEqual(answer, .submitted(kind: .question, decision: "answered"))
             let response = try await question.value
             XCTAssertEqual(response.objectValue?["response"]?.stringValue, expectedAnswer)
+        }
+    }
+
+    private func holdVisibleFileEdit(
+        host: AgentSessionRuntimeHost, session: AgentTabSession, root: URL, otherRoot: URL?,
+        invoke: @escaping @MainActor (String, [String: Value]) async throws -> Value
+    ) async throws -> @MainActor () async throws -> Void {
+        let file = root.appendingPathComponent("Witness.swift")
+        let otherFile = try XCTUnwrap(otherRoot).appendingPathComponent("Witness.swift")
+        let interactions = try XCTUnwrap(host.scope.installedInteractions)
+        let command = try host.scope.admit(session: session)
+        let approvalScope = ApplyEditsApprovalScope(windowID: host.routeID, tabID: session.tabID)
+        await interactions.approvalStore.setAutoEditEnabled(false, for: approvalScope, updateGlobalDefault: false)
+        let operationID = "visible-host-edit-witness"
+        var earlyResult: Result<Value, Error>?
+        let edit = Task<Value, Error> { @MainActor in
+            do {
+                let response = try await invoke("apply_edits", [
+                    "path": .string(file.path), "search": .string("{ 42 }"), "replace": .string("{ 43 }"),
+                    "operation_id": .string(operationID)
+                ])
+                earlyResult = .success(response)
+                return response
+            } catch {
+                earlyResult = .failure(error)
+                throw error
+            }
+        }
+        addTeardownBlock { edit.cancel() }
+        try await AsyncTestWait.waitUntil("hold the exact visible-host protected edit") {
+            earlyResult != nil || session.pendingApplyEditsReview != nil
+        }
+        if let earlyResult { XCTFail("Protected edit finished before suspension: \(earlyResult)") }
+        let review = try XCTUnwrap(session.pendingApplyEditsReview)
+        XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), VisibleHeldTool.uneditedSource)
+        return {
+            XCTAssertFalse(host.scope.presentation.hasPresenter(for: session))
+            XCTAssertTrue(command.isCurrent)
+            XCTAssertEqual(session.pendingApplyEditsReview?.id, review.id)
+            let stale = await interactions.submitApplyEditsReviewDecision(command: command, reviewID: UUID(), decision: .accept)
+            XCTAssertFalse(stale)
+            XCTAssertEqual(session.pendingApplyEditsReview?.id, review.id)
+            XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), VisibleHeldTool.uneditedSource)
+
+            let accepted = await interactions.submitApplyEditsReviewDecision(command: command, reviewID: review.id, decision: .accept)
+            guard accepted else { return XCTFail("The originating command must accept its pending review") }
+            try await AsyncTestWait.waitUntil("settle the approved originating edit") { earlyResult != nil }
+            let result: Value
+            do {
+                result = try await edit.value
+            } catch {
+                let didWrite = (try? String(contentsOf: file, encoding: .utf8)) == VisibleHeldTool.editedSource
+                XCTFail("Originating edit invocation failed after approval (didWrite: \(didWrite)): \(error)")
+                throw error
+            }
+            XCTAssertEqual(result.objectValue?["edits_applied"]?.intValue, 1, "\(result)")
+            XCTAssertEqual(result.objectValue?["operation_id"]?.stringValue, operationID)
+            XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), VisibleHeldTool.editedSource)
+            XCTAssertEqual(try String(contentsOf: otherFile, encoding: .utf8), VisibleHeldTool.uneditedSource)
+            do {
+                let diff = try await invoke("git", ["op": .string("diff"), "detail": .string("patches")])
+                XCTAssertTrue(String(describing: diff).contains("+func visibleHostWitness() -> Int { 43 }"), "\(diff)")
+            } catch {
+                XCTFail("Git failed on the retained originating root: \(error)")
+                throw error
+            }
         }
     }
 
