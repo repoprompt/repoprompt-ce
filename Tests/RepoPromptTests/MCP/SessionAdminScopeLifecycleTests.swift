@@ -9124,30 +9124,22 @@ final class SessionAdminInventoryReadTests: XCTestCase {
     func testReducedTargetApprovalReportsTheMissingCapabilitiesWithoutDelivering() async throws {
         try await MCPSharedServerTestLease.shared.withLease { _ in
             let runtime = AppDomainRuntimeComposition.shared.runtime
-            let observerFixture = try await LoadedWindowFixture.make(activeID: UUID(), parentID: nil, processRuntime: runtime)
-            let targetFixture = try await LoadedWindowFixture.make(activeID: UUID(), parentID: nil, processRuntime: runtime)
-            addTeardownBlock { @MainActor in await targetFixture.cleanup()
-                await observerFixture.cleanup()
-            }
-            try observerFixture.installCarriers()
-            try targetFixture.installCarriers()
-            _ = try await targetFixture.persistActiveCarriers()
-            // This test exercises reduced consent for a saved target, not the earlier
-            // missing-target refusal. An in-memory inventory row is not saved authority.
-            let targetTab = try XCTUnwrap(targetFixture.carriers?.composeTabs.first)
-            let targetWorkspace = try XCTUnwrap(targetFixture.window.workspaceManager.activeWorkspace)
-            let targetID = try XCTUnwrap(targetTab.activeAgentSessionID)
-            _ = try await AgentSessionDataService.shared.saveAgentSession(
-                AgentSession(id: targetID, workspaceID: targetWorkspace.id, composeTabID: targetTab.id, name: targetTab.name),
-                for: targetWorkspace
+            // Both sides need canonical carriers: target preparation may refresh the shared
+            // catalog before reduced consent is evaluated. It must not erase the observer.
+            let observerFixture = try await LoadedWindowFixture.make(
+                activeID: UUID(), parentID: nil, processRuntime: runtime, commitCarriersBeforeActivation: true
             )
+            addTeardownBlock { @MainActor in await observerFixture.cleanup() }
+            let targetFixture = try await LoadedWindowFixture.make(
+                activeID: UUID(), parentID: nil, processRuntime: runtime, commitCarriersBeforeActivation: true
+            )
+            addTeardownBlock { @MainActor in await targetFixture.cleanup() }
             let vm = observerFixture.window.agentModeViewModel
             let tab = try XCTUnwrap(observerFixture.carriers?.composeTabs.first)
             let sessionID = try XCTUnwrap(tab.activeAgentSessionID)
-            let session = vm.session(for: tab.id)
-            _ = try XCTUnwrap(vm.test_installPersistentSessionBinding(sessionID: sessionID, on: session, updateWorkspaceMetadata: true))
-            session.hasLoadedPersistedState = true
-            session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            let session = try XCTUnwrap(vm.sessions[tab.id])
+            XCTAssertTrue(session.permitsBoundOperationAndSave)
+            XCTAssertEqual(session.persistentSessionBindingIdentity?.sessionID, sessionID)
             let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(vm, tabID: tab.id)
             let target = try XCTUnwrap(targetFixture.carriers?.composeTabs.first?.activeAgentSessionID)
             let bridge = AgentSessionLinkRuntimeBridge.shared

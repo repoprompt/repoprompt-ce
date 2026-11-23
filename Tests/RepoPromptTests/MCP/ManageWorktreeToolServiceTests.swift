@@ -828,7 +828,12 @@ final class ManageWorktreeSessionAuthorityTests: XCTestCase {
                 let original = try XCTUnwrap(viewModel.runtimeCommand(sessionID: fixture.sessionID))
                 var replaced = false
                 var successorItemCount = 0
-                viewModel.test_setAgentSessionSaver { _, _, _ in
+                viewModel.test_setAgentSessionSaver { saved, _, _ in
+                    // A delayed ordinary save must not advance the replacement trigger.
+                    // Only the post-create save can carry this test's first binding.
+                    guard saved.id == fixture.sessionID, !saved.worktreeBindings.isEmpty else {
+                        return fixture.physical.appendingPathComponent("session.json")
+                    }
                     if !replaced {
                         replaced = true
                         viewModel.test_removeSession(tabID: fixture.session.tabID)

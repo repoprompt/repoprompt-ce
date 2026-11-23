@@ -574,7 +574,40 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
 
         func testActivatedTwoLaneContractWithoutSelectingWorkspaceUsesProductionAdmissionAndReturnedCalls() async throws {
             try await MCPSharedServerTestLease.shared.withLease { _ in
-                try await self.exerciseLiveDiscovery(activate: true, contractJourney: true, withoutSelectingWorkspace: true)
+                // Earlier journeys can update the process-wide Default document on disk.
+                // This case still goes through ordinary startup, but starts with its own ledger.
+                let sandbox = try WorkspaceTestProcessSandbox.validate()
+                let directory = sandbox.appendingPathComponent("startup-lane-\(UUID())", isDirectory: true)
+                let storage = AppProfileLocations.current.customWorkspaceDirectory(
+                    selectedDirectory: directory.appendingPathComponent("Workspaces", isDirectory: true)
+                )
+                let storageKey = "GlobalCustomStorageURL"
+                let previousStorage = UserDefaults.standard.object(forKey: storageKey)
+                UserDefaults.standard.set(storage.path, forKey: storageKey)
+                defer {
+                    if let previousStorage {
+                        UserDefaults.standard.set(previousStorage, forKey: storageKey)
+                    } else {
+                        UserDefaults.standard.removeObject(forKey: storageKey)
+                    }
+                    try? FileManager.default.removeItem(at: directory)
+                }
+                let runtime = MCPDomainRuntime(configuration: .init(
+                    mode: .app, profileIdentifier: "startup-lane-\(UUID())",
+                    storageDirectory: directory.appendingPathComponent("runtime"), workspaceStorageDirectory: storage,
+                    eventDirectory: directory.appendingPathComponent("events"), temporaryDirectory: directory.appendingPathComponent("tmp"),
+                    externalReloadInterval: nil
+                ))
+                try await runtime.start()
+                do {
+                    try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
+                        try await self.exerciseLiveDiscovery(activate: true, contractJourney: true, withoutSelectingWorkspace: true)
+                    }
+                } catch {
+                    _ = await runtime.shutdown()
+                    throw error
+                }
+                _ = await runtime.shutdown()
             }
         }
 
@@ -1178,6 +1211,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     // switch, activeWorkspace assignment, or workspace argument on lane creation.
                     // Observer/chat placement is fixture-seeded in that ordinary owner.
                     await window.workspaceManager.awaitInitialWorkspaceActivationCompletion()
+                    await window.workspaceManager.waitUntilPostSwitchGitDataLoadComplete()
                     let selectedID = try XCTUnwrap(window.workspaceManager.activeWorkspaceID)
                     let snapshotValue = await client.canonicalWorkspaceSnapshot(selectedID)
                     let snapshot = try XCTUnwrap(snapshotValue, "The ordinary startup selection must have canonical authority")
@@ -1237,7 +1271,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     created = try await client.create(workspace, fileURL: window.workspaceManager.workspaceFileURL(for: workspace))
                 }
                 guard created.disposition == .applied else {
-                    throw MCPError.internalError("Discovery fixture workspace creation failed: \(created)")
+                    throw MCPError.internalError("Discovery fixture workspace creation failed: \(created.diagnostic ?? created.disposition.rawValue)")
                 }
                 if !withoutSelectingWorkspace { fixtureWorkspaceID = workspace.id }
                 let presentation = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
@@ -1269,6 +1303,8 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     try await AsyncTestWait.waitUntil("Agent Mode workspace restoration settles") {
                         !vm.workspaceSwitchInFlight
                     }
+                    let activeAdoption = await vm.awaitWorkspaceRuntimeAdoption(expectedWorkspaceID: workspace.id)
+                    XCTAssertTrue(activeAdoption, "Agent Mode must settle the ordinary workspace activation before binding")
                     await vm.test_waitForSessionListCacheRefresh()
                     XCTAssertEqual(window.workspaceManager.activeWorkspaceID, initialWorkspaceID)
                     XCTAssertEqual(window.promptManager.activeComposeTabID, initialTabID)
