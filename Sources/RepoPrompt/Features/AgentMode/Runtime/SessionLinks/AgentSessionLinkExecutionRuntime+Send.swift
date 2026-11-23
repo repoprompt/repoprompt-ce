@@ -672,8 +672,7 @@ extension AgentSessionLinkExecutionRuntime {
         return await startPersistedNoncomposerTurn(
             session: liveSession, tabID: tabID, claim: claim, savedItemID: userItem.id,
             acceptedAt: Date(), providerMessage: providerMessage, stopFence: stopFence,
-            attachments: attachments,
-            providerSwitchPreparation: switchPreparation,
+            attachments: attachments, providerSwitchPreparation: switchPreparation,
             managedStart: managedStart, directStartOptions: directStartOptions,
             revalidateBeforeDispatch: revalidateBeforeDispatch, dispatchIsCurrent: dispatchIsCurrent
         )

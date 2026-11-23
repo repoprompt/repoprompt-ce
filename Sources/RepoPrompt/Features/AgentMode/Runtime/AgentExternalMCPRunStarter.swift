@@ -19,12 +19,12 @@ enum AgentExternalMCPRunStarter {
         let commitConfiguration: @MainActor () async throws -> Void
         let dispatch: @MainActor (_ requirePendingStart: @escaping @MainActor () throws -> Void) async throws -> AgentModeViewModel.MCPInstructionDispatch
         let snapshot: @MainActor () async -> AgentRunMCPSnapshot
+        var requireAuthority: @MainActor () throws -> Void = {}
     }
 
     static func finishPendingStart(
         sessionID: UUID, tabID: UUID, session: AgentTabSession?, ownedActivation: AgentMCPControlContext,
-        originalStopFence: AgentRunStartStopFence? = nil, expiry: AgentRunStartExpiry?,
-        validateWorkspaceAuthority: (@MainActor () throws -> Void)? = nil, actions: PendingStartActions
+        originalStopFence: AgentRunStartStopFence? = nil, expiry: AgentRunStartExpiry?, actions: PendingStartActions
     ) async throws -> StartOutcome {
         try expiry?.recordActivation(sessionID: sessionID, tabID: tabID)
         guard let session, session.activeAgentSessionID == sessionID,
@@ -34,13 +34,14 @@ enum AgentExternalMCPRunStarter {
         }
         let stop = originalStopFence ?? AgentRunStartStopFence(session: session)
         let requirePendingStart: @MainActor () throws -> Void = {
-            try validateWorkspaceAuthority?()
+            try actions.requireAuthority()
             guard actions.ownerIsCurrent(), session.activeAgentSessionID == sessionID,
                   session.mcpControlContext == ownedActivation, stop.permitsStart(of: session)
             else {
                 throw MCPError.invalidParams("The pending agent start was withdrawn or replaced before dispatch.")
             }
         }
+        try actions.requireAuthority()
         try await actions.configure()
         try await actions.prepareRequestBinding()
         try Task.checkCancellation()
@@ -214,11 +215,11 @@ enum AgentExternalMCPRunStarter {
                 )
             }
         }
-        try requireWorkspaceAuthority()
         // A fresh target remains creation-owned through control, model and request setup.
         // Only the complete initial configuration may cross the first durable-save boundary.
         let ownedActivation: AgentModeViewModel.AgentMCPControlContext
         do {
+            try requireWorkspaceAuthority()
             ownedActivation = try await agentModeVM.mcpActivateControlContext(
                 forTabID: target.tabID,
                 sessionID: sessionID,
@@ -242,8 +243,7 @@ enum AgentExternalMCPRunStarter {
         do {
             let outcome = try await finishPendingStart(
                 sessionID: sessionID, tabID: target.tabID, session: activatedSession,
-                ownedActivation: ownedActivation, expiry: startExpiry, validateWorkspaceAuthority: requireWorkspaceAuthority,
-                actions: .init(
+                ownedActivation: ownedActivation, expiry: startExpiry, actions: .init(
                     ownerIsCurrent: { agentModeVM.session(for: target.tabID, createIfNeeded: false) === activatedSession },
                     configure: {
                         if let oracleReviewSource {
@@ -290,7 +290,8 @@ enum AgentExternalMCPRunStarter {
                             preserveRoutedInitialEffort: preserveRoutedInitialEffort, remoteAttachments: remoteAttachments,
                             validateInitialStart: requirePendingStart
                         )
-                    }, snapshot: { await resolveInitialSnapshot(sessionID: sessionID, agentModeVM: agentModeVM) }
+                    }, snapshot: { await resolveInitialSnapshot(sessionID: sessionID, agentModeVM: agentModeVM) },
+                    requireAuthority: requireWorkspaceAuthority
                 )
             )
             #if DEBUG
