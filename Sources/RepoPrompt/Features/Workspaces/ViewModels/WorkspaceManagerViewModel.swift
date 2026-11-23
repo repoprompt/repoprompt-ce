@@ -11577,7 +11577,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     func persistAgentAdmission(
         _ identity: AgentProvisionalAdmissionIdentity,
-        source: WorkspaceSaveSource = WorkspaceSaveSource("agentSessionLifecycleAdmission"),
+        source: WorkspaceSaveSource = .agentSessionLifecycleAdmission,
         timing: WorkspaceAgentAdmissionTiming? = nil
     ) async -> AgentAdmissionPersistenceReceipt {
         // The initiating admission owns this unpublished proposal. A peer catalog refresh
@@ -11659,7 +11659,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         let outcome = await pollAndSaveStateWithOutcomeAsync(
             workspaceID: identity.workspaceID,
             source: source,
-            allowRetainedAgentAdmissionRecoveryRetry: false
+            allowRetainedAgentAdmissionRecoveryRetry: false,
+            requiringAgentAdmission: identity
         )
         guard let workspace = workspace(withID: identity.workspaceID), !workspace.isEphemeral else {
             return AgentAdmissionPersistenceReceipt(outcome: outcome, commitEvidence: .none)
@@ -13183,7 +13184,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         workspaceID requestedWorkspaceID: UUID? = nil,
         source: WorkspaceSaveSource = .pollAndSaveStateAsync,
         allowRetainedAgentAdmissionRecoveryRetry: Bool = true,
-        skippingUnusedStartupDefault: Bool = false
+        skippingUnusedStartupDefault: Bool = false,
+        requiringAgentAdmission: AgentProvisionalAdmissionIdentity? = nil
     ) async -> WorkspacePersistenceOutcome {
         guard !Task.isCancelled else {
             return .rejected(reason: "own_save_cancelled", category: .cancelled)
@@ -13241,7 +13243,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                 source: source,
                 allowRetainedAgentAdmissionRecoveryRetry: false,
                 ownSaveFence: fence,
-                skippingUnusedStartupDefault: skippingUnusedStartupDefault
+                skippingUnusedStartupDefault: skippingUnusedStartupDefault,
+                requiringAgentAdmission: requiringAgentAdmission
             )
         } catch {
             return .rejected(reason: "own_save_cancelled", category: .cancelled)
@@ -13253,7 +13256,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         source: WorkspaceSaveSource,
         allowRetainedAgentAdmissionRecoveryRetry: Bool,
         ownSaveFence: OwnSaveFence?,
-        skippingUnusedStartupDefault: Bool = false
+        skippingUnusedStartupDefault: Bool = false,
+        requiringAgentAdmission: AgentProvisionalAdmissionIdentity? = nil
     ) async -> WorkspacePersistenceOutcome {
         guard let wsID = requestedWorkspaceID ?? activeWorkspace?.id,
               let currentWorkspace = workspace(withID: wsID)
@@ -13274,6 +13278,15 @@ class WorkspaceManagerViewModel: ObservableObject {
                 reason: "agent_admission_recovery_pending",
                 category: .durabilityUncertain
             )
+        }
+        func includesRequiredAdmission(_ workspace: WorkspaceModel) -> Bool {
+            guard let requiringAgentAdmission else { return true }
+            return WorkspaceAgentAdmissionDocument.recoveryProjection(in: workspace, identity: requiringAgentAdmission).containsIdentity
+        }
+        // Joining a predecessor may let a peer document displace an unpublished lane before
+        // this save captures anything. Return to the initiating admission without writing.
+        guard includesRequiredAdmission(currentWorkspace) else {
+            return .rejected(reason: "provisional_admission_capture_changed", category: .workspaceChanged)
         }
         let cur = stateVersionByWorkspaceID[wsID, default: 0]
         let last = lastSavedVersionByWorkspaceID[wsID, default: -1]
@@ -13341,6 +13354,9 @@ class WorkspaceManagerViewModel: ObservableObject {
         let snapshot = captureActiveTabSnapshotForWorkspaceIndex(index, source: source)
         guard let capturedWorkspace = workspace(withID: wsID) else {
             return .rejected(reason: "workspace_changed_after_capture")
+        }
+        guard includesRequiredAdmission(capturedWorkspace) else {
+            return .rejected(reason: "provisional_admission_capture_changed", category: .workspaceChanged)
         }
         let fileURL = workspaceFileURL(for: capturedWorkspace)
         reloadComposeTabsAfterSaveCaptureIfNeeded(capturedWorkspace, capturedSnapshot: snapshot)
@@ -16746,6 +16762,12 @@ class WorkspaceManagerViewModel: ObservableObject {
         else { throw WorkspacePersistenceFailure(category: .workspaceChanged) }
 
         let currentGeneration = fullDocumentAdoptionGenerations[proposal.id, default: 0]
+        if source == .agentSessionLifecycleAdmission, currentGeneration != capture.adoptionGeneration {
+            // Only the initiating admission can carry its exact unpublished tab across a
+            // peer adoption. An ordinary retry would otherwise save the peer projection and
+            // report success without ever writing that tab.
+            throw WorkspacePersistenceFailure(category: .workspaceChanged)
+        }
         if currentGeneration != capture.adoptionGeneration,
            domainWorkspaceDigestsByID[proposal.id] == capture.digest
         {

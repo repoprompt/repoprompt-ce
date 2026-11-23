@@ -490,17 +490,14 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                     let peerRecord = published.workspaces.first { $0.document.workspaceID == workspaceID }
                     let peerDocument = peerRecord.flatMap { try? JSONDecoder().decode(WorkspaceModel.self, from: $0.document.documentBytes) }
                     XCTAssertNotNil(peerDocument)
-                    XCTAssertEqual(peerDocument?.composeTabs.contains { $0.id == fresh.id || $0.activeAgentSessionID == sessionID }, false,
-                                   "The peer must not publish the initiating transaction's provisional carrier")
+                    XCTAssertEqual(
+                        peerDocument?.composeTabs.contains { $0.id == fresh.id || $0.activeAgentSessionID == sessionID },
+                        false,
+                        "The peer must not publish the initiating transaction's provisional carrier"
+                    )
                 }
                 manager.setWorkspaceSaveAfterAuthoritySnapshotHandlerForTesting(interpose)
-                fixture.window.promptManager.setAgentAdmissionPersistenceReceiptHandlerForTesting { _, receipt in
-                    print("FIRST_LANE_PEER_SAVE_RECEIPT outcome=\(receipt.outcome) evidence=\(receipt.commitEvidence)")
-                }
-                defer {
-                    manager.setWorkspaceSaveAfterAuthoritySnapshotHandlerForTesting(nil)
-                    fixture.window.promptManager.setAgentAdmissionPersistenceReceiptHandlerForTesting(nil)
-                }
+                defer { manager.setWorkspaceSaveAfterAuthoritySnapshotHandlerForTesting(nil) }
 
                 let lane = try await createLinkedLane(
                     fixture: fixture, overseer: linked, name: "Contended first lane",
