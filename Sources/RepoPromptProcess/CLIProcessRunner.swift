@@ -256,6 +256,14 @@ package final class CLIProcessRunner {
         return access(path, X_OK) == 0
     }
 
+    /// Runs the command to completion with buffered output.
+    ///
+    /// `onProcessStarted` and `onProcessExited` observe the child's lifetime. Both run
+    /// sequentially on the caller's task and should return quickly: `onProcessExited`
+    /// delays the output drain. `onProcessStarted` fires once after spawn succeeds and never
+    /// fires when launch policy, environment construction, command resolution, or spawn fails.
+    /// `onProcessExited` then fires exactly once after the waiter settles (normal exit, timeout,
+    /// wait failure, or cancellation with `cancelChildOnTaskCancellation`), before drain.
     package func run(
         args: [String],
         stdin: String?,
@@ -265,7 +273,9 @@ package final class CLIProcessRunner {
         additionalEnvironment: [String: String] = [:],
         additionalRemovedKeys: Set<String> = [],
         environmentFilter: CLIProcessConfiguration.EnvironmentFilter? = nil,
-        cancelChildOnTaskCancellation: Bool = false
+        cancelChildOnTaskCancellation: Bool = false,
+        onProcessStarted: (@Sendable (pid_t) async -> Void)? = nil,
+        onProcessExited: (@Sendable (pid_t) async -> Void)? = nil
     ) async throws -> Result {
         if config.processPurpose == .provider {
             try ProviderProcessLaunchPolicy.check(allowsLaunchInTests: config.allowsProviderProcessLaunchForTesting)
@@ -396,8 +406,12 @@ package final class CLIProcessRunner {
                     }
                 }
 
+                await onProcessStarted?(spawned.pid)
                 let waitAndDrain = {
-                    let (status, timedOut) = try await waitTask.value
+                    let waited = await waitTask.result
+                    // The waiter settles only after the child is terminated and reaped.
+                    await onProcessExited?(spawned.pid)
+                    let (status, timedOut) = try waited.get()
                     inputWriter?.stop()
                     if cancelChildOnTaskCancellation { try Task.checkCancellation() }
                     let deadline = DispatchTime.now() + outputDrainTimeout

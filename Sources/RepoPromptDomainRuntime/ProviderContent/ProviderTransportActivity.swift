@@ -150,3 +150,78 @@ private final class PendingCompletionIterator: @unchecked Sendable {
         return try await current.next()
     }
 }
+
+/// Reports transport liveness on a fixed cadence between `start()` and `stop()`.
+///
+/// For owners that hold their own evidence of a live transport, such as a child process
+/// the runner has spawned and not yet reaped. Call `start()` only once that evidence exists
+/// and `stop()` as soon as it ends. `stop()` joins the timer, so `report` is never invoked after
+/// any `stop()` call returns. `report` returns `false` once its sink has terminated, which ends
+/// the timer. `start()` is ignored after `stop()`, so a late start cannot resurrect liveness.
+package final class ProviderTransportHeartbeat: @unchecked Sendable {
+    package typealias Report = @Sendable () -> Bool
+
+    private enum State {
+        case idle
+        case running(Task<Void, Never>)
+        case stopped(Task<Void, Never>?)
+    }
+
+    private let interval: TimeInterval
+    private let sleep: ProviderPendingCompletionStream.Sleep
+    private let report: Report
+    private let lock = NSLock()
+    private var state = State.idle
+
+    package init(
+        interval: TimeInterval = ProviderTransportActivity.pendingCompletionHeartbeatInterval,
+        sleep: @escaping ProviderPendingCompletionStream.Sleep = { seconds in try await Task.sleep(for: .seconds(seconds)) },
+        report: @escaping Report
+    ) {
+        precondition(interval.isFinite && interval > 0, "Heartbeat interval must be positive and finite")
+        self.interval = interval
+        self.sleep = sleep
+        self.report = report
+    }
+
+    package func start() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard case .idle = state else { return }
+        let interval = interval
+        let sleep = sleep
+        let report = report
+        state = .running(Task {
+            while !Task.isCancelled {
+                do {
+                    try await sleep(interval)
+                } catch {
+                    return
+                }
+                guard !Task.isCancelled, report() else { return }
+            }
+        })
+    }
+
+    package func stop() async {
+        let task = markStopped()
+        task?.cancel()
+        await task?.value
+    }
+
+    private func markStopped() -> Task<Void, Never>? {
+        lock.lock()
+        defer { lock.unlock() }
+        let task: Task<Void, Never>?
+        switch state {
+        case .idle:
+            task = nil
+        case let .running(running):
+            task = running
+        case let .stopped(previous):
+            task = previous
+        }
+        state = .stopped(task)
+        return task
+    }
+}

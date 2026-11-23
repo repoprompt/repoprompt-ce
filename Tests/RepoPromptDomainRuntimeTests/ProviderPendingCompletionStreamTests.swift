@@ -230,3 +230,73 @@ private final class PendingCompletionRequest: @unchecked Sendable {
         continuation?.resume(with: result)
     }
 }
+
+private final class HeartbeatCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    private let result: Bool
+
+    init(result: Bool = true) {
+        self.result = result
+    }
+
+    var reports: Int {
+        lock.withLock { count }
+    }
+
+    func report() -> Bool {
+        lock.withLock { count += 1 }
+        return result
+    }
+}
+
+final class ProviderTransportHeartbeatTests: XCTestCase {
+    func testReportsOnEachTickUntilStoppedAndNeverAfter() async {
+        let ticker = LivenessTicker()
+        let counter = HeartbeatCounter()
+        let heartbeat = ProviderTransportHeartbeat(interval: 30, sleep: { _ in try await ticker.sleep() }, report: counter.report)
+        heartbeat.start()
+        for expected in 1 ... 3 {
+            ticker.allowOneTick()
+            await waitForReports(counter, expected)
+        }
+        await heartbeat.stop()
+        let settled = counter.reports
+        ticker.allowOneTick()
+        try? await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(counter.reports, settled)
+        XCTAssertEqual(ticker.cancelledSleeps, 1)
+        await heartbeat.stop()
+    }
+
+    func testStopBeforeStartPreventsLaterStart() async {
+        let ticker = LivenessTicker()
+        let counter = HeartbeatCounter()
+        let heartbeat = ProviderTransportHeartbeat(interval: 30, sleep: { _ in try await ticker.sleep() }, report: counter.report)
+        await heartbeat.stop()
+        heartbeat.start()
+        ticker.allowOneTick()
+        try? await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(counter.reports, 0)
+    }
+
+    func testTerminatedSinkEndsTimer() async {
+        let ticker = LivenessTicker()
+        let counter = HeartbeatCounter(result: false)
+        let heartbeat = ProviderTransportHeartbeat(interval: 30, sleep: { _ in try await ticker.sleep() }, report: counter.report)
+        heartbeat.start()
+        ticker.allowOneTick()
+        await waitForReports(counter, 1)
+        ticker.allowOneTick()
+        try? await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(counter.reports, 1)
+        await heartbeat.stop()
+    }
+
+    private func waitForReports(_ counter: HeartbeatCounter, _ expected: Int) async {
+        for _ in 0 ..< 400 where counter.reports < expected {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(counter.reports, expected)
+    }
+}

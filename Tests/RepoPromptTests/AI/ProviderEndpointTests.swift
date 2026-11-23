@@ -219,3 +219,36 @@ final class ErrorExtensionsKeychainTests: XCTestCase {
         XCTAssertEqual(backend.calls, [.init(operation: .delete, account: .zAIAPI, accessMode: .interactive)])
     }
 }
+
+@MainActor
+final class ErrorExtensionsProviderErrorTests: XCTestCase {
+    func testWrappedDevinCLIFailureShowsProviderMessage() {
+        let source = NSError(domain: "DevinCLI", code: 7, userInfo: [NSLocalizedDescriptionKey: "model refused the request"])
+        let message = AIProviderError.apiError(source: source).asFriendlyString()
+
+        XCTAssertEqual(message, "model refused the request")
+    }
+
+    func testDetailCasesShowTheirDetail() {
+        XCTAssertEqual(AIProviderError.invalidConfiguration(detail: "Devin CLI is not available.").asFriendlyString(), "Devin CLI is not available.")
+        XCTAssertEqual(AIProviderError.invalidResponse(detail: "Devin returned no completion").asFriendlyString(), "Devin returned no completion")
+        XCTAssertEqual(AIProviderError.missingAPIKey.asFriendlyString(), "Missing API key.")
+    }
+
+    func testNestedProviderErrorsAndKeychainSourcesUnwrap() {
+        XCTAssertEqual(
+            AIProviderError.apiError(source: AIProviderError.invalidResponse(detail: "inner detail")).asFriendlyString(),
+            "inner detail"
+        )
+        XCTAssertEqual(
+            AIProviderError.unknown(source: KeychainService.KeychainError.userInteractionCancelled).asFriendlyString(),
+            "Keychain interaction was cancelled"
+        )
+    }
+
+    func testErrorsWithoutAMessageKeepGenericDiagnostics() {
+        XCTAssertTrue(AIProviderError.apiError(source: nil).asFriendlyString().hasPrefix("Unknown error ["))
+        let plain = NSError(domain: "Plain", code: 3)
+        XCTAssertTrue(plain.asFriendlyString().hasPrefix("Unknown error [Plain, code 3]"))
+    }
+}

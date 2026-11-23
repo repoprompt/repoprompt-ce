@@ -99,6 +99,70 @@ final class CLIProcessRunnerCancellationTests: XCTestCase {
         XCTAssertEqual(control.stdout, Data("control".utf8))
     }
 
+    func testNonStreamingLifetimeHooksBracketChildAndPrecedeDrain() async throws {
+        let events = LifetimeEvents()
+        let runner = CLIProcessRunner(
+            config: CLIProcessConfiguration(command: "/bin/sh", processPurpose: .tool, enableDebugLogging: false),
+            beforeOutputDrain: { events.append("drain") }
+        )
+        let result = try await runner.run(
+            args: ["-c", "printf done"], stdin: nil, outputMode: .none, timeout: 2,
+            onProcessStarted: { _ in events.append("started") },
+            onProcessExited: { _ in events.append("exited") }
+        )
+        XCTAssertEqual(result.stdout, Data("done".utf8))
+        XCTAssertEqual(events.values, ["started", "exited", "drain"])
+    }
+
+    func testNonStreamingLifetimeHooksSkippedWhenSpawnFails() async {
+        let events = LifetimeEvents()
+        let runner = CLIProcessRunner(
+            config: CLIProcessConfiguration(command: "/nonexistent/rpce-missing-command", processPurpose: .tool, enableDebugLogging: false)
+        )
+        do {
+            _ = try await runner.run(
+                args: [], stdin: nil, outputMode: .none, timeout: 2,
+                onProcessStarted: { _ in events.append("started") },
+                onProcessExited: { _ in events.append("exited") }
+            )
+            XCTFail("Expected launch failure")
+        } catch {}
+        XCTAssertEqual(events.values, [])
+    }
+
+    func testNonStreamingLifetimeExitHookFiresOnceForTimeoutAndCancellation() async throws {
+        let timeoutEvents = LifetimeEvents()
+        let runner = CLIProcessRunner(config: CLIProcessConfiguration(command: "/bin/sh", processPurpose: .tool, enableDebugLogging: false))
+        let timed = try await runner.run(
+            args: ["-c", "exec /bin/sleep 30"], stdin: nil, outputMode: .none, timeout: 0.1,
+            onProcessStarted: { _ in timeoutEvents.append("started") },
+            onProcessExited: { _ in timeoutEvents.append("exited") }
+        )
+        XCTAssertTrue(timed.timedOut)
+        XCTAssertEqual(timeoutEvents.values, ["started", "exited"])
+
+        let cancelEvents = LifetimeEvents()
+        let started = expectation(description: "child started")
+        let task = Task {
+            try await runner.run(
+                args: ["-c", "exec /bin/sleep 30"], stdin: nil, outputMode: .none, timeout: 30,
+                cancelChildOnTaskCancellation: true,
+                onProcessStarted: { _ in
+                    cancelEvents.append("started")
+                    started.fulfill()
+                },
+                onProcessExited: { _ in cancelEvents.append("exited") }
+            )
+        }
+        await fulfillment(of: [started], timeout: 5)
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("Expected cancellation")
+        } catch is CancellationError {}
+        XCTAssertEqual(cancelEvents.values, ["started", "exited"])
+    }
+
     func testNonStreamingCancellationDuringDrainDoesNotPublishOutput() async throws {
         let entered = expectation(description: "child exited before drain")
         let release = DispatchSemaphore(value: 0)
@@ -945,5 +1009,18 @@ private final class OwnedFixtureCleanup: @unchecked Sendable {
             markSettled()
         }
         closeHandles()
+    }
+}
+
+private final class LifetimeEvents: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [String] = []
+
+    var values: [String] {
+        lock.withLock { storage }
+    }
+
+    func append(_ value: String) {
+        lock.withLock { storage.append(value) }
     }
 }

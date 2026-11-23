@@ -46,18 +46,23 @@ extension MCPWorktreeToolProvider {
             let result = partial.applyResult
             let abort = partial.abortResult
             let preview = partial.preview
-            return ToolResultDTOs.ManageWorktreeReplyDTO(op: op.rawValue, merge: .init(
+            let sourceEndpoint = result?.source ?? preview?.inspection.source
+            let targetEndpoint = result?.target ?? abort?.target ?? preview?.inspection.target
+            let source = sourceEndpoint.map(endpointDTO)
+            let target = targetEndpoint.map(endpointDTO)
+            let mergeDTO = ToolResultDTOs.ManageWorktreeReplyDTO.MergeDTO(
                 status: "committed_incomplete", operationID: partial.operationID,
                 sessionID: partial.writer.sessionID.uuidString,
-                source: (result?.source ?? preview?.inspection.source).map(endpointDTO),
-                target: (result?.target ?? abort?.target ?? preview?.inspection.target).map(endpointDTO),
+                source: source,
+                target: target,
                 targetHeadAfter: result?.targetHeadAfter ?? abort?.targetHead,
                 mergeCommit: result?.mergeCommit,
                 artifacts: artifactsDTO(preview?.artifacts),
                 conflictFiles: result?.conflictFiles,
                 errorCode: "merge_completion_incomplete", error: partial.localizedDescription,
                 nextActions: ["Inspect the operation and target before retrying; a committed effect is not replayed automatically."]
-            ))
+            )
+            return ToolResultDTOs.ManageWorktreeReplyDTO(op: op.rawValue, merge: mergeDTO)
         }
     }
 
