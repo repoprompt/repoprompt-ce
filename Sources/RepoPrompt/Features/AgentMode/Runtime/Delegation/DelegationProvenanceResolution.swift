@@ -90,7 +90,7 @@ struct OpenWindowsDelegationProvenanceSource: DelegationProvenanceSource {
         let carriers = AgentSessionCarrierResolver.capture(
             windows: windows, sessionIDs: sessionIDs, includeRuntimeOwners: includeRuntime
         )
-        let savedIDs = AgentSessionRuntimeStore.shared.retainedExecutionHosts.compactMap { $0.workspaceActivation?.savedCarrierSessionID }
+        let savedIDs = AgentSessionRuntimeStore.shared.retainedExecutionHosts.compactMap { $0.workspaceActivation?.retainedCarrierSessionID }
         let ids = sessionIDs ?? carriers.sessionIDs.union(savedIDs)
         // The carrier capture already took each window's binding census for runtime owners; reuse its
         // states so one read builds one census per window.
@@ -156,7 +156,7 @@ struct OpenWindowsDelegationProvenanceSource: DelegationProvenanceSource {
         guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: id),
               let host = writer.scope.executableHost, !host.route.isClosing, (try? writer.admitCommand().get()) != nil
         else { return nil }
-        let isSavedCarrier = host.workspaceActivation?.savedCarrierSessionID == id && host.workspaceActivation?.isCurrent == true
+        let isSavedCarrier = host.workspaceActivation?.retainedCarrierSessionID == id && host.workspaceActivation?.isCurrent == true
         let hasTransactionCarrier = AppSavedAgentSessionExecution.approvedLinkOrigin.get()?.canonicalWriters.contains(writer.identity) == true
         guard isSavedCarrier || hasTransactionCarrier else { return nil }
         let session = writer.session

@@ -86,6 +86,7 @@ enum AppSavedAgentSessionExecution {
         let settings: APISettingsViewModel
         var claudeControllerFactory: ClaudeAgentModeCoordinator.ClaudeControllerFactory?
         var mcpTransport: MCPService?
+        var modelRouterSettings: GlobalSettingsStore?
     }
 
     struct Lookup {
@@ -191,7 +192,7 @@ enum AppSavedAgentSessionExecution {
         )
         guard let routeLease = owner.acquire(.execution) else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
         let route = owner.route
-        let settings = GlobalSettingsStore.shared
+        let settings = providerEnvironment?.modelRouterSettings ?? GlobalSettingsStore.shared
         let diagnostics = AppAgentSessionLinkCatalogEventSink()
         let perf = AppAgentModePerfRecorder()
         let paths = AgentSessionRuntimeHost.makeSessionWorkspaceProviders { workspace.repoPaths.first }

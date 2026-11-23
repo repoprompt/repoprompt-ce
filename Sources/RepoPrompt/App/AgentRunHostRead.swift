@@ -365,7 +365,10 @@ extension AgentRunHostAdmission {
             }
             manager.beginPreparedOversightPreparation(sessionID)
             holdingPreparation = true
-            let restored = try await manager.prepareSavedOversightTarget(sessionID, isStillAuthorized: { sourceIsCurrent }).get()
+            let environment = try captureContinuationProviderEnvironment()
+            let restored = try await manager.prepareSavedOversightTarget(
+                sessionID, providerEnvironment: environment, isStillAuthorized: { sourceIsCurrent }
+            ).get()
             initial = try await requireSingleSteerTarget(sessionID)
             guard initial.command.identity == restored.identity, initial.command.writer.session.tabID == saved.tab.id,
                   initial.command.writer.session.parentSessionID == saved.entry.parentSessionID
@@ -419,6 +422,9 @@ extension AgentRunHostAdmission {
             read.command.identity == target.command.identity && read.controlActivationID == target.controlActivationID ? read : nil
         }
         guard let qualified else { return tools.decoratedRunValue(snapshot: AgentRunMCPToolService.agentRunExpiredSnapshot(sessionID: sessionID), workflow: workflow, delivery: delivery) }
+        if let targetHost = qualified.command.writer.scope.executableHost {
+            manager.retainChildControl(qualified.command, host: targetHost)
+        }
         let access = readAccess(for: [qualified], operation: .runSteer)
         let snapshot = await access.snapshot(sessionID)
         guard await (try? requireReadTargets([qualified], operation: .runSteer)) != nil else {
@@ -463,6 +469,7 @@ extension AgentRunHostAdmission {
             let restored = try await requireSingleSteerTarget(original.sessionID)
             guard restored.command.identity == original.command.identity, restored.registration == context.registration,
                   restored.controlActivationID == context.activationID else { throw MCPFileToolAuthorityFailure.superseded }
+            WindowStatesManager.shared.retainChildControl(restored.command, host: targetHost)
             return (restored, context)
         } catch {
             if session.mcpControlContext == context {
@@ -525,7 +532,21 @@ extension AgentRunHostAdmission {
         let stopFence = AgentRunStartStopFence(session: session)
         func deliver() async throws -> AgentMCPInstructionDispatch {
             try await requireReadTargets([target], operation: .runSteer)
-            guard stopFence.permitsStart(of: session),
+            guard session.autoEffortJudgmentID == nil else {
+                throw MCPError.invalidParams("Auto effort is already choosing effort for this session. Retry after that turn starts.")
+            }
+            let policy = autoEffortPolicy(for: targetHost, command: command)
+            let judgesEffort = AutoEffortModelPolicy.shouldJudgeMCPUserTurn(
+                isEnabled: targetHost.modelRouterSettingsStore.autoEffortEnabled(),
+                startsNewRun: !session.runState.isActive, hasPriorUserTurn: session.hasSentFirstMessage,
+                isNativePreparedTurn: false, preserveRoutedInitialEffort: false
+            )
+            let effort = judgesEffort ? await policy.chooseAutoEffortForUserTurn(
+                text: text, session: session, workflow: workflow,
+                isCurrent: { readTargetIsCurrent(target, operation: .runSteer) && stopFence.permitsStart(of: session) }
+            ) : nil
+            try await requireReadTargets([target], operation: .runSteer)
+            guard stopFence.permitsStart(of: session), !session.runState.isActive,
                   let claim = executor.claimComposerSubmitAttempt(.init(
                       id: UUID(), target: programmatic, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: ""
                   )) else { throw MCPFileToolAuthorityFailure.superseded }
@@ -535,7 +556,9 @@ extension AgentRunHostAdmission {
             let outcome = await executor.persistAndStartNoncomposerTurn(
                 session: session, tabID: session.tabID, workspaceID: command.identity.workspaceID,
                 claim: claim, displayText: text, providerMessage: providerText, workflow: workflow,
-                attribution: nil, stopFence: stopFence, directStartOptions: .init(),
+                attribution: nil, stopFence: stopFence, directStartOptions: .init(autoEffortSelection: effort?.selection),
+                audit: effort.map { choice in { policy.auditForSubmittedTurn($0, session: session, autoEffort: choice.audit) } },
+                revalidateBeforeDispatch: { try await requireReadTargets([target], operation: .runSteer) },
                 dispatchIsCurrent: {
                     readTargetIsCurrent(target, operation: .runSteer) && stopFence.permitsStart(of: session)
                         && session.pendingApplyEditsReview == nil && session.pendingWorktreeMergeReview == nil
@@ -546,6 +569,9 @@ extension AgentRunHostAdmission {
             case let .delivered(delivery):
                 guard delivery.deliveryState == .runStarted || session.runState == .failed else {
                     throw MCPError.invalidParams("The instruction was saved, but the originating run did not start.")
+                }
+                if delivery.deliveryState == .runStarted, let selection = effort?.selection {
+                    policy.recordSubmittedAutoEffort(selection, for: session)
                 }
                 return .startedRun
             }

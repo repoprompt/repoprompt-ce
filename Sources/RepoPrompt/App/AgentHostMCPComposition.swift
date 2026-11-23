@@ -59,7 +59,7 @@ extension MCPHostRouteResources {
             MCPWindowToolName.askUser, MCPWindowToolName.manageSelection, MCPWindowToolName.agentSessionLink,
             MCPWindowToolName.agentManage, MCPWindowToolName.manageWorktree, MCPWindowToolName.sessionAdmin,
             MCPWindowToolName.becomeOverseer, MCPWindowToolName.applyEdits, MCPWindowToolName.git,
-            MCPWindowToolName.agentSelf, MCPWindowToolName.selfNoop
+            MCPWindowToolName.agentSelf, MCPWindowToolName.selfNoop, MCPWindowToolName.agentRun
         ]
         let fileTools = MCPFileReadResources.contentToolNames.union(MCPFileReadResources.toolNames)
         let binder = makeToolBinder(
@@ -121,6 +121,8 @@ extension MCPHostRouteResources {
                     return try await host.executeHostBecomeOverseer(args, invocation: invocation)
                 case MCPWindowToolName.agentManage:
                     return try await host.executeHostAgentManage(args, invocation: invocation)
+                case MCPWindowToolName.agentRun:
+                    return try await AgentRunHostAdmission(host: host, invocation: invocation).executeAgentRun(args)
                 case MCPWindowToolName.manageWorktree:
                     return try await Value(worktrees.executeManageWorktree(args: args, invocationContext: invocation))
                 case MCPWindowToolName.sessionAdmin:

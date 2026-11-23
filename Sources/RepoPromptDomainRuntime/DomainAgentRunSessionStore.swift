@@ -209,6 +209,7 @@ package actor DomainAgentRunSessionStore {
         var epochStates: [UUID: EpochState] = [:]
         var waiters: [Waiter] = []
         var expiryTask: Task<Void, Never>?
+        var registrationEnded: (@Sendable (Registration) async -> Void)?
         var nextEpochOrdinal: UInt64 = 1
         var continuityGeneration: UInt64 = 0
     }
@@ -338,6 +339,7 @@ package actor DomainAgentRunSessionStore {
         }
         if let previous = records.removeValue(forKey: sessionID) {
             previous.expiryTask?.cancel()
+            notifyRegistrationEnded(previous)
             expireWaiters(previous.waiters)
             cancellationHandlers.removeValue(forKey: sessionID)
             recordRejectedOperation(
@@ -798,10 +800,27 @@ package actor DomainAgentRunSessionStore {
         records[sessionID] != nil
     }
 
+    /// Join the existing exact registration lifetime; this does not add a timer or renew it.
+    package func observeRegistrationEnd(
+        _ registration: Registration, observer: @escaping @Sendable (Registration) async -> Void
+    ) -> Bool {
+        guard var record = currentRecord(for: registration, operation: "observe_registration_end") else { return false }
+        record.registrationEnded = observer
+        records[registration.sessionID] = record
+        return true
+    }
+
+    private func notifyRegistrationEnded(_ record: Record) {
+        guard let observer = record.registrationEnded else { return }
+        let registration = record.registration
+        Task { await observer(registration) }
+    }
+
     package func cleanup(registration: Registration) {
         guard let record = currentRecord(for: registration, operation: "cleanup") else { return }
         records.removeValue(forKey: registration.sessionID)
         record.expiryTask?.cancel()
+        notifyRegistrationEnded(record)
         expireWaiters(record.waiters)
         cancellationHandlers.removeValue(forKey: registration.sessionID)
         updateMetadata(for: record, state: .dormant, resumable: true)
@@ -841,6 +860,7 @@ package actor DomainAgentRunSessionStore {
         #endif
         for record in activeRecords.values {
             record.expiryTask?.cancel()
+            notifyRegistrationEnded(record)
             resume(record.waiters, with: .cancelled)
         }
 
@@ -1042,6 +1062,7 @@ package actor DomainAgentRunSessionStore {
         else { return }
         records.removeValue(forKey: cursor.registration.sessionID)
         expireWaiters(record.waiters)
+        notifyRegistrationEnded(record)
         cancellationHandlers.removeValue(forKey: cursor.registration.sessionID)
         updateMetadata(for: record, state: .dormant, resumable: true)
         scheduleMetadataPersistence()

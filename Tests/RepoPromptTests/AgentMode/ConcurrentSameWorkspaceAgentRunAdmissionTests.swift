@@ -1368,6 +1368,7 @@ import XCTest
             let initialWorkspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
             let initialTabs = initialWorkspace.composeTabs
             let initialTabIDs = Set(initialTabs.map(\.id))
+            let foregroundDraft = "Keep this foreground draft while the provisional child is rejected"
             let provisionalIdentity = ProvisionalAdmissionIdentityRecorder()
             let beforeSaveToken = fixture.window.workspaceManager.addBeforeSaveListener { workspace in
                 guard workspace.id == workspaceID,
@@ -1375,6 +1376,9 @@ import XCTest
                           !initialTabIDs.contains($0.id) && $0.activeAgentSessionID != nil
                       }), let sessionID = tab.activeAgentSessionID
                 else { return }
+                if provisionalIdentity.value() == nil {
+                    fixture.window.promptManager.promptText = foregroundDraft
+                }
                 provisionalIdentity.record(.init(tabID: tab.id, sessionID: sessionID))
             }
             let providerRecorder = AdmissionProviderRecorder(
@@ -1451,6 +1455,8 @@ import XCTest
                 )
             )
 
+            XCTAssertEqual(projectedWorkspace.composeTabs.first?.promptText, foregroundDraft)
+            await fixture.window.workspaceManager.debugAwaitWorkingDocumentCommitToDomainAuthority(workspaceID: workspaceID)
             let canonicalSnapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(workspaceID)
             let canonical = try XCTUnwrap(canonicalSnapshot)
             let canonicalWorkspace = try JSONDecoder().decode(

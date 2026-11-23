@@ -229,11 +229,25 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
         )
         addTeardownBlock { await transport.fullShutdown() }
         let promptGate = try AgentSessionLinkACPResponseGate(directory: directory)
-        defer { promptGate.release(consumers: 2) }
+        let childGate = try AgentSessionLinkACPResponseGate(directory: directory, name: "child-response-gate")
+        let continuationGate = try AgentSessionLinkACPResponseGate(directory: directory, name: "continuation-response-gate")
+        let cancelledGate = try AgentSessionLinkACPResponseGate(directory: directory, name: "cancelled-response-gate")
+        @MainActor func releaseGates() {
+            promptGate.release()
+            childGate.release()
+            continuationGate.release()
+            cancelledGate.release()
+        }
+        defer { releaseGates() }
+        let childMessage = "Run the independent child witness"
+        let followUp = "Continue the completed independent child"
+        let cancelledMessage = "Hold the explicitly bound independent child"
+        let promptGates = try JSONEncoder().encode([childMessage: childGate.path, followUp: continuationGate.path, cancelledMessage: cancelledGate.path])
         let provider = AgentSessionLinkCapturingACPProvider(
             providerID: .openCode, commandPath: script.path, environment: [
                 "ACP_ASSISTANT_TEXT_ON_PROMPT": assistantText,
-                "ACP_HOLD_METHOD": "session/prompt", "ACP_RESPONSE_GATE": promptGate.path
+                "ACP_HOLD_METHOD": "session/prompt", "ACP_RESPONSE_GATE": promptGate.path,
+                "ACP_RESPONSE_GATES_JSON": String(decoding: promptGates, as: UTF8.self), "ACP_LOAD": "1"
             ]
         )
         provider.usesDefaultNormalizer = true
@@ -259,8 +273,10 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                 defer { fixture.cleanUp() }
                 let visible = ComposeTabState(activeAgentSessionID: UUID())
                 let emptyTab = ComposeTabState(name: "Existing empty tab", promptText: "Keep this draft")
+                let unparentedID = UUID()
+                let unparented = ComposeTabState(name: "Independent saved tab", activeAgentSessionID: unparentedID)
                 let stash = StashedTab(tab: fixture.tab)
-                fixture.placement.workspace.composeTabs = [visible, emptyTab]
+                fixture.placement.workspace.composeTabs = [visible, unparented, emptyTab]
                 fixture.placement.workspace.stashedTabs = [stash]
                 fixture.placement.workspace.repoPaths = [root.path]
                 let workspace = fixture.placement.workspace
@@ -272,6 +288,11 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                 _ = try await fixture.service.saveAgentSession(.init(
                     id: expiredChildID, workspaceID: workspace.id, composeTabID: visible.id,
                     name: "Previously saved child", parentSessionID: fixture.sessionID
+                ), for: workspace)
+
+                _ = try await fixture.service.saveAgentSession(.init(
+                    id: unparentedID, workspaceID: workspace.id, composeTabID: unparented.id,
+                    name: "Independent saved tab"
                 ), for: workspace)
 
                 let windows = WindowStatesManager.shared
@@ -352,7 +373,9 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                         } catch let error as MCPFileToolAuthorityFailure {
                             let operation = arguments["op"]?.stringValue ?? ""
                             let publishesArtifacts = arguments["artifacts"]?.boolValue == true
-                            XCTFail("Registered \(name) \(operation) (artifacts: \(publishesArtifacts)) failed its file receipt: \(error)")
+                            let boundTab = arguments["_tabID"] != nil
+                            let explicitWorktree = arguments["worktree"] != nil
+                            XCTFail("Registered \(name) \(operation) (artifacts: \(publishesArtifacts), bound tab: \(boundTab), worktree: \(explicitWorktree)) failed its file receipt: \(error)")
                             throw error
                         }
                     }
@@ -547,14 +570,14 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                     }
                     XCTAssertTrue(command.isCurrent)
                     let recoveredWorkspace = try await spawn.canonicalWorkspace()
-                    XCTAssertEqual(recoveredWorkspace.composeTabs, [visible, emptyTab])
+                    XCTAssertEqual(recoveredWorkspace.composeTabs, [visible, unparented, emptyTab])
                     XCTAssertEqual(recoveredWorkspace.lastSearchQuery, "flushed while leaving A")
                     let emptyAdmission = try await AgentRunHostChildCreation.publish(
                         from: spawn, name: "Do not rename the existing tab", bindingEmptyTabID: emptyTab.id
                     )
                     do {
                         let bound = try await spawn.canonicalWorkspace()
-                        XCTAssertEqual(bound.composeTabs.map(\.id), [visible.id, emptyTab.id])
+                        XCTAssertEqual(bound.composeTabs.map(\.id), [visible.id, unparented.id, emptyTab.id])
                         let carrier = try XCTUnwrap(bound.composeTabs.last)
                         XCTAssertEqual(carrier.activeAgentSessionID, emptyAdmission.command.identity.sessionID)
                         XCTAssertEqual(carrier.name, emptyTab.name)
@@ -569,16 +592,33 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                         emptyAdmission.host.scope.hasReleasedWriterClaims && emptyAdmission.host.route.isClosing
                     }
                     let cleared = try await spawn.canonicalWorkspace()
-                    XCTAssertEqual(cleared.composeTabs.map(\.id), [visible.id, emptyTab.id])
+                    XCTAssertEqual(cleared.composeTabs.map(\.id), [visible.id, unparented.id, emptyTab.id])
                     let unbound = try XCTUnwrap(cleared.composeTabs.last)
                     var preserved = emptyTab
                     preserved.lastModified = unbound.lastModified
                     XCTAssertEqual(unbound, preserved)
                     XCTAssertEqual(cleared.activeComposeTabID, recoveredWorkspace.activeComposeTabID)
-                    let childMessage = "Run the independent child witness"
                     let modelID = AgentModelSelectionID(agentRaw: "openCode", modelRaw: "model-a").rawValue
-                    let childOutcome = try await spawn.executeCanonicalNewChild([
-                        "message": .string(childMessage), "model_id": .string(modelID),
+                    do {
+                        _ = try await invoke(MCPWindowToolName.agentRun, [
+                            "op": .string("start"), "_tabID": .string(unparented.id.uuidString),
+                            "model_id": .string(modelID), "message": .string("Rejected before it can change ownership"),
+                            "worktree": .string("@main"), "worktree_repo_root": .string(nextRoot.path), "detach": .bool(true)
+                        ])
+                        XCTFail("The bound start must refuse an unrelated worktree root")
+                    } catch let MCPError.invalidParams(message) {
+                        XCTAssertTrue(message?.contains(nextRoot.path) == true, message ?? "Missing worktree refusal")
+                    }
+                    let rejectedPayload = try await fixture.service.loadAgentSession(id: unparentedID, for: workspace)
+                    XCTAssertNil(try XCTUnwrap(rejectedPayload).parentSessionID)
+                    do {
+                        _ = try await invoke(MCPWindowToolName.agentRun, ["op": .string("poll"), "session_id": .string(unparentedID.uuidString)])
+                        XCTFail("A rejected bound start must not grant child-control authorization")
+                    } catch {
+                        XCTAssertEqual(error.localizedDescription, AgentSessionTargetOperationGuard.denialError(sessionID: unparentedID).localizedDescription)
+                    }
+                    let childOutcome = try await invoke(MCPWindowToolName.agentRun, [
+                        "op": .string("start"), "message": .string(childMessage), "model_id": .string(modelID),
                         "session_name": .string("Accepted child"), "timeout": .int(10), "detach": .bool(true)
                     ])
                     let launchedRawID = try XCTUnwrap(childOutcome.objectValue?["session_id"]?.stringValue)
@@ -590,38 +630,60 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                     XCTAssertEqual(childOutcome.objectValue?["status"], .string("running"))
                     XCTAssertEqual(launchedWriter.session.parentSessionID, fixture.sessionID)
                     XCTAssertTrue(spawn.sourceIsCurrent, "Starting the child does not rebind its caller")
-                    // The scripted ACP provider does not connect its own MCP client. Complete
-                    // the child's handshake independently, with its issued policy and route.
-                    let childReceipt = try await originatingPolicyReceipt(for: launchedWriter.session)
-                    let childConnectionID = UUID()
-                    let childInstallation = await launchedHost.route.installPendingPolicy(
-                        childReceipt, connectionID: childConnectionID, clientName: nil, tabID: launchedWriter.session.tabID
+                    /// The scripted ACP provider does not connect its own MCP client. Complete
+                    /// the child's handshake independently, with its issued policy and route.
+                    @MainActor func connectChild() async throws -> (MCPRunRoutingCleanupReceipt, UUID) {
+                        let session = launchedWriter.session
+                        let childReceipt = try await originatingPolicyReceipt(for: session)
+                        let childRoute = launchedHost.route
+                        if let current = childRoute.runRouteBindings.connectionID(forRunID: childReceipt.runID) {
+                            // A reused provider renews the existing route from its own startup
+                            // task. Do not issue a synthetic successor mapping on its behalf.
+                            try await AsyncTestWait.waitUntil("the retained ACP route admits its next exact attempt") {
+                                childRoute.canonicalHostInvocation(
+                                    .init(connectionID: current, clientName: nil, windowID: launchedHost.routeID)
+                                )?.command.identity == launchedWriter.identity
+                            }
+                            if let generation = childReceipt.routingWaitGeneration {
+                                await MCPRoutingWaiter.notifyRouted(runID: childReceipt.runID, generation: generation)
+                            }
+                            return (childReceipt, current)
+                        }
+                        let childConnectionID = UUID()
+                        let childInstallation = await childRoute.installPendingPolicy(
+                            childReceipt, connectionID: childConnectionID, clientName: nil, tabID: session.tabID
+                        )
+                        let childToken = try XCTUnwrap(childInstallation?.token)
+                        let childBindingIsCurrent = await childRoute.canCommitPendingPolicy(childReceipt, token: childToken)
+                        XCTAssertTrue(childBindingIsCurrent)
+                        await ServerNetworkManager.shared.debugSeedConnectionRunRouting(
+                            connectionID: childConnectionID, runID: childReceipt.runID, purpose: .agentModeRun,
+                            windowID: launchedHost.routeID, registration: childReceipt
+                        )
+                        let childGeneration = try XCTUnwrap(childReceipt.routingWaitGeneration)
+                        await MCPRoutingWaiter.notifyRouted(runID: childReceipt.runID, generation: childGeneration)
+                        return (childReceipt, childConnectionID)
+                    }
+                    let (childReceipt, childConnectionID) = try await connectChild()
+                    let originalChildConnection = try launchedHost.route.fileReadConnection(
+                        metadata: .init(connectionID: childConnectionID, clientName: nil, windowID: launchedHost.routeID)
                     )
-                    let childToken = try XCTUnwrap(childInstallation?.token)
-                    let childBindingIsCurrent = await launchedHost.route.canCommitPendingPolicy(childReceipt, token: childToken)
-                    XCTAssertTrue(childBindingIsCurrent)
-                    await ServerNetworkManager.shared.debugSeedConnectionRunRouting(
-                        connectionID: childConnectionID, runID: childReceipt.runID, purpose: .agentModeRun,
-                        windowID: launchedHost.routeID, registration: childReceipt
-                    )
-                    let childGeneration = try XCTUnwrap(childReceipt.routingWaitGeneration)
-                    await MCPRoutingWaiter.notifyRouted(runID: childReceipt.runID, generation: childGeneration)
                     let reference = Value.string(launchedID.uuidString)
-                    let polled = try await spawn.executeControlRead(["session_id": reference], poll: true)
+                    let polled = try await invoke(MCPWindowToolName.agentRun, ["op": .string("poll"), "session_id": reference])
                     XCTAssertEqual(polled.objectValue?["session_id"], reference)
                     XCTAssertEqual(polled.objectValue?["status"], .string("running"))
-                    let batch = try await spawn.executeControlRead(["session_ids": .array([reference, reference])], poll: true)
+                    let batch = try await invoke(MCPWindowToolName.agentRun, ["op": .string("poll"), "session_ids": .array([reference, reference])])
                     XCTAssertEqual(batch.objectValue?["poll"]?.objectValue?["polled_count"], .int(1))
                     XCTAssertEqual(batch.objectValue?["snapshots"]?.arrayValue?.first?.objectValue?["session_id"], reference)
-                    let waited = try await spawn.executeControlRead(["session_ids": .array([reference]), "timeout": .int(0)], poll: false)
+                    let waited = try await invoke(MCPWindowToolName.agentRun, ["op": .string("wait"), "session_ids": .array([reference]), "timeout": .int(0)])
                     XCTAssertEqual(waited.objectValue?["session_id"], reference)
-                    let expired = try await spawn.executeControlRead(["session_id": .string(expiredChildID.uuidString)], poll: true)
+                    let expired = try await invoke(MCPWindowToolName.agentRun, ["op": .string("poll"), "session_id": .string(expiredChildID.uuidString)])
                     XCTAssertEqual(expired.objectValue?["status"], .string("expired"))
                     if case .unavailable(.absent) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: expiredChildID) {} else {
                         XCTFail("Polling an expired child must not load a writer")
                     }
                     do {
-                        _ = try await spawn.executeControlCancellation(["session_id": .string(fixture.sessionID.uuidString)])
+                        _ = try await invoke(MCPWindowToolName.agentRun, ["op": .string("cancel"), "session_id": .string(fixture.sessionID.uuidString)])
                         XCTFail("Originating parent cannot cancel itself through its child-control route")
                     } catch {
                         XCTAssertEqual(error.localizedDescription, AgentSessionTargetOperationGuard.denialError(sessionID: fixture.sessionID).localizedDescription)
@@ -676,42 +738,154 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                     let childInteraction = try XCTUnwrap(childRuntime.mcpPendingInteraction(for: childSession))
                     let protectedInputRows = childSession.items.filter { $0.kind == .user }.map(\.id)
                     do {
-                        _ = try await spawn.executeControlSteer(["session_id": reference, "message": .string("Do not consume the protected question")])
+                        _ = try await invoke(MCPWindowToolName.agentRun, ["op": .string("steer"), "session_id": reference, "message": .string("Do not consume the protected question")])
                         XCTFail("Steering cannot answer a protected question")
                     } catch {
                         XCTAssertEqual(childRuntime.mcpPendingInteraction(for: childSession)?.id, childInteraction.id)
                         XCTAssertEqual(childSession.items.filter { $0.kind == .user }.map(\.id), protectedInputRows)
                     }
                     var responseArgs: [String: Value] = [
-                        "session_id": reference, "interaction_id": .string(UUID().uuidString),
+                        "op": .string("respond"), "session_id": reference, "interaction_id": .string(UUID().uuidString),
                         "answers": .object(["response": .string("Continue child")])
                     ]
                     do {
-                        _ = try await spawn.executeControlResponse(responseArgs)
+                        _ = try await invoke(MCPWindowToolName.agentRun, responseArgs)
                         XCTFail("A response for another interaction cannot consume the child's question")
                     } catch {
                         XCTAssertEqual(childRuntime.mcpPendingInteraction(for: childSession)?.id, childInteraction.id)
                     }
                     responseArgs["interaction_id"] = .string(childInteraction.id.uuidString)
-                    let controlResponse = try await spawn.executeControlResponse(responseArgs)
+                    let controlResponse = try await invoke(MCPWindowToolName.agentRun, responseArgs)
                     XCTAssertEqual(controlResponse.objectValue?["session_id"], reference)
                     let childAnswer = try await childQuestion.value
                     XCTAssertTrue(String(describing: childAnswer).contains("Continue child"), "\(childAnswer)")
                     XCTAssertNil(childRuntime.mcpPendingInteraction(for: childSession))
-                    promptGate.release(consumers: 2)
-                    await launchedWriter.session.agentTask?.value
+                    let terminalWait = Task { @MainActor in
+                        try await invoke(MCPWindowToolName.agentRun, ["op": .string("wait"), "session_id": reference, "timeout": .int(10)])
+                    }
+                    defer { terminalWait.cancel() }
+                    try await AsyncTestWait.waitUntil("registered wait belongs to the still-running saved parent") {
+                        host.route.toolExecutionRuntime.hasActiveChildAgentRunWaits(runID: receipt.runID)
+                    }
+                    childGate.release()
+                    let terminal = try await terminalWait.value
+                    XCTAssertEqual(terminal.objectValue?["status"], .string("completed"), "\(terminal)")
+                    await childSession.agentTask?.value
+                    XCTAssertTrue(writer.session.runState.isActive)
+                    XCTAssertTrue(launchedWriter.isCurrent, "Provider exit alone must not release an admitted control owner")
+
+                    let steered = try await invoke(MCPWindowToolName.agentRun, [
+                        "op": .string("steer"), "session_id": reference, "message": .string(followUp), "wait": .bool(false)
+                    ])
+                    XCTAssertEqual(steered.objectValue?["session_id"], reference)
+                    let (resumedProcess, resumedConnectionID) = try await connectChild()
+                    XCTAssertEqual(resumedProcess.runID, childReceipt.runID)
+                    XCTAssertEqual(resumedConnectionID, childConnectionID)
+                    XCTAssertFalse(launchedHost.route.fileReadConnectionIsCurrent(originalChildConnection))
+                    try await continuationGate.waitUntilEntered()
+                    continuationGate.release()
+                    try await AsyncTestWait.waitUntil("the steer produces a physical provider input") {
+                        provider.promptedMessages.contains { $0.userMessage.contains(followUp) }
+                    }
+                    await childSession.agentTask?.value
+
+                    // Displace the parent carrier after the exact child row has hit disk, without
+                    // changing either live writer. The input stays durable; provider launch loses.
+                    let blockedMessage = "Keep this input but do not dispatch with a displaced parent"
+                    let persistence = launchedWriter.scope.persistence
+                    let originalSaver = persistence.saver
+                    var displacedParent = false
+                    persistence.saver = { payload, storageWorkspace, count in
+                        let url = try await originalSaver(payload, storageWorkspace, count)
+                        if !displacedParent, payload.workingSourceItems().contains(where: { $0.text == blockedMessage }) {
+                            let latest = await activation.authority.canonicalWorkspaceSnapshot(workspace.id)
+                            let snapshot = try XCTUnwrap(latest)
+                            var document = try JSONDecoder().decode(WorkspaceModel.self, from: snapshot.document.documentBytes)
+                            document.stashedTabs.removeAll { $0.id == stash.id }
+                            let receipt = try await activation.authority.saveFailClosed(
+                                document, fileURL: snapshot.document.fileURL,
+                                expectedWorkspaceRevision: snapshot.revisions.workingRevision,
+                                expectedContentDigest: snapshot.document.contentDigest
+                            )
+                            XCTAssertEqual(receipt.saved?.disposition, .applied)
+                            displacedParent = receipt.saved?.disposition == .applied
+                        }
+                        return url
+                    }
+                    defer { persistence.saver = originalSaver }
+                    do {
+                        _ = try await invoke(MCPWindowToolName.agentRun, [
+                            "op": .string("steer"), "session_id": reference, "message": .string(blockedMessage), "wait": .bool(false)
+                        ])
+                        XCTFail("A changed parent carrier must prevent provider launch after saving the input")
+                    } catch let MCPError.invalidParams(message) {
+                        XCTAssertTrue(message?.contains("saved") == true, message ?? "Missing durable-input receipt")
+                    }
+                    persistence.saver = originalSaver
+                    XCTAssertTrue(displacedParent)
+                    XCTAssertTrue(writer.isCurrent)
+                    XCTAssertTrue(launchedWriter.isCurrent)
+                    XCTAssertFalse(childSession.runState.isActive)
+                    XCTAssertFalse(provider.promptedMessages.contains { $0.userMessage.contains(blockedMessage) })
+                    let stoppedInput = try await fixture.service.loadAgentSession(id: launchedID, for: workspace)
+                    XCTAssertTrue(try XCTUnwrap(stoppedInput).workingSourceItems().contains { $0.kind == .user && $0.text == blockedMessage })
+                    let fresh = await activation.authority.canonicalWorkspaceSnapshot(workspace.id)
+                    let displaced = try XCTUnwrap(fresh)
+                    var restored = try JSONDecoder().decode(WorkspaceModel.self, from: displaced.document.documentBytes)
+                    restored.stashedTabs.append(stash)
+                    let restoredParent = try await activation.authority.saveFailClosed(
+                        restored, fileURL: displaced.document.fileURL,
+                        expectedWorkspaceRevision: displaced.revisions.workingRevision,
+                        expectedContentDigest: displaced.document.contentDigest
+                    )
+                    XCTAssertEqual(restoredParent.saved?.disposition, .applied)
+                    let previousTargets = try await spawn.captureReadTargets([launchedID], operation: .runWait)
+                    let previousRead = spawn.readAccess(for: previousTargets, operation: .runWait)
+                    let previousCursor = try XCTUnwrap(previousRead.waitCursor(launchedID))
+
+                    let restarted = try await invoke(MCPWindowToolName.agentRun, [
+                        "op": .string("start"), "_tabID": .string(childSession.tabID.uuidString), "message": .string(cancelledMessage),
+                        "model_id": .string(modelID), "timeout": .int(10), "detach": .bool(true)
+                    ])
+                    XCTAssertEqual(restarted.objectValue?["session_id"], reference, "An explicit bound tab must retain its exact existing session")
+                    _ = try await connectChild()
+                    try await cancelledGate.waitUntilEntered()
+                    XCTAssertNotEqual(childSession.mcpControlContext?.registration, previousCursor.registration)
+                    await AgentRunSessionStore.shared.test_expire(cursor: previousCursor)
+                    XCTAssertTrue(launchedWriter.isCurrent, "An old control registration cannot retire its successor")
+                    let childStop = childSession.stopState.cancellationGeneration
+                    let parentStop = writer.session.stopState.cancellationGeneration
+                    let stopping = Task { @MainActor in
+                        try await invoke(MCPWindowToolName.agentRun, ["op": .string("cancel"), "session_id": reference])
+                    }
+                    defer { stopping.cancel() }
+                    try await AsyncTestWait.waitUntil("cancellation claims the child's actual provider turn") {
+                        childSession.stopState.cancellationGeneration != childStop
+                    }
+                    let cancelled = try await stopping.value
+                    cancelledGate.release()
+                    XCTAssertEqual(cancelled.objectValue?["status"], .string("cancelled"), "\(cancelled)")
+                    XCTAssertEqual(writer.session.stopState.cancellationGeneration, parentStop)
+                    XCTAssertTrue(writer.session.runState.isActive)
+                    await childSession.agentTask?.value
+                    let finalTargets = try await spawn.captureReadTargets([launchedID], operation: .runWait)
+                    let finalRead = spawn.readAccess(for: finalTargets, operation: .runWait)
+                    let finalCursor = try XCTUnwrap(finalRead.waitCursor(launchedID))
+                    await AgentRunSessionStore.shared.test_expire(cursor: finalCursor)
+                    try await AsyncTestWait.waitUntil("the exact expired child control permits natural host settlement") {
+                        launchedHost.scope.hasReleasedWriterClaims && launchedHost.route.isClosing
+                    }
+
+                    promptGate.release()
                     await writer.session.agentTask?.value
-                    XCTAssertEqual(provider.promptedMessages.count, 2)
                     XCTAssertTrue(provider.promptedMessages.contains { $0.userMessage.contains(message) })
                     XCTAssertTrue(provider.promptedMessages.contains { $0.userMessage.contains(childMessage) })
-                    let childDrain = launchedHost.beginFinalShutdown()
-                    childDrain.startIfNeeded()
-                    let childSettlement = await childDrain.wait(until: .now.advanced(by: .seconds(5)))
-                    XCTAssertEqual(childSettlement, .released)
                     let durableChild = try await fixture.service.loadAgentSession(id: launchedID, for: workspace)
                     XCTAssertEqual(durableChild?.parentSessionID, fixture.sessionID)
                     let childRows = try XCTUnwrap(durableChild).workingSourceItems()
                     XCTAssertTrue(childRows.contains { $0.kind == .assistant && $0.text.contains(assistantText) }, "Missing durable child reply: \(childRows.map(\.text))")
+                    XCTAssertTrue(childRows.contains { $0.kind == .user && $0.text.contains(followUp) })
+                    XCTAssertGreaterThanOrEqual(childRows.count(where: { $0.kind == .assistant && $0.text.contains(assistantText) }), 2)
                     acceptedChild = nil
                     let parent = UUID()
                     let placement = try XCTUnwrap(SessionAdminWindowsStructureHost().commitOrganizationalPlacement(
@@ -728,7 +902,7 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                     let current = await runtime.workspaceStore.canonicalWorkspaceSnapshot(workspace.id)
                     let document = try XCTUnwrap(current?.document.documentBytes)
                     let unchanged = try JSONDecoder().decode(WorkspaceModel.self, from: document)
-                    XCTAssertEqual(unchanged.composeTabs.count, 3)
+                    XCTAssertEqual(unchanged.composeTabs.count, 4)
                     XCTAssertEqual(unchanged.composeTabs.first, visible)
                     XCTAssertEqual(unchanged.composeTabs.last?.activeAgentSessionID, launchedID)
                     XCTAssertEqual(unchanged.activeComposeTabID, departingWorkspace.activeComposeTabID)
@@ -738,7 +912,7 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                     XCTAssertEqual(PromptViewModel.constructionCountForTesting, promptCount)
                     XCTAssertEqual(WorkspaceManagerViewModel.constructionCountForTesting, workspaceCount)
                 } catch {
-                    promptGate.release(consumers: 2)
+                    releaseGates()
                     if let acceptedChild, !acceptedChild.scope.hasReleasedWriterClaims {
                         let childDrain = acceptedChild.beginFinalShutdown()
                         childDrain.startIfNeeded()

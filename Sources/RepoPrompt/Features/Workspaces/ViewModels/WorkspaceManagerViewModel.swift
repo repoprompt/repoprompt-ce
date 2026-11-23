@@ -11467,7 +11467,9 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     @discardableResult
-    private func captureActiveTabSnapshotForWorkspaceIndex(_ index: Int, source: WorkspaceSaveSource = .pollAndSaveState) -> ComposeTabState? {
+    private func captureActiveTabSnapshotForWorkspaceIndex(
+        _ index: Int, source: WorkspaceSaveSource = .pollAndSaveState, publishWorkingCapture: Bool = true
+    ) -> ComposeTabState? {
         guard workspaces.indices.contains(index) else { return nil }
         var workspace = workspaces[index]
         let (name, _) = activeComposeTabContext()
@@ -11508,10 +11510,12 @@ class WorkspaceManagerViewModel: ObservableObject {
                 composeTabPresentationPublication = (workspace.id, [snapshot.id])
             }
             workspaces[index] = workspace
-            publishWorkingDocumentToDomainAuthority(workspace)
-            #if DEBUG
-                workspaceSaveCapturePublicationCountByWorkspaceIDForTesting[workspace.id, default: 0] += 1
-            #endif
+            if publishWorkingCapture {
+                publishWorkingDocumentToDomainAuthority(workspace)
+                #if DEBUG
+                    workspaceSaveCapturePublicationCountByWorkspaceIDForTesting[workspace.id, default: 0] += 1
+                #endif
+            }
             let metadata = workspaceSaveMetadata(for: workspace, source: source)
             workspaceSaveTracer.capture(
                 metadata: metadata,
@@ -11531,10 +11535,12 @@ class WorkspaceManagerViewModel: ObservableObject {
             updateWorkspaceState(&workspace, with: legacy)
             composeTabPresentationPublication = (workspace.id, [])
             workspaces[index] = workspace
-            publishWorkingDocumentToDomainAuthority(workspace)
-            #if DEBUG
-                workspaceSaveCapturePublicationCountByWorkspaceIDForTesting[workspace.id, default: 0] += 1
-            #endif
+            if publishWorkingCapture {
+                publishWorkingDocumentToDomainAuthority(workspace)
+                #if DEBUG
+                    workspaceSaveCapturePublicationCountByWorkspaceIDForTesting[workspace.id, default: 0] += 1
+                #endif
+            }
             return nil
         }
     }
@@ -11632,7 +11638,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         let outcome = await pollAndSaveStateWithOutcomeAsync(
             workspaceID: identity.workspaceID,
             source: source,
-            allowRetainedAgentAdmissionRecoveryRetry: false
+            allowRetainedAgentAdmissionRecoveryRetry: false,
+            publishWorkingCapture: false
         )
         guard let workspace = workspace(withID: identity.workspaceID), !workspace.isEphemeral else {
             return AgentAdmissionPersistenceReceipt(outcome: outcome, commitEvidence: .none)
@@ -13156,7 +13163,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         workspaceID requestedWorkspaceID: UUID? = nil,
         source: WorkspaceSaveSource = .pollAndSaveStateAsync,
         allowRetainedAgentAdmissionRecoveryRetry: Bool = true,
-        skippingUnusedStartupDefault: Bool = false
+        skippingUnusedStartupDefault: Bool = false,
+        publishWorkingCapture: Bool = true
     ) async -> WorkspacePersistenceOutcome {
         guard !Task.isCancelled else {
             return .rejected(reason: "own_save_cancelled", category: .cancelled)
@@ -13214,7 +13222,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                 source: source,
                 allowRetainedAgentAdmissionRecoveryRetry: false,
                 ownSaveFence: fence,
-                skippingUnusedStartupDefault: skippingUnusedStartupDefault
+                skippingUnusedStartupDefault: skippingUnusedStartupDefault,
+                publishWorkingCapture: publishWorkingCapture
             )
         } catch {
             return .rejected(reason: "own_save_cancelled", category: .cancelled)
@@ -13226,7 +13235,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         source: WorkspaceSaveSource,
         allowRetainedAgentAdmissionRecoveryRetry: Bool,
         ownSaveFence: OwnSaveFence?,
-        skippingUnusedStartupDefault: Bool = false
+        skippingUnusedStartupDefault: Bool = false,
+        publishWorkingCapture: Bool = true
     ) async -> WorkspacePersistenceOutcome {
         guard let wsID = requestedWorkspaceID ?? activeWorkspace?.id,
               let currentWorkspace = workspace(withID: wsID)
@@ -13311,7 +13321,11 @@ class WorkspaceManagerViewModel: ObservableObject {
         {
             return .notRequired(workspaceID: wsID)
         }
-        let snapshot = captureActiveTabSnapshotForWorkspaceIndex(index, source: source)
+        // A provisional Agent identity belongs to its leased durable save. Publishing
+        // this capture separately can resurrect it after that save refuses and rolls back.
+        let snapshot = captureActiveTabSnapshotForWorkspaceIndex(
+            index, source: source, publishWorkingCapture: publishWorkingCapture
+        )
         guard let capturedWorkspace = workspace(withID: wsID) else {
             return .rejected(reason: "workspace_changed_after_capture")
         }

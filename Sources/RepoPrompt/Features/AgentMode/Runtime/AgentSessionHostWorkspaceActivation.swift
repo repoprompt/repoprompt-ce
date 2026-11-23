@@ -18,6 +18,11 @@ final class AgentSessionHostWorkspaceActivation {
     private let resources: AgentHostWorkspaceResources
     private let settings: APISettingsRuntimeLease
     private let savedTarget: AgentSavedSessionTargetLoader.Target?
+    private let retainedChildSessionID: UUID?
+    var retainedCarrierSessionID: UUID? {
+        savedCarrierSessionID ?? retainedChildSessionID
+    }
+
     var savedCarrierSessionID: UUID? {
         savedTarget?.entry.id
     }
@@ -38,7 +43,7 @@ final class AgentSessionHostWorkspaceActivation {
         windowID: Int, authority: DomainWorkspaceAuthorityClient,
         activations: AgentWorkspaceSessionIndexStore,
         resources: AgentHostWorkspaceResources, settings: APISettingsRuntimeLease,
-        savedTarget: AgentSavedSessionTargetLoader.Target? = nil
+        savedTarget: AgentSavedSessionTargetLoader.Target? = nil, retainedChildSessionID: UUID? = nil
     ) throws {
         guard let owner = activations.latestSessionIndexOwner, owner.workspaceID != nil,
               !settings.isReleased, resources.contexts != nil,
@@ -50,12 +55,13 @@ final class AgentSessionHostWorkspaceActivation {
         self.resources = resources
         self.settings = settings
         self.savedTarget = savedTarget
+        self.retainedChildSessionID = retainedChildSessionID
         savedSelection = savedTarget?.tab.selection
     }
 
     /// A child owns its own activation and settings lease. It borrows the exact parent's file
     /// store and authority, not a presenter or the parent's saved-carrier proof.
-    func makeChildActivation(routeID: Int, workspace: WorkspaceModel) throws -> AgentSessionHostWorkspaceActivation {
+    func makeChildActivation(routeID: Int, workspace: WorkspaceModel, childSessionID: UUID) throws -> AgentSessionHostWorkspaceActivation {
         guard isCurrent, catalogFileLease?.rootsAreCurrent == true,
               workspace.id == key.owner.workspaceID, routeID != authority.windowID,
               let childSettings = APISettingsRuntimeLease.acquire(from: settings.settings)
@@ -66,7 +72,7 @@ final class AgentSessionHostWorkspaceActivation {
             return try .init(
                 windowID: routeID,
                 authority: .init(store: authority.store, windowID: routeID, metadataPathPolicy: authority.metadataPathPolicy),
-                activations: index, resources: resources, settings: childSettings
+                activations: index, resources: resources, settings: childSettings, retainedChildSessionID: childSessionID
             )
         } catch {
             childSettings.release()
@@ -192,7 +198,11 @@ final class AgentSessionHostWorkspaceActivation {
     }
 
     var modelAvailability: AgentModelCatalog.AvailabilityContext? {
-        isCurrent ? settings.settings.agentModeAvailabilityContext : nil
+        providerSettings?.agentModeAvailabilityContext
+    }
+
+    var providerSettings: APISettingsViewModel? {
+        isCurrent ? settings.settings : nil
     }
 
     func capture(

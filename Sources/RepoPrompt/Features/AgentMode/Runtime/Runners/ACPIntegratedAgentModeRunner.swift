@@ -1349,7 +1349,29 @@ final class ACPIntegratedAgentModeRunner {
                     log("deferred MCP routing until ACP follow-up prompt", runID: runID)
                 }
 
+                let originatingHost = receipt.currentExecutableHost(for: session)
+                let retainedProcess = if originatingHost?.route.identity.kind == .independent {
+                    await controller.routingProcessRegistration()
+                } else {
+                    nil as MCPRunRoutingProcessRegistration?
+                }
                 guard await admitReused(.routingReleased) else { return .superseded }
+                if let originatingHost, originatingHost.route.identity.kind == .independent,
+                   originatingHost.route.runRouteBindings.connectionID(forRunID: runID) != nil
+                {
+                    // Reuse keeps the process and run ID, not the previous attempt's tool
+                    // admission. The controller's exact cleanup receipt is the only renewal.
+                    guard receipt.currentExecutableHost(for: session) === originatingHost,
+                          let retainedProcess, let command = try? originatingHost.scope.admit(session: session),
+                          originatingHost.route.renewAdoptedProviderAttempt(
+                              runID: runID, tabID: session.tabID, writer: command.identity,
+                              attemptID: runAttemptID, receipts: [retainedProcess.receipt]
+                          )
+                    else {
+                        let message = "The retained ACP process no longer owns its RepoPrompt MCP route."
+                        return providerControlCommand == nil ? .failed(errorText: message) : .refusedBeforeSend(errorText: message)
+                    }
+                }
                 if let providerControlCommand {
                     phase = .entered
                     return await runProviderControlCommandTurn(

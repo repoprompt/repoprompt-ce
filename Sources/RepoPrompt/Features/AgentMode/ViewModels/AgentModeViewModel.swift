@@ -9416,7 +9416,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let persistence = await workspaceManager.pollAndSaveStateWithOutcomeAsync(
                 workspaceID: expectedWorkspaceID,
                 source: WorkspaceSaveSource("agentSessionLifecycleExistingTabAdmission"),
-                allowRetainedAgentAdmissionRecoveryRetry: false
+                allowRetainedAgentAdmissionRecoveryRetry: false,
+                publishWorkingCapture: false
             )
             timing.end()
             #if DEBUG
