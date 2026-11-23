@@ -161,6 +161,24 @@ extension MCPHostRouteResources {
     }
 }
 
+extension AgentSessionRuntimeHost {
+    /// Preserve managed-lane forwarding without carrying child-only arguments or picking a window.
+    func forwardHostAgentRunSteer(_ args: [String: Value], invocation: ToolInvocationContext) async throws -> Value {
+        try Task.checkCancellation()
+        try AgentRunMCPToolService.requireOversightSteerArguments(args)
+        guard ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.agentSessionLink) else {
+            throw MCPError.invalidParams("Oversight steering is disabled. Enable agent_session_link in tool settings, then use its steer operation under a Manage link.")
+        }
+        var forwarded: [String: Value] = [
+            "op": .string("steer"),
+            "idempotency_key": args["idempotency_key"] ?? .string(UUID().uuidString)
+        ]
+        forwarded["session_id"] = args["session_id"]
+        forwarded["message"] = args["message"]
+        return try await executeHostSessionLink(forwarded, invocation: invocation)
+    }
+}
+
 private extension AgentSessionRuntimeHost {
     static func hostQuestionTimeout() -> TimeInterval {
         GlobalSettingsStore.shared.contextBuilderBehaviorSettings().questionTimeoutSeconds

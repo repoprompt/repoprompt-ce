@@ -748,8 +748,13 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         _ props: AgentMonitorPillProps,
         to endpoint: DomainAgentSessionLinkEndpointIdentity
     ) {
-        guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else { return }
-        viewModel.agentSessionLinkPublishProjection(props, to: endpoint)
+        if let runtime = independentLinkRuntime(for: endpoint), props.endpoint == endpoint {
+            runtime.residentMonitorPropsBySessionID[endpoint.sessionID] = props.outbound.isEmpty ? nil : props
+        } else if let viewModel = agentSessionLinkOwningViewModel(for: endpoint) {
+            viewModel.agentSessionLinkPublishProjection(props, to: endpoint)
+        } else {
+            return
+        }
         if props.inbound.isEmpty, props.outbound.isEmpty { schedulePreparedOversightCleanup() }
     }
 

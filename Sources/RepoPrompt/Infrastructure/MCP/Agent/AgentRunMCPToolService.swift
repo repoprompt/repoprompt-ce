@@ -507,44 +507,56 @@ struct AgentRunMCPToolService {
     var forwardOversightSteer: (([String: Value], RequestMetadata) async throws -> Value)?
     private enum OversightSteerRouting: Error { case required(RequestMetadata) }
 
-    func execute(args: [String: Value]) async throws -> Value {
-        let op = normalizedString(args["op"])?.lowercased() ?? "wait"
+    enum Operation: String {
+        case start, poll, wait, cancel, steer, respond
+    }
+
+    func resolveOperation(_ args: [String: Value]) throws -> Operation {
+        let raw = normalizedString(args["op"])?.lowercased() ?? "wait"
         #if DEBUG
-            if op != "start", args["_worktree_startup_benchmark_token"] != nil {
+            if raw != "start", args["_worktree_startup_benchmark_token"] != nil {
                 throw MCPError.invalidParams("The worktree startup benchmark token is only supported with agent_run op=start.")
             }
         #endif
-        if op != "start", startWorktreeCoordinator.containsArguments(args) {
+        if raw != "start", startWorktreeCoordinator.containsArguments(args) {
             throw MCPError.invalidParams("agent_run worktree arguments are only supported with op=start.")
         }
-        switch op {
-        case "start":
+        guard let operation = Operation(rawValue: raw) else {
+            throw MCPError.invalidParams("Unsupported agent_run op '\(raw)'. Use start, poll, wait, cancel, steer, or respond.")
+        }
+        return operation
+    }
+
+    func execute(args: [String: Value]) async throws -> Value {
+        switch try resolveOperation(args) {
+        case .start:
             return try await executeStart(args: args)
-        case "poll":
+        case .poll:
             return try await executeWait(args: args, forcePoll: true)
-        case "wait":
+        case .wait:
             return try await executeWait(args: args)
-        case "cancel":
+        case .cancel:
             return try await executeCancel(args: args)
-        case "steer":
+        case .steer:
             do {
                 return try await executeSteer(args: args)
             } catch let OversightSteerRouting.required(metadata) {
                 try Task.checkCancellation()
                 guard let forwardOversightSteer else { throw AgentSessionTargetOperationGuard.denialError(reference: "target") }
-                // Validate before any forwarder can deliver; never silently discard child-only options.
-                let allowedKeys: Set = ["op", "session_id", "message", "idempotency_key", "wait"]
-                if let rejected = args.keys.sorted().first(where: {
-                    !allowedKeys.contains($0) || ($0 == "wait" && args[$0] != .bool(false))
-                }) {
-                    throw MCPError.invalidParams("Managed lane steering uses agent_session_link steer. Rejected argument '\(rejected)': only op, session_id, message, idempotency_key, and literal wait=false are supported. Nothing was delivered.")
-                }
+                try Self.requireOversightSteerArguments(args)
                 return try await forwardOversightSteer(args, metadata)
             }
-        case "respond":
+        case .respond:
             return try await executeRespond(args: args)
-        default:
-            throw MCPError.invalidParams("Unsupported agent_run op '\(op)'. Use start, poll, wait, cancel, steer, or respond.")
+        }
+    }
+
+    static func requireOversightSteerArguments(_ args: [String: Value]) throws {
+        let allowedKeys: Set = ["op", "session_id", "message", "idempotency_key", "wait"]
+        if let rejected = args.keys.sorted().first(where: {
+            !allowedKeys.contains($0) || ($0 == "wait" && args[$0] != .bool(false))
+        }) {
+            throw MCPError.invalidParams("Managed lane steering uses agent_session_link steer. Rejected argument '\(rejected)': only op, session_id, message, idempotency_key, and literal wait=false are supported. Nothing was delivered.")
         }
     }
 
@@ -1472,9 +1484,9 @@ struct AgentRunMCPToolService {
         return decoratedMultiPollValue(sessionIDs: sessionIDs, snapshots: snapshots, overseers: overseers)
     }
 
-    func executeResolvedPollMany(sessionIDs: [UUID], read: RunReadAccess) async -> Value {
+    func executeResolvedPollMany(sessionIDs: [UUID], read: RunReadAccess, overseers: [UUID: Value] = [:]) async -> Value {
         let snapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, read: read)
-        return decoratedMultiPollValue(sessionIDs: sessionIDs, snapshots: snapshots, overseers: [:])
+        return decoratedMultiPollValue(sessionIDs: sessionIDs, snapshots: snapshots, overseers: overseers)
     }
 
     private func executeCancel(args: [String: Value]) async throws -> Value {
@@ -1694,6 +1706,21 @@ struct AgentRunMCPToolService {
         }
         await Task.yield()
 
+        return try await completeSteer(
+            args,
+            metadata: metadata,
+            snapshot: snapshot,
+            workflow: workflow,
+            delivery: delivery,
+            read: windowReadAccess(agentModeVM)
+        )
+    }
+
+    func completeSteer(
+        _ args: [String: Value], metadata: RequestMetadata, snapshot: AgentRunMCPSnapshot,
+        workflow: AgentWorkflowDefinition?, delivery: AgentMCPInstructionDispatch, read: RunReadAccess
+    ) async throws -> Value {
+        let sessionID = snapshot.sessionID
         // Steer-and-wait: optionally block until the agent reaches an interesting state
         let shouldWait: Bool = {
             if let explicit = parseBool(args["wait"]) {
@@ -1729,7 +1756,7 @@ struct AgentRunMCPToolService {
             if timeout > 0 {
                 return try await waitForInterestingState(
                     sessionID: sessionID,
-                    read: windowReadAccess(agentModeVM),
+                    read: read,
                     metadata: metadata,
                     timeoutSeconds: timeout,
                     stage: "steering",
@@ -3373,7 +3400,7 @@ struct AgentRunMCPToolService {
         return workflow
     }
 
-    private func resolveMessage(_ value: Value?, name: String) throws -> String {
+    func resolveMessage(_ value: Value?, name: String) throws -> String {
         let message = normalizedString(value) ?? ""
         guard !message.isEmpty else {
             throw MCPError.invalidParams("\(name) is required.")

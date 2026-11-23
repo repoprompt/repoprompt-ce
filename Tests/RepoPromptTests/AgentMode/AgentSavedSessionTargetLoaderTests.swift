@@ -659,6 +659,14 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                         childRuntime.mcpPendingInteraction(for: childSession)?.kind == .question
                     }
                     let childInteraction = try XCTUnwrap(childRuntime.mcpPendingInteraction(for: childSession))
+                    let protectedInputRows = childSession.items.filter { $0.kind == .user }.map(\.id)
+                    do {
+                        _ = try await spawn.executeControlSteer(["session_id": reference, "message": .string("Do not consume the protected question")])
+                        XCTFail("Steering cannot answer a protected question")
+                    } catch {
+                        XCTAssertEqual(childRuntime.mcpPendingInteraction(for: childSession)?.id, childInteraction.id)
+                        XCTAssertEqual(childSession.items.filter { $0.kind == .user }.map(\.id), protectedInputRows)
+                    }
                     var responseArgs: [String: Value] = [
                         "session_id": reference, "interaction_id": .string(UUID().uuidString),
                         "answers": .object(["response": .string("Continue child")])
