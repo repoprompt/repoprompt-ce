@@ -158,6 +158,14 @@ protocol CodexSessionControlling: AnyObject {
         reasoningEffort: String?,
         serviceTier: String?
     ) async throws -> CodexNativeSessionController.SessionRef
+    func startOrResume(
+        existing: CodexNativeSessionController.SessionRef?,
+        baseInstructions: String,
+        developerInstructions: String?,
+        model: String?,
+        reasoningEffort: String?,
+        serviceTier: String?
+    ) async throws -> CodexNativeSessionController.SessionRef
     func readThreadSnapshot(
         includeTurns: Bool,
         timeout: TimeInterval?
@@ -903,6 +911,7 @@ final class CodexNativeSessionController {
     private struct ThreadBindingContext {
         let existing: SessionRef?
         let baseInstructions: String
+        let developerInstructions: String?
         let model: String?
         let reasoningEffort: String?
         let serviceTier: String?
@@ -1364,6 +1373,7 @@ final class CodexNativeSessionController {
                 resumeThreadID: priorThreadID,
                 existing: priorReference,
                 baseInstructions: binding.baseInstructions,
+                developerInstructions: binding.developerInstructions,
                 model: binding.model,
                 serviceTier: binding.serviceTier,
                 configOverrides: configOverrides,
@@ -1385,6 +1395,7 @@ final class CodexNativeSessionController {
                 resumeThreadID: nil,
                 existing: nil,
                 baseInstructions: binding.baseInstructions,
+                developerInstructions: binding.developerInstructions,
                 model: binding.model,
                 serviceTier: binding.serviceTier,
                 configOverrides: configOverrides,
@@ -1858,6 +1869,7 @@ final class CodexNativeSessionController {
         resumeThreadID: String?,
         existing: SessionRef?,
         baseInstructions: String,
+        developerInstructions: String? = nil,
         model: String?,
         serviceTier: String?,
         configOverrides: [String: Any],
@@ -1865,6 +1877,7 @@ final class CodexNativeSessionController {
     ) async throws -> [String: Any] {
         if let resumeThreadID {
             var params: [String: Any] = ["threadId": resumeThreadID]
+            params["developerInstructions"] = developerInstructions
             if usesBoundedThreadSnapshots {
                 params["excludeTurns"] = true
                 params["initialTurnsPage"] = Self.snapshotTurnPageParams
@@ -1935,7 +1948,9 @@ final class CodexNativeSessionController {
         if !configOverrides.isEmpty {
             params["config"] = configOverrides
         }
-        if !baseInstructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if let developerInstructions {
+            params["developerInstructions"] = developerInstructions
+        } else if !baseInstructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             params["baseInstructions"] = baseInstructions
         }
         return try await requestWithCompatibleAppServerRequestValueStyle(
@@ -1978,6 +1993,24 @@ final class CodexNativeSessionController {
     func startOrResume(
         existing: SessionRef?,
         baseInstructions: String,
+        model: String?,
+        reasoningEffort: String?,
+        serviceTier: String?
+    ) async throws -> SessionRef {
+        try await startOrResume(
+            existing: existing,
+            baseInstructions: baseInstructions,
+            developerInstructions: nil,
+            model: model,
+            reasoningEffort: reasoningEffort,
+            serviceTier: serviceTier
+        )
+    }
+
+    func startOrResume(
+        existing: SessionRef?,
+        baseInstructions: String,
+        developerInstructions: String?,
         model: String?,
         reasoningEffort: String?,
         serviceTier: String?
@@ -2033,6 +2066,13 @@ final class CodexNativeSessionController {
                     )
                 #endif
                 throw error
+            }
+            let resolvedDeveloperInstructions: String? = if case .bundled = runtime.source,
+                                                            runtime.version == .init(major: 0, minor: 170, patch: 0)
+            {
+                developerInstructions
+            } else {
+                nil
             }
             // Fail closed before any process launch or thread request: a child that expects
             // RepoPrompt MCP tools must not start without them. The gate runs only for tool-expecting
@@ -2145,6 +2185,7 @@ final class CodexNativeSessionController {
                     resumeThreadID: resumeThreadID,
                     existing: existing,
                     baseInstructions: baseInstructions,
+                    developerInstructions: resolvedDeveloperInstructions,
                     model: model,
                     serviceTier: serviceTier,
                     configOverrides: configOverrides,
@@ -2180,6 +2221,7 @@ final class CodexNativeSessionController {
             threadBindingContext = ThreadBindingContext(
                 existing: existing,
                 baseInstructions: baseInstructions,
+                developerInstructions: resolvedDeveloperInstructions,
                 model: model,
                 reasoningEffort: reasoningEffort,
                 serviceTier: serviceTier
@@ -5259,16 +5301,18 @@ final class CodexNativeSessionController {
             usesBoundedThreadSnapshots = Self.supportsBoundedThreadSnapshots(version)
         }
 
-        func test_startThreadBinding() async throws -> [String: Any] {
+        func test_startThreadBinding(baseInstructions: String = "", developerInstructions: String? = nil) async throws -> [String: Any] {
             try await requestThreadBinding(
-                resumeThreadID: nil, existing: nil, baseInstructions: "",
+                resumeThreadID: nil, existing: nil, baseInstructions: baseInstructions,
+                developerInstructions: developerInstructions,
                 model: nil, serviceTier: nil, configOverrides: [:], timeout: 5
             )
         }
 
-        func test_resumeThreadBinding(existing: SessionRef, timeout: TimeInterval = 5) async throws -> [String: Any] {
+        func test_resumeThreadBinding(existing: SessionRef, timeout: TimeInterval = 5, developerInstructions: String? = nil) async throws -> [String: Any] {
             try await requestThreadBinding(
                 resumeThreadID: existing.conversationID, existing: existing, baseInstructions: "",
+                developerInstructions: developerInstructions,
                 model: nil, serviceTier: nil, configOverrides: [:], timeout: timeout
             )
         }
@@ -9965,6 +10009,23 @@ extension CodexSessionControlling {
             baseInstructions: baseInstructions,
             model: model,
             reasoningEffort: reasoningEffort
+        )
+    }
+
+    func startOrResume(
+        existing: CodexNativeSessionController.SessionRef?,
+        baseInstructions: String,
+        developerInstructions _: String?,
+        model: String?,
+        reasoningEffort: String?,
+        serviceTier: String?
+    ) async throws -> CodexNativeSessionController.SessionRef {
+        try await startOrResume(
+            existing: existing,
+            baseInstructions: baseInstructions,
+            model: model,
+            reasoningEffort: reasoningEffort,
+            serviceTier: serviceTier
         )
     }
 

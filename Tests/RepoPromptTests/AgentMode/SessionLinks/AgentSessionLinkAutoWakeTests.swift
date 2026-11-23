@@ -1733,7 +1733,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             input: scope.providerInput(skillCatalog: AgentSkillCatalog(), perfRecorder: NoopAgentModePerfRecorder()),
             workspacePaths: { [] }, inputWorkspace: { _, _ in nil }, initialThreadInput: { _, _ in nil },
             modelDisplayName: { $0.selectedModelRaw },
-            start: { command, text, _, outcome, _ in
+            start: { command, text, _, _, outcome, _ in
                 XCTAssertTrue(command.isCurrent)
                 if let start { await start(command.writer.session, text, outcome) }
                 else { XCTFail("This fixture must never launch a provider") }

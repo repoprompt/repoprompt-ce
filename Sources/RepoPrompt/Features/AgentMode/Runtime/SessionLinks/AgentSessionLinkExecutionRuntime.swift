@@ -29,7 +29,7 @@ final class AgentSessionLinkExecutionRuntime {
         let inputWorkspace: @MainActor (AgentTabSession, AgentSessionRuntimeStore.Command?) async throws -> AgentSessionProviderInputRuntime.WorkspaceSource?
         let initialThreadInput: @MainActor (AgentTabSession, AgentSessionRuntimeStore.Command?) async throws -> AgentSessionProviderInputRuntime.InitialThreadInput?
         let modelDisplayName: @MainActor (AgentTabSession) -> String
-        let start: @MainActor (AgentSessionRuntimeStore.Command, String, AgentDirectRunStartOptions, AgentRunStartOutcomeRecorder?, AgentProviderSwitchSendPreparation?) async -> CodexAgentModeCoordinator.NativeSendOutcome?
+        let start: @MainActor (AgentSessionRuntimeStore.Command, String, [AgentFileAttachment], AgentDirectRunStartOptions, AgentRunStartOutcomeRecorder?, AgentProviderSwitchSendPreparation?) async -> CodexAgentModeCoordinator.NativeSendOutcome?
         let settleSelfCompact: @MainActor (AgentTabSession) -> Void
         let selfCompactBlocksWake: @MainActor (AgentTabSession) -> Bool
         let selfCompactHoldsWakeAcquisition: @MainActor (AgentTabSession) -> Bool
@@ -157,7 +157,7 @@ final class AgentSessionLinkExecutionRuntime {
         session.clearAgentSessionLinkWaitingOnAfterAcceptedTurn()
     }
 
-    func startAgentRun(command: AgentSessionRuntimeStore.Command, initialMessage: String, directStartOptions: AgentDirectRunStartOptions, startOutcome: AgentRunStartOutcomeRecorder? = nil, providerSwitchPreparation: AgentProviderSwitchSendPreparation?) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
+    func startAgentRun(command: AgentSessionRuntimeStore.Command, initialMessage: String, attachments: [AgentFileAttachment] = [], directStartOptions: AgentDirectRunStartOptions, startOutcome: AgentRunStartOutcomeRecorder? = nil, providerSwitchPreparation: AgentProviderSwitchSendPreparation?) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
         precondition(command.writer.scope === scope, "Startup must use its originating link executor")
         do { try command.requireCurrent() }
         catch {
@@ -165,7 +165,7 @@ final class AgentSessionLinkExecutionRuntime {
             startOutcome?.recordStartFailure(message: message)
             return .failed(message: message)
         }
-        return await commands.start(command, initialMessage, directStartOptions, startOutcome, providerSwitchPreparation)
+        return await commands.start(command, initialMessage, attachments, directStartOptions, startOutcome, providerSwitchPreparation)
     }
 
     func claimEmptyComposer(for candidate: AgentSessionLinkEndpointCandidate, session: TabSession) -> AgentComposerSubmitClaim? {

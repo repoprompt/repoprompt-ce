@@ -859,6 +859,8 @@ allowed_tracked_docs=(
   "docs/architecture/oracle-attachments.md"
   "docs/architecture/oracle-groups-rewrite.md"
   "docs/architecture/provider-plugins.md"
+  "docs/architecture/remote-control.md"
+  "docs/architecture/remote-iroh-transport.md"
   "docs/architecture/routing-profile-publication.md"
   "docs/architecture/settings-persistence.md"
   "docs/architecture/self-compact-native-note-delivery.md"

@@ -265,7 +265,10 @@ struct AgentModeSidebarSessionBuilder {
             hasUnknownConversationContent: entry.hasUnknownConversationContent,
             isMCPOriginated: entry.isMCPOriginated,
             worktreeBindingSummaries: entry.worktreeBindingSummaries,
-            activeWorktreeMergeSummaries: entry.activeWorktreeMergeSummaries
+            activeWorktreeMergeSummaries: entry.activeWorktreeMergeSummaries,
+            originWorkflowID: entry.originWorkflowID,
+            originWorkflowDisplayName: entry.originWorkflowDisplayName,
+            lastRunStartedAt: entry.lastRunStartedAt
         )
     }
 

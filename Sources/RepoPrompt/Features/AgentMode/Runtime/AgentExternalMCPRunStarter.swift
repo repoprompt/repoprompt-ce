@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 
 @MainActor
 enum AgentExternalMCPRunStarter {
@@ -18,6 +19,7 @@ enum AgentExternalMCPRunStarter {
         let commitConfiguration: @MainActor () async throws -> Void
         let dispatch: @MainActor (_ requirePendingStart: @escaping @MainActor () throws -> Void) async throws -> AgentModeViewModel.MCPInstructionDispatch
         let snapshot: @MainActor () async -> AgentRunMCPSnapshot
+        var requireAuthority: @MainActor () throws -> Void = {}
     }
 
     static func finishPendingStart(
@@ -32,12 +34,14 @@ enum AgentExternalMCPRunStarter {
         }
         let stop = originalStopFence ?? AgentRunStartStopFence(session: session)
         let requirePendingStart: @MainActor () throws -> Void = {
+            try actions.requireAuthority()
             guard actions.ownerIsCurrent(), session.activeAgentSessionID == sessionID,
                   session.mcpControlContext == ownedActivation, stop.permitsStart(of: session)
             else {
                 throw MCPError.invalidParams("The pending agent start was withdrawn or replaced before dispatch.")
             }
         }
+        try actions.requireAuthority()
         try await actions.configure()
         try await actions.prepareRequestBinding()
         try Task.checkCancellation()
@@ -96,7 +100,9 @@ enum AgentExternalMCPRunStarter {
         oracleReviewSource: AgentRunOracleReviewSource? = nil,
         preserveRoutedInitialEffort: Bool = false,
         dispatchInstruction: DispatchInstruction? = nil,
-        startExpiry: AgentRunStartExpiry? = nil
+        startExpiry: AgentRunStartExpiry? = nil,
+        remoteAttachments: [AgentFileAttachment]? = nil,
+        workspaceAuthority: AgentModeViewModel.MCPWorkspaceTargetAuthority? = nil
     ) async throws -> StartOutcome {
         try await startWithBindingDisposition(
             target: target,
@@ -113,7 +119,9 @@ enum AgentExternalMCPRunStarter {
             oracleReviewSource: oracleReviewSource,
             preserveRoutedInitialEffort: preserveRoutedInitialEffort,
             dispatchInstruction: dispatchInstruction,
-            startExpiry: startExpiry
+            startExpiry: startExpiry,
+            remoteAttachments: remoteAttachments,
+            workspaceAuthority: workspaceAuthority
         )
     }
 
@@ -168,7 +176,9 @@ enum AgentExternalMCPRunStarter {
         oracleReviewSource: AgentRunOracleReviewSource?,
         preserveRoutedInitialEffort: Bool,
         dispatchInstruction: DispatchInstruction?,
-        startExpiry: AgentRunStartExpiry?
+        startExpiry: AgentRunStartExpiry?,
+        remoteAttachments: [AgentFileAttachment]? = nil,
+        workspaceAuthority: AgentModeViewModel.MCPWorkspaceTargetAuthority? = nil
     ) async throws -> StartOutcome {
         let resolvedModel: String?
         let resolvedEffort: String?
@@ -196,10 +206,20 @@ enum AgentExternalMCPRunStarter {
                 "workflowName": workflow?.displayName ?? "nil"
             ])
         #endif
+        func requireWorkspaceAuthority() throws {
+            if let workspaceAuthority {
+                try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                    workspaceAuthority.target,
+                    expectedWorkspaceID: workspaceAuthority.expectedWorkspaceID,
+                    allowMatchingControlledSession: workspaceAuthority.allowMatchingControlledSession
+                )
+            }
+        }
         // A fresh target remains creation-owned through control, model and request setup.
         // Only the complete initial configuration may cross the first durable-save boundary.
         let ownedActivation: AgentModeViewModel.AgentMCPControlContext
         do {
+            try requireWorkspaceAuthority()
             ownedActivation = try await agentModeVM.mcpActivateControlContext(
                 forTabID: target.tabID,
                 sessionID: sessionID,
@@ -234,7 +254,8 @@ enum AgentExternalMCPRunStarter {
                         }
                         try await agentModeVM.mcpConfigureSession(
                             tabID: target.tabID, agentRaw: agentRaw, modelRaw: resolvedModel,
-                            reasoningEffortRaw: resolvedEffort, requireInactiveRunState: true, creationHandle: target.creationHandle
+                            reasoningEffortRaw: resolvedEffort, requireInactiveRunState: true,
+                            workspaceAuthority: workspaceAuthority, creationHandle: target.creationHandle
                         )
                     }, prepareRequestBinding: {
                         switch bindingDisposition {
@@ -266,9 +287,11 @@ enum AgentExternalMCPRunStarter {
                         }
                         return try await agentModeVM.mcpDispatchInstruction(
                             sessionID: sessionID, text: message, allowStartingRun: true, workflow: workflow,
-                            preserveRoutedInitialEffort: preserveRoutedInitialEffort, validateInitialStart: requirePendingStart
+                            preserveRoutedInitialEffort: preserveRoutedInitialEffort, remoteAttachments: remoteAttachments,
+                            validateInitialStart: requirePendingStart
                         )
-                    }, snapshot: { await resolveInitialSnapshot(sessionID: sessionID, agentModeVM: agentModeVM) }
+                    }, snapshot: { await resolveInitialSnapshot(sessionID: sessionID, agentModeVM: agentModeVM) },
+                    requireAuthority: requireWorkspaceAuthority
                 )
             )
             #if DEBUG

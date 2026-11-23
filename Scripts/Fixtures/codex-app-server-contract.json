@@ -434,6 +434,7 @@
         "baseInstructions",
         "config",
         "cwd",
+        "developerInstructions",
         "experimentalRawEvents",
         "model",
         "serviceTier"
@@ -489,6 +490,7 @@
       "maySend": [
         "config",
         "cwd",
+        "developerInstructions",
         "model",
         "serviceTier",
         "path",

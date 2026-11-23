@@ -17,6 +17,23 @@ import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 import SwiftUI
 
+struct AgentSessionSelectionCapabilities: Equatable {
+    let allowedAgentRawValues: [String]
+    let allowedModelRawValues: [String]
+    let allowedReasoningEffortRawValues: [String]
+    let resolvedModelRaw: String
+    let resolvedReasoningEffortRaw: String?
+    let isMutable: Bool
+    let agentUnavailableReason: String?
+    let selectionUnavailableReason: String?
+}
+
+struct AgentSessionResolvedConfiguration: Equatable {
+    let agentRaw: String
+    let modelRaw: String
+    let reasoningEffortRaw: String?
+}
+
 // MARK: - Agent Mode View Model
 
 /// View model for Agent mode - manages per-tab agent chat sessions with long-running agent interactions
@@ -2005,6 +2022,26 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return dict?[agentRaw]
     }
 
+    func remoteDefaultSelection() -> AgentSessionResolvedConfiguration {
+        let savedAgentRaw = UserDefaults.standard.string(forKey: Self.lastUsedAgentKey)
+        let savedModelRaw = savedAgentRaw.flatMap { Self.lastUsedModelRaw(forAgentRaw: $0) }
+        let normalized = normalizedSelection(agentRaw: savedAgentRaw, modelRaw: savedModelRaw)
+        let discoveryAgent = remoteSelectableDiscoveryAgent(for: normalized.agent)
+        let discoveryModel = discoveryAgent.flatMap {
+            Self.discoveryModel(matching: normalized.modelRaw, in: $0)
+        }
+        let preferredEffort = normalized.agent == .codexExec
+            ? CodexAgentToolPreferences.lastUsedReasoningEffort(forModelRaw: normalized.modelRaw)?.rawValue
+            : nil
+        return AgentSessionResolvedConfiguration(
+            agentRaw: normalized.agent.rawValue,
+            modelRaw: discoveryModel?.id ?? normalized.modelRaw,
+            reasoningEffortRaw: discoveryModel.flatMap {
+                try? Self.resolveRemoteReasoningEffort(for: $0, agent: normalized.agent, currentEffort: preferredEffort)
+            }
+        )
+    }
+
     /// Read the defaults used by a fresh window without borrowing a historical foreground tab.
     /// Catalog inputs may come from a donor, but this function never changes its selection.
     static func freshComposerSelection(
@@ -3035,13 +3072,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             modelDisplayName: { [weak self] session in
                 self?.inputBarModelDisplayName(rawModel: session.selectedModelRaw, agentKind: session.selectedAgent) ?? session.selectedModelRaw
             },
-            start: { [weak self] command, text, options, outcome, preparation in
+            start: { [weak self] command, text, attachments, options, outcome, preparation in
                 let session = command.writer.session
                 guard let self, command.writer.scope === runtimeSessionStore,
                       command.isCurrent, sessions[session.tabID] === session else { return nil }
                 return await startAgentRun(
                     tabID: session.tabID,
                     initialMessage: text,
+                    attachments: attachments,
                     directStartOptions: options,
                     startOutcome: outcome,
                     providerSwitchPreparation: preparation
@@ -7337,6 +7375,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.setRunningStatus(nil, source: nil)
         session.activeAgentRunStartedAt = nil
         session.deferredActiveAgentRunTimerRollback = nil
+        session.originWorkflowID = nil
+        session.originWorkflowDisplayName = nil
+        session.lastRunStartedAt = nil
         session.waitingPrompt = nil
         session.pendingAskUser = nil
         session.pendingUserInputRequest = nil
@@ -8451,7 +8492,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 hasUnknownConversationContent: existingEntry.hasUnknownConversationContent,
                 isMCPOriginated: existingEntry.isMCPOriginated || session.isMCPOriginated,
                 worktreeBindingSummaries: existingEntry.worktreeBindingSummaries,
-                activeWorktreeMergeSummaries: existingEntry.activeWorktreeMergeSummaries
+                activeWorktreeMergeSummaries: existingEntry.activeWorktreeMergeSummaries,
+                originWorkflowID: existingEntry.originWorkflowID,
+                originWorkflowDisplayName: existingEntry.originWorkflowDisplayName,
+                lastRunStartedAt: existingEntry.lastRunStartedAt
             )
             guard repairedEntry != existingEntry else { return }
             applyLocalSessionIndexUpsert(repairedEntry)
@@ -9494,6 +9538,354 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             mutationTarget: .runtimeOnly,
             invalidateAsyncWork: true
         )
+    }
+
+    func remoteCodexToolBinding() -> (binding: AgentProviderControlsBinding, isMutable: Bool) {
+        let binding = providerBindingService.topLevelSettingsControlsBinding(providerID: .codex)
+        let hasActiveCodexRun = sessions.values.contains {
+            $0.selectedAgent == .codexExec && $0.runState.isActive
+        }
+        return (binding, !hasActiveCodexRun)
+    }
+
+    func mcpApplyRemoteCodexToolMutation(
+        settingID: String,
+        enabled: Bool,
+        expectedRevision: Int
+    ) throws -> AgentProviderControlsBinding {
+        let current = remoteCodexToolBinding()
+        guard current.isMutable else {
+            throw MCPError.invalidParams("Tool controls are locked during an active Codex run.")
+        }
+        guard current.binding.revision == expectedRevision else {
+            throw MCPError.invalidParams("Tool settings changed on the Mac. Refresh and try again.")
+        }
+        let mutation: CodexToolSettingMutation
+        switch settingID {
+        case "bash": mutation = .bashTool(enabled: enabled)
+        case "search": mutation = .searchTool(enabled: enabled)
+        case "goals": mutation = .goalSupport(enabled: enabled)
+        case "reasoning_summaries": mutation = .reasoningSummaries(enabled: enabled)
+        default:
+            guard settingID.hasPrefix("mcp:"),
+                  let tools = current.binding.codexTools
+            else { throw MCPError.invalidParams("Unknown Codex tool setting.") }
+            let serverName = String(settingID.dropFirst(4))
+            guard let entry = tools.mcpServerEntries.first(where: {
+                $0.normalizedName.caseInsensitiveCompare(serverName) == .orderedSame
+            }) else { throw MCPError.invalidParams("That MCP server is no longer available.") }
+            guard entry.normalizedName.caseInsensitiveCompare(MCPIntegrationHelper.repoPromptMCPServerName) != .orderedSame else {
+                throw MCPError.invalidParams("RepoPromptCE is required and cannot be disabled.")
+            }
+            mutation = .mcpServer(normalizedName: entry.normalizedName, enabled: enabled)
+        }
+        applyCodexToolSettingMutation(mutation)
+        return providerBindingService.topLevelSettingsControlsBinding(providerID: .codex)
+    }
+
+    func remoteSelectableDiscoveryAgent(
+        for agent: AgentProviderKind
+    ) -> AgentModelCatalog.DiscoveryAgent? {
+        guard availableAgents.contains(agent) else { return nil }
+        let options = modelOptions(for: agent, includeClaudeEffortVariants: false)
+        let visible = options.filter { !$0.isPlaceholderDefault }
+        let selectable = visible.isEmpty ? options : visible
+        guard !selectable.isEmpty else { return nil }
+
+        return AgentModelCatalog.discoveryAgent(
+            agent,
+            availability: agentAvailabilityContext,
+            modelOptions: selectable,
+            preferredModelRaw: defaultModelRaw(for: agent)
+        )
+    }
+
+    func remoteDiscoveryAgents() -> [AgentProviderKind: AgentModelCatalog.DiscoveryAgent] {
+        availableAgents.reduce(into: [:]) { result, agent in
+            result[agent] = remoteSelectableDiscoveryAgent(for: agent)
+        }
+    }
+
+    func mcpSessionSelectionCapabilities(
+        tabID: UUID,
+        sessionID: UUID,
+        discoveryAgents: [AgentProviderKind: AgentModelCatalog.DiscoveryAgent]
+    ) -> AgentSessionSelectionCapabilities? {
+        guard let session = sessions[tabID], session.activeAgentSessionID == sessionID else { return nil }
+        return remoteSessionSelectionCapabilities(
+            discoveryAgent: discoveryAgents[session.selectedAgent],
+            allowedAgents: availableAgents.filter { discoveryAgents[$0] != nil && canSelectAgent($0, for: session) },
+            modelRaw: session.selectedModelRaw,
+            reasoningEffortRaw: session.selectedAgent.usesClaudeNativeRuntime
+                ? session.selectedClaudeEffortRaw : session.selectedReasoningEffortRaw,
+            isMutable: !session.runState.isActive && !Self.hasBlockingInteraction(session)
+                && session.pendingHandoff.providerSwitchDelivery == nil
+        )
+    }
+
+    func mcpPersistedSessionSelectionCapabilities(
+        agentRaw: String?,
+        modelRaw: String?,
+        reasoningEffortRaw: String?,
+        isMutable: Bool,
+        discoveryAgents: [AgentProviderKind: AgentModelCatalog.DiscoveryAgent]
+    ) -> AgentSessionSelectionCapabilities? {
+        guard let agentRaw,
+              let agent = AgentProviderKind(rawValue: agentRaw),
+              let modelRaw,
+              !modelRaw.isEmpty
+        else {
+            return nil
+        }
+        return remoteSessionSelectionCapabilities(
+            discoveryAgent: discoveryAgents[agent],
+            allowedAgents: availableAgents.filter {
+                discoveryAgents[$0] != nil && ($0 == agent || (agent.usesClaudeNativeRuntime && $0.usesClaudeNativeRuntime))
+            },
+            modelRaw: modelRaw,
+            reasoningEffortRaw: reasoningEffortRaw,
+            isMutable: isMutable
+        )
+    }
+
+    private func remoteSessionSelectionCapabilities(
+        discoveryAgent: AgentModelCatalog.DiscoveryAgent?,
+        allowedAgents: [AgentProviderKind],
+        modelRaw: String,
+        reasoningEffortRaw: String?,
+        isMutable: Bool
+    ) -> AgentSessionSelectionCapabilities? {
+        guard let discoveryAgent else { return nil }
+        let discoveryModel = Self.discoveryModel(matching: modelRaw, in: discoveryAgent)
+        let efforts = discoveryModel?.remoteReasoningEfforts(for: discoveryAgent.agent).map(\.id) ?? []
+        let selectionReason = isMutable ? nil : "Model and reasoning controls are locked in the current chat state."
+        return AgentSessionSelectionCapabilities(
+            allowedAgentRawValues: allowedAgents.map(\.rawValue),
+            allowedModelRawValues: discoveryAgent.models.filter(\.available).map(\.id),
+            allowedReasoningEffortRawValues: efforts,
+            resolvedModelRaw: discoveryModel?.id ?? modelRaw,
+            resolvedReasoningEffortRaw: reasoningEffortRaw,
+            isMutable: isMutable,
+            agentUnavailableReason: allowedAgents.count > 1 ? selectionReason : "Start a new chat to switch providers.",
+            selectionUnavailableReason: selectionReason
+        )
+    }
+
+    static func resolveRemoteReasoningEffort(
+        for model: AgentModelCatalog.DiscoveryModel,
+        agent: AgentProviderKind,
+        requestedEffort: String? = nil,
+        currentEffort: String?
+    ) throws -> String? {
+        let allowed = model.remoteReasoningEfforts(for: agent).map(\.id)
+        if let requestedEffort {
+            let normalized = agent == .codexExec
+                ? CodexReasoningEffort.parse(requestedEffort)?.rawValue
+                : requestedEffort.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard let normalized, allowed.contains(normalized) else {
+                throw MCPError.invalidParams("The requested reasoning effort is unavailable for \(model.name).")
+            }
+            return normalized
+        }
+        if let currentEffort, allowed.contains(currentEffort) { return currentEffort }
+        return model.remoteDefaultReasoningEffort(for: agent)
+    }
+
+    func resolveRemoteLaunchSelection(
+        tabID: UUID,
+        agentRaw: String?,
+        modelRaw: String?,
+        reasoningEffortRaw: String?
+    ) async throws -> AgentSessionResolvedConfiguration {
+        let session = await ensureSessionReady(tabID: tabID)
+        let requestedAgent: AgentProviderKind
+        if let agentRaw {
+            guard let exactAgent = availableAgents.first(where: {
+                $0.rawValue.caseInsensitiveCompare(agentRaw) == .orderedSame
+            }) else {
+                throw MCPError.invalidParams("The requested agent is unavailable on this Mac.")
+            }
+            requestedAgent = exactAgent
+        } else {
+            requestedAgent = session.selectedAgent
+        }
+        guard let discoveryAgent = remoteSelectableDiscoveryAgent(for: requestedAgent) else {
+            throw MCPError.invalidParams("The requested agent is unavailable on this Mac.")
+        }
+
+        let currentModel = requestedAgent == session.selectedAgent
+            ? Self.discoveryModel(matching: session.selectedModelRaw, in: discoveryAgent)
+            : nil
+        let requestedModel: AgentModelCatalog.DiscoveryModel
+        if let modelRaw {
+            guard let exactModel = Self.discoveryModel(matching: modelRaw, in: discoveryAgent),
+                  exactModel.available
+            else {
+                throw MCPError.invalidParams("The requested model is unavailable for \(requestedAgent.displayName).")
+            }
+            requestedModel = exactModel
+        } else if let currentModel {
+            requestedModel = currentModel
+        } else if let defaultModel = Self.defaultDiscoveryModel(in: discoveryAgent) {
+            requestedModel = defaultModel
+        } else {
+            throw MCPError.invalidParams("No configurable model is available for \(requestedAgent.displayName).")
+        }
+
+        let currentEffort: String? = if requestedModel.id == currentModel?.id {
+            requestedAgent.usesClaudeNativeRuntime ? session.selectedClaudeEffortRaw : session.selectedReasoningEffortRaw
+        } else {
+            nil
+        }
+        let requestedEffort = try Self.resolveRemoteReasoningEffort(
+            for: requestedModel, agent: requestedAgent, requestedEffort: reasoningEffortRaw, currentEffort: currentEffort
+        )
+
+        return AgentSessionResolvedConfiguration(
+            agentRaw: requestedAgent.rawValue,
+            modelRaw: requestedModel.id,
+            reasoningEffortRaw: requestedEffort
+        )
+    }
+
+    func currentRemoteSelection(tabID: UUID, sessionID: UUID) -> AgentSessionResolvedConfiguration? {
+        guard let session = sessions[tabID], session.activeAgentSessionID == sessionID else { return nil }
+        let model = remoteSelectableDiscoveryAgent(for: session.selectedAgent).flatMap {
+            Self.discoveryModel(matching: session.selectedModelRaw, in: $0)
+        }
+        return AgentSessionResolvedConfiguration(
+            agentRaw: session.selectedAgent.rawValue,
+            modelRaw: model?.id ?? session.selectedModelRaw,
+            reasoningEffortRaw: session.selectedAgent.usesClaudeNativeRuntime
+                ? session.selectedClaudeEffortRaw : session.selectedReasoningEffortRaw
+        )
+    }
+
+    func mcpConfigureRemoteSession(
+        tabID: UUID,
+        sessionID: UUID,
+        agentRaw: String?,
+        modelRaw: String?,
+        reasoningEffortRaw: String?,
+        workspaceAuthority: MCPWorkspaceTargetAuthority? = nil
+    ) async throws -> AgentSessionResolvedConfiguration {
+        if let existing = sessions[tabID],
+           existing.activeAgentSessionID == sessionID,
+           existing.runState.isActive || Self.hasBlockingInteraction(existing)
+        {
+            throw MCPError.invalidParams("Model and effort controls are locked during an active run.")
+        }
+        let session = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: true)
+        guard session.activeAgentSessionID == sessionID else {
+            throw MCPError.invalidParams("The requested agent session is not currently available.")
+        }
+        guard !session.runState.isActive, !Self.hasBlockingInteraction(session) else {
+            throw MCPError.invalidParams("Model and effort controls are locked during an active run.")
+        }
+
+        let requestedAgent: AgentProviderKind
+        if let agentRaw {
+            guard let exactAgent = availableAgents.first(where: {
+                $0.rawValue.caseInsensitiveCompare(agentRaw) == .orderedSame
+            }), canSelectAgent(exactAgent, for: session) else {
+                throw MCPError.invalidParams("The provider is locked for this chat. Start a new chat to switch providers.")
+            }
+            requestedAgent = exactAgent
+        } else {
+            requestedAgent = session.selectedAgent
+        }
+        guard let discoveryAgent = remoteSelectableDiscoveryAgent(for: requestedAgent) else {
+            throw MCPError.invalidParams("The requested agent is unavailable on this Mac.")
+        }
+
+        let currentModel = requestedAgent == session.selectedAgent
+            ? Self.discoveryModel(matching: session.selectedModelRaw, in: discoveryAgent)
+            : nil
+        let requestedModel: AgentModelCatalog.DiscoveryModel
+        if let modelRaw {
+            guard let exactModel = Self.discoveryModel(matching: modelRaw, in: discoveryAgent),
+                  exactModel.available
+            else {
+                throw MCPError.invalidParams("The requested model is unavailable for \(requestedAgent.displayName).")
+            }
+            requestedModel = exactModel
+        } else if let currentModel {
+            requestedModel = currentModel
+        } else if let defaultModel = Self.defaultDiscoveryModel(in: discoveryAgent) {
+            requestedModel = defaultModel
+        } else {
+            throw MCPError.invalidParams("No configurable model is available for \(requestedAgent.displayName).")
+        }
+
+        let currentEffort: String? = if requestedModel.id == currentModel?.id {
+            requestedAgent.usesClaudeNativeRuntime ? session.selectedClaudeEffortRaw : session.selectedReasoningEffortRaw
+        } else {
+            nil
+        }
+        let requestedEffort = try Self.resolveRemoteReasoningEffort(
+            for: requestedModel, agent: requestedAgent, requestedEffort: reasoningEffortRaw, currentEffort: currentEffort
+        )
+
+        try await mcpConfigureSession(
+            tabID: tabID,
+            agentRaw: requestedAgent.rawValue,
+            modelRaw: requestedModel.id,
+            reasoningEffortRaw: requestedEffort,
+            requireInactiveRunState: true,
+            workspaceAuthority: workspaceAuthority
+        )
+        let resolvedModel = Self.discoveryModel(matching: session.selectedModelRaw, in: discoveryAgent)
+        return AgentSessionResolvedConfiguration(
+            agentRaw: session.selectedAgent.rawValue,
+            modelRaw: resolvedModel?.id ?? session.selectedModelRaw,
+            reasoningEffortRaw: session.selectedAgent.usesClaudeNativeRuntime
+                ? session.selectedClaudeEffortRaw : session.selectedReasoningEffortRaw
+        )
+    }
+
+    private static func discoveryModel(
+        matching rawModel: String,
+        in agent: AgentModelCatalog.DiscoveryAgent
+    ) -> AgentModelCatalog.DiscoveryModel? {
+        if let exact = agent.models.first(where: { $0.id.caseInsensitiveCompare(rawModel) == .orderedSame }) {
+            return exact
+        }
+        if let targetMatch = agent.models.first(where: { model in
+            model.startTargets.contains { $0.modelRaw.caseInsensitiveCompare(rawModel) == .orderedSame }
+        }) {
+            return targetMatch
+        }
+        guard agent.agent == .codexExec else { return nil }
+        let requestedSlug = CodexAgentToolPreferences.reasoningEffortPreferenceSlug(forModelRaw: rawModel)
+        return agent.models.first { model in
+            CodexAgentToolPreferences.reasoningEffortPreferenceSlug(forModelRaw: model.id)
+                .caseInsensitiveCompare(requestedSlug) == .orderedSame
+        }
+    }
+
+    private static func defaultDiscoveryModel(
+        in agent: AgentModelCatalog.DiscoveryAgent
+    ) -> AgentModelCatalog.DiscoveryModel? {
+        if let defaultTargetModel = agent.models.first(where: { $0.startTargets.contains(where: \.isDefault) }) {
+            return defaultTargetModel
+        }
+        if let defaultRaw = agent.defaults.modelRaw,
+           let match = discoveryModel(matching: defaultRaw, in: agent)
+        {
+            return match
+        }
+        return agent.models.first(where: \.available)
+    }
+
+    private static func hasBlockingInteraction(_ session: TabSession) -> Bool {
+        session.pendingAskUser != nil
+            || session.pendingUserInputRequest != nil
+            || session.pendingMCPElicitationRequest != nil
+            || session.pendingApproval != nil
+            || session.pendingPermissionsRequest != nil
+            || session.pendingCodexHookReview != nil
+            || session.pendingWorktreeMergeReview != nil
+            || session.pendingApplyEditsReview != nil
     }
 
     func mcpConfigureSession(
@@ -10773,6 +11165,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         workflow: AgentWorkflowDefinition? = nil,
         nativePreparedTurn: NativeSlashPreparedUserTurn? = nil,
         preserveRoutedInitialEffort: Bool = false,
+        remoteAttachments: [AgentFileAttachment]? = nil,
         validateInitialStart: (@MainActor () throws -> Void)? = nil
     ) async throws -> MCPInstructionDispatch {
         guard let originalWriter = mcpRuntime.controlledWriter(sessionID: sessionID),
@@ -10799,7 +11192,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         try Task.checkCancellation()
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedText.isEmpty else {
+        guard !trimmedText.isEmpty || remoteAttachments?.isEmpty == false else {
             throw MCPError.invalidParams("message is required.")
         }
         if let interaction = mcpRuntime.mcpPendingInteraction(for: session),
@@ -10863,6 +11256,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             codexAttemptID = nil
             signalsDeliveryAfterDispatch = false
         }
+        if remoteAttachments?.isEmpty == false, delivery != .startedRun {
+            throw MCPError.invalidParams("Wait for the current run to finish before sending attachments.")
+        }
         let submittedAutoEffortSelection = delivery == .startedRun ? autoEffortSelection : nil
         let submittedAutoEffortAudit = delivery == .startedRun
             ? autoEffortChoice?.audit
@@ -10910,6 +11306,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     autoEffortSelection: submittedAutoEffortSelection,
                     autoEffortAudit: submittedAutoEffortAudit,
                     isLocalComposerInput: false,
+                    remoteAttachments: remoteAttachments,
                     scheduledProviderSwitchSubmission: { pendingSwitchSubmission = $0 }
                 )
             }
@@ -10983,6 +11380,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 ackCancellationTarget.tracker.cancel(attemptID: ackCancellationTarget.attemptID)
             }
         }
+    }
+
+    func applyBoundInteractionResponse(
+        kind: AgentRunMCPSnapshot.Interaction.Kind,
+        interactionID: UUID,
+        payload: MCPInteractionResponsePayload,
+        command: AgentSessionRuntimeStore.Command
+    ) throws {
+        let session = command.writer.session
+        let resolution = try interactionRuntime.mcpPendingInteractionResolution(
+            for: session, kind: kind, interactionID: interactionID, payload: payload
+        )
+        try interactionRuntime.applyPendingInteractionResolution(resolution, command: command)
+        mcpRuntime.handleObservedMCPStateChange(for: session)
     }
 
     func mcpResolvePendingInteraction(
@@ -12407,7 +12818,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         hasUnknownConversationContent: Bool = false,
         isMCPOriginated: Bool = false,
         worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary] = [],
-        activeWorktreeMergeSummaries: [AgentSessionWorktreeMergeSummary] = []
+        activeWorktreeMergeSummaries: [AgentSessionWorktreeMergeSummary] = [],
+        originWorkflowID: String? = nil,
+        originWorkflowDisplayName: String? = nil,
+        lastRunStartedAt: Date? = nil
     ) {
         applyLocalSessionIndexUpsert(AgentSessionIndexEntry(
             id: sessionID,
@@ -12435,7 +12849,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             hasUnknownConversationContent: hasUnknownConversationContent,
             isMCPOriginated: isMCPOriginated,
             worktreeBindingSummaries: worktreeBindingSummaries,
-            activeWorktreeMergeSummaries: activeWorktreeMergeSummaries
+            activeWorktreeMergeSummaries: activeWorktreeMergeSummaries,
+            originWorkflowID: originWorkflowID,
+            originWorkflowDisplayName: originWorkflowDisplayName,
+            lastRunStartedAt: lastRunStartedAt
         ))
     }
 
@@ -13866,7 +14283,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             delegationScopeID: agentSession.delegationScopeID,
             isMCPOriginated: agentSession.isMCPOriginated,
             worktreeBindingSummaries: agentSession.worktreeBindings.worktreeBindingSummaries,
-            activeWorktreeMergeSummaries: agentSession.worktreeMergeOperations.activeWorktreeMergeSummaries
+            activeWorktreeMergeSummaries: agentSession.worktreeMergeOperations.activeWorktreeMergeSummaries,
+            originWorkflowID: agentSession.originWorkflowID,
+            originWorkflowDisplayName: agentSession.originWorkflowDisplayName,
+            lastRunStartedAt: agentSession.lastRunStartedAt
         )
     }
 
@@ -14530,13 +14950,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         repromptAudit: AgentAutomationTurnAudit.Reprompt? = nil,
         isLocalComposerInput: Bool = true,
         providerSwitchClaim: AgentComposerSubmitClaim? = nil,
+        remoteAttachments: [AgentFileAttachment]? = nil,
         scheduledProviderSwitchSubmission: ((Task<UserTurnSubmissionResult, Never>) -> Void)? = nil
     ) -> UserTurnSubmissionResult {
         let session = session(for: tabID)
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard repromptedText == nil || isLocalComposerInput else { return .blocked(message: "Re-prompt is local composer input only.") }
-        let attachmentsToSend = session.pendingFileAttachments
-        let taggedFilesToSend = session.pendingTaggedFileAttachments
+        let attachmentsToSend = remoteAttachments ?? session.pendingFileAttachments
+        let taggedFilesToSend = remoteAttachments == nil ? session.pendingTaggedFileAttachments : []
         if AgentSessionLinkExecutionRuntime.providerSwitchUnconfirmed(session) {
             return .blocked(message: AgentSessionLinkSendFailure.providerSwitchUnconfirmed.message)
         }
@@ -14671,7 +15092,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         // An unloaded payload may restore a pending switch. Its composer remains untouched until
         // hydration and actual input admission finish.
-        if session.pendingHandoff.providerSwitchDelivery == nil,
+        if remoteAttachments == nil, session.pendingHandoff.providerSwitchDelivery == nil,
            !(isLocalComposerInput && codexAttemptID == nil && !taggedFilesToSend.isEmpty),
            session.activeAgentSessionID == nil || session.hasLoadedPersistedState
         {
@@ -15895,6 +16316,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         attachments: attachmentsToSend,
                         taggedFileAttachments: providerTaggedFiles,
                         codexFallbackContext: fallbackContext,
+                        appliedWorkflow: activeWorkflow,
                         autoEffortSelection: autoEffortSelection,
                         directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: providerSkipsSlashExpansion, stopFence: producerStopFence),
                         providerSwitchPreparation: acceptedSwitchPreparation
@@ -16041,6 +16463,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         initialMessage: wrappedText,
                         attachments: attachmentsToSend,
                         taggedFileAttachments: providerTaggedFiles,
+                        appliedWorkflow: activeWorkflow,
                         autoEffortSelection: autoEffortSelection,
                         directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: providerSkipsSlashExpansion, stopFence: resumedFence, localComposerCandidate: localComposerCandidate, initialUserItemID: userItem.id, restorationDraftText: restorationDraftText),
                         providerSwitchPreparation: acceptedSwitchPreparation
@@ -16088,6 +16511,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     initialMessage: wrappedText,
                     attachments: attachmentsToSend,
                     taggedFileAttachments: providerTaggedFiles,
+                    appliedWorkflow: activeWorkflow,
                     autoEffortSelection: autoEffortSelection,
                     directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: providerSkipsSlashExpansion, stopFence: producerStopFence, localComposerCandidate: localComposerCandidate, initialUserItemID: userItem.id, restorationDraftText: restorationDraftText),
                     providerSwitchPreparation: acceptedSwitchPreparation
@@ -16851,6 +17275,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         attachments: [AgentFileAttachment] = [],
         taggedFileAttachments: [AgentTaggedFileAttachment] = [],
         codexFallbackContext: TabSession.CodexFallbackSubmissionContext? = nil,
+        appliedWorkflow: AgentWorkflowDefinition? = nil,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
         directStartOptions: AgentDirectRunStartOptions = .default,
         startOutcome: AgentRunStartOutcomeRecorder? = nil,
@@ -16866,8 +17291,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return await runtimeSessionStore.startup.start(
             session: session, initialMessage: initialMessage, attachments: attachments,
             taggedFileAttachments: taggedFileAttachments, codexFallbackContext: codexFallbackContext,
-            autoEffortSelection: autoEffortSelection, directStartOptions: directStartOptions,
-            startOutcome: startOutcome, providerSwitchPreparation: providerSwitchPreparation,
+            appliedWorkflow: appliedWorkflow, autoEffortSelection: autoEffortSelection,
+            directStartOptions: directStartOptions, startOutcome: startOutcome,
+            providerSwitchPreparation: providerSwitchPreparation,
             claudeCoordinator: claudeCoordinator, links: linkExecutionRuntime, environment: makeRunStartEnvironment()
         )
     }
