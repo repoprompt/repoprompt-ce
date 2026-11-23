@@ -384,6 +384,68 @@ struct AgentRunMCPToolService {
         return AgentModelCatalog.taskLabels.contains { $0.label == normalized }
     }
 
+    struct StartSelection {
+        let resolved: AgentMCPSelectionResolver.ResolvedSelection
+        let routedTarget: AgentRoutingExecutableTarget?
+
+        func resolveParameters(_ value: Value?, workspacePath: String?) async throws -> [ACPModelParameterSelection] {
+            // Resolve advertised parameters only after worktree preparation. Stored role pins
+            // are captured with model selection; explicit request parameters take precedence.
+            let explicit = try await AgentMCPModelParameterSupport.resolve(
+                value: routedTarget == nil ? value : nil,
+                agent: resolved.agentRaw.flatMap(AgentProviderKind.init(rawValue:)),
+                modelRaw: resolved.modelRaw,
+                workspacePath: workspacePath
+            )
+            return AgentMCPModelParameterSupport.merged(inherited: resolved.modelParameterSelections, explicit: explicit)
+        }
+    }
+
+    static func resolveStartSelection(
+        requestedModelID: String?,
+        hasExplicitModelParameters: Bool,
+        resolvedTabID: UUID?,
+        message: String,
+        workspaceID: UUID,
+        availability: () -> AgentModelCatalog.AvailabilityContext,
+        usageBalancingEnabled: () -> Bool,
+        route: (_ task: String, _ baseline: AgentRoutingExecutableTarget?, _ allowUsageBalance: Bool) async throws -> AgentRoutingExecutableTarget?
+    ) async throws -> StartSelection {
+        let defaultTaskLabel = defaultTaskLabelForStart(resolvedTabID: resolvedTabID)
+        let shouldRouteStart = shouldRouteModelForStart(
+            requestedModelID: requestedModelID,
+            hasExplicitModelParameters: hasExplicitModelParameters
+        )
+        func resolveBaseline() throws -> AgentMCPSelectionResolver.ResolvedSelection {
+            try AgentMCPSelectionResolver.resolve(
+                modelID: requestedModelID, defaultTaskLabel: defaultTaskLabel,
+                availability: availability(), workspaceID: workspaceID
+            )
+        }
+        let canBalanceStart = shouldRouteStart && resolvedTabID == nil && usageBalancingEnabled()
+        let usageBaseline = canBalanceStart ? try? resolveBaseline() : nil
+        let baselineTarget = usageBaseline.flatMap { value -> AgentRoutingExecutableTarget? in
+            guard let agent = value.agentRaw, let model = value.modelRaw else { return nil }
+            return .init(agentRaw: agent, modelRaw: model, reasoningEffortRaw: nil, modelParameters: value.modelParameterSelections)
+        }
+        if shouldRouteStart, let routed = try await route(
+            message, baselineTarget, resolvedTabID == nil && usageBaseline?.usageBalancingEligible == true
+        ) {
+            return StartSelection(
+                resolved: .init(
+                    agentRaw: routed.agentRaw,
+                    modelRaw: routed.modelRaw,
+                    taskLabelKind: taskLabelKindForRouterOwnedStart(
+                        requestedModelID: requestedModelID, defaultTaskLabel: defaultTaskLabel
+                    ),
+                    modelParameterSelections: routed.modelParameters
+                ),
+                routedTarget: routed
+            )
+        }
+        return try StartSelection(resolved: usageBaseline ?? resolveBaseline(), routedTarget: nil)
+    }
+
     let toolName: String
     var perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     let captureRequestMetadata: () async -> RequestMetadata
@@ -663,66 +725,38 @@ struct AgentRunMCPToolService {
             }
         }
 
-        // Compute the default task label before target creation. Omitted `model_id`
-        // for agent_run.start resolves through the effective workspace Pair role default.
-        let defaultTaskLabel = Self.defaultTaskLabelForStart(resolvedTabID: resolvedTabID, workflow: workflow)
-
-        // An explicit compound model ID or model parameters are caller authority, even when
-        // Router is on. Default and role-label starts remain eligible for model routing.
-        let requestedModelID = normalizedString(args["model_id"])
-        let routedTaskLabelKind = Self.taskLabelKindForRouterOwnedStart(
-            requestedModelID: requestedModelID,
-            defaultTaskLabel: defaultTaskLabel
-        )
-        var selection: AgentMCPSelectionResolver.ResolvedSelection
-        var routedReasoningEffortRaw: String?
-        var routerSelectedTarget = false
-        let shouldRouteStart = Self.shouldRouteModelForStart(requestedModelID: requestedModelID, hasExplicitModelParameters: args["model_parameters"] != nil)
-        let canBalanceStart = shouldRouteStart && resolvedTabID == nil && agentModeVM.modelRouterSettingsStore.modelRouterConfiguration().usageBalancing.enabled
-        let usageBaseline: AgentMCPSelectionResolver.ResolvedSelection? = canBalanceStart ? try? AgentMCPSelectionResolver.resolve(
-            modelID: requestedModelID, defaultTaskLabel: defaultTaskLabel,
-            availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
-            workspaceID: workspace.id
-        ) : nil
-        let baselineTarget = usageBaseline.flatMap { value -> AgentRoutingExecutableTarget? in
-            guard let agent = value.agentRaw, let model = value.modelRaw else { return nil }
-            return .init(agentRaw: agent, modelRaw: model, reasoningEffortRaw: nil, modelParameters: value.modelParameterSelections)
-        }
+        let startSelection: StartSelection
         do {
-            if shouldRouteStart, let routed = try await agentModeVM.routeSubagentTargetIfEnabled(
-                task: message,
-                surface: .general,
-                baseline: baselineTarget,
-                allowUsageBalance: resolvedTabID == nil && usageBaseline?.usageBalancingEligible == true
-            ) {
-                selection = AgentMCPSelectionResolver.ResolvedSelection(
-                    agentRaw: routed.agentRaw,
-                    modelRaw: routed.modelRaw,
-                    taskLabelKind: routedTaskLabelKind,
-                    modelParameterSelections: routed.modelParameters
-                )
-                routedReasoningEffortRaw = routed.reasoningEffortRaw
-                routerSelectedTarget = true
-                #if DEBUG
-                    perfRecorder.event("modelRouter.subagent.selected", fields: [
-                        "entryPoint": "agent_run.start",
-                        "provider": routed.agentRaw,
-                        "model": routed.modelRaw,
-                        "effort": routed.reasoningEffortRaw ?? "provider-default",
-                        "overrodeRequestedModel": "false"
-                    ])
-                #endif
-            } else {
-                selection = try usageBaseline ?? AgentMCPSelectionResolver.resolve(
-                    modelID: requestedModelID,
-                    defaultTaskLabel: defaultTaskLabel,
-                    availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
-                    workspaceID: workspace.id
+            startSelection = try await Self.resolveStartSelection(
+                requestedModelID: normalizedString(args["model_id"]),
+                hasExplicitModelParameters: args["model_parameters"] != nil,
+                resolvedTabID: resolvedTabID,
+                message: message,
+                workspaceID: workspace.id,
+                availability: { targetWindow.apiSettingsViewModel.agentModeAvailabilityContext },
+                usageBalancingEnabled: { agentModeVM.modelRouterSettingsStore.modelRouterConfiguration().usageBalancing.enabled }
+            ) { task, baseline, allowUsageBalance in
+                try await agentModeVM.routeSubagentTargetIfEnabled(
+                    task: task, surface: .general, baseline: baseline, allowUsageBalance: allowUsageBalance
                 )
             }
         } catch {
             throw MCPError.invalidParams(error.localizedDescription)
         }
+        let selection = startSelection.resolved
+        let routedReasoningEffortRaw = startSelection.routedTarget?.reasoningEffortRaw
+        let routerSelectedTarget = startSelection.routedTarget != nil
+        #if DEBUG
+            if let routed = startSelection.routedTarget {
+                perfRecorder.event("modelRouter.subagent.selected", fields: [
+                    "entryPoint": "agent_run.start",
+                    "provider": routed.agentRaw,
+                    "model": routed.modelRaw,
+                    "effort": routed.reasoningEffortRaw ?? "provider-default",
+                    "overrodeRequestedModel": "false"
+                ])
+            }
+        #endif
 
         #if DEBUG
             if let rawToken = normalizedString(args["_worktree_startup_benchmark_token"]) {
@@ -1007,20 +1041,8 @@ struct AgentRunMCPToolService {
             runParameterWorkspacePath = try agentModeVM.session(for: target.tabID, createIfNeeded: false)
                 .flatMap { try agentModeVM.effectiveWorkspacePath(for: $0) }
                 ?? workspace.repoPaths.first
-            let explicitModelParameterSelections = try await AgentMCPModelParameterSupport.resolve(
-                value: routerSelectedTarget ? nil : args["model_parameters"],
-                agent: selection.agentRaw.flatMap { AgentProviderKind(rawValue: $0) },
-                modelRaw: selection.modelRaw,
-                workspacePath: runParameterWorkspacePath
-            )
-            // A role-label start inherits the role's stored pin as a baseline, captured with the
-            // role resolution (never re-read after awaited setup). Explicit request parameters
-            // override matching identities; a compound model_id inherits nothing, because the
-            // resolver hands back no baseline for one — which is why the merge needs no role
-            // check here.
-            modelParameterSelections = AgentMCPModelParameterSupport.merged(
-                inherited: selection.modelParameterSelections,
-                explicit: explicitModelParameterSelections
+            modelParameterSelections = try await startSelection.resolveParameters(
+                args["model_parameters"], workspacePath: runParameterWorkspacePath
             )
         } catch {
             await agentModeVM.mcpDiscardSessionTarget(target)

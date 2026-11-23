@@ -468,15 +468,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func canSelectAgent(_ candidate: AgentProviderKind, for session: TabSession) -> Bool {
-        if session.pendingHandoff.providerSwitchDelivery != nil { return candidate == session.selectedAgent }
-        guard session.isProviderSelectionLocked else { return true }
-        if candidate == session.selectedAgent {
-            return true
-        }
-        if session.selectedAgent.usesClaudeNativeRuntime, candidate.usesClaudeNativeRuntime {
-            return true
-        }
-        return false
+        session.permitsMCPProviderSelection(candidate)
     }
 
     // MARK: - Session Management
@@ -9578,107 +9570,43 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 throw MCPError.invalidParams("Cannot change model settings while this session is actively running.")
             }
         }
-        try requireConfigurationAdmission()
-        if let workspaceAuthority {
-            try requireCurrentMCPWorkspaceTarget(
-                workspaceAuthority.target,
-                expectedWorkspaceID: workspaceAuthority.expectedWorkspaceID,
-                allowMatchingControlledSession: workspaceAuthority.allowMatchingControlledSession
-            )
+        func requireConfigurationAuthority() throws {
+            try requireConfigurationAdmission()
+            if let workspaceAuthority {
+                try requireCurrentMCPWorkspaceTarget(
+                    workspaceAuthority.target,
+                    expectedWorkspaceID: workspaceAuthority.expectedWorkspaceID,
+                    allowMatchingControlledSession: workspaceAuthority.allowMatchingControlledSession
+                )
+            }
         }
+        try requireConfigurationAuthority()
         let normalized = normalizedSelection(
             agentRaw: agentRaw ?? session.selectedAgent.rawValue,
             modelRaw: modelRaw ?? session.selectedModelRaw,
             preserveUnavailableAgent: true
         )
-        if session.activeAgentSessionID != nil,
-           normalized.agent != session.selectedAgent,
-           !canSelectAgent(normalized.agent, for: session)
-        {
-            throw MCPError.invalidParams(
-                "This session is locked to \(session.selectedAgent.displayName). Start a new session to change agents."
-            )
-        }
-
-        if session.pendingHandoff.providerSwitchDelivery != nil,
-           normalized.agent != session.selectedAgent || normalized.modelRaw != session.selectedModelRaw
-        {
-            throw MCPError.invalidParams(AgentSessionLinkSendFailure.providerHandoverNeedsReview.message)
-        }
-        try mcpValidateModelParameterSelections(
-            selectedAgent: normalized.agent,
-            selectedModelRaw: normalized.modelRaw,
-            selections: modelParameterSelections
-        )
-        let previousAgent = session.selectedAgent
-        if previousAgent != normalized.agent {
-            codexCoordinator.handleProviderSwitch(from: previousAgent, to: normalized.agent, session: session)
-            await claudeCoordinator.handleProviderIdentityTransition(
-                session: session,
-                from: previousAgent,
-                to: normalized.agent
-            )
-        }
-
+        let beforeCommit: (() async -> Void)?
         #if DEBUG
-            await test_beforeMCPSelectionCommit?()
+            beforeCommit = test_beforeMCPSelectionCommit
+        #else
+            beforeCommit = nil
         #endif
-        // Recheck after awaited hydration/provider setup, then apply the complete
-        // configuration without suspension before another run can be admitted.
-        try requireConfigurationAdmission()
-        if let workspaceAuthority {
-            try requireCurrentMCPWorkspaceTarget(
-                workspaceAuthority.target,
-                expectedWorkspaceID: workspaceAuthority.expectedWorkspaceID,
-                allowMatchingControlledSession: workspaceAuthority.allowMatchingControlledSession
-            )
-        }
-        if session.pendingHandoff.providerSwitchDelivery != nil,
-           normalized.agent != session.selectedAgent || normalized.modelRaw != session.selectedModelRaw
-        {
-            throw MCPError.invalidParams(AgentSessionLinkSendFailure.providerHandoverNeedsReview.message)
-        }
-        session.selectedAgent = normalized.agent
-        session.selectedModelRaw = normalized.modelRaw
-        if normalized.agent.usesClaudeNativeRuntime {
-            // All native providers preserve an explicit pin and clear a previous/inherited pin
-            // when this request omits effort, symmetrically with the normalization exemption below.
-            session.selectedReasoningEffortRaw = reasoningEffortRaw
-            session.selectedClaudeEffortRaw = reasoningEffortRaw
-        } else if let reasoningEffortRaw {
-            session.selectedReasoningEffortRaw = reasoningEffortRaw
-        }
-        try mcpApplyModelParameterSelections(tabID: tabID, selections: modelParameterSelections, creationHandle: creationHandle)
-        // Recompute the MCP permission profile after a provider change so a `.custom`
-        // tri-state policy's per-provider override never goes stale on an already-active
-        // MCP-controlled session (sub-agent or top-level).
-        _ = refreshMCPPermissionProfileIfNeeded(for: session)
-        // Codex normalization clears reasoning effort for every non-Codex provider.
-        // Native MCP effort is a separate session pin and must survive configuration, including
-        // explicit overseer lane selections for compatible native agents.
-        if !session.selectedAgent.usesClaudeNativeRuntime {
-            codexCoordinator.normalizeCodexSelectionForSession(
-                session,
-                preservingExplicitEffort: reasoningEffortRaw != nil
-            )
-        }
-        // Record last-used effort for the MCP path so the in-memory fallback
-        // used by `normalizeCodexSelectionForSession` stays current.  The UI path
-        // records this via the `@Published selectedReasoningEffortRaw` didSet, but
-        // MCP calls bypass that observer.  Only record when the caller explicitly
-        // provided an effort and normalization accepted it, avoiding unsupported
-        // requests or fallback/default values becoming sticky global state.
-        if let reasoningEffortRaw,
-           session.selectedAgent == .codexExec,
-           let requestedEffort = CodexReasoningEffort.parse(reasoningEffortRaw),
-           let acceptedEffort = CodexReasoningEffort.parse(session.selectedReasoningEffortRaw),
-           requestedEffort == acceptedEffort
-        {
-            CodexAgentToolPreferences.setLastUsedReasoningEffort(
-                acceptedEffort,
-                forModelRaw: session.selectedModelRaw
-            )
-            codexCoordinator.recordLastUsedReasoningEffort(acceptedEffort, forModelRaw: session.selectedModelRaw)
+        let previousPermissionProfile = session.permissionProfile
+        let previousParameters = session.acpModelParameterSelections
+        try await runtimeHost.configureMCPModel(
+            for: session, selection: normalized, reasoningEffortRaw: reasoningEffortRaw,
+            parameters: modelParameterSelections, beforeCommit: beforeCommit,
+            requireAdmission: requireConfigurationAuthority
+        )
+        if tabID == currentTabID {
+            if session.permissionProfile != previousPermissionProfile {
+                updatePermissionBindingState(from: session)
+            }
+            if session.acpModelParameterSelections != previousParameters {
+                syncComposerUIState()
+                syncRunInteractionUIState()
+            }
         }
         if tabID == currentTabID {
             applySessionToBindings(session)

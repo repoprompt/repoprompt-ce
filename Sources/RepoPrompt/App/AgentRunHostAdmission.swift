@@ -70,7 +70,27 @@ struct AgentRunHostAdmission {
             == Set(rootLease.roots.map { ($0.fullPath as NSString).standardizingPath })
     }
 
-    func routeSubagentTargetIfEnabled(
+    func resolveStartSelection(
+        arguments: [String: Value], resolvedTabID: UUID?, message: String
+    ) async throws -> AgentRunMCPToolService.StartSelection {
+        try await requireCurrent()
+        guard let initialAvailability = activation.modelAvailability else { throw MCPFileToolAuthorityFailure.superseded }
+        let selection = try await AgentRunMCPToolService.resolveStartSelection(
+            requestedModelID: AgentMCPToolHelpers.normalizedString(arguments["model_id"]),
+            hasExplicitModelParameters: arguments["model_parameters"] != nil,
+            resolvedTabID: resolvedTabID,
+            message: message,
+            workspaceID: workspaceID,
+            availability: { activation.modelAvailability ?? initialAvailability },
+            usageBalancingEnabled: { host.modelRouterSettingsStore.modelRouterConfiguration().usageBalancing.enabled }
+        ) { task, baseline, allowUsageBalance in
+            try await routeSubagentTargetIfEnabled(task: task, baseline: baseline, allowUsageBalance: allowUsageBalance)
+        }
+        try await requireCurrent()
+        return selection
+    }
+
+    private func routeSubagentTargetIfEnabled(
         task: String, baseline: AgentRoutingExecutableTarget?, allowUsageBalance: Bool
     ) async throws -> AgentRoutingExecutableTarget? {
         try await requireCurrent()
