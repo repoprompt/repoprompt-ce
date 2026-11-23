@@ -377,6 +377,7 @@ final class MCPBecomeOverseerActivationProof: @unchecked Sendable {
     private let lock = NSLock()
     private var valid = true
     private var armed = false
+    private var independentRegistration: MCPRunRoutingCleanupReceipt?
     /// Installed synchronously on MainActor before network qualification starts. Sinks only revoke.
     private var familyObservers: [AnyCancellable] = []
 
@@ -449,9 +450,10 @@ final class MCPBecomeOverseerActivationProof: @unchecked Sendable {
         lock.withLock { valid = false }
     }
 
-    fileprivate func arm() -> Bool {
+    fileprivate func arm(independentRegistration: MCPRunRoutingCleanupReceipt?) -> Bool {
         lock.withLock {
             guard valid, !armed else { return false }
+            self.independentRegistration = independentRegistration
             armed = true
             return true
         }
@@ -502,19 +504,36 @@ final class MCPBecomeOverseerActivationProof: @unchecked Sendable {
               authorization.windowIdentity?.catalogRegistrationHandle == windowIdentity.catalogRegistrationHandle,
               ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.agentSessionLink),
               ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.becomeOverseer),
-              let window = WindowStatesManager.shared.modelRoutingWindow(withID: endpoint.windowID),
-              ObjectIdentifier(window) == windowIdentity.windowStateIdentity,
-              ObjectIdentifier(window.mcpServer) == windowIdentity.serverViewModelIdentity,
-              window.mcpServer.runRouteBindings.hasCurrentMapping(
-                  runID: routeToken.runID, connectionID: routeToken.connectionID, expectedTabID: endpoint.tabID
-              ),
-              window.agentModeViewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint
+              hasCurrentEndpoint(endpoint)
         else {
             valid = false
             return false
         }
         valid = false
         return commit()
+    }
+
+    /// Called under the proof lock on MainActor. Validate the owner captured by admission,
+    /// never a replacement host or the window that happened to present the original session.
+    @MainActor
+    private func hasCurrentEndpoint(_ endpoint: DomainAgentSessionLinkEndpointIdentity) -> Bool {
+        if let registration = independentRegistration {
+            guard let owner = registration.routeOwner,
+                  ObjectIdentifier(owner) == windowIdentity.windowStateIdentity,
+                  ObjectIdentifier(owner) == windowIdentity.serverViewModelIdentity,
+                  owner.catalogHandle == windowIdentity.catalogRegistrationHandle else { return false }
+            return owner.registeredModelObserverEndpoint(
+                registration: registration, connectionID: routeToken.connectionID,
+                workspaceID: endpoint.workspaceID, tabID: endpoint.tabID
+            ) == endpoint
+        }
+        guard let window = WindowStatesManager.shared.modelRoutingWindow(withID: endpoint.windowID),
+              ObjectIdentifier(window) == windowIdentity.windowStateIdentity,
+              ObjectIdentifier(window.mcpServer) == windowIdentity.serverViewModelIdentity,
+              window.mcpServer.runRouteBindings.hasCurrentMapping(
+                  runID: routeToken.runID, connectionID: routeToken.connectionID, expectedTabID: endpoint.tabID
+              ) else { return false }
+        return window.agentModeViewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint
     }
 }
 
@@ -3203,6 +3222,8 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                   authorization: authorization, windowIdentity: windowIdentity
               )
         else { return nil }
+        let registration = runPolicyStateByRunID[route.runID]?.cleanupReceipt
+        let independentRegistration = registration?.routeOwner?.identity.kind == .independent ? registration : nil
         becomeOverseerActivationProofs[invocation.invocationID] = .init(value: proof)
         #if DEBUG
             await debugAfterBecomeOverseerProofRegistrationForTesting?(invocation.invocationID, endpoint)
@@ -3215,7 +3236,8 @@ actor ServerNetworkManager: MCPServerConnectionHost {
               isCurrentToolDispatchAuthorization(authorization),
               isCurrentCatalogRouteToken(token),
               effectivePolicyState(for: authorization.connectionID).taskLabelKind != .explore,
-              proof.arm()
+              independentRegistration.map(ownsRunRegistration) ?? true,
+              proof.arm(independentRegistration: independentRegistration)
         else { return nil }
         issued = true
         return proof

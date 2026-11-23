@@ -1520,7 +1520,8 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 var expectedTargetID = targetID
                 if activate {
                     let response = try await connection.callTool(name: MCPWindowToolName.becomeOverseer, arguments: [:], timeoutSeconds: 2)
-                    XCTAssertNotNil(try MCPExportWatchdogIntegrationTests.responseObject(from: response)["result"] as? [String: Any])
+                    let result = try XCTUnwrap(try MCPExportWatchdogIntegrationTests.responseObject(from: response)["result"] as? [String: Any])
+                    XCTAssertNotEqual(result["isError"] as? Bool, true, response.rawJSON)
                     let noLinks = await authority.links(forObserver: observerID)
                     XCTAssertTrue(noLinks.items.isEmpty, "Activation manufactures no grants")
                     XCTAssertNotNil(observer.oversight.overseerActivation)
@@ -2533,7 +2534,9 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
         private func w3RequireCurrentCatalog(vm: AgentModeViewModel, session: AgentTabSession, label: String) async throws {
             let manager = ServerNetworkManager.shared
             let run = try XCTUnwrap(session.runID)
-            let observedRoute = await manager.authoritativeRunCatalogRouteToken(runID: run, windowID: vm.windowID, tabID: session.tabID)
+            let host = vm.runtimeHost
+            XCTAssertTrue(host.scope.sessions[session.tabID] === session, "Read the catalog from the exact originating writer's host")
+            let observedRoute = await manager.authoritativeRunCatalogRouteToken(runID: run, windowID: host.routeID, tabID: session.tabID)
             let route = try XCTUnwrap(observedRoute)
             let observedProjection = await manager.debugRunCatalogProjection(for: run)
             let projection = try XCTUnwrap(observedProjection)
