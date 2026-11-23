@@ -50,6 +50,12 @@ extension AgentRunHostAdmission {
 
     func requireReadTargets(_ targets: [ReadTarget], operation: DomainAgentSessionTargetOperation) async throws {
         let snapshot = try await canonicalSnapshot()
+        try validateReadTargets(targets, operation: operation, snapshot: snapshot)
+    }
+
+    private func validateReadTargets(
+        _ targets: [ReadTarget], operation: DomainAgentSessionTargetOperation, snapshot: DomainWorkspaceSnapshot
+    ) throws {
         for target in targets {
             guard readTargetIsCurrent(target, operation: operation),
                   target.activation.executionTab(in: snapshot, command: target.command) != nil
@@ -96,6 +102,43 @@ extension AgentRunHostAdmission {
         }, unavailable: { _ in nil })
     }
 
+    /// No writer is installed for a read. A verified durable carrier without a live control
+    /// registration can report only the expired run handle, never a saved transcript preview.
+    private func captureExpiredRead(
+        sessionID: UUID, operation: DomainAgentSessionTargetOperation
+    ) async throws -> AgentSavedSessionTargetLoader.Target {
+        let denial = AgentSessionTargetOperationGuard.denialError(sessionID: sessionID)
+        func absent() -> Bool {
+            guard sourceIsCurrent,
+                  case .unavailable(.absent) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: sessionID)
+            else { return false }
+            return true
+        }
+        guard absent(),
+              let lookup = try? await AppSavedAgentSessionExecution.resolve(
+                  sessionID, store: activation.authority.store, isStillAuthorized: absent
+              ), lookup.target.workspace.id == workspaceID else { throw denial }
+        let target = lookup.target
+        let workspace = try await canonicalWorkspace()
+        guard absent(), target.carrier(in: workspace) != nil else { throw denial }
+        try authorizeExpiredRead(target, operation: operation)
+        return target
+    }
+
+    private func authorizeExpiredRead(
+        _ target: AgentSavedSessionTargetLoader.Target, operation: DomainAgentSessionTargetOperation
+    ) throws {
+        let sessionID = target.entry.id
+        guard !AgentSessionDeletionRegistry.shared.blocksNewOversight(sessionID: sessionID),
+              case .unavailable(.absent) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: sessionID)
+        else { throw AgentSessionTargetOperationGuard.denialError(sessionID: sessionID) }
+        try AgentSessionTargetOperationGuard.require(
+            operation: operation, caller: caller,
+            provenance: .known(targetSessionID: sessionID, parentSessionID: target.entry.parentSessionID),
+            reference: sessionID.uuidString
+        )
+    }
+
     /// Reuse the exact single/multi wait policies without an adapter that can select a window.
     func executeControlRead(_ args: [String: Value], poll: Bool) async throws -> Value {
         let usesArray = args["session_ids"] != nil
@@ -110,7 +153,16 @@ extension AgentRunHostAdmission {
             return seen.insert(id).inserted ? id : nil
         }
         let operation: DomainAgentSessionTargetOperation = poll ? .runPoll : .runWait
-        let targets = try await captureReadTargets(sessionIDs, operation: operation)
+        var liveIDs: [UUID] = []
+        var expired: [AgentSavedSessionTargetLoader.Target] = []
+        for id in sessionIDs {
+            if case .unavailable(.absent) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: id) {
+                try await expired.append(captureExpiredRead(sessionID: id, operation: operation))
+            } else {
+                liveIDs.append(id)
+            }
+        }
+        let targets = try await captureReadTargets(liveIDs, operation: operation)
         let read = readAccess(for: targets, operation: operation)
         let tools = makeHostToolService(waitTargets: targets)
         let timeout = try poll ? 0 : AgentRunMCPToolService.resolvedWaitTimeoutSeconds(
@@ -127,7 +179,26 @@ extension AgentRunHostAdmission {
                 sessionIDs: sessionIDs, read: read, metadata: invocation.metadata, timeoutSeconds: timeout
             )
         }
-        try await requireReadTargets(targets, operation: operation)
+        for target in expired {
+            let current = try await captureExpiredRead(sessionID: target.entry.id, operation: operation)
+            guard current.tab.id == target.tab.id, current.stashedTabID == target.stashedTabID,
+                  current.entry.parentSessionID == target.entry.parentSessionID,
+                  current.workspace.customStoragePath == target.workspace.customStoragePath
+            else { throw AgentSessionTargetOperationGuard.denialError(sessionID: target.entry.id) }
+        }
+        // Qualify every carrier against the same final authority snapshot. A prior sidecar
+        // read alone does not authorize using an ID whose tab changed during another read.
+        let finalSnapshot = try await canonicalSnapshot()
+        try validateReadTargets(targets, operation: operation, snapshot: finalSnapshot)
+        if !expired.isEmpty {
+            let workspace = try JSONDecoder().decode(WorkspaceModel.self, from: finalSnapshot.document.documentBytes)
+            for target in expired {
+                guard target.carrier(in: workspace) != nil else {
+                    throw AgentSessionTargetOperationGuard.denialError(sessionID: target.entry.id)
+                }
+                try authorizeExpiredRead(target, operation: operation)
+            }
+        }
         return value
     }
 
@@ -148,6 +219,95 @@ extension AgentRunHostAdmission {
             cancellation, metadata: invocation.metadata, snapshot: { await read.snapshot(sessionID) },
             revalidateOrigin: { try await requireReadTargets(targets, operation: .runCancel) }
         )
+    }
+
+    func executeControlResponse(_ args: [String: Value]) async throws -> Value {
+        let sessionID = try Self.controlSessionID(Self.requireControlSessionReference(args))
+        let targets = try await captureReadTargets([sessionID], operation: .runRespond)
+        guard let target = targets.first, let interactions = target.command.writer.scope.installedInteractions else {
+            throw AgentSessionTargetOperationGuard.denialError(sessionID: sessionID)
+        }
+        let tools = makeHostToolService()
+        let interactionID = try tools.requireUUID(args["interaction_id"], name: "interaction_id")
+        let workflow = try tools.resolveWorkflow(args: args)
+        let payload = try AgentRunMCPToolService.parseResponsePayload(args: args)
+        try await requireReadTargets(targets, operation: .runRespond)
+        let delivery = try await interactions.resolveMCPResponse(command: target.command, interactionID: interactionID, payload: payload) { text in
+            try await submitExactActiveControlInput(target, text: text, workflow: workflow, operation: .runRespond, expectedInstructionID: interactionID)
+        }
+        await Task.yield()
+        let candidate = await readAccess(for: targets, operation: .runRespond).snapshot(sessionID)
+        let snapshot: AgentRunMCPSnapshot = if await (try? requireReadTargets(targets, operation: .runRespond)) != nil {
+            candidate
+        } else {
+            // The response already settled on the exact interaction. Do not project a successor,
+            // and do not misreport the accepted effect as a refusal to answer.
+            AgentRunMCPToolService.agentRunExpiredSnapshot(sessionID: sessionID)
+        }
+        return tools.decoratedRunValue(snapshot: snapshot, workflow: workflow, delivery: delivery)
+    }
+
+    func submitExactActiveControlInput(
+        _ target: ReadTarget, text: String, workflow: AgentWorkflowDefinition?,
+        operation: DomainAgentSessionTargetOperation, expectedInstructionID: UUID? = nil
+    ) async throws -> AgentMCPInstructionDispatch {
+        try await requireReadTargets([target], operation: operation)
+        let scope = target.command.writer.scope
+        let session = target.command.writer.session
+        guard let targetHost = scope.executableHost, let executor = scope.linkExecution,
+              let endpoint = executor.agentSessionLinkObserverEndpoint(tabID: session.tabID),
+              endpoint.sessionID == target.sessionID,
+              let route = executor.agentSessionLinkManagedSteerRoute(for: session)
+        else { throw MCPError.invalidParams("The requested agent run cannot receive active input.") }
+        let currentInteraction = target.runtime.mcpPendingInteraction(for: session)
+        if let currentInteraction, currentInteraction.kind != .instruction {
+            throw MCPError.invalidParams("The run is waiting on \(currentInteraction.kind.rawValue). Use agent_run.respond instead.")
+        }
+        if let expectedInstructionID {
+            guard currentInteraction?.id == expectedInstructionID, route == .waitingInstruction else {
+                throw MCPError.invalidParams("The pending instruction prompt no longer matches interaction_id.")
+            }
+        }
+        guard session.pendingApplyEditsReview == nil, session.pendingWorktreeMergeReview == nil else {
+            throw MCPError.invalidParams("Resolve the protected review before submitting task input.")
+        }
+        let origin = targetHost.canonicalInputEnvironment(for: session)
+        func inputIsCurrent() -> Bool {
+            guard origin.resourcesAreCurrent(), readTargetIsCurrent(target, operation: operation),
+                  session.pendingApplyEditsReview == nil, session.pendingWorktreeMergeReview == nil else { return false }
+            let pending = target.runtime.mcpPendingInteraction(for: session)
+            if let expectedInstructionID {
+                return pending?.kind == .instruction && pending?.id == expectedInstructionID
+                    && executor.agentSessionLinkManagedSteerRoute(for: session) == .waitingInstruction
+            }
+            return pending == nil || pending?.kind == .instruction
+        }
+        let environment = AgentSessionLinkExecutionRuntime.ManagedInputEnvironment(
+            workspaceID: origin.workspaceID, resourcesAreCurrent: inputIsCurrent,
+            settings: origin.settings, tools: origin.tools, validateResources: { command in
+                guard await origin.validateResources(command),
+                      await (try? requireReadTargets([target], operation: operation)) != nil else { return false }
+                return inputIsCurrent()
+            }, captureProviderLaunchInput: origin.captureProviderLaunchInput
+        )
+        let sink = AgentSessionLinkManagedSteerSink()
+        let turn = AgentNoncomposerTurn(endpoint: endpoint, providerText: text, sink: sink)
+        guard executor.submitNoncomposerSteer(
+            tabID: session.tabID, session: session, displayText: text, turn: turn,
+            route: route, workflow: workflow, environment: environment, originatingCommand: target.command
+        ) else { throw MCPError.invalidParams("The requested agent run changed before input could be submitted.") }
+        let result = await sink.awaitOutcome(timeoutSeconds: AgentSessionLinkExecutionRuntime.agentSessionLinkManagedSteerOutcomeTimeoutSeconds)
+        switch result {
+        case let .delivered(state):
+            switch state {
+            case .deliveredToWaitingInstruction: return .deliveredIntoWaitingContinuation
+            case .queuedFollowUp: return .queuedFollowUp
+            case .queuedInterrupt: return route == .claudeInterrupt ? .queuedClaudeInterrupt : .queuedACPInterrupt
+            default: return .dispatchedCodexTurn
+            }
+        case let .notAccepted(message), let .unconfirmed(message):
+            throw MCPError.invalidParams(message)
+        }
     }
 
     static func requireControlSessionReference(_ args: [String: Value]) throws -> String {

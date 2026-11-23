@@ -2803,7 +2803,7 @@ struct AgentRunMCPToolService {
         )
     }
 
-    private func decoratedRunValue(
+    func decoratedRunValue(
         snapshot: AgentRunMCPSnapshot,
         workflow: AgentWorkflowDefinition? = nil,
         delivery: AgentModeViewModel.MCPInstructionDispatch? = nil,
@@ -3355,7 +3355,7 @@ struct AgentRunMCPToolService {
 
     /// Parses and resolves in one step, which is all `agent_run` ever needs: it has no ledger to
     /// consult between the two halves, so nothing here may observe them apart.
-    private func resolveWorkflow(args: [String: Value]) throws -> AgentWorkflowDefinition? {
+    func resolveWorkflow(args: [String: Value]) throws -> AgentWorkflowDefinition? {
         guard let reference = try AgentWorkflowReference.parse(args: args) else { return nil }
         guard let workflow = reference.resolved() else {
             throw MCPError.invalidParams(reference.notFoundMessage)
@@ -3722,7 +3722,7 @@ struct AgentRunMCPToolService {
         return resolved
     }
 
-    private func requireUUID(_ value: Value?, name: String) throws -> UUID {
+    func requireUUID(_ value: Value?, name: String) throws -> UUID {
         guard let raw = normalizedString(value), let uuid = UUID(uuidString: raw) else {
             throw MCPError.invalidParams("\(name) must be a UUID string.")
         }

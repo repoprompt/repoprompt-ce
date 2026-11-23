@@ -266,6 +266,11 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                 let created = try await authority.create(workspace, fileURL: fixture.root.appendingPathComponent("saved.json"))
                 XCTAssertEqual(created.disposition, .applied)
                 try await fixture.save(agentKind: "openCode", agentModel: "model-a")
+                let expiredChildID = try XCTUnwrap(visible.activeAgentSessionID)
+                _ = try await fixture.service.saveAgentSession(.init(
+                    id: expiredChildID, workspaceID: workspace.id, composeTabID: visible.id,
+                    name: "Previously saved child", parentSessionID: fixture.sessionID
+                ), for: workspace)
 
                 let windows = WindowStatesManager.shared
                 let count = WindowState.windowCounter
@@ -313,26 +318,32 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                     let bindingIsCurrent = await host.route.canCommitPendingPolicy(receipt, token: token)
                     XCTAssertTrue(bindingIsCurrent, "Handshake must accept the exact saved binding before dispatch")
                     let metadata = MCPRequestMetadata(connectionID: connectionID, clientName: nil, windowID: host.routeID)
-                    let registration = try await runtime.routingCoordinator.currentRegistration(connectionID: connectionID)
-                    func invoke(_ name: String, _ arguments: [String: Value], grantingAccess: Bool = true) async throws -> Value {
-                        let resolution = try await runtime.domainHost.resolve(toolName: name, scope: .window(id: host.routeID))
+                    func invoke(
+                        _ name: String, _ arguments: [String: Value], grantingAccess: Bool = true,
+                        asChild child: (metadata: MCPRequestMetadata, runID: UUID)? = nil
+                    ) async throws -> Value {
+                        let source = child?.metadata ?? metadata
+                        let sourceConnectionID = try XCTUnwrap(source.connectionID)
+                        let routeID = try XCTUnwrap(source.windowID)
+                        let resolution = try await runtime.domainHost.resolve(toolName: name, scope: .window(id: routeID))
+                        let registration = try await runtime.routingCoordinator.currentRegistration(connectionID: sourceConnectionID)
                         let invocationID = UUID()
                         let security = DomainToolInvocationSecurityContext(
                             principal: .init(
                                 principalID: UUID(), stableKey: "saved-route-witness", displayName: "Scripted provider",
-                                kind: .runScoped, assurance: grantingAccess ? .hostLaunchToken : .displayNameOnly, processID: nil, runID: receipt.runID,
+                                kind: .runScoped, assurance: grantingAccess ? .hostLaunchToken : .displayNameOnly, processID: nil, runID: child?.runID ?? receipt.runID,
                                 provider: "openCode", verifiedIdentityFingerprint: nil
                             ),
-                            connectionID: connectionID, connectionGeneration: registration.generation, invocationID: invocationID,
+                            connectionID: sourceConnectionID, connectionGeneration: registration.generation, invocationID: invocationID,
                             runtimeID: runtime.identity.runtimeID, runtimeGeneration: runtime.identity.lifecycleGeneration,
                             workspaceID: workspace.id, authorizedCanonicalRoots: [root.path],
                             ephemeralGrantedToolNames: grantingAccess ? [name] : []
                         )
-                        let request = ToolInvocationContext.trustedLocal(toolName: name, metadata: metadata)
+                        let request = ToolInvocationContext.trustedLocal(toolName: name, metadata: source)
                         do {
                             return try await MCPInvocationContextBridge.withInvocation(request) {
                                 try await runtime.domainHost.invoke(.init(
-                                    invocationID: invocationID, connectionID: connectionID, resolution: resolution,
+                                    invocationID: invocationID, connectionID: sourceConnectionID, resolution: resolution,
                                     arguments: arguments, securityContext: security
                                 ))
                             }
@@ -561,6 +572,11 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                     XCTAssertEqual(batch.objectValue?["snapshots"]?.arrayValue?.first?.objectValue?["session_id"], reference)
                     let waited = try await spawn.executeControlRead(["session_ids": .array([reference]), "timeout": .int(0)], poll: false)
                     XCTAssertEqual(waited.objectValue?["session_id"], reference)
+                    let expired = try await spawn.executeControlRead(["session_id": .string(expiredChildID.uuidString)], poll: true)
+                    XCTAssertEqual(expired.objectValue?["status"], .string("expired"))
+                    if case .unavailable(.absent) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: expiredChildID) {} else {
+                        XCTFail("Polling an expired child must not load a writer")
+                    }
                     do {
                         _ = try await spawn.executeControlCancellation(["session_id": .string(fixture.sessionID.uuidString)])
                         XCTFail("Originating parent cannot cancel itself through its child-control route")
@@ -600,6 +616,37 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                     XCTAssertEqual(wake.reason, .steeringRequested)
                     XCTAssertEqual(wake.snapshot.sessionID, launchedID)
                     XCTAssertEqual(wake.steeringOriginRunID, receipt.runID)
+                    let childMetadata = MCPRequestMetadata(connectionID: childConnectionID, clientName: nil, windowID: launched.host.routeID)
+                    let childQuestion = Task { @MainActor in
+                        try await invoke(
+                            "ask_user",
+                            ["question": .string("Continue the child?"), "timeout_seconds": .int(10)],
+                            asChild: (childMetadata, childReceipt.runID)
+                        )
+                    }
+                    defer { childQuestion.cancel() }
+                    let childRuntime = launched.command.writer.scope.mcp
+                    let childSession = launched.command.writer.session
+                    try await AsyncTestWait.waitUntil("the registered question reaches the exact child writer") {
+                        childRuntime.mcpPendingInteraction(for: childSession)?.kind == .question
+                    }
+                    let childInteraction = try XCTUnwrap(childRuntime.mcpPendingInteraction(for: childSession))
+                    var responseArgs: [String: Value] = [
+                        "session_id": reference, "interaction_id": .string(UUID().uuidString),
+                        "answers": .object(["response": .string("Continue child")])
+                    ]
+                    do {
+                        _ = try await spawn.executeControlResponse(responseArgs)
+                        XCTFail("A response for another interaction cannot consume the child's question")
+                    } catch {
+                        XCTAssertEqual(childRuntime.mcpPendingInteraction(for: childSession)?.id, childInteraction.id)
+                    }
+                    responseArgs["interaction_id"] = .string(childInteraction.id.uuidString)
+                    let controlResponse = try await spawn.executeControlResponse(responseArgs)
+                    XCTAssertEqual(controlResponse.objectValue?["session_id"], reference)
+                    let childAnswer = try await childQuestion.value
+                    XCTAssertTrue(String(describing: childAnswer).contains("Continue child"), "\(childAnswer)")
+                    XCTAssertNil(childRuntime.mcpPendingInteraction(for: childSession))
                     promptGate.release(consumers: 2)
                     await launched.command.writer.session.agentTask?.value
                     await writer.session.agentTask?.value

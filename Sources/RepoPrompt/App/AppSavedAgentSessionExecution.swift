@@ -65,7 +65,14 @@ enum AppSavedAgentSessionExecution {
         _ sessionID: UUID, domain: MCPDomainRuntime,
         isStillAuthorized: @MainActor () -> Bool
     ) async throws -> Lookup {
-        let snapshot = await domain.workspaceStore.snapshot()
+        try await resolve(sessionID, store: domain.workspaceStore, isStillAuthorized: isStillAuthorized)
+    }
+
+    static func resolve(
+        _ sessionID: UUID, store: DomainWorkspaceStore,
+        isStillAuthorized: @MainActor () -> Bool
+    ) async throws -> Lookup {
+        let snapshot = await store.snapshot()
         guard snapshot.isBootstrapped, snapshot.unavailableWorkspaceIDs.isEmpty,
               !Task.isCancelled, isStillAuthorized() else { throw AgentSavedSessionTargetLoader.Failure.changed }
         let workspaces = try snapshot.workspaces.filter { $0.health != .removed }.map {
@@ -82,9 +89,9 @@ enum AppSavedAgentSessionExecution {
             isCurrent: { _ in isStillAuthorized() }
         ).get()
         let validate: (Target) async -> Bool = { candidate in
-            let latest = await domain.workspaceStore.snapshot()
+            let latest = await store.snapshot()
             guard latest.catalogRevision == snapshot.catalogRevision, latest.unavailableWorkspaceIDs.isEmpty,
-                  let current = await domain.workspaceStore.canonicalWorkspaceSnapshot(candidate.workspace.id), current.health != .removed,
+                  let current = await store.canonicalWorkspaceSnapshot(candidate.workspace.id), current.health != .removed,
                   let decoded = try? JSONDecoder().decode(WorkspaceModel.self, from: current.document.documentBytes) else { return false }
             return candidate.carrier(in: decoded) != nil
         }
