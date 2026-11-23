@@ -266,11 +266,17 @@ actor MCPBootstrapLease {
     }
 
     private func armExpectedPIDPolicy() async -> Bool {
-        guard routingOwner != nil else { return await expectedPIDPolicyArmer(spec) }
+        guard let routingOwner else { return await expectedPIDPolicyArmer(spec) }
         guard let receipt = cleanupReceipts.last, let client = spec.clientName else { return false }
-        return await ServerNetworkManager.shared.requireExpectedAgentPIDForPendingPolicy(
+        let armed = await ServerNetworkManager.shared.requireExpectedAgentPIDForPendingPolicy(
             for: client, runID: spec.runID, windowID: spec.windowID, registration: receipt
         )
+        #if DEBUG
+            if armed, let onArmed = await routingOwner.test_afterExpectedPIDPolicyArmed {
+                return await onArmed(spec, receipt)
+            }
+        #endif
+        return armed
     }
 
     private func resolveRouteAuthority() async -> MCPRunRouteAuthorityDecision {

@@ -99,6 +99,10 @@ import XCTest
 
         private func exerciseRunner(_ kind: AgentProviderKind, catalogBeforeSend: Bool, retainedOffer: RetainedOfferCase? = nil) async throws {
             let reusesConnection = retainedOffer != nil
+            let codexDebugKey = "enableCodexDebugLogging"
+            let previousCodexDebug = UserDefaults.standard.object(forKey: codexDebugKey)
+            if kind == .codexExec { UserDefaults.standard.set(true, forKey: codexDebugKey) }
+            defer { UserDefaults.standard.set(previousCodexDebug, forKey: codexDebugKey) }
             let manager = ServerNetworkManager.shared
             try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
             let window = WindowState(domainRuntime: AppDomainRuntimeComposition.shared.runtime)
@@ -114,6 +118,9 @@ import XCTest
             let provider = HeldDiscoveryProvider()
             let clientName = kind == .codexExec ? AgentProviderKind.codexMCPClientID : AgentProviderKind.claudeMCPClientID
             let runID = UUID()
+            var runRouteID = windowID
+            var fixtureWorkspace: WorkspaceModel?
+            let authority = DomainWorkspaceAuthorityClient(store: AppDomainRuntimeComposition.shared.runtime.workspaceStore, windowID: windowID)
             let observerTab = UUID()
             let targetTab = UUID()
             var transports: [PersistentMCPTestEndpoint] = []
@@ -145,30 +152,46 @@ import XCTest
                     await transport.connectionManager.stop()
                     await manager.debugRemoveConnection(transport.connectionID)
                 }
-                await manager.clearClientConnectionPolicy(for: clientName, windowID: windowID, runID: runID)
-                await manager.cleanupRunRoutingState(for: runID, windowID: windowID)
+                await manager.clearClientConnectionPolicy(for: clientName, windowID: runRouteID, runID: runID)
+                await manager.cleanupRunRoutingState(for: runID, windowID: runRouteID)
                 window.apiSettingsViewModel.isClaudeCodeConnected = wasClaudeConnected
                 window.apiSettingsViewModel.isCodexConnected = wasCodexConnected
+                await vm.test_retireAndCancelFixture()
                 await window.tearDown()
+                if let fixtureWorkspace {
+                    let deleted = await authority.delete(workspaceID: fixtureWorkspace.id, expectedCatalogRevision: nil, expectedWorkspaceRevision: nil)
+                    XCTAssertEqual(deleted.disposition, .applied)
+                    let directory = window.workspaceManager.workspaceFileURL(for: fixtureWorkspace).deletingLastPathComponent()
+                    if FileManager.default.fileExists(atPath: directory.path) {
+                        do { try FileManager.default.removeItem(at: directory) }
+                        catch { XCTFail("Remove late-qualification fixture storage: \(error)") }
+                    }
+                }
                 await AppDomainRuntimeComposition.shared.unregister(registration.handle)
                 WindowStatesManager.shared.unregisterWindowState(window)
             }
             do {
                 await window.workspaceManager.awaitInitialized()
                 var workspace = WorkspaceModel(name: "Late catalog qualification", repoPaths: [])
-                workspace.isEphemeral = true
                 workspace.composeTabs = [
                     ComposeTabState(id: observerTab, name: "Observer", activeAgentSessionID: UUID()),
                     ComposeTabState(id: targetTab, name: "Target", activeAgentSessionID: UUID())
                 ]
                 workspace.activeComposeTabID = observerTab
+                let created = try await authority.create(workspace, fileURL: window.workspaceManager.workspaceFileURL(for: workspace))
+                guard created.disposition == .applied else { throw MCPError.internalError("Late-qualification fixture workspace was not committed") }
+                fixtureWorkspace = workspace
                 for tab in workspace.composeTabs {
                     let payload = try AgentSession(id: XCTUnwrap(tab.activeAgentSessionID), workspaceID: workspace.id, composeTabID: tab.id, name: tab.name, agentKind: kind.rawValue, autoWakeOnOversightUpdates: false)
                     _ = try await AgentSessionDataService.shared.saveAgentSession(payload, for: workspace)
                 }
-                window.workspaceManager.workspaces.append(workspace)
+                let projection = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
+                let refreshed = await projection.refreshForAgentAdmission()
+                XCTAssertTrue(refreshed)
                 let switched = await window.workspaceManager.switchWorkspace(to: workspace, saveState: false)
                 XCTAssertTrue(switched.didSwitch)
+                let adopted = await vm.awaitWorkspaceRuntimeAdoption(expectedWorkspaceID: workspace.id)
+                XCTAssertTrue(adopted)
                 window.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: false)
                 let observer = await vm.ensureSessionReady(tabID: observerTab, reconnectActiveProviders: false)
                 session = observer
@@ -179,6 +202,9 @@ import XCTest
                 observer.runState = .completed
                 vm.refreshDerivedTranscriptState(for: observer, publishActivePresentation: false)
                 let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(vm, tabID: observerTab)
+                let exactRouteID = endpoint.windowID
+                runRouteID = exactRouteID
+                XCTAssertNotEqual(exactRouteID, windowID, "Provider policy belongs to the admitted writer's route")
                 guard case .added = try await bridge.addMonitorLink(observerSessionID: endpoint.sessionID, rawTargetSessionID: XCTUnwrap(target.activeAgentSessionID).uuidString) else {
                     throw CancellationError()
                 }
@@ -200,7 +226,17 @@ import XCTest
                 if !reusesConnection {
                     await manager.debugSetReturnedCatalogToolsForTesting { tools, _ in tools.filter { $0.name != MCPWindowToolName.selfNoop } }
                 }
-                await manager.installClientConnectionPolicy(for: clientName, windowID: windowID, restrictedTools: AgentModeMCPToolPolicy.restrictedTools, oneShot: true, reason: "late-catalog fixture", ttl: 60, tabID: observerTab, runID: runID, additionalTools: reusesConnection ? AgentModeMCPPolicyInstaller.additionalTools(for: kind) : nil, purpose: .agentModeRun, taskLabelKind: nil, allowsAgentExternalControlTools: false)
+                let catalogAttempt = observer.beginRunAttempt(source: "late-catalog initial provider route")
+                defer { _ = observer.endRunAttempt(ifCurrent: catalogAttempt, source: "late-catalog fixture cleanup") }
+                let origin = vm.runtimeHost
+                let policyReceipt = await manager.installClientConnectionPolicy(
+                    for: clientName, windowID: runRouteID, restrictedTools: AgentModeMCPToolPolicy.restrictedTools,
+                    oneShot: true, reason: "late-catalog fixture", ttl: 60, tabID: observerTab, runID: runID,
+                    additionalTools: reusesConnection ? AgentModeMCPPolicyInstaller.additionalTools(for: kind) : nil,
+                    purpose: .agentModeRun, taskLabelKind: nil, allowsAgentExternalControlTools: false,
+                    routingOwner: origin.route, originatingContextSource: origin.originatingContextSource
+                )
+                _ = try XCTUnwrap(policyReceipt, "The initial catalog must belong to the exact host run")
                 await manager.setEnabled(true)
                 let initial = try await PersistentMCPTestEndpoint.make(label: "late-catalog-initial", networkManager: manager, clientName: clientName, requiredToolNames: [MCPWindowToolName.agentSessionLink])
                 transports.append(initial)
@@ -208,6 +244,7 @@ import XCTest
                 _ = try await provider.listTools()
                 XCTAssertEqual(vm.linkExecutionRuntime.selfNoopHintIsCurrent(for: observer), reusesConnection)
                 let initialOffer = await manager.debugRunCatalogProjection(for: runID)
+                XCTAssertTrue(observer.endRunAttempt(ifCurrent: catalogAttempt, source: "late-catalog begin idle qualification"))
                 observer.isPreparingInitialWorktree = true
                 observer.oversight.autoWakeOnUpdates = true
                 target.installRunID(UUID())
@@ -330,13 +367,11 @@ import XCTest
                     await cleanup()
                     return
                 }
-                // Keep the production policy installer. Only process/PID admission is replaced
-                // with this test process's real socket client after that policy has been installed.
-                vm.test_initializeRunService(mcpServerEnabler: { true }, expectedPIDPolicyArmer: { spec in
+                // Keep the production lease, policy installation and route validation. Supply
+                // the controlled provider's real socket when the originating policy is armed.
+                origin.route.test_afterExpectedPIDPolicyArmed = { spec, registration in
                     guard let name = spec.clientName else { return false }
-                    await manager.registerExpectedAgentPID(getpid(), for: name, runID: spec.runID)
-                    let armed = await manager.requireExpectedAgentPIDForPendingPolicy(for: name, runID: spec.runID, windowID: spec.windowID)
-                    guard armed else { return false }
+                    await manager.registerExpectedAgentPID(getpid(), for: name, runID: spec.runID, registration: registration)
                     if let retainedOffer {
                         if retainedOffer == .benign || retainedOffer == .expiry {
                             let currentInputs = await manager.debugCurrentRunCatalogOfferInputs(for: runID)
@@ -403,8 +438,8 @@ import XCTest
                         } catch {
                             XCTFail("Retention edge fixture failed: \(error)")
                         }
-                        let committed = await manager.isRunRouteAuthoritativelyCommitted(runID: spec.runID, windowID: spec.windowID, tabID: spec.tabID, expectedAgentPID: getpid())
-                        await manager.clearExpectedAgentPID(getpid(), for: name, runID: spec.runID)
+                        let committed = await manager.isRunRouteAuthoritativelyCommitted(runID: spec.runID, windowID: spec.windowID, tabID: spec.tabID, expectedAgentPID: getpid(), registration: registration)
+                        await manager.clearExpectedAgentPID(getpid(), for: name, runID: spec.runID, registration: registration)
                         return committed
                     }
                     if catalogBeforeSend {
@@ -416,21 +451,24 @@ import XCTest
                         await provider.attach(next)
                         _ = try await provider.listTools()
                         try await Self.assertReturnedDeclaration(runID: spec.runID, expected: catalogBeforeSend)
-                        let committed = await manager.isRunRouteAuthoritativelyCommitted(runID: spec.runID, windowID: spec.windowID, tabID: spec.tabID, expectedAgentPID: getpid())
-                        await manager.clearExpectedAgentPID(getpid(), for: name, runID: spec.runID)
+                        let committed = await manager.isRunRouteAuthoritativelyCommitted(runID: spec.runID, windowID: spec.windowID, tabID: spec.tabID, expectedAgentPID: getpid(), registration: registration)
+                        await manager.clearExpectedAgentPID(getpid(), for: name, runID: spec.runID, registration: registration)
                         return committed
                     } catch {
                         XCTFail("Actual startup catalog failed: \(error)")
-                        await manager.clearExpectedAgentPID(getpid(), for: name, runID: spec.runID)
+                        await manager.clearExpectedAgentPID(getpid(), for: name, runID: spec.runID, registration: registration)
                         return false
                     }
-                })
+                }
+                defer { origin.route.test_afterExpectedPIDPolicyArmed = nil }
                 if kind == .claudeCode {
                     window.apiSettingsViewModel.isClaudeCodeConnected = true
-                    let controller = ClaudeNativeProcessSessionController(host: ClaudeNativeSessionAppHost(), runID: runID, tabID: observerTab, windowID: windowID, workspacePath: nil, config: .discovery(commandName: "/usr/bin/false", runtimeVariant: .standard))
+                    let config = ClaudeCodeAgentConfig.discovery(commandName: "/usr/bin/false", runtimeVariant: .standard)
+                    let controller = ClaudeNativeProcessSessionController(host: ClaudeNativeSessionAppHost(), runID: runID, tabID: observerTab, windowID: exactRouteID, workspacePath: nil, config: config)
                     native = controller
                     await controller.test_installConfigurationTransport(initialized: reusesConnection, controlRequest: { _ in ["session_id": "late-catalog-claude"] }, write: { frames.append($0) })
-                    observer.claudeController = controller
+                    let runtimeConfig = ClaudeCompatiblePluginBridge.runtimeConfig(from: config, mode: .agentMode)
+                    observer.claudeController = ClaudeCompatibleNativeSessionAdapter(runtimeConfig: runtimeConfig, routingIdentity: (runID, exactRouteID)) { controller }
                     let binding = vm.providerBindingService
                     let runtime = ClaudeControllerLaunchPolicy.resolve(permissionMode: binding.runtimePermission(for: kind, profile: observer.permissionProfile).claudePermissionMode, profile: observer.permissionProfile, defaults: binding.preferences.defaults, securePermissions: binding.preferences.securePermissions)
                     let permission = ClaudeAgentToolPreferences.resolvePermissionMode(requestedMode: runtime.permissionMode ?? observer.permissionProfile.claudePermissionMode, agentKind: kind, selectedModelRaw: observer.selectedModelRaw, unsupportedAutoFallback: .autoApproveEdits)
@@ -443,22 +481,6 @@ import XCTest
                     observer.codexControllerTaskLabelKind = observer.mcpControlContext?.taskLabelKind
                     observer.codexControllerWorkspacePaths = try vm.codexRuntimeWorkspacePaths(for: observer)
                     observer.codexControllerFeatureState = .init(computerUseEnabled: false, goalSupportEnabled: CodexGoalSupport.isEnabled, reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled, memoriesEnabled: CodexMemories.isEnabled, capabilities: vm.providerBindingService.codexCapabilitiesForLaunch(isMCPRelated: observer.isMCPRelated))
-                    codex.setStartOrResumeHook {
-                        await manager.registerExpectedAgentPID(getpid(), for: clientName, runID: runID)
-                        let armed = await manager.requireExpectedAgentPIDForPendingPolicy(for: clientName, runID: runID, windowID: windowID)
-                        if catalogBeforeSend { await manager.debugSetReturnedCatalogToolsForTesting(nil) }
-                        do {
-                            XCTAssertTrue(armed)
-                            let next = try await PersistentMCPTestEndpoint.make(label: "late-catalog-codex-startup", networkManager: manager, clientName: clientName, useProductionAgentAdmission: true, requiredToolNames: [MCPWindowToolName.agentSessionLink])
-                            await MainActor.run { transports.append(next) }
-                            await provider.attach(next)
-                            _ = try await provider.listTools()
-                            try await Self.assertReturnedDeclaration(runID: runID, expected: catalogBeforeSend)
-                        } catch {
-                            XCTFail("Actual Codex startup socket failed: \(error)")
-                        }
-                        await manager.clearExpectedAgentPID(getpid(), for: clientName, runID: runID)
-                    }
                 }
                 let outcome = AgentRunStartOutcomeRecorder()
                 await vm.startAgentRun(tabID: observerTab, initialMessage: "", directStartOptions: .laneUpdate(wakeID: attempt.wakeID), startOutcome: outcome)

@@ -359,6 +359,9 @@ final class MCPHostRouteResources {
     #if DEBUG
         /// Suspend the actual transfer after tentative publication to exercise actor reentrancy.
         var test_afterProcessConnectionTransfer: (@MainActor @Sendable (MCPRunRoutingCleanupReceipt) async -> Void)?
+        /// An in-process provider fixture can supply its real socket after the exact policy is armed.
+        /// The fixture may stop its own startup, but a successful hook never substitutes for route proof.
+        var test_afterExpectedPIDPolicyArmed: (@MainActor @Sendable (MCPBootstrapLeaseSpec, MCPRunRoutingCleanupReceipt) async -> Bool)?
     #endif
 
     /// Join original publications before transferring the existing domain receipt and context.

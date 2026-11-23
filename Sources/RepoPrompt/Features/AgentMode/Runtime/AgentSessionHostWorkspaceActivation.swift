@@ -199,6 +199,12 @@ final class AgentSessionHostWorkspaceActivation {
         isCurrent ? settings.settings.agentModeAvailabilityContext : nil
     }
 
+    #if DEBUG
+        func test_hasSettingsLease(from owner: APISettingsViewModel) -> Bool {
+            !settings.isReleased && settings.settings === owner
+        }
+    #endif
+
     func capture(
         command: AgentSessionRuntimeStore.Command, rootIDs: [UUID], route: MCPHostRouteResources
     ) async throws -> AgentSessionHostStartupResources {

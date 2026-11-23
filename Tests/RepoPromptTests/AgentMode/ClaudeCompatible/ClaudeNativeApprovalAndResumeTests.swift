@@ -3676,9 +3676,11 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
             let registration = try await AppDomainRuntimeComposition.shared.register(window.mcpServer.windowMCPToolCatalogService)
             let vm = window.agentModeViewModel
             var connections: [PersistentMCPTestEndpoint] = []
-            var runIDs: [UUID] = []
+            var policies: [MCPRunRoutingCleanupReceipt] = []
+            var fixtureWorkspace: WorkspaceModel?
             var session: AgentTabSession?
             var storeRegistration: AgentRunSessionStore.Registration?
+            let authority = DomainWorkspaceAuthorityClient(store: AppDomainRuntimeComposition.shared.runtime.workspaceStore, windowID: window.windowID)
             let cleanup: @MainActor () async -> Void = {
                 if let session { await vm.claudeCoordinator.shutdownClaudeSession(session) }
                 if let storeRegistration { await AgentRunSessionStore.cleanup(registration: storeRegistration) }
@@ -3687,11 +3689,20 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
                     await connection.connectionManager.stop()
                     await manager.debugRemoveConnection(connection.connectionID)
                 }
-                for runID in runIDs {
-                    await manager.clearClientConnectionPolicy(for: AgentProviderKind.claudeMCPClientID, windowID: window.windowID, runID: runID)
-                    await manager.cleanupRunRoutingState(for: runID, windowID: window.windowID)
+                for policy in policies {
+                    await manager.cleanupRunRoutingState(ownedBy: policy)
                 }
+                await vm.test_retireAndCancelFixture()
                 await window.tearDown()
+                if let fixtureWorkspace {
+                    let deleted = await authority.delete(workspaceID: fixtureWorkspace.id, expectedCatalogRevision: nil, expectedWorkspaceRevision: nil)
+                    XCTAssertEqual(deleted.disposition, .applied)
+                    let directory = window.workspaceManager.workspaceFileURL(for: fixtureWorkspace).deletingLastPathComponent()
+                    if FileManager.default.fileExists(atPath: directory.path) {
+                        do { try FileManager.default.removeItem(at: directory) }
+                        catch { XCTFail("Remove Claude route fixture storage: \(error)") }
+                    }
+                }
                 await AppDomainRuntimeComposition.shared.unregister(registration.handle)
                 WindowStatesManager.shared.unregisterWindowState(window)
             }
@@ -3699,15 +3710,22 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
                 await window.workspaceManager.awaitInitialized()
                 let tabID = UUID(), sessionID = UUID()
                 var workspace = WorkspaceModel(name: "Claude adopted route fixture", repoPaths: [])
-                workspace.isEphemeral = true
                 workspace.composeTabs = [ComposeTabState(id: tabID, name: "Claude route", activeAgentSessionID: sessionID)]
                 workspace.activeComposeTabID = tabID
+                let created = try await authority.create(workspace, fileURL: window.workspaceManager.workspaceFileURL(for: workspace))
+                _ = try XCTUnwrap(created.disposition == .applied ? created : nil)
+                fixtureWorkspace = workspace
                 let persisted = AgentSession(id: sessionID, workspaceID: workspace.id, composeTabID: tabID, name: "Claude route", agentKind: AgentProviderKind.claudeCode.rawValue)
                 _ = try await AgentSessionDataService.shared.saveAgentSession(persisted, for: workspace)
-                window.workspaceManager.workspaces.append(workspace)
+                let projection = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
+                let refreshed = await projection.refreshForAgentAdmission()
+                XCTAssertTrue(refreshed)
                 let switched = await window.workspaceManager.switchWorkspace(to: workspace, saveState: false)
                 XCTAssertTrue(switched.didSwitch)
-                window.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: true)
+                let adopted = await vm.awaitWorkspaceRuntimeAdoption(expectedWorkspaceID: workspace.id)
+                let host = try XCTUnwrap(adopted ? vm.runtimeHost : nil)
+                XCTAssertNotEqual(host.routeID, window.windowID)
+                window.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: false)
                 let live = await vm.ensureSessionReady(tabID: tabID, reconnectActiveProviders: false)
                 session = live
                 let registered = await AgentRunSessionStore.register(sessionID: sessionID)
@@ -3715,16 +3733,24 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
                 live.mcpControlContext = try .init(sessionID: sessionID, activationID: UUID(), writerIdentity: controlWriterIdentity(for: live), registration: registered, currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil, originatingConnectionID: nil, interactionTransport: .mcp(sessionID: sessionID, originatingConnectionID: nil), suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: false, taskLabelKind: .pair, autoEditOverride: nil)
                 let controller = MonitorFakeNativeController()
                 let runID = UUID()
-                runIDs.append(runID)
                 live.installRunID(runID)
                 live.claudeController = controller
-                _ = await vm.claudeCoordinator.test_installEventListener(for: live)
-                @MainActor func connect(_ runID: UUID) async throws -> PersistentMCPTestEndpoint {
-                    await manager.installClientConnectionPolicy(for: AgentProviderKind.claudeMCPClientID, windowID: window.windowID, restrictedTools: AgentModeMCPToolPolicy.restrictedTools, oneShot: true, reason: "Claude adoption route regression", ttl: 60, tabID: tabID, runID: runID, additionalTools: [MCPWindowToolName.getFileTree], purpose: .agentModeRun, taskLabelKind: .pair, allowsAgentExternalControlTools: false)
+                let originalListener = await vm.claudeCoordinator.test_installEventListener(for: live)
+                @MainActor func connect(_ runID: UUID) async throws -> (PersistentMCPTestEndpoint, MCPRunRoutingCleanupReceipt) {
+                    let policy = await manager.installClientConnectionPolicy(
+                        for: AgentProviderKind.claudeMCPClientID, windowID: host.routeID,
+                        restrictedTools: AgentModeMCPToolPolicy.restrictedTools, oneShot: true,
+                        reason: "Claude adoption route regression", ttl: 60, tabID: tabID, runID: runID,
+                        additionalTools: [MCPWindowToolName.getFileTree], purpose: .agentModeRun, taskLabelKind: .pair,
+                        allowsAgentExternalControlTools: false, routingOwner: host.route,
+                        originatingContextSource: host.originatingContextSource
+                    )
+                    let receipt = try XCTUnwrap(policy)
+                    policies.append(receipt)
                     await manager.setEnabled(true)
                     let endpoint = try await PersistentMCPTestEndpoint.make(label: "claude-adoption-route", networkManager: manager, clientName: AgentProviderKind.claudeMCPClientID, requiredToolNames: [MCPWindowToolName.getFileTree])
                     connections.append(endpoint)
-                    return endpoint
+                    return (endpoint, receipt)
                 }
                 @MainActor func callTree(_ connection: PersistentMCPTestEndpoint, runID: UUID) async throws {
                     let response = try await connection.callTool(name: MCPWindowToolName.getFileTree, arguments: ["type": "roots"], timeoutSeconds: 3)
@@ -3734,9 +3760,14 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
                     XCTAssertNotEqual(result["isError"] as? Bool, true)
                     let routed = await manager.debugCachedRunID(for: connection.connectionID)
                     XCTAssertEqual(routed, runID)
-                    XCTAssertEqual(window.mcpServer.runRouteBindings.connectionID(forRunID: runID), connection.connectionID)
+                    XCTAssertEqual(host.route.runRouteBindings.connectionID(forRunID: runID), connection.connectionID)
                 }
-                let connection = try await connect(runID)
+                // The process connection is initially admitted during a scheduled attempt. Its
+                // committed read route survives returning the controller to the idle listener.
+                let initial = live.beginRunAttempt(source: "Claude scheduled process connection")
+                let (connection, originalPolicy) = try await connect(runID)
+                try XCTUnwrap(originalListener).routingCleanup = .registered([originalPolicy])
+                XCTAssertTrue(live.endRunAttempt(ifCurrent: initial, source: "Claude process now idle"))
                 var epochs: [AgentRunTurnEpoch] = []
                 for index in 0 ..< 2 {
                     let turnID = UUID()
@@ -3748,7 +3779,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
                     await controller.emit(.stream(.init(type: "content", text: "route answer \(index)")))
                     await controller.emit(.turnsCompleted(turnIDs: [turnID], status: .completed))
                     await until("real-route terminal publishes") { live.runState == .completed && !live.runLifecycle.terminalCommitInProgress }
-                    XCTAssertEqual(window.mcpServer.runRouteBindings.connectionID(forRunID: runID), connection.connectionID)
+                    XCTAssertEqual(host.route.runRouteBindings.connectionID(forRunID: runID), connection.connectionID)
                 }
                 XCTAssertNotEqual(epochs[0], epochs[1])
                 let preparation = Gate()
@@ -3762,9 +3793,11 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
                 await until("third turn waits in fresh epoch preparation") { preparation.isWaiting }
                 XCTAssertEqual(vm.mcpRuntime.mcpSnapshot(for: live)?.status, .running)
                 let adoption = listener.adoptionTask
-                let candidate = try XCTUnwrap(vm.agentSessionLinkCandidate(tabID: tabID, sessionID: sessionID, tabName: "Claude route", isWindowClosing: false))
+                let execution = try XCTUnwrap(host.scope.linkExecution)
+                let endpoint = try XCTUnwrap(execution.agentSessionLinkObserverEndpoint(tabID: tabID))
+                let candidate = try XCTUnwrap(execution.agentSessionLinkRuntimeCandidate(for: endpoint, displayName: "Claude route"))
                 let observer = DomainAgentSessionLinkEndpointIdentity(windowID: 2, workspaceID: UUID(), tabID: UUID(), sessionID: UUID(), persistentBindingGeneration: UUID(), bindingTransitionGeneration: 1)
-                let stop = await vm.linkExecutionRuntime.agentSessionLinkPerformStop(
+                let stop = await execution.agentSessionLinkPerformStop(
                     to: candidate,
                     request: .init(requestID: UUID(), linkID: UUID(), linkGeneration: 1, observerEndpoint: observer, observerDisplayName: "Overseer"),
                     liveness: { .init(observerEndpointIsLive: true, targetEndpointIsLive: true, targetWindowIsClosing: false) },
@@ -3782,13 +3815,17 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
                 try await AsyncTestWait.waitUntil("Stop retires the process route", timeout: 3) {
                     await manager.debugCachedRunID(for: connection.connectionID) == nil
                 }
-                XCTAssertNil(window.mcpServer.runRouteBindings.connectionID(forRunID: runID))
+                XCTAssertNil(host.route.runRouteBindings.connectionID(forRunID: runID))
+                XCTAssertTrue(originalPolicy.isConsumed)
                 let successorID = UUID()
-                runIDs.append(successorID)
                 live.installRunID(successorID)
-                let successor = try await connect(successorID)
+                let successorAttempt = live.beginRunAttempt(source: "Claude successor process connection")
+                let (successor, successorPolicy) = try await connect(successorID)
                 await vm.cleanupMCPRunRoutingForDiscardedSession(boundSessionID: sessionID, liveSession: live, explicitRunID: runID, reason: "late retired Claude cleanup fixture")
+                await manager.cleanupRunRoutingState(ownedBy: originalPolicy)
+                XCTAssertFalse(successorPolicy.isConsumed)
                 try await callTree(successor, runID: successorID)
+                XCTAssertTrue(live.endRunAttempt(ifCurrent: successorAttempt, source: "Claude route fixture complete"))
             } catch {
                 await cleanup()
                 throw error
