@@ -556,15 +556,24 @@ struct AgentRunMCPToolService {
         detach || timeoutSeconds <= 0 ? capturedDefaultWaitSeconds : timeoutSeconds
     }
 
-    @MainActor private struct StartResult {
+    struct StartResult {
         let value: Value
         let sessionID: UUID
         let metadata: MCPRequestMetadata
-        let delivery: AgentModeViewModel.MCPInstructionDispatch
+        let delivery: AgentMCPInstructionDispatch
         let running: Bool
     }
 
-    private func executeStart(args: [String: Value]) async throws -> Value {
+    struct StartRequest {
+        let message: String
+        let workflow: AgentWorkflowDefinition?
+        let worktree: AgentMCPStartWorktreeCoordinator.Request
+        let detached: Bool
+        let defaultWaitSeconds: TimeInterval
+        let timeoutSeconds: TimeInterval
+    }
+
+    func parseStartRequest(_ args: [String: Value]) throws -> StartRequest {
         let message = try resolveMessage(args["message"], name: "message")
         let workflow = try resolveWorkflow(args: args)
         let worktreeStartRequest = try startWorktreeCoordinator.parseRequest(args: args)
@@ -578,31 +587,65 @@ struct AgentRunMCPToolService {
             args["timeout"],
             capturedDefaultWaitSeconds: capturedDefaultWaitSeconds
         )
+        return .init(
+            message: message, workflow: workflow, worktree: worktreeStartRequest, detached: detach,
+            defaultWaitSeconds: capturedDefaultWaitSeconds, timeoutSeconds: timeoutSeconds
+        )
+    }
 
+    private func executeStart(args: [String: Value]) async throws -> Value {
+        let request = try parseStartRequest(args)
         let targetWindow = try requireTargetWindow()
         let agentModeVM = targetWindow.agentModeViewModel
+        return try await executeResolvedStart(request, operation: { expiry in
+            try await performStart(
+                args: args, message: request.message, workflow: request.workflow,
+                worktreeStartRequest: request.worktree, targetWindow: targetWindow, expiry: expiry
+            )
+        }, expiredResult: { sessionID in
+            StartResult(
+                value: Self.startExpiryValue(sessionID: sessionID, agentModeVM: agentModeVM),
+                sessionID: sessionID, metadata: .init(connectionID: nil, clientName: nil, windowID: nil),
+                delivery: .startedRun, running: false
+            )
+        }, awaitStartedRun: { result in
+            try await waitForStartedRun(request, result: result, read: windowReadAccess(agentModeVM))
+        })
+    }
+
+    func executeResolvedStart(
+        _ request: StartRequest,
+        operation: @escaping @MainActor (AgentRunStartExpiry) async throws -> StartResult,
+        expiredResult: (UUID) throws -> StartResult,
+        awaitStartedRun: (StartResult) async throws -> Value
+    ) async throws -> Value {
         let defaultExpiry = AgentRunStartExpiry(toolName: toolName, budgetSeconds: Self.startBudgetSeconds(
-            detach: detach, timeoutSeconds: timeoutSeconds, capturedDefaultWaitSeconds: capturedDefaultWaitSeconds
+            detach: request.detached, timeoutSeconds: request.timeoutSeconds, capturedDefaultWaitSeconds: request.defaultWaitSeconds
         ))
         #if DEBUG
             let expiry = testStartExpiryOverride ?? defaultExpiry
         #else
             let expiry = defaultExpiry
         #endif
+
         let result = try await AgentRunStartBudget.run(expiry: expiry) {
-            try await performStart(args: args, message: message, workflow: workflow, worktreeStartRequest: worktreeStartRequest, targetWindow: targetWindow, expiry: expiry)
+            try await operation(expiry)
         } onExpiry: {
             guard let sessionID = expiry.activatedSessionID else { throw expiry.timeoutError }
-            return StartResult(value: Self.startExpiryValue(sessionID: sessionID, agentModeVM: agentModeVM), sessionID: sessionID, metadata: .init(connectionID: nil, clientName: nil, windowID: nil), delivery: .startedRun, running: false)
+            return try expiredResult(sessionID)
         }
-        if detach || !result.running || timeoutSeconds <= 0 {
+        if request.detached || !result.running || request.timeoutSeconds <= 0 {
             return result.value
         }
-        return try await waitForInterestingState(
-            sessionID: result.sessionID, read: windowReadAccess(agentModeVM), metadata: result.metadata,
-            timeoutSeconds: timeoutSeconds, stage: "starting",
+        return try await awaitStartedRun(result)
+    }
+
+    func waitForStartedRun(_ request: StartRequest, result: StartResult, read: RunReadAccess) async throws -> Value {
+        try await waitForInterestingState(
+            sessionID: result.sessionID, read: read, metadata: result.metadata,
+            timeoutSeconds: request.timeoutSeconds, stage: "starting",
             message: "Waiting for the started run to finish or request input...",
-            workflow: workflow, initialDelivery: result.delivery
+            workflow: request.workflow, initialDelivery: result.delivery
         )
     }
 
@@ -1257,7 +1300,7 @@ struct AgentRunMCPToolService {
     }
 
     private func executeWaitAny(args: [String: Value]) async throws -> Value {
-        let references = try parseSessionIDArray(args)
+        let references = try Self.parseSessionIDArray(args)
         let targetWindow = try requireTargetWindow()
         let agentModeVM = resolvedAgentModeViewModel(targetWindow)
         let sessionIDs = try await resolveControlSessionIDs(references, targetWindow: targetWindow, agentModeVM: agentModeVM)
@@ -1389,7 +1432,7 @@ struct AgentRunMCPToolService {
     }
 
     private func executePollMany(args: [String: Value]) async throws -> Value {
-        let references = try parseSessionIDArray(args)
+        let references = try Self.parseSessionIDArray(args)
         let targetWindow = try requireTargetWindow()
         let agentModeVM = resolvedAgentModeViewModel(targetWindow)
         let sessionIDs = try await resolveControlSessionIDs(references, targetWindow: targetWindow, agentModeVM: agentModeVM)
@@ -1417,6 +1460,11 @@ struct AgentRunMCPToolService {
             }
         }
         return decoratedMultiPollValue(sessionIDs: sessionIDs, snapshots: snapshots, overseers: overseers)
+    }
+
+    func executeResolvedPollMany(sessionIDs: [UUID], read: RunReadAccess) async -> Value {
+        let snapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, read: read)
+        return decoratedMultiPollValue(sessionIDs: sessionIDs, snapshots: snapshots, overseers: [:])
     }
 
     private func executeCancel(args: [String: Value]) async throws -> Value {
@@ -3633,8 +3681,8 @@ struct AgentRunMCPToolService {
         }
     }
 
-    private func parseSessionIDArray(_ args: [String: Value]) throws -> [String] {
-        if normalizedString(args["session_id"]) != nil {
+    static func parseSessionIDArray(_ args: [String: Value]) throws -> [String] {
+        if AgentMCPToolHelpers.normalizedString(args["session_id"]) != nil {
             throw MCPError.invalidParams("Specify either session_id or session_ids, not both.")
         }
         guard let raw = args["session_ids"] else {
@@ -3644,7 +3692,7 @@ struct AgentRunMCPToolService {
             throw MCPError.invalidParams("session_ids must be a non-empty array of session IDs.")
         }
         return try values.map { value -> String in
-            guard let reference = normalizedString(value) else {
+            guard let reference = AgentMCPToolHelpers.normalizedString(value) else {
                 throw MCPError.invalidParams("session_ids must contain only non-empty strings.")
             }
             return reference

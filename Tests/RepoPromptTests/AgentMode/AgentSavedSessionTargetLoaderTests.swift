@@ -552,6 +552,21 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                     let childGeneration = try XCTUnwrap(childReceipt.routingWaitGeneration)
                     await MCPRoutingWaiter.notifyRouted(runID: childReceipt.runID, generation: childGeneration)
                     let launchedID = launched.command.identity.sessionID
+                    let reference = Value.string(launchedID.uuidString)
+                    let polled = try await spawn.executeControlRead(["session_id": reference], poll: true)
+                    XCTAssertEqual(polled.objectValue?["session_id"], reference)
+                    XCTAssertEqual(polled.objectValue?["status"], .string("running"))
+                    let batch = try await spawn.executeControlRead(["session_ids": .array([reference, reference])], poll: true)
+                    XCTAssertEqual(batch.objectValue?["poll"]?.objectValue?["polled_count"], .int(1))
+                    XCTAssertEqual(batch.objectValue?["snapshots"]?.arrayValue?.first?.objectValue?["session_id"], reference)
+                    let waited = try await spawn.executeControlRead(["session_ids": .array([reference]), "timeout": .int(0)], poll: false)
+                    XCTAssertEqual(waited.objectValue?["session_id"], reference)
+                    do {
+                        _ = try await spawn.executeControlCancellation(["session_id": .string(fixture.sessionID.uuidString)])
+                        XCTFail("Originating parent cannot cancel itself through its child-control route")
+                    } catch {
+                        XCTAssertEqual(error.localizedDescription, AgentSessionTargetOperationGuard.denialError(sessionID: fixture.sessionID).localizedDescription)
+                    }
                     let readTargets = try await spawn.captureReadTargets([launchedID], operation: .runWait)
                     let childReadAccess = spawn.readAccess(for: readTargets, operation: .runWait)
                     let childCursor = try XCTUnwrap(childReadAccess.waitCursor(launchedID))
