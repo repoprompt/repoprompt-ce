@@ -2000,6 +2000,11 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             defer { window.apiSettingsViewModel.isClaudeCodeConnected = connected }
             let vm = window.agentModeViewModel
             let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(vm, tabID: session.tabID)
+            let setupAttempt = try XCTUnwrap(session.activeRunOwnership)
+            guard session.endRunAttempt(ifCurrent: setupAttempt, source: "inactive after held catalog setup") else {
+                XCTFail("Only the exact setup attempt may yield the idle fixture")
+                throw CancellationError()
+            }
             session.appendItem(.user("ordinary baseline", sequenceIndex: session.nextSequenceIndex))
             session.appendItem(.assistant("ordinary conclusion", sequenceIndex: session.nextSequenceIndex))
             session.runState = .completed
@@ -2050,7 +2055,8 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 permissionMode: permission.effectiveMode, allowNativeBashTool: runtime.allowNativeBashTool,
                 mcpStrictMode: runtime.mcpStrictMode
             ), for: session)
-            vm.test_initializeRunService(mcpServerEnabler: { true }, connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in }, expectedPIDPolicyArmer: { _ in true })
+            // This test keeps the existing native pipe. Do not substitute a run service whose
+            // policy/PID callbacks would skip the real originating host's startup admission.
             let acceptedReturn = TestReleaseFence(name: "W3 actual native call before fake acceptance")
             defer { acceptedReturn.release() }
             await provider.setSendSuspension { await acceptedReturn.enterAndWait() }
