@@ -1698,6 +1698,8 @@ final class ManageWorktreeSessionAuthorityTests: XCTestCase {
                 _ = try git.runGit(["worktree", "add", "--detach", physical.path, "HEAD"], at: logical)
                 let identity = try XCTUnwrap(GitWorktreeIdentityResolver.resolve(atWorkTreeRoot: physical))
                 let vm = driver.window.agentModeViewModel
+                let adopted = await vm.awaitWorkspaceRuntimeAdoption(expectedWorkspaceID: driver.fixture.workspace.id)
+                _ = try XCTUnwrap(adopted ? vm.runtimeHost.workspaceActivation : nil, "Wait for the canonical Agent host, not just Git-data setup.")
                 let session = AgentModeViewModel.TabSession(tabID: driver.tabID)
                 session.hasLoadedPersistedState = true
                 let sessionID = UUID()

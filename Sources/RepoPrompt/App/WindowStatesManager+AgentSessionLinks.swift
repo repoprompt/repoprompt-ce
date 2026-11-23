@@ -382,7 +382,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         }
     }
 
-    private func independentLinkRuntime(
+    func independentLinkRuntime(
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> AgentSessionLinkExecutionRuntime? {
         guard !isTerminating,
@@ -963,7 +963,9 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
     func agentSessionLinkBootstrapState(
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> AgentSessionOverseerBootstrapState? {
-        guard !isTerminating, let window = modelRoutingWindow(withID: endpoint.windowID), !window.isClosing else { return nil }
+        guard !isTerminating else { return nil }
+        if let runtime = independentLinkRuntime(for: endpoint) { return runtime.agentSessionLinkBootstrapState(for: endpoint) }
+        guard let window = modelRoutingWindow(withID: endpoint.windowID), !window.isClosing else { return nil }
         return window.agentModeViewModel.agentSessionLinkBootstrapState(for: endpoint)
     }
 
@@ -971,6 +973,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> AgentSessionOverseerBootstrapRefusal? {
         guard !isTerminating else { return .terminating }
+        if let runtime = independentLinkRuntime(for: endpoint) { return runtime.agentSessionLinkBootstrapRefusal(for: endpoint) }
         guard let window = modelRoutingWindow(withID: endpoint.windowID), !window.isClosing else { return .notLoaded }
         return window.agentModeViewModel.agentSessionLinkBootstrapRefusal(for: endpoint)
     }
@@ -978,7 +981,17 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
     func agentSessionLinkActivateOverseer(
         for endpoint: DomainAgentSessionLinkEndpointIdentity, expected: AgentSessionOverseerBootstrapState
     ) -> Bool {
-        guard !isTerminating, let window = modelRoutingWindow(withID: endpoint.windowID), !window.isClosing else { return false }
+        guard !isTerminating else { return false }
+        if let runtime = independentLinkRuntime(for: endpoint) {
+            guard runtime.agentSessionLinkActivateOverseer(for: endpoint, expected: expected) else { return false }
+            if let session = runtime.sessions[endpoint.tabID] {
+                for window in allWindows where !window.isClosing && window.agentModeViewModel.runtimeSessionStore === runtime.scope {
+                    window.agentModeViewModel.agentSessionLinkRepaintCurrentPillIfOwned(session)
+                }
+            }
+            return true
+        }
+        guard let window = modelRoutingWindow(withID: endpoint.windowID), !window.isClosing else { return false }
         return window.agentModeViewModel.agentSessionLinkActivateOverseer(for: endpoint, expected: expected)
     }
 

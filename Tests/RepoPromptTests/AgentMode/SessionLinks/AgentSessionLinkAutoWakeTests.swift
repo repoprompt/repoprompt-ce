@@ -1786,7 +1786,34 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         let switched = await window.workspaceManager.requestWorkspaceSwitch(to: other, reason: "supersededAgentActivationWitness", silent: true)
         XCTAssertTrue(switched.didSwitch)
         try await AsyncTestWait.waitUntil("hold the obsolete composed host") { staleCandidate != nil }
+        let otherTabID = try XCTUnwrap(other.activeComposeTabID)
+        var readinessStarted = false
+        var readinessFinished = false
+        let readiness = Task { @MainActor in
+            readinessStarted = true
+            defer { readinessFinished = true }
+            return await agent.ensureSessionReady(tabID: otherTabID, expectedWorkspaceID: other.id)
+        }
+        defer { readiness.cancel() }
+        try await AsyncTestWait.waitUntil("start the exact B readiness request") { readinessStarted }
+        XCTAssertFalse(readinessFinished, "An emitted workspace selection is not a ready host")
+        XCTAssertNil(host.scope.sessions[otherTabID], "The unsettled B request must not create a writer in A")
+
+        var cancelledJoinStarted = false
+        let cancelledJoin = Task { @MainActor in
+            cancelledJoinStarted = true
+            return await agent.awaitWorkspaceRuntimeAdoption(expectedWorkspaceID: other.id)
+        }
+        try await AsyncTestWait.waitUntil("start the independently cancellable B join") { cancelledJoinStarted }
+        cancelledJoin.cancel()
+        let cancelledWasReady = await cancelledJoin.value
+        XCTAssertFalse(cancelledWasReady)
+        XCTAssertFalse(readinessFinished, "Cancelling one join must not cancel the producer or other joiners")
+
         try await activateVisibleLifetimeWorkspace(workspace, in: window)
+        let staleReadiness = await readiness.value
+        XCTAssertEqual(staleReadiness.operationAdmissionFailureMessage, AgentTabSession.loadingAdmissionFailureMessage)
+        XCTAssertNil(host.scope.sessions[otherTabID], "A superseded readiness request must not write into the reattached host")
         XCTAssertTrue(agent.runtimeHost === host)
         await gate.open()
         let stale = try XCTUnwrap(staleCandidate)
@@ -1901,17 +1928,13 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
     ) async throws {
         let manager = window.workspaceManager
         try await AsyncTestWait.waitUntil("project the canonical workspace") { manager.workspace(withID: workspace.id) != nil }
-        var completed = false
-        window.agentModeViewModel.test_afterWorkspaceSwitchAdoptionCompleted = { owner in
-            if owner.workspaceID == workspace.id { completed = true }
-        }
-        defer { window.agentModeViewModel.test_afterWorkspaceSwitchAdoptionCompleted = nil }
         let result = await manager.requestWorkspaceSwitch(to: workspace, reason: "visibleAgentLifetimeWitness", silent: true)
         guard result.didSwitch else {
             XCTFail("Production workspace switch did not complete: \(result)")
             throw AgentHostWorkspaceResources.Failure.authorityUnavailable
         }
-        try await AsyncTestWait.waitUntil("settle Agent workspace adoption") { completed }
+        let isReady = await window.agentModeViewModel.awaitWorkspaceRuntimeAdoption(expectedWorkspaceID: workspace.id)
+        XCTAssertEqual(isReady, expectsHost, "Wait for the exact production adoption result")
         if expectsHost {
             XCTAssertEqual(window.agentModeViewModel.runtimeHost.workspaceActivation?.key.owner.workspaceID, workspace.id)
         } else {

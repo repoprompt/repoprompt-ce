@@ -832,15 +832,31 @@ import XCTest
             }
             defer { manager.setAgentAdmissionCanonicalSnapshotHandlerForTesting(nil) }
             let recorder = AdmissionProviderRecorder(expectedCount: 1, blockProviders: false)
+            var admissionFinished = false
             let task = Task { @MainActor in
-                try await self.makeAgentRunStartService(window: fixture.window, recorder: recorder).execute(args: [
+                defer { admissionFinished = true }
+                return try await self.makeAgentRunStartService(window: fixture.window, recorder: recorder).execute(args: [
                     "op": .string("start"),
                     "message": .string("cancelled while reading authority"),
                     "detach": .bool(true),
                     "timeout": .int(0)
                 ])
             }
-            await gate.waitUntilEntered()
+            do {
+                try await waitUntil("canonical read hook or early admission exit") {
+                    if admissionFinished { return true }
+                    return await gate.hasEntered()
+                }
+            } catch {
+                task.cancel()
+                await gate.open()
+                throw error
+            }
+            guard await gate.hasEntered() else {
+                _ = try await task.value
+                XCTFail("Admission returned before the canonical read hook.")
+                return
+            }
             task.cancel()
             await gate.open()
             do {
@@ -2442,6 +2458,11 @@ import XCTest
         // Admission begins only once that setup and its badge publication have finished.
         await window.workspaceManager.waitUntilPostSwitchGitDataLoadComplete()
         let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        let vm = window.agentModeViewModel
+        let adopted = await vm.awaitWorkspaceRuntimeAdoption(expectedWorkspaceID: workspace.id)
+        guard adopted else {
+            throw AdmissionTestError.fixtureSetup("durable workspace did not adopt its Agent host: current=\(String(describing: vm.runtimeHost.workspaceActivation?.key.owner.workspaceID)) expected=\(workspace.id) awaiting=\(vm.isAwaitingWorkspaceAdoption) inFlight=\(vm.workspaceSwitchInFlight) sessions=\(vm.sessions.count)")
+        }
         window.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: true)
         // The reload schedules or coalesces the dirty-badge callback synchronously.
         // FIFO ordering joins that specific callback before the fixture is returned.
@@ -3057,6 +3078,10 @@ import XCTest
             await withCheckedContinuation { continuation in
                 releaseWaiters.append(continuation)
             }
+        }
+
+        func hasEntered() -> Bool {
+            entered
         }
 
         func waitUntilEntered() async {
