@@ -1279,7 +1279,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     await manager.debugSetReturnedCatalogToolsForTesting(Self.w0fReturnedShape())
                 }
                 observer.runState = .running
-                _ = observer.beginRunAttempt(source: "held-provider-route")
+                let catalogAttempt = observer.beginRunAttempt(source: "held-provider-route")
                 // Install the ordinary restricted Agent policy BEFORE initialize/tools/list. This
                 // transport is never an external unrestricted caller that is converted after the fact.
                 let origin = vm.runtimeHost
@@ -1605,6 +1605,12 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     case let .reprompt(phase):
                         try await w2RegisteredTerminal(window: window, session: observer, connection: connection, runID: runID, delayed: false, nativeResult: true, closing: false, leading: false, cancel: false, repromptPhase: phase)
                     case .undeclared:
+                        // This control sends no MCP command. Settle its setup attempt before the
+                        // terminal helper samples the one ordinary close it intends to measure.
+                        guard observer.endRunAttempt(ifCurrent: catalogAttempt, source: "silent-close catalog setup settled") else {
+                            XCTFail("The held catalog attempt must still be the exact setup owner")
+                            throw CancellationError()
+                        }
                         try await w2RegisteredTerminal(window: window, session: observer, connection: connection, runID: runID, delayed: false, nativeResult: false, closing: false, leading: false, cancel: false, w3Undeclared: true)
                     case let .terminal(delayed, nativeResult, closing, leading, cancel, corrupt):
                         try await w2RegisteredTerminal(window: window, session: observer, connection: connection, runID: runID, delayed: delayed, nativeResult: nativeResult, closing: closing, leading: leading, cancel: cancel, corrupt: corrupt, w4Display: w4Display)
@@ -2151,6 +2157,8 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
         ) async throws {
             let vm = window.agentModeViewModel
             let manager = ServerNetworkManager.shared
+            let deliveryHost = vm.runtimeHost
+            XCTAssertTrue(deliveryHost.scope.sessions[session.tabID] === session)
             let connection = try await w3Provider?.currentConnection() ?? connection
             let claude = session.selectedAgent == .claudeCode
             var phaseStart = ContinuousClock.now
@@ -2208,7 +2216,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             }
             let handler = vm.test_claudeCoordinator.testToolTrackingHandler(for: session)
             let codex = vm.test_codexCoordinator
-            let decoder = CodexNativeSessionController(client: CodexAppServerClient(), runID: runID, tabID: session.tabID, windowID: window.windowID, workspacePaths: .uniform(nil))
+            let decoder = CodexNativeSessionController(client: CodexAppServerClient(), runID: runID, tabID: session.tabID, windowID: deliveryHost.routeID, workspacePaths: .uniform(nil))
             let thread = "w2-exact-thread"
             let turn = "w2-exact-turn-\(owner.attemptID)"
             let raw = (claude ? "toolu_w2_queued_host" : "w2_original_native_call_string") + "-\(owner.attemptID)"
@@ -2380,8 +2388,8 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     if let hostID {
                         XCTAssertTrue(nativeIDs.allSatisfy { $0 != hostID })
                     }
-                    XCTAssertFalse(window.mcpServer.hasActiveToolExecutions(runID: runID))
-                    XCTAssertFalse(manager.hasPendingToolCardObservations(windowID: window.windowID, runID: runID))
+                    XCTAssertFalse(deliveryHost.route.toolExecutionRuntime.hasActiveToolExecutions(runID: runID))
+                    XCTAssertFalse(manager.hasPendingToolCardObservations(windowID: deliveryHost.routeID, runID: runID))
                     if nativeResult {
                         try await native(result: true)
                     }
@@ -3467,7 +3475,9 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             vm.agentSessionLinkRunCatalogProjectionByEndpoint[endpoint] = projection
             XCTAssertEqual(claim.routineQuietCheckIn, !ordinaryCandidate)
             XCTAssertEqual(claim.fragment.contains("Nothing needed? Call self_noop."), !ordinaryCandidate)
-            let owner = session.beginRunAttempt(source: "W2.production-proof-fixture")
+            // The production wire policy captures the held attempt. The claim tests vary
+            // catalog and attention, not the transport owner underneath the provider.
+            let owner = try XCTUnwrap(session.activeRunOwnership)
             session.quietLedger.markRoutineWake(owner: owner, wakeID: wake)
             if !ordinaryCandidate { session.oversight.pendingAutoWake?.phase = .dispatching }
             session.runState = .running
