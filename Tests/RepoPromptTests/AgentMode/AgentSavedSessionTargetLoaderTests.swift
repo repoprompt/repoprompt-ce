@@ -493,6 +493,21 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                         let pendingWorkspace = try await spawn.canonicalWorkspace()
                         XCTAssertEqual(pendingWorkspace.composeTabs.last?.activeAgentSessionID, childID)
                         XCTAssertEqual(pendingWorkspace.activeComposeTabID, departingWorkspace.activeComposeTabID)
+                        let coordinator = AgentMCPStartWorktreeCoordinator(
+                            operationName: "agent_run.start", vcsService: .shared, gitTargetResolver: .init(),
+                            startupPhaseEventSink: AppWorktreeStartupPhaseEventSink()
+                        )
+                        let origin = try await provisional.prepareWorktree(coordinator.parseRequest(args: [:]), from: spawn)
+                        XCTAssertEqual(origin, root.standardizedFileURL.path)
+                        let otherRepo = otherFile.deletingLastPathComponent().path
+                        let foreign = try coordinator.parseRequest(args: ["worktree": .string("@main"), "worktree_repo_root": .string(otherRepo)])
+                        do {
+                            _ = try await provisional.prepareWorktree(foreign, from: spawn)
+                            XCTFail("Child startup must not resolve worktree selectors against the newly visible workspace")
+                        } catch let MCPError.invalidParams(message) {
+                            XCTAssertTrue(message?.contains(otherRepo) == true, message ?? "Missing invalid-params detail")
+                        }
+                        XCTAssertTrue(child.worktreeBindings.isEmpty)
                     } catch {
                         await provisional.discardIfProvisional()
                         throw error

@@ -54,13 +54,18 @@ struct AgentRunHostAdmission {
     /// New child publication advances the workspace revision. Recheck the originating carrier
     /// and roots, rather than requiring the entire pre-publication document to remain unchanged.
     func canonicalWorkspace() async throws -> WorkspaceModel {
-        try await requireCurrent()
-        guard let current = await activation.authority.canonicalWorkspaceSnapshot(workspaceID),
-              provesCanonicalCarrier(in: current),
-              let workspace = try? JSONDecoder().decode(WorkspaceModel.self, from: current.document.documentBytes),
+        let current = try await canonicalSnapshot()
+        guard let workspace = try? JSONDecoder().decode(WorkspaceModel.self, from: current.document.documentBytes),
               workspace.id == workspaceID, !workspace.isEphemeral
         else { throw MCPFileToolAuthorityFailure.superseded }
         return workspace
+    }
+
+    func canonicalSnapshot() async throws -> DomainWorkspaceSnapshot {
+        try await requireCurrent()
+        guard let current = await activation.authority.canonicalWorkspaceSnapshot(workspaceID),
+              provesCanonicalCarrier(in: current) else { throw MCPFileToolAuthorityFailure.superseded }
+        return current
     }
 
     func provesCanonicalCarrier(in snapshot: DomainWorkspaceSnapshot) -> Bool {

@@ -1,6 +1,8 @@
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptVCS
+import RepoPromptWorkspaceContext
 
 /// App wiring only. This creates a child route and empty scope; publishing a carrier and
 /// admitting a provider still belong to the exact workspace and session transactions.
@@ -153,6 +155,61 @@ final class AgentRunHostChildCreation {
             }
             throw error
         }
+    }
+
+    /// Reuse the tool's existing worktree planner and binding transition, but read from the
+    /// originating parent's pinned roots. The child cannot be rebound to a presented workspace.
+    func prepareWorktree(
+        _ request: AgentMCPStartWorktreeCoordinator.Request, from source: AgentRunHostAdmission,
+        expiry: AgentRunStartExpiry? = nil
+    ) async throws -> String? {
+        let workspace = try await source.canonicalWorkspace()
+        guard let activation = host.workspaceActivation, let lease = activation.catalogFileLease,
+              source.workspaceID == command.identity.workspaceID, lease.roots == source.rootLease.roots
+        else { throw MCPFileToolAuthorityFailure.superseded }
+        let writer = command.writer
+        let session = writer.session
+        let fallbackPath = workspace.repoPaths.first
+        func requireCurrent() async throws {
+            try expiry?.throwIfExpired()
+            let snapshot = try await source.canonicalSnapshot()
+            try command.requireCurrent()
+            guard claim.state == .provisional, stopFence.permitsStart(of: session),
+                  source.sourceIsCurrent, lease.rootsAreCurrent, host.workspaceActivation === activation,
+                  activation.owns(scope: host.scope, route: host.route),
+                  snapshot.document.metadata.repoPaths == workspace.repoPaths,
+                  activation.executionTab(in: snapshot, command: command) != nil
+            else { throw MCPFileToolAuthorityFailure.superseded }
+        }
+        try await requireCurrent()
+        if !request.hasExplicitWorktreeArgs, request.inheritParentWorktreeBindings {
+            let inherited = source.connection.lookupSource.worktreeBindings
+            _ = try await host.scope.worktrees.transition(
+                inherited, command: command, intent: .initialSend,
+                revalidateAuthority: requireCurrent
+            )
+        }
+        let coordinator = AgentMCPStartWorktreeCoordinator(
+            operationName: "agent_run.start", vcsService: .shared, gitTargetResolver: .init(),
+            startupPhaseEventSink: AppWorktreeStartupPhaseEventSink()
+        )
+        try await coordinator.prepare(request: request, authority: .init(
+            sessionID: command.identity.sessionID, files: lease.resources.files,
+            requireCurrent: requireCurrent, roots: { (fallbackPath, lease.roots) }, primaryRoot: { fallbackPath },
+            bindings: { session.worktreeBindings }, transition: { bindings, context, hints in
+                _ = try await self.host.scope.worktrees.transition(
+                    bindings, command: self.command, intent: .initialSend, startupContext: context,
+                    initializationHintsByBindingID: hints, revalidateAuthority: requireCurrent
+                )
+            },
+            // Canonical transitions publish the root projection with the binding. If those
+            // exact roots did not survive, refuse rather than installing an unfenced fallback.
+            materialize: { _ in false }
+        ))
+        try await requireCurrent()
+        return try AgentWorktreeRuntimeWorkspaceResolver.effectiveWorkspacePath(
+            bindings: session.worktreeBindings, fallbackWorkspacePath: fallbackPath
+        )
     }
 
     /// After durable acknowledgement recovery may not remove the carrier. A Stop or lost
