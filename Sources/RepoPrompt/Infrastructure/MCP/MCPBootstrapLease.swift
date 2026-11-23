@@ -254,7 +254,7 @@ actor MCPBootstrapLease {
             await policyInstaller(spec)
             return true
         }
-        let process = reusingProcess ? await processRegistrationProvider?() : nil
+        let process = reusingProcess ? await existingProcessRegistration(on: routingOwner) : nil
         guard let generation = routingWaitGeneration,
               let receipt = await Self.installPolicy(
                   spec, routingOwner: routingOwner, originatingContextSource: originatingContextSource,
@@ -263,6 +263,14 @@ actor MCPBootstrapLease {
         else { return false }
         cleanupReceipts.append(receipt)
         return true
+    }
+
+    private func existingProcessRegistration(on routingOwner: MCPHostRouteResources) async -> MCPRunRoutingProcessRegistration? {
+        if let explicit = await processRegistrationProvider?() { return explicit }
+        #if DEBUG
+            if let fixture = await routingOwner.test_existingProcessForBootstrap { return await fixture(spec) }
+        #endif
+        return nil
     }
 
     private func armExpectedPIDPolicy() async -> Bool {

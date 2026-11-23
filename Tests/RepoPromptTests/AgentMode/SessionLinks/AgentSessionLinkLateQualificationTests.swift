@@ -120,6 +120,7 @@ import XCTest
             let observerTab = UUID()
             let targetTab = UUID()
             var transports: [PersistentMCPTestEndpoint] = []
+            var initialPolicy: MCPRunRoutingCleanupReceipt?
             var grant: DomainAgentSessionLinkReference?
             var session: AgentTabSession?
             var native: ClaudeNativeProcessSessionController?
@@ -148,6 +149,7 @@ import XCTest
                     await transport.connectionManager.stop()
                     await manager.debugRemoveConnection(transport.connectionID)
                 }
+                if let initialPolicy { await manager.cleanupRunRoutingState(ownedBy: initialPolicy) }
                 await manager.clearClientConnectionPolicy(for: clientName, windowID: runRouteID, runID: runID)
                 await manager.cleanupRunRoutingState(for: runID, windowID: runRouteID)
                 window.apiSettingsViewModel.isClaudeCodeConnected = wasClaudeConnected
@@ -230,13 +232,19 @@ import XCTest
                     oneShot: true, reason: "late-catalog fixture", ttl: 60, tabID: observerTab, runID: runID,
                     additionalTools: reusesConnection ? AgentModeMCPPolicyInstaller.additionalTools(for: kind) : nil,
                     purpose: .agentModeRun, taskLabelKind: nil, allowsAgentExternalControlTools: false,
+                    requiresExpectedAgentPID: true,
                     routingOwner: origin.route, originatingContextSource: origin.originatingContextSource
                 )
-                _ = try XCTUnwrap(policyReceipt, "The initial catalog must belong to the exact host run")
+                let registration = try XCTUnwrap(policyReceipt, "The initial catalog must belong to the exact host run")
+                initialPolicy = registration
                 await manager.setEnabled(true)
-                let initial = try await PersistentMCPTestEndpoint.make(label: "late-catalog-initial", networkManager: manager, clientName: clientName, requiredToolNames: [MCPWindowToolName.agentSessionLink])
+                let peerPID = getpid()
+                await manager.registerExpectedAgentPID(peerPID, for: clientName, runID: runID, registration: registration)
+                let initial = try await PersistentMCPTestEndpoint.make(label: "late-catalog-initial", networkManager: manager, clientName: clientName, useProductionAgentAdmission: true, requiredToolNames: [MCPWindowToolName.agentSessionLink])
                 transports.append(initial)
                 await provider.attach(initial)
+                let committed = await manager.isRunRouteAuthoritativelyCommitted(runID: runID, windowID: exactRouteID, tabID: observerTab, expectedAgentPID: peerPID, registration: registration)
+                XCTAssertTrue(committed, "A retained offer starts on a PID-verified provider route, not debug admission")
                 _ = try await provider.listTools()
                 XCTAssertEqual(vm.linkExecutionRuntime.selfNoopHintIsCurrent(for: observer), reusesConnection)
                 let initialOffer = await manager.debugRunCatalogProjection(for: runID)
@@ -363,8 +371,17 @@ import XCTest
                     await cleanup()
                     return
                 }
-                // Keep the production lease, policy installation and route validation. Supply
-                // the controlled provider's real socket when the originating policy is armed.
+                // The real socket peer is XCTest, while the controlled Claude transport writes
+                // to a frame recorder. Supply the already committed process proof to the lease;
+                // ordinary transfer still validates PID, policy, connection and new attempt.
+                if reusesConnection, retainedOffer != .reconnect {
+                    origin.route.test_existingProcessForBootstrap = { spec in
+                        guard spec.runID == runID, spec.windowID == exactRouteID, spec.tabID == observerTab,
+                              await manager.isRunRouteAuthoritativelyCommitted(runID: runID, windowID: exactRouteID, tabID: observerTab, expectedAgentPID: peerPID, registration: registration)
+                        else { return nil }
+                        return .init(receipt: registration, pid: peerPID)
+                    }
+                }
                 origin.route.test_afterExpectedPIDPolicyArmed = { spec, registration in
                     guard let name = spec.clientName else { return false }
                     await manager.registerExpectedAgentPID(getpid(), for: name, runID: spec.runID, registration: registration)
@@ -434,9 +451,7 @@ import XCTest
                         } catch {
                             XCTFail("Retention edge fixture failed: \(error)")
                         }
-                        let committed = await manager.isRunRouteAuthoritativelyCommitted(runID: spec.runID, windowID: spec.windowID, tabID: spec.tabID, expectedAgentPID: getpid(), registration: registration)
-                        await manager.clearExpectedAgentPID(getpid(), for: name, runID: spec.runID, registration: registration)
-                        return committed
+                        return await manager.isRunRouteAuthoritativelyCommitted(runID: spec.runID, windowID: spec.windowID, tabID: spec.tabID, expectedAgentPID: peerPID, registration: registration)
                     }
                     if catalogBeforeSend {
                         await manager.debugSetReturnedCatalogToolsForTesting(nil)
@@ -456,7 +471,10 @@ import XCTest
                         return false
                     }
                 }
-                defer { origin.route.test_afterExpectedPIDPolicyArmed = nil }
+                defer {
+                    origin.route.test_existingProcessForBootstrap = nil
+                    origin.route.test_afterExpectedPIDPolicyArmed = nil
+                }
                 if kind == .claudeCode {
                     window.apiSettingsViewModel.isClaudeCodeConnected = true
                     let config = ClaudeCodeAgentConfig.discovery(commandName: "/usr/bin/false", runtimeVariant: .standard)

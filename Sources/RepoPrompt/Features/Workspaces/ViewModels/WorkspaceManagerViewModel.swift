@@ -11580,6 +11580,18 @@ class WorkspaceManagerViewModel: ObservableObject {
         source: WorkspaceSaveSource = WorkspaceSaveSource("agentSessionLifecycleAdmission"),
         timing: WorkspaceAgentAdmissionTiming? = nil
     ) async -> AgentAdmissionPersistenceReceipt {
+        // The initiating admission owns this unpublished proposal. A peer catalog refresh
+        // may legitimately replace the window projection; it never inherits the proposal.
+        let activation = rootActivationGeneration
+        let provisionalTab: ComposeTabState? = workspace(withID: identity.workspaceID).flatMap { local in
+            guard !local.isEphemeral,
+                  WorkspaceAgentAdmissionDocument.recoveryProjection(in: local, identity: identity).containsIdentity else { return nil }
+            return local.composeTabs.first(where: { $0.id == identity.tabID })
+        }
+        func ownsActivation() -> Bool {
+            !Task.isCancelled && !isPreparingForWindowClose && !isSwitchingWorkspace
+                && activeWorkspaceID == identity.workspaceID && rootActivationGeneration == activation
+        }
         let receipt = await persistAgentAdmissionAttempt(identity, source: source, timing: timing)
         // A pre-commit conflict may have been a peer's ordinary save. Reconcile through the
         // existing document/protected-identity owner once, then save the same provisional tab.
@@ -11587,15 +11599,11 @@ class WorkspaceManagerViewModel: ObservableObject {
         guard receipt.commitEvidence == .none, !receipt.outcome.workingCommitted,
               receipt.outcome.normalizedFailureCategory == .authorityRevisionConflict
               || receipt.outcome.normalizedFailureCategory == .workspaceChanged,
-              !Task.isCancelled, !isPreparingForWindowClose,
-              activeWorkspaceID == identity.workspaceID,
-              let local = workspace(withID: identity.workspaceID), !local.isEphemeral,
-              WorkspaceAgentAdmissionDocument.recoveryProjection(in: local, identity: identity).containsIdentity,
-              let provisionalTab = local.composeTabs.first(where: { $0.id == identity.tabID }),
+              ownsActivation(), let provisionalTab,
               let client = domainWorkspaceAuthorityClient,
               let refresh = domainCatalogRefreshAwaiter,
               let before = await client.canonicalWorkspaceSnapshot(identity.workspaceID),
-              before.health.acceptsMutations, before.revisions.dirtyRevision == nil,
+              ownsActivation(), before.health.acceptsMutations, before.revisions.dirtyRevision == nil,
               let canonicalBefore = try? Self.decodeDomainWorkspaceProjection(
                   documentBytes: before.document.documentBytes, fileURL: before.document.fileURL
               ),
@@ -11604,10 +11612,9 @@ class WorkspaceManagerViewModel: ObservableObject {
         timing?.begin(.catalogRefresh)
         let didRefresh = await refresh()
         timing?.end()
-        guard didRefresh, !Task.isCancelled, !isPreparingForWindowClose,
-              activeWorkspaceID == identity.workspaceID,
+        guard didRefresh, ownsActivation(),
               let after = await client.canonicalWorkspaceSnapshot(identity.workspaceID),
-              after.health.acceptsMutations,
+              ownsActivation(), after.health.acceptsMutations,
               let canonicalAfter = try? Self.decodeDomainWorkspaceProjection(
                   documentBytes: after.document.documentBytes, fileURL: after.document.fileURL
               )
@@ -11621,18 +11628,24 @@ class WorkspaceManagerViewModel: ObservableObject {
                 : .canonicalWorking(revision: after.revisions.workingRevision, digest: after.document.contentDigest)
             return AgentAdmissionPersistenceReceipt(outcome: receipt.outcome, commitEvidence: evidence)
         }
-        guard !Task.isCancelled, !isPreparingForWindowClose,
-              activeWorkspaceID == identity.workspaceID,
-              after.revisions.dirtyRevision == nil,
+        guard ownsActivation(), after.revisions.dirtyRevision == nil,
               case .absent = WorkspaceAgentAdmissionDocument.recoveryProjection(in: canonicalAfter, identity: identity),
-              let current = workspace(withID: identity.workspaceID),
-              WorkspaceAgentAdmissionDocument.recoveryProjection(in: current, identity: identity).containsIdentity,
-              current.composeTabs.first(where: { $0.id == identity.tabID }) == provisionalTab,
+              let index = workspaces.firstIndex(where: { $0.id == identity.workspaceID && !$0.isEphemeral }),
               let baseline = fullDocumentWriteBaseline(workspaceID: identity.workspaceID),
               baseline.workingRevision == after.revisions.workingRevision,
               baseline.contentDigest == after.document.contentDigest,
               baseline.fileURL == after.document.fileURL
         else { return receipt }
+        let current = workspaces[index]
+        switch WorkspaceAgentAdmissionDocument.recoveryProjection(in: current, identity: identity) {
+        case .absent:
+            workspaces[index].composeTabs.append(provisionalTab)
+        case .removed:
+            guard current.composeTabs.first(where: { $0.id == identity.tabID }) == provisionalTab else { return receipt }
+        case .conflict:
+            return receipt
+        }
+        guard ownsActivation() else { return receipt }
         markWorkspaceDirty(workspaceID: identity.workspaceID)
         return await persistAgentAdmissionAttempt(identity, source: source, timing: timing)
     }
