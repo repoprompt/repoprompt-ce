@@ -650,17 +650,27 @@ struct AgentRunMCPToolService {
     }
 
     static func startExpiryValue(sessionID: UUID, agentModeVM: AgentModeViewModel) -> Value {
-        let snapshot = startExpirySnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
+        startExpiryValue(startExpirySnapshot(sessionID: sessionID, agentModeVM: agentModeVM))
+    }
+
+    static func startExpiryValue(_ snapshot: AgentRunMCPSnapshot) -> Value {
         var object = snapshot.asObject()
         object["_meta"] = .object(["wait_result": .string(snapshot.isStartupPendingForMCPWait ? "startup_pending" : "timed_out")])
         return .object(object)
     }
 
     static func startExpirySnapshot(sessionID: UUID, agentModeVM: AgentModeViewModel) -> AgentRunMCPSnapshot {
-        guard let live = agentModeVM.mcpSnapshot(sessionID: sessionID) else { return .expired(sessionID: sessionID) }
-        if let session = agentModeVM.mcpRuntime.controlledWriter(sessionID: sessionID)?.session,
-           let epoch = session.mcpControlContext?.currentEpoch
-        {
+        startExpirySnapshot(
+            sessionID: sessionID, live: agentModeVM.mcpSnapshot(sessionID: sessionID),
+            ownerSession: agentModeVM.mcpRuntime.controlledWriter(sessionID: sessionID)?.session
+        )
+    }
+
+    static func startExpirySnapshot(
+        sessionID: UUID, live: AgentRunMCPSnapshot?, ownerSession: AgentTabSession?
+    ) -> AgentRunMCPSnapshot {
+        guard let live else { return .expired(sessionID: sessionID) }
+        if let session = ownerSession, let epoch = session.mcpControlContext?.currentEpoch {
             let ownership = session.runState.isActive
                 ? session.activeRunOwnership
                 : session.lastTerminalCommitRevision?.ownership

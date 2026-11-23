@@ -25,19 +25,32 @@ enum WorkspaceAgentFreshAdmission {
     static func prepare(
         workspace: WorkspaceModel,
         sessionID: UUID,
+        bindingEmptyTabID: UUID? = nil,
         makeTab: () -> ComposeTabState?
     ) -> Preparation {
         let existing = workspace.composeTabs + workspace.stashedTabs.map(\.tab)
         guard !existing.contains(where: { $0.activeAgentSessionID == sessionID }) else {
             return .rejected(rejected("session_already_bound", reason: .sessionIdentityChanged))
         }
-        guard let tab = makeTab() else {
-            return .rejected(rejected("workspace_changed", reason: .workspaceChanged))
-        }
-        guard tab.activeAgentSessionID == sessionID,
-              !existing.contains(where: { $0.id == tab.id })
-        else {
-            return .rejected(rejected("tab_identity_collision", reason: .sessionIdentityChanged))
+        let tab: ComposeTabState
+        if let bindingEmptyTabID {
+            let matching = existing.filter { $0.id == bindingEmptyTabID }
+            guard matching.count == 1, var empty = workspace.composeTabs.first(where: { $0.id == bindingEmptyTabID }),
+                  empty.activeAgentSessionID == nil
+            else { return .rejected(rejected("target_tab_binding_changed", reason: .sessionIdentityChanged)) }
+            empty.activeAgentSessionID = sessionID
+            empty.lastModified = Date()
+            tab = empty
+        } else {
+            guard let fresh = makeTab() else {
+                return .rejected(rejected("workspace_changed", reason: .workspaceChanged))
+            }
+            guard fresh.activeAgentSessionID == sessionID,
+                  !existing.contains(where: { $0.id == fresh.id })
+            else {
+                return .rejected(rejected("tab_identity_collision", reason: .sessionIdentityChanged))
+            }
+            tab = fresh
         }
         let claim = AgentProvisionalAdmissionClaim(identity: .init(
             recoveryID: UUID(), workspaceID: workspace.id, tabID: tab.id,

@@ -80,6 +80,10 @@ final class AgentRunHostChildCreation {
         var stopFence: AgentRunStartStopFence?
     }
 
+    private final class CarrierTitle {
+        var value = "Agent Session"
+    }
+
     let host: AgentSessionRuntimeHost
     let command: AgentSessionRuntimeStore.Command
     let creation: AgentSessionCreationHandle
@@ -101,16 +105,21 @@ final class AgentRunHostChildCreation {
         self.claim = claim
     }
 
-    static func publish(from source: AgentRunHostAdmission, name: String) async throws -> AgentRunHostChildCreation {
+    static func publish(
+        from source: AgentRunHostAdmission, name: String? = nil, bindingEmptyTabID: UUID? = nil
+    ) async throws -> AgentRunHostChildCreation {
         try source.requireSpawnSource()
         let allocation = AgentSessionCreationClaim(workspaceID: source.workspaceID)
-        let host = try await AgentRunHostChildComposition.compose(from: source) { _ in name }
+        let pending = PendingWriter()
+        let title = CarrierTitle()
+        let host = try await AgentRunHostChildComposition.compose(from: source) { _ in title.value }
         guard let activation = host.workspaceActivation else {
             host.beginRetirement().startIfNeeded()
             throw MCPFileToolAuthorityFailure.unavailable
         }
-        let publisher = WorkspaceAgentCanonicalFreshAdmission(authority: activation.authority, connectionID: source.connection.connectionID)
-        let pending = PendingWriter()
+        let publisher = WorkspaceAgentCanonicalFreshAdmission(
+            authority: activation.authority, connectionID: source.connection.connectionID, bindingEmptyTabID: bindingEmptyTabID
+        )
         let onRecovery: @MainActor (AgentAdmissionRecoveryOutcome) async -> Void = { outcome in
             switch outcome {
             case .recovered, .alreadyRecovered, .localOnly, .ownershipChanged:
@@ -120,8 +129,12 @@ final class AgentRunHostChildCreation {
         }
         do {
             let result = try await publisher.publish(workspaceID: source.workspaceID, sessionID: allocation.sessionID, adapters: .init(
-                makeTab: { _ in ComposeTabState(name: name, activeAgentSessionID: allocation.sessionID) },
-                prepareWriter: { tab in
+                makeTab: { workspace in
+                    ComposeTabState(
+                        name: name ?? ComposeTabState.nextDefaultName(in: workspace.composeTabs), activeAgentSessionID: allocation.sessionID
+                    )
+                }, prepareWriter: { tab in
+                    title.value = tab.name
                     let scope = host.scope
                     guard scope.sessions.isEmpty, activation.isCurrent else { return false }
                     let session = scope.makeSession(tabID: tab.id)

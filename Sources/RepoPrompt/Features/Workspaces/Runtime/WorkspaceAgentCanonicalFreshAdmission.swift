@@ -20,6 +20,11 @@ final class WorkspaceAgentCanonicalFreshAdmission {
     private let authority: DomainWorkspaceAuthorityClient
     private let origin: DomainCommandOrigin
     private let coordinator: WorkspaceAgentAdmissionCoordinator
+    private let bindingEmptyTabID: UUID?
+    private var recoveryMutation: WorkspaceAgentAdmissionDocument.RecoveryMutation {
+        bindingEmptyTabID == nil ? .removeTab : .clearBinding
+    }
+
     private let lifecycleAuthority = AgentSessionLifecycleAuthority()
     private var claim: AgentProvisionalAdmissionClaim?
     private var ownsPreparedWriter: (() -> Bool)?
@@ -28,11 +33,13 @@ final class WorkspaceAgentCanonicalFreshAdmission {
     init(
         authority: DomainWorkspaceAuthorityClient,
         connectionID: UUID,
+        bindingEmptyTabID: UUID? = nil,
         coordinator: WorkspaceAgentAdmissionCoordinator = .shared
     ) {
         self.authority = authority
         origin = .appMCP(connectionID: connectionID)
         self.coordinator = coordinator
+        self.bindingEmptyTabID = bindingEmptyTabID
     }
 
     func publish(
@@ -40,7 +47,7 @@ final class WorkspaceAgentCanonicalFreshAdmission {
     ) async throws -> WorkspaceAgentFreshAdmission.Result {
         let timing = WorkspaceAgentAdmissionTiming()
         return try await coordinator.withAdmission(
-            workspaceID: workspaceID, admissionID: UUID(), kind: .freshTab,
+            workspaceID: workspaceID, admissionID: UUID(), kind: bindingEmptyTabID == nil ? .freshTab : .existingTab,
             classifyOutcome: { (result: WorkspaceAgentFreshAdmission.Result) in
                 if case .created = result { return .committed }
                 return .rejected
@@ -53,7 +60,8 @@ final class WorkspaceAgentCanonicalFreshAdmission {
                   !Task.isCancelled, adapters.sourceIsCurrent(), adapters.provesSourceInSnapshot(baseline)
             else { return WorkspaceAgentFreshAdmission.rejected("workspace_changed", reason: .workspaceChanged) }
             let preparation = WorkspaceAgentFreshAdmission.prepare(
-                workspace: workspace, sessionID: sessionID, makeTab: { adapters.makeTab(workspace) }
+                workspace: workspace, sessionID: sessionID, bindingEmptyTabID: bindingEmptyTabID,
+                makeTab: { adapters.makeTab(workspace) }
             )
             switch preparation {
             case let .rejected(result): return result
@@ -125,7 +133,14 @@ final class WorkspaceAgentCanonicalFreshAdmission {
     ) async throws -> WorkspaceAgentFreshAdmission.Result {
         let identity = claim.identity
         var proposed = workspace
-        proposed.composeTabs.append(tab)
+        if let bindingEmptyTabID {
+            guard let index = proposed.composeTabs.firstIndex(where: { $0.id == bindingEmptyTabID }),
+                  proposed.composeTabs[index].activeAgentSessionID == nil, tab.id == bindingEmptyTabID
+            else { return WorkspaceAgentFreshAdmission.rejected("target_tab_binding_changed", reason: .sessionIdentityChanged) }
+            proposed.composeTabs[index] = tab
+        } else {
+            proposed.composeTabs.append(tab)
+        }
         proposed.dateModified = tab.lastModified
         let document = try await WorkspaceFileDecodeCache.shared.documentPreparation.document(for: proposed, fileURL: baseline.document.fileURL)
         guard await adapters.validateSource(), !Task.isCancelled, adapters.sourceIsCurrent(), self.claim == nil,
@@ -150,7 +165,7 @@ final class WorkspaceAgentCanonicalFreshAdmission {
         let after = await authority.canonicalWorkspaceSnapshot(identity.workspaceID)
         let isCancelled = Task.isCancelled
         let containsCarrier = after.flatMap { try? Self.decode($0.document) }.map {
-            WorkspaceAgentAdmissionDocument.recoveryProjection(in: $0, identity: identity).containsIdentity
+            WorkspaceAgentAdmissionDocument.recoveryProjection(in: $0, identity: identity, mutation: recoveryMutation).containsIdentity
         } == true
         let sourceSharesSnapshot = after.map(adapters.provesSourceInSnapshot) == true
         let receipt = Self.receipt(write: write, snapshot: containsCarrier ? after : nil, proposed: document)
@@ -251,7 +266,7 @@ final class WorkspaceAgentCanonicalFreshAdmission {
     ) async -> AgentAdmissionRecoveryOutcome {
         guard ownsWriter() else { return .ownershipChanged }
         return await WorkspaceAgentAdmissionRecovery.recover(
-            identity: identity, mutation: .removeTab, store: authority.store, origin: origin, decode: Self.decode,
+            identity: identity, mutation: recoveryMutation, store: authority.store, origin: origin, decode: Self.decode,
             workingCommit: .init(
                 read: { self.workingRecoveryCommit },
                 record: { self.workingRecoveryCommit = $0 },
