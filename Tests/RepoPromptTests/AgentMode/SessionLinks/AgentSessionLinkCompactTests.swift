@@ -380,7 +380,7 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
             input: scope.providerInput(skillCatalog: AgentSkillCatalog(), perfRecorder: NoopAgentModePerfRecorder()),
             workspacePaths: { [] }, inputWorkspace: { _, _ in nil }, initialThreadInput: { _, _ in nil },
             modelDisplayName: { $0.selectedModelRaw },
-            start: { _, _, _, _, _ in XCTFail("A refused terminal must not start a provider")
+            start: { _, _, _, _, _, _ in XCTFail("A refused terminal must not start a provider")
                 return nil
             },
             settleSelfCompact: { _ in XCTFail("Runtime settlement must not call the legacy adapter") },

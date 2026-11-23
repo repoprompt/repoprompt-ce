@@ -156,6 +156,9 @@ actor AgentSessionDataService {
         let agentReasoningEffort: String?
         let acpModelParameterSelections: [ACPModelParameterSelection]?
         let lastRunState: String?
+        let originWorkflowID: String?
+        let originWorkflowDisplayName: String?
+        let lastRunStartedAt: Date?
         let providerSessionID: String?
         let providerCleanupHandle: ProviderConversationCleanupHandle?
         let autoEditEnabled: Bool
@@ -1148,16 +1151,25 @@ actor AgentSessionDataService {
 
     private func metadataRecords(
         for workspace: WorkspaceModel,
-        limit: Int? = nil
+        limit: Int? = nil,
+        verifyInventory: Bool = false
     ) async throws -> [AgentSessionMetadataRecord] {
-        let index = try await metadataIndex(for: workspace, mode: .backfillIfMissing)
+        var index = try await metadataIndex(for: workspace, mode: .backfillIfMissing)
+        if verifyInventory, let current = index, let folder = try existingAgentSessionsFolder(for: workspace),
+           try metadataIndexNeedsFilenameReconciliation(current, folder: folder)
+        {
+            index = try await reconcileMetadataIndex(folder: folder)
+        }
         let records = index?.entries.sortedForAgentSessionMetadataIndex() ?? []
         guard let limit else { return records }
         return Array(records.prefix(max(limit, 0)))
     }
 
-    func indexedAgentSessionMetadataRecords(for workspace: WorkspaceModel) async throws -> [AgentSessionMetadataRecord] {
-        try await metadataRecords(for: workspace)
+    func indexedAgentSessionMetadataRecords(
+        for workspace: WorkspaceModel,
+        verifyInventory: Bool = false
+    ) async throws -> [AgentSessionMetadataRecord] {
+        try await metadataRecords(for: workspace, verifyInventory: verifyInventory)
     }
 
     func sidebarStreamMetadataRecords(for workspace: WorkspaceModel) async throws -> [AgentSessionMetadataRecord] {
@@ -1497,6 +1509,9 @@ actor AgentSessionDataService {
                 agentReasoningEffort: header.agentReasoningEffort,
                 acpModelParameterSelections: header.acpModelParameterSelections ?? [],
                 lastRunState: AgentSessionRestoreSupport.coldRestoredLastRunStateRaw(header.lastRunState),
+                originWorkflowID: header.originWorkflowID,
+                originWorkflowDisplayName: header.originWorkflowDisplayName,
+                lastRunStartedAt: header.lastRunStartedAt,
                 providerSessionID: header.providerSessionID,
                 providerCleanupHandle: header.providerCleanupHandle,
                 autoEditEnabled: header.autoEditEnabled,

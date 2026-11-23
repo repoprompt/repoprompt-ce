@@ -20,6 +20,8 @@ The app target (`RepoPromptApp`) is the composition and product-flow owner, not 
 | `RepoPromptPersistence` | CodeMap artifacts/catalog/manifests/leases and durable artifact storage | FileSystem, VCS values, CodeMapCore, Shared; no workspace capability or app source-provenance dependency |
 | `RepoPromptSettingsCore` | Persisted settings values/document/file store, settings store and global-ignore facet | App-only deployment, with typed events; app policy and notifications remain composition-owned |
 | `RepoPromptC`, `CSwiftPCRE2`, `TreeSitterScannerSupport`, `Sparkle` | C/binary support | Leaf support targets |
+| `RepoPromptRemoteProtocol` | Standalone Remote wire values, replay, coalescing, and notification crypto; mirrored by the mobile peer | App-free leaf; App, Shared, and their tests declare direct imports |
+| `RepoPromptIrohSpikeMac` | Isolated Iroh transport diagnostic executable | External transport package only |
 | `<Module>Tests` | Tests of their corresponding module | Production target plus explicitly cataloged test support |
 
 Each extraction adds its production and test rows to the catalog, records its former app path(s) under `moved_families`, and lowers the matching ratchet baseline. This PR adds `RepoPromptFoundation`, `RepoPromptInstrumentation`, `RepoPromptProcess`, and `RepoPromptSecureStorage`, and extends `RepoPromptRegexCore`; the app remains the implementation owner of instrumentation diagnostics. The placement rule checks newly added paths against the PR merge base, so already-existing app adapters are not mistaken for new module code.

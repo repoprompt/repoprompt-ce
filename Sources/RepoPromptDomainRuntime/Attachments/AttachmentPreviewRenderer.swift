@@ -41,16 +41,31 @@ package enum AttachmentPreviewRenderer {
         }
     }
 
+    /// Phone photos can exceed the general preview budget. Only use this for retained, owned files.
+    package static func jpegData(fromRetainedPhoto bytes: Data) throws -> Data? {
+        try Task.checkCancellation()
+        guard let source = CGImageSourceCreateWithData(bytes as CFData, imageSourceOptions) else { return nil }
+        return try jpegData(
+            fromImageSource: source, sourcePixelLimit: 64 * 1024 * 1024,
+            sourceDimensionLimit: 12288, maxBytes: 128 * 1024
+        )
+    }
+
     private static var imageSourceOptions: CFDictionary {
         [kCGImageSourceShouldCache: false] as CFDictionary
     }
 
-    private static func jpegData(fromImageSource source: CGImageSource) throws -> Data? {
+    private static func jpegData(
+        fromImageSource source: CGImageSource,
+        sourcePixelLimit: Int = maxSourcePixelCount,
+        sourceDimensionLimit: Int = maxSourceDimension,
+        maxBytes: Int? = nil
+    ) throws -> Data? {
         guard let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
               let width = sourceDimension(properties[kCGImagePropertyPixelWidth]),
               let height = sourceDimension(properties[kCGImagePropertyPixelHeight]),
-              width <= maxSourceDimension, height <= maxSourceDimension,
-              width <= maxSourcePixelCount / height
+              width <= sourceDimensionLimit, height <= sourceDimensionLimit,
+              width <= sourcePixelLimit / height
         else {
             try Task.checkCancellation()
             return nil
@@ -73,7 +88,9 @@ package enum AttachmentPreviewRenderer {
             try Task.checkCancellation()
             return nil
         }
-        return try encodeJPEG(opaque)
+        let jpeg = try encodeJPEG(opaque)
+        guard let maxBytes, let jpeg, jpeg.count > maxBytes else { return jpeg }
+        return try encodeJPEG(opaque, quality: 0.5).flatMap { $0.count <= maxBytes ? $0 : nil }
     }
 
     private static func jpegData(fromPDF document: CGPDFDocument?) throws -> Data? {
@@ -107,14 +124,14 @@ package enum AttachmentPreviewRenderer {
         return try encodeJPEG(rendered)
     }
 
-    private static func encodeJPEG(_ image: CGImage) throws -> Data? {
+    private static func encodeJPEG(_ image: CGImage, quality: Double = jpegQuality) throws -> Data? {
         let output = NSMutableData()
         guard let destination = CGImageDestinationCreateWithData(output, UTType.jpeg.identifier as CFString, 1, nil)
         else {
             try Task.checkCancellation()
             return nil
         }
-        CGImageDestinationAddImage(destination, image, [kCGImageDestinationLossyCompressionQuality: jpegQuality] as CFDictionary)
+        CGImageDestinationAddImage(destination, image, [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
         let finalized = CGImageDestinationFinalize(destination)
         try Task.checkCancellation()
         guard finalized else { return nil }

@@ -552,6 +552,7 @@ extension AgentSessionLinkExecutionRuntime {
         attribution: AgentCrossSessionAttribution?,
         delegationDecisionBatch: AgentDelegationDecisionBatch? = nil,
         stopFence: AgentRunStartStopFence,
+        attachments: [AgentFileAttachment] = [],
         providerSwitchPreparation: ProviderSwitchSendPreparation? = nil,
         dispatchIsCurrent: @MainActor () -> Bool
     ) async -> AgentSessionLinkSendTransactionOutcome {
@@ -583,7 +584,7 @@ extension AgentSessionLinkExecutionRuntime {
         if liveSession.pendingHandoff.providerSwitchDelivery != nil, switchPreparation == nil {
             let input = liveSession.isCodexComputerUseArmed
                 ? CodexComputerUseWorkflow.renderProviderPrompt(userInstructions: providerMessage) : providerMessage
-            switch await providerSwitchSendAdmission(session: liveSession, input: input, isCurrent: {
+            switch await providerSwitchSendAdmission(session: liveSession, input: input, attachments: attachments, isCurrent: {
                 stopFence.permitsStart(of: liveSession) && self.composerSubmitClaimIsCurrent(claim) && dispatchIsCurrent()
             }) {
             case let .failure(failure):
@@ -604,6 +605,7 @@ extension AgentSessionLinkExecutionRuntime {
         // 6. Durable acceptance. The bubble keeps raw words; the exact provider payload is metadata.
         var userItem = AgentChatItem.user(
             displayText,
+            attachments: attachments,
             sequenceIndex: liveSession.nextSequenceIndex,
             // Badges the one-shot workflow the sender attached to *this* message through the row's
             // existing metadata, so the standard pill renders beside the attribution badge with no
@@ -648,6 +650,7 @@ extension AgentSessionLinkExecutionRuntime {
         return await startPersistedNoncomposerTurn(
             session: liveSession, tabID: tabID, claim: claim, savedItemID: userItem.id,
             acceptedAt: Date(), providerMessage: providerMessage, stopFence: stopFence,
+            attachments: attachments,
             providerSwitchPreparation: switchPreparation,
             dispatchIsCurrent: dispatchIsCurrent
         )
@@ -657,6 +660,7 @@ extension AgentSessionLinkExecutionRuntime {
         session liveSession: TabSession, tabID: UUID, claim: AgentComposerSubmitClaim,
         savedItemID: UUID, acceptedAt: Date, providerMessage: String,
         stopFence: AgentRunStartStopFence,
+        attachments: [AgentFileAttachment] = [],
         providerSwitchPreparation: ProviderSwitchSendPreparation? = nil,
         dispatchIsCurrent: @MainActor () -> Bool
     ) async -> AgentSessionLinkSendTransactionOutcome {
@@ -735,8 +739,11 @@ extension AgentSessionLinkExecutionRuntime {
         _ = await startAgentRun(
             command: command,
             initialMessage: dispatchedProviderMessage,
+            attachments: attachments,
             directStartOptions: AgentDirectRunStartOptions(
-                ignoresPendingHandoff: true, stopFence: stopFence
+                ignoresPendingHandoff: true,
+                stopFence: stopFence,
+                initialUserItemID: attachments.isEmpty ? nil : savedItemID
             ),
             startOutcome: startRecorder,
             providerSwitchPreparation: providerSwitchPreparation

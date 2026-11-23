@@ -40,8 +40,19 @@ package enum SecureStorageAccount: CaseIterable, Hashable, Identifiable {
     case agentPermissionAntigravityDocument
     case agentPermissionDevinDocument
 
+    // Paired-device and transport identities.
+    case remoteIrohIdentity
+    case remotePairedDevice
+    case remoteNotificationRegistration
+
     package var identifier: String {
         switch self {
+        case .remoteIrohIdentity:
+            "com.repoprompt.ce.remote.iroh-identity.v1"
+        case .remotePairedDevice:
+            "com.repoprompt.ce.remote.device"
+        case .remoteNotificationRegistration:
+            "com.repoprompt.ce.remote.notifications"
         case .anthropicAPI:
             "AnthropicAPI"
         case .openAIAPI:
@@ -132,6 +143,9 @@ package enum SecureStorageAccount: CaseIterable, Hashable, Identifiable {
 
     package var displayName: String {
         switch self {
+        case .remoteIrohIdentity: "Remote Iroh identity"
+        case .remotePairedDevice: "Remote paired device"
+        case .remoteNotificationRegistration: "Remote notification registration"
         case .anthropicAPI: "Anthropic API key"
         case .openAIAPI: "OpenAI API key"
         case .geminiAPI: "Gemini API key"
