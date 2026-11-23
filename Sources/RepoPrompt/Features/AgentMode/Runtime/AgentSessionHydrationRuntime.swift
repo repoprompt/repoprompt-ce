@@ -218,6 +218,7 @@ enum AgentSessionHydrationRuntime {
         }
         session.codexConversationID = persisted.codexConversationID
         session.codexRolloutPath = persisted.codexRolloutPath
+        session.codexInstructionMode = persisted.codexInstructionMode
         session.providerCleanupHandle = persisted.resolvedProviderCleanupHandle
         session.codexModel = persisted.codexModel
         session.codexReasoningEffort = persisted.codexReasoningEffort
