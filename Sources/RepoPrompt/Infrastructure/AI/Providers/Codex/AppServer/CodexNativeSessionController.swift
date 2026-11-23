@@ -1000,6 +1000,10 @@ final class CodexNativeSessionController {
             )
         }
         guard let mode = existing.instructionMode else {
+            // The mode stays unknown: Codex does not report how a thread's base was chosen, and
+            // guessing legacy would strip a native thread's only RepoPrompt guidance. Re-sending
+            // the note on each resume does not accumulate copies, because Codex replaces the
+            // thread's developer instructions rather than appending them.
             let mayCarryNote = isBundledRuntime && supportsNativeModelInstructions(runtimeVersion)
             return ThreadInstructionResolution(
                 mode: nil,
