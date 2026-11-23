@@ -1173,6 +1173,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         var test_beforeWorkspaceSwitchAdoption: (@MainActor (SessionIndexOwner) async -> Void)?
         /// Passive: runs synchronously when that queued adoption task finishes, on every exit.
         var test_afterWorkspaceSwitchAdoptionCompleted: (@MainActor (SessionIndexOwner) -> Void)?
+        var test_afterPreparingWorkspaceHost: (@MainActor (SessionIndexOwner) async -> Void)?
         /// Passive: runs synchronously when `onTabChanged`'s spawned activation task finishes, on every exit.
         var test_afterTabActivationContinuation: (@MainActor (UUID, Int) -> Void)?
         var test_beforeMCPSelectionCommit: (@MainActor () async -> Void)?
@@ -3543,7 +3544,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) -> AgentModeRunService {
         let publication = mcpRuntime
         let dependencies = AgentModeRunService.Dependencies(
-            windowID: windowID,
+            windowID: runtimeHost.routeID,
             connectionPolicyInstaller: connectionPolicyInstaller ?? self.connectionPolicyInstaller,
             expectedPIDPolicyArmer: expectedPIDPolicyArmer ?? { spec in
                 guard spec.requiresExpectedAgentPID, let clientName = spec.clientName else {
@@ -4688,7 +4689,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         withdrawUnpublishedComposerSubmissionsForPresentationLoss()
         detachRunPresentation()
         cleanUpClosingPresentation()
+        retireEmptyDetachedHost(host)
         return host
+    }
+
+    private func retireEmptyDetachedHost(_ host: AgentSessionRuntimeHost) {
+        guard host.scope.sessions.isEmpty, !host.scope.isRetiring, !host.scope.hasPendingHostEffects else { return }
+        host.beginRetirement().startIfNeeded()
     }
 
     func prepareForWindowClose() async {
@@ -13386,6 +13393,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 do {
                     prepared = try await prepare(workspace, owner, sessionIndexStore)
                     destination = prepared
+                    #if DEBUG
+                        await test_afterPreparingWorkspaceHost?(owner)
+                    #endif
                 } catch {
                     settleRefusedDestination()
                     return
@@ -13520,12 +13530,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if let destination {
             destination.scope.retainExecutableHost()
             runtimeHost = destination
-            if preservesOrigin, outgoing !== destination, !outgoing.scope.isRetiring,
-               outgoing.scope.sessions.isEmpty, outgoing.scope.saveQueue.inFlightSessionIDs.isEmpty,
-               outgoing.scope.worktrees.pendingTransitions == 0
-            {
-                outgoing.beginRetirement().startIfNeeded()
-            }
+            if preservesOrigin, outgoing !== destination { retireEmptyDetachedHost(outgoing) }
             finishDestructiveWorkspaceAdoption(owner)
             synchronizeRunPresentationAttachments(previous: [:])
             guard sessionIndexStore.isOwnerCurrent(owner), runtimeHost === destination,
@@ -19049,7 +19054,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private func captureFreshSessionCreation(
         tab: ComposeTabState, claim: AgentSessionCreationClaim
     ) -> FreshSessionCreation? {
-        guard workspaceManager?.activeWorkspaceID == claim.workspaceID,
+        guard !isAwaitingWorkspaceAdoption, workspaceManager?.activeWorkspaceID == claim.workspaceID,
               tab.activeAgentSessionID == nil || tab.activeAgentSessionID == claim.sessionID,
               sessions[tab.id] == nil else { return nil }
         // Build the complete blocked runtime before either the runtime map or tab carrier exposes it.

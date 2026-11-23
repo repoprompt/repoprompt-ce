@@ -517,6 +517,18 @@ final class AgentSessionRuntimeStore {
             persistence.queue
         }
 
+        /// Scope-owned producers can still owe acknowledgements after their last session leaves
+        /// the runtime map. Do not infer that the host is idle from an empty map alone.
+        var hasPendingHostEffects: Bool {
+            !saveQueue.inFlightSessionIDs.isEmpty || attachments.hasPendingRetention
+                || worktrees.pendingTransitions != 0 || continuation.hasPendingStarts
+                || installedInteractions?.hasPendingEffects == true || !sessionDeletionDrains.isEmpty
+                || linkExecution?.pendingManagedInputEffects.isEmpty == false
+                || linkExecution?.pendingSendEffects.isEmpty == false
+                || linkExecution?.pendingStopEffects.isEmpty == false
+                || linkExecution?.pendingSelfCompactEffects.isEmpty == false
+        }
+
         /// The host fences readiness synchronously when destructive owner adoption is queued,
         /// and releases it only after that adoption's discard slice (or its own abandoned exit).
         private(set) var isAwaitingWorkspaceAdoption = false

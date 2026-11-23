@@ -1131,6 +1131,10 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         try await runVisibleLifetimeWitness(switchWorkspace: false, detachedShutdown: .workspaceDeletion)
     }
 
+    func testWorkspaceSwitchCannotReclaimOutgoingHostClaimedByDeletionDuringAdoption() async throws {
+        try await runVisibleLifetimeWitness(switchWorkspace: true, detachedShutdown: .workspaceDeletionDuringSwitch)
+    }
+
     func testExplicitQuitBoundsDetachedVisibleDrainWithoutDroppingRequiredSave() async throws {
         try await runVisibleLifetimeWitness(switchWorkspace: false, detachedShutdown: .quit)
     }
@@ -1171,7 +1175,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
     }
 
     private enum DetachedShutdown {
-        case workspaceDeletion, quit, sessionDeletion
+        case workspaceDeletion, workspaceDeletionDuringSwitch, quit, sessionDeletion
     }
 
     private func runVisibleLifetimeWitness(
@@ -1377,6 +1381,33 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             XCTAssertEqual(try host.scope.admit(session: session).identity, command.identity)
             XCTAssertFalse(host.scope.isRetiring)
             XCTAssertFalse(host.route.isClosing)
+            XCTAssertEqual(provider.promptedMessages.count, 1)
+            return
+        }
+
+        if detachedShutdown == .workspaceDeletionDuringSwitch {
+            let suspension = TestReleaseFence(name: "hold prepared B before presentation adoption")
+            agent.test_afterPreparingWorkspaceHost = { owner in
+                if owner.workspaceID == second.id { await suspension.enterAndWait() }
+            }
+            defer {
+                suspension.release()
+                agent.test_afterPreparingWorkspaceHost = nil
+            }
+            let switching = Task { try await activateVisibleLifetimeWorkspace(second, in: window) }
+            addTeardownBlock { _ = await switching.result }
+            guard await suspension.waitUntilEntered() else { return XCTFail("Switch did not prepare B") }
+            XCTAssertTrue(agent.runtimeHost === host)
+            try assertOriginalAttempt()
+            try await assertExplicitDetachedShutdown(
+                .workspaceDeletion, host: host, session: session, attemptID: attemptID, workspaceID: workspace.id,
+                releaseProvider: gate.release
+            )
+            suspension.release()
+            try await switching.value
+            XCTAssertFalse(agent.runtimeHost === host)
+            XCTAssertEqual(agent.runtimeHost.workspaceActivation?.key.owner.workspaceID, second.id)
+            XCTAssertFalse(AgentSessionRuntimeStore.shared.retainedExecutionHosts.contains { $0 === host })
             XCTAssertEqual(provider.promptedMessages.count, 1)
             return
         }
@@ -1740,7 +1771,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         switch shutdown {
         case .sessionDeletion:
             return XCTFail("Single-session deletion must use the session data service.")
-        case .workspaceDeletion:
+        case .workspaceDeletion, .workspaceDeletionDuringSwitch:
             let deadline = ContinuousClock.now.advanced(by: .seconds(5))
             let refused = await AgentSessionRuntimeHost.drainRetainedHostsForWorkspaceDeletion(workspaceID: workspaceID, until: deadline) { false }
             XCTAssertFalse(refused)
@@ -2544,8 +2575,8 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             )
             XCTFail("Expected placement to be refused before effects")
         } catch let refusal as DomainMutationRefusedBeforeEffects {
-            guard case AgentHostWorkspaceResources.Failure.contextUnavailable = refusal.underlying else {
-                return XCTFail("Expected the exact canonical carrier to be unavailable: \(refusal.underlying)")
+            guard case AgentSessionWorktreeRuntime.TransitionError.stale = refusal.underlying else {
+                return XCTFail("Expected placement to be stale after authorization suspended: \(refusal.underlying)")
             }
         }
         do {
