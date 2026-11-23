@@ -3711,7 +3711,9 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             route: AgentSessionLinkRunCatalogRouteToken, runID: UUID, kind: AgentProviderKind,
             codex: LifecycleNoopCodexController, codexRecorder: LifecycleRecorder
         ) async throws {
-            let owner = observer.beginRunAttempt(source: "W0f.catalog-proof")
+            // The held connection was admitted to this attempt. A second attempt before the
+            // positive list would test stale-route denial, not catalog convergence on the wire.
+            let owner = try XCTUnwrap(observer.activeRunOwnership)
             let wireDefinitions = try await provider.definitions()
             let wireTools = try JSONDecoder().decode([MCP.Tool].self, from: JSONSerialization.data(withJSONObject: wireDefinitions))
             let positive = try await w0fProjection(manager, runID)
@@ -3737,7 +3739,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
 
             /// W0-only consumer. No product hint, dispatch admission or terminal decision is wired.
             func hint(_ sample: AgentSessionLinkRunCatalogProjection, owner capturedOwner: AgentRunOwnership) async -> String? {
-                guard let token = await manager.authoritativeRunCatalogRouteToken(runID: runID, windowID: window.windowID, tabID: endpoint.tabID) else { return nil }
+                guard let token = await manager.authoritativeRunCatalogRouteToken(runID: runID, windowID: endpoint.windowID, tabID: endpoint.tabID) else { return nil }
                 let supported = await manager.hasCurrentReturnedTool(Self.w0fTool(), routeToken: token, projectionRevision: sample.projectionRevision)
                 guard supported, !Task.isCancelled, sample.routeToken == token,
                       ToolAvailabilityStore.shared.isEnabled(Self.w0fTool().name),
