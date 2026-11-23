@@ -365,6 +365,21 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                     let generation = try XCTUnwrap(receipt.routingWaitGeneration)
                     await MCPRoutingWaiter.notifyRouted(runID: receipt.runID, generation: generation)
                     try await promptGate.waitUntilEntered()
+                    let attemptID = try XCTUnwrap(writer.session.activeRunAttemptID)
+                    let connection = try host.route.fileReadConnection(metadata: metadata)
+                    XCTAssertFalse(host.route.renewAdoptedProviderAttempt(
+                        runID: receipt.runID, tabID: UUID(), writer: writer.identity, attemptID: UUID(), receipts: [receipt]
+                    ))
+                    XCTAssertTrue(host.route.fileReadConnectionIsCurrent(connection), "An unrelated tab cannot replace the admitted binding")
+                    XCTAssertTrue(host.route.renewAdoptedProviderAttempt(
+                        runID: receipt.runID, tabID: writer.session.tabID, writer: writer.identity, attemptID: attemptID, receipts: [receipt]
+                    ))
+                    let noop = try await invoke(MCPWindowToolName.selfNoop, [:])
+                    XCTAssertEqual(noop, AgentSelfNoopTool.acknowledgement)
+                    let noopOwner = try XCTUnwrap(writer.session.activeRunOwnership)
+                    XCTAssertEqual(writer.session.quietLedger.declarationBodyEntryCardinality(owner: noopOwner), 1)
+                    let selfContext = try await invoke(MCPWindowToolName.agentSelf, ["op": .string("context")])
+                    XCTAssertEqual(selfContext.objectValue?["result"], .string("ok"))
                     let read = try await invoke("read_file", ["path": .string(file.path)])
                     XCTAssertTrue(read.objectValue?["content"]?.stringValue?.contains("savedHostNeedle") == true, "\(read)")
                     let autoSelected = try await invoke("get_file_tree", ["mode": .string("selected")])

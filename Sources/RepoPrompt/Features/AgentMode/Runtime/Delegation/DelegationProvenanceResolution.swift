@@ -107,7 +107,7 @@ struct OpenWindowsDelegationProvenanceSource: DelegationProvenanceSource {
             let ambiguous = carriers.ambiguousSessionIDs.contains(id) || observed.contains(.ambiguous)
             // A canonical carrier and its exact writer prove placement even while the owning
             // sidebar index is absent. A disagreeing replica can veto but cannot supply proof.
-            if let canonical = canonicalWriterProvenance(for: id, carriers: carriers) {
+            if let canonical = canonicalWriterProvenance(for: id) {
                 var workspaces = carriers.affectedWorkspaceIDs(for: id)
                 if ambiguous || placementConflict || workspaces.contains(where: { $0 != canonical.workspaceID }) {
                     if let workspaceID = canonical.workspaceID { workspaces.insert(workspaceID) }
@@ -152,20 +152,13 @@ struct OpenWindowsDelegationProvenanceSource: DelegationProvenanceSource {
         return result
     }
 
-    private func canonicalWriterProvenance(for id: UUID, carriers: AgentSessionCarrierResolver.Snapshot) -> DelegationSessionProvenance? {
+    private func canonicalWriterProvenance(for id: UUID) -> DelegationSessionProvenance? {
         guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: id),
               let host = writer.scope.executableHost, !host.route.isClosing, (try? writer.admitCommand().get()) != nil
         else { return nil }
         let isSavedCarrier = host.workspaceActivation?.savedCarrierSessionID == id && host.workspaceActivation?.isCurrent == true
-        if !isSavedCarrier {
-            guard let origin = AppSavedAgentSessionExecution.approvedLinkOrigin.get(),
-                  origin.target == writer.identity, origin.hasCanonicalCarrier,
-                  carriers.rows.contains(where: {
-                      $0.sessionID == id && $0.workspaceID == writer.identity.workspaceID
-                          && $0.tab.id == writer.session.tabID && $0.tab.activeAgentSessionID == id && $0.stashedTabID == nil
-                          && $0.window.agentModeViewModel.sessions[$0.tab.id] === writer.session
-                  }) else { return nil }
-        }
+        let hasTransactionCarrier = AppSavedAgentSessionExecution.approvedLinkOrigin.get()?.canonicalWriters.contains(writer.identity) == true
+        guard isSavedCarrier || hasTransactionCarrier else { return nil }
         let session = writer.session
         let bindings = Set(session.worktreeBindings.map(\.worktreeID))
         return .init(

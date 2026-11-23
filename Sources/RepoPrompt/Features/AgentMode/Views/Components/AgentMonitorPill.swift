@@ -982,12 +982,12 @@ struct AgentMonitorPopoverView: View {
             }
             ForEach(props.persistence.warnings) { warning in
                 messageText(warning.message)
-                if warning.id.hasPrefix(WindowStatesManager.agentHostRecoveryWarningPrefix) {
+                if warning.canRetrySessionSettlement {
                     Button("Retry session settlement") {
                         guard !isRetryingSave else { return }
                         isRetryingSave = true
                         Task {
-                            await WindowStatesManager.shared.retryRetainedAgentHostDrain(warningID: warning.id)
+                            await AgentSessionLinkRuntimeBridge.shared.retrySessionSettlement(warningID: warning.id)
                             isRetryingSave = false
                         }
                     }

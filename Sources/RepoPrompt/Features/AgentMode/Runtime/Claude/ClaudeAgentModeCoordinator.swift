@@ -87,6 +87,11 @@ final class ClaudeAgentModeCoordinator {
         let scheduleSave: @MainActor (_ session: AgentTabSession) -> Void
         var cleanupProviderRun: @MainActor (AgentSessionRuntimeHost.RunRoutingCleanup) async -> Void = { _ in }
         var legacyRunRoutingCleanup: @MainActor (UUID) -> AgentSessionRuntimeHost.RunRoutingCleanup? = { .legacyWindow(runID: $0) }
+        var prepareAdoptedRunRoute: @MainActor (AgentTabSession, UUID, UUID, AgentSessionRuntimeHost.RunRoutingCleanup) -> AdoptedRunRoutePreparation = { _, runID, _, cleanup in
+            guard case let .legacyWindow(ownerRunID) = cleanup, ownerRunID == runID else { return .refused }
+            return .unchanged
+        }
+
         weak var sessionRuntime: AgentSessionRuntimeStore.Scope?
         let stageClaudeResumeRecoveryHandoff: @MainActor (_ session: AgentTabSession) async -> Bool
         let prependPendingHandoff: @MainActor (_ text: String, _ session: AgentTabSession) -> String
@@ -408,6 +413,14 @@ final class ClaudeAgentModeCoordinator {
 
     func reserveEvents(for session: AgentTabSession) -> ClaudeAttemptEventReservation? {
         reserveEventsForHostPreparation(for: session)
+    }
+
+    enum AdoptedRunRoutePreparation {
+        case unchanged, renewed, refused
+    }
+
+    func prepareAdoptedRunRoute(session: AgentTabSession, runID: UUID, attemptID: UUID, cleanup: AgentSessionRuntimeHost.RunRoutingCleanup) -> AdoptedRunRoutePreparation {
+        hostCapabilities.prepareAdoptedRunRoute(session, runID, attemptID, cleanup)
     }
 
     func cleanupAdoptedRun(session: AgentTabSession, runID: UUID, cleanup: AgentSessionRuntimeHost.RunRoutingCleanup) async {

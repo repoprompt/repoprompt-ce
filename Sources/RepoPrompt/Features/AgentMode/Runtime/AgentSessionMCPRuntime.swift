@@ -1451,7 +1451,6 @@ final class AgentSessionMCPRuntime {
 
     /// Stages immutable launch data for this exact control activation. A later review never
     /// falls back to the child's own selection if provenance was unavailable at launch.
-    @discardableResult
     func stageAgentRunOracleReviewSource(
         _ source: AgentRunOracleReviewSource, session: AgentTabSession,
         sessionID: UUID, workspaceID: UUID, expectedParentSessionID: UUID?
@@ -1477,6 +1476,7 @@ final class AgentSessionMCPRuntime {
         )
     }
 
+    @discardableResult
     func mcpBindPendingAgentRunOracleReviewContext(
         tabID: UUID,
         runID: UUID

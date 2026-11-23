@@ -47,9 +47,10 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
 
     func reportRetainedAgentHostDrain(_ drain: AgentSessionHostDrainRuntime) {
         guard case .retained? = drain.outcome else { return }
-        AgentSessionLinkRuntimeBridge.shared.launchCoordinatorReportWarning(
+        AgentSessionLinkRuntimeBridge.shared.reportPersistenceWarning(
             id: Self.agentHostRecoveryWarningPrefix + drain.recoveryID.uuidString,
-            message: "A background Agent session could not finish saving or releasing its resources. Its original owner is retained. Retry settlement after correcting any storage problems."
+            message: "A background Agent session could not finish saving or releasing its resources. Its original owner is retained. Retry settlement after correcting any storage problems.",
+            canRetrySessionSettlement: true
         )
     }
 

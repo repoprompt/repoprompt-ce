@@ -315,6 +315,23 @@ final class AgentSessionRuntimeHost {
         capabilities.legacyRunRoutingCleanup = { [route] runID in
             route.identity.kind == .independent ? nil : .legacyWindow(runID: runID)
         }
+        capabilities.prepareAdoptedRunRoute = { [weak scope, route] session, runID, attemptID, cleanup in
+            switch cleanup {
+            case let .legacyWindow(legacyRunID):
+                return route.identity.kind != .independent && legacyRunID == runID ? .unchanged : .refused
+            case let .registered(receipts):
+                guard session.runID == runID, !route.isClosing, let scope,
+                      let command = try? scope.admit(session: session),
+                      receipts.contains(where: { !$0.isConsumed && $0.routeOwner === route && $0.routeID == route.identity.routeID && $0.runID == runID })
+                else { return .refused }
+                // Owning a still-pending cleanup receipt does not mean the process has opened
+                // MCP. Leave its route absent; turn adoption cannot issue a connection or grant.
+                guard route.runRouteBindings.connectionID(forRunID: runID) != nil else { return .unchanged }
+                return route.renewAdoptedProviderAttempt(
+                    runID: runID, tabID: session.tabID, writer: command.identity, attemptID: attemptID, receipts: receipts
+                ) ? .renewed : .refused
+            }
+        }
         capabilities.cleanupProviderRun = { [route, runToolCanceller, runRoutingCleaner] cleanup in
             await Self.performRunRoutingCleanup(
                 cleanup, route: route, reason: "claudeNative.providerInitiated",

@@ -53,7 +53,8 @@ extension MCPHostRouteResources {
         let hostTools: Set<String> = [
             MCPWindowToolName.askUser, MCPWindowToolName.manageSelection, MCPWindowToolName.agentSessionLink,
             MCPWindowToolName.agentManage, MCPWindowToolName.manageWorktree, MCPWindowToolName.sessionAdmin,
-            MCPWindowToolName.becomeOverseer, MCPWindowToolName.applyEdits, MCPWindowToolName.git
+            MCPWindowToolName.becomeOverseer, MCPWindowToolName.applyEdits, MCPWindowToolName.git,
+            MCPWindowToolName.agentSelf, MCPWindowToolName.selfNoop
         ]
         let fileTools = MCPFileReadResources.contentToolNames.union(MCPFileReadResources.toolNames)
         let binder = makeToolBinder(
@@ -105,6 +106,10 @@ extension MCPHostRouteResources {
                     return try await host.executeHostApplyEdits(args, invocation: invocation)
                 case MCPWindowToolName.askUser:
                     return try await host.executeHostAskUser(args, invocation: invocation)
+                case MCPWindowToolName.agentSelf:
+                    return try await host.executeHostSelf(args, invocation: invocation)
+                case MCPWindowToolName.selfNoop:
+                    return await host.executeHostSelfNoop(args, invocation: invocation)
                 case MCPWindowToolName.agentSessionLink:
                     return try await host.executeHostSessionLink(args, invocation: invocation)
                 case MCPWindowToolName.becomeOverseer:
@@ -191,6 +196,30 @@ private extension AgentSessionRuntimeHost {
               await ServerNetworkManager.shared.runPurpose(for: connectionID) == .agentModeRun,
               hostFileCommand(connection)?.identity == original.identity else { return nil }
         return original
+    }
+
+    func executeHostSelfNoop(_ args: [String: Value], invocation: ToolInvocationContext) async -> Value {
+        if let origin = AgentSelfMCPCallOrigin.current, let links = scope.linkExecution {
+            links.enterSelfNoopBody(origin: origin, invocationID: invocation.invocationID, argumentsAreEmpty: args.isEmpty)
+            let endpoint = await hostObserverEndpoint(invocation.metadata)
+            links.acceptSelfNoopBody(origin: origin, endpoint: endpoint, invocationID: invocation.invocationID)
+        }
+        return AgentSelfNoopTool.acknowledgement
+    }
+
+    func executeHostSelf(_ args: [String: Value], invocation: ToolInvocationContext) async throws -> Value {
+        try await AgentSelfMCPToolService.execute(
+            args: args, isEnabled: { ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.agentSelf) }
+        ) {
+            guard let origin = AgentSelfMCPCallOrigin.current,
+                  let endpoint = await hostObserverEndpoint(invocation.metadata), endpoint == origin.endpoint,
+                  endpoint.hasResolvedPersistentBinding, let links = scope.linkExecution
+            else { throw AgentSelfMCPToolService.unavailableError }
+            return .init(
+                read: { links.agentSelfContextSnapshot(endpoint: endpoint, origin: origin) },
+                compact: { await links.agentSelfCompactMCPAdmission(endpoint: endpoint, origin: origin, note: $0, idempotencyKey: $1) }
+            )
+        }
     }
 
     func executeHostAskUser(_ args: [String: Value], invocation: ToolInvocationContext) async throws -> Value {
