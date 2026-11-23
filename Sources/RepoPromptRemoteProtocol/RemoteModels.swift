@@ -7,83 +7,10 @@ import Foundation
 public enum RemoteProtocol {
     public static let minimumSupportedVersion = 1
     public static let currentVersion = 1
-    public static let versionedPath = "/remote/v1"
-    public static let pairingPath = versionedPath + "/pair"
-    public static let unpairPath = versionedPath + "/unpair"
-    public static let snapshotPath = versionedPath + "/snapshot"
-    public static let eventsPath = versionedPath + "/events"
-    public static let workspacesPath = versionedPath + "/workspaces"
-    public static let sessionsPath = versionedPath + "/sessions"
-    public static let agentsPath = versionedPath + "/agents"
-    public static let workflowsPath = versionedPath + "/workflows"
-    public static let contextBuilderPath = versionedPath + "/context-builder"
-    public static let commandsPath = versionedPath + "/commands"
-    public static let historyPath = versionedPath + "/history"
-    public static let transcriptPath = versionedPath + "/transcript"
-    public static let imageAttachmentPath = versionedPath + "/image_attachment"
-    public static let diagnosticsPath = versionedPath + "/diagnostics"
-    public static let transportBootstrapPath = versionedPath + "/transport/bootstrap"
-    public static let irohBindingPath = versionedPath + "/transport/bind"
     public static let irohALPN = "repoprompt-remote/1"
 
     public static func supports(_ version: Int) -> Bool {
         (minimumSupportedVersion ... currentVersion).contains(version)
-    }
-}
-
-/// Data encoded in the QR code. It identifies the desktop and gives the phone
-/// enough information to establish a TLS-verified connection; it never
-/// contains the issued device credential. Newly issued codes expire after a
-/// short interval and are invalidated when used or regenerated. Legacy codes
-/// without `expiresAt` remain decodable during migration.
-public struct RemotePairingAdvertisement: Codable, Sendable, Equatable {
-    public let protocolVersion: Int
-    public let desktopInstanceID: String
-    public let serviceName: String?
-    public let host: String?
-    public let port: Int?
-    public let certificateSHA256: String
-    public let oneTimeSecret: String
-    public let expiresAt: Date?
-
-    public init(
-        protocolVersion: Int = RemoteProtocol.currentVersion,
-        desktopInstanceID: String,
-        serviceName: String? = nil,
-        host: String? = nil,
-        port: Int? = nil,
-        certificateSHA256: String,
-        oneTimeSecret: String,
-        expiresAt: Date? = nil
-    ) {
-        self.protocolVersion = protocolVersion
-        self.desktopInstanceID = desktopInstanceID
-        self.serviceName = serviceName
-        self.host = host
-        self.port = port
-        self.certificateSHA256 = certificateSHA256
-        self.oneTimeSecret = oneTimeSecret
-        self.expiresAt = expiresAt
-    }
-
-}
-
-public struct RemotePairingRequest: Codable, Sendable, Equatable {
-    public let protocolVersion: Int
-    public let desktopInstanceID: String
-    public let oneTimeSecret: String
-    public let deviceName: String
-
-    public init(
-        protocolVersion: Int = RemoteProtocol.currentVersion,
-        desktopInstanceID: String,
-        oneTimeSecret: String,
-        deviceName: String
-    ) {
-        self.protocolVersion = protocolVersion
-        self.desktopInstanceID = desktopInstanceID
-        self.oneTimeSecret = oneTimeSecret
-        self.deviceName = deviceName
     }
 }
 
@@ -250,7 +177,7 @@ public struct RemoteConnectionSummary: Codable, Sendable, Equatable {
     public let transport: String
     public let lastConnectedAt: Date?
 
-    public init(state: State, transport: String = "lan_https", lastConnectedAt: Date? = nil) {
+    public init(state: State, transport: String = "iroh", lastConnectedAt: Date? = nil) {
         self.state = state
         self.transport = transport
         self.lastConnectedAt = lastConnectedAt

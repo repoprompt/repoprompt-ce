@@ -1,18 +1,10 @@
 import Foundation
 import RepoPromptRemoteProtocol
 
-enum RemoteGatewayTransportContext: Equatable {
-    case legacyHTTPS
-    case authenticatedPeer(endpointID: String, deviceID: String)
-}
-
 struct RemoteGatewayRequestContext: Equatable {
-    let transport: RemoteGatewayTransportContext
+    let endpointID: String
+    let deviceID: String
     let authorizationHeader: String?
-
-    static func legacyHTTPS(authorizationHeader: String?) -> Self {
-        Self(transport: .legacyHTTPS, authorizationHeader: authorizationHeader)
-    }
 }
 
 enum RemoteGatewayCommandEndpoint: Equatable {
@@ -28,10 +20,7 @@ struct RemoteGatewayTranscriptRequest: Equatable {
 }
 
 enum RemoteGatewayRequest {
-    case pair(RemotePairingRequest)
     case pairIroh(RemoteIrohPairingRequest, authenticatedPeerEndpointID: String)
-    case transportBootstrap
-    case bindIrohEndpoint(RemoteIrohBindingRequest)
     case unpair
     case snapshot
     case diagnostics
@@ -59,12 +48,6 @@ struct RemoteGatewayResponse {
     static func error(_ error: RemoteErrorResponse, status: Int) -> Self {
         Self(status: status, content: .error(error))
     }
-}
-
-enum RemoteGatewayPairingResult {
-    case success(RemotePairingResponse)
-    case forbidden(String)
-    case failed
 }
 
 enum RemoteGatewayRevocationResult {
@@ -96,10 +79,7 @@ enum RemoteGatewayCommandResult {
 @MainActor
 struct RemoteGatewayRoutingServices {
     var authorize: (RemoteGatewayRequestContext) -> Bool
-    var pair: (RemotePairingRequest) -> RemoteGatewayPairingResult
     var pairIroh: (RemoteIrohPairingRequest, String) -> Result<RemoteIrohPairingResponse, Error>
-    var transportBootstrap: () -> RemoteTransportBootstrapResponse?
-    var bindIrohEndpoint: (RemoteIrohBindingRequest, String?) -> Result<RemoteIrohBindingResponse, Error>
     var unpair: () -> RemoteGatewayRevocationResult
     var snapshot: () async -> RemoteSnapshot?
     var diagnostics: () async -> RemoteDiagnostics?
@@ -114,7 +94,6 @@ struct RemoteGatewayRoutingServices {
 
     init(
         authorize: @escaping (RemoteGatewayRequestContext) -> Bool,
-        pair: @escaping (RemotePairingRequest) -> RemoteGatewayPairingResult,
         unpair: @escaping () -> RemoteGatewayRevocationResult,
         snapshot: @escaping () async -> RemoteSnapshot?,
         diagnostics: @escaping () async -> RemoteDiagnostics?,
@@ -128,17 +107,10 @@ struct RemoteGatewayRoutingServices {
         imageAttachment: @escaping (RemoteImageAttachmentRequest) async throws -> RemoteImageAttachmentChunk? = { _ in nil },
         pairIroh: @escaping (RemoteIrohPairingRequest, String) -> Result<RemoteIrohPairingResponse, Error> = { _, _ in
             .failure(RemoteGatewayRouterError.irohUnavailable)
-        },
-        transportBootstrap: @escaping () -> RemoteTransportBootstrapResponse? = { nil },
-        bindIrohEndpoint: @escaping (RemoteIrohBindingRequest, String?) -> Result<RemoteIrohBindingResponse, Error> = { _, _ in
-            .failure(RemoteGatewayRouterError.irohUnavailable)
         }
     ) {
         self.authorize = authorize
-        self.pair = pair
         self.pairIroh = pairIroh
-        self.transportBootstrap = transportBootstrap
-        self.bindIrohEndpoint = bindIrohEndpoint
         self.unpair = unpair
         self.snapshot = snapshot
         self.diagnostics = diagnostics
@@ -163,10 +135,10 @@ enum RemoteGatewayRouterError: LocalizedError {
 
 /// Transport-independent application router for the desktop Remote gateway.
 ///
-/// Network adapters translate their wire format into `RemoteGatewayRequest`
+/// The Iroh adapter translates wire frames into `RemoteGatewayRequest`
 /// values and serialize the returned JSON or ordered events. Authorization,
 /// authority enforcement, command behavior, and application errors stay here
-/// so additional transports cannot create a second routing policy.
+/// after the adapter authenticates each peer.
 @MainActor
 final class RemoteGatewayRequestRouter {
     private let services: RemoteGatewayRoutingServices
@@ -185,8 +157,6 @@ final class RemoteGatewayRequestRouter {
         context: RemoteGatewayRequestContext
     ) async -> RemoteGatewayResponse {
         switch request {
-        case let .pair(pairingRequest):
-            return routePairing(pairingRequest)
         case let .pairIroh(pairingRequest, authenticatedPeerEndpointID):
             return routeIrohPairing(pairingRequest, authenticatedPeerEndpointID: authenticatedPeerEndpointID)
         default:
@@ -201,34 +171,8 @@ final class RemoteGatewayRequestRouter {
         }
 
         switch request {
-        case .pair, .pairIroh:
+        case .pairIroh:
             preconditionFailure("Pairing is handled before authorization.")
-
-        case .transportBootstrap:
-            guard let response = services.transportBootstrap() else {
-                return .error(
-                    .init(code: "iroh_unavailable", message: "Iroh transport is not available.", retryable: true),
-                    status: 503
-                )
-            }
-            return encode(response)
-
-        case let .bindIrohEndpoint(request):
-            guard case .legacyHTTPS = context.transport else {
-                return .error(
-                    .init(
-                        code: "endpoint_binding_requires_legacy_https",
-                        message: "Iroh endpoint binding must be authorized through the pinned HTTPS transport."
-                    ),
-                    status: 403
-                )
-            }
-            switch services.bindIrohEndpoint(request, context.authorizationHeader) {
-            case let .success(response):
-                return encode(response)
-            case let .failure(error):
-                return .error(.init(code: "endpoint_binding_failed", message: error.localizedDescription), status: 403)
-            }
 
         case .unpair:
             guard case .success = services.unpair() else {
@@ -352,20 +296,6 @@ final class RemoteGatewayRequestRouter {
             encode(response)
         case let .failure(error):
             .error(.init(code: "pairing_failed", message: error.localizedDescription), status: 403)
-        }
-    }
-
-    private func routePairing(_ request: RemotePairingRequest) -> RemoteGatewayResponse {
-        switch services.pair(request) {
-        case let .success(response):
-            encode(response)
-        case let .forbidden(message):
-            .error(.init(code: "pairing_failed", message: message), status: 403)
-        case .failed:
-            .error(
-                .init(code: "pairing_failed", message: "Pairing could not be completed."),
-                status: 500
-            )
         }
     }
 

@@ -12,13 +12,8 @@ application repository. `Sources/RepoPromptShared/RemoteProtocolExports.swift`
 re-exports the internal target for desktop consumers without importing the app
 UI or MCP implementation.
 
-Companion clients own their protocol implementations independently. Compatibility
-is defined only by the versioned wire format. The protocol-v1 baseline in this
-repository is frozen against the RepoPrompt Remote TestFlight source commit
-`0bfa18f2a480791cddde24bb79fa79b40d0dd934`; the contract tests and JSON fixtures
-under `Tests/RepoPromptRemoteProtocolTests/` protect decoding and additive-field
-compatibility with that shipped client. Neither application needs the other
-application's checkout to build.
+Companion clients build their protocol implementations independently. The
+shared Swift sources and JSON fixtures define the versioned Iroh wire contract.
 
 `RemoteSnapshot` is the authoritative fleet projection sent after pairing and
 on reconnect. It contains desktop and connection state, authorization, all saved
@@ -35,34 +30,19 @@ events after the mobile cursor. If the cursor is older than the retained range,
 the gateway must return a complete snapshot before resuming live events. Event
 IDs are deduplicated so retries cannot apply the same event twice.
 
-The current wire surface includes:
+Iroh frames cover pairing, authentication, snapshots, event replay,
+workspace and session lists, agent and workflow catalogs, diagnostics,
+history, transcripts, attachments, context building, and chat commands.
 
-- `POST /remote/v1/pair`
-- `GET /remote/v1/snapshot`
-- `GET /remote/v1/events?after=<cursor>`
-- `GET /remote/v1/workspaces`
-- `GET /remote/v1/sessions`
-- `GET /remote/v1/agents`
-- `GET /remote/v1/workflows`
-- `GET /remote/v1/diagnostics`
-- `GET /remote/v1/history?q=<query>&limit=<n>`
-- `GET /remote/v1/transcript?session_id=<id>&after=<sequence>&limit=<n>&details=1`
-- `POST /remote/v1/commands`
-- `POST /remote/v1/context-builder`
-
-History can be scoped with `workspace_id`. The response echoes the workspace
-and includes `olderCursor` when more chats are available. Pass its
-`lastActivityAt` and `sessionID` as `before_date` and `before_id` on the next
-HTTPS request, or as the typed `before` cursor over Iroh. Dates are measured in
-seconds since 2001-01-01 UTC. Older desktops return a global page without the
-workspace echo.
+History requests can be scoped to a workspace. The response echoes the
+workspace and includes an `olderCursor` for the next page when needed.
 
 The gateway emits coarse workspace, session, run-state, interaction, and
 authorization/catalog events from the same authoritative projection used for
 snapshots. Transcript rows are paged separately so the fleet stream stays
 bounded. Tool arguments/results, reasoning, file/worktree key paths, process
 metadata, and approval-adjacent details are only returned when the client
-explicitly requests `details=1`; common credential fields are redacted before
+explicitly requests details; common credential fields are redacted before
 returning them.
 
 ## Authorization
@@ -97,8 +77,7 @@ RemoteGatewayController
   ├── pairing and device credential store
   ├── desktop-enforced authorization
   ├── snapshot projection
-  ├── HTTPS JSON snapshot/catalog/history/transcript/diagnostics endpoints
-  ├── HTTPS JSON command endpoint
+  ├── authenticated Iroh read and command streams
   ├── resumable event stream and replay buffer
   └── encrypted notification envelope + configurable relay client
         │
@@ -115,16 +94,10 @@ uses `RemoteSnapshotBuilder`, `WindowRemoteReadService`, and
 The command boundary rechecks authorization before dispatching Agent Mode
 start, follow-up, steer, response, cancel, and resume operations.
 
-The gateway is opt-in. Pinned LAN HTTPS remains the default transport and uses
-Bonjour for discovery; Iroh is a separate explicit opt-in for newer Remote
-builds. The default pairing QR remains the untagged LAN advertisement understood
-by the current TestFlight build. Pairing codes contain a short-lived, one-time
-secret, never a long-lived bearer credential. The desktop stores the generated PKCS#12 TLS identity, Iroh endpoint identity,
-and paired-device credential in the app's signed secure-storage domain. The
-runtime imports the TLS identity in memory. An upgrade migrates legacy records
-that are accessible without a Keychain prompt, preserving the certificate pin and
-bearer. Unpair persists a revocation marker before clearing the live connection
-so a legacy record cannot restore access after a restart.
+Enabling Remote starts the Iroh gateway. Pairing codes are short-lived and
+single-use. The Mac stores the Iroh endpoint secret and the paired-device
+credential in its signed secure-storage domain. Unpairing revokes the stored
+credential before clearing the live connection.
 
 ## Local development integration
 
@@ -165,8 +138,8 @@ rpce-cli-debug -e 'windows'
 ```
 
 The local signing identity and secure-storage override are required when
-validating CE certificate and paired-credential persistence; never commit the
-identity or team. Prefer the
+validating Iroh identity and paired-credential persistence. Keep the
+identity and team in local build settings. Prefer the
 applicable `make dev-*` targets (`make dev-test`, `make dev-smoke`, and so on)
 to uncoordinated commands. Use `rpce-cli-debug` against the running CE debug app
 to select a known workspace, create recognizable non-destructive session state,
@@ -175,17 +148,16 @@ and record the CLI start/wait result that the phone observes.
 Run acceptance in sequence: pair Simulator through the Debug manual field with
 the copied short-lived `rpremote://pair?...` value, then test a registered
 physical iPhone by camera on the same non-isolated LAN. On the device, verify
-Bonjour discovery and recovery after Wi-Fi interruption and a CE restart with
-an ephemeral-port change. Only one device credential is active: forget the
+Iroh reconnect after a network change and a CE restart. Only one device credential is active: forget the
 pairing in iOS and revoke it in CE before re-pairing, and confirm the old
 credential is rejected.
 
 Optional local push comes last. Run the relay with APNs sandbox credentials
 (`APNS_PRODUCTION` unset) and configure the Mac-side relay URL as
 `http://127.0.0.1:8787/v1/notify`. The Mac, not the phone, resolves loopback;
-push remains only an attention signal followed by authoritative LAN resync.
+push remains only an attention signal followed by authoritative Iroh resync.
 This path does not cover production APNs, FCM, or deployed relay operations.
-Simulator, physical-device, Bonjour/LAN, Keychain-persistence, and APNs
+Simulator, physical-device, Iroh path, Keychain-persistence, and APNs
 acceptance remain environment-dependent and are not established by these
 documentation steps.
 
@@ -247,32 +219,3 @@ The desktop gateway remains responsible for its own threat model, residual risks
 and release gates. Companion applications maintain their security documentation
 and release process independently; they are wire-compatible peers, not build-time
 dependencies.
-
-## Upstream compatibility maintenance
-
-The October 7, 2026 integration incorporates upstream
-`2ee1a27a58c64cf9a7fcd10c513333e001148d26` while preserving the standalone
-Remote Gateway and Iroh transport. Remote session metadata belongs to the current
-`AgentTabSession` authority. Model configuration retains upstream's workspace and
-inactive-run admission checks, and successful starts settle provisional session
-claims through `mcpAcceptSessionTarget`.
-
-Remote pending interactions are projected from Agent Mode's canonical
-`mcpPendingInteraction` surface, including permission and worktree approvals.
-The optional `responseUnavailableReason` wire field directs hook trust,
-unsupported approval choices, and multipart requests to the Mac. The gateway
-also rejects responses to these requests, including from older mobile clients.
-The protocol remains version 1; legacy payloads omit this optional field.
-
-Validation for this integration: the desktop product build, MCP product build,
-93 focused Remote/persistence tests, and repository Swift lint passed. The mobile
-peer passed 62 iOS Simulator tests, 34 protocol tests, and 3 relay tests. The
-mobile repository's `Scripts/check-desktop-compatibility.py` checks vendored Swift
-sources and JSON fixtures against the tested desktop revision. Real paired-device
-acceptance and release packaging are separate, unperformed checks.
-
-The window catalog owns one lazy Remote Gateway, which owns its pairing and
-availability services. Settings observes those same instances. The Remote targets
-and direct imports are registered in the upstream module catalog; architecture
-ratchet limits remain unchanged. Gateway/security/mutation and producer/projection
-test classes retain their suite names in two app-test files.

@@ -123,8 +123,6 @@ public enum RemoteRPCOperation: String, Codable, Sendable, CaseIterable {
     case imageAttachment = "image_attachment"
     case command
     case contextBuilder = "context_builder"
-    case transportBootstrap = "transport_bootstrap"
-    case bindIrohEndpoint = "bind_iroh_endpoint"
 }
 
 public struct RemoteRPCRequest: Codable, Sendable, Equatable {

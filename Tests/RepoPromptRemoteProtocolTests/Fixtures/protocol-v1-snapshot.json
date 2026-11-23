@@ -8,7 +8,7 @@
   },
   "connection": {
     "state": "connected",
-    "transport": "lan_https"
+    "transport": "iroh"
   },
   "authorization": {
     "defaultLevel": 2

@@ -2,29 +2,8 @@ import XCTest
 @testable import RepoPromptRemoteProtocol
 
 final class RemoteTransportContractTests: XCTestCase {
-    func testLegacyPairingFixtureDecodesWithoutExpiry() throws {
-        let advertisement = try JSONDecoder().decode(
-            RemotePairingAdvertisement.self,
-            from: fixtureData(named: "protocol-v1-legacy-pairing")
-        )
-
-        XCTAssertEqual(advertisement.protocolVersion, 1)
-        XCTAssertEqual(advertisement.desktopInstanceID, "legacy-desktop")
-        XCTAssertEqual(advertisement.certificateSHA256, String(repeating: "a", count: 64))
-        XCTAssertNil(advertisement.expiresAt)
-    }
-
-    func testPairingCodeVariantsAndIrohContractsRoundTrip() throws {
+    func testIrohPairingContractsRoundTrip() throws {
         let expiry = Date(timeIntervalSince1970: 2_000)
-        let legacy = RemotePairingAdvertisement(
-            desktopInstanceID: "desktop",
-            serviceName: "RepoPrompt-desktop",
-            host: "192.0.2.10",
-            port: 8443,
-            certificateSHA256: String(repeating: "a", count: 64),
-            oneTimeSecret: "secret",
-            expiresAt: expiry
-        )
         let endpoint = RemoteIrohEndpointAddress(
             endpointID: String(repeating: "b", count: 64),
             directAddresses: ["192.0.2.10:4433", "[2001:db8::1]:4433"],
@@ -34,16 +13,13 @@ final class RemoteTransportContractTests: XCTestCase {
             desktopInstanceID: "desktop",
             server: endpoint,
             oneTimeSecret: "secret",
-            expiresAt: expiry,
-            legacyFallback: legacy
+            expiresAt: expiry
         )
 
-        for code in [RemotePairingCode.legacyLAN(legacy), .iroh(iroh)] {
-            XCTAssertEqual(
-                try JSONDecoder().decode(RemotePairingCode.self, from: JSONEncoder().encode(code)),
-                code
-            )
-        }
+        XCTAssertEqual(
+            try JSONDecoder().decode(RemoteIrohPairingAdvertisement.self, from: JSONEncoder().encode(iroh)),
+            iroh
+        )
 
         let pairingRequest = RemoteIrohPairingRequest(
             desktopInstanceID: "desktop",
@@ -58,29 +34,6 @@ final class RemoteTransportContractTests: XCTestCase {
                 from: JSONEncoder().encode(pairingRequest)
             ),
             pairingRequest
-        )
-
-        let bootstrap = RemoteTransportBootstrapResponse(
-            desktopInstanceID: "desktop",
-            server: endpoint
-        )
-        XCTAssertEqual(
-            try JSONDecoder().decode(
-                RemoteTransportBootstrapResponse.self,
-                from: JSONEncoder().encode(bootstrap)
-            ),
-            bootstrap
-        )
-
-        let binding = RemoteIrohBindingRequest(
-            desktopInstanceID: "desktop",
-            deviceID: "device",
-            expectedServerEndpointID: endpoint.endpointID,
-            clientEndpointID: pairingRequest.clientEndpointID
-        )
-        XCTAssertEqual(
-            try JSONDecoder().decode(RemoteIrohBindingRequest.self, from: JSONEncoder().encode(binding)),
-            binding
         )
 
         let pairingResponse = RemoteIrohPairingResponse(
@@ -103,20 +56,6 @@ final class RemoteTransportContractTests: XCTestCase {
                 from: JSONEncoder().encode(pairingResponse)
             ),
             pairingResponse
-        )
-
-        let bindingResponse = RemoteIrohBindingResponse(
-            desktopInstanceID: "desktop",
-            deviceID: "device",
-            serverEndpointID: endpoint.endpointID,
-            clientEndpointID: pairingRequest.clientEndpointID
-        )
-        XCTAssertEqual(
-            try JSONDecoder().decode(
-                RemoteIrohBindingResponse.self,
-                from: JSONEncoder().encode(bindingResponse)
-            ),
-            bindingResponse
         )
     }
 

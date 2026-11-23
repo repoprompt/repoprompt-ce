@@ -31,7 +31,7 @@ final class RemoteContractTests: XCTestCase {
     func testProtocolCompatibilityAcceptsCurrentVersionOnly() {
         XCTAssertEqual(RemoteProtocol.minimumSupportedVersion, 1)
         XCTAssertEqual(RemoteProtocol.currentVersion, 1)
-        XCTAssertEqual(RemoteProtocol.versionedPath, "/remote/v1")
+        XCTAssertEqual(RemoteProtocol.irohALPN, "repoprompt-remote/1")
         XCTAssertTrue(RemoteProtocol.supports(RemoteProtocol.currentVersion))
         XCTAssertFalse(RemoteProtocol.supports(RemoteProtocol.currentVersion + 1))
         XCTAssertFalse(RemoteProtocol.supports(RemoteProtocol.minimumSupportedVersion - 1))

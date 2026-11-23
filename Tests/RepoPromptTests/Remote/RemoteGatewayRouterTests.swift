@@ -49,25 +49,7 @@ final class RemoteGatewayRouterTests: XCTestCase {
         )
     }
 
-    func testLegacyHTTPDecodesWorkspaceHistoryScopeAndCursor() {
-        let workspace = UUID()
-        let session = UUID()
-        let request = RemoteLegacyHTTPRequest(
-            method: "GET",
-            target: "\(RemoteProtocol.historyPath)?workspace_id=\(workspace)&before_date=12.5&before_id=\(session)&limit=25",
-            headers: [:],
-            body: Data()
-        )
-        guard case let .request(.history(history)) = RemoteLegacyHTTPRequestDecoder.decode(request) else {
-            return XCTFail("Expected a workspace history request.")
-        }
-        XCTAssertEqual(history, RemoteHistoryRPCRequest(
-            limit: 25, workspaceID: workspace,
-            before: RemoteHistoryCursor(lastActivityAt: Date(timeIntervalSinceReferenceDate: 12.5), sessionID: session)
-        ))
-    }
-
-    func testProtectedRequestsRequireAuthorizationBeforeRoutingForEveryTransportContext() async throws {
+    func testProtectedRequestsRequireAuthorizationBeforeRouting() async throws {
         var snapshotCalls = 0
         let router = makeRouter(
             authorize: { _ in false },
@@ -78,9 +60,9 @@ final class RemoteGatewayRouterTests: XCTestCase {
         )
 
         for context in [
-            RemoteGatewayRequestContext.legacyHTTPS(authorizationHeader: nil),
+            RemoteGatewayRequestContext.testPeer(authorizationHeader: nil),
             RemoteGatewayRequestContext(
-                transport: .authenticatedPeer(endpointID: "peer-1", deviceID: "device-1"),
+                endpointID: "peer-1", deviceID: "device-1",
                 authorizationHeader: "Bearer invalid"
             )
         ] {
@@ -103,22 +85,17 @@ final class RemoteGatewayRouterTests: XCTestCase {
                 return chunk
             }
         )
-        let denied = await router.route(.imageAttachment(request), context: .legacyHTTPS(authorizationHeader: nil))
+        let denied = await router.route(.imageAttachment(request), context: .testPeer(authorizationHeader: nil))
         XCTAssertEqual(denied.status, 401)
         XCTAssertEqual(reads, 0)
 
-        let networkRequest = try RemoteLegacyHTTPRequest(
-            method: "POST", target: RemoteProtocol.imageAttachmentPath, headers: [:], body: JSONEncoder().encode(request)
-        )
-        guard case let .request(decoded) = RemoteLegacyHTTPRequestDecoder.decode(networkRequest)
-        else { return XCTFail("Expected the HTTPS adapter to decode the image request.") }
-        let response = await router.route(decoded, context: .legacyHTTPS(authorizationHeader: "Bearer paired"))
+        let response = await router.route(.imageAttachment(request), context: .testPeer(authorizationHeader: "Bearer paired"))
         XCTAssertEqual(try JSONDecoder().decode(RemoteImageAttachmentChunk.self, from: json(from: response)), chunk)
 
         let invalid = RemoteImageAttachmentRequest(
             sessionID: request.sessionID, itemID: request.itemID, attachmentID: request.attachmentID, variant: .original, offset: 20
         )
-        let rejected = await router.route(.imageAttachment(invalid), context: .legacyHTTPS(authorizationHeader: "Bearer paired"))
+        let rejected = await router.route(.imageAttachment(invalid), context: .testPeer(authorizationHeader: "Bearer paired"))
         XCTAssertEqual(rejected.status, 400)
         XCTAssertEqual(reads, 1)
     }
@@ -128,7 +105,7 @@ final class RemoteGatewayRouterTests: XCTestCase {
 
         let response = await router.route(
             .unpair,
-            context: .legacyHTTPS(authorizationHeader: "Bearer credential")
+            context: .testPeer(authorizationHeader: "Bearer credential")
         )
 
         XCTAssertEqual(response.status, 500)
@@ -147,7 +124,7 @@ final class RemoteGatewayRouterTests: XCTestCase {
         let response = await router.route(
             .unpair,
             context: .init(
-                transport: .authenticatedPeer(endpointID: "peer", deviceID: "device"),
+                endpointID: "peer", deviceID: "device",
                 authorizationHeader: "Bearer credential"
             )
         )
@@ -162,8 +139,10 @@ final class RemoteGatewayRouterTests: XCTestCase {
     }
 
     func testPairingBypassesEstablishedCredentialAuthorization() async throws {
-        let pairingRequest = RemotePairingRequest(
+        let pairingRequest = RemoteIrohPairingRequest(
             desktopInstanceID: "desktop",
+            expectedServerEndpointID: "server",
+            clientEndpointID: "peer",
             oneTimeSecret: "secret",
             deviceName: "Phone"
         )
@@ -174,26 +153,27 @@ final class RemoteGatewayRouterTests: XCTestCase {
             isAvailable: true,
             lastSeenAt: Date(timeIntervalSince1970: 1)
         )
-        let expected = RemotePairingResponse(
-            desktop: desktop,
-            deviceID: "device",
-            credential: "credential"
+        let expected = RemoteIrohPairingResponse(
+            pairingResponse: .init(desktop: desktop, deviceID: "device", credential: "credential"),
+            serverEndpointID: "server",
+            clientEndpointID: "peer"
         )
         let router = makeRouter(
             authorize: { _ in false },
-            pair: { request in
+            pairIroh: { request, peer in
+                XCTAssertEqual(peer, "peer")
                 XCTAssertEqual(request, pairingRequest)
                 return .success(expected)
             }
         )
 
         let response = await router.route(
-            .pair(pairingRequest),
-            context: .legacyHTTPS(authorizationHeader: nil)
+            .pairIroh(pairingRequest, authenticatedPeerEndpointID: "peer"),
+            context: .testPeer(authorizationHeader: nil)
         )
 
         XCTAssertEqual(response.status, 200)
-        XCTAssertEqual(try JSONDecoder().decode(RemotePairingResponse.self, from: json(from: response)), expected)
+        XCTAssertEqual(try JSONDecoder().decode(RemoteIrohPairingResponse.self, from: json(from: response)), expected)
     }
 
     func testCommandResponsePreservesResolvedFieldsAndAddsCurrentEventCursor() async throws {
@@ -243,7 +223,7 @@ final class RemoteGatewayRouterTests: XCTestCase {
 
         let response = await router.route(
             .command(command, endpoint: .commands),
-            context: .legacyHTTPS(authorizationHeader: "Bearer valid")
+            context: .testPeer(authorizationHeader: "Bearer valid")
         )
         let decoded = try JSONDecoder().decode(RemoteCommandResponse.self, from: json(from: response))
 
@@ -254,7 +234,7 @@ final class RemoteGatewayRouterTests: XCTestCase {
         XCTAssertEqual(decoded.resolvedToolCatalog, catalog)
     }
 
-    func testCommandAuthorityMatrixMatchesLegacyPolicy() {
+    func testCommandAuthorityMatrix() {
         let expected: [(RemoteCommandOperation, RemoteAuthorityLevel)] = [
             (.respond, .respond),
             (.startRun, .control),
@@ -296,7 +276,7 @@ final class RemoteGatewayRouterTests: XCTestCase {
 
         let response = await router.route(
             .command(command, endpoint: .commands),
-            context: .legacyHTTPS(authorizationHeader: "Bearer valid")
+            context: .testPeer(authorizationHeader: "Bearer valid")
         )
         let decoded = try JSONDecoder().decode(RemoteCommandResponse.self, from: json(from: response))
 
@@ -316,7 +296,7 @@ final class RemoteGatewayRouterTests: XCTestCase {
 
         let response = await router.route(
             .command(RemoteCommandRequest(operation: .cancel), endpoint: .contextBuilder),
-            context: .legacyHTTPS(authorizationHeader: "Bearer valid")
+            context: .testPeer(authorizationHeader: "Bearer valid")
         )
 
         XCTAssertEqual(response.status, 400)
@@ -347,35 +327,7 @@ final class RemoteGatewayRouterTests: XCTestCase {
         )
     }
 
-    func testIrohEndpointBindingIsRejectedOutsidePinnedLegacyHTTPS() async throws {
-        var bindingCalls = 0
-        let router = makeRouter(bindIrohEndpoint: { _, _ in
-            bindingCalls += 1
-            return .failure(TestFailure.unexpectedResponse)
-        })
-        let request = RemoteIrohBindingRequest(
-            desktopInstanceID: "desktop",
-            deviceID: "device",
-            expectedServerEndpointID: String(repeating: "a", count: 64),
-            clientEndpointID: String(repeating: "b", count: 64)
-        )
-        let response = await router.route(
-            .bindIrohEndpoint(request),
-            context: .init(
-                transport: .authenticatedPeer(
-                    endpointID: String(repeating: "b", count: 64),
-                    deviceID: "device"
-                ),
-                authorizationHeader: "Bearer valid"
-            )
-        )
-
-        XCTAssertEqual(response.status, 403)
-        XCTAssertEqual(try error(from: response).code, "endpoint_binding_requires_legacy_https")
-        XCTAssertEqual(bindingCalls, 0)
-    }
-
-    func testEventsRemainTypedUntilTheLegacyAdapterSerializesSSE() async throws {
+    func testEventsRemainTypedAndStaleCursorsRequestSnapshot() async throws {
         let event = RemoteEvent(
             desktopInstanceID: "desktop",
             sequence: 9,
@@ -388,7 +340,7 @@ final class RemoteGatewayRouterTests: XCTestCase {
 
         let response = await replayRouter.route(
             .events(after: 8),
-            context: .legacyHTTPS(authorizationHeader: "Bearer valid")
+            context: .testPeer(authorizationHeader: "Bearer valid")
         )
         XCTAssertEqual(response.status, 200)
         guard case let .events(events) = response.content else {
@@ -399,116 +351,14 @@ final class RemoteGatewayRouterTests: XCTestCase {
         let staleRouter = makeRouter(replay: { _ in .snapshotRequired })
         let staleResponse = await staleRouter.route(
             .events(after: 1),
-            context: .legacyHTTPS(authorizationHeader: "Bearer valid")
+            context: .testPeer(authorizationHeader: "Bearer valid")
         )
         XCTAssertEqual(staleResponse.status, 409)
         XCTAssertEqual(try error(from: staleResponse).code, "snapshot_required")
     }
 
-    func testLegacyDecoderPreservesRouteAndTranscriptQuerySemantics() {
-        let sessionID = UUID()
-        let request = RemoteLegacyHTTPRequest(
-            method: "GET",
-            target: "\(RemoteProtocol.transcriptPath)?session_id=\(sessionID.uuidString)&after=12&limit=33&details=1",
-            headers: ["authorization": "Bearer token"],
-            body: Data()
-        )
-
-        guard case let .request(.transcript(transcript)) = RemoteLegacyHTTPRequestDecoder.decode(request) else {
-            return XCTFail("Expected a transcript router request")
-        }
-        XCTAssertEqual(transcript.sessionID, sessionID)
-        XCTAssertEqual(transcript.paging, .legacyForward(afterSequenceIndex: 12))
-        XCTAssertEqual(transcript.limit, 33)
-        XCTAssertTrue(transcript.includeDetails)
-    }
-
-    func testLegacyDecoderPreservesValidationErrorsAndRouteTable() throws {
-        let invalidTranscript = RemoteLegacyHTTPRequest(
-            method: "GET",
-            target: "\(RemoteProtocol.transcriptPath)?session_id=invalid",
-            headers: [:],
-            body: Data()
-        )
-        guard case let .response(response) = RemoteLegacyHTTPRequestDecoder.decode(invalidTranscript) else {
-            return XCTFail("Expected an immediate validation response")
-        }
-        XCTAssertEqual(response.status, 400)
-        XCTAssertEqual(try error(from: response).code, "invalid_session")
-
-        let routes: [(String, String, String)] = [
-            ("POST", RemoteProtocol.unpairPath, "unpair"),
-            ("GET", RemoteProtocol.snapshotPath, "snapshot"),
-            ("GET", RemoteProtocol.diagnosticsPath, "diagnostics"),
-            ("GET", RemoteProtocol.workspacesPath, "workspaces"),
-            ("GET", RemoteProtocol.sessionsPath, "sessions"),
-            ("GET", RemoteProtocol.agentsPath, "agents"),
-            ("GET", RemoteProtocol.workflowsPath, "workflows"),
-            ("GET", RemoteProtocol.historyPath, "history"),
-            ("GET", RemoteProtocol.eventsPath, "events")
-        ]
-        for (method, path, expected) in routes {
-            let request = RemoteLegacyHTTPRequest(method: method, target: path, headers: [:], body: Data())
-            guard case let .request(route) = RemoteLegacyHTTPRequestDecoder.decode(request) else {
-                XCTFail("Expected route for \(method) \(path)")
-                continue
-            }
-            XCTAssertEqual(routeName(route), expected)
-        }
-    }
-
-    func testLegacyParserRetainsBoundedBodyAndHeaderBehavior() {
-        var buffer = Data("POST /remote/v1/commands HTTP/1.1\r\nAuthorization: Bearer token\r\nContent-Length: 4\r\n\r\ntesttrailing".utf8)
-        let request = RemoteLegacyHTTPParser.nextRequest(from: &buffer)
-
-        XCTAssertEqual(request?.method, "POST")
-        XCTAssertEqual(request?.target, "/remote/v1/commands")
-        XCTAssertEqual(request?.headers["authorization"], "Bearer token")
-        XCTAssertEqual(request?.body, Data("test".utf8))
-        XCTAssertEqual(buffer, Data("trailing".utf8))
-
-        var oversized = Data("POST / HTTP/1.1\r\nContent-Length: 1048577\r\n\r\n".utf8)
-        XCTAssertNil(RemoteLegacyHTTPParser.nextRequest(from: &oversized))
-        XCTAssertTrue(oversized.isEmpty)
-    }
-
-    func testLegacyResponseEncoderPreservesHTTPAndShortSSEWireBehavior() {
-        let event = RemoteEvent(
-            desktopInstanceID: "desktop",
-            sequence: 11,
-            type: .sessionUpdated
-        )
-        let encodedEvent = RemoteLegacyHTTPResponseEncoder.encode(
-            RemoteGatewayResponse(status: 200, content: .events([event]))
-        )
-        let eventText = String(decoding: encodedEvent.data, as: UTF8.self)
-        XCTAssertTrue(eventText.hasPrefix("HTTP/1.1 200 OK\r\n"))
-        XCTAssertTrue(eventText.contains("Content-Type: text/event-stream; charset=utf-8\r\n"))
-        XCTAssertTrue(eventText.contains("Cache-Control: no-store\r\n"))
-        XCTAssertTrue(eventText.contains("id: 11\ndata: "))
-
-        let connected = RemoteLegacyHTTPResponseEncoder.encode(
-            RemoteGatewayResponse(status: 200, content: .events([]))
-        )
-        XCTAssertTrue(String(decoding: connected.data, as: UTF8.self).hasSuffix(": connected\n\n"))
-
-        let error = RemoteLegacyHTTPResponseEncoder.encode(.error(
-            .init(code: "snapshot_required", message: "Refresh.", retryable: true),
-            status: 409
-        ))
-        let errorText = String(decoding: error.data, as: UTF8.self)
-        XCTAssertTrue(errorText.hasPrefix("HTTP/1.1 409 Conflict\r\n"))
-        XCTAssertTrue(errorText.contains("Content-Type: application/json; charset=utf-8\r\n"))
-        XCTAssertTrue(errorText.contains("\"code\":\"snapshot_required\""))
-    }
-
-    func testLegacyAdapterRetainsOneMegabyteInboundBound() {
-        XCTAssertEqual(RemoteLegacyHTTPSGatewayAdapter.maximumBufferedRequestBytes, 1_048_576)
-    }
-
     private func makeRouter(
         authorize: @escaping (RemoteGatewayRequestContext) -> Bool = { _ in true },
-        pair: @escaping (RemotePairingRequest) -> RemoteGatewayPairingResult = { _ in .failed },
         unpair: @escaping () -> RemoteGatewayRevocationResult = { .success },
         snapshot: @escaping () async -> RemoteSnapshot? = { nil },
         replay: @escaping (UInt64?) async -> RemoteEventReplayResult = { _ in .events([]) },
@@ -519,13 +369,12 @@ final class RemoteGatewayRouterTests: XCTestCase {
         execute: @escaping (RemoteCommandRequest) async -> RemoteGatewayCommandResult = { _ in .unavailable },
         eventCursor: @escaping () async -> UInt64 = { 0 },
         imageAttachment: @escaping (RemoteImageAttachmentRequest) async throws -> RemoteImageAttachmentChunk? = { _ in nil },
-        bindIrohEndpoint: @escaping (RemoteIrohBindingRequest, String?) -> Result<RemoteIrohBindingResponse, Error> = { _, _ in
+        pairIroh: @escaping (RemoteIrohPairingRequest, String) -> Result<RemoteIrohPairingResponse, Error> = { _, _ in
             .failure(TestFailure.unexpectedResponse)
         }
     ) -> RemoteGatewayRequestRouter {
         RemoteGatewayRequestRouter(services: RemoteGatewayRoutingServices(
             authorize: authorize,
-            pair: pair,
             unpair: unpair,
             snapshot: snapshot,
             diagnostics: { nil },
@@ -537,7 +386,7 @@ final class RemoteGatewayRouterTests: XCTestCase {
             execute: execute,
             eventCursor: eventCursor,
             imageAttachment: imageAttachment,
-            bindIrohEndpoint: bindIrohEndpoint
+            pairIroh: pairIroh
         ))
     }
 
@@ -557,10 +406,7 @@ final class RemoteGatewayRouterTests: XCTestCase {
 
     private func routeName(_ request: RemoteGatewayRequest) -> String {
         switch request {
-        case .pair: "pair"
         case .pairIroh: "pair_iroh"
-        case .transportBootstrap: "transport_bootstrap"
-        case .bindIrohEndpoint: "bind_iroh_endpoint"
         case .unpair: "unpair"
         case .snapshot: "snapshot"
         case .diagnostics: "diagnostics"
@@ -574,6 +420,12 @@ final class RemoteGatewayRouterTests: XCTestCase {
         case .events: "events"
         case .command: "command"
         }
+    }
+}
+
+private extension RemoteGatewayRequestContext {
+    static func testPeer(authorizationHeader: String?) -> Self {
+        Self(endpointID: "peer", deviceID: "device", authorizationHeader: authorizationHeader)
     }
 }
 
@@ -595,36 +447,27 @@ final class RemoteIrohSecurityTests: XCTestCase {
         case failed
     }
 
-    func testIssuedLegacyAndIrohAdvertisementsShareExpiringSecret() throws {
+    func testPairingAdvertisementContainsAnExpiringSingleUseSecret() throws {
         let clock = TestClock(Date(timeIntervalSince1970: 1000))
-        let manager = makeManager(clock: clock)
-        let issued = try manager.issuePairingAdvertisements(
-            port: 8443,
-            serviceName: "RepoPrompt-test",
-            host: "192.0.2.1",
-            server: RemoteIrohEndpointAddress(endpointID: endpointID("a"))
-        )
+        let server = RemoteIrohEndpointAddress(endpointID: endpointID("a"))
+        let issued = try makeManager(clock: clock).issueAdvertisement(server: server)
 
-        XCTAssertEqual(issued.legacy.oneTimeSecret, issued.iroh.oneTimeSecret)
-        XCTAssertEqual(issued.legacy.expiresAt, clock.date.addingTimeInterval(300))
-        XCTAssertEqual(issued.iroh.expiresAt, clock.date.addingTimeInterval(300))
-        XCTAssertEqual(issued.iroh.legacyFallback, issued.legacy)
-        XCTAssertEqual(Data(base64URL: issued.legacy.oneTimeSecret)?.count, 32)
+        XCTAssertEqual(issued.server, server)
+        XCTAssertEqual(issued.expiresAt, clock.date.addingTimeInterval(300))
+        XCTAssertEqual(Data(base64URL: issued.oneTimeSecret)?.count, 32)
     }
 
     func testPairingSecretExpiresAndIsSingleUse() throws {
         let clock = TestClock(Date(timeIntervalSince1970: 2000))
         var persisted: [RemoteStoredDeviceCredential?] = []
         let manager = makeManager(clock: clock) { persisted.append($0) }
-        let advertisement = try manager.issueAdvertisement(
-            port: 8443,
-            serviceName: "RepoPrompt-test",
-            host: nil
-        )
-        clock.date = try XCTUnwrap(advertisement.expiresAt?.addingTimeInterval(1))
+        let advertisement = try manager.issueAdvertisement(server: .init(endpointID: endpointID("a")))
+        clock.date = advertisement.expiresAt.addingTimeInterval(1)
 
-        XCTAssertThrowsError(try manager.pair(
+        XCTAssertThrowsError(try manager.pairIroh(
             request: pairingRequest(secret: advertisement.oneTimeSecret),
+            authenticatedPeerEndpointID: endpointID("b"),
+            serverEndpointID: endpointID("a"),
             desktop: desktopSummary()
         )) { error in
             guard case RemoteGatewaySecurityError.pairingSecretExpired = error else {
@@ -633,8 +476,10 @@ final class RemoteIrohSecurityTests: XCTestCase {
         }
         XCTAssertTrue(persisted.isEmpty)
 
-        XCTAssertThrowsError(try manager.pair(
+        XCTAssertThrowsError(try manager.pairIroh(
             request: pairingRequest(secret: advertisement.oneTimeSecret),
+            authenticatedPeerEndpointID: endpointID("b"),
+            serverEndpointID: endpointID("a"),
             desktop: desktopSummary()
         )) { error in
             guard case RemoteGatewaySecurityError.pairingSecretInvalid = error else {
@@ -646,17 +491,13 @@ final class RemoteIrohSecurityTests: XCTestCase {
     func testPairingReplayFailsEvenWhenCredentialPersistenceFails() throws {
         let clock = TestClock(Date(timeIntervalSince1970: 3000))
         let manager = makeManager(clock: clock) { _ in throw PersistenceFailure.failed }
-        let advertisement = try manager.issueAdvertisement(
-            port: 8443,
-            serviceName: "RepoPrompt-test",
-            host: nil
-        )
+        let advertisement = try manager.issueAdvertisement(server: .init(endpointID: endpointID("a")))
         let request = pairingRequest(secret: advertisement.oneTimeSecret)
 
-        XCTAssertThrowsError(try manager.pair(request: request, desktop: desktopSummary())) { error in
+        XCTAssertThrowsError(try manager.pairIroh(request: request, authenticatedPeerEndpointID: endpointID("b"), serverEndpointID: endpointID("a"), desktop: desktopSummary())) { error in
             XCTAssertTrue(error is PersistenceFailure)
         }
-        XCTAssertThrowsError(try manager.pair(request: request, desktop: desktopSummary())) { error in
+        XCTAssertThrowsError(try manager.pairIroh(request: request, authenticatedPeerEndpointID: endpointID("b"), serverEndpointID: endpointID("a"), desktop: desktopSummary())) { error in
             guard case RemoteGatewaySecurityError.pairingSecretInvalid = error else {
                 return XCTFail("Expected consumed secret rejection, got \(error)")
             }
@@ -676,19 +517,14 @@ final class RemoteIrohSecurityTests: XCTestCase {
         let manager = makeManager(clock: clock, storedDevice: stale) { persisted = $0 }
         let serverID = endpointID("a")
         let replacementClientID = endpointID("c")
-        let issued = try manager.issuePairingAdvertisements(
-            port: 8443,
-            serviceName: "RepoPrompt-test",
-            host: nil,
-            server: RemoteIrohEndpointAddress(endpointID: serverID)
-        )
+        let issued = try manager.issueAdvertisement(server: RemoteIrohEndpointAddress(endpointID: serverID))
 
         let response = try manager.pairIroh(
             request: RemoteIrohPairingRequest(
                 desktopInstanceID: "desktop",
                 expectedServerEndpointID: serverID,
                 clientEndpointID: replacementClientID,
-                oneTimeSecret: issued.iroh.oneTimeSecret,
+                oneTimeSecret: issued.oneTimeSecret,
                 deviceName: "Replacement phone"
             ),
             authenticatedPeerEndpointID: replacementClientID,
@@ -699,7 +535,11 @@ final class RemoteIrohSecurityTests: XCTestCase {
         XCTAssertNotEqual(response.pairingResponse.deviceID, stale.deviceID)
         XCTAssertEqual(persisted?.deviceID, response.pairingResponse.deviceID)
         XCTAssertEqual(persisted?.irohPeerEndpointID, replacementClientID)
-        XCTAssertFalse(manager.isAuthorized("Bearer \(stale.credential)"))
+        XCTAssertFalse(manager.isAuthorizedIroh(
+            authorizationHeader: "Bearer \(stale.credential)",
+            deviceID: stale.deviceID,
+            authenticatedPeerEndpointID: stale.irohPeerEndpointID
+        ))
         XCTAssertTrue(manager.isAuthorizedIroh(
             authorizationHeader: "Bearer \(response.pairingResponse.credential)",
             deviceID: response.pairingResponse.deviceID,
@@ -713,17 +553,12 @@ final class RemoteIrohSecurityTests: XCTestCase {
         let manager = makeManager(clock: clock) { persisted = $0 }
         let serverID = endpointID("a")
         let clientID = endpointID("b")
-        let issued = try manager.issuePairingAdvertisements(
-            port: 8443,
-            serviceName: "RepoPrompt-test",
-            host: nil,
-            server: RemoteIrohEndpointAddress(endpointID: serverID)
-        )
+        let issued = try manager.issueAdvertisement(server: RemoteIrohEndpointAddress(endpointID: serverID))
         let request = RemoteIrohPairingRequest(
             desktopInstanceID: "desktop",
             expectedServerEndpointID: serverID,
             clientEndpointID: clientID,
-            oneTimeSecret: issued.iroh.oneTimeSecret,
+            oneTimeSecret: issued.oneTimeSecret,
             deviceName: "Phone"
         )
 
@@ -761,191 +596,37 @@ final class RemoteIrohSecurityTests: XCTestCase {
         ))
     }
 
-    func testAuthenticatedHTTPSBindingUpdatesExistingCredentialWithoutReplacement() throws {
-        let clock = TestClock(Date(timeIntervalSince1970: 5000))
-        let original = RemoteStoredDeviceCredential(
-            deviceID: "device",
-            credential: "bearer",
-            expiresAt: clock.date.addingTimeInterval(60),
-            deviceName: "Phone"
-        )
-        var persisted: RemoteStoredDeviceCredential? = nil
-        let manager = makeManager(clock: clock, storedDevice: original) { persisted = $0 }
-        let serverID = endpointID("a")
-        let firstClientID = endpointID("b")
-        let request = RemoteIrohBindingRequest(
-            desktopInstanceID: "desktop",
-            deviceID: original.deviceID,
-            expectedServerEndpointID: serverID,
-            clientEndpointID: firstClientID
-        )
-
-        let response = try manager.bindIrohEndpoint(
-            request: request,
-            authorizationHeader: "Bearer bearer",
-            serverEndpointID: serverID
-        )
-        XCTAssertEqual(response.deviceID, original.deviceID)
-        XCTAssertEqual(persisted?.credential, original.credential)
-        XCTAssertEqual(persisted?.irohPeerEndpointID, firstClientID)
-        XCTAssertTrue(manager.isAuthorizedIroh(
-            authorizationHeader: "Bearer bearer",
-            deviceID: "device",
-            authenticatedPeerEndpointID: firstClientID
-        ))
-        XCTAssertFalse(manager.isAuthorizedIroh(
-            authorizationHeader: "Bearer bearer",
-            deviceID: "device",
-            authenticatedPeerEndpointID: endpointID("c")
-        ))
-
-        let replacementClientID = endpointID("d")
-        _ = try manager.bindIrohEndpoint(
-            request: RemoteIrohBindingRequest(
-                desktopInstanceID: "desktop",
-                deviceID: original.deviceID,
-                expectedServerEndpointID: serverID,
-                clientEndpointID: replacementClientID
-            ),
-            authorizationHeader: "Bearer bearer",
-            serverEndpointID: serverID
-        )
-        XCTAssertEqual(persisted?.irohPeerEndpointID, replacementClientID)
-        XCTAssertFalse(manager.isAuthorizedIroh(
-            authorizationHeader: "Bearer bearer",
-            deviceID: "device",
-            authenticatedPeerEndpointID: firstClientID
-        ))
-    }
-
-    func testBindingRejectsWrongBearerDeviceAndServer() throws {
-        let clock = TestClock(Date(timeIntervalSince1970: 6000))
-        let original = RemoteStoredDeviceCredential(
-            deviceID: "device",
-            credential: "bearer",
-            expiresAt: clock.date.addingTimeInterval(60),
-            deviceName: "Phone"
-        )
-        let manager = makeManager(clock: clock, storedDevice: original)
-        let serverID = endpointID("a")
-
-        for (request, bearer, actualServer) in [
-            (RemoteIrohBindingRequest(
-                desktopInstanceID: "desktop",
-                deviceID: "device",
-                expectedServerEndpointID: serverID,
-                clientEndpointID: endpointID("b")
-            ), "Bearer wrong", serverID),
-            (RemoteIrohBindingRequest(
-                desktopInstanceID: "desktop",
-                deviceID: "other",
-                expectedServerEndpointID: serverID,
-                clientEndpointID: endpointID("b")
-            ), "Bearer bearer", serverID),
-            (RemoteIrohBindingRequest(
-                desktopInstanceID: "desktop",
-                deviceID: "device",
-                expectedServerEndpointID: endpointID("c"),
-                clientEndpointID: endpointID("b")
-            ), "Bearer bearer", serverID)
-        ] {
-            XCTAssertThrowsError(try manager.bindIrohEndpoint(
-                request: request,
-                authorizationHeader: bearer,
-                serverEndpointID: actualServer
-            ))
-        }
-    }
-
     func testPersistedPairingFieldsAreBoundedAndEndpointIDsAreCanonical() throws {
         let clock = TestClock(Date(timeIntervalSince1970: 6500))
         var persisted: RemoteStoredDeviceCredential?
         let manager = makeManager(clock: clock) { persisted = $0 }
-        let advertisement = try manager.issueAdvertisement(
-            port: 8443,
-            serviceName: "RepoPrompt-test",
-            host: nil
+        let advertisement = try manager.issueAdvertisement(server: .init(endpointID: endpointID("a")))
+        let request = pairingRequest(secret: advertisement.oneTimeSecret, deviceName: String(repeating: "📱", count: 512))
+        XCTAssertThrowsError(try manager.pairIroh(
+            request: request,
+            authenticatedPeerEndpointID: "invalid-endpoint",
+            serverEndpointID: endpointID("a"),
+            desktop: desktopSummary()
+        ))
+        _ = try manager.pairIroh(
+            request: request,
+            authenticatedPeerEndpointID: endpointID("b"),
+            serverEndpointID: endpointID("a"),
+            desktop: desktopSummary()
         )
-        let request = RemotePairingRequest(
-            desktopInstanceID: "desktop",
-            oneTimeSecret: advertisement.oneTimeSecret,
-            deviceName: String(repeating: "📱", count: 512)
-        )
-        _ = try manager.pair(request: request, desktop: desktopSummary())
         XCTAssertEqual(persisted?.deviceName.count, RemotePairingManager.maximumDeviceNameCharacters)
-
-        let boundManager = makeManager(clock: clock, storedDevice: persisted)
-        XCTAssertThrowsError(try boundManager.bindIrohEndpoint(
-            request: RemoteIrohBindingRequest(
-                desktopInstanceID: "desktop",
-                deviceID: persisted?.deviceID ?? "",
-                expectedServerEndpointID: endpointID("a"),
-                clientEndpointID: "not-an-endpoint"
-            ),
-            authorizationHeader: "Bearer \(persisted?.credential ?? "")",
-            serverEndpointID: endpointID("a")
-        )) { error in
-            guard case RemoteGatewaySecurityError.endpointBindingInvalid = error else {
-                return XCTFail("Expected endpointBindingInvalid, got \(error)")
-            }
-        }
     }
 
-    func testStoredCredentialDecodesLegacyShapeAndOldDecoderIgnoresBinding() throws {
-        let oldJSON = """
-        {
-          "deviceID": "device",
-          "credential": "bearer",
-          "expiresAt": 1000
-        }
-        """
-        let decoded = try JSONDecoder().decode(
-            RemoteStoredDeviceCredential.self,
-            from: Data(oldJSON.utf8)
-        )
-        XCTAssertEqual(decoded.deviceName, "Remote device")
-        XCTAssertNil(decoded.irohPeerEndpointID)
-
-        let updated = RemoteStoredDeviceCredential(
-            deviceID: decoded.deviceID,
-            credential: decoded.credential,
-            expiresAt: decoded.expiresAt,
-            deviceName: decoded.deviceName,
-            irohPeerEndpointID: endpointID("a")
-        )
-        struct LegacyCredential: Decodable {
-            let deviceID: String
-            let credential: String
-            let expiresAt: Date
-            let deviceName: String
-        }
-        let legacy = try JSONDecoder().decode(
-            LegacyCredential.self,
-            from: JSONEncoder().encode(updated)
-        )
-        XCTAssertEqual(legacy.deviceID, updated.deviceID)
-        XCTAssertEqual(legacy.credential, updated.credential)
-        XCTAssertEqual(legacy.expiresAt, updated.expiresAt)
-        XCTAssertEqual(legacy.deviceName, updated.deviceName)
-    }
-
-    func testLegacyCredentialMigratesAndCannotReturnAfterRevocation() throws {
+    func testRevokedCredentialStaysUnavailableAfterReopeningStorage() throws {
         let backend = TestSecureStorageBackend()
-        let legacy = Data("old pairing fixture".utf8)
-        let store = RemoteGatewayKeychain(backend: backend) { service in
-            XCTAssertEqual(service, SecureStorageAccount.remotePairedDevice.identifier)
-            return legacy
-        }
-        XCTAssertEqual(try store.read(.remotePairedDevice), legacy)
-        XCTAssertEqual(backend.value(for: .remotePairedDevice), legacy.base64EncodedString())
+        let store = RemoteGatewayKeychain(backend: backend)
+        let data = Data("pairing fixture".utf8)
+        try store.write(data, for: .remotePairedDevice)
+        XCTAssertEqual(try store.read(.remotePairedDevice), data)
         try store.remove(.remotePairedDevice)
 
-        let reopened = RemoteGatewayKeychain(backend: backend) { _ in
-            XCTFail("A revoked device must never fall back to legacy storage.")
-            return legacy
-        }
+        let reopened = RemoteGatewayKeychain(backend: backend)
         XCTAssertNil(try reopened.read(.remotePairedDevice))
-
         let replacement = Data("new pairing fixture".utf8)
         try reopened.write(replacement, for: .remotePairedDevice)
         XCTAssertEqual(try reopened.read(.remotePairedDevice), replacement)
@@ -968,7 +649,6 @@ final class RemoteIrohSecurityTests: XCTestCase {
             XCTAssertTrue(error is PersistenceFailure)
         }
         XCTAssertTrue(manager.isPaired)
-        XCTAssertTrue(manager.isAuthorized("Bearer bearer"))
         XCTAssertTrue(manager.isAuthorizedIroh(
             authorizationHeader: "Bearer bearer",
             deviceID: "device",
@@ -1022,7 +702,6 @@ final class RemoteIrohSecurityTests: XCTestCase {
     ) -> RemotePairingManager {
         RemotePairingManager(
             desktopInstanceID: "desktop",
-            certificateSHA256: String(repeating: "f", count: 64),
             storedDevice: storedDevice,
             now: { clock.date },
             randomBytes: { count in Data(repeating: UInt8(count), count: count) },
@@ -1030,11 +709,13 @@ final class RemoteIrohSecurityTests: XCTestCase {
         )
     }
 
-    private func pairingRequest(secret: String) -> RemotePairingRequest {
-        RemotePairingRequest(
+    private func pairingRequest(secret: String, deviceName: String = "Phone") -> RemoteIrohPairingRequest {
+        RemoteIrohPairingRequest(
             desktopInstanceID: "desktop",
+            expectedServerEndpointID: endpointID("a"),
+            clientEndpointID: endpointID("b"),
             oneTimeSecret: secret,
-            deviceName: "Phone"
+            deviceName: deviceName
         )
     }
 
@@ -2332,7 +2013,8 @@ final class RemoteSnapshotProjectionTests: XCTestCase {
             deviceID: "device-1",
             credential: "credential-1",
             expiresAt: now.addingTimeInterval(60),
-            deviceName: "Test phone"
+            deviceName: "Test phone",
+            irohPeerEndpointID: String(repeating: "a", count: 64)
         )
         XCTAssertTrue(RemoteCredentialAuthority.accepts(
             authorizationHeader: "Bearer credential-1",

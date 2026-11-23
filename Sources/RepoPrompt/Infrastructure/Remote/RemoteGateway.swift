@@ -3,7 +3,7 @@ import Foundation
 import OSLog
 import RepoPromptRemoteProtocol
 
-/// Opt-in LAN gateway for the Remote control surface. The gateway is
+/// Opt-in Iroh gateway for the Remote control surface. The gateway is
 /// intentionally independent from the Unix-socket MCP server and talks to
 /// typed application services through the snapshot and command boundaries.
 @MainActor
@@ -11,11 +11,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
     private static let unpairLogger = Logger(subsystem: "com.pvncher.repoprompt.ce", category: "RemoteUnpair")
 
     @Published private(set) var isRunning = false
-    @Published private(set) var pairingAdvertisement: RemotePairingAdvertisement?
-    @Published private(set) var irohPairingAdvertisement: RemoteIrohPairingAdvertisement?
     @Published private(set) var pairingCode: String?
-    @Published private(set) var legacyPairingCode: String?
-    @Published private(set) var irohPairingCode: String?
     @Published private(set) var irohDiagnostics = RemoteIrohGatewayDiagnostics()
     @Published private(set) var lastError: String?
     @Published private(set) var lastRequestAt: Date?
@@ -26,19 +22,13 @@ final class RemoteGatewayController: NSObject, ObservableObject {
         didSet { UserDefaults.standard.set(isEnabled, forKey: Self.enabledKey) }
     }
 
-    @Published var isIrohEnabled: Bool {
-        didSet { UserDefaults.standard.set(isIrohEnabled, forKey: Self.irohEnabledKey) }
-    }
-
     private static let enabledKey = "RepoPrompt.remote.gatewayEnabled"
-    private static let irohEnabledKey = "RepoPrompt.remote.irohEnabled"
     private static let defaultAuthorityKey = "RepoPrompt.remote.defaultAuthority"
 
     private weak var windowStatesManager: WindowStatesManager?
     private var controlService: (any RemoteAgentControlService)?
     private let pairingManager = RemotePairingManager()
     private lazy var notificationRelay = RemoteNotificationRelay(pairingManager: pairingManager)
-    private let tlsIdentityStore = RemoteTLSIdentityStore()
     private let irohIdentityStore = RemoteIrohIdentityStore()
     let availabilityController = RemoteAvailabilityController()
     private let replayBuffer = RemoteEventReplayBuffer(capacity: 512)
@@ -46,11 +36,10 @@ final class RemoteGatewayController: NSObject, ObservableObject {
     /// Changes only when the CE process restarts. Gateway stop/start preserves it.
     private let transcriptRevisionEpoch = UUID()
 
-    private var tlsIdentity: RemoteTLSIdentity?
     private var irohGeneration: UInt64 = 0
+    private var isStarting = false
     private var eventPollTask: Task<Void, Never>?
     private var lastPublishedSnapshot: RemoteSnapshot?
-    private(set) var activePort: UInt16?
 
     private lazy var requestRouter = RemoteGatewayRequestRouter(services: makeRoutingServices())
     private lazy var irohAdapter = RemoteIrohGatewayAdapter(
@@ -65,16 +54,6 @@ final class RemoteGatewayController: NSObject, ObservableObject {
             self?.lastSuccessfulRequestAt = Date()
         }
     )
-    private lazy var legacyAdapter = RemoteLegacyHTTPSGatewayAdapter(
-        router: requestRouter,
-        requestReceived: { [weak self] in
-            self?.lastRequestAt = Date()
-        },
-        successfulResponseSent: { [weak self] in
-            self?.lastSuccessfulRequestAt = Date()
-        }
-    )
-
     var notificationRelayConfigured: Bool {
         notificationRelay.isConfigured
     }
@@ -85,7 +64,6 @@ final class RemoteGatewayController: NSObject, ObservableObject {
 
     override init() {
         isEnabled = UserDefaults.standard.bool(forKey: Self.enabledKey)
-        isIrohEnabled = UserDefaults.standard.object(forKey: Self.irohEnabledKey) as? Bool ?? false
         isPaired = pairingManager.isPaired
         super.init()
     }
@@ -114,26 +92,10 @@ final class RemoteGatewayController: NSObject, ObservableObject {
     }
 
     func refreshPairingAdvertisement() {
-        guard let activePort else { return }
+        guard let server = irohAdapter.currentAddress else { return }
         do {
-            if let server = irohAdapter.currentAddress, isIrohEnabled {
-                let issued = try pairingManager.issuePairingAdvertisements(
-                    port: activePort,
-                    serviceName: bonjourName,
-                    host: RemoteLocalAddress.preferredIPv4Address(),
-                    server: server
-                )
-                setPairingAdvertisements(legacy: issued.legacy, iroh: issued.iroh)
-            } else {
-                try setPairingAdvertisements(
-                    legacy: pairingManager.issueAdvertisement(
-                        port: activePort,
-                        serviceName: bonjourName,
-                        host: RemoteLocalAddress.preferredIPv4Address()
-                    ),
-                    iroh: nil
-                )
-            }
+            let advertisement = try pairingManager.issueAdvertisement(server: server)
+            pairingCode = Self.makePairingCode(for: advertisement)
             lastError = nil
         } catch {
             lastError = error.localizedDescription
@@ -159,50 +121,30 @@ final class RemoteGatewayController: NSObject, ObservableObject {
     }
 
     func start() async throws {
-        guard !isRunning else { return }
-        guard windowStatesManager != nil else {
-            throw RemoteGatewayError.configurationUnavailable
-        }
+        guard isEnabled, !isRunning, !isStarting else { return }
+        guard windowStatesManager != nil else { throw RemoteGatewayError.configurationUnavailable }
 
+        isStarting = true
+        irohGeneration &+= 1
+        let generation = irohGeneration
+        defer { if irohGeneration == generation { isStarting = false } }
         do {
-            let identity = try tlsIdentityStore.loadOrCreate()
-            tlsIdentity = identity
-            if identity.wasCreated {
-                // A new TLS identity invalidates the certificate pin held by
-                // existing phones, so do not leave an unusable device paired.
+            let identity = try irohIdentityStore.loadOrCreate()
+            if identity.origin != .loaded, pairingManager.isPaired {
                 try pairingManager.revokeDevice()
-                controlService?.clearAttachmentUploads()
                 isPaired = false
             }
-            pairingManager.setCertificateSHA256(identity.certificateSHA256)
-
-            let port = try await legacyAdapter.start(
-                identity: identity,
-                serviceName: bonjourName,
-                desktopInstanceID: pairingManager.desktopInstanceID
+            _ = try await irohAdapter.start(
+                secret: identity.secret,
+                desktopInstanceID: pairingManager.desktopInstanceID,
+                generation: generation
             )
-            activePort = port
-            if isIrohEnabled {
-                do {
-                    let identity = try irohIdentityStore.loadOrCreate()
-                    if identity.origin == .replacedCorruptValue {
-                        try pairingManager.clearIrohPeerBinding()
-                    }
-                    irohGeneration &+= 1
-                    _ = try await irohAdapter.start(
-                        secret: identity.secret,
-                        desktopInstanceID: pairingManager.desktopInstanceID,
-                        generation: irohGeneration
-                    )
-                } catch {
-                    irohDiagnostics.lastError = error.localizedDescription
-                }
-            }
-            refreshPairingAdvertisement()
+            guard irohGeneration == generation, isEnabled else { return }
             isRunning = true
-            lastError = nil
+            refreshPairingAdvertisement()
             startEventPolling()
         } catch {
+            guard irohGeneration == generation else { return }
             stop()
             lastError = error.localizedDescription
             throw error
@@ -214,10 +156,11 @@ final class RemoteGatewayController: NSObject, ObservableObject {
         eventPollTask?.cancel()
         eventPollTask = nil
         lastPublishedSnapshot = nil
-        legacyAdapter.stop()
+        irohGeneration &+= 1
+        isStarting = false
         irohAdapter.stop()
-        setPairingAdvertisements(legacy: nil, iroh: nil)
-        activePort = nil
+        pairingManager.invalidateAdvertisement()
+        pairingCode = nil
         isRunning = false
         availabilityController.releaseSleepAssertion()
     }
@@ -252,38 +195,6 @@ final class RemoteGatewayController: NSObject, ObservableObject {
         }
     }
 
-    func setIrohEnabled(_ enabled: Bool) async {
-        isIrohEnabled = enabled
-        guard isRunning else { return }
-        if enabled {
-            do {
-                let identity = try irohIdentityStore.loadOrCreate()
-                irohGeneration &+= 1
-                _ = try await irohAdapter.start(
-                    secret: identity.secret,
-                    desktopInstanceID: pairingManager.desktopInstanceID,
-                    generation: irohGeneration
-                )
-            } catch {
-                irohDiagnostics.lastError = error.localizedDescription
-            }
-        } else {
-            irohAdapter.stop()
-        }
-        refreshPairingAdvertisement()
-    }
-
-    private func setPairingAdvertisements(
-        legacy: RemotePairingAdvertisement?,
-        iroh: RemoteIrohPairingAdvertisement?
-    ) {
-        pairingAdvertisement = legacy
-        irohPairingAdvertisement = iroh
-        legacyPairingCode = legacy.flatMap(Self.makePairingCode(for:))
-        irohPairingCode = iroh.flatMap { Self.makePairingCode(for: RemotePairingCode.iroh($0)) }
-        pairingCode = legacyPairingCode ?? irohPairingCode
-    }
-
     func revokePairedDevice() {
         do {
             try pairingManager.revokeDevice()
@@ -305,27 +216,11 @@ final class RemoteGatewayController: NSObject, ObservableObject {
     private func makeRoutingServices() -> RemoteGatewayRoutingServices {
         RemoteGatewayRoutingServices(
             authorize: { [unowned self] context in
-                switch context.transport {
-                case .legacyHTTPS:
-                    pairingManager.isAuthorized(context.authorizationHeader)
-                case let .authenticatedPeer(endpointID, deviceID):
-                    pairingManager.isAuthorizedIroh(
-                        authorizationHeader: context.authorizationHeader,
-                        deviceID: deviceID,
-                        authenticatedPeerEndpointID: endpointID
-                    )
-                }
-            },
-            pair: { [unowned self] request in
-                do {
-                    let response = try pairingManager.pair(request: request, desktop: desktopSummary)
-                    isPaired = true
-                    return .success(response)
-                } catch let error as RemoteGatewaySecurityError {
-                    return .forbidden(error.localizedDescription)
-                } catch {
-                    return .failed
-                }
+                pairingManager.isAuthorizedIroh(
+                    authorizationHeader: context.authorizationHeader,
+                    deviceID: context.deviceID,
+                    authenticatedPeerEndpointID: context.endpointID
+                )
             },
             unpair: { [unowned self] in
                 Self.unpairLogger.info("Authenticated remote Unpair request received")
@@ -438,24 +333,6 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                     )
                     isPaired = true
                     return .success(response)
-                } catch {
-                    return .failure(error)
-                }
-            },
-            transportBootstrap: { [unowned self] in
-                guard let server = irohAdapter.currentAddress, isIrohEnabled else { return nil }
-                return RemoteTransportBootstrapResponse(
-                    desktopInstanceID: pairingManager.desktopInstanceID,
-                    server: server
-                )
-            },
-            bindIrohEndpoint: { [unowned self] request, authorizationHeader in
-                do {
-                    return try .success(pairingManager.bindIrohEndpoint(
-                        request: request,
-                        authorizationHeader: authorizationHeader,
-                        serverEndpointID: irohAdapter.currentAddress?.endpointID ?? ""
-                    ))
                 } catch {
                     return .failure(error)
                 }
@@ -675,10 +552,6 @@ final class RemoteGatewayController: NSObject, ObservableObject {
         )
     }
 
-    private var bonjourName: String {
-        "RepoPrompt-\(pairingManager.desktopInstanceID.prefix(8))"
-    }
-
     private var desktopSummary: RemoteDesktopSummary {
         RemoteDesktopSummary(
             instanceID: pairingManager.desktopInstanceID,
@@ -695,7 +568,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
         guard let window = windowStatesManager?.allWindows.first else {
             let snapshot = await RemoteSnapshot(
                 desktop: desktopSummary,
-                connection: .init(state: .connected, transport: "lan_https"),
+                connection: .init(state: .connected, transport: "iroh"),
                 authorization: authorization,
                 eventCursor: replayBuffer.latestCursor(),
                 transcriptRevisionEpoch: transcriptRevisionEpoch
@@ -719,7 +592,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
         )
         let snapshot = await builder.build(
             desktop: desktopSummary,
-            connection: .init(state: .connected, transport: "lan_https", lastConnectedAt: Date()),
+            connection: .init(state: .connected, transport: "iroh", lastConnectedAt: Date()),
             authorization: authorization,
             eventCursor: replayBuffer.latestCursor(),
             transcriptRevisionEpoch: transcriptRevisionEpoch
@@ -731,12 +604,10 @@ final class RemoteGatewayController: NSObject, ObservableObject {
 
 enum RemoteGatewayError: LocalizedError {
     case configurationUnavailable
-    case listenerUnavailable
 
     var errorDescription: String? {
         switch self {
         case .configurationUnavailable: "Remote gateway configuration is unavailable."
-        case .listenerUnavailable: "The Remote gateway listener could not start."
         }
     }
 }

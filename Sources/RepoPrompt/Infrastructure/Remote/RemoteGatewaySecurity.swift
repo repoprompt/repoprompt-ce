@@ -1,5 +1,4 @@
 import CryptoKit
-import Darwin
 import Foundation
 import RepoPromptRemoteProtocol
 import RepoPromptSecureStorage
@@ -7,9 +6,6 @@ import Security
 
 enum RemoteGatewaySecurityError: LocalizedError {
     case keychainFailure(OSStatus)
-    case certificateUnavailable
-    case identityGenerationFailed(String)
-    case identityImportFailed(OSStatus)
     case pairingSecretInvalid
     case pairingSecretExpired
     case endpointBindingInvalid
@@ -20,12 +16,6 @@ enum RemoteGatewaySecurityError: LocalizedError {
         switch self {
         case let .keychainFailure(status):
             "Remote credential storage failed (Keychain status \(status))."
-        case .certificateUnavailable:
-            "The Remote TLS certificate is unavailable."
-        case let .identityGenerationFailed(message):
-            "The Remote TLS identity could not be generated: \(message)"
-        case let .identityImportFailed(status):
-            "The Remote TLS identity could not be imported (status \(status))."
         case .pairingSecretInvalid:
             "The pairing code is invalid."
         case .pairingSecretExpired:
@@ -41,32 +31,19 @@ enum RemoteGatewaySecurityError: LocalizedError {
 }
 
 struct RemoteGatewayKeychain {
-    private static let legacyAccount = "remote"
-    private static let revoked = "revoked"
     private static let accessMode = KeychainAccessMode.nonInteractive(reason: .backgroundAvailabilityCheck)
-
-    static let shared = Self(
-        backend: SecureKeyValueStorageFactory.defaultBackend(),
-        readLegacy: Self.readLegacyItem
-    )
+    static let shared = Self(backend: SecureKeyValueStorageFactory.defaultBackend())
 
     let backend: any SecureKeyValueStorageBackend
-    let readLegacy: @Sendable (String) throws -> Data?
 
     func read(_ account: SecureStorageAccount) throws -> Data? {
-        let service = account.identifier
         do {
-            return try readCurrent(service: service)
+            let value = try backend.get(for: account.identifier, accessMode: Self.accessMode)
+            guard value != "revoked" else { return nil }
+            guard let data = Data(base64Encoded: value) else { throw KeychainService.KeychainError.invalidData }
+            return data
         } catch KeychainService.KeychainError.itemNotFound {
-            guard backend.persistsValuesAcrossLaunches,
-                  let legacy = try readLegacy(service) else { return nil }
-            do {
-                try backend.create(legacy.base64EncodedString(), for: service, accessMode: Self.accessMode)
-                return legacy
-            } catch KeychainService.KeychainError.duplicateItem {
-                // A concurrent update or revocation wins over an older record.
-                return try readCurrent(service: service)
-            }
+            return nil
         }
     }
 
@@ -75,42 +52,7 @@ struct RemoteGatewayKeychain {
     }
 
     func remove(_ account: SecureStorageAccount) throws {
-        // Keep a durable tombstone so the app can never reimport an old credential
-        // after unpairing, including when the current signer cannot delete the old item.
-        try backend.save(Self.revoked, for: account.identifier, accessMode: Self.accessMode)
-    }
-
-    private func readCurrent(service: String) throws -> Data? {
-        let value = try backend.get(for: service, accessMode: Self.accessMode)
-        guard value != Self.revoked else { return nil }
-        guard let data = Data(base64Encoded: value) else {
-            throw KeychainService.KeychainError.invalidData
-        }
-        return data
-    }
-
-    private static func readLegacyItem(service: String) throws -> Data? {
-        // File-based storage from builds before signing identities were isolated.
-        // A stale ACL must not display an authorization dialog at gateway startup.
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: legacyAccount,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-            kSecUseAuthenticationUI as String: kSecUseAuthenticationUISkip
-        ]
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        switch status {
-        case errSecSuccess:
-            guard let data = result as? Data else { throw KeychainService.KeychainError.invalidData }
-            return data
-        case errSecItemNotFound, errSecInteractionNotAllowed:
-            return nil
-        default:
-            throw RemoteGatewaySecurityError.keychainFailure(status)
-        }
+        try backend.save("revoked", for: account.identifier, accessMode: Self.accessMode)
     }
 }
 
@@ -132,167 +74,12 @@ private func remoteBase64URL(_ data: Data) -> String {
         .trimmingCharacters(in: CharacterSet(charactersIn: "="))
 }
 
-struct RemoteTLSIdentity {
-    let identity: SecIdentity
-    let certificateSHA256: String
-    var wasCreated: Bool
-}
-
-/// Owns the self-signed identity used by the opt-in LAN gateway. The PKCS#12
-/// blob is kept in Keychain; the private key is never checked into the source
-/// tree or left in the temporary generation directory.
-final class RemoteTLSIdentityStore {
-    private let importPassphrase = "RepoPromptRemoteIdentity"
-
-    func loadOrCreate() throws -> RemoteTLSIdentity {
-        if let stored = try RemoteGatewayKeychain.shared.read(.remoteTLSIdentity) {
-            var identity = try importIdentity(from: stored)
-            identity.wasCreated = false
-            return identity
-        }
-
-        if let legacy = try RemoteGatewayKeychain.shared.read(.remoteLegacyTLSIdentity),
-           var identity = try? importIdentity(from: legacy)
-        {
-            try RemoteGatewayKeychain.shared.write(legacy, for: .remoteTLSIdentity)
-            try? RemoteGatewayKeychain.shared.remove(.remoteLegacyTLSIdentity)
-            identity.wasCreated = false
-            return identity
-        }
-
-        let bundle = try generatePKCS12Bundle()
-        try RemoteGatewayKeychain.shared.write(bundle, for: .remoteTLSIdentity)
-        var identity = try importIdentity(from: bundle)
-        identity.wasCreated = true
-        return identity
-    }
-
-    private func importIdentity(from data: Data) throws -> RemoteTLSIdentity {
-        var imported: CFArray?
-        var options: [String: Any] = [kSecImportExportPassphrase as String: importPassphrase]
-        if #available(macOS 15, *) {
-            options[kSecImportToMemoryOnly as String] = true
-        }
-        let status = SecPKCS12Import(data as CFData, options as CFDictionary, &imported)
-        guard status == errSecSuccess,
-              let entries = imported as? [[String: Any]],
-              let first = entries.first,
-              let identityValue = first[kSecImportItemIdentity as String]
-        else {
-            throw RemoteGatewaySecurityError.identityImportFailed(status)
-        }
-        guard CFGetTypeID(identityValue as CFTypeRef) == SecIdentityGetTypeID() else {
-            throw RemoteGatewaySecurityError.identityImportFailed(status)
-        }
-        let identity = identityValue as! SecIdentity
-
-        var certificate: SecCertificate?
-        guard SecIdentityCopyCertificate(identity, &certificate) == errSecSuccess,
-              let certificate,
-              let certificateData = SecCertificateCopyData(certificate) as Data?
-        else {
-            throw RemoteGatewaySecurityError.certificateUnavailable
-        }
-
-        let digest = SHA256.hash(data: certificateData)
-            .map { String(format: "%02x", $0) }
-            .joined()
-        return RemoteTLSIdentity(identity: identity, certificateSHA256: digest, wasCreated: false)
-    }
-
-    private func generatePKCS12Bundle() throws -> Data {
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("repoprompt-remote-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-
-        let keyURL = directory.appendingPathComponent("key.pem")
-        let certificateURL = directory.appendingPathComponent("certificate.pem")
-        let bundleURL = directory.appendingPathComponent("identity.p12")
-
-        try runOpenSSL(arguments: [
-            "req", "-x509", "-newkey", "rsa:2048",
-            "-nodes",
-            "-keyout", keyURL.path,
-            "-out", certificateURL.path,
-            "-days", "3650",
-            "-subj", "/CN=RepoPrompt Remote"
-        ])
-        try runOpenSSL(arguments: [
-            "pkcs12", "-export",
-            "-out", bundleURL.path,
-            "-inkey", keyURL.path,
-            "-in", certificateURL.path,
-            "-passout", "pass:\(importPassphrase)"
-        ])
-        do {
-            return try Data(contentsOf: bundleURL)
-        } catch {
-            throw RemoteGatewaySecurityError.identityGenerationFailed(error.localizedDescription)
-        }
-    }
-
-    private func runOpenSSL(arguments: [String]) throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/openssl")
-        process.arguments = arguments
-        let errorPipe = Pipe()
-        process.standardError = errorPipe
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            throw RemoteGatewaySecurityError.identityGenerationFailed(error.localizedDescription)
-        }
-        guard process.terminationStatus == 0 else {
-            let diagnostic = String(
-                data: errorPipe.fileHandleForReading.readDataToEndOfFile(),
-                encoding: .utf8
-            )?.trimmingCharacters(in: .whitespacesAndNewlines)
-            throw RemoteGatewaySecurityError.identityGenerationFailed(
-                diagnostic?.isEmpty == false ? diagnostic! : "openssl exited with status \(process.terminationStatus)"
-            )
-        }
-    }
-}
-
 struct RemoteStoredDeviceCredential: Codable, Equatable {
     let deviceID: String
     let credential: String
     let expiresAt: Date
     let deviceName: String
-    let irohPeerEndpointID: String?
-
-    private enum CodingKeys: String, CodingKey {
-        case deviceID
-        case credential
-        case expiresAt
-        case deviceName
-        case irohPeerEndpointID
-    }
-
-    init(
-        deviceID: String,
-        credential: String,
-        expiresAt: Date,
-        deviceName: String,
-        irohPeerEndpointID: String? = nil
-    ) {
-        self.deviceID = deviceID
-        self.credential = credential
-        self.expiresAt = expiresAt
-        self.deviceName = deviceName
-        self.irohPeerEndpointID = irohPeerEndpointID
-    }
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        deviceID = try container.decode(String.self, forKey: .deviceID)
-        credential = try container.decode(String.self, forKey: .credential)
-        expiresAt = try container.decode(Date.self, forKey: .expiresAt)
-        deviceName = try container.decodeIfPresent(String.self, forKey: .deviceName) ?? "Remote device"
-        irohPeerEndpointID = try container.decodeIfPresent(String.self, forKey: .irohPeerEndpointID)
-    }
+    let irohPeerEndpointID: String
 }
 
 enum RemoteConstantTimeComparison {
@@ -353,14 +140,6 @@ private struct RemotePendingPairingSecret {
     let expiresAt: Date
 }
 
-struct RemoteIssuedPairingAdvertisements {
-    let legacy: RemotePairingAdvertisement
-    let iroh: RemoteIrohPairingAdvertisement
-}
-
-/// Enforces the first-release one-device pairing rule. Pairing material stays
-/// in memory until used or manually replaced; the issued bearer credential is
-/// Keychain-backed.
 @MainActor
 final class RemotePairingManager {
     static let pairingLifetime: TimeInterval = 5 * 60
@@ -368,7 +147,6 @@ final class RemotePairingManager {
     static let maximumDeviceNameCharacters = 128
 
     let desktopInstanceID: String
-    private(set) var certificateSHA256: String
     private var pendingSecret: RemotePendingPairingSecret?
     private var storedDevice: RemoteStoredDeviceCredential?
     private var notificationRegistration: RemoteNotificationRegistration?
@@ -414,7 +192,6 @@ final class RemotePairingManager {
 
     init(
         desktopInstanceID: String,
-        certificateSHA256: String = "",
         storedDevice: RemoteStoredDeviceCredential? = nil,
         notificationRegistration: RemoteNotificationRegistration? = nil,
         now: @escaping () -> Date,
@@ -422,7 +199,6 @@ final class RemotePairingManager {
         persistStoredDevice: @escaping (RemoteStoredDeviceCredential?) throws -> Void
     ) {
         self.desktopInstanceID = desktopInstanceID
-        self.certificateSHA256 = certificateSHA256
         self.storedDevice = storedDevice
         self.notificationRegistration = notificationRegistration
         self.now = now
@@ -454,64 +230,18 @@ final class RemotePairingManager {
         notificationRegistration
     }
 
-    func setCertificateSHA256(_ fingerprint: String) {
-        certificateSHA256 = fingerprint
-    }
-
-    func issueAdvertisement(
-        port: UInt16,
-        serviceName: String,
-        host: String?
-    ) throws -> RemotePairingAdvertisement {
+    func issueAdvertisement(server: RemoteIrohEndpointAddress) throws -> RemoteIrohPairingAdvertisement {
         let pending = try createPendingSecret()
-        return makeLegacyAdvertisement(
-            pending: pending,
-            port: port,
-            serviceName: serviceName,
-            host: host
-        )
-    }
-
-    func issuePairingAdvertisements(
-        port: UInt16,
-        serviceName: String,
-        host: String?,
-        server: RemoteIrohEndpointAddress
-    ) throws -> RemoteIssuedPairingAdvertisements {
-        let pending = try createPendingSecret()
-        let legacy = makeLegacyAdvertisement(
-            pending: pending,
-            port: port,
-            serviceName: serviceName,
-            host: host
-        )
-        let iroh = RemoteIrohPairingAdvertisement(
+        return RemoteIrohPairingAdvertisement(
             desktopInstanceID: desktopInstanceID,
             server: server,
             oneTimeSecret: pending.value,
-            expiresAt: pending.expiresAt,
-            legacyFallback: legacy
+            expiresAt: pending.expiresAt
         )
-        return RemoteIssuedPairingAdvertisements(legacy: legacy, iroh: iroh)
     }
 
-    func pair(
-        request: RemotePairingRequest,
-        desktop: RemoteDesktopSummary
-    ) throws -> RemotePairingResponse {
-        try validateProtocolAndDesktop(
-            protocolVersion: request.protocolVersion,
-            requestedDesktopInstanceID: request.desktopInstanceID
-        )
-        guard !certificateSHA256.isEmpty else {
-            throw RemoteGatewaySecurityError.certificateUnavailable
-        }
-        try consumePendingSecret(request.oneTimeSecret)
-        let credential = try createAndPersistCredential(
-            deviceName: request.deviceName,
-            irohPeerEndpointID: nil
-        )
-        return pairingResponse(for: credential, desktop: desktop)
+    func invalidateAdvertisement() {
+        pendingSecret = nil
     }
 
     func pairIroh(
@@ -524,9 +254,6 @@ final class RemotePairingManager {
             protocolVersion: request.protocolVersion,
             requestedDesktopInstanceID: request.desktopInstanceID
         )
-        guard !certificateSHA256.isEmpty else {
-            throw RemoteGatewaySecurityError.certificateUnavailable
-        }
         guard request.expectedServerEndpointID == serverEndpointID,
               request.clientEndpointID == authenticatedPeerEndpointID,
               Self.isCanonicalEndpointID(serverEndpointID),
@@ -546,54 +273,6 @@ final class RemotePairingManager {
         )
     }
 
-    func bindIrohEndpoint(
-        request: RemoteIrohBindingRequest,
-        authorizationHeader: String?,
-        serverEndpointID: String
-    ) throws -> RemoteIrohBindingResponse {
-        try validateProtocolAndDesktop(
-            protocolVersion: request.protocolVersion,
-            requestedDesktopInstanceID: request.desktopInstanceID
-        )
-        guard let storedDevice,
-              RemoteCredentialAuthority.accepts(
-                  authorizationHeader: authorizationHeader,
-                  credential: storedDevice,
-                  at: now()
-              ),
-              request.deviceID == storedDevice.deviceID,
-              request.expectedServerEndpointID == serverEndpointID,
-              Self.isCanonicalEndpointID(request.clientEndpointID),
-              Self.isCanonicalEndpointID(serverEndpointID)
-        else {
-            throw RemoteGatewaySecurityError.endpointBindingInvalid
-        }
-
-        let updated = RemoteStoredDeviceCredential(
-            deviceID: storedDevice.deviceID,
-            credential: storedDevice.credential,
-            expiresAt: storedDevice.expiresAt,
-            deviceName: storedDevice.deviceName,
-            irohPeerEndpointID: request.clientEndpointID
-        )
-        try persistStoredDevice(updated)
-        self.storedDevice = updated
-        return RemoteIrohBindingResponse(
-            desktopInstanceID: desktopInstanceID,
-            deviceID: updated.deviceID,
-            serverEndpointID: serverEndpointID,
-            clientEndpointID: request.clientEndpointID
-        )
-    }
-
-    func isAuthorized(_ authorizationHeader: String?) -> Bool {
-        RemoteCredentialAuthority.accepts(
-            authorizationHeader: authorizationHeader,
-            credential: storedDevice,
-            at: now()
-        )
-    }
-
     func isAuthorizedIroh(
         authorizationHeader: String?,
         deviceID: String,
@@ -608,18 +287,6 @@ final class RemotePairingManager {
         )
     }
 
-    func clearIrohPeerBinding() throws {
-        guard let storedDevice, storedDevice.irohPeerEndpointID != nil else { return }
-        let updated = RemoteStoredDeviceCredential(
-            deviceID: storedDevice.deviceID,
-            credential: storedDevice.credential,
-            expiresAt: storedDevice.expiresAt,
-            deviceName: storedDevice.deviceName
-        )
-        try persistStoredDevice(updated)
-        self.storedDevice = updated
-    }
-
     func revokeDevice() throws {
         // Durable credential deletion must succeed before the in-memory paired
         // state changes, otherwise a restart could resurrect a revoked phone.
@@ -628,7 +295,7 @@ final class RemotePairingManager {
         storedDevice = nil
         notificationRegistration = nil
         // The bearer deletion above is the authoritative revocation. Ancillary
-        // notification cleanup must not turn a successful unpair into HTTP 500.
+        // notification cleanup must not turn a successful unpair into a failure.
         try? RemoteGatewayKeychain.shared.remove(.remoteNotificationRegistration)
     }
 
@@ -660,23 +327,6 @@ final class RemotePairingManager {
         return pending
     }
 
-    private func makeLegacyAdvertisement(
-        pending: RemotePendingPairingSecret,
-        port: UInt16,
-        serviceName: String,
-        host: String?
-    ) -> RemotePairingAdvertisement {
-        RemotePairingAdvertisement(
-            desktopInstanceID: desktopInstanceID,
-            serviceName: serviceName,
-            host: host,
-            port: Int(port),
-            certificateSHA256: certificateSHA256,
-            oneTimeSecret: pending.value,
-            expiresAt: pending.expiresAt
-        )
-    }
-
     private func validateProtocolAndDesktop(
         protocolVersion: Int,
         requestedDesktopInstanceID: String
@@ -706,7 +356,7 @@ final class RemotePairingManager {
 
     private func createAndPersistCredential(
         deviceName: String,
-        irohPeerEndpointID: String?
+        irohPeerEndpointID: String
     ) throws -> RemoteStoredDeviceCredential {
         let trimmedName = deviceName.trimmingCharacters(in: .whitespacesAndNewlines)
         let boundedName = String(trimmedName.prefix(Self.maximumDeviceNameCharacters))
@@ -740,39 +390,5 @@ final class RemotePairingManager {
             credential: credential.credential,
             credentialExpiresAt: credential.expiresAt
         )
-    }
-}
-
-enum RemoteLocalAddress {
-    static func preferredIPv4Address() -> String? {
-        var address: String?
-        var interfacePointer: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&interfacePointer) == 0 else { return nil }
-        defer { freeifaddrs(interfacePointer) }
-        var current = interfacePointer
-        while let interface = current?.pointee {
-            defer { current = interface.ifa_next }
-            guard let addressPointer = interface.ifa_addr,
-                  addressPointer.pointee.sa_family == UInt8(AF_INET),
-                  let name = interface.ifa_name,
-                  String(cString: name) != "lo0"
-            else { continue }
-            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-            var sockaddr = addressPointer.pointee
-            let status = getnameinfo(
-                &sockaddr,
-                socklen_t(addressPointer.pointee.sa_len),
-                &host,
-                socklen_t(host.count),
-                nil,
-                0,
-                NI_NUMERICHOST
-            )
-            if status == 0 {
-                address = String(cString: host)
-                break
-            }
-        }
-        return address
     }
 }

@@ -67,18 +67,22 @@ final class RemoteIrohGatewayAdapter {
             guard let serverAddress else { throw RemoteIrohGatewayAdapterError.notRunning }
             return serverAddress
         }
+        activeGeneration = generation
         update { $0.state = "starting" }
+        var candidate: TransportEndpoint?
         do {
             let endpoint = try await RepoPromptIrohSpike.startApplication(
                 secret: secret,
                 relayEnabled: relayEnabled,
                 generation: generation
             )
+            candidate = endpoint
             let snapshot: EndpointSnapshot = if let onlineSnapshot = try? await endpoint.waitUntilOnline(timeoutMillis: 5000) {
                 onlineSnapshot
             } else {
                 try endpoint.snapshot()
             }
+            guard activeGeneration == generation else { throw CancellationError() }
             guard !snapshot.endpointId.isEmpty else {
                 throw RemoteIrohGatewayAdapterError.invalidEndpoint
             }
@@ -88,7 +92,6 @@ final class RemoteIrohGatewayAdapter {
             )
             self.endpoint = endpoint
             self.desktopInstanceID = desktopInstanceID
-            activeGeneration = generation
             serverAddress = address
             update {
                 $0.state = "running"
@@ -98,9 +101,13 @@ final class RemoteIrohGatewayAdapter {
             startAcceptLoop(endpoint)
             return address
         } catch {
-            update {
-                $0.state = "failed"
-                $0.lastError = error.localizedDescription
+            if let candidate { try? await candidate.shutdown() }
+            if activeGeneration == generation {
+                activeGeneration = nil
+                update {
+                    $0.state = "failed"
+                    $0.lastError = error.localizedDescription
+                }
             }
             throw error
         }
@@ -223,10 +230,7 @@ final class RemoteIrohGatewayAdapter {
             let hello = try frame.decodedPayload(as: RemotePairingHello.self, expectedKind: .pairingHello)
             let routed = await router.route(
                 .pairIroh(hello.request, authenticatedPeerEndpointID: peerEndpointID),
-                context: .init(transport: .authenticatedPeer(
-                    endpointID: peerEndpointID,
-                    deviceID: "pairing"
-                ), authorizationHeader: nil)
+                context: .init(endpointID: peerEndpointID, deviceID: "", authorizationHeader: nil)
             )
             let payload = try successfulJSON(from: routed)
             let pairing = try decoder.decode(RemoteIrohPairingResponse.self, from: payload)
@@ -249,7 +253,7 @@ final class RemoteIrohGatewayAdapter {
                 throw RemoteIrohGatewayAdapterError.serverEndpointMismatch
             }
             let context = RemoteGatewayRequestContext(
-                transport: .authenticatedPeer(endpointID: peerEndpointID, deviceID: hello.deviceID),
+                endpointID: peerEndpointID, deviceID: hello.deviceID,
                 authorizationHeader: "Bearer \(hello.credential)"
             )
             guard router.isAuthorized(context) else {
@@ -280,7 +284,7 @@ final class RemoteIrohGatewayAdapter {
             let routed = await router.route(
                 request,
                 context: .init(
-                    transport: .authenticatedPeer(endpointID: peerEndpointID, deviceID: session.deviceID),
+                    endpointID: peerEndpointID, deviceID: session.deviceID,
                     authorizationHeader: session.authorizationHeader
                 )
             )
@@ -310,7 +314,7 @@ final class RemoteIrohGatewayAdapter {
             let routed = await router.route(
                 .events(after: subscription.after),
                 context: .init(
-                    transport: .authenticatedPeer(endpointID: peerEndpointID, deviceID: session.deviceID),
+                    endpointID: peerEndpointID, deviceID: session.deviceID,
                     authorizationHeader: session.authorizationHeader
                 )
             )
@@ -362,7 +366,7 @@ final class RemoteIrohGatewayAdapter {
             throw RemoteIrohGatewayAdapterError.unauthorizedPeer
         }
         let context = RemoteGatewayRequestContext(
-            transport: .authenticatedPeer(endpointID: peerEndpointID, deviceID: session.deviceID),
+            endpointID: peerEndpointID, deviceID: session.deviceID,
             authorizationHeader: session.authorizationHeader
         )
         guard router.isAuthorized(context) else {
@@ -404,12 +408,6 @@ final class RemoteIrohGatewayAdapter {
             return try .command(
                 decodePayload(RemoteCommandRequest.self, from: rpc.payload),
                 endpoint: .contextBuilder
-            )
-        case .transportBootstrap:
-            return .transportBootstrap
-        case .bindIrohEndpoint:
-            return try .bindIrohEndpoint(
-                decodePayload(RemoteIrohBindingRequest.self, from: rpc.payload)
             )
         }
     }

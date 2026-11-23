@@ -12,8 +12,6 @@ struct RemoteSettingsView: View {
         _availability = ObservedObject(wrappedValue: gateway.availabilityController)
     }
 
-    @State private var showsLegacyPairingCode = true
-
     private static let authorityLevels: [RemoteAuthorityLevel] = [
         .observe, .respond, .control, .danger
     ]
@@ -55,29 +53,9 @@ struct RemoteSettingsView: View {
                         Task { await gateway.setEnabled(enabled) }
                     }
                 ))
-                Toggle("Enable Iroh (requires a newer Remote build)", isOn: Binding(
-                    get: { gateway.isIrohEnabled },
-                    set: { enabled in
-                        Task { await gateway.setIrohEnabled(enabled) }
-                    }
-                ))
-                .disabled(!gateway.isEnabled)
-
-                if gateway.isIrohEnabled {
-                    LabeledContent("Iroh") {
-                        Text(gateway.irohDiagnostics.state.capitalized)
-                            .foregroundStyle(gateway.irohDiagnostics.state == "running" ? .green : .secondary)
-                    }
-                    if gateway.irohDiagnostics.path != .unknown {
-                        LabeledContent("Iroh path") {
-                            Text(gateway.irohDiagnostics.path.rawValue.replacingOccurrences(of: "_", with: " ").capitalized)
-                        }
-                    }
-                    if let error = gateway.irohDiagnostics.lastError {
-                        Text("Iroh: \(error)")
-                            .font(.caption)
-                            .foregroundStyle(.orange)
-                            .textSelection(.enabled)
+                if gateway.isRunning, gateway.irohDiagnostics.path != .unknown {
+                    LabeledContent("Iroh path") {
+                        Text(gateway.irohDiagnostics.path.rawValue.replacingOccurrences(of: "_", with: " ").capitalized)
                     }
                 }
 
@@ -135,7 +113,7 @@ struct RemoteSettingsView: View {
         } else {
             GroupBox("Pair your phone") {
                 VStack(alignment: .leading, spacing: 14) {
-                    if let pairingCode = displayedPairingCode {
+                    if let pairingCode = gateway.pairingCode {
                         HStack(alignment: .top, spacing: 20) {
                             PairingQRCodeView(payload: pairingCode)
                                 .frame(width: 220, height: 220)
@@ -150,13 +128,6 @@ struct RemoteSettingsView: View {
                                     .font(.callout)
                                     .foregroundStyle(.secondary)
                                     .fixedSize(horizontal: false, vertical: true)
-                                if gateway.irohPairingCode != nil, gateway.legacyPairingCode != nil {
-                                    Picker("Pairing transport", selection: $showsLegacyPairingCode) {
-                                        Text("LAN HTTPS").tag(true)
-                                        Text("Iroh").tag(false)
-                                    }
-                                    .pickerStyle(.segmented)
-                                }
                                 HStack {
                                     Button("Generate new code") {
                                         gateway.refreshPairingAdvertisement()
@@ -164,7 +135,7 @@ struct RemoteSettingsView: View {
                                     Button("Copy pairing link") {
                                         copyPairingLink()
                                     }
-                                    .disabled(displayedPairingCode == nil)
+                                    .disabled(gateway.pairingCode == nil)
                                 }
                             }
                         }
@@ -233,13 +204,8 @@ struct RemoteSettingsView: View {
         }
     }
 
-    private var displayedPairingCode: String? {
-        if showsLegacyPairingCode { return gateway.legacyPairingCode }
-        return gateway.irohPairingCode ?? gateway.legacyPairingCode
-    }
-
     private func copyPairingLink() {
-        guard let pairingCode = displayedPairingCode else { return }
+        guard let pairingCode = gateway.pairingCode else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(pairingCode, forType: .string)
     }

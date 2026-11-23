@@ -53,6 +53,7 @@ public struct RemoteIrohEndpointAddress: Codable, Sendable, Equatable {
     }
 }
 
+/// Short-lived pairing data containing the authenticated Mac endpoint.
 public struct RemoteIrohPairingAdvertisement: Codable, Sendable, Equatable {
     public let protocolVersion: Int
     public let desktopInstanceID: String
@@ -60,7 +61,6 @@ public struct RemoteIrohPairingAdvertisement: Codable, Sendable, Equatable {
     public let alpn: String
     public let oneTimeSecret: String
     public let expiresAt: Date
-    public let legacyFallback: RemotePairingAdvertisement
 
     public init(
         protocolVersion: Int = RemoteProtocol.currentVersion,
@@ -68,8 +68,7 @@ public struct RemoteIrohPairingAdvertisement: Codable, Sendable, Equatable {
         server: RemoteIrohEndpointAddress,
         alpn: String = RemoteProtocol.irohALPN,
         oneTimeSecret: String,
-        expiresAt: Date,
-        legacyFallback: RemotePairingAdvertisement
+        expiresAt: Date
     ) {
         self.protocolVersion = protocolVersion
         self.desktopInstanceID = desktopInstanceID
@@ -77,44 +76,6 @@ public struct RemoteIrohPairingAdvertisement: Codable, Sendable, Equatable {
         self.alpn = alpn
         self.oneTimeSecret = oneTimeSecret
         self.expiresAt = expiresAt
-        self.legacyFallback = legacyFallback
-    }
-}
-
-public enum RemotePairingCode: Codable, Sendable, Equatable {
-    case legacyLAN(RemotePairingAdvertisement)
-    case iroh(RemoteIrohPairingAdvertisement)
-
-    private enum Discriminator: String, Codable {
-        case legacyLAN = "legacy_lan"
-        case iroh
-    }
-
-    private enum CodingKeys: String, CodingKey {
-        case kind
-        case advertisement
-    }
-
-    public init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        switch try container.decode(Discriminator.self, forKey: .kind) {
-        case .legacyLAN:
-            self = .legacyLAN(try container.decode(RemotePairingAdvertisement.self, forKey: .advertisement))
-        case .iroh:
-            self = .iroh(try container.decode(RemoteIrohPairingAdvertisement.self, forKey: .advertisement))
-        }
-    }
-
-    public func encode(to encoder: Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        switch self {
-        case let .legacyLAN(advertisement):
-            try container.encode(Discriminator.legacyLAN, forKey: .kind)
-            try container.encode(advertisement, forKey: .advertisement)
-        case let .iroh(advertisement):
-            try container.encode(Discriminator.iroh, forKey: .kind)
-            try container.encode(advertisement, forKey: .advertisement)
-        }
     }
 }
 
@@ -154,72 +115,6 @@ public struct RemoteIrohPairingResponse: Codable, Sendable, Equatable {
         clientEndpointID: String
     ) {
         self.pairingResponse = pairingResponse
-        self.serverEndpointID = serverEndpointID
-        self.clientEndpointID = clientEndpointID
-    }
-}
-
-public struct RemoteTransportBootstrapResponse: Codable, Sendable, Equatable {
-    public let protocolVersion: Int
-    public let wireVersion: Int
-    public let desktopInstanceID: String
-    public let server: RemoteIrohEndpointAddress
-    public let alpn: String
-
-    public init(
-        protocolVersion: Int = RemoteProtocol.currentVersion,
-        wireVersion: Int = RemoteWireProtocol.currentVersion,
-        desktopInstanceID: String,
-        server: RemoteIrohEndpointAddress,
-        alpn: String = RemoteProtocol.irohALPN
-    ) {
-        self.protocolVersion = protocolVersion
-        self.wireVersion = wireVersion
-        self.desktopInstanceID = desktopInstanceID
-        self.server = server
-        self.alpn = alpn
-    }
-}
-
-public struct RemoteIrohBindingRequest: Codable, Sendable, Equatable {
-    public let protocolVersion: Int
-    public let desktopInstanceID: String
-    public let deviceID: String
-    public let expectedServerEndpointID: String
-    public let clientEndpointID: String
-
-    public init(
-        protocolVersion: Int = RemoteProtocol.currentVersion,
-        desktopInstanceID: String,
-        deviceID: String,
-        expectedServerEndpointID: String,
-        clientEndpointID: String
-    ) {
-        self.protocolVersion = protocolVersion
-        self.desktopInstanceID = desktopInstanceID
-        self.deviceID = deviceID
-        self.expectedServerEndpointID = expectedServerEndpointID
-        self.clientEndpointID = clientEndpointID
-    }
-}
-
-public struct RemoteIrohBindingResponse: Codable, Sendable, Equatable {
-    public let protocolVersion: Int
-    public let desktopInstanceID: String
-    public let deviceID: String
-    public let serverEndpointID: String
-    public let clientEndpointID: String
-
-    public init(
-        protocolVersion: Int = RemoteProtocol.currentVersion,
-        desktopInstanceID: String,
-        deviceID: String,
-        serverEndpointID: String,
-        clientEndpointID: String
-    ) {
-        self.protocolVersion = protocolVersion
-        self.desktopInstanceID = desktopInstanceID
-        self.deviceID = deviceID
         self.serverEndpointID = serverEndpointID
         self.clientEndpointID = clientEndpointID
     }
