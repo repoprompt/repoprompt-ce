@@ -47,9 +47,10 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
 
     func reportRetainedAgentHostDrain(_ drain: AgentSessionHostDrainRuntime) {
         guard case .retained? = drain.outcome else { return }
-        AgentSessionLinkRuntimeBridge.shared.launchCoordinatorReportWarning(
+        AgentSessionLinkRuntimeBridge.shared.reportPersistenceWarning(
             id: Self.agentHostRecoveryWarningPrefix + drain.recoveryID.uuidString,
-            message: "A background Agent session could not finish saving or releasing its resources. Its original owner is retained. Retry settlement after correcting any storage problems."
+            message: "A background Agent session could not finish saving or releasing its resources. Its original owner is retained. Retry settlement after correcting any storage problems.",
+            canRetrySessionSettlement: true
         )
     }
 
@@ -762,8 +763,13 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         _ props: AgentMonitorPillProps,
         to endpoint: DomainAgentSessionLinkEndpointIdentity
     ) {
-        guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else { return }
-        viewModel.agentSessionLinkPublishProjection(props, to: endpoint)
+        if let runtime = independentLinkRuntime(for: endpoint), props.endpoint == endpoint {
+            runtime.residentMonitorPropsBySessionID[endpoint.sessionID] = props.outbound.isEmpty ? nil : props
+        } else if let viewModel = agentSessionLinkOwningViewModel(for: endpoint) {
+            viewModel.agentSessionLinkPublishProjection(props, to: endpoint)
+        } else {
+            return
+        }
         if props.inbound.isEmpty, props.outbound.isEmpty { schedulePreparedOversightCleanup() }
     }
 

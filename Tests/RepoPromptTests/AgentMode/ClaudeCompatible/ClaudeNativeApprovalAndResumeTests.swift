@@ -3851,6 +3851,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
             f.listener.routingCleanup = .registered([original])
             try await feed(assistant("original provider turn"), f.controller)
             await until("registered provider turn adopts") { f.session.runState == .running }
+            XCTAssertNil(route.runRouteBindings.connectionID(forRunID: runID), "Adopting a provider turn does not turn pending policy into a connection")
             let ownership = try XCTUnwrap(f.session.activeRunOwnership)
             let teardown = try XCTUnwrap(f.session.claimRunAttemptTerminalTeardown(ownership: ownership, terminalState: .cancelled))
             let replaced = await manager.installClientConnectionPolicy(

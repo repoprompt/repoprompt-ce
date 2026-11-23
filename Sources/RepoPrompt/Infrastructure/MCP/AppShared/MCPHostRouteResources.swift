@@ -367,13 +367,33 @@ final class MCPHostRouteResources {
     /// Join original publications before transferring the existing domain receipt and context.
     /// No new connection generation or catalog lookup is manufactured for a process refresh.
     func transferProcessConnection(_ connectionID: UUID, from origin: MCPRunRoutingCleanupReceipt, to successor: MCPRunRoutingCleanupReceipt) async -> Bool {
-        // Equal route IDs can belong to distinct epoch contexts. An explicit source requires new admission.
-        guard !origin.usesExplicitProviderContext, !successor.usesExplicitProviderContext else { return false }
         await settleRoutingPublications()
+        let renewal: ProviderContext?
+        if origin.usesExplicitProviderContext || successor.usesExplicitProviderContext {
+            guard origin.usesExplicitProviderContext, successor.usesExplicitProviderContext,
+                  let resolver = successor.providerContextResolver, let context = await resolver(),
+                  await context.validateCarrier() else { return false }
+            renewal = context
+        } else {
+            renewal = nil
+        }
         guard !isClosing, origin.routeOwner === self, successor.routeOwner === self,
-              coordinator == nil || connections[connectionID]?.policyID == origin.policyID,
-              runRouteBindings.transferProcessConnection(connectionID, from: origin, to: successor)
-        else { return false }
+              coordinator == nil || connections[connectionID]?.policyID == origin.policyID else { return false }
+        if let renewal {
+            let next = renewal.snapshot
+            guard renewal.isCurrent(), let previous = runRouteBindings.tabContextByConnectionID[connectionID],
+                  previous.routeOwnerIdentity == ObjectIdentifier(self), next.windowID == identity.routeID,
+                  previous.windowID == next.windowID, previous.runID == origin.runID, next.runID == origin.runID,
+                  previous.tabID == next.tabID, previous.workspaceID == next.workspaceID,
+                  previous.activeAgentSessionID == next.activeAgentSessionID,
+                  previous.savedCarrierSessionID == next.savedCarrierSessionID,
+                  previous.worktreeBindingState.bindings == next.worktreeBindingState.bindings,
+                  case let .captured(previousWriter) = previous.modelWriterAtBinding,
+                  case let .captured(nextWriter) = next.modelWriterAtBinding, previousWriter == nextWriter
+            else { return false }
+        }
+        guard runRouteBindings.transferProcessConnection(connectionID, from: origin, to: successor) else { return false }
+        if let renewal { renewProviderAttempt(connectionID: connectionID, attemptID: renewal.snapshot.runAttemptIDAtBinding) }
         if let retained = connections[connectionID] {
             connections[connectionID] = RetainedConnection(registration: retained.registration, policyID: successor.policyID)
         }
@@ -381,6 +401,42 @@ final class MCPHostRouteResources {
             await test_afterProcessConnectionTransfer?(successor)
         #endif
         return true
+    }
+
+    /// A provider-initiated turn uses an existing process registration, not a policy minted
+    /// by a presenter. Only its admitted writer may renew the attempt on that connection.
+    func renewAdoptedProviderAttempt(
+        runID: UUID, tabID: UUID, writer: AgentSessionRuntimeStore.WriterIdentity,
+        attemptID: UUID, receipts: [MCPRunRoutingCleanupReceipt]
+    ) -> Bool {
+        guard identity.kind == .independent, !isClosing,
+              let connectionID = runRouteBindings.connectionID(forRunID: runID),
+              let ownership = runRouteBindings.cleanupOwnership(for: connectionID),
+              receipts.contains(where: {
+                  !$0.isConsumed && $0.routeOwner === self && $0.routeID == identity.routeID
+                      && $0.runID == runID && $0.policyID == ownership.policyID
+              }),
+              let previous = runRouteBindings.tabContextByConnectionID[connectionID],
+              previous.routeOwnerIdentity == ObjectIdentifier(self), previous.windowID == identity.routeID,
+              previous.runID == runID, previous.tabID == tabID, previous.workspaceID == writer.workspaceID,
+              previous.activeAgentSessionID == writer.sessionID,
+              case let .captured(boundWriter) = previous.modelWriterAtBinding, boundWriter == writer
+        else { return false }
+        renewProviderAttempt(connectionID: connectionID, attemptID: attemptID)
+        return true
+    }
+
+    private func renewProviderAttempt(connectionID: UUID, attemptID: UUID?) {
+        guard var context = runRouteBindings.tabContextByConnectionID[connectionID],
+              context.runAttemptIDAtBinding != attemptID else { return }
+        readFileAutoSelectionCoordinator?.invalidate(
+            context: runRouteBindings.readFileAutoSelectionContextKey(connectionID: connectionID, context: context)
+        )
+        runRouteBindings.nextReadFileAutoSelectionBindingGeneration &+= 1
+        context.readFileAutoSelectionGeneration = runRouteBindings.nextReadFileAutoSelectionBindingGeneration
+        context.runAttemptIDAtBinding = attemptID
+        runRouteBindings.tabContextByConnectionID[connectionID] = context
+        runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
     }
 
     func installProviderContextSource(_ source: @escaping ProviderContextSource) {
@@ -511,6 +567,10 @@ final class MCPHostRouteResources {
     func resolveHostModelEndpoint(_ metadata: MCPRequestMetadata) -> ModelEndpoint? {
         guard catalogHandle != nil, !isClosing else { return nil }
         return catalog?.hostModelEndpoint?(metadata)
+    }
+
+    func canonicalWorkspaceSnapshots(_ workspaceIDs: Set<UUID>) async -> [UUID: DomainWorkspaceSnapshot] {
+        await domainRuntime.workspaceStore.canonicalWorkspaceSnapshots(workspaceIDs)
     }
 
     var workspaceStorageDirectory: URL {

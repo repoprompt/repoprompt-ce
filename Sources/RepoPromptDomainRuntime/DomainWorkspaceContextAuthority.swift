@@ -124,6 +124,11 @@ package struct DomainWorkspaceStore: Sendable {
         await authority.canonicalWorkspaceSnapshot(workspaceID)
     }
 
+    /// Read a bounded set of canonical membership carriers in one actor turn.
+    package func canonicalWorkspaceSnapshots(_ workspaceIDs: Set<UUID>) async -> [UUID: DomainWorkspaceSnapshot] {
+        await authority.canonicalWorkspaceSnapshots(workspaceIDs)
+    }
+
     package func agentAdmissionSnapshot(_ workspaceID: UUID) async -> DomainWorkspaceAdmissionSnapshot {
         await authority.agentAdmissionSnapshot(workspaceID)
     }
@@ -457,6 +462,12 @@ actor DomainWorkspaceContextAuthority {
 
     /// Command outcomes and mutation admission must report canonical record state; the read
     /// overlay is routing-only and must never leak into recovery health or revision baselines.
+    func canonicalWorkspaceSnapshots(_ workspaceIDs: Set<UUID>) -> [UUID: DomainWorkspaceSnapshot] {
+        var snapshots: [UUID: DomainWorkspaceSnapshot] = [:]
+        for id in workspaceIDs { snapshots[id] = canonicalWorkspaceSnapshot(id) }
+        return snapshots
+    }
+
     func canonicalWorkspaceSnapshot(_ workspaceID: UUID) -> DomainWorkspaceSnapshot? {
         records[workspaceID].map(makeSnapshot)
     }

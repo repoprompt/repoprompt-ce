@@ -15,7 +15,7 @@ enum AppSavedAgentSessionExecution {
     struct ApprovedLinkOrigin {
         let observer: DomainAgentSessionLinkEndpointIdentity
         let target: AgentSessionRuntimeStore.WriterIdentity
-        let hasCanonicalCarrier: Bool
+        let canonicalWriters: [AgentSessionRuntimeStore.WriterIdentity]
     }
 
     /// Retain both admitted incarnations across the asynchronous administration call.
@@ -26,27 +26,59 @@ enum AppSavedAgentSessionExecution {
     static func captureApprovedLinkOrigin(
         observer: DomainAgentSessionLinkEndpointIdentity, writer: AgentSessionRuntimeStore.Writer
     ) async -> ApprovedLinkOrigin {
-        let hasCarrier = await hasApprovedLinkCarrier(for: writer)
-        return .init(observer: observer, target: writer.identity, hasCanonicalCarrier: hasCarrier)
+        let candidates = [writer] + [exactLinkObserverWriter(observer)].compactMap(\.self)
+        let allowed = await canonicalLinkWriters(candidates, expectedObserver: observer)
+        return .init(observer: observer, target: writer.identity, canonicalWriters: allowed)
     }
 
-    static func hasApprovedLinkCarrier(for writer: AgentSessionRuntimeStore.Writer) async -> Bool {
-        let identity = writer.identity
-        guard let host = writer.scope.executableHost,
-              let snapshot = await AppDomainRuntimeComposition.shared.runtime.workspaceStore.canonicalWorkspaceSnapshot(identity.workspaceID),
-              snapshot.health != .removed, !Task.isCancelled, !host.route.isClosing,
-              (try? writer.admitCommand().get()) != nil else { return false }
-        let tabID = writer.session.tabID
-        if let activation = host.workspaceActivation {
-            return activation.isCurrent && activation.executionTab(
-                in: snapshot, workspaceID: identity.workspaceID, tabID: tabID, sessionID: identity.sessionID
-            ) != nil
+    static func revalidateApprovedLinkOrigin(_ origin: ApprovedLinkOrigin, writer: AgentSessionRuntimeStore.Writer) async -> Bool {
+        guard origin.target == writer.identity else { return false }
+        let candidates = [writer] + [exactLinkObserverWriter(origin.observer)].compactMap(\.self)
+        let expected = origin.canonicalWriters
+        guard !expected.isEmpty else { return true } // This transaction did not use a canonical fallback.
+        let current = await canonicalLinkWriters(candidates.filter { expected.contains($0.identity) }, expectedObserver: origin.observer)
+        return expected.allSatisfy { current.contains($0) }
+    }
+
+    private static func exactLinkObserverWriter(_ observer: DomainAgentSessionLinkEndpointIdentity) -> AgentSessionRuntimeStore.Writer? {
+        guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
+            sessionID: observer.sessionID, expectedWorkspaceID: observer.workspaceID
+        ), writer.scope.linkExecution?.agentSessionLinkObserverEndpoint(tabID: observer.tabID) == observer else { return nil }
+        return writer
+    }
+
+    private static func canonicalLinkWriters(
+        _ writers: [AgentSessionRuntimeStore.Writer], expectedObserver: DomainAgentSessionLinkEndpointIdentity
+    ) async -> [AgentSessionRuntimeStore.WriterIdentity] {
+        let receipts = writers.compactMap { writer in
+            writer.scope.executableHost.map { (writer: writer, host: $0, activation: $0.workspaceActivation) }
         }
-        // A legacy loaded writer still needs the exact persisted compose carrier, not
-        // a sidebar index entry that may be absent while its owner refreshes.
-        let matches = snapshot.contexts.filter { $0.metadata.identity.contextID == tabID && $0.health != .removed }
-        let tab = matches.first.flatMap { try? JSONDecoder().decode(ComposeTabState.self, from: $0.metadata.documentBytes) }
-        return matches.count == 1 && tab?.id == tabID && tab?.activeAgentSessionID == identity.sessionID
+        guard let runtime = receipts.first?.host.route,
+              receipts.allSatisfy({ $0.host.route.domainRuntimeIdentity == runtime.domainRuntimeIdentity })
+        else { return [] }
+        let snapshots = await runtime.canonicalWorkspaceSnapshots(Set(receipts.map(\.writer.identity.workspaceID)))
+        guard !Task.isCancelled else { return [] }
+        return receipts.compactMap { receipt -> AgentSessionRuntimeStore.WriterIdentity? in
+            let identity = receipt.writer.identity
+            let host = receipt.host
+            let tabID = receipt.writer.session.tabID
+            guard let snapshot = snapshots[identity.workspaceID], snapshot.health != .removed,
+                  !host.route.isClosing, host.workspaceActivation === receipt.activation,
+                  (try? receipt.writer.admitCommand().get()) != nil,
+                  identity.sessionID != expectedObserver.sessionID
+                  || receipt.writer.scope.linkExecution?.agentSessionLinkObserverEndpoint(tabID: tabID) == expectedObserver
+            else { return nil }
+            if let activation = receipt.activation {
+                guard activation.owns(scope: receipt.writer.scope, route: host.route),
+                      activation.executionTab(in: snapshot, workspaceID: identity.workspaceID, tabID: tabID, sessionID: identity.sessionID) != nil
+                else { return nil }
+            } else {
+                let matches = snapshot.contexts.filter { $0.metadata.identity.contextID == tabID && $0.health != .removed }
+                let tab = matches.first.flatMap { try? JSONDecoder().decode(ComposeTabState.self, from: $0.metadata.documentBytes) }
+                guard matches.count == 1, tab?.id == tabID, tab?.activeAgentSessionID == identity.sessionID else { return nil }
+            }
+            return identity
+        }
     }
 
     struct ProviderEnvironment {
@@ -65,7 +97,14 @@ enum AppSavedAgentSessionExecution {
         _ sessionID: UUID, domain: MCPDomainRuntime,
         isStillAuthorized: @MainActor () -> Bool
     ) async throws -> Lookup {
-        let snapshot = await domain.workspaceStore.snapshot()
+        try await resolve(sessionID, store: domain.workspaceStore, isStillAuthorized: isStillAuthorized)
+    }
+
+    static func resolve(
+        _ sessionID: UUID, store: DomainWorkspaceStore,
+        isStillAuthorized: @MainActor () -> Bool
+    ) async throws -> Lookup {
+        let snapshot = await store.snapshot()
         guard snapshot.isBootstrapped, snapshot.unavailableWorkspaceIDs.isEmpty,
               !Task.isCancelled, isStillAuthorized() else { throw AgentSavedSessionTargetLoader.Failure.changed }
         let workspaces = try snapshot.workspaces.filter { $0.health != .removed }.map {
@@ -82,9 +121,9 @@ enum AppSavedAgentSessionExecution {
             isCurrent: { _ in isStillAuthorized() }
         ).get()
         let validate: (Target) async -> Bool = { candidate in
-            let latest = await domain.workspaceStore.snapshot()
+            let latest = await store.snapshot()
             guard latest.catalogRevision == snapshot.catalogRevision, latest.unavailableWorkspaceIDs.isEmpty,
-                  let current = await domain.workspaceStore.canonicalWorkspaceSnapshot(candidate.workspace.id), current.health != .removed,
+                  let current = await store.canonicalWorkspaceSnapshot(candidate.workspace.id), current.health != .removed,
                   let decoded = try? JSONDecoder().decode(WorkspaceModel.self, from: current.document.documentBytes) else { return false }
             return candidate.carrier(in: decoded) != nil
         }

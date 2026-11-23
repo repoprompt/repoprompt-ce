@@ -75,7 +75,13 @@ final class ClaudeIntegratedAgentModeRunner {
               let cleanup = listener.routingCleanup,
               let subscription = listener.reserve()
         else { return false }
-        let owner = session.beginRunAttempt(source: "claudeNative.providerInitiated")
+        let attemptID = UUID()
+        if case .refused = claudeCoordinator.prepareAdoptedRunRoute(session: session, runID: runID, attemptID: attemptID, cleanup: cleanup) {
+            listener.close(subscription, returningTail: false)
+            listener.terminalPublished(for: subscription)
+            return false
+        }
+        let owner = session.beginRunAttempt(source: "claudeNative.providerInitiated", attemptID: attemptID)
         session.claudeTerminalAnchor = (owner, .none)
         session.beginProviderInitiatedTurnAccounting()
         session.activeReasoningItemID = nil

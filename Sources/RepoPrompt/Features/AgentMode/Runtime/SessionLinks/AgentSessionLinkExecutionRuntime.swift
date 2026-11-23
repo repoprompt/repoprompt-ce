@@ -80,6 +80,8 @@ final class AgentSessionLinkExecutionRuntime {
     var agentSessionLinkPromptInventoryBySessionID: [UUID: AgentSessionLinkPublishedPromptInventory] = [:]
     var agentSessionLinkRunCatalogProjectionByEndpoint: [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkRunCatalogProjection] = [:]
     var agentSessionLinkPromptInventoryHoldsByEndpoint: [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkPromptInventoryHold] = [:]
+    // Only the exact published endpoint can provide resident poll counts without a presenter.
+    var residentMonitorPropsBySessionID: [UUID: AgentMonitorPillProps] = [:]
     var agentSessionLinkNextPromptInventoryHoldToken: UInt64 = 0
     var agentSessionLinkPassiveNoticesBySessionID: [UUID: AgentSessionLinkPassiveStatusNotices.Snapshot] = [:]
     let agentSessionLinkPromptClaimStore = AgentSessionLinkOutboundPromptClaimStore()

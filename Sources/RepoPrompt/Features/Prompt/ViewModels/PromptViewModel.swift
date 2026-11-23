@@ -4933,13 +4933,7 @@ class PromptViewModel: ObservableObject {
     }
 
     private func autoNameForNewTab(_ existing: [ComposeTabState]) -> String {
-        let numericNames = Set(existing.compactMap { $0.name.stripLeadingTNumber() })
-        for i in 1 ... 999 {
-            if !numericNames.contains(i) {
-                return "T\(i)"
-            }
-        }
-        return "T\(existing.count + 1)"
+        ComposeTabState.nextDefaultName(in: existing)
     }
 
     private func updateActiveTabDirtyState() {
@@ -6923,18 +6917,7 @@ class PromptViewModel: ObservableObject {
     }
 
     private func canonicalTabIndex(from name: String) -> Int? {
-        name.stripLeadingTNumber()
-    }
-}
-
-private extension String {
-    func stripLeadingTNumber() -> Int? {
-        let trimmed = trimmingCharacters(in: .whitespaces)
-        guard trimmed.count >= 2 else { return nil }
-        let prefix = trimmed.prefix(1)
-        guard prefix == "T" || prefix == "t" else { return nil }
-        let numberPart = trimmed.dropFirst()
-        return Int(numberPart)
+        ComposeTabState.defaultTitleIndex(name)
     }
 }
 

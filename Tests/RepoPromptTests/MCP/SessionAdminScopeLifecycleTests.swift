@@ -9053,13 +9053,14 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 XCTAssertEqual(refusal, .failed(.childSession), "OFF: another parent's child is not linkable without applicable consent")
             }
             if global, ownChild, !revokeAfterLink {
-                // Exercise the admitted writer while an owner-current index lacks this row.
-                // The persisted carrier and writer remain exact; the sidebar is only a projection.
-                let vm = targetFixture.window.agentModeViewModel
-                let owner = try XCTUnwrap(vm.sessionIndexStore.sessionIndexOwner)
-                let workspace = try XCTUnwrap(targetFixture.window.workspaceManager.activeWorkspace)
-                vm.test_installSessionIndexSnapshot([:], owner: owner, latestOwner: owner, activeWorkspace: workspace)
-                XCTAssertNil(vm.ownerValidatedSessionIndex[target])
+                // Both canonical writers remain exact while the sidebar has neither row.
+                for (fixture, id) in [(observerFixture, caller), (targetFixture, target)] {
+                    let vm = fixture.window.agentModeViewModel
+                    let owner = try XCTUnwrap(vm.sessionIndexStore.sessionIndexOwner)
+                    let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+                    vm.test_installSessionIndexSnapshot([:], owner: owner, latestOwner: owner, activeWorkspace: workspace)
+                    XCTAssertNil(vm.ownerValidatedSessionIndex[id])
+                }
             }
             let key = UUID().uuidString
             let response = await bridge.requestTargetedOversight(observer: endpoint, targetSessionID: target, message: revokeAfterLink ? "must not dispatch" : nil, idempotencyKey: key)

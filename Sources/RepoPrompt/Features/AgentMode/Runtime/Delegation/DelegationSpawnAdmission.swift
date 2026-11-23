@@ -215,6 +215,36 @@ enum DelegationSpawnAdmission {
         return MCPError.invalidParams("\(code): \(json)")
     }
 
+    /// The creating writer owns the first configured save; the stamp must not race it or
+    /// authorize a second writer. A lapsed lease leaves the new session unplaced, as before.
+    static func stageOnCanonicalCreation(
+        _ admission: Admission?, command: AgentSessionRuntimeStore.Command, creation: AgentSessionCreationHandle,
+        scopes: DelegationScopeRuntime = AgentSessionLinkRuntimeBridge.shared.delegationScopes
+    ) throws {
+        guard let admission, let scopeID = admission.stampScopeID, let lease = admission.stampLease,
+              scopes.isCurrent(lease) else { return }
+        try command.requireCurrent()
+        let session = command.writer.session
+        guard session.creationHandleIsCurrent(creation), session.activeAgentSessionID == command.identity.sessionID else {
+            throw DelegationPlacementPersistenceError.ownerChanged
+        }
+        _ = applyCreationStamp(to: session, creatorSessionID: admission.creatorSessionID, delegationScopeID: scopeID)
+    }
+
+    static func applyCreationStamp(to session: AgentTabSession, creatorSessionID: UUID, delegationScopeID: UUID) -> Bool {
+        let placement = DelegationSpawnTargetPlacement(
+            organizationalParentID: session.organizationalParentID,
+            parentSessionID: session.parentSessionID,
+            createdByOverseerSessionID: session.createdByOverseerSessionID,
+            delegationScopeID: session.delegationScopeID
+        )
+        guard placement.admitsStamp(by: creatorSessionID) else { return false }
+        session.organizationalParentID = creatorSessionID
+        session.delegationScopeID = delegationScopeID
+        session.isDirty = true
+        return true
+    }
+
     /// Auto-join after creation. Skipped silently if the scope lapsed meanwhile or the session already
     /// has a placement of its own (`stampDelegationPlacementIfUnplaced`): the session was created
     /// under the surface's own authority and simply does not join by stamp. For a creating target,

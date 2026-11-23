@@ -261,13 +261,13 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         }
         guard isStillAuthorized(), !Task.isCancelled else { return .revoked }
         let writer = command.writer
-        if AppSavedAgentSessionExecution.approvedLinkOrigin.get()?.hasCanonicalCarrier == true {
-            // The synchronous membership projection may precede suspended target shaping.
-            // Recheck its canonical carrier before entering the durable Add transaction.
-            let carrierIsCurrent = await AppSavedAgentSessionExecution.hasApprovedLinkCarrier(for: writer)
+        if let origin = AppSavedAgentSessionExecution.approvedLinkOrigin.get() {
+            // One canonical read proves both endpoints; no target proof survives an await for
+            // the observer's placement in a different workspace.
+            let carriersAreCurrent = await AppSavedAgentSessionExecution.revalidateApprovedLinkOrigin(origin, writer: writer)
             guard isStillAuthorized(), !Task.isCancelled else { return .revoked }
-            guard carrierIsCurrent else {
-                return .failed("target_binding_changed: The canonical carrier changed before linking; nothing was linked.")
+            guard carriersAreCurrent else {
+                return .failed("target_binding_changed: A canonical carrier changed before linking; nothing was linked.")
             }
         }
         guard command.isCurrent, let host = writer.scope.executableHost, !host.route.isClosing else {
