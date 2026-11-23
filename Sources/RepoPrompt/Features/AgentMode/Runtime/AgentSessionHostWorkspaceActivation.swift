@@ -53,6 +53,27 @@ final class AgentSessionHostWorkspaceActivation {
         savedSelection = savedTarget?.tab.selection
     }
 
+    /// A child owns its own activation and settings lease. It borrows the exact parent's file
+    /// store and authority, not a presenter or the parent's saved-carrier proof.
+    func makeChildActivation(routeID: Int, workspace: WorkspaceModel) throws -> AgentSessionHostWorkspaceActivation {
+        guard isCurrent, catalogFileLease?.rootsAreCurrent == true,
+              workspace.id == key.owner.workspaceID, routeID != authority.windowID,
+              let childSettings = APISettingsRuntimeLease.acquire(from: settings.settings)
+        else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
+        let index = AgentWorkspaceSessionIndexStore()
+        index.receiveWorkspaceSwitchNotification(workspace)
+        do {
+            return try .init(
+                windowID: routeID,
+                authority: .init(store: authority.store, windowID: routeID, metadataPathPolicy: authority.metadataPathPolicy),
+                activations: index, resources: resources, settings: childSettings
+            )
+        } catch {
+            childSettings.release()
+            throw error
+        }
+    }
+
     /// For saved execution the loader establishes the session-to-carrier relationship. The
     /// canonical document proves placement; the original writer proves execution authority.
     /// Project the saved session ID only into request-local bytes, never into a visible tab.

@@ -518,6 +518,14 @@ final class MCPHostRouteResources {
         domainRuntime.identity
     }
 
+    /// A child uses the same process authority and listener, but an independent execution
+    /// lease and route. This does not issue a child writer or rebind the caller's connection.
+    func makeChildExecutionRoute() -> (owner: LeaseOwner, transport: MCPService)? {
+        guard identity.kind == .independent, !isClosing, catalogHandle != nil,
+              let transport = catalog?.hostTransport else { return nil }
+        return (LeaseOwner(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: coordinator, runtime: domainRuntime), transport)
+    }
+
     /// A provider start, not a window joining or a catalog being registered, requests the
     /// process listener. Transport startup cannot transfer admission to a replacement catalog.
     func ensureHostProviderTransport() async -> Bool {

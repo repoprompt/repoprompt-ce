@@ -13,6 +13,8 @@ final class WorkspaceAgentCanonicalFreshAdmission {
         let ownsWriter: () -> Bool
         let validateSource: () async -> Bool
         let sourceIsCurrent: () -> Bool
+        var provesSourceInSnapshot: (DomainWorkspaceSnapshot) -> Bool = { _ in true }
+        var retainedRecoveryDidSettle: @MainActor (AgentAdmissionRecoveryOutcome) async -> Void = { _ in }
     }
 
     private let authority: DomainWorkspaceAuthorityClient
@@ -20,6 +22,7 @@ final class WorkspaceAgentCanonicalFreshAdmission {
     private let coordinator: WorkspaceAgentAdmissionCoordinator
     private let lifecycleAuthority = AgentSessionLifecycleAuthority()
     private var claim: AgentProvisionalAdmissionClaim?
+    private var ownsPreparedWriter: (() -> Bool)?
     private var workingRecoveryCommit: AgentAdmissionRecoveryWorkingCommit?
 
     init(
@@ -47,7 +50,7 @@ final class WorkspaceAgentCanonicalFreshAdmission {
                   let baseline = await authority.canonicalWorkspaceSnapshot(workspaceID),
                   baseline.health.acceptsMutations, baseline.revisions.dirtyRevision == nil,
                   let workspace = try? Self.decode(baseline.document), workspace.id == workspaceID, !workspace.isEphemeral,
-                  !Task.isCancelled, adapters.sourceIsCurrent()
+                  !Task.isCancelled, adapters.sourceIsCurrent(), adapters.provesSourceInSnapshot(baseline)
             else { return WorkspaceAgentFreshAdmission.rejected("workspace_changed", reason: .workspaceChanged) }
             let preparation = WorkspaceAgentFreshAdmission.prepare(
                 workspace: workspace, sessionID: sessionID, makeTab: { adapters.makeTab(workspace) }
@@ -62,16 +65,27 @@ final class WorkspaceAgentCanonicalFreshAdmission {
         }
     }
 
-    /// Only the caller that acknowledged the complete initial session payload may accept.
+    var hasRetainedRecovery: Bool {
+        claim.map { coordinator.retainedRecoveryState(recoveryID: $0.identity.recoveryID) != nil } ?? false
+    }
+
+    /// Only the exact writer that acknowledged the complete initial session payload may accept.
     @discardableResult
-    func acceptConfiguredCreation(_ expected: AgentProvisionalAdmissionClaim) -> Bool {
-        guard claim === expected, expected.markAccepted() else { return false }
+    func acceptConfiguredCreation(_ expected: AgentProvisionalAdmissionClaim, writer: AgentSessionRuntimeStore.Writer) -> Bool {
+        let identity = expected.identity
+        guard claim === expected, ownsPreparedWriter?() == true, writer.isCurrent, writer.identity.workspaceID == identity.workspaceID,
+              writer.identity.sessionID == identity.sessionID, writer.session.tabID == identity.tabID,
+              writer.session.qualifiedRestorationReadiness == .authoritative(writer.restoration, .freshBindingDurablyCreated),
+              expected.markAccepted() else { return false }
         releaseReservation(expected.identity)
         return true
     }
 
     /// Compensation may outlive requester cancellation, but may never acquire a new writer.
-    func discard(_ expected: AgentProvisionalAdmissionClaim, ownsWriter: @escaping @MainActor () -> Bool) async -> AgentAdmissionRecoveryOutcome {
+    func discard(
+        _ expected: AgentProvisionalAdmissionClaim, ownsWriter: @escaping @MainActor () -> Bool,
+        retainedRecoveryDidSettle: @escaping @MainActor (AgentAdmissionRecoveryOutcome) async -> Void = { _ in }
+    ) async -> AgentAdmissionRecoveryOutcome {
         guard claim === expected, expected.state == .provisional else { return .ownershipChanged }
         guard ownsWriter() else {
             expected.markComplete()
@@ -82,7 +96,7 @@ final class WorkspaceAgentCanonicalFreshAdmission {
         return await Task { @MainActor in
             do {
                 let outcome = try await self.withRecoveryLease(expected.identity) {
-                    await self.settleRecovery(expected, ownsWriter: ownsWriter)
+                    await self.settleRecovery(expected, ownsWriter: ownsWriter, retainedRecoveryDidSettle: retainedRecoveryDidSettle)
                 }
                 switch outcome {
                 case .recovered, .alreadyRecovered, .localOnly:
@@ -95,7 +109,10 @@ final class WorkspaceAgentCanonicalFreshAdmission {
                 self.releaseReservationUnlessRetained(expected.identity)
                 return outcome
             } catch {
-                let outcome = await self.settleRecovery(expected, ownsWriter: ownsWriter, initialOutcome: .failed(.durabilityUncertain))
+                let outcome = await self.settleRecovery(
+                    expected, ownsWriter: ownsWriter, initialOutcome: .failed(.durabilityUncertain),
+                    retainedRecoveryDidSettle: retainedRecoveryDidSettle
+                )
                 self.releaseReservationUnlessRetained(expected.identity)
                 return outcome
             }
@@ -121,6 +138,7 @@ final class WorkspaceAgentCanonicalFreshAdmission {
             claim.markComplete()
             return WorkspaceAgentFreshAdmission.rejected("creation_preparation_changed", reason: .sessionIdentityChanged)
         }
+        ownsPreparedWriter = adapters.ownsWriter
         timing.begin(.save)
         timing.recordSaveAttempt()
         let write = try? await authority.saveFailClosed(
@@ -134,13 +152,16 @@ final class WorkspaceAgentCanonicalFreshAdmission {
         let containsCarrier = after.flatMap { try? Self.decode($0.document) }.map {
             WorkspaceAgentAdmissionDocument.recoveryProjection(in: $0, identity: identity).containsIdentity
         } == true
+        let sourceSharesSnapshot = after.map(adapters.provesSourceInSnapshot) == true
         let receipt = Self.receipt(write: write, snapshot: containsCarrier ? after : nil, proposed: document)
         let result = try await WorkspaceAgentFreshAdmission.settle(
             tab: tab, claim: claim, receipt: receipt,
-            bindingStillCurrent: sourceUnchanged && adapters.sourceIsCurrent() && adapters.ownsWriter() && containsCarrier,
+            bindingStillCurrent: sourceUnchanged && adapters.sourceIsCurrent() && adapters.ownsWriter() && containsCarrier && sourceSharesSnapshot,
             isCancelled: isCancelled, lifecycleAuthority: lifecycleAuthority, rollbackProjection: {}, recover: {
                 // Cancellation of the publication waiter does not cancel compensation.
-                await Task { @MainActor in await self.settleRecovery(claim, ownsWriter: adapters.ownsWriter) }.value
+                await Task { @MainActor in
+                    await self.settleRecovery(claim, ownsWriter: adapters.ownsWriter, retainedRecoveryDidSettle: adapters.retainedRecoveryDidSettle)
+                }.value
             }
         )
         if case .created = result { committed = true }
@@ -190,7 +211,8 @@ final class WorkspaceAgentCanonicalFreshAdmission {
 
     private func settleRecovery(
         _ claim: AgentProvisionalAdmissionClaim, ownsWriter: @escaping @MainActor () -> Bool,
-        initialOutcome: AgentAdmissionRecoveryOutcome? = nil
+        initialOutcome: AgentAdmissionRecoveryOutcome? = nil,
+        retainedRecoveryDidSettle: @escaping @MainActor (AgentAdmissionRecoveryOutcome) async -> Void
     ) async -> AgentAdmissionRecoveryOutcome {
         let identity = claim.identity
         return await WorkspaceAgentAdmissionRecoveryRetention.settle(claim: claim, adapters: .init(
@@ -205,7 +227,7 @@ final class WorkspaceAgentCanonicalFreshAdmission {
                     recoveryID: identity.recoveryID, workspaceID: identity.workspaceID, sessionID: identity.sessionID,
                     reservationOwnerID: identity.recoveryID, start: start, operation: operation
                 )
-            }
+            }, didRecover: retainedRecoveryDidSettle
         ))
     }
 
@@ -248,6 +270,7 @@ final class WorkspaceAgentCanonicalFreshAdmission {
     }
 
     private func releaseReservation(_ identity: AgentProvisionalAdmissionIdentity) {
+        ownsPreparedWriter = nil
         coordinator.releaseProvisionalSession(workspaceID: identity.workspaceID, sessionID: identity.sessionID, ownerID: identity.recoveryID)
     }
 

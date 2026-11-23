@@ -479,6 +479,32 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                     }
                     let models = try await invoke("agent_manage", ["op": .string("list_agents"), "roles_only": .bool(true)])
                     XCTAssertNotNil(models.objectValue)
+
+                    let spawn = try await AgentRunHostAdmission(host: host, invocation: .trustedLocal(toolName: "agent_run", metadata: metadata))
+                    let provisional = try await AgentRunHostChildCreation.publish(from: spawn, name: "Provisional child")
+                    let childID = provisional.command.identity.sessionID
+                    let child = provisional.command.writer.session
+                    XCTAssertEqual(child.parentSessionID, fixture.sessionID)
+                    XCTAssertNotEqual(provisional.host.routeID, host.routeID)
+                    XCTAssertThrowsError(try provisional.command.writer.admitCommand().get(), "Publishing a carrier cannot admit provider execution") {
+                        XCTAssertEqual($0 as? AgentSessionRuntimeStore.CommandRejection, .restorationUnavailable)
+                    }
+                    do {
+                        let pendingWorkspace = try await spawn.canonicalWorkspace()
+                        XCTAssertEqual(pendingWorkspace.composeTabs.last?.activeAgentSessionID, childID)
+                        XCTAssertEqual(pendingWorkspace.activeComposeTabID, departingWorkspace.activeComposeTabID)
+                    } catch {
+                        await provisional.discardIfProvisional()
+                        throw error
+                    }
+                    await provisional.discardIfProvisional()
+                    try await AsyncTestWait.waitUntil("only the compensated child route is retired") {
+                        provisional.host.scope.hasReleasedWriterClaims && provisional.host.route.isClosing
+                    }
+                    XCTAssertTrue(command.isCurrent)
+                    let recoveredWorkspace = try await spawn.canonicalWorkspace()
+                    XCTAssertEqual(recoveredWorkspace.composeTabs, [visible])
+                    XCTAssertEqual(recoveredWorkspace.lastSearchQuery, "flushed while leaving A")
                     promptGate.release()
                     await writer.session.agentTask?.value
                     XCTAssertEqual(provider.promptedMessages.count, 1)
