@@ -17,6 +17,7 @@ enum RemoteGatewaySecurityError: LocalizedError {
     case pairingInProgress
     case alreadyPaired
     case gatewayUnavailable
+    case storageResetUnavailable
 
     var response: RemoteErrorResponse {
         let code = switch self {
@@ -29,6 +30,7 @@ enum RemoteGatewaySecurityError: LocalizedError {
         case .pairingInProgress: "pairing_in_progress"
         case .alreadyPaired: "already_paired"
         case .gatewayUnavailable: "gateway_unavailable"
+        case .storageResetUnavailable: "pairing_storage_unavailable"
         default: "pairing_storage_unavailable"
         }
         return .init(code: code, message: localizedDescription, retryable: code == "pairing_storage_unavailable" || code == "gateway_unavailable")
@@ -60,6 +62,8 @@ enum RemoteGatewaySecurityError: LocalizedError {
             "This Mac is already paired. To replace the phone, unpair it in Mac Settings."
         case .gatewayUnavailable:
             "Remote is unavailable on your Mac. Enable Remote in Mac Settings to resume."
+        case .storageResetUnavailable:
+            "Pairing storage can be reset when the existing record is unreadable."
         }
     }
 }
@@ -221,6 +225,7 @@ enum RemoteDesktopPairingStatus: Equatable {
     case paired(expiresAt: Date)
     case credentialExpired
     case storageUnavailable
+    case storageUnreadable
 }
 
 @MainActor
@@ -235,7 +240,7 @@ final class RemotePairingManager {
     }
     private var storedState: RemoteStoredPairingState
     private(set) var storageError: Error?
-    private var reloadStoredState: (() throws -> RemoteStoredPairingState)?
+    private let reloadStoredState: (() throws -> RemoteStoredPairingState)?
     private var storedDevice: RemoteStoredDeviceCredential? {
         storedState.active
     }
@@ -263,6 +268,10 @@ final class RemotePairingManager {
             notificationRegistration: notificationRegistration,
             now: Date.init,
             randomBytes: remoteRandomBytes,
+            reloadStoredState: {
+                try RemoteGatewayKeychain.shared.read(.remotePairedDevice)
+                    .map(RemoteStoredPairingState.decode) ?? RemoteStoredPairingState()
+            },
             persistState: { state in
                 if state.pending == nil, state.advertisement == nil {
                     if let active = state.active {
@@ -280,11 +289,6 @@ final class RemotePairingManager {
                 }
             }
         )
-        reloadStoredState = {
-            try RemoteGatewayKeychain.shared.read(.remotePairedDevice)
-                .map(RemoteStoredPairingState.decode) ?? RemoteStoredPairingState()
-        }
-        retryStorageRead()
     }
 
     init(
@@ -293,6 +297,7 @@ final class RemotePairingManager {
         notificationRegistration: RemoteNotificationRegistration? = nil,
         now: @escaping () -> Date,
         randomBytes: @escaping (Int) throws -> Data,
+        reloadStoredState: (() throws -> RemoteStoredPairingState)? = nil,
         persistState: @escaping (RemoteStoredPairingState) throws -> Void
     ) {
         self.desktopInstanceID = desktopInstanceID
@@ -300,7 +305,9 @@ final class RemotePairingManager {
         self.notificationRegistration = notificationRegistration
         self.now = now
         self.randomBytes = randomBytes
+        self.reloadStoredState = reloadStoredState
         self.persistState = persistState
+        retryStorageRead()
     }
 
     func retryStorageRead() {
@@ -323,8 +330,10 @@ final class RemotePairingManager {
     }
 
     var status: RemoteDesktopPairingStatus {
-        if storageError != nil {
-            return .storageUnavailable
+        if let storageError {
+            let unreadable = storageError is DecodingError
+                || (storageError as? KeychainService.KeychainError) == .invalidData
+            return unreadable ? .storageUnreadable : .storageUnavailable
         }
         if isPaired, let storedDevice {
             return .paired(expiresAt: storedDevice.expiresAt)
@@ -503,7 +512,19 @@ final class RemotePairingManager {
         if let storageError {
             throw storageError
         }
+        try clearPairingStorage()
+    }
+
+    func resetUnreadableStorage() throws {
+        guard status == .storageUnreadable else {
+            throw RemoteGatewaySecurityError.storageResetUnavailable
+        }
+        try clearPairingStorage()
+    }
+
+    private func clearPairingStorage() throws {
         try save(.init())
+        storageError = nil
         notificationRegistration = nil
         // The bearer deletion above is the authoritative revocation. Ancillary
         // notification cleanup must not turn a successful unpair into a failure.

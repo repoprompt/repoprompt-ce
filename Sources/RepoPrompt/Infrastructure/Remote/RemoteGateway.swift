@@ -26,8 +26,12 @@ final class RemoteGatewayController: NSObject, ObservableObject {
         return false
     }
 
+    var phoneReadiness: RemoteIrohPhoneReadiness {
+        isRunning && isPaired ? irohDiagnostics.phoneReadiness : .offline
+    }
+
     var isPhoneConnected: Bool {
-        isRunning && isPaired && irohDiagnostics.activePeerCount > 0
+        phoneReadiness == .connected
     }
 
     @Published var isEnabled: Bool {
@@ -211,16 +215,30 @@ final class RemoteGatewayController: NSObject, ObservableObject {
     func revokePairedDevice() {
         do {
             try pairingManager.revokeDevice()
-            commandGeneration &+= 1
-            controlService?.clearAttachmentUploads()
-            irohAdapter.revokePeerSessions()
-            refreshPairingStatus()
-            lastError = nil
-            pairingCode = nil
+            publishPairingRevocation()
         } catch {
             refreshPairingStatus()
             lastError = error.localizedDescription
         }
+    }
+
+    func resetUnreadablePairingStorage() {
+        do {
+            try pairingManager.resetUnreadableStorage()
+            publishPairingRevocation()
+        } catch {
+            refreshPairingStatus()
+            lastError = error.localizedDescription
+        }
+    }
+
+    private func publishPairingRevocation() {
+        commandGeneration &+= 1
+        controlService?.clearAttachmentUploads()
+        irohAdapter.revokePeerSessions()
+        refreshPairingStatus()
+        lastError = nil
+        pairingCode = nil
     }
 
     func retryPairingStorage() {
@@ -279,12 +297,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                     // Delete the durable credential first. Only then invalidate
                     // Iroh sessions and publish the unpaired UI state.
                     try pairingManager.revokeDevice()
-                    commandGeneration &+= 1
-                    controlService?.clearAttachmentUploads()
-                    irohAdapter.revokePeerSessions()
-                    refreshPairingStatus()
-                    lastError = nil
-                    pairingCode = nil
+                    publishPairingRevocation()
                     Self.unpairLogger.info("Durable credential revocation succeeded; Iroh sessions invalidated")
                     return .success
                 } catch {
@@ -635,8 +648,13 @@ final class RemoteGatewayController: NSObject, ObservableObject {
     }
 
     private var connectionSummary: RemoteConnectionSummary {
-        .init(
-            state: isPhoneConnected ? .connected : .disconnected,
+        let state: RemoteConnectionSummary.State = switch phoneReadiness {
+        case .offline: .disconnected
+        case .syncing, .legacyActive: .connecting
+        case .connected: .connected
+        }
+        return .init(
+            state: state,
             transport: "iroh",
             lastConnectedAt: irohDiagnostics.lastSyncedActivityAt
         )

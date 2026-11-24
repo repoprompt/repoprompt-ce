@@ -3,11 +3,19 @@ import OSLog
 import RepoPromptIrohTransport
 import RepoPromptRemoteProtocol
 
+enum RemoteIrohPhoneReadiness: Equatable {
+    case offline
+    case syncing
+    case legacyActive
+    case connected
+}
+
 struct RemoteIrohGatewayDiagnostics: Equatable {
     var state = "stopped"
     var endpointID: String?
     var path: RemoteIrohPathKind = .unknown
     var activePeerCount = 0
+    var phoneReadiness: RemoteIrohPhoneReadiness = .offline
     var lastTransitionAt: Date?
     var lastError: String?
     var lastSyncedActivityAt: Date?
@@ -27,13 +35,14 @@ final class RemoteIrohGatewayAdapter {
         let sessionID: UUID?
         private(set) var ticket: UUID?
         private(set) var lastActivityAt: Date?
+        private(set) var hasConfirmedSync = false
 
         init(sessionID: UUID?) {
             self.sessionID = sessionID
         }
 
         mutating func issueTicket() -> UUID? {
-            guard sessionID != nil, lastActivityAt == nil else { return nil }
+            guard sessionID != nil, !hasConfirmedSync else { return nil }
             if let ticket {
                 return ticket
             }
@@ -44,18 +53,23 @@ final class RemoteIrohGatewayAdapter {
 
         mutating func confirm(_ ticket: UUID, at date: Date = Date()) -> Bool {
             guard ticket == self.ticket else { return false }
-            lastActivityAt = date
+            hasConfirmedSync = true
+            recordActivity(at: date)
             return true
         }
 
         mutating func recordActivity(at date: Date = Date()) {
-            if lastActivityAt != nil {
-                lastActivityAt = date
-            }
+            lastActivityAt = date
         }
 
-        func isLive(at date: Date = Date()) -> Bool {
-            lastActivityAt.map { date.timeIntervalSince($0) < 25 } ?? false
+        func readiness(at date: Date = Date()) -> RemoteIrohPhoneReadiness {
+            guard let lastActivityAt, date.timeIntervalSince(lastActivityAt) < 25 else {
+                return .offline
+            }
+            if hasConfirmedSync {
+                return .connected
+            }
+            return sessionID == nil ? .legacyActive : .syncing
         }
     }
 
@@ -177,6 +191,7 @@ final class RemoteIrohGatewayAdapter {
         update {
             $0.state = "stopped"
             $0.activePeerCount = 0
+            $0.phoneReadiness = .offline
             $0.lastSyncedActivityAt = nil
             $0.path = .unknown
         }
@@ -380,10 +395,12 @@ final class RemoteIrohGatewayAdapter {
                 throw RemoteIrohGatewayAdapterError.unauthorizedPeer
             }
             let sessionID = hello.supportsSyncConfirmation == true ? UUID() : nil
+            var sync = SyncState(sessionID: sessionID)
+            sync.recordActivity()
             sessions[peerEndpointID] = Session(
                 deviceID: hello.deviceID,
                 authorizationHeader: "Bearer \(hello.credential)",
-                sync: SyncState(sessionID: sessionID)
+                sync: sync
             )
             publishSessionCount()
             let accepted = RemoteHelloAccepted(
@@ -400,7 +417,7 @@ final class RemoteIrohGatewayAdapter {
             let session = try authenticatedSession(peerEndpointID, sessionID: frame.sessionID)
             let rpc = try frame.decodedPayload(as: RemoteRPCRequest.self, expectedKind: .rpcRequest)
             let request = try gatewayRequest(for: rpc)
-            if case .command = request, session.sync.sessionID != nil, session.sync.lastActivityAt == nil {
+            if case .command = request, session.sync.sessionID != nil, !session.sync.hasConfirmedSync {
                 throw RemoteIrohGatewayAdapterError.syncRequired
             }
             if case .unpair = request {
@@ -506,7 +523,7 @@ final class RemoteIrohGatewayAdapter {
         if authenticationUnavailable() {
             throw RemoteIrohGatewayAdapterError.remote(.init(
                 code: "pairing_storage_unavailable",
-                message: "Unlock the Mac’s Keychain and retry pairing storage in Mac Settings.",
+                message: "Open Remote settings on the Mac to recover its pairing storage.",
                 retryable: true
             ))
         }
@@ -635,14 +652,25 @@ final class RemoteIrohGatewayAdapter {
     }
 
     private func publishSessionCount() {
-        let live = sessions.values.filter { $0.sync.isLive() }
-        let lastActivity = live.compactMap(\.sync.lastActivityAt).max()
-        guard diagnostics.activePeerCount != live.count || diagnostics.lastSyncedActivityAt != lastActivity else {
+        let now = Date()
+        let active = sessions.values.filter { $0.sync.readiness(at: now) != .offline }
+        let lastSyncedActivity = active.filter { $0.sync.hasConfirmedSync }.compactMap(\.sync.lastActivityAt).max()
+        let readiness = if lastSyncedActivity != nil {
+            RemoteIrohPhoneReadiness.connected
+        } else if active.contains(where: { $0.sync.sessionID != nil }) {
+            RemoteIrohPhoneReadiness.syncing
+        } else {
+            active.isEmpty ? RemoteIrohPhoneReadiness.offline : .legacyActive
+        }
+        guard diagnostics.activePeerCount != active.count || diagnostics.phoneReadiness != readiness
+            || diagnostics.lastSyncedActivityAt != lastSyncedActivity
+        else {
             return
         }
         update {
-            $0.activePeerCount = live.count
-            $0.lastSyncedActivityAt = lastActivity
+            $0.activePeerCount = active.count
+            $0.phoneReadiness = readiness
+            $0.lastSyncedActivityAt = lastSyncedActivity
         }
     }
 

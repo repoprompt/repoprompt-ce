@@ -46,7 +46,8 @@ server-generated sync ticket. The phone decodes the snapshot and echoes the
 ticket in `sync_confirm`. The Mac shows Connected once it validates that
 ticket for the current session. The status expires after 25 seconds without
 authenticated application activity. An earlier client can use its existing
-credential, with Settings showing Paired until a client confirms sync.
+credential. Settings shows Phone active for this connection and prompts the
+user to update the phone to confirm sync.
 
 The phone supervises its connection and event poll with one retry task.
 Foregrounding or returning online restarts recovery promptly, and a failed
