@@ -129,27 +129,26 @@ package struct AntigravityACPAgentProvider: ACPAgentProvider {
         return "oauth-personal"
     }
 
-    package func shouldEmitStderrLine(_ line: String) -> Bool {
-        stderrLineDisposition(line) == .transcript
+    package func shouldEmitStderrLine(_: String) -> Bool {
+        // Antigravity process stderr is diagnostic-only, never transcript content.
+        // The controller retains non-discarded stderr for diagnostics and surfaces
+        // the latest line when the process times out or exits unexpectedly.
+        false
     }
 
     package func stderrLineDisposition(_ line: String) -> ACPStderrLineDisposition {
         // Antigravity writes its Python harness and raw websocket frames to stderr
         // (for example `I0906 ... local_connection.py ... RAW WS MSG`).
+        // Discard raw websocket frames before they reach diagnostic buffers or
+        // error previews, because frame payloads can contain arbitrary assistant
+        // text, tool errors, or full prompt bodies. Keep all other stderr in
+        // diagnostics only so process logs never render as chat transcript rows.
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Classify the record header, never the frame payload: it can contain
-        // arbitrary assistant text, tool errors, and even whole prompt bodies.
-        let harnessPrefix = #"^[DIWEF]\d{4}\s+(?:\d{2}:\d{2}:\d{2}(?:\.\d+)?\s+)?\d+\s+"#
-        guard trimmed.range(of: harnessPrefix, options: .regularExpression) != nil else { return .transcript }
-        let frameHeader = harnessPrefix + #"local_connection\.py(?::\d+\])?\s+RAW WS MSG\b"#
-        if trimmed.range(of: frameHeader, options: .regularExpression) != nil { return .discard }
-        guard trimmed.first == "I" || trimmed.first == "D" else { return .transcript }
-        let lowercased = trimmed.lowercased()
-        let isFailure = lowercased.contains("error")
-            || lowercased.contains("exception")
-            || lowercased.contains("traceback")
-            || lowercased.contains("failed")
-        return isFailure ? .transcript : .diagnosticsOnly
+        let frameHeader = #"^[DIWEF]\d{4}\s+(?:\d{2}:\d{2}:\d{2}(?:\.\d+)?\s+)?\d+\s+local_connection\.py(?::\d+\])?\s+RAW WS MSG\b"#
+        if trimmed.range(of: frameHeader, options: .regularExpression) != nil {
+            return .discard
+        }
+        return .diagnosticsOnly
     }
 
     package func normalizeError(_ error: Error) -> Error {

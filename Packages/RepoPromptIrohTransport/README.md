@@ -23,7 +23,7 @@ Third-party notices are in `THIRD_PARTY-NOTICES.md`.
 
 ## Binary delivery
 
-Ordinary SwiftPM and Xcode builds consume the immutable CE-owned release asset declared in `Package.swift`. The approximately 293 MiB uncompressed XCFramework is not stored in Git and a clean checkout does not run Cargo. The release ZIP is content-verified by SwiftPM’s checksum.
+Ordinary SwiftPM and Xcode builds consume the checksum-pinned release asset declared in `Package.swift`, currently hosted on a contributor fork. The approximately 293 MiB uncompressed XCFramework is not stored in Git and a clean checkout does not run Cargo. SwiftPM verifies the ZIP’s content, not its build provenance. Release acceptance requires an organization-controlled artifact with a source-to-binary receipt and a bundled transitive license inventory.
 
 To reproduce the artifact locally:
 
