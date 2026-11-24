@@ -19,6 +19,26 @@ class ReleaseCacheTests(unittest.TestCase):
             self.assertNotIn('github.sha', step)
             self.assertNotIn('restore-keys:', step)
             self.assertNotIn('.build/swiftbuild', step)
+            self.assertNotIn('.build/workspace-state.json', step)
+            self.assertNotIn('.build/checkouts', step)
+
+    def test_binary_download_cache_is_shared_without_restoring_installed_targets(self):
+        workflows = Path(__file__).resolve().parent.parent / '.github/workflows'
+        restore_keys = []
+        for name, expected_steps in [('ci.yml', 2), ('ci-integration-products.yml', 1), ('ci-main.yml', 1)]:
+            steps = [step for step in (workflows / name).read_text().split('\n      - name: ')
+                     if '~/Library/Caches/org.swift.swiftpm/artifacts' in step]
+            self.assertEqual(len(steps), expected_steps, name)
+            for step in steps:
+                self.assertIn('path: ~/Library/Caches/org.swift.swiftpm/artifacts', step)
+                self.assertNotIn('.build/artifacts', step)
+                key = next(line.strip() for line in step.splitlines() if line.strip().startswith('key: '))
+                if 'actions/cache/save@' in step:
+                    self.assertIn('steps.binaries-cache.outputs.cache-primary-key', key)
+                else:
+                    self.assertIn("'Packages/*/Package.swift'", key)
+                    restore_keys.append(key)
+        self.assertEqual(len(set(restore_keys)), 1)
 
     def test_cache_key_failures_are_not_masked_and_signed_releases_stay_clean(self):
         workflows = Path(__file__).resolve().parent.parent / '.github/workflows'

@@ -37,12 +37,8 @@ jobs:
       - name: Cache checksum-verified SwiftPM binary artifacts
         uses: actions/cache@v6
         with:
-          path: |
-            .build/artifacts
-            .build/swiftbuild/artifacts
-            Packages/RepoPromptAgentProviders/.build/artifacts
-            ~/Library/Caches/org.swift.swiftpm/artifacts
-          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-binaries-v1-${{ hashFiles('Package.resolved', 'Packages/RepoPromptAgentProviders/Package.resolved') }}
+          path: ~/Library/Caches/org.swift.swiftpm/artifacts
+          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-downloads-v2-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/*/Package.swift', 'Packages/*/Package.resolved', 'Vendor/*/Package.swift') }}
 
       - name: Resolve Sentry dependency downloads with bounded retries
         env:

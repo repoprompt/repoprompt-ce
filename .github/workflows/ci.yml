@@ -160,12 +160,10 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: |
-            .build/checkouts
             .build/repositories
-            .build/workspace-state.json
             Packages/RepoPromptAgentProviders/.build
-          # The enforcing root build cleans its products anyway. Do not transfer
-          # them (or admission receipts), or save another multi-GB copy per commit.
+          # Restore root Git mirrors only. SwiftPM must create the workspace state,
+          # checkouts and installed binary targets together in each scratch directory.
           key: support-${{ steps.support-toolchain.outputs.key }}
 
       - name: Invalidate cached admission evidence before any build or selftest
@@ -177,12 +175,8 @@ jobs:
         id: binaries-cache
         uses: actions/cache/restore@v6
         with:
-          path: |
-            .build/artifacts
-            .build/swiftbuild/artifacts
-            Packages/RepoPromptAgentProviders/.build/artifacts
-            ~/Library/Caches/org.swift.swiftpm/artifacts
-          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-binaries-v1-${{ hashFiles('Package.resolved', 'Packages/RepoPromptAgentProviders/Package.resolved') }}
+          path: ~/Library/Caches/org.swift.swiftpm/artifacts
+          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-downloads-v2-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/*/Package.swift', 'Packages/*/Package.resolved', 'Vendor/*/Package.swift') }}
 
       - name: Resolve dependency downloads with bounded retries
         id: resolve-dependency-downloads-with-bounded-retries
@@ -345,11 +339,7 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.binaries-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
-          path: |
-            .build/artifacts
-            .build/swiftbuild/artifacts
-            Packages/RepoPromptAgentProviders/.build/artifacts
-            ~/Library/Caches/org.swift.swiftpm/artifacts
+          path: ~/Library/Caches/org.swift.swiftpm/artifacts
           key: ${{ steps.binaries-cache.outputs.cache-primary-key }}
 
       # One compatible main seed; PRs restore only. Root products/receipts are
@@ -360,9 +350,7 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: |
-            .build/checkouts
             .build/repositories
-            .build/workspace-state.json
             Packages/RepoPromptAgentProviders/.build
           key: ${{ steps.rootbundles-cache.outputs.cache-primary-key }}
 
