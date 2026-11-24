@@ -1,11 +1,11 @@
 import Foundation
 import MCP
 import RepoPromptAIContracts
-import RepoPromptDomainRuntime
-import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import RepoPromptRemoteProtocol
 import RepoPromptSecureStorage
+import RepoPromptSettingsCore
 import XCTest
 
 @MainActor
@@ -724,6 +724,43 @@ final class RemoteIrohSecurityTests: XCTestCase {
         XCTAssertEqual(try reopened.read(.remotePairedDevice), replacement)
     }
 
+    func testUnpairAllowsSamePhoneToConfirmFreshPairingAfterRestart() throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 6800))
+        let server = RemoteIrohEndpointAddress(endpointID: endpointID("a"))
+        var disk = RemoteStoredPairingState()
+        var nextByte: UInt8 = 0
+        let randomBytes: (Int) -> Data = { count in
+            nextByte += 1
+            return Data(repeating: nextByte, count: count)
+        }
+        let manager = makeManager(clock: clock, randomBytes: randomBytes) { disk = $0 }
+        let oldCode = try manager.issueAdvertisement(server: server)
+        let oldRequest = pairingRequest(secret: oldCode.oneTimeSecret)
+        let oldResponse = try prepare(oldRequest, on: manager)
+        let oldConfirmation = try confirmation(for: oldResponse)
+        XCTAssertTrue(try confirm(oldConfirmation, on: manager))
+        XCTAssertTrue(isAuthorized(oldResponse, on: manager))
+
+        try manager.revokeDevice()
+        XCTAssertEqual(manager.status, .idle)
+        XCTAssertFalse(isAuthorized(oldResponse, on: manager))
+
+        let restoredState = try RemoteStoredPairingState.decode(JSONEncoder().encode(disk))
+        let reopened = makeManager(clock: clock, storedState: restoredState, randomBytes: randomBytes) { disk = $0 }
+        XCTAssertEqual(reopened.status, .idle)
+        let newCode = try reopened.issueAdvertisement(server: server)
+        XCTAssertNotEqual(newCode.oneTimeSecret, oldCode.oneTimeSecret)
+        XCTAssertThrowsError(try prepare(oldRequest, on: reopened))
+
+        let replacement = try prepare(pairingRequest(secret: newCode.oneTimeSecret), on: reopened)
+        XCTAssertEqual(replacement.clientEndpointID, oldResponse.clientEndpointID)
+        XCTAssertThrowsError(try confirm(oldConfirmation, on: reopened))
+        XCTAssertFalse(isAuthorized(replacement, on: reopened))
+        XCTAssertTrue(try confirm(confirmation(for: replacement), on: reopened))
+        XCTAssertTrue(isAuthorized(replacement, on: reopened))
+        XCTAssertFalse(isAuthorized(oldResponse, on: reopened))
+    }
+
     func testFailedDurableRevocationRetainsPairedAuthorizationState() {
         let clock = TestClock(Date(timeIntervalSince1970: 7000))
         let stored = RemoteStoredDeviceCredential(
@@ -790,13 +827,14 @@ final class RemoteIrohSecurityTests: XCTestCase {
     private func makeManager(
         clock: TestClock,
         storedState: RemoteStoredPairingState = .init(),
+        randomBytes: @escaping (Int) -> Data = { count in Data(repeating: UInt8(count), count: count) },
         persist: @escaping (RemoteStoredPairingState) throws -> Void = { _ in }
     ) -> RemotePairingManager {
         RemotePairingManager(
             desktopInstanceID: "desktop",
             storedState: storedState,
             now: { clock.date },
-            randomBytes: { count in Data(repeating: UInt8(count), count: count) },
+            randomBytes: randomBytes,
             persistState: persist
         )
     }
