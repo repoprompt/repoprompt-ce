@@ -14,17 +14,44 @@ gateway lifecycle, session state, permissions, and command execution.
 
 Swift Keychain stores a separate 32-byte Iroh endpoint secret and passes it to Rust only when starting the endpoint. The desktop instance ID, bearer credential, and Iroh endpoint identity have separate purposes.
 
-Iroh pairing requires a live five-minute single-use QR secret, the expected Mac endpoint ID, and equality between the request's client endpoint ID and the peer authenticated by QUIC. Established RPCs are rejected before routing unless endpoint ID, device ID, bearer, and expiry match the one-device record. The router repeats that authorization check on every request.
+The QR advertises `requiresPairingConfirmation` and includes a five-minute
+single-use secret, desktop instance ID, and pinned Mac Iroh endpoint. The
+phone saves its attempt ID and endpoint binding before sending
+`pairing_prepare`. The Mac validates the QR and both endpoint IDs and writes
+the provisional credential and QR redemption as one Keychain update.
 
-The QR includes the Mac's Iroh address and a short-lived secret. Endpoint
-identity and the bearer credential are verified on every connection.
-Replacing an endpoint identity requires pairing again.
+A repeated prepare from the same endpoint, attempt ID, and QR secret returns
+the same credential during the pending window. The phone saves that credential
+and attempt ID in Keychain before sending `pairing_confirm`. The Mac promotes
+the record only after checking the provisional bearer, the attempt ID, the
+device ID, and the authenticated peer. A repeated confirmation returns the same
+`pairing_confirmed` acknowledgment after either app restarts, without extending
+the lifetime. Pending credentials authorize confirmation only.
+
+An expired or abandoned attempt can be replaced from Mac Settings. Existing
+saved credentials and their usual authorization rules remain supported. New
+pairings require updated builds on both sides.
 
 ## Framing and recovery
 
 Application DTOs remain protocol v1 JSON models inside `RemoteWireFrame` wire version 1. RPCs and event polls use bounded QUIC bidirectional streams. The mobile client repeats `event_subscribe` as a cursor-based bounded poll: the server returns one ordered replay frame or heartbeat and closes that request stream. Stale cursors return `snapshot_required`, forcing an authoritative snapshot before polling resumes. This is intentionally not advertised as a long-lived server-push stream.
 
-Client connection attempts are staged: private/link-local direct addresses, all direct addresses with relay disabled, then relay-enabled. The authenticated Iroh path summary is surfaced as local direct, internet direct, relay, or unknown.
+The phone starts a single relay-capable dial with Iroh discovery and direct
+routes available immediately. Successful authentication can refresh the phone's
+cached route hints for the pinned Mac identity.
+
+The authenticated hello establishes an application session when the phone
+supports first-sync confirmation. The first successful snapshot includes a
+server-generated sync ticket. The phone decodes the snapshot and echoes the
+ticket in `sync_confirm`. The Mac shows Connected once it validates that
+ticket for the current session. The status expires after 25 seconds without
+authenticated application activity. An earlier client can use its existing
+credential, with Settings showing Paired until a client confirms sync.
+
+The phone supervises its connection and event poll with one retry task.
+Foregrounding or returning online restarts recovery promptly, and a failed
+dial backs off with jitter before retrying. Cached data remains visible
+while offline. Mutating commands are never automatically replayed.
 
 ## Lifecycle and rollback
 

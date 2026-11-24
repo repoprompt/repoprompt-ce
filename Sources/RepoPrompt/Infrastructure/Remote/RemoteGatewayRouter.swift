@@ -77,6 +77,7 @@ typealias RemoteDispatchAuthorization = @MainActor () throws -> Void
 struct RemoteGatewayRoutingServices {
     var authorize: (RemoteGatewayRequestContext) -> Bool
     var pairIroh: (RemoteIrohPairingRequest, String) -> Result<RemoteIrohPairingResponse, Error>
+    var confirmIroh: (RemotePairingConfirmation, String) throws -> Void
     var unpair: () -> RemoteGatewayRevocationResult
     var snapshot: () async -> RemoteSnapshot?
     var diagnostics: () async -> RemoteDiagnostics?
@@ -104,8 +105,12 @@ struct RemoteGatewayRoutingServices {
         imageAttachment: @escaping (RemoteImageAttachmentRequest) async throws -> RemoteImageAttachmentChunk? = { _ in nil },
         pairIroh: @escaping (RemoteIrohPairingRequest, String) -> Result<RemoteIrohPairingResponse, Error> = { _, _ in
             .failure(RemoteGatewayRouterError.irohUnavailable)
+        },
+        confirmIroh: @escaping (RemotePairingConfirmation, String) throws -> Void = { _, _ in
+            throw RemoteGatewayRouterError.irohUnavailable
         }
     ) {
+        self.confirmIroh = confirmIroh
         self.authorize = authorize
         self.pairIroh = pairIroh
         self.unpair = unpair
@@ -147,6 +152,10 @@ final class RemoteGatewayRequestRouter {
 
     func isAuthorized(_ context: RemoteGatewayRequestContext) -> Bool {
         services.authorize(context)
+    }
+
+    func confirmIroh(_ confirmation: RemotePairingConfirmation, peerEndpointID: String) throws {
+        try services.confirmIroh(confirmation, peerEndpointID)
     }
 
     func route(
@@ -292,8 +301,16 @@ final class RemoteGatewayRequestRouter {
         case let .success(response):
             encode(response)
         case let .failure(error):
-            .error(.init(code: "pairing_failed", message: error.localizedDescription), status: 403)
+            .error(Self.pairingError(error), status: 403)
         }
+    }
+
+    static func pairingError(_ error: Error) -> RemoteErrorResponse {
+        (error as? RemoteGatewaySecurityError)?.response ?? .init(
+            code: "pairing_storage_unavailable",
+            message: "The Mac could not access or save pairing in Keychain. Retry on your phone.",
+            retryable: true
+        )
     }
 
     private func routeCommand(
