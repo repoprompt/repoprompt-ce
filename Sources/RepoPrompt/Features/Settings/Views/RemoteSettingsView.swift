@@ -6,6 +6,7 @@ import SwiftUI
 struct RemoteSettingsView: View {
     @ObservedObject private var gateway: RemoteGatewayController
     @ObservedObject private var availability: RemoteAvailabilityController
+    @State private var showingStorageReset = false
 
     init(gateway: RemoteGatewayController) {
         _gateway = ObservedObject(wrappedValue: gateway)
@@ -100,11 +101,18 @@ struct RemoteSettingsView: View {
     private var gatewayStatus: String {
         switch gateway.pairingStatus {
         case .storageUnavailable: "Pairing storage unavailable"
+        case .storageUnreadable: "Pairing storage unreadable"
         case .attemptExpired: "Pairing attempt expired"
         case .codeExpired: "Pairing code expired"
         case .credentialExpired: "Paired credential expired"
         case .pending: "Pairing pending"
-        case .paired: gateway.isPhoneConnected ? "Paired · Connected" : "Paired · Offline"
+        case .paired:
+            switch gateway.phoneReadiness {
+            case .offline: "Paired · Offline"
+            case .syncing: "Paired · Syncing"
+            case .legacyActive: "Paired · Phone active"
+            case .connected: "Paired · Connected"
+            }
         case .idle, .codeReady:
             if gateway.isRunning {
                 "Ready for pairing"
@@ -121,8 +129,11 @@ struct RemoteSettingsView: View {
         if gateway.isPaired {
             GroupBox("Paired phone") {
                 VStack(alignment: .leading, spacing: 14) {
-                    if gateway.isRunning, !gateway.isPhoneConnected {
+                    if gateway.isRunning, gateway.phoneReadiness == .offline {
                         Text("Open RepoPrompt Remote on your phone to reconnect and finish syncing.")
+                            .foregroundStyle(.secondary)
+                    } else if gateway.phoneReadiness == .legacyActive {
+                        Text("Update RepoPrompt Remote on your phone to confirm its first sync.")
                             .foregroundStyle(.secondary)
                     }
                     Button("Unpair phone", role: .destructive) {
@@ -138,6 +149,17 @@ struct RemoteSettingsView: View {
                         Text("Unlock this Mac’s Keychain and retry loading pairing.")
                             .foregroundStyle(.secondary)
                         Button("Retry Keychain") { gateway.retryPairingStorage() }
+                    } else if case .storageUnreadable = gateway.pairingStatus {
+                        Text("This Mac can’t read its saved pairing. Reset it to generate a new code.")
+                            .foregroundStyle(.secondary)
+                        Button("Reset pairing storage", role: .destructive) { showingStorageReset = true }
+                            .confirmationDialog("Reset Remote pairing storage?", isPresented: $showingStorageReset) {
+                                Button("Reset pairing storage", role: .destructive) {
+                                    gateway.resetUnreadablePairingStorage()
+                                }
+                            } message: {
+                                Text("The saved phone pairing will be removed. Any previously paired phone will need a new code.")
+                            }
                     } else if case let .pending(deviceName, expiresAt) = gateway.pairingStatus {
                         Text("Waiting for \(deviceName) to save and confirm pairing. Reopen RepoPrompt Remote on that phone to resume.")
                             .foregroundStyle(.secondary)

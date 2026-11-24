@@ -308,7 +308,7 @@ final class RemoteGatewayRequestRouter {
     static func pairingError(_ error: Error) -> RemoteErrorResponse {
         (error as? RemoteGatewaySecurityError)?.response ?? .init(
             code: "pairing_storage_unavailable",
-            message: "The Mac could not access or save pairing in Keychain. Retry on your phone.",
+            message: "The Mac could not access or save pairing in Keychain. Check Remote settings on your Mac and retry.",
             retryable: true
         )
     }
