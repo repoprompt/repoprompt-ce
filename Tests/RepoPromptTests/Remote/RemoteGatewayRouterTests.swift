@@ -1,11 +1,11 @@
 import Foundation
 import MCP
 import RepoPromptAIContracts
-import RepoPromptDomainRuntime
-import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import RepoPromptRemoteProtocol
 import RepoPromptSecureStorage
+import RepoPromptSettingsCore
 import XCTest
 
 @MainActor
@@ -652,18 +652,61 @@ final class RemoteIrohSecurityTests: XCTestCase {
         let now = Date(timeIntervalSince1970: 6750)
         var firstConnection = RemoteIrohGatewayAdapter.SyncState(sessionID: UUID())
         firstConnection.recordActivity(at: now)
-        XCTAssertFalse(firstConnection.isLive(at: now))
+        XCTAssertEqual(firstConnection.readiness(at: now), .syncing)
         let lostSnapshotTicket = try XCTUnwrap(firstConnection.issueTicket())
-        XCTAssertFalse(firstConnection.isLive(at: now), "A generated or sent snapshot is not a confirmation")
+        XCTAssertEqual(firstConnection.readiness(at: now), .syncing)
 
         var reconnect = RemoteIrohGatewayAdapter.SyncState(sessionID: UUID())
         let newTicket = try XCTUnwrap(reconnect.issueTicket())
         XCTAssertFalse(reconnect.confirm(lostSnapshotTicket, at: now))
-        XCTAssertFalse(reconnect.isLive(at: now))
+        XCTAssertEqual(reconnect.readiness(at: now), .offline)
         XCTAssertTrue(reconnect.confirm(newTicket, at: now))
         XCTAssertTrue(reconnect.confirm(newTicket, at: now))
-        XCTAssertTrue(reconnect.isLive(at: now))
-        XCTAssertFalse(reconnect.isLive(at: now.addingTimeInterval(26)))
+        XCTAssertEqual(reconnect.readiness(at: now), .connected)
+        XCTAssertEqual(reconnect.readiness(at: now.addingTimeInterval(26)), .offline)
+    }
+
+    func testLegacyPhoneShowsActivityWithoutClaimingConfirmedSync() {
+        let now = Date(timeIntervalSince1970: 6800)
+        var legacy = RemoteIrohGatewayAdapter.SyncState(sessionID: nil)
+        legacy.recordActivity(at: now)
+        XCTAssertEqual(legacy.readiness(at: now), .legacyActive)
+        XCTAssertNil(legacy.issueTicket())
+        XCTAssertFalse(legacy.confirm(UUID(), at: now))
+        XCTAssertEqual(legacy.readiness(at: now.addingTimeInterval(26)), .offline)
+    }
+
+    func testCorruptStorageCanBeResetAfterDurableWrite() throws {
+        var disk: Data? = Data("damaged".utf8)
+        var failWrites = true
+        let manager = RemotePairingManager(
+            desktopInstanceID: "desktop", now: Date.init, randomBytes: { Data(repeating: 43, count: $0) },
+            reloadStoredState: { try disk.map(RemoteStoredPairingState.decode) ?? .init() },
+            persistState: { state in
+                if failWrites {
+                    throw PersistenceFailure.failed
+                }
+                disk = try JSONEncoder().encode(state)
+            }
+        )
+        XCTAssertEqual(manager.status, .storageUnreadable)
+        XCTAssertThrowsError(try manager.resetUnreadableStorage())
+        XCTAssertEqual(manager.status, .storageUnreadable)
+        failWrites = false
+        try manager.resetUnreadableStorage()
+        manager.retryStorageRead()
+        XCTAssertEqual(manager.status, .idle)
+        XCTAssertNoThrow(try manager.issueAdvertisement(server: .init(endpointID: endpointID("a"))))
+    }
+
+    func testTemporaryKeychainFailureCannotResetPairing() {
+        let manager = RemotePairingManager(
+            desktopInstanceID: "desktop", now: Date.init, randomBytes: { Data(repeating: 43, count: $0) },
+            reloadStoredState: { throw PersistenceFailure.failed },
+            persistState: { _ in XCTFail("An inaccessible Keychain item must not be replaced") }
+        )
+        XCTAssertEqual(manager.status, .storageUnavailable)
+        XCTAssertThrowsError(try manager.resetUnreadableStorage())
     }
 
     func testRevokedCredentialStaysUnavailableAfterReopeningStorage() throws {

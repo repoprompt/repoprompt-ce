@@ -162,11 +162,10 @@ jobs:
           path: |
             .build/checkouts
             .build/repositories
-            .build/workspace-state.json
             Packages/RepoPromptAgentProviders/.build
-          # The enforcing root build cleans its products anyway. Do not transfer
-          # them (or admission receipts), or save another multi-GB copy per commit.
-          key: support-${{ steps.support-toolchain.outputs.key }}
+          # Resolve a fresh root workspace so SwiftPM discovers the artifacts
+          # available on this runner. Keep dependency mirrors and provider output.
+          key: support-repositories-v1-${{ steps.support-toolchain.outputs.key }}
 
       - name: Invalidate cached admission evidence before any build or selftest
         id: invalidate-cached-admission-evidence-before-any-build-or-selftest
@@ -182,13 +181,20 @@ jobs:
             .build/swiftbuild/artifacts
             Packages/RepoPromptAgentProviders/.build/artifacts
             ~/Library/Caches/org.swift.swiftpm/artifacts
-          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-binaries-v1-${{ hashFiles('Package.resolved', 'Packages/RepoPromptAgentProviders/Package.resolved') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-binaries-v2-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/RepoPromptAgentProviders/Package.swift', 'Packages/RepoPromptAgentProviders/Package.resolved', 'Packages/RepoPromptIrohTransport/Package.swift') }}
 
       - name: Resolve dependency downloads with bounded retries
         id: resolve-dependency-downloads-with-bounded-retries
         run: |
           python3 Scripts/ci_resolve_packages.py
           python3 Scripts/ci_resolve_packages.py --scratch-path .build/swiftbuild
+          for scratch in .build .build/swiftbuild; do
+            plist="$scratch/artifacts/repopromptirohtransport/IrohTransportFFI/IrohTransportFFI.xcframework/Info.plist"
+            if [[ ! -s "$plist" ]]; then
+              echo "::error::SwiftPM resolution did not materialize $plist"
+              exit 1
+            fi
+          done
           python3 Scripts/ci_resolve_packages.py --root Packages/RepoPromptAgentProviders
 
       - name: Verify macOS process supervision and platform tooling
@@ -362,7 +368,6 @@ jobs:
           path: |
             .build/checkouts
             .build/repositories
-            .build/workspace-state.json
             Packages/RepoPromptAgentProviders/.build
           key: ${{ steps.rootbundles-cache.outputs.cache-primary-key }}
 
