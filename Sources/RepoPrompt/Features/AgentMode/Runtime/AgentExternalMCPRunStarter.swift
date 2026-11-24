@@ -102,6 +102,7 @@ enum AgentExternalMCPRunStarter {
         dispatchInstruction: DispatchInstruction? = nil,
         startExpiry: AgentRunStartExpiry? = nil,
         remoteAttachments: [AgentFileAttachment]? = nil,
+        validateDispatch: (@MainActor () throws -> Void)? = nil,
         workspaceAuthority: AgentModeViewModel.MCPWorkspaceTargetAuthority? = nil
     ) async throws -> StartOutcome {
         try await startWithBindingDisposition(
@@ -121,6 +122,7 @@ enum AgentExternalMCPRunStarter {
             dispatchInstruction: dispatchInstruction,
             startExpiry: startExpiry,
             remoteAttachments: remoteAttachments,
+            validateDispatch: validateDispatch,
             workspaceAuthority: workspaceAuthority
         )
     }
@@ -178,6 +180,7 @@ enum AgentExternalMCPRunStarter {
         dispatchInstruction: DispatchInstruction?,
         startExpiry: AgentRunStartExpiry?,
         remoteAttachments: [AgentFileAttachment]? = nil,
+        validateDispatch: (@MainActor () throws -> Void)? = nil,
         workspaceAuthority: AgentModeViewModel.MCPWorkspaceTargetAuthority? = nil
     ) async throws -> StartOutcome {
         let resolvedModel: String?
@@ -207,6 +210,7 @@ enum AgentExternalMCPRunStarter {
             ])
         #endif
         func requireWorkspaceAuthority() throws {
+            try validateDispatch?()
             if let workspaceAuthority {
                 try agentModeVM.requireCurrentMCPWorkspaceTarget(
                     workspaceAuthority.target,
@@ -255,7 +259,8 @@ enum AgentExternalMCPRunStarter {
                         try await agentModeVM.mcpConfigureSession(
                             tabID: target.tabID, agentRaw: agentRaw, modelRaw: resolvedModel,
                             reasoningEffortRaw: resolvedEffort, requireInactiveRunState: true,
-                            workspaceAuthority: workspaceAuthority, creationHandle: target.creationHandle
+                            validateDispatch: validateDispatch, workspaceAuthority: workspaceAuthority,
+                            creationHandle: target.creationHandle
                         )
                     }, prepareRequestBinding: {
                         switch bindingDisposition {

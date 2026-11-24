@@ -2546,6 +2546,53 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertEqual(fixture.session.items.count(where: { $0.text.contains("Started a fresh thread") }), 1)
     }
 
+    /// A resume follows the conversation's recorded instruction mode, not the session's current
+    /// eligibility: a native thread keeps its note after gaining a parent, and a legacy thread does
+    /// not get guidance its RepoPrompt base already carries.
+    func testResumeDeveloperNoteFollowsRecordedInstructionMode() async throws {
+        let note = AgentModePrompts.codexNativeDeveloperNote()
+        let cases: [(mode: CodexThreadInstructionMode?, hasParent: Bool, expected: String?)] = [
+            (.native, true, note),
+            (.legacy, false, nil),
+            (nil, false, note),
+            (nil, true, nil)
+        ]
+        for testCase in cases {
+            let fixture = makeFixture([[.success(Self.oldThreadID)]], shouldManageCodexTooling: false)
+            fixture.session.codexInstructionMode = testCase.mode
+            fixture.session.parentSessionID = testCase.hasParent ? UUID() : nil
+            await fixture.coordinator.ensureCodexNativeSession(session: fixture.session)
+            let controller = try XCTUnwrap(fixture.factory.controllers.first)
+            XCTAssertEqual(controller.receivedExistingIDs, [Self.oldThreadID], "\(testCase)")
+            XCTAssertEqual(controller.developerInstructionAttempts, [testCase.expected], "\(testCase)")
+            XCTAssertEqual(fixture.session.codexInstructionMode, testCase.mode, "a resume must keep the recorded mode")
+            await fixture.coordinator.shutdownCodexSession(fixture.session)
+        }
+    }
+
+    /// A missing-rollout fallback starts a new conversation, so it is offered the new-thread note
+    /// even when the lost conversation was legacy, and records the new conversation's mode.
+    func testMissingRolloutFallbackRecordsNewConversationInstructionMode() async throws {
+        let fixture = makeFixture([[.missingRollout, .success("ready-fresh-thread")]])
+        fixture.session.codexInstructionMode = .legacy
+        let startup = Task { await fixture.coordinator.ensureCodexNativeSession(session: fixture.session) }
+        defer { startup.cancel() }
+        try await waitForPendingStart(fixture)
+        XCTAssertEqual(fixture.session.codexInstructionMode, .legacy, "staged startup must not publish the new mode early")
+        try await MCPRoutingWaiter.shared.notifyRouted(runID: XCTUnwrap(fixture.session.runID))
+        await startup.value
+
+        XCTAssertEqual(fixture.session.codexConversationID, "ready-fresh-thread")
+        XCTAssertEqual(fixture.session.codexInstructionMode, .native)
+        XCTAssertEqual(
+            fixture.factory.controllers.first?.developerInstructionAttempts,
+            [nil, AgentModePrompts.codexNativeDeveloperNote()]
+        )
+        var persisted = AgentSession(id: UUID(), name: "Instruction mode", savedAt: Date(), autoEditEnabled: false)
+        AgentSessionPayloadBuilder.applyCodexPersistence(from: fixture.session, to: &persisted)
+        XCTAssertEqual(persisted.codexInstructionMode, .native)
+    }
+
     func testSecondCallerCannotBypassUnpublishedStartup() async throws {
         let gate = TestReleaseFence(name: "first Codex start response")
         let fixture = makeFixture(restored: true, [[.suspendedSuccess("claimed-thread", gate)]])
@@ -3111,11 +3158,16 @@ final class WedgeFakeCodexController: CodexSessionControllerPassiveStubDefaults,
             )
         case let .success(threadID):
             lock.withLock { active = true }
+            // Mirrors the real controller on a supported runtime: a start records its mode, a
+            // resume keeps the existing one.
             return CodexNativeSessionController.SessionRef(
                 conversationID: threadID,
                 rolloutPath: nil,
                 model: model,
-                reasoningEffort: reasoningEffort
+                reasoningEffort: reasoningEffort,
+                instructionMode: existing == nil
+                    ? (developerInstructions == nil ? .legacy : .native)
+                    : existing?.instructionMode
             )
         case nil:
             throw CodexAppServerClient.ClientError.invalidResponse

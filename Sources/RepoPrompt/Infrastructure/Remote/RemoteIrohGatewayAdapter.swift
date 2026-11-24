@@ -25,6 +25,10 @@ final class RemoteIrohGatewayAdapter {
     private struct Session {
         let deviceID: String
         let authorizationHeader: String
+
+        func context(endpointID: String) -> RemoteGatewayRequestContext {
+            .init(endpointID: endpointID, deviceID: deviceID, authorizationHeader: authorizationHeader)
+        }
     }
 
     private let router: RemoteGatewayRequestRouter
@@ -179,6 +183,14 @@ final class RemoteIrohGatewayAdapter {
             }
             let frame = try decoder.decode(RemoteWireFrame.self, from: data)
             try frame.validateEncodedLimit(direction: .clientToServer)
+            let isUnpairRequest = isUnpairRPC(frame)
+            let originalContext: RemoteGatewayRequestContext? = if !isUnpairRequest,
+                                                                   frame.kind == .rpcRequest || frame.kind == .eventSubscribe
+            {
+                try authenticatedSession(peerEndpointID).context(endpointID: peerEndpointID)
+            } else {
+                nil
+            }
             let response = try await response(
                 to: frame,
                 peerEndpointID: peerEndpointID
@@ -187,7 +199,13 @@ final class RemoteIrohGatewayAdapter {
             try response.validateEncodedLimit(
                 direction: response.kind == .event ? .serverEvent : .serverResponse
             )
-            let isUnpairRequest = isUnpairRPC(frame)
+            guard request.generation() == activeGeneration else {
+                request.close()
+                return
+            }
+            if let originalContext, !router.isAuthorized(originalContext) {
+                throw RemoteIrohGatewayAdapterError.unauthorizedPeer
+            }
             if isUnpairRequest {
                 Self.unpairLogger.info("Sending framed Iroh Unpair response after durable revocation")
             }
@@ -247,6 +265,12 @@ final class RemoteIrohGatewayAdapter {
                 as: RemoteAuthenticatedHello.self,
                 expectedKind: .authenticatedHello
             )
+            guard RemoteProtocol.supports(hello.protocolVersion) else {
+                throw RemoteIrohGatewayAdapterError.remote(.init(
+                    code: "unsupported_protocol_version",
+                    message: "This version of RepoPrompt Remote is not supported by the Mac."
+                ))
+            }
             guard hello.expectedServerEndpointID == serverAddress?.endpointID,
                   hello.desktopInstanceID == desktopInstanceID
             else {
@@ -357,7 +381,17 @@ final class RemoteIrohGatewayAdapter {
                 break
             }
         }
-        guard !selected.isEmpty else { throw RemoteIrohGatewayAdapterError.frameTooLarge }
+        guard !selected.isEmpty else {
+            return try RemoteWireFrame(
+                kind: .streamError,
+                messageID: messageID,
+                encoding: RemoteErrorResponse(
+                    code: "snapshot_required",
+                    message: "The next event exceeds the replay limit. Refresh the snapshot.",
+                    retryable: true
+                )
+            )
+        }
         return try RemoteWireFrame(kind: .event, messageID: messageID, encoding: selected)
     }
 

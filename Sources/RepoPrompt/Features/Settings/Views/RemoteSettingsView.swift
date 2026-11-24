@@ -166,7 +166,7 @@ struct RemoteSettingsView: View {
                 }
                 .pickerStyle(.menu)
 
-                Text("Observe is the recommended default. Higher levels control which paired-device commands the Mac will accept.")
+                Text("Observe is read-only. Respond adds answers and one-time approvals, and Control adds run commands. Danger also permits changes to Codex tool settings for the entire Mac. Worktree merges, permission grants, and persistent approvals stay on the Mac. Push notifications are currently unavailable.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

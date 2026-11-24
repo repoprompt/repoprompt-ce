@@ -1639,10 +1639,14 @@ final class AgentTabSession: ObservableObject {
     var codexSessionLinkCatalogRepairCycle: AgentSessionLinkCodexCatalogRepair.Cycle?
     /// Retained across controller replacements, but not persisted across cold restoration.
     var codexContextWindowSelection: CodexContextWindowPreferences.Selection?
+    /// How the current Codex conversation's base instructions were chosen; persisted with the
+    /// conversation identity and nil for conversations saved before it was recorded.
+    var codexInstructionMode: CodexThreadInstructionMode?
 
     func clearCodexConversationIdentity() {
         codexConversationID = nil
         codexContextWindowSelection = nil
+        codexInstructionMode = nil
     }
 
     func codexContextWindowForBinding(current: CodexContextWindowPreferences.Selection) -> CodexContextWindowPreferences.Selection {

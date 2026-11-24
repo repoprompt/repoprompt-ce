@@ -1,5 +1,5 @@
-import XCTest
 @testable import RepoPromptRemoteProtocol
+import XCTest
 
 final class RemoteContractTests: XCTestCase {
     func testMacOnlyInteractionReasonIsOptionalForOlderClientsAndGateways() throws {
@@ -82,10 +82,22 @@ final class RemoteContractTests: XCTestCase {
         XCTAssertEqual(latestCursor, 1)
     }
 
+    func testReplayBufferRequestsSnapshotForCursorFromBeforeRestart() async {
+        let buffer = RemoteEventReplayBuffer()
+        let emptyReplay = await buffer.replay(after: 42, desktopInstanceID: "desktop")
+        XCTAssertEqual(emptyReplay, .snapshotRequired)
+
+        await buffer.append(RemoteEvent(desktopInstanceID: "desktop", type: .sessionUpdated))
+        let aheadReplay = await buffer.replay(after: 42, desktopInstanceID: "desktop")
+        let currentReplay = await buffer.replay(after: 1, desktopInstanceID: "desktop")
+        XCTAssertEqual(aheadReplay, .snapshotRequired)
+        XCTAssertEqual(currentReplay, .events([]))
+    }
+
     func testReplayBufferRemainsBoundedUnderManyEvents() async {
         let capacity = 128
         let buffer = RemoteEventReplayBuffer(capacity: capacity)
-        for index in 0 ..< 5_000 {
+        for index in 0 ..< 5000 {
             _ = await buffer.append(
                 RemoteEvent(
                     desktopInstanceID: "desktop-1",
@@ -95,15 +107,15 @@ final class RemoteContractTests: XCTestCase {
         }
 
         let latestCursor = await buffer.latestCursor()
-        XCTAssertEqual(latestCursor, 5_000)
-        let retained = await buffer.replay(after: 4_872, desktopInstanceID: "desktop-1")
+        XCTAssertEqual(latestCursor, 5000)
+        let retained = await buffer.replay(after: 4872, desktopInstanceID: "desktop-1")
         guard case let .events(events) = retained else {
             return XCTFail("Expected the retained window to be replayable")
         }
         XCTAssertEqual(events.count, capacity)
-        XCTAssertEqual(events.first?.sequence, 4_873)
-        XCTAssertEqual(events.last?.sequence, 5_000)
-        let stale = await buffer.replay(after: 4_871, desktopInstanceID: "desktop-1")
+        XCTAssertEqual(events.first?.sequence, 4873)
+        XCTAssertEqual(events.last?.sequence, 5000)
+        let stale = await buffer.replay(after: 4871, desktopInstanceID: "desktop-1")
         XCTAssertEqual(stale, .snapshotRequired)
     }
 
@@ -174,7 +186,7 @@ final class RemoteContractTests: XCTestCase {
     }
 
     func testEventCoalescerScalesAcrossLargeFleetProjectionBatch() {
-        let events = (0 ..< 2_000).flatMap { index in
+        let events = (0 ..< 2000).flatMap { _ in
             let sessionID = UUID()
             return [
                 RemoteEvent(
@@ -194,7 +206,7 @@ final class RemoteContractTests: XCTestCase {
 
         let result = RemoteEventCoalescer.coalesce(events)
 
-        XCTAssertEqual(result.count, 2_000)
+        XCTAssertEqual(result.count, 2000)
         XCTAssertTrue(result.allSatisfy { $0.type == .sessionUpdated })
     }
 
@@ -403,7 +415,7 @@ final class RemoteContractTests: XCTestCase {
             timestamp: item.timestamp,
             itemID: item.id
         )
-        let revisionEpoch = UUID(uuidString: "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB")!
+        let revisionEpoch = try XCTUnwrap(UUID(uuidString: "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB"))
         let page = RemoteTranscriptPage(
             sessionID: sessionID,
             items: [item],
@@ -528,8 +540,8 @@ final class RemoteContractTests: XCTestCase {
     }
 
     func testTranscriptCursorRoundTripsAndUsesDeterministicTotalOrder() throws {
-        let earlyID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
-        let lateID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
+        let earlyID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000001"))
+        let lateID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000002"))
         let timestamp = Date(timeIntervalSince1970: 100)
         let cursors = [
             RemoteTranscriptCursor(sequenceIndex: 2, timestamp: timestamp, itemID: earlyID),
@@ -572,7 +584,7 @@ final class RemoteContractTests: XCTestCase {
             interactionID: UUID(),
             secret: secret
         )
-        XCTAssertTrue(String(decoding: try JSONEncoder().encode(request), as: UTF8.self).contains(secret))
+        XCTAssertTrue(try String(decoding: JSONEncoder().encode(request), as: UTF8.self).contains(secret))
 
         let session = RemoteSessionSummary(
             sessionID: sessionID,
@@ -626,11 +638,11 @@ final class RemoteContractTests: XCTestCase {
             sessionID: sessionID
         )
 
-        for value in [
-            try JSONEncoder().encode(snapshot),
-            try JSONEncoder().encode(defaultPage),
-            try JSONEncoder().encode(revisionEvent),
-            try JSONEncoder().encode(response)
+        for value in try [
+            JSONEncoder().encode(snapshot),
+            JSONEncoder().encode(defaultPage),
+            JSONEncoder().encode(revisionEvent),
+            JSONEncoder().encode(response)
         ] {
             let encoded = String(decoding: value, as: UTF8.self)
             XCTAssertFalse(encoded.contains(secret))
@@ -642,7 +654,7 @@ final class RemoteContractTests: XCTestCase {
 
         let optInDetail = RemoteTranscriptDetail(argumentsJSON: rawDetail)
         XCTAssertTrue(
-            String(decoding: try JSONEncoder().encode(optInDetail), as: UTF8.self).contains(rawDetail)
+            try String(decoding: JSONEncoder().encode(optInDetail), as: UTF8.self).contains(rawDetail)
         )
     }
 
@@ -661,7 +673,7 @@ final class RemoteContractTests: XCTestCase {
             desktopInstanceID: "desktop-1",
             deviceID: "device-1"
         )
-        let encoded = String(decoding: try JSONEncoder().encode(envelope), as: UTF8.self)
+        let encoded = try String(decoding: JSONEncoder().encode(envelope), as: UTF8.self)
         XCTAssertFalse(encoded.contains(payload.title))
         XCTAssertFalse(encoded.contains(payload.body))
         XCTAssertEqual(

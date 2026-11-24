@@ -392,6 +392,29 @@
     },
     {
       "union": "ClientRequest.json",
+      "method": "config/read",
+      "alwaysSent": [
+        "includeLayers"
+      ],
+      "maySend": [
+        "cwd"
+      ],
+      "responseSchema": "v2/ConfigReadResponse.json",
+      "consumedResponse": [
+        {
+          "path": "config",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "config.developer_instructions",
+          "presence": "optional",
+          "nullable": true
+        }
+      ]
+    },
+    {
+      "union": "ClientRequest.json",
       "method": "config/batchWrite",
       "alwaysSent": [
         "edits",

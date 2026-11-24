@@ -64,17 +64,14 @@ enum RemoteGatewayTranscriptResult {
     case unavailable
 }
 
-enum RemoteGatewayRegistrationResult {
-    case success
-    case failed
-}
-
 enum RemoteGatewayCommandResult {
     case success(RemoteCommandResponse)
     case rejected(String)
     case failed
     case unavailable
 }
+
+typealias RemoteDispatchAuthorization = @MainActor () throws -> Void
 
 @MainActor
 struct RemoteGatewayRoutingServices {
@@ -87,9 +84,9 @@ struct RemoteGatewayRoutingServices {
     var transcript: (RemoteGatewayTranscriptRequest) async -> RemoteGatewayTranscriptResult
     var imageAttachment: (RemoteImageAttachmentRequest) async throws -> RemoteImageAttachmentChunk?
     var replay: (UInt64?) async -> RemoteEventReplayResult
-    var registerNotifications: (RemoteNotificationRegistration) -> RemoteGatewayRegistrationResult
     var authorizationState: () -> RemoteAuthorizationState
-    var execute: (RemoteCommandRequest) async -> RemoteGatewayCommandResult
+    var commandGeneration: () -> UInt64
+    var execute: (RemoteCommandRequest, @escaping RemoteDispatchAuthorization) async -> RemoteGatewayCommandResult
     var eventCursor: () async -> UInt64
 
     init(
@@ -100,9 +97,9 @@ struct RemoteGatewayRoutingServices {
         history: @escaping (RemoteHistoryRPCRequest) async throws -> RemoteHistoryPage?,
         transcript: @escaping (RemoteGatewayTranscriptRequest) async -> RemoteGatewayTranscriptResult,
         replay: @escaping (UInt64?) async -> RemoteEventReplayResult,
-        registerNotifications: @escaping (RemoteNotificationRegistration) -> RemoteGatewayRegistrationResult,
         authorizationState: @escaping () -> RemoteAuthorizationState,
-        execute: @escaping (RemoteCommandRequest) async -> RemoteGatewayCommandResult,
+        commandGeneration: @escaping () -> UInt64,
+        execute: @escaping (RemoteCommandRequest, @escaping RemoteDispatchAuthorization) async -> RemoteGatewayCommandResult,
         eventCursor: @escaping () async -> UInt64,
         imageAttachment: @escaping (RemoteImageAttachmentRequest) async throws -> RemoteImageAttachmentChunk? = { _ in nil },
         pairIroh: @escaping (RemoteIrohPairingRequest, String) -> Result<RemoteIrohPairingResponse, Error> = { _, _ in
@@ -118,8 +115,8 @@ struct RemoteGatewayRoutingServices {
         self.transcript = transcript
         self.imageAttachment = imageAttachment
         self.replay = replay
-        self.registerNotifications = registerNotifications
         self.authorizationState = authorizationState
+        self.commandGeneration = commandGeneration
         self.execute = execute
         self.eventCursor = eventCursor
     }
@@ -283,7 +280,7 @@ final class RemoteGatewayRequestRouter {
             }
 
         case let .command(command, endpoint):
-            return await routeCommand(command, endpoint: endpoint)
+            return await routeCommand(command, endpoint: endpoint, context: context)
         }
     }
 
@@ -301,7 +298,8 @@ final class RemoteGatewayRequestRouter {
 
     private func routeCommand(
         _ command: RemoteCommandRequest,
-        endpoint: RemoteGatewayCommandEndpoint
+        endpoint: RemoteGatewayCommandEndpoint,
+        context: RemoteGatewayRequestContext
     ) async -> RemoteGatewayResponse {
         if endpoint == .contextBuilder, command.operation != .contextBuilder {
             return .error(
@@ -314,32 +312,11 @@ final class RemoteGatewayRequestRouter {
         }
 
         if command.operation == .registerNotifications {
-            guard let registration = command.notificationRegistration else {
-                return .error(
-                    .init(
-                        code: "invalid_notification_registration",
-                        message: "A notification registration is required."
-                    ),
-                    status: 400
-                )
-            }
-            switch services.registerNotifications(registration) {
-            case .success:
-                return await encode(RemoteCommandResponse(
-                    commandID: command.commandID,
-                    accepted: true,
-                    message: "Notification registration saved.",
-                    eventCursor: services.eventCursor()
-                ))
-            case .failed:
-                return .error(
-                    .init(
-                        code: "notification_registration_failed",
-                        message: "Notification registration could not be saved."
-                    ),
-                    status: 409
-                )
-            }
+            // Re-enable only when the Mac, not the client, owns the relay destination.
+            return .error(
+                .init(code: "notifications_unavailable", message: "This Mac does not support Remote push notifications."),
+                status: 503
+            )
         }
 
         let requiredAuthority = Self.requiredAuthority(for: command.operation)
@@ -353,7 +330,17 @@ final class RemoteGatewayRequestRouter {
             )
         }
 
-        switch await services.execute(command) {
+        let generation = services.commandGeneration()
+        switch await services.execute(command, {
+            guard generation == self.services.commandGeneration(),
+                  self.services.authorize(context),
+                  self.services.authorizationState().allows(requiredAuthority)
+            else {
+                throw RemoteAgentControlServiceError.commandRejected(
+                    "Remote access changed before this command could be dispatched."
+                )
+            }
+        }) {
         case let .success(response):
             return await encode(Self.attachingEventCursor(
                 to: response,
@@ -415,7 +402,9 @@ final class RemoteGatewayRequestRouter {
         switch operation {
         case .respond:
             .respond
-        case .startRun, .configureSession, .configureTools, .followUp, .steer, .cancel, .resume, .contextBuilder, .uploadAttachment:
+        case .configureTools:
+            .danger
+        case .startRun, .configureSession, .followUp, .steer, .cancel, .resume, .contextBuilder, .uploadAttachment:
             .control
         case .registerNotifications:
             .observe
