@@ -11,21 +11,59 @@ enum RemoteGatewaySecurityError: LocalizedError {
     case endpointBindingInvalid
     case unsupportedProtocol(Int)
     case deviceCredentialUnavailable
+    case confirmationRequired
+    case attemptUnavailable
+    case confirmationRejected
+    case pairingInProgress
+    case alreadyPaired
+    case gatewayUnavailable
+    case storageResetUnavailable
+
+    var response: RemoteErrorResponse {
+        let code = switch self {
+        case .pairingSecretExpired: "pairing_expired"
+        case .pairingSecretInvalid, .attemptUnavailable: "pairing_unavailable"
+        case .endpointBindingInvalid: "endpoint_mismatch"
+        case .unsupportedProtocol: "unsupported_protocol_version"
+        case .confirmationRequired: "pairing_upgrade_required"
+        case .confirmationRejected: "pairing_confirmation_rejected"
+        case .pairingInProgress: "pairing_in_progress"
+        case .alreadyPaired: "already_paired"
+        case .gatewayUnavailable: "gateway_unavailable"
+        case .storageResetUnavailable: "pairing_storage_unavailable"
+        default: "pairing_storage_unavailable"
+        }
+        return .init(code: code, message: localizedDescription, retryable: code == "pairing_storage_unavailable" || code == "gateway_unavailable")
+    }
 
     var errorDescription: String? {
         switch self {
         case let .keychainFailure(status):
             "Remote credential storage failed (Keychain status \(status))."
         case .pairingSecretInvalid:
-            "The pairing code is invalid."
+            "This pairing code is no longer available. Generate a new code on your Mac."
         case .pairingSecretExpired:
-            "The pairing code has expired."
+            "This pairing attempt expired. Generate a new code on your Mac."
         case .endpointBindingInvalid:
             "The authenticated Iroh endpoint binding is invalid."
         case let .unsupportedProtocol(version):
             "The pairing request uses unsupported protocol version \(version)."
         case .deviceCredentialUnavailable:
             "No paired device credential is available."
+        case .confirmationRequired:
+            "Update RepoPrompt Remote on your phone to use confirmed pairing."
+        case .attemptUnavailable:
+            "This pairing attempt is no longer available. Generate a new code on your Mac."
+        case .confirmationRejected:
+            "The Mac could not verify this pairing confirmation. Generate a new code on your Mac."
+        case .pairingInProgress:
+            "A phone is already confirming this code. Resume on that phone or generate a new code."
+        case .alreadyPaired:
+            "This Mac is already paired. To replace the phone, unpair it in Mac Settings."
+        case .gatewayUnavailable:
+            "Remote is unavailable on your Mac. Enable Remote in Mac Settings to resume."
+        case .storageResetUnavailable:
+            "Pairing storage can be reset when the existing record is unreadable."
         }
     }
 }
@@ -80,6 +118,7 @@ struct RemoteStoredDeviceCredential: Codable, Equatable {
     let expiresAt: Date
     let deviceName: String
     let irohPeerEndpointID: String
+    var pairingAttemptID: UUID? = nil
 }
 
 enum RemoteConstantTimeComparison {
@@ -110,7 +149,11 @@ enum RemoteCredentialAuthority {
               let authorizationHeader,
               authorizationHeader.hasPrefix("Bearer ")
         else { return false }
-        return String(authorizationHeader.dropFirst("Bearer ".count)) == credential.credential
+        let bearer = authorizationHeader.dropFirst("Bearer ".count)
+        guard bearer.utf8.count <= 256 else { return false }
+        let received = Data(SHA256.hash(data: Data(bearer.utf8)))
+        let expected = Data(SHA256.hash(data: Data(credential.credential.utf8)))
+        return RemoteConstantTimeComparison.equals(received, expected)
     }
 
     static func acceptsIroh(
@@ -133,27 +176,81 @@ private struct RemoteStoredNotificationRegistration: Codable, Equatable {
     let updatedAt: Date
 }
 
-private struct RemotePendingPairingSecret {
+struct RemotePendingPairingSecret: Codable, Equatable {
     let value: String
-    let digest: Data
-    let issuedAt: Date
     let expiresAt: Date
+}
+
+struct RemotePendingPairing: Codable, Equatable {
+    let attemptID: UUID
+    let secretDigest: Data
+    let serverEndpointID: String
+    let expiresAt: Date
+    let credential: RemoteStoredDeviceCredential
+}
+
+/// One Keychain item is the transaction boundary for prepare, promotion and revocation.
+struct RemoteStoredPairingState: Codable, Equatable {
+    let version: Int
+    var active: RemoteStoredDeviceCredential?
+    var pending: RemotePendingPairing?
+    var advertisement: RemotePendingPairingSecret?
+
+    init(
+        active: RemoteStoredDeviceCredential? = nil,
+        pending: RemotePendingPairing? = nil,
+        advertisement: RemotePendingPairingSecret? = nil
+    ) {
+        version = 1
+        self.active = active
+        self.pending = pending
+        self.advertisement = advertisement
+    }
+
+    static func decode(_ data: Data) throws -> Self {
+        let decoder = JSONDecoder()
+        if let state = try? decoder.decode(Self.self, from: data), state.version == 1 {
+            return state
+        }
+        return try Self(active: decoder.decode(RemoteStoredDeviceCredential.self, from: data))
+    }
+}
+
+enum RemoteDesktopPairingStatus: Equatable {
+    case idle
+    case codeReady(expiresAt: Date)
+    case codeExpired
+    case pending(deviceName: String, expiresAt: Date)
+    case attemptExpired
+    case paired(expiresAt: Date)
+    case credentialExpired
+    case storageUnavailable
+    case storageUnreadable
 }
 
 @MainActor
 final class RemotePairingManager {
-    static let pairingLifetime: TimeInterval = 5 * 60
+    static let pairingLifetime = RemoteWireProtocol.pairingAttemptLifetime
     static let credentialLifetime: TimeInterval = 60 * 60 * 24 * 30
     static let maximumDeviceNameCharacters = 128
 
     let desktopInstanceID: String
-    private var pendingSecret: RemotePendingPairingSecret?
-    private var storedDevice: RemoteStoredDeviceCredential?
+    private var pendingSecret: RemotePendingPairingSecret? {
+        storedState.advertisement
+    }
+
+    private var storedState: RemoteStoredPairingState
+    private(set) var storageError: Error?
+    private let reloadStoredState: (() throws -> RemoteStoredPairingState)?
+    private var storedDevice: RemoteStoredDeviceCredential? {
+        storedState.active
+    }
+
     private var notificationRegistration: RemoteNotificationRegistration?
 
     private let now: () -> Date
     private let randomBytes: (Int) throws -> Data
-    private let persistStoredDevice: (RemoteStoredDeviceCredential?) throws -> Void
+    private let persistState: (RemoteStoredPairingState) throws -> Void
     private let encoder = JSONEncoder()
 
     convenience init() {
@@ -166,25 +263,31 @@ final class RemotePairingManager {
             desktopInstanceID = UUID().uuidString
             UserDefaults.standard.set(desktopInstanceID, forKey: key)
         }
-        let storedDevice = try? RemoteGatewayKeychain.shared.read(.remotePairedDevice)
-            .flatMap { try decoder.decode(RemoteStoredDeviceCredential.self, from: $0) }
         let notificationRegistration = try? RemoteGatewayKeychain.shared.read(.remoteNotificationRegistration)
             .flatMap { try decoder.decode(RemoteStoredNotificationRegistration.self, from: $0).registration }
-
         self.init(
             desktopInstanceID: desktopInstanceID,
-            storedDevice: storedDevice,
             notificationRegistration: notificationRegistration,
             now: Date.init,
             randomBytes: remoteRandomBytes,
-            persistStoredDevice: { credential in
-                if let credential {
-                    try RemoteGatewayKeychain.shared.write(
-                        JSONEncoder().encode(credential),
-                        for: .remotePairedDevice
-                    )
+            reloadStoredState: {
+                try RemoteGatewayKeychain.shared.read(.remotePairedDevice)
+                    .map(RemoteStoredPairingState.decode) ?? RemoteStoredPairingState()
+            },
+            persistState: { state in
+                if state.pending == nil, state.advertisement == nil {
+                    if let active = state.active {
+                        // Existing desktop builds can still read confirmed credentials after a rollback.
+                        try RemoteGatewayKeychain.shared.write(
+                            JSONEncoder().encode(active), for: .remotePairedDevice
+                        )
+                    } else {
+                        try RemoteGatewayKeychain.shared.remove(.remotePairedDevice)
+                    }
                 } else {
-                    try RemoteGatewayKeychain.shared.remove(.remotePairedDevice)
+                    try RemoteGatewayKeychain.shared.write(
+                        JSONEncoder().encode(state), for: .remotePairedDevice
+                    )
                 }
             }
         )
@@ -192,30 +295,68 @@ final class RemotePairingManager {
 
     init(
         desktopInstanceID: String,
-        storedDevice: RemoteStoredDeviceCredential? = nil,
+        storedState: RemoteStoredPairingState = .init(),
         notificationRegistration: RemoteNotificationRegistration? = nil,
         now: @escaping () -> Date,
         randomBytes: @escaping (Int) throws -> Data,
-        persistStoredDevice: @escaping (RemoteStoredDeviceCredential?) throws -> Void
+        reloadStoredState: (() throws -> RemoteStoredPairingState)? = nil,
+        persistState: @escaping (RemoteStoredPairingState) throws -> Void
     ) {
         self.desktopInstanceID = desktopInstanceID
-        self.storedDevice = storedDevice
+        self.storedState = storedState
         self.notificationRegistration = notificationRegistration
         self.now = now
         self.randomBytes = randomBytes
-        self.persistStoredDevice = persistStoredDevice
+        self.reloadStoredState = reloadStoredState
+        self.persistState = persistState
+        retryStorageRead()
+    }
+
+    func retryStorageRead() {
+        guard let reloadStoredState else { return }
+        do {
+            storedState = try reloadStoredState()
+            storageError = nil
+        } catch {
+            storageError = error
+        }
+    }
+
+    var hasStoredPairing: Bool {
+        storedDevice != nil || storedState.pending != nil || pendingSecret != nil
     }
 
     var isPaired: Bool {
-        storedDevice != nil
+        guard storageError == nil, let storedDevice else { return false }
+        return now() < storedDevice.expiresAt
+    }
+
+    var status: RemoteDesktopPairingStatus {
+        if let storageError {
+            let unreadable = storageError is DecodingError
+                || (storageError as? KeychainService.KeychainError) == .invalidData
+            return unreadable ? .storageUnreadable : .storageUnavailable
+        }
+        if isPaired, let storedDevice {
+            return .paired(expiresAt: storedDevice.expiresAt)
+        }
+        if let pending = storedState.pending {
+            return now() < pending.expiresAt
+                ? .pending(deviceName: pending.credential.deviceName, expiresAt: pending.expiresAt)
+                : .attemptExpired
+        }
+        if let pendingSecret {
+            return now() < pendingSecret.expiresAt ? .codeReady(expiresAt: pendingSecret.expiresAt) : .codeExpired
+        }
+        return storedDevice == nil ? .idle : .credentialExpired
     }
 
     var pairedDeviceID: String? {
-        storedDevice?.deviceID
+        isPaired ? storedDevice?.deviceID : nil
     }
 
     var pairedCredential: String? {
-        storedDevice?.credential
+        isPaired ? storedDevice?.credential : nil
     }
 
     var pairedDeviceName: String? {
@@ -231,17 +372,30 @@ final class RemotePairingManager {
     }
 
     func issueAdvertisement(server: RemoteIrohEndpointAddress) throws -> RemoteIrohPairingAdvertisement {
+        if let storageError {
+            throw storageError
+        }
+        guard !isPaired else { throw RemoteGatewaySecurityError.alreadyPaired }
         let pending = try createPendingSecret()
-        return RemoteIrohPairingAdvertisement(
-            desktopInstanceID: desktopInstanceID,
-            server: server,
-            oneTimeSecret: pending.value,
-            expiresAt: pending.expiresAt
-        )
+        try save(.init(active: storedDevice, advertisement: pending))
+        return makeAdvertisement(server: server, secret: pending)
     }
 
-    func invalidateAdvertisement() {
-        pendingSecret = nil
+    func restoreAdvertisement(server: RemoteIrohEndpointAddress) -> RemoteIrohPairingAdvertisement? {
+        guard let pendingSecret, case .codeReady = status else { return nil }
+        return makeAdvertisement(server: server, secret: pendingSecret)
+    }
+
+    private func makeAdvertisement(
+        server: RemoteIrohEndpointAddress, secret: RemotePendingPairingSecret
+    ) -> RemoteIrohPairingAdvertisement {
+        RemoteIrohPairingAdvertisement(
+            desktopInstanceID: desktopInstanceID,
+            server: server,
+            oneTimeSecret: secret.value,
+            expiresAt: secret.expiresAt,
+            requiresPairingConfirmation: true
+        )
     }
 
     func pairIroh(
@@ -261,16 +415,83 @@ final class RemotePairingManager {
         else {
             throw RemoteGatewaySecurityError.endpointBindingInvalid
         }
-        try consumePendingSecret(request.oneTimeSecret)
-        let credential = try createAndPersistCredential(
+        if let storageError {
+            throw storageError
+        }
+        guard let attemptID = request.attemptID else {
+            throw RemoteGatewaySecurityError.confirmationRequired
+        }
+        guard !isPaired else { throw RemoteGatewaySecurityError.alreadyPaired }
+        guard request.oneTimeSecret.utf8.count <= 256 else {
+            throw RemoteGatewaySecurityError.pairingSecretInvalid
+        }
+        let digest = Data(SHA256.hash(data: Data(request.oneTimeSecret.utf8)))
+        if let pending = storedState.pending {
+            guard pending.attemptID == attemptID,
+                  pending.serverEndpointID == serverEndpointID,
+                  pending.credential.irohPeerEndpointID == authenticatedPeerEndpointID,
+                  RemoteConstantTimeComparison.equals(digest, pending.secretDigest)
+            else { throw RemoteGatewaySecurityError.pairingInProgress }
+            guard now() < pending.expiresAt else { throw RemoteGatewaySecurityError.pairingSecretExpired }
+            return provisionalResponse(for: pending, desktop: desktop)
+        }
+
+        try validatePendingSecret(digest)
+        let credential = try createCredential(
             deviceName: request.deviceName,
-            irohPeerEndpointID: authenticatedPeerEndpointID
+            irohPeerEndpointID: authenticatedPeerEndpointID,
+            attemptID: attemptID
         )
-        return RemoteIrohPairingResponse(
-            pairingResponse: pairingResponse(for: credential, desktop: desktop),
+        let pending = RemotePendingPairing(
+            attemptID: attemptID,
+            secretDigest: digest,
             serverEndpointID: serverEndpointID,
-            clientEndpointID: authenticatedPeerEndpointID
+            expiresAt: now().addingTimeInterval(Self.pairingLifetime),
+            credential: credential
         )
+        try save(.init(active: storedDevice, pending: pending))
+        return provisionalResponse(for: pending, desktop: desktop)
+    }
+
+    /// Returns true only for the promotion. An authenticated retry returns the same acknowledgment.
+    func confirmIroh(
+        _ confirmation: RemotePairingConfirmation,
+        authenticatedPeerEndpointID: String,
+        serverEndpointID: String
+    ) throws -> Bool {
+        let hello = confirmation.authentication
+        try validateProtocolAndDesktop(
+            protocolVersion: hello.protocolVersion,
+            requestedDesktopInstanceID: hello.desktopInstanceID
+        )
+        guard hello.expectedServerEndpointID == serverEndpointID else {
+            throw RemoteGatewaySecurityError.endpointBindingInvalid
+        }
+        if let storageError {
+            throw storageError
+        }
+        func matches(_ credential: RemoteStoredDeviceCredential) -> Bool {
+            credential.pairingAttemptID == confirmation.attemptID && RemoteCredentialAuthority.acceptsIroh(
+                authorizationHeader: "Bearer \(hello.credential)",
+                deviceID: hello.deviceID,
+                authenticatedPeerEndpointID: authenticatedPeerEndpointID,
+                credential: credential,
+                at: now()
+            )
+        }
+        if let storedDevice, isPaired {
+            guard matches(storedDevice) else { throw RemoteGatewaySecurityError.confirmationRejected }
+            return false
+        }
+        guard let pending = storedState.pending else { throw RemoteGatewaySecurityError.attemptUnavailable }
+        guard pending.serverEndpointID == serverEndpointID, matches(pending.credential) else {
+            throw RemoteGatewaySecurityError.confirmationRejected
+        }
+        guard now() < pending.expiresAt else { throw RemoteGatewaySecurityError.pairingSecretExpired }
+        try save(.init(active: pending.credential))
+        notificationRegistration = nil
+        try? RemoteGatewayKeychain.shared.remove(.remoteNotificationRegistration)
+        return true
     }
 
     func isAuthorizedIroh(
@@ -278,7 +499,7 @@ final class RemotePairingManager {
         deviceID: String,
         authenticatedPeerEndpointID: String
     ) -> Bool {
-        RemoteCredentialAuthority.acceptsIroh(
+        storageError == nil && RemoteCredentialAuthority.acceptsIroh(
             authorizationHeader: authorizationHeader,
             deviceID: deviceID,
             authenticatedPeerEndpointID: authenticatedPeerEndpointID,
@@ -290,9 +511,22 @@ final class RemotePairingManager {
     func revokeDevice() throws {
         // Durable credential deletion must succeed before the in-memory paired
         // state changes, otherwise a restart could resurrect a revoked phone.
-        try persistStoredDevice(nil)
-        pendingSecret = nil
-        storedDevice = nil
+        if let storageError {
+            throw storageError
+        }
+        try clearPairingStorage()
+    }
+
+    func resetUnreadableStorage() throws {
+        guard status == .storageUnreadable else {
+            throw RemoteGatewaySecurityError.storageResetUnavailable
+        }
+        try clearPairingStorage()
+    }
+
+    private func clearPairingStorage() throws {
+        try save(.init())
+        storageError = nil
         notificationRegistration = nil
         // The bearer deletion above is the authoritative revocation. Ancillary
         // notification cleanup must not turn a successful unpair into a failure.
@@ -317,14 +551,10 @@ final class RemotePairingManager {
     private func createPendingSecret() throws -> RemotePendingPairingSecret {
         let issuedAt = now()
         let value = try remoteBase64URL(randomBytes(32))
-        let pending = RemotePendingPairingSecret(
+        return RemotePendingPairingSecret(
             value: value,
-            digest: Data(SHA256.hash(data: Data(value.utf8))),
-            issuedAt: issuedAt,
             expiresAt: issuedAt.addingTimeInterval(Self.pairingLifetime)
         )
-        pendingSecret = pending
-        return pending
     }
 
     private func validateProtocolAndDesktop(
@@ -339,39 +569,51 @@ final class RemotePairingManager {
         }
     }
 
-    private func consumePendingSecret(_ candidate: String) throws {
+    private func validatePendingSecret(_ candidateDigest: Data) throws {
         guard let pendingSecret else {
             throw RemoteGatewaySecurityError.pairingSecretInvalid
         }
         guard now() < pendingSecret.expiresAt else {
-            self.pendingSecret = nil
             throw RemoteGatewaySecurityError.pairingSecretExpired
         }
-        let candidateDigest = Data(SHA256.hash(data: Data(candidate.utf8)))
-        guard RemoteConstantTimeComparison.equals(candidateDigest, pendingSecret.digest) else {
+        let expectedDigest = Data(SHA256.hash(data: Data(pendingSecret.value.utf8)))
+        guard RemoteConstantTimeComparison.equals(candidateDigest, expectedDigest) else {
             throw RemoteGatewaySecurityError.pairingSecretInvalid
         }
-        self.pendingSecret = nil
     }
 
-    private func createAndPersistCredential(
+    private func save(_ state: RemoteStoredPairingState) throws {
+        try persistState(state)
+        storedState = state
+    }
+
+    private func createCredential(
         deviceName: String,
-        irohPeerEndpointID: String
+        irohPeerEndpointID: String,
+        attemptID: UUID
     ) throws -> RemoteStoredDeviceCredential {
         let trimmedName = deviceName.trimmingCharacters(in: .whitespacesAndNewlines)
         let boundedName = String(trimmedName.prefix(Self.maximumDeviceNameCharacters))
-        let credential = try RemoteStoredDeviceCredential(
+        return try RemoteStoredDeviceCredential(
             deviceID: UUID().uuidString,
             credential: remoteBase64URL(randomBytes(48)),
             expiresAt: now().addingTimeInterval(Self.credentialLifetime),
             deviceName: boundedName.isEmpty ? "Remote device" : boundedName,
-            irohPeerEndpointID: irohPeerEndpointID
+            irohPeerEndpointID: irohPeerEndpointID,
+            pairingAttemptID: attemptID
         )
-        try persistStoredDevice(credential)
-        storedDevice = credential
-        notificationRegistration = nil
-        try? RemoteGatewayKeychain.shared.remove(.remoteNotificationRegistration)
-        return credential
+    }
+
+    private func provisionalResponse(
+        for pending: RemotePendingPairing,
+        desktop: RemoteDesktopSummary
+    ) -> RemoteIrohPairingResponse {
+        RemoteIrohPairingResponse(
+            pairingResponse: pairingResponse(for: pending.credential, desktop: desktop),
+            serverEndpointID: pending.serverEndpointID,
+            clientEndpointID: pending.credential.irohPeerEndpointID,
+            attemptID: pending.attemptID
+        )
     }
 
     private static func isCanonicalEndpointID(_ value: String) -> Bool {
