@@ -111,6 +111,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
             lastError = nil
         } catch {
             lastError = error.localizedDescription
+            SentryTelemetryBootstrap.recordRemotePairingFailure(.issueAdvertisement)
         }
     }
 
@@ -142,7 +143,11 @@ final class RemoteGatewayController: NSObject, ObservableObject {
         isStarting = true
         irohGeneration &+= 1
         let generation = irohGeneration
-        defer { if irohGeneration == generation { isStarting = false } }
+        defer {
+            if irohGeneration == generation {
+                isStarting = false
+            }
+        }
         do {
             let identity = try irohIdentityStore.loadOrCreate()
             if identity.origin != .loaded, pairingManager.hasStoredPairing {
@@ -164,6 +169,9 @@ final class RemoteGatewayController: NSObject, ObservableObject {
             startEventPolling()
         } catch {
             guard irohGeneration == generation else { return }
+            if !(error is CancellationError) {
+                SentryTelemetryBootstrap.recordRemotePairingFailure(.startGateway)
+            }
             stop()
             lastError = error.localizedDescription
             throw error

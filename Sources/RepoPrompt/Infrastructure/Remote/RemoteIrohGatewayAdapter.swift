@@ -167,7 +167,9 @@ final class RemoteIrohGatewayAdapter {
             startAcceptLoop(endpoint)
             return address
         } catch {
-            if let candidate { try? await candidate.shutdown() }
+            if let candidate {
+                try? await candidate.shutdown()
+            }
             if activeGeneration == generation {
                 activeGeneration = nil
                 update {
@@ -244,12 +246,21 @@ final class RemoteIrohGatewayAdapter {
         }
         let peerEndpointID = request.peerEndpointId()
         requestReceived()
+        let path = Self.pathKind(from: request.pathSummary())
         update {
-            $0.path = Self.pathKind(from: request.pathSummary())
+            $0.path = path
             $0.lastError = nil
         }
 
         var messageID: UUID?
+        var pairing: SentryTelemetryBootstrap.PairingContext?
+        var pairingTrace: SentryTelemetryBootstrap.TraceSpan?
+        var pairingResponseSent = false
+        defer {
+            if let pairingTrace {
+                SentryTelemetryBootstrap.finishRemotePairing(pairingTrace, attemptID: pairing?.attemptID, delivered: pairingResponseSent)
+            }
+        }
         do {
             let data = request.payload()
             guard data.count <= RemoteWireProtocol.maximumClientFrameBytes else {
@@ -257,6 +268,11 @@ final class RemoteIrohGatewayAdapter {
             }
             let frame = try decoder.decode(RemoteWireFrame.self, from: data)
             messageID = frame.messageID
+            if let step = SentryTelemetryBootstrap.PairingContext.Step(frame.kind) {
+                let context = SentryTelemetryBootstrap.PairingContext(step: step, path: path)
+                pairing = context
+                pairingTrace = SentryTelemetryBootstrap.beginRemotePairing(context)
+            }
             let isUnpairRequest = isUnpairRPC(frame)
             let originalContext: RemoteGatewayRequestContext? = if !isUnpairRequest,
                                                                    frame.kind == .rpcRequest || frame.kind == .eventSubscribe
@@ -267,8 +283,10 @@ final class RemoteIrohGatewayAdapter {
             }
             let response = try await response(
                 to: frame,
-                peerEndpointID: peerEndpointID
+                peerEndpointID: peerEndpointID,
+                pairing: &pairing
             )
+            pairing?.failure = .encodeResponse
             let encoded = try encoder.encode(response)
             let direction: RemoteWireDirection = response.kind == .event ? .serverEvent : .serverResponse
             guard encoded.count <= direction.maximumEncodedFrameBytes else {
@@ -287,7 +305,12 @@ final class RemoteIrohGatewayAdapter {
             if isUnpairRequest {
                 Self.unpairLogger.info("Sending framed Iroh Unpair response after durable revocation")
             }
+            pairing?.failure = .sendResponse
             try await request.respond(payload: encoded)
+            if let pairing {
+                pairingResponseSent = true
+                SentryTelemetryBootstrap.recordRemotePairingResponse(pairing)
+            }
             if isUnpairRequest {
                 Self.unpairLogger.info("Framed Iroh Unpair response delivery completed")
             }
@@ -304,6 +327,14 @@ final class RemoteIrohGatewayAdapter {
             guard request.generation() == activeGeneration else {
                 request.close()
                 return
+            }
+            if let pairing, !(error is CancellationError) {
+                let failure: SentryTelemetryBootstrap.PairingFailure = if case let RemoteIrohGatewayAdapterError.remote(response) = error {
+                    .init(code: response.code)
+                } else {
+                    pairing.failure
+                }
+                SentryTelemetryBootstrap.recordRemotePairingFailure(failure, context: pairing)
             }
             let frame = makeStreamError(error, messageID: messageID)
             if let encoded = try? encoder.encode(frame) {
@@ -327,18 +358,24 @@ final class RemoteIrohGatewayAdapter {
 
     private func response(
         to frame: RemoteWireFrame,
-        peerEndpointID: String
+        peerEndpointID: String,
+        pairing: inout SentryTelemetryBootstrap.PairingContext?
     ) async throws -> RemoteWireFrame {
         guard frame.wireVersion == RemoteWireProtocol.currentVersion else {
+            pairing?.failure = .unsupportedWireVersion
             throw RemoteIrohGatewayAdapterError.unsupportedWireVersion
         }
 
         switch frame.kind {
         case .pairingHello:
+            pairing?.attemptID = frame.messageID
             throw RemoteIrohGatewayAdapterError.remote(RemoteGatewaySecurityError.confirmationRequired.response)
 
         case .pairingPrepare:
+            pairing?.failure = .decodeRequest
             let hello = try frame.decodedPayload(as: RemotePairingHello.self, expectedKind: .pairingPrepare)
+            pairing?.attemptID = hello.request.attemptID
+            pairing?.failure = .rejected
             let routed = await router.route(
                 .pairIroh(hello.request, authenticatedPeerEndpointID: peerEndpointID),
                 context: .init(endpointID: peerEndpointID, deviceID: "", authorizationHeader: nil)
@@ -347,15 +384,18 @@ final class RemoteIrohGatewayAdapter {
             return RemoteWireFrame(kind: .helloAccepted, messageID: frame.messageID, payload: payload)
 
         case .pairingConfirm:
+            pairing?.failure = .decodeRequest
             let confirmation = try frame.decodedPayload(
                 as: RemotePairingConfirmation.self,
                 expectedKind: .pairingConfirm
             )
+            pairing?.attemptID = confirmation.attemptID
             do {
                 try router.confirmIroh(confirmation, peerEndpointID: peerEndpointID)
             } catch {
                 throw RemoteIrohGatewayAdapterError.remote(RemoteGatewayRequestRouter.pairingError(error))
             }
+            pairing?.failure = .encodeResponse
             return try RemoteWireFrame(
                 kind: .pairingConfirmed, messageID: frame.messageID, encoding: confirmation.attemptID
             )
@@ -676,11 +716,15 @@ final class RemoteIrohGatewayAdapter {
 
     private static func pathKind(from summary: String) -> RemoteIrohPathKind {
         let lower = summary.lowercased()
-        if lower.contains("relay") { return .relay }
+        if lower.contains("relay") {
+            return .relay
+        }
         if lower.contains("192.168.") || lower.contains("10.") || lower.contains("172.16.") {
             return .localDirect
         }
-        if lower.contains("direct") || lower.contains("udp") { return .internetDirect }
+        if lower.contains("direct") || lower.contains("udp") {
+            return .internetDirect
+        }
         return .unknown
     }
 }
