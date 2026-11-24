@@ -654,7 +654,7 @@ final class RemoteIrohGatewayAdapter {
     private func publishSessionCount() {
         let now = Date()
         let active = sessions.values.filter { $0.sync.readiness(at: now) != .offline }
-        let lastSyncedActivity = active.filter { $0.sync.hasConfirmedSync }.compactMap(\.sync.lastActivityAt).max()
+        let lastSyncedActivity = active.filter(\.sync.hasConfirmedSync).compactMap(\.sync.lastActivityAt).max()
         let readiness = if lastSyncedActivity != nil {
             RemoteIrohPhoneReadiness.connected
         } else if active.contains(where: { $0.sync.sessionID != nil }) {

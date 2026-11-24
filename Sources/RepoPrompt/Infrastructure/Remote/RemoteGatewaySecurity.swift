@@ -238,12 +238,14 @@ final class RemotePairingManager {
     private var pendingSecret: RemotePendingPairingSecret? {
         storedState.advertisement
     }
+
     private var storedState: RemoteStoredPairingState
     private(set) var storageError: Error?
     private let reloadStoredState: (() throws -> RemoteStoredPairingState)?
     private var storedDevice: RemoteStoredDeviceCredential? {
         storedState.active
     }
+
     private var notificationRegistration: RemoteNotificationRegistration?
 
     private let now: () -> Date
