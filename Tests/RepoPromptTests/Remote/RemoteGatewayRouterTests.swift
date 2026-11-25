@@ -491,7 +491,7 @@ final class RemoteIrohSecurityTests: XCTestCase {
     func testIssuedCodeCanBeUsedAfterMacRestartsBeforePrepare() throws {
         let clock = TestClock(Date(timeIntervalSince1970: 1800))
         var disk = RemoteStoredPairingState()
-        let firstMac = makeManager(clock: clock) { disk = $0 }
+        let firstMac = makeManager(clock: clock, persist: { disk = $0 })
         let server = RemoteIrohEndpointAddress(endpointID: endpointID("a"))
         let issued = try firstMac.issueAdvertisement(server: server)
         let reopened = makeManager(clock: clock, storedState: disk)
@@ -503,7 +503,7 @@ final class RemoteIrohSecurityTests: XCTestCase {
     func testLostCredentialReplyCanResumeAfterMacRestart() throws {
         let clock = TestClock(Date(timeIntervalSince1970: 2000))
         var disk = RemoteStoredPairingState()
-        let firstMac = makeManager(clock: clock) { disk = $0 }
+        let firstMac = makeManager(clock: clock, persist: { disk = $0 })
         let issued = try firstMac.issueAdvertisement(server: .init(endpointID: endpointID("a")))
         XCTAssertEqual(issued.requiresPairingConfirmation, true)
         let request = pairingRequest(secret: issued.oneTimeSecret)
@@ -514,7 +514,7 @@ final class RemoteIrohSecurityTests: XCTestCase {
         XCTAssertEqual(disk.pending?.attemptID, request.attemptID)
 
         let restoredState = try RemoteStoredPairingState.decode(JSONEncoder().encode(disk))
-        let reopenedMac = makeManager(clock: clock, storedState: restoredState) { disk = $0 }
+        let reopenedMac = makeManager(clock: clock, storedState: restoredState, persist: { disk = $0 })
         XCTAssertThrowsError(try prepare(pairingRequest(secret: issued.oneTimeSecret), on: reopenedMac))
         let competingPeer = RemoteIrohPairingRequest(
             desktopInstanceID: "desktop",
@@ -533,7 +533,7 @@ final class RemoteIrohSecurityTests: XCTestCase {
     func testLostFinalAcknowledgementReturnsTheSameResultAfterMacRestart() throws {
         let clock = TestClock(Date(timeIntervalSince1970: 3000))
         var disk = RemoteStoredPairingState()
-        let manager = makeManager(clock: clock) { disk = $0 }
+        let manager = makeManager(clock: clock, persist: { disk = $0 })
         let advertised = try manager.issueAdvertisement(server: .init(endpointID: endpointID("a")))
         let response = try prepare(pairingRequest(secret: advertised.oneTimeSecret), on: manager)
         let confirmation = try confirmation(for: response)
@@ -547,9 +547,9 @@ final class RemoteIrohSecurityTests: XCTestCase {
         XCTAssertNil(committed.pending)
 
         clock.date = clock.date.addingTimeInterval(2)
-        let reopenedMac = makeManager(clock: clock, storedState: committed) { _ in
+        let reopenedMac = makeManager(clock: clock, storedState: committed, persist: { _ in
             XCTFail("Confirm retry must not write or renew a credential")
-        }
+        })
         XCTAssertThrowsError(try confirm(confirmation, on: reopenedMac, peer: endpointID("c")))
         XCTAssertFalse(try confirm(confirmation, on: reopenedMac))
         XCTAssertTrue(isAuthorized(response, on: reopenedMac))
@@ -579,12 +579,12 @@ final class RemoteIrohSecurityTests: XCTestCase {
         let clock = TestClock(Date(timeIntervalSince1970: 4000))
         var shouldFail = false
         var disk = RemoteStoredPairingState()
-        let manager = makeManager(clock: clock) {
+        let manager = makeManager(clock: clock, persist: {
             if shouldFail {
                 throw PersistenceFailure.failed
             }
             disk = $0
-        }
+        })
         let issued = try manager.issueAdvertisement(server: .init(endpointID: endpointID("a")))
         let request = pairingRequest(secret: issued.oneTimeSecret)
         let initial = disk
@@ -640,7 +640,7 @@ final class RemoteIrohSecurityTests: XCTestCase {
     func testPersistedPairingFieldsAreBoundedAndEndpointIDsAreCanonical() throws {
         let clock = TestClock(Date(timeIntervalSince1970: 6500))
         var disk = RemoteStoredPairingState()
-        let manager = makeManager(clock: clock) { disk = $0 }
+        let manager = makeManager(clock: clock, persist: { disk = $0 })
         let advertisement = try manager.issueAdvertisement(server: .init(endpointID: endpointID("a")))
         let request = pairingRequest(secret: advertisement.oneTimeSecret, deviceName: String(repeating: "📱", count: 512))
         XCTAssertThrowsError(try prepare(request, on: manager, peer: "invalid-endpoint"))
@@ -733,7 +733,7 @@ final class RemoteIrohSecurityTests: XCTestCase {
             nextByte += 1
             return Data(repeating: nextByte, count: count)
         }
-        let manager = makeManager(clock: clock, randomBytes: randomBytes) { disk = $0 }
+        let manager = makeManager(clock: clock, randomBytes: randomBytes, persist: { disk = $0 })
         let oldCode = try manager.issueAdvertisement(server: server)
         let oldRequest = pairingRequest(secret: oldCode.oneTimeSecret)
         let oldResponse = try prepare(oldRequest, on: manager)
@@ -746,7 +746,7 @@ final class RemoteIrohSecurityTests: XCTestCase {
         XCTAssertFalse(isAuthorized(oldResponse, on: manager))
 
         let restoredState = try RemoteStoredPairingState.decode(JSONEncoder().encode(disk))
-        let reopened = makeManager(clock: clock, storedState: restoredState, randomBytes: randomBytes) { disk = $0 }
+        let reopened = makeManager(clock: clock, storedState: restoredState, randomBytes: randomBytes, persist: { disk = $0 })
         XCTAssertEqual(reopened.status, .idle)
         let newCode = try reopened.issueAdvertisement(server: server)
         XCTAssertNotEqual(newCode.oneTimeSecret, oldCode.oneTimeSecret)
@@ -770,9 +770,9 @@ final class RemoteIrohSecurityTests: XCTestCase {
             deviceName: "Phone",
             irohPeerEndpointID: endpointID("a")
         )
-        let manager = makeManager(clock: clock, storedState: .init(active: stored)) { _ in
+        let manager = makeManager(clock: clock, storedState: .init(active: stored), persist: { _ in
             throw PersistenceFailure.failed
-        }
+        })
 
         XCTAssertThrowsError(try manager.revokeDevice()) { error in
             XCTAssertTrue(error is PersistenceFailure)
