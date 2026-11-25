@@ -882,7 +882,7 @@ final class RemoteIrohSecurityTests: XCTestCase {
             nextByte += 1
             return Data(repeating: nextByte, count: count)
         }
-        let manager = makeManager(clock: clock, randomBytes: randomBytes) { disk = $0 }
+        let manager = makeManager(clock: clock, randomBytes: randomBytes, persist: { disk = $0 })
         let oldCode = try manager.issueAdvertisement(server: server)
         let oldRequest = pairingRequest(secret: oldCode.oneTimeSecret)
         let oldResponse = try prepare(oldRequest, on: manager)
@@ -895,7 +895,7 @@ final class RemoteIrohSecurityTests: XCTestCase {
         XCTAssertFalse(isAuthorized(oldResponse, on: manager))
 
         let restoredState = try RemoteStoredPairingState.decode(JSONEncoder().encode(disk))
-        let reopened = makeManager(clock: clock, storedState: restoredState, randomBytes: randomBytes) { disk = $0 }
+        let reopened = makeManager(clock: clock, storedState: restoredState, randomBytes: randomBytes, persist: { disk = $0 })
         XCTAssertEqual(reopened.status, .idle)
         let newCode = try reopened.issueAdvertisement(server: server)
         XCTAssertNotEqual(newCode.oneTimeSecret, oldCode.oneTimeSecret)
