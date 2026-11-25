@@ -134,6 +134,19 @@ enum RemoteWorkspaceActivationError: Error, Equatable {
 @MainActor
 protocol SessionQueryService: AnyObject {
     func remoteSessions() async -> [RemoteSessionRecord]
+    func bootstrapRemoteSessions() async -> [RemoteSessionRecord]
+}
+
+extension SessionQueryService {
+    func bootstrapRemoteSessions() async -> [RemoteSessionRecord] {
+        let sessions = await remoteSessions()
+        let parents = sessions.reduce(into: [UUID: UUID]()) { result, session in
+            result[session.sessionID] = session.parentSessionID
+        }
+        let roots = Set(sessions.filter(\.isLive).map(\.sessionID))
+        let related = RemoteBootstrapSessionGraph.relatedIDs(liveIDs: roots, parentByChild: parents)
+        return sessions.filter { related.contains($0.sessionID) }
+    }
 }
 
 @MainActor
@@ -170,7 +183,8 @@ final class RemoteSnapshotBuilder {
         connection: RemoteConnectionSummary,
         authorization: RemoteAuthorizationState,
         eventCursor: UInt64 = 0,
-        transcriptRevisionEpoch: UUID? = nil
+        transcriptRevisionEpoch: UUID? = nil,
+        bootstrap: Bool = false
     ) async -> RemoteSnapshot {
         let workspaces = await workspaceCatalog.allSavedWorkspaces()
             .map {
@@ -185,7 +199,12 @@ final class RemoteSnapshotBuilder {
             }
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
 
-        let records = await sessionQuery.remoteSessions()
+        let records = if bootstrap {
+            await sessionQuery.bootstrapRemoteSessions()
+        } else {
+            await sessionQuery.remoteSessions()
+        }
+        let projectedIDs = Set(records.map(\.sessionID))
         let childIDsByParent = records.reduce(into: [UUID: [UUID]]()) { result, record in
             guard let parent = record.parentSessionID else { return }
             result[parent, default: []].append(record.sessionID)
@@ -195,7 +214,9 @@ final class RemoteSnapshotBuilder {
                 sessionID: $0.sessionID,
                 workspaceID: $0.workspaceID.uuidString,
                 composeTabID: $0.composeTabID,
-                parentSessionID: $0.parentSessionID,
+                parentSessionID: $0.parentSessionID.flatMap { parentID in
+                    !bootstrap || projectedIDs.contains(parentID) ? parentID : nil
+                },
                 sessionName: $0.sessionName,
                 workflow: $0.workflow,
                 workflowID: $0.workflowID,
@@ -312,8 +333,7 @@ final class WorkspaceManagerRemoteActivationService: WorkspaceActivationService 
     }
 
     func activate(workspaceID: UUID) async -> Result<RemoteWorkspaceActivationResult, RemoteWorkspaceActivationError> {
-        guard let manager else { return .failure(.workspaceNotFound) }
-        guard let workspace = manager.workspace(withID: workspaceID) else {
+        guard let manager, let workspace = manager.workspace(withID: workspaceID) else {
             return .failure(.workspaceNotFound)
         }
 
@@ -357,14 +377,41 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
     }
 
     func remoteSessions() async -> [RemoteSessionRecord] {
+        await remoteSessions(bootstrapIDs: nil)
+    }
+
+    func bootstrapRemoteSessions() async -> [RemoteSessionRecord] {
+        let liveIDs = Set(contexts.flatMap {
+            $0.agentMode.sessions.values.compactMap(\.activeAgentSessionID)
+        })
+        guard !liveIDs.isEmpty else { return [] }
+        let parents = contexts.reduce(into: [UUID: UUID]()) { result, context in
+            for entry in context.agentMode.sessionIndex.values {
+                if let parentID = entry.parentSessionID {
+                    result[entry.id] = parentID
+                }
+            }
+        }
+        let related = RemoteBootstrapSessionGraph.relatedIDs(liveIDs: liveIDs, parentByChild: parents)
+        return await remoteSessions(bootstrapIDs: related)
+    }
+
+    private func remoteSessions(bootstrapIDs: Set<UUID>?) async -> [RemoteSessionRecord] {
         var records: [UUID: RemoteSessionRecord] = [:]
         for context in contexts {
             let workspaceID = context.agentMode.sessionIndexOwner?.workspaceID
                 ?? context.workspaceManager.activeWorkspaceID
             guard let workspaceID else { continue }
             let liveByTabID = context.agentMode.sessions
+            let index = context.agentMode.sessionIndex
+            let entries = if let bootstrapIDs {
+                index.values.filter { bootstrapIDs.contains($0.id) }
+            } else {
+                Array(index.values)
+            }
+            guard !entries.isEmpty else { continue }
             let discoveryAgents = context.agentMode.remoteDiscoveryAgents()
-            for entry in context.agentMode.sessionIndex.values {
+            for entry in entries {
                 let live = Self.matchingLiveSession(
                     entryID: entry.id,
                     tabID: entry.tabID,
@@ -381,7 +428,7 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
                     )
                 } else if let cached = revisionTracker?.cachedPersistedRevision(sessionID: entry.id, savedAt: entry.savedAt) {
                     cached
-                } else if revisionTracker?.revision(for: entry.id) != nil,
+                } else if bootstrapIDs == nil, revisionTracker?.revision(for: entry.id) != nil,
                           let workspace = context.workspaceManager.workspace(withID: workspaceID),
                           let persisted = try? await AgentSessionDataService.shared.loadAgentSession(id: entry.id, for: workspace)
                 {
@@ -399,7 +446,7 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
                         sessionID: entry.id,
                         discoveryAgents: discoveryAgents
                     )
-                } else {
+                } else if bootstrapIDs == nil {
                     context.agentMode.mcpPersistedSessionSelectionCapabilities(
                         agentRaw: entry.agentKindRaw,
                         modelRaw: entry.agentModelRaw,
@@ -407,6 +454,8 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
                         isMutable: Self.isConfigurationMutable(runState: runState),
                         discoveryAgents: discoveryAgents
                     )
+                } else {
+                    nil
                 }
                 let activity: String? = switch runState {
                 case .opening, .working: live?.runningStatusText

@@ -10,6 +10,153 @@ import XCTest
 
 @MainActor
 final class RemoteGatewayRouterTests: XCTestCase {
+    func testFirstSyncDoesNotSendSavedSessionIndexForTwoWorkspaces() async throws {
+        let workspaceIDs = [UUID(), UUID()]
+        let liveID = UUID()
+        let workspaces = workspaceIDs.map {
+            RemoteWorkspaceRecord(
+                workspaceID: $0, name: "Open workspace", repositoryRootSummary: nil, isOpen: true,
+                activeSessionIDs: $0 == workspaceIDs[0] ? [liveID] : [], lastActivityAt: nil
+            )
+        }
+        let controls = RemoteSessionConfigurationControls(
+            agent: .init(isMutable: true, allowedValueIDs: ["codex"]),
+            model: .init(isMutable: true, allowedValueIDs: (0 ..< 100).map {
+                "provider/model-\($0)-" + String(repeating: "x", count: 180)
+            }),
+            reasoningEffort: .init(isMutable: true, allowedValueIDs: ["high"])
+        )
+        let saved = (0 ..< 256).map {
+            RemoteSessionRecord(
+                sessionID: UUID(), workspaceID: workspaceIDs[$0 % 2], composeTabID: nil, parentSessionID: nil,
+                sessionName: "Saved chat \($0)", workflow: nil, agent: "codex", model: nil, reasoningEffort: nil,
+                runState: .completed, lifecycleStage: nil, latestMeaningfulActivity: nil, pendingInteraction: nil,
+                worktreeSummary: nil, mergeAttention: nil, failureSummary: nil,
+                lastUpdatedAt: .distantPast, isLive: false, configurationControls: controls
+            )
+        }
+        let active = RemoteSessionRecord(
+            sessionID: liveID, workspaceID: workspaceIDs[0], composeTabID: UUID(), parentSessionID: nil,
+            sessionName: "Active chat", workflow: nil, agent: "codex", model: nil, reasoningEffort: nil,
+            runState: .working, lifecycleStage: nil, latestMeaningfulActivity: nil, pendingInteraction: nil,
+            worktreeSummary: nil, mergeAttention: nil, failureSummary: nil, lastUpdatedAt: Date(), isLive: true
+        )
+        let builder = RemoteSnapshotBuilder(
+            workspaceCatalog: FixtureWorkspaceCatalog(records: workspaces),
+            sessionQuery: FixtureSessionQuery(records: saved + [active]),
+            workflowCatalog: StaticRemoteCatalogService()
+        )
+        func snapshot(bootstrap: Bool) async -> RemoteSnapshot {
+            await builder.build(
+                desktop: .init(instanceID: "desktop", displayName: "Mac", appVersion: "test", isAvailable: true),
+                connection: .init(state: .connecting), authorization: .init(), eventCursor: 42,
+                bootstrap: bootstrap
+            )
+        }
+
+        let full = await snapshot(bootstrap: false)
+        let fullJSON = try JSONEncoder().encode(full)
+        let oldFrame = try RemoteWireFrame(
+            kind: .rpcResponse, messageID: UUID(), encoding: RemoteRPCResponse(result: fullJSON, syncTicket: UUID())
+        )
+        XCTAssertThrowsError(try oldFrame.validateEncodedLimit(direction: .serverResponse))
+        let router = makeRouter(snapshot: { full }, bootstrapSnapshot: { await snapshot(bootstrap: true) })
+        let context = RemoteGatewayRequestContext.testPeer(authorizationHeader: "Bearer valid")
+        let reply = await router.route(.snapshot, context: context)
+        XCTAssertEqual(reply.status, 200)
+        let data = try json(from: reply)
+        let syncFrame = try RemoteWireFrame(
+            kind: .rpcResponse, messageID: UUID(), encoding: RemoteRPCResponse(result: data, syncTicket: UUID())
+        )
+        try syncFrame.validateEncodedLimit(direction: .serverResponse)
+
+        let firstSync = try JSONDecoder().decode(RemoteSnapshot.self, from: data)
+        XCTAssertEqual(Set(firstSync.workspaces.map(\.workspaceID)), Set(workspaceIDs.map(\.uuidString)))
+        XCTAssertEqual(firstSync.sessions.map(\.sessionID), [liveID])
+        XCTAssertEqual(firstSync.eventCursor, 42)
+
+        let sessionsReply = await router.route(.sessions, context: context)
+        let sessionList = try JSONDecoder().decode([RemoteSessionSummary].self, from: json(from: sessionsReply))
+        XCTAssertEqual(sessionList.count, saved.count + 1)
+    }
+
+    func testFirstSyncPreservesSavedRelationshipsAroundLiveSession() async throws {
+        let workspaceID = UUID()
+        let liveID = UUID()
+        let parentID = UUID()
+        let childID = UUID()
+        let unrelatedID = UUID()
+        func record(_ id: UUID, parent: UUID? = nil, live: Bool = false) -> RemoteSessionRecord {
+            RemoteSessionRecord(
+                sessionID: id, workspaceID: workspaceID, composeTabID: nil, parentSessionID: parent,
+                sessionName: "Chat", workflow: nil, agent: "codex", model: nil, reasoningEffort: nil,
+                runState: live ? .working : .completed, lifecycleStage: nil, latestMeaningfulActivity: nil,
+                pendingInteraction: nil, worktreeSummary: nil, mergeAttention: nil, failureSummary: nil,
+                lastUpdatedAt: .distantPast, isLive: live
+            )
+        }
+        let workspaces = FixtureWorkspaceCatalog(records: [.init(
+            workspaceID: workspaceID, name: "Open workspace", repositoryRootSummary: nil, isOpen: true,
+            activeSessionIDs: [liveID], lastActivityAt: nil
+        )])
+        let sessions = FixtureSessionQuery(records: [
+            record(parentID), record(liveID, parent: parentID, live: true),
+            record(childID, parent: liveID), record(unrelatedID)
+        ])
+        let builder = RemoteSnapshotBuilder(
+            workspaceCatalog: workspaces, sessionQuery: sessions, workflowCatalog: StaticRemoteCatalogService()
+        )
+        let router = makeRouter(bootstrapSnapshot: {
+            await builder.build(
+                desktop: .init(instanceID: "desktop", displayName: "Mac", appVersion: "test", isAvailable: true),
+                connection: .init(state: .connecting), authorization: .init(), bootstrap: true
+            )
+        })
+
+        let reply = await router.route(.snapshot, context: .testPeer(authorizationHeader: "Bearer valid"))
+        let snapshot = try JSONDecoder().decode(RemoteSnapshot.self, from: json(from: reply))
+        let byID = Dictionary(uniqueKeysWithValues: snapshot.sessions.map { ($0.sessionID, $0) })
+        XCTAssertEqual(Set(byID.keys), [parentID, liveID, childID])
+        XCTAssertEqual(byID[parentID]?.childSessionIDs, [liveID])
+        XCTAssertEqual(byID[liveID]?.parentSessionID, parentID)
+        XCTAssertEqual(byID[liveID]?.childSessionIDs, [childID])
+        XCTAssertEqual(byID[childID]?.parentSessionID, liveID)
+        XCTAssertEqual(byID[liveID]?.isLive, true)
+        XCTAssertEqual(byID[childID]?.isLive, false)
+    }
+
+    func testFirstSyncCompactsOversizedLiveDataAndKeepsCoreState() async throws {
+        let workspaceID = UUID().uuidString
+        let sessionID = UUID()
+        let epoch = UUID()
+        let prompt = String(repeating: "x", count: RemoteSnapshotBootstrap.maximumJSONBytes + 1)
+        let snapshot = RemoteSnapshot(
+            desktop: .init(instanceID: "desktop", displayName: "Mac", appVersion: "test", isAvailable: true),
+            connection: .init(state: .connecting), authorization: .init(defaultLevel: .control),
+            workspaces: [.init(workspaceID: workspaceID, name: "Open workspace", isOpen: true)],
+            sessions: [.init(
+                sessionID: sessionID, workspaceID: workspaceID, runState: .waitingForInput,
+                pendingInteraction: .init(id: "request", kind: .approval, prompt: prompt), isLive: true
+            )],
+            eventCursor: 73, transcriptRevisionEpoch: epoch
+        )
+        let router = makeRouter(bootstrapSnapshot: { snapshot })
+        let reply = await router.route(.snapshot, context: .testPeer(authorizationHeader: "Bearer valid"))
+        XCTAssertEqual(reply.status, 200)
+        let data = try json(from: reply)
+        XCTAssertLessThanOrEqual(data.count, RemoteSnapshotBootstrap.maximumJSONBytes)
+
+        let core = try JSONDecoder().decode(RemoteSnapshot.self, from: data)
+        XCTAssertEqual(core.workspaces, snapshot.workspaces)
+        XCTAssertEqual(core.sessions.map(\.sessionID), [sessionID])
+        XCTAssertEqual(core.sessions.first?.runState, .waitingForInput)
+        XCTAssertNil(core.sessions.first?.pendingInteraction?.prompt)
+        XCTAssertNotNil(core.sessions.first?.pendingInteraction?.responseUnavailableReason)
+        XCTAssertEqual(core.authorization, snapshot.authorization)
+        XCTAssertEqual(core.eventCursor, 73)
+        XCTAssertEqual(core.transcriptRevisionEpoch, epoch)
+    }
+
     func testWorkspaceHistoryScopesBeforePagingAndKeepsEqualTimestamps() throws {
         let workspace = UUID()
         let busyWorkspace = UUID()
@@ -402,7 +549,8 @@ final class RemoteGatewayRouterTests: XCTestCase {
         imageAttachment: @escaping (RemoteImageAttachmentRequest) async throws -> RemoteImageAttachmentChunk? = { _ in nil },
         pairIroh: @escaping (RemoteIrohPairingRequest, String) -> Result<RemoteIrohPairingResponse, Error> = { _, _ in
             .failure(TestFailure.unexpectedResponse)
-        }
+        },
+        bootstrapSnapshot: (() async -> RemoteSnapshot?)? = nil
     ) -> RemoteGatewayRequestRouter {
         RemoteGatewayRequestRouter(services: RemoteGatewayRoutingServices(
             authorize: authorize,
@@ -417,7 +565,8 @@ final class RemoteGatewayRouterTests: XCTestCase {
             execute: execute,
             eventCursor: eventCursor,
             imageAttachment: imageAttachment,
-            pairIroh: pairIroh
+            pairIroh: pairIroh,
+            bootstrapSnapshot: bootstrapSnapshot
         ))
     }
 

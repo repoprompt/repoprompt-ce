@@ -748,7 +748,7 @@ enum RemoteIrohGatewayAdapterError: LocalizedError {
         switch self {
         case .notRunning: "The Iroh endpoint is not running."
         case .invalidEndpoint: "The Iroh endpoint did not provide a valid identity."
-        case .responseTooLarge: "The Mac snapshot exceeds the Remote response limit. Close unused workspaces on the Mac and reconnect."
+        case .responseTooLarge: "The Mac could not send this response within the Remote transfer limit."
         case .frameTooLarge: "The Iroh request exceeded the one-megabyte limit."
         case .unsupportedWireVersion: "The Iroh wire version is unsupported."
         case .serverEndpointMismatch: "The authenticated server endpoint did not match the pairing record."
