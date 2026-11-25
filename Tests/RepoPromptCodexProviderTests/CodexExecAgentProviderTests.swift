@@ -294,17 +294,10 @@ final class CodexExecAgentProviderTests: XCTestCase {
     }
 
     private func run(_ provider: CodexExecAgentProvider, releasing gate: ExecFixtureGate? = nil, releasingFIFO fifo: URL? = nil) async throws -> [AIStreamResult] {
-        // Match existing subprocess-test watchdogs: success is event-driven; expiry is a failure.
-        let watchdog = Task {
-            do { try await Task.sleep(for: .seconds(10)) } catch { return false }
-            XCTFail("Codex Exec fixture exceeded its bounded deadline")
-            await gate?.release()
-            if let fifo { self.releaseFixtureFIFO(fifo) }
-            await provider.dispose()
-            return true
-        }
-        do {
-            let results = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
+        let finished = XCTestExpectation(description: "Codex Exec fixture stream finished")
+        let consumer = Task {
+            defer { finished.fulfill() }
+            return try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
                 let stream = try await provider.streamAgentMessage(AgentMessage(systemPrompt: "system", userMessage: "user"), runID: UUID())
                 var results: [AIStreamResult] = []
                 for try await result in stream {
@@ -312,14 +305,17 @@ final class CodexExecAgentProviderTests: XCTestCase {
                 }
                 return results
             }
-            watchdog.cancel()
-            if await watchdog.value { throw ExecFixtureFailure.deadline }
-            return results
-        } catch {
-            watchdog.cancel()
-            if await watchdog.value { throw ExecFixtureFailure.deadline }
-            throw error
         }
+
+        guard await XCTWaiter.fulfillment(of: [finished], timeout: 10) == .completed else {
+            XCTFail("Codex Exec fixture exceeded its bounded deadline")
+            consumer.cancel()
+            await gate?.release()
+            if let fifo { releaseFixtureFIFO(fifo) }
+            await provider.dispose()
+            throw ExecFixtureFailure.deadline
+        }
+        return try await consumer.value
     }
 
     private func releaseFixtureFIFO(_ fifo: URL) {
