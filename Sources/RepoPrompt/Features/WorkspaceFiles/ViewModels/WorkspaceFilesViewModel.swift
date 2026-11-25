@@ -121,8 +121,12 @@ struct FileHierarchyIndex {
     }
 
     mutating func insertFolder(_ folder: FolderViewModel, rootKey: String? = nil) {
-        let path = folder.standardizedFullPath
         let ownerRootKey = rootKey.map(StandardizedPath.absolute) ?? StandardizedPath.absolute(folder.rootPath)
+        insertFolder(folder, standardizedOwnerRootKey: ownerRootKey)
+    }
+
+    mutating func insertFolder(_ folder: FolderViewModel, standardizedOwnerRootKey ownerRootKey: String) {
+        let path = folder.standardizedFullPath
         if let existing = foldersByFullPath.updateValue(folder, forKey: path) {
             if foldersByID[existing.id] === existing {
                 foldersByID.removeValue(forKey: existing.id)
@@ -162,8 +166,12 @@ struct FileHierarchyIndex {
     }
 
     mutating func insertFile(_ file: FileViewModel, rootKey: String? = nil) {
-        let path = file.standardizedFullPath
         let ownerRootKey = rootKey.map(StandardizedPath.absolute) ?? file.standardizedRootFolderPath
+        insertFile(file, standardizedOwnerRootKey: ownerRootKey)
+    }
+
+    mutating func insertFile(_ file: FileViewModel, standardizedOwnerRootKey ownerRootKey: String) {
+        let path = file.standardizedFullPath
         if let existing = filesByFullPath.updateValue(file, forKey: path) {
             if filesByID[existing.id] === existing {
                 filesByID.removeValue(forKey: existing.id)
@@ -3771,10 +3779,13 @@ class WorkspaceFilesViewModel: ObservableObject {
         )
         #if DEBUG
             let cleanupFolderRemovalDurationMS = debugPerfElapsedMS(since: folderRemovalStartMS)
-
-            var stats = ReindexTraversalStats()
             let traversalStartMS = debugPerfTimestampMS()
-            reindexFolderRecursively(rootFolder, into: &fileHierarchyIndex, rootKey: rootKey, stats: &stats)
+        #endif
+        // Compute the owner key the insertion overload used to derive for each node.
+        let standardizedOwnerRootKey = StandardizedPath.absolute(rootKey)
+        #if DEBUG
+            var stats = ReindexTraversalStats()
+            reindexFolderRecursively(rootFolder, into: &fileHierarchyIndex, standardizedOwnerRootKey: standardizedOwnerRootKey, stats: &stats)
             let reindexTraversalDurationMS = debugPerfElapsedMS(since: traversalStartMS)
 
             let totalDurationMS = debugPerfElapsedMS(since: totalStartMS)
@@ -3801,7 +3812,7 @@ class WorkspaceFilesViewModel: ObservableObject {
                 totalDurationMS: totalDurationMS
             )
         #else
-            reindexFolderRecursively(rootFolder, into: &fileHierarchyIndex, rootKey: rootKey)
+            reindexFolderRecursively(rootFolder, into: &fileHierarchyIndex, standardizedOwnerRootKey: standardizedOwnerRootKey)
         #endif
     }
 
@@ -3816,14 +3827,14 @@ class WorkspaceFilesViewModel: ObservableObject {
         private func reindexFolderRecursively(
             _ folder: FolderViewModel,
             into index: inout FileHierarchyIndex,
-            rootKey: String,
+            standardizedOwnerRootKey: String,
             stats: inout ReindexTraversalStats
         ) {
             var visitedFolderIDs = Set<UUID>()
             reindexFolderRecursively(
                 folder,
                 into: &index,
-                rootKey: rootKey,
+                standardizedOwnerRootKey: standardizedOwnerRootKey,
                 visitedFolderIDs: &visitedFolderIDs,
                 stats: &stats
             )
@@ -3833,13 +3844,13 @@ class WorkspaceFilesViewModel: ObservableObject {
         private func reindexFolderRecursively(
             _ folder: FolderViewModel,
             into index: inout FileHierarchyIndex,
-            rootKey: String,
+            standardizedOwnerRootKey: String,
             visitedFolderIDs: inout Set<UUID>,
             stats: inout ReindexTraversalStats
         ) {
             guard visitedFolderIDs.insert(folder.id).inserted else { return }
             stats.visitedFolderCount += 1
-            index.insertFolder(folder, rootKey: rootKey)
+            index.insertFolder(folder, standardizedOwnerRootKey: standardizedOwnerRootKey)
 
             for child in folder.children {
                 switch child {
@@ -3847,13 +3858,13 @@ class WorkspaceFilesViewModel: ObservableObject {
                     reindexFolderRecursively(
                         subFolder,
                         into: &index,
-                        rootKey: rootKey,
+                        standardizedOwnerRootKey: standardizedOwnerRootKey,
                         visitedFolderIDs: &visitedFolderIDs,
                         stats: &stats
                     )
                 case let .file(fileVM):
                     stats.visitedFileCount += 1
-                    index.insertFile(fileVM, rootKey: rootKey)
+                    index.insertFile(fileVM, standardizedOwnerRootKey: standardizedOwnerRootKey)
                 }
             }
         }
@@ -3862,13 +3873,13 @@ class WorkspaceFilesViewModel: ObservableObject {
         private func reindexFolderRecursively(
             _ folder: FolderViewModel,
             into index: inout FileHierarchyIndex,
-            rootKey: String
+            standardizedOwnerRootKey: String
         ) {
             var visitedFolderIDs = Set<UUID>()
             reindexFolderRecursively(
                 folder,
                 into: &index,
-                rootKey: rootKey,
+                standardizedOwnerRootKey: standardizedOwnerRootKey,
                 visitedFolderIDs: &visitedFolderIDs
             )
         }
@@ -3877,11 +3888,11 @@ class WorkspaceFilesViewModel: ObservableObject {
         private func reindexFolderRecursively(
             _ folder: FolderViewModel,
             into index: inout FileHierarchyIndex,
-            rootKey: String,
+            standardizedOwnerRootKey: String,
             visitedFolderIDs: inout Set<UUID>
         ) {
             guard visitedFolderIDs.insert(folder.id).inserted else { return }
-            index.insertFolder(folder, rootKey: rootKey)
+            index.insertFolder(folder, standardizedOwnerRootKey: standardizedOwnerRootKey)
 
             for child in folder.children {
                 switch child {
@@ -3889,11 +3900,11 @@ class WorkspaceFilesViewModel: ObservableObject {
                     reindexFolderRecursively(
                         subFolder,
                         into: &index,
-                        rootKey: rootKey,
+                        standardizedOwnerRootKey: standardizedOwnerRootKey,
                         visitedFolderIDs: &visitedFolderIDs
                     )
                 case let .file(fileVM):
-                    index.insertFile(fileVM, rootKey: rootKey)
+                    index.insertFile(fileVM, standardizedOwnerRootKey: standardizedOwnerRootKey)
                 }
             }
         }

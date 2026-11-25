@@ -145,6 +145,100 @@ final class RemovedFolderIndexRebuildTests: XCTestCase {
         XCTAssertFalse(index.hasIndexedPaths(inRemovedFolders: removed, rootKey: "/other-root"))
     }
 
+    func testStandardizedOwnerInsertionsPreserveAllIndexMaps() {
+        let root = "/workspace/日本語"
+        let nestedRoot = root + "/nested"
+        let path = nestedRoot + "/shared"
+        let outer = makeFolder(path: root, root: root)
+        let nested = makeFolder(path: nestedRoot, root: nestedRoot)
+        let originalFolder = makeFolder(path: path, root: root + "/./")
+        let originalFile = makeFile(path: path + "/file.swift", root: root + "/./")
+        let replacementFolder = makeFolder(path: path, root: nestedRoot)
+        let replacementFile = makeFile(path: path + "/file.swift", root: nestedRoot)
+        let explicitOwnerFile = makeFile(path: nestedRoot + "/outer.swift", root: nestedRoot)
+
+        var reference = FileHierarchyIndex()
+        reference.insertFolder(outer, rootKey: root + "/./")
+        reference.insertFolder(nested, rootKey: nestedRoot + "/")
+        reference.insertFolder(originalFolder)
+        reference.insertFile(originalFile)
+        var index = FileHierarchyIndex()
+        index.insertFolder(outer, standardizedOwnerRootKey: root)
+        index.insertFolder(nested, standardizedOwnerRootKey: nestedRoot)
+        index.insertFolder(originalFolder, standardizedOwnerRootKey: root)
+        index.insertFile(originalFile, standardizedOwnerRootKey: root)
+        assertSameIndex(index, as: reference)
+        XCTAssertEqual(index.filePathsByRoot[nestedRoot], [])
+
+        reference.insertFolder(replacementFolder, rootKey: nestedRoot + "/./")
+        reference.insertFile(replacementFile, rootKey: nestedRoot + "/./")
+        reference.insertFile(explicitOwnerFile, rootKey: root + "/")
+        index.insertFolder(replacementFolder, standardizedOwnerRootKey: nestedRoot)
+        index.insertFile(replacementFile, standardizedOwnerRootKey: nestedRoot)
+        index.insertFile(explicitOwnerFile, standardizedOwnerRootKey: root)
+        assertSameIndex(index, as: reference)
+
+        XCTAssertEqual(index.folderPathsByRoot, [root: [root], nestedRoot: [nestedRoot, path]])
+        XCTAssertEqual(index.filePathsByRoot, [
+            root: [explicitOwnerFile.standardizedFullPath],
+            nestedRoot: [replacementFile.standardizedFullPath]
+        ])
+        XCTAssertNil(index.foldersByID[originalFolder.id])
+        XCTAssertNil(index.filesByID[originalFile.id])
+        XCTAssertTrue(index.foldersByFullPath[path] === replacementFolder)
+        XCTAssertTrue(index.filesByFullPath[replacementFile.standardizedFullPath] === replacementFile)
+    }
+
+    #if DEBUG
+        func testHierarchyRebuildPreservesTraversalAndVisitCounts() throws {
+            let rootPath = "/workspace/日本語"
+            let root = makeFolder(path: rootPath + "/./", root: rootPath)
+            let first = makeFolder(path: rootPath + "/first", root: rootPath)
+            let last = makeFolder(path: rootPath + "/last", root: rootPath)
+            let path = rootPath + "/duplicate.swift"
+            let original = makeFile(path: path, root: rootPath)
+            let replacement = makeFile(path: path, root: rootPath)
+            first.setChildren([.file(original)])
+            last.setChildren([.file(replacement)])
+            root.setChildren([.folder(last), .folder(first), .folder(first)])
+            XCTAssertEqual(root.children.map(\.id), [first.id, first.id, last.id])
+
+            let store = WorkspaceFileContextStore(codemapGraphIndexBuildLaunchPolicyForTesting: .disabled)
+            let viewModel = WorkspaceFilesViewModel(workspaceFileContextStore: store)
+            for _ in 0 ..< 2 {
+                viewModel.registerRootFolderForTesting(root)
+                let sample = try XCTUnwrap(viewModel.latestIndexRebuildPerfSampleForTesting())
+                XCTAssertEqual(sample.reindexVisitedFolderCount, 3)
+                XCTAssertEqual(sample.reindexVisitedFileCount, 2)
+                XCTAssertNil(viewModel.appliedIndexProjectedFileForTesting(id: original.id))
+                XCTAssertTrue(viewModel.appliedIndexProjectedFileForTesting(id: replacement.id) === replacement)
+                let snapshot = viewModel.appliedIndexProjectionIndexSnapshotForTesting()
+                XCTAssertEqual(snapshot.fileIDsByPath, [path: replacement.id])
+                XCTAssertEqual(snapshot.folderIDsByPath, [
+                    rootPath: root.id,
+                    first.standardizedFullPath: first.id,
+                    last.standardizedFullPath: last.id
+                ])
+            }
+        }
+    #endif
+
+    private func assertSameIndex(_ actual: FileHierarchyIndex, as expected: FileHierarchyIndex) {
+        XCTAssertEqual(actual.filesByFullPath.mapValues(ObjectIdentifier.init), expected.filesByFullPath.mapValues(ObjectIdentifier.init))
+        XCTAssertEqual(actual.foldersByFullPath.mapValues(ObjectIdentifier.init), expected.foldersByFullPath.mapValues(ObjectIdentifier.init))
+        XCTAssertEqual(actual.filesByID.mapValues(ObjectIdentifier.init), expected.filesByID.mapValues(ObjectIdentifier.init))
+        XCTAssertEqual(actual.foldersByID.mapValues(ObjectIdentifier.init), expected.foldersByID.mapValues(ObjectIdentifier.init))
+        XCTAssertEqual(actual.filePathsByRoot, expected.filePathsByRoot)
+        XCTAssertEqual(actual.folderPathsByRoot, expected.folderPathsByRoot)
+    }
+
+    private func makeFolder(path: String, root: String) -> FolderViewModel {
+        FolderViewModel(
+            folder: Folder(name: (path as NSString).lastPathComponent, path: path, modificationDate: .distantPast),
+            rootPath: root
+        )
+    }
+
     func testLargeUnmaterializedRemovalBatchStaysResponsive() {
         let removed = Set((0 ..< 2000).map { "/workspace/.worktrees/removed-\($0)" })
         let files = Set((0 ..< 12000).map { "/workspace/source/module/component/detail/types/nested/File\($0).swift" })
