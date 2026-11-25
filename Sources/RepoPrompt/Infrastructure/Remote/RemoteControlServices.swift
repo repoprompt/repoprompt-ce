@@ -134,6 +134,13 @@ enum RemoteWorkspaceActivationError: Error, Equatable {
 @MainActor
 protocol SessionQueryService: AnyObject {
     func remoteSessions() async -> [RemoteSessionRecord]
+    func liveRemoteSessions() async -> [RemoteSessionRecord]
+}
+
+extension SessionQueryService {
+    func liveRemoteSessions() async -> [RemoteSessionRecord] {
+        await remoteSessions().filter(\.isLive)
+    }
 }
 
 @MainActor
@@ -170,7 +177,8 @@ final class RemoteSnapshotBuilder {
         connection: RemoteConnectionSummary,
         authorization: RemoteAuthorizationState,
         eventCursor: UInt64 = 0,
-        transcriptRevisionEpoch: UUID? = nil
+        transcriptRevisionEpoch: UUID? = nil,
+        liveSessionsOnly: Bool = false
     ) async -> RemoteSnapshot {
         let workspaces = await workspaceCatalog.allSavedWorkspaces()
             .map {
@@ -185,7 +193,11 @@ final class RemoteSnapshotBuilder {
             }
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
 
-        let records = await sessionQuery.remoteSessions()
+        let records = if liveSessionsOnly {
+            await sessionQuery.liveRemoteSessions()
+        } else {
+            await sessionQuery.remoteSessions()
+        }
         let childIDsByParent = records.reduce(into: [UUID: [UUID]]()) { result, record in
             guard let parent = record.parentSessionID else { return }
             result[parent, default: []].append(record.sessionID)
@@ -312,8 +324,7 @@ final class WorkspaceManagerRemoteActivationService: WorkspaceActivationService 
     }
 
     func activate(workspaceID: UUID) async -> Result<RemoteWorkspaceActivationResult, RemoteWorkspaceActivationError> {
-        guard let manager else { return .failure(.workspaceNotFound) }
-        guard let workspace = manager.workspace(withID: workspaceID) else {
+        guard let manager, let workspace = manager.workspace(withID: workspaceID) else {
             return .failure(.workspaceNotFound)
         }
 
@@ -357,19 +368,39 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
     }
 
     func remoteSessions() async -> [RemoteSessionRecord] {
+        await remoteSessions(liveOnly: false)
+    }
+
+    func liveRemoteSessions() async -> [RemoteSessionRecord] {
+        await remoteSessions(liveOnly: true)
+    }
+
+    private func remoteSessions(liveOnly: Bool) async -> [RemoteSessionRecord] {
         var records: [UUID: RemoteSessionRecord] = [:]
         for context in contexts {
             let workspaceID = context.agentMode.sessionIndexOwner?.workspaceID
                 ?? context.workspaceManager.activeWorkspaceID
             guard let workspaceID else { continue }
             let liveByTabID = context.agentMode.sessions
+            let index = context.agentMode.sessionIndex
+            let entries = if liveOnly {
+                liveByTabID.values.compactMap { session in
+                    session.activeAgentSessionID.flatMap { index[$0] }
+                }
+            } else {
+                Array(index.values)
+            }
+            guard !entries.isEmpty else { continue }
             let discoveryAgents = context.agentMode.remoteDiscoveryAgents()
-            for entry in context.agentMode.sessionIndex.values {
+            for entry in entries {
                 let live = Self.matchingLiveSession(
                     entryID: entry.id,
                     tabID: entry.tabID,
                     liveByTabID: liveByTabID
                 )
+                if liveOnly, live == nil {
+                    continue
+                }
                 let runState = live.map { Self.mapRunState($0.runState) }
                     ?? Self.mapPersistedRunState(entry.lastRunStateRaw)
                 let transcriptRevision: UInt64? = if let live {
