@@ -11,7 +11,7 @@ enum RemoteSnapshotBootstrap {
             return full
         }
 
-        let compactSessions = snapshot.sessions.map(compactSession)
+        let compactSessions = snapshot.sessions.map { compactSession($0) }
         let compactAttention = snapshot.attentionItems.map {
             RemoteAttentionItem(
                 id: $0.id, kind: $0.kind, sessionID: $0.sessionID,
@@ -35,13 +35,14 @@ enum RemoteSnapshotBootstrap {
                 isOpen: $0.isOpen, lastActivityAt: $0.lastActivityAt
             )
         }
-        var sessions = compactSessions
+        var sessions = compactSessions.filter(\.isLive) + compactSessions.filter { !$0.isLive }
         while true {
             let workspaceIDs = Set(workspaces.map(\.workspaceID))
             let visibleSessions = sessions.filter { workspaceIDs.contains($0.workspaceID) }
             let sessionIDs = Set(visibleSessions.map(\.sessionID))
+            let linkedSessions = visibleSessions.map { compactSession($0, retaining: sessionIDs) }
             let core = try encoder.encode(copy(
-                snapshot, workspaces: workspaces, sessions: visibleSessions,
+                snapshot, workspaces: workspaces, sessions: linkedSessions,
                 attention: compactAttention.filter { sessionIDs.contains($0.sessionID) },
                 includeCatalogs: false
             ))
@@ -58,16 +59,20 @@ enum RemoteSnapshotBootstrap {
         }
     }
 
-    private static func compactSession(_ session: RemoteSessionSummary) -> RemoteSessionSummary {
+    private static func compactSession(
+        _ session: RemoteSessionSummary,
+        retaining sessionIDs: Set<UUID>? = nil
+    ) -> RemoteSessionSummary {
         RemoteSessionSummary(
             sessionID: session.sessionID, workspaceID: session.workspaceID, composeTabID: session.composeTabID,
-            parentSessionID: session.parentSessionID, sessionName: session.sessionName.map(preview),
+            parentSessionID: session.parentSessionID.flatMap { sessionIDs?.contains($0) == false ? nil : $0 },
+            sessionName: session.sessionName.map(preview),
             workflow: session.workflow.map(preview), workflowID: session.workflowID, runStartedAt: session.runStartedAt,
             transcriptRevision: session.transcriptRevision, agent: session.agent, model: session.model,
             reasoningEffort: session.reasoningEffort, runState: session.runState, lifecycleStage: session.lifecycleStage,
             latestMeaningfulActivity: session.latestMeaningfulActivity.map(preview),
             pendingInteraction: session.pendingInteraction.map(compactInteraction),
-            childSessionIDs: session.childSessionIDs,
+            childSessionIDs: session.childSessionIDs.filter { sessionIDs?.contains($0) != false },
             worktreeSummary: session.worktreeSummary.map(preview), mergeAttention: session.mergeAttention.map(preview),
             failureSummary: session.failureSummary.map(preview), lastUpdatedAt: session.lastUpdatedAt, isLive: session.isLive
         )
@@ -108,5 +113,24 @@ enum RemoteSnapshotBootstrap {
 
     private static func preview(_ value: String) -> String {
         String(decoding: value.utf8.prefix(previewBytes), as: UTF8.self)
+    }
+}
+
+enum RemoteBootstrapSessionGraph {
+    static func relatedIDs(liveIDs: Set<UUID>, parentByChild: [UUID: UUID]) -> Set<UUID> {
+        let childrenByParent = parentByChild.reduce(into: [UUID: [UUID]]()) { result, link in
+            result[link.value, default: []].append(link.key)
+        }
+        var included = liveIDs
+        var pending = Array(liveIDs)
+        while let sessionID = pending.popLast() {
+            if let parentID = parentByChild[sessionID], included.insert(parentID).inserted {
+                pending.append(parentID)
+            }
+            for childID in childrenByParent[sessionID, default: []] where included.insert(childID).inserted {
+                pending.append(childID)
+            }
+        }
+        return included
     }
 }

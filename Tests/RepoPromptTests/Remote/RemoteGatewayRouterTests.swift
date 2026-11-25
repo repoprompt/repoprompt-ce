@@ -46,21 +46,21 @@ final class RemoteGatewayRouterTests: XCTestCase {
             sessionQuery: FixtureSessionQuery(records: saved + [active]),
             workflowCatalog: StaticRemoteCatalogService()
         )
-        func snapshot(liveOnly: Bool) async -> RemoteSnapshot {
+        func snapshot(bootstrap: Bool) async -> RemoteSnapshot {
             await builder.build(
                 desktop: .init(instanceID: "desktop", displayName: "Mac", appVersion: "test", isAvailable: true),
                 connection: .init(state: .connecting), authorization: .init(), eventCursor: 42,
-                liveSessionsOnly: liveOnly
+                bootstrap: bootstrap
             )
         }
 
-        let full = await snapshot(liveOnly: false)
+        let full = await snapshot(bootstrap: false)
         let fullJSON = try JSONEncoder().encode(full)
         let oldFrame = try RemoteWireFrame(
             kind: .rpcResponse, messageID: UUID(), encoding: RemoteRPCResponse(result: fullJSON, syncTicket: UUID())
         )
         XCTAssertThrowsError(try oldFrame.validateEncodedLimit(direction: .serverResponse))
-        let router = makeRouter(snapshot: { full }, bootstrapSnapshot: { await snapshot(liveOnly: true) })
+        let router = makeRouter(snapshot: { full }, bootstrapSnapshot: { await snapshot(bootstrap: true) })
         let context = RemoteGatewayRequestContext.testPeer(authorizationHeader: "Bearer valid")
         let reply = await router.route(.snapshot, context: context)
         XCTAssertEqual(reply.status, 200)
@@ -78,6 +78,51 @@ final class RemoteGatewayRouterTests: XCTestCase {
         let sessionsReply = await router.route(.sessions, context: context)
         let sessionList = try JSONDecoder().decode([RemoteSessionSummary].self, from: json(from: sessionsReply))
         XCTAssertEqual(sessionList.count, saved.count + 1)
+    }
+
+    func testFirstSyncPreservesSavedRelationshipsAroundLiveSession() async throws {
+        let workspaceID = UUID()
+        let liveID = UUID()
+        let parentID = UUID()
+        let childID = UUID()
+        let unrelatedID = UUID()
+        func record(_ id: UUID, parent: UUID? = nil, live: Bool = false) -> RemoteSessionRecord {
+            RemoteSessionRecord(
+                sessionID: id, workspaceID: workspaceID, composeTabID: nil, parentSessionID: parent,
+                sessionName: "Chat", workflow: nil, agent: "codex", model: nil, reasoningEffort: nil,
+                runState: live ? .working : .completed, lifecycleStage: nil, latestMeaningfulActivity: nil,
+                pendingInteraction: nil, worktreeSummary: nil, mergeAttention: nil, failureSummary: nil,
+                lastUpdatedAt: .distantPast, isLive: live
+            )
+        }
+        let workspaces = FixtureWorkspaceCatalog(records: [.init(
+            workspaceID: workspaceID, name: "Open workspace", repositoryRootSummary: nil, isOpen: true,
+            activeSessionIDs: [liveID], lastActivityAt: nil
+        )])
+        let sessions = FixtureSessionQuery(records: [
+            record(parentID), record(liveID, parent: parentID, live: true),
+            record(childID, parent: liveID), record(unrelatedID)
+        ])
+        let builder = RemoteSnapshotBuilder(
+            workspaceCatalog: workspaces, sessionQuery: sessions, workflowCatalog: StaticRemoteCatalogService()
+        )
+        let router = makeRouter(bootstrapSnapshot: {
+            await builder.build(
+                desktop: .init(instanceID: "desktop", displayName: "Mac", appVersion: "test", isAvailable: true),
+                connection: .init(state: .connecting), authorization: .init(), bootstrap: true
+            )
+        })
+
+        let reply = await router.route(.snapshot, context: .testPeer(authorizationHeader: "Bearer valid"))
+        let snapshot = try JSONDecoder().decode(RemoteSnapshot.self, from: json(from: reply))
+        let byID = Dictionary(uniqueKeysWithValues: snapshot.sessions.map { ($0.sessionID, $0) })
+        XCTAssertEqual(Set(byID.keys), [parentID, liveID, childID])
+        XCTAssertEqual(byID[parentID]?.childSessionIDs, [liveID])
+        XCTAssertEqual(byID[liveID]?.parentSessionID, parentID)
+        XCTAssertEqual(byID[liveID]?.childSessionIDs, [childID])
+        XCTAssertEqual(byID[childID]?.parentSessionID, liveID)
+        XCTAssertEqual(byID[liveID]?.isLive, true)
+        XCTAssertEqual(byID[childID]?.isLive, false)
     }
 
     func testFirstSyncCompactsOversizedLiveDataAndKeepsCoreState() async throws {
