@@ -316,9 +316,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                 }
             },
             snapshot: { [unowned self] in
-                let result = await snapshot()
-                lastSnapshotAt = Date()
-                return result
+                await snapshot()
             },
             diagnostics: { [unowned self] in
                 await diagnostics()
@@ -426,6 +424,11 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                     pairingCode = nil
                     lastError = nil
                 }
+            },
+            bootstrapSnapshot: { [unowned self] in
+                let result = await snapshot(bootstrap: true)
+                lastSnapshotAt = Date()
+                return result
             }
         )
     }
@@ -668,7 +671,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
         )
     }
 
-    private func snapshot() async -> RemoteSnapshot {
+    private func snapshot(bootstrap: Bool = false) async -> RemoteSnapshot {
         let authorization = authorizationState
         guard let window = windowStatesManager?.allWindows.first else {
             return await RemoteSnapshot(
@@ -698,7 +701,8 @@ final class RemoteGatewayController: NSObject, ObservableObject {
             connection: connectionSummary,
             authorization: authorization,
             eventCursor: replayBuffer.latestCursor(),
-            transcriptRevisionEpoch: transcriptRevisionEpoch
+            transcriptRevisionEpoch: transcriptRevisionEpoch,
+            bootstrap: bootstrap
         )
     }
 }
