@@ -93,14 +93,20 @@ final class CodeBlockDirectionTests: XCTestCase {
         renderer.scale = 1
         let bitmap = try NSBitmapImageRep(cgImage: XCTUnwrap(renderer.cgImage))
 
-        // Use the same foreground color modifier as the controls so their local colors win.
+        // Mask the copy button's padded 32-point corner because it can inherit the ink color.
+        // The first code line extends past that corner even if the RTL clearance regresses.
+        let copyButtonSize = 32
+        let copyButtonX = direction == .rightToLeft ? 0 : bitmap.pixelsWide - copyButtonSize
+        let copyButtonColumns = copyButtonX ..< (copyButtonX + copyButtonSize)
+
         // Group consecutive rows of code ink so each line is checked independently.
         var lines: [CGRect] = []
         var currentLine = CGRect.null
         for y in 0 ..< bitmap.pixelsHigh {
             var row = CGRect.null
             for x in 0 ..< bitmap.pixelsWide {
-                guard let pixel = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.sRGB),
+                guard y >= copyButtonSize || !copyButtonColumns.contains(x),
+                      let pixel = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.sRGB),
                       pixel.redComponent > 0.6, pixel.greenComponent < 0.4
                 else { continue }
                 row = row.union(CGRect(x: x, y: y, width: 1, height: 1))
