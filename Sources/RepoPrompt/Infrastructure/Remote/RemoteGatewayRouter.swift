@@ -77,8 +77,10 @@ typealias RemoteDispatchAuthorization = @MainActor () throws -> Void
 struct RemoteGatewayRoutingServices {
     var authorize: (RemoteGatewayRequestContext) -> Bool
     var pairIroh: (RemoteIrohPairingRequest, String) -> Result<RemoteIrohPairingResponse, Error>
+    var confirmIroh: (RemotePairingConfirmation, String) throws -> Void
     var unpair: () -> RemoteGatewayRevocationResult
     var snapshot: () async -> RemoteSnapshot?
+    var bootstrapSnapshot: () async -> RemoteSnapshot?
     var diagnostics: () async -> RemoteDiagnostics?
     var history: (RemoteHistoryRPCRequest) async throws -> RemoteHistoryPage?
     var transcript: (RemoteGatewayTranscriptRequest) async -> RemoteGatewayTranscriptResult
@@ -104,12 +106,18 @@ struct RemoteGatewayRoutingServices {
         imageAttachment: @escaping (RemoteImageAttachmentRequest) async throws -> RemoteImageAttachmentChunk? = { _ in nil },
         pairIroh: @escaping (RemoteIrohPairingRequest, String) -> Result<RemoteIrohPairingResponse, Error> = { _, _ in
             .failure(RemoteGatewayRouterError.irohUnavailable)
-        }
+        },
+        confirmIroh: @escaping (RemotePairingConfirmation, String) throws -> Void = { _, _ in
+            throw RemoteGatewayRouterError.irohUnavailable
+        },
+        bootstrapSnapshot: (() async -> RemoteSnapshot?)? = nil
     ) {
+        self.confirmIroh = confirmIroh
         self.authorize = authorize
         self.pairIroh = pairIroh
         self.unpair = unpair
         self.snapshot = snapshot
+        self.bootstrapSnapshot = bootstrapSnapshot ?? snapshot
         self.diagnostics = diagnostics
         self.history = history
         self.transcript = transcript
@@ -149,6 +157,10 @@ final class RemoteGatewayRequestRouter {
         services.authorize(context)
     }
 
+    func confirmIroh(_ confirmation: RemotePairingConfirmation, peerEndpointID: String) throws {
+        try services.confirmIroh(confirmation, peerEndpointID)
+    }
+
     func route(
         _ request: RemoteGatewayRequest,
         context: RemoteGatewayRequestContext
@@ -185,8 +197,8 @@ final class RemoteGatewayRequestRouter {
             return encode(RemoteUnpairResponse())
 
         case .snapshot:
-            guard let snapshot = await services.snapshot() else { return unavailableReadResponse() }
-            return encode(snapshot)
+            guard let snapshot = await services.bootstrapSnapshot() else { return unavailableReadResponse() }
+            return encodeSnapshot(snapshot)
 
         case .diagnostics:
             guard let diagnostics = await services.diagnostics() else { return unavailableReadResponse() }
@@ -292,8 +304,16 @@ final class RemoteGatewayRequestRouter {
         case let .success(response):
             encode(response)
         case let .failure(error):
-            .error(.init(code: "pairing_failed", message: error.localizedDescription), status: 403)
+            .error(Self.pairingError(error), status: 403)
         }
+    }
+
+    static func pairingError(_ error: Error) -> RemoteErrorResponse {
+        (error as? RemoteGatewaySecurityError)?.response ?? .init(
+            code: "pairing_storage_unavailable",
+            message: "The Mac could not access or save pairing in Keychain. Check Remote settings on your Mac and retry.",
+            retryable: true
+        )
     }
 
     private func routeCommand(
@@ -380,9 +400,17 @@ final class RemoteGatewayRequestRouter {
         )
     }
 
+    private func encodeSnapshot(_ snapshot: RemoteSnapshot) -> RemoteGatewayResponse {
+        encodeJSON { try RemoteSnapshotBootstrap.encode(snapshot, with: encoder) }
+    }
+
     private func encode(_ value: some Encodable, status: Int = 200) -> RemoteGatewayResponse {
+        encodeJSON(status: status) { try encoder.encode(value) }
+    }
+
+    private func encodeJSON(status: Int = 200, _ data: () throws -> Data) -> RemoteGatewayResponse {
         do {
-            return try RemoteGatewayResponse(status: status, content: .json(encoder.encode(value)))
+            return try RemoteGatewayResponse(status: status, content: .json(data()))
         } catch {
             return .error(
                 .init(code: "encoding_failed", message: "The response could not be encoded."),

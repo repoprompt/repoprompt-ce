@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptMCPServer
+import RepoPromptRemoteProtocol
 import RepoPromptSettingsCore
 
 #if REPOPROMPT_SENTRY_ENABLED
@@ -49,7 +50,14 @@ enum SentryTelemetryBootstrap {
                 options.enableUncaughtNSExceptionReporting = true
                 options.enableAppHangTracking = appHangReportsEnabled
                 options.enableMetricKit = false
-                options.enableLogs = false
+                options.enableLogs = true
+                options.beforeSendLog = { log in
+                    guard log.body == remotePairingResponseMessage else { return nil }
+                    log.attributes = log.attributes.filter {
+                        ["component", "pairing_attempt", "pairing_side", "pairing_step", "pairing_path", "sentry.release", "sentry.environment"].contains($0.key)
+                    }
+                    return log
+                }
                 options.maxBreadcrumbs = 20
                 options.maxCacheItems = 10
                 options.attachStacktrace = true
@@ -164,6 +172,130 @@ enum SentryTelemetryBootstrap {
             fileprivate init() {}
         #endif
     }
+
+    struct PairingContext {
+        enum Step: String {
+            case legacyHello = "legacy_hello"
+            case prepare
+            case confirm
+
+            init?(_ kind: RemoteWireFrameKind) {
+                switch kind {
+                case .pairingHello: self = .legacyHello
+                case .pairingPrepare: self = .prepare
+                case .pairingConfirm: self = .confirm
+                default: return nil
+                }
+            }
+        }
+
+        let step: Step
+        let path: RemoteIrohPathKind
+        var attemptID: UUID?
+        var failure: PairingFailure = .invalidFrame
+    }
+
+    enum PairingFailure: String {
+        case startGateway = "start_gateway"
+        case issueAdvertisement = "issue_advertisement"
+        case invalidFrame = "invalid_frame"
+        case unsupportedWireVersion = "unsupported_wire_version"
+        case decodeRequest = "decode_request"
+        case encodeResponse = "encode_response"
+        case sendResponse = "send_response"
+        case expiredCode = "expired_code"
+        case unavailableCode = "unavailable_code"
+        case endpointMismatch = "endpoint_mismatch"
+        case unsupportedProtocol = "unsupported_protocol"
+        case upgradeRequired = "upgrade_required"
+        case confirmationRejected = "confirmation_rejected"
+        case pairingInProgress = "pairing_in_progress"
+        case alreadyPaired = "already_paired"
+        case gatewayUnavailable = "gateway_unavailable"
+        case storageUnavailable = "storage_unavailable"
+        case rejected
+
+        init(code: String) {
+            self = switch code {
+            case "pairing_expired": .expiredCode
+            case "pairing_unavailable": .unavailableCode
+            case "endpoint_mismatch": .endpointMismatch
+            case "unsupported_protocol_version": .unsupportedProtocol
+            case "pairing_upgrade_required": .upgradeRequired
+            case "pairing_confirmation_rejected": .confirmationRejected
+            case "pairing_in_progress": .pairingInProgress
+            case "already_paired": .alreadyPaired
+            case "gateway_unavailable": .gatewayUnavailable
+            case "pairing_storage_unavailable": .storageUnavailable
+            default: .rejected
+            }
+        }
+    }
+
+    @MainActor
+    static func beginRemotePairing(_ context: PairingContext) -> TraceSpan {
+        #if REPOPROMPT_SENTRY_ENABLED
+            guard started, performanceTracingEnabled else { return TraceSpan(nil) }
+            let span = SentrySDK.startTransaction(name: "Remote pairing", operation: "remote.pairing", bindToScope: false)
+            for (key, value) in remotePairingTags(context) {
+                span.setTag(value: value, key: key)
+            }
+            return TraceSpan(span)
+        #else
+            return TraceSpan()
+        #endif
+    }
+
+    static func finishRemotePairing(_ trace: TraceSpan, attemptID: UUID?, delivered: Bool) {
+        #if REPOPROMPT_SENTRY_ENABLED
+            if let attemptID {
+                trace.span?.setTag(value: attemptID.uuidString.lowercased(), key: "pairing_attempt")
+            }
+            trace.span?.finish(status: delivered ? .ok : .internalError)
+        #endif
+    }
+
+    @MainActor
+    static func recordRemotePairingResponse(_ context: PairingContext) {
+        #if REPOPROMPT_SENTRY_ENABLED
+            guard started else { return }
+            SentrySDK.logger.info(remotePairingResponseMessage, attributes: remotePairingTags(context))
+        #endif
+    }
+
+    @MainActor
+    static func recordRemotePairingFailure(_ failure: PairingFailure, context: PairingContext? = nil) {
+        #if REPOPROMPT_SENTRY_ENABLED
+            guard started else { return }
+            let now = ContinuousClock.now
+            recentPairingFailures.removeAll { now - $0 >= .seconds(60) }
+            guard recentPairingFailures.count < 10 else { return }
+            recentPairingFailures.append(now)
+
+            var tags = remotePairingTags(context)
+            tags["pairing_reason"] = failure.rawValue
+            let event = Event(level: .error)
+            event.message = SentryMessage(formatted: "Remote pairing failed on Mac: \(failure.rawValue)")
+            event.fingerprint = ["remote-pairing-macos", context?.step.rawValue ?? "setup", failure.rawValue]
+            event.tags = tags
+            SentrySDK.capture(event: event)
+        #endif
+    }
+
+    #if REPOPROMPT_SENTRY_ENABLED
+        private static let remotePairingResponseMessage = "Remote pairing response sent by Mac"
+        @MainActor private static var recentPairingFailures: [ContinuousClock.Instant] = []
+
+        private static func remotePairingTags(_ context: PairingContext?) -> [String: String] {
+            var tags = ["component": "remote_pairing", "pairing_side": "macos"]
+            if let context {
+                tags["pairing_step"] = context.step.rawValue
+                tags["pairing_path"] = context.path.rawValue
+                tags["pairing_attempt"] = context.attemptID?.uuidString.lowercased()
+            }
+            return tags
+        }
+    #endif
 
     static func addBreadcrumb(_ category: Category, action: Action, attributes: @autoclosure () -> [Attribute] = []) {
         #if REPOPROMPT_SENTRY_ENABLED
@@ -324,6 +456,11 @@ enum SentryTelemetryBootstrap {
             event.request = nil
             event.serverName = nil
             event.dist = nil
+            if event.tags?["component"] == "remote_pairing" {
+                event.breadcrumbs = nil
+                event.extra = nil
+                event.context = event.context?.filter { $0.key == "trace" }
+            }
             if let message = event.message {
                 event.message = SentryMessage(formatted: scrubString(message.formatted))
                 event.message?.message = message.message.map(scrubString)
