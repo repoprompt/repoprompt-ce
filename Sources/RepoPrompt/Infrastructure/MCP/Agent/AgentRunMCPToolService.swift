@@ -344,7 +344,7 @@ struct AgentRunMCPToolService {
         try AgentMCPToolHelpers.parseTimeoutSeconds(value) ?? capturedDefaultWaitSeconds
     }
 
-    private nonisolated static func agentRunExpiredSnapshot(sessionID: UUID) -> AgentRunMCPSnapshot {
+    nonisolated static func agentRunExpiredSnapshot(sessionID: UUID) -> AgentRunMCPSnapshot {
         AgentRunMCPSnapshot.expired(
             sessionID: sessionID,
             statusText: agentRunExpiredHandleRecoveryNote
@@ -382,6 +382,68 @@ struct AgentRunMCPToolService {
         else { return true }
         let normalized = requestedModelID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return AgentModelCatalog.taskLabels.contains { $0.label == normalized }
+    }
+
+    struct StartSelection {
+        let resolved: AgentMCPSelectionResolver.ResolvedSelection
+        let routedTarget: AgentRoutingExecutableTarget?
+
+        func resolveParameters(_ value: Value?, workspacePath: String?) async throws -> [ACPModelParameterSelection] {
+            // Resolve advertised parameters only after worktree preparation. Stored role pins
+            // are captured with model selection; explicit request parameters take precedence.
+            let explicit = try await AgentMCPModelParameterSupport.resolve(
+                value: routedTarget == nil ? value : nil,
+                agent: resolved.agentRaw.flatMap(AgentProviderKind.init(rawValue:)),
+                modelRaw: resolved.modelRaw,
+                workspacePath: workspacePath
+            )
+            return AgentMCPModelParameterSupport.merged(inherited: resolved.modelParameterSelections, explicit: explicit)
+        }
+    }
+
+    static func resolveStartSelection(
+        requestedModelID: String?,
+        hasExplicitModelParameters: Bool,
+        resolvedTabID: UUID?,
+        message: String,
+        workspaceID: UUID,
+        availability: () -> AgentModelCatalog.AvailabilityContext,
+        usageBalancingEnabled: () -> Bool,
+        route: (_ task: String, _ baseline: AgentRoutingExecutableTarget?, _ allowUsageBalance: Bool) async throws -> AgentRoutingExecutableTarget?
+    ) async throws -> StartSelection {
+        let defaultTaskLabel = defaultTaskLabelForStart(resolvedTabID: resolvedTabID)
+        let shouldRouteStart = shouldRouteModelForStart(
+            requestedModelID: requestedModelID,
+            hasExplicitModelParameters: hasExplicitModelParameters
+        )
+        func resolveBaseline() throws -> AgentMCPSelectionResolver.ResolvedSelection {
+            try AgentMCPSelectionResolver.resolve(
+                modelID: requestedModelID, defaultTaskLabel: defaultTaskLabel,
+                availability: availability(), workspaceID: workspaceID
+            )
+        }
+        let canBalanceStart = shouldRouteStart && resolvedTabID == nil && usageBalancingEnabled()
+        let usageBaseline = canBalanceStart ? try? resolveBaseline() : nil
+        let baselineTarget = usageBaseline.flatMap { value -> AgentRoutingExecutableTarget? in
+            guard let agent = value.agentRaw, let model = value.modelRaw else { return nil }
+            return .init(agentRaw: agent, modelRaw: model, reasoningEffortRaw: nil, modelParameters: value.modelParameterSelections)
+        }
+        if shouldRouteStart, let routed = try await route(
+            message, baselineTarget, resolvedTabID == nil && usageBaseline?.usageBalancingEligible == true
+        ) {
+            return StartSelection(
+                resolved: .init(
+                    agentRaw: routed.agentRaw,
+                    modelRaw: routed.modelRaw,
+                    taskLabelKind: taskLabelKindForRouterOwnedStart(
+                        requestedModelID: requestedModelID, defaultTaskLabel: defaultTaskLabel
+                    ),
+                    modelParameterSelections: routed.modelParameters
+                ),
+                routedTarget: routed
+            )
+        }
+        return try StartSelection(resolved: usageBaseline ?? resolveBaseline(), routedTarget: nil)
     }
 
     let toolName: String
@@ -445,44 +507,56 @@ struct AgentRunMCPToolService {
     var forwardOversightSteer: (([String: Value], RequestMetadata) async throws -> Value)?
     private enum OversightSteerRouting: Error { case required(RequestMetadata) }
 
-    func execute(args: [String: Value]) async throws -> Value {
-        let op = normalizedString(args["op"])?.lowercased() ?? "wait"
+    enum Operation: String {
+        case start, poll, wait, cancel, steer, respond
+    }
+
+    func resolveOperation(_ args: [String: Value]) throws -> Operation {
+        let raw = normalizedString(args["op"])?.lowercased() ?? "wait"
         #if DEBUG
-            if op != "start", args["_worktree_startup_benchmark_token"] != nil {
+            if raw != "start", args["_worktree_startup_benchmark_token"] != nil {
                 throw MCPError.invalidParams("The worktree startup benchmark token is only supported with agent_run op=start.")
             }
         #endif
-        if op != "start", startWorktreeCoordinator.containsArguments(args) {
+        if raw != "start", startWorktreeCoordinator.containsArguments(args) {
             throw MCPError.invalidParams("agent_run worktree arguments are only supported with op=start.")
         }
-        switch op {
-        case "start":
+        guard let operation = Operation(rawValue: raw) else {
+            throw MCPError.invalidParams("Unsupported agent_run op '\(raw)'. Use start, poll, wait, cancel, steer, or respond.")
+        }
+        return operation
+    }
+
+    func execute(args: [String: Value]) async throws -> Value {
+        switch try resolveOperation(args) {
+        case .start:
             return try await executeStart(args: args)
-        case "poll":
+        case .poll:
             return try await executeWait(args: args, forcePoll: true)
-        case "wait":
+        case .wait:
             return try await executeWait(args: args)
-        case "cancel":
+        case .cancel:
             return try await executeCancel(args: args)
-        case "steer":
+        case .steer:
             do {
                 return try await executeSteer(args: args)
             } catch let OversightSteerRouting.required(metadata) {
                 try Task.checkCancellation()
                 guard let forwardOversightSteer else { throw AgentSessionTargetOperationGuard.denialError(reference: "target") }
-                // Validate before any forwarder can deliver; never silently discard child-only options.
-                let allowedKeys: Set = ["op", "session_id", "message", "idempotency_key", "wait"]
-                if let rejected = args.keys.sorted().first(where: {
-                    !allowedKeys.contains($0) || ($0 == "wait" && args[$0] != .bool(false))
-                }) {
-                    throw MCPError.invalidParams("Managed lane steering uses agent_session_link steer. Rejected argument '\(rejected)': only op, session_id, message, idempotency_key, and literal wait=false are supported. Nothing was delivered.")
-                }
+                try Self.requireOversightSteerArguments(args)
                 return try await forwardOversightSteer(args, metadata)
             }
-        case "respond":
+        case .respond:
             return try await executeRespond(args: args)
-        default:
-            throw MCPError.invalidParams("Unsupported agent_run op '\(op)'. Use start, poll, wait, cancel, steer, or respond.")
+        }
+    }
+
+    static func requireOversightSteerArguments(_ args: [String: Value]) throws {
+        let allowedKeys: Set = ["op", "session_id", "message", "idempotency_key", "wait"]
+        if let rejected = args.keys.sorted().first(where: {
+            !allowedKeys.contains($0) || ($0 == "wait" && args[$0] != .bool(false))
+        }) {
+            throw MCPError.invalidParams("Managed lane steering uses agent_session_link steer. Rejected argument '\(rejected)': only op, session_id, message, idempotency_key, and literal wait=false are supported. Nothing was delivered.")
         }
     }
 
@@ -494,15 +568,24 @@ struct AgentRunMCPToolService {
         detach || timeoutSeconds <= 0 ? capturedDefaultWaitSeconds : timeoutSeconds
     }
 
-    @MainActor private struct StartResult {
+    struct StartResult {
         let value: Value
         let sessionID: UUID
         let metadata: MCPRequestMetadata
-        let delivery: AgentModeViewModel.MCPInstructionDispatch
+        let delivery: AgentMCPInstructionDispatch
         let running: Bool
     }
 
-    private func executeStart(args: [String: Value]) async throws -> Value {
+    struct StartRequest {
+        let message: String
+        let workflow: AgentWorkflowDefinition?
+        let worktree: AgentMCPStartWorktreeCoordinator.Request
+        let detached: Bool
+        let defaultWaitSeconds: TimeInterval
+        let timeoutSeconds: TimeInterval
+    }
+
+    func parseStartRequest(_ args: [String: Value]) throws -> StartRequest {
         let message = try resolveMessage(args["message"], name: "message")
         let workflow = try resolveWorkflow(args: args)
         let worktreeStartRequest = try startWorktreeCoordinator.parseRequest(args: args)
@@ -516,46 +599,90 @@ struct AgentRunMCPToolService {
             args["timeout"],
             capturedDefaultWaitSeconds: capturedDefaultWaitSeconds
         )
+        return .init(
+            message: message, workflow: workflow, worktree: worktreeStartRequest, detached: detach,
+            defaultWaitSeconds: capturedDefaultWaitSeconds, timeoutSeconds: timeoutSeconds
+        )
+    }
 
+    private func executeStart(args: [String: Value]) async throws -> Value {
+        let request = try parseStartRequest(args)
         let targetWindow = try requireTargetWindow()
         let agentModeVM = targetWindow.agentModeViewModel
+        return try await executeResolvedStart(request, operation: { expiry in
+            try await performStart(
+                args: args, message: request.message, workflow: request.workflow,
+                worktreeStartRequest: request.worktree, targetWindow: targetWindow, expiry: expiry
+            )
+        }, expiredResult: { sessionID in
+            StartResult(
+                value: Self.startExpiryValue(sessionID: sessionID, agentModeVM: agentModeVM),
+                sessionID: sessionID, metadata: .init(connectionID: nil, clientName: nil, windowID: nil),
+                delivery: .startedRun, running: false
+            )
+        }, awaitStartedRun: { result in
+            try await waitForStartedRun(request, result: result, read: windowReadAccess(agentModeVM))
+        })
+    }
+
+    func executeResolvedStart(
+        _ request: StartRequest,
+        operation: @escaping @MainActor (AgentRunStartExpiry) async throws -> StartResult,
+        expiredResult: (UUID) throws -> StartResult,
+        awaitStartedRun: (StartResult) async throws -> Value
+    ) async throws -> Value {
         let defaultExpiry = AgentRunStartExpiry(toolName: toolName, budgetSeconds: Self.startBudgetSeconds(
-            detach: detach, timeoutSeconds: timeoutSeconds, capturedDefaultWaitSeconds: capturedDefaultWaitSeconds
+            detach: request.detached, timeoutSeconds: request.timeoutSeconds, capturedDefaultWaitSeconds: request.defaultWaitSeconds
         ))
         #if DEBUG
             let expiry = testStartExpiryOverride ?? defaultExpiry
         #else
             let expiry = defaultExpiry
         #endif
+
         let result = try await AgentRunStartBudget.run(expiry: expiry) {
-            try await performStart(args: args, message: message, workflow: workflow, worktreeStartRequest: worktreeStartRequest, targetWindow: targetWindow, expiry: expiry)
+            try await operation(expiry)
         } onExpiry: {
             guard let sessionID = expiry.activatedSessionID else { throw expiry.timeoutError }
-            return StartResult(value: Self.startExpiryValue(sessionID: sessionID, agentModeVM: agentModeVM), sessionID: sessionID, metadata: .init(connectionID: nil, clientName: nil, windowID: nil), delivery: .startedRun, running: false)
+            return try expiredResult(sessionID)
         }
-        if detach || !result.running || timeoutSeconds <= 0 {
+        if request.detached || !result.running || request.timeoutSeconds <= 0 {
             return result.value
         }
-        return try await waitForInterestingState(
-            sessionID: result.sessionID, agentModeVM: agentModeVM, metadata: result.metadata,
-            timeoutSeconds: timeoutSeconds, stage: "starting",
+        return try await awaitStartedRun(result)
+    }
+
+    func waitForStartedRun(_ request: StartRequest, result: StartResult, read: RunReadAccess) async throws -> Value {
+        try await waitForInterestingState(
+            sessionID: result.sessionID, read: read, metadata: result.metadata,
+            timeoutSeconds: request.timeoutSeconds, stage: "starting",
             message: "Waiting for the started run to finish or request input...",
-            workflow: workflow, initialDelivery: result.delivery
+            workflow: request.workflow, initialDelivery: result.delivery
         )
     }
 
     static func startExpiryValue(sessionID: UUID, agentModeVM: AgentModeViewModel) -> Value {
-        let snapshot = startExpirySnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
+        startExpiryValue(startExpirySnapshot(sessionID: sessionID, agentModeVM: agentModeVM))
+    }
+
+    static func startExpiryValue(_ snapshot: AgentRunMCPSnapshot) -> Value {
         var object = snapshot.asObject()
         object["_meta"] = .object(["wait_result": .string(snapshot.isStartupPendingForMCPWait ? "startup_pending" : "timed_out")])
         return .object(object)
     }
 
     static func startExpirySnapshot(sessionID: UUID, agentModeVM: AgentModeViewModel) -> AgentRunMCPSnapshot {
-        guard let live = agentModeVM.mcpSnapshot(sessionID: sessionID) else { return .expired(sessionID: sessionID) }
-        if let session = agentModeVM.mcpRuntime.controlledWriter(sessionID: sessionID)?.session,
-           let epoch = session.mcpControlContext?.currentEpoch
-        {
+        startExpirySnapshot(
+            sessionID: sessionID, live: agentModeVM.mcpSnapshot(sessionID: sessionID),
+            ownerSession: agentModeVM.mcpRuntime.controlledWriter(sessionID: sessionID)?.session
+        )
+    }
+
+    static func startExpirySnapshot(
+        sessionID: UUID, live: AgentRunMCPSnapshot?, ownerSession: AgentTabSession?
+    ) -> AgentRunMCPSnapshot {
+        guard let live else { return .expired(sessionID: sessionID) }
+        if let session = ownerSession, let epoch = session.mcpControlContext?.currentEpoch {
             let ownership = session.runState.isActive
                 ? session.activeRunOwnership
                 : session.lastTerminalCommitRevision?.ownership
@@ -663,66 +790,38 @@ struct AgentRunMCPToolService {
             }
         }
 
-        // Compute the default task label before target creation. Omitted `model_id`
-        // for agent_run.start resolves through the effective workspace Pair role default.
-        let defaultTaskLabel = Self.defaultTaskLabelForStart(resolvedTabID: resolvedTabID, workflow: workflow)
-
-        // An explicit compound model ID or model parameters are caller authority, even when
-        // Router is on. Default and role-label starts remain eligible for model routing.
-        let requestedModelID = normalizedString(args["model_id"])
-        let routedTaskLabelKind = Self.taskLabelKindForRouterOwnedStart(
-            requestedModelID: requestedModelID,
-            defaultTaskLabel: defaultTaskLabel
-        )
-        var selection: AgentMCPSelectionResolver.ResolvedSelection
-        var routedReasoningEffortRaw: String?
-        var routerSelectedTarget = false
-        let shouldRouteStart = Self.shouldRouteModelForStart(requestedModelID: requestedModelID, hasExplicitModelParameters: args["model_parameters"] != nil)
-        let canBalanceStart = shouldRouteStart && resolvedTabID == nil && agentModeVM.modelRouterSettingsStore.modelRouterConfiguration().usageBalancing.enabled
-        let usageBaseline: AgentMCPSelectionResolver.ResolvedSelection? = canBalanceStart ? try? AgentMCPSelectionResolver.resolve(
-            modelID: requestedModelID, defaultTaskLabel: defaultTaskLabel,
-            availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
-            workspaceID: workspace.id
-        ) : nil
-        let baselineTarget = usageBaseline.flatMap { value -> AgentRoutingExecutableTarget? in
-            guard let agent = value.agentRaw, let model = value.modelRaw else { return nil }
-            return .init(agentRaw: agent, modelRaw: model, reasoningEffortRaw: nil, modelParameters: value.modelParameterSelections)
-        }
+        let startSelection: StartSelection
         do {
-            if shouldRouteStart, let routed = try await agentModeVM.routeSubagentTargetIfEnabled(
-                task: message,
-                surface: .general,
-                baseline: baselineTarget,
-                allowUsageBalance: resolvedTabID == nil && usageBaseline?.usageBalancingEligible == true
-            ) {
-                selection = AgentMCPSelectionResolver.ResolvedSelection(
-                    agentRaw: routed.agentRaw,
-                    modelRaw: routed.modelRaw,
-                    taskLabelKind: routedTaskLabelKind,
-                    modelParameterSelections: routed.modelParameters
-                )
-                routedReasoningEffortRaw = routed.reasoningEffortRaw
-                routerSelectedTarget = true
-                #if DEBUG
-                    perfRecorder.event("modelRouter.subagent.selected", fields: [
-                        "entryPoint": "agent_run.start",
-                        "provider": routed.agentRaw,
-                        "model": routed.modelRaw,
-                        "effort": routed.reasoningEffortRaw ?? "provider-default",
-                        "overrodeRequestedModel": "false"
-                    ])
-                #endif
-            } else {
-                selection = try usageBaseline ?? AgentMCPSelectionResolver.resolve(
-                    modelID: requestedModelID,
-                    defaultTaskLabel: defaultTaskLabel,
-                    availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
-                    workspaceID: workspace.id
+            startSelection = try await Self.resolveStartSelection(
+                requestedModelID: normalizedString(args["model_id"]),
+                hasExplicitModelParameters: args["model_parameters"] != nil,
+                resolvedTabID: resolvedTabID,
+                message: message,
+                workspaceID: workspace.id,
+                availability: { targetWindow.apiSettingsViewModel.agentModeAvailabilityContext },
+                usageBalancingEnabled: { agentModeVM.modelRouterSettingsStore.modelRouterConfiguration().usageBalancing.enabled }
+            ) { task, baseline, allowUsageBalance in
+                try await agentModeVM.routeSubagentTargetIfEnabled(
+                    task: task, surface: .general, baseline: baseline, allowUsageBalance: allowUsageBalance
                 )
             }
         } catch {
             throw MCPError.invalidParams(error.localizedDescription)
         }
+        let selection = startSelection.resolved
+        let routedReasoningEffortRaw = startSelection.routedTarget?.reasoningEffortRaw
+        let routerSelectedTarget = startSelection.routedTarget != nil
+        #if DEBUG
+            if let routed = startSelection.routedTarget {
+                perfRecorder.event("modelRouter.subagent.selected", fields: [
+                    "entryPoint": "agent_run.start",
+                    "provider": routed.agentRaw,
+                    "model": routed.modelRaw,
+                    "effort": routed.reasoningEffortRaw ?? "provider-default",
+                    "overrodeRequestedModel": "false"
+                ])
+            }
+        #endif
 
         #if DEBUG
             if let rawToken = normalizedString(args["_worktree_startup_benchmark_token"]) {
@@ -1007,20 +1106,8 @@ struct AgentRunMCPToolService {
             runParameterWorkspacePath = try agentModeVM.session(for: target.tabID, createIfNeeded: false)
                 .flatMap { try agentModeVM.effectiveWorkspacePath(for: $0) }
                 ?? workspace.repoPaths.first
-            let explicitModelParameterSelections = try await AgentMCPModelParameterSupport.resolve(
-                value: routerSelectedTarget ? nil : args["model_parameters"],
-                agent: selection.agentRaw.flatMap { AgentProviderKind(rawValue: $0) },
-                modelRaw: selection.modelRaw,
-                workspacePath: runParameterWorkspacePath
-            )
-            // A role-label start inherits the role's stored pin as a baseline, captured with the
-            // role resolution (never re-read after awaited setup). Explicit request parameters
-            // override matching identities; a compound model_id inherits nothing, because the
-            // resolver hands back no baseline for one — which is why the merge needs no role
-            // check here.
-            modelParameterSelections = AgentMCPModelParameterSupport.merged(
-                inherited: selection.modelParameterSelections,
-                explicit: explicitModelParameterSelections
+            modelParameterSelections = try await startSelection.resolveParameters(
+                args["model_parameters"], workspacePath: runParameterWorkspacePath
             )
         } catch {
             await agentModeVM.mcpDiscardSessionTarget(target)
@@ -1213,23 +1300,29 @@ struct AgentRunMCPToolService {
                 args["timeout"],
                 capturedDefaultWaitSeconds: capturedDefaultWaitSeconds
             )
-        let initialSnapshot = await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
+        let read = windowReadAccess(agentModeVM)
+        return try await executeResolvedWait(sessionID: sessionID, read: read, metadata: metadata, timeoutSeconds: timeoutSeconds)
+    }
+
+    func executeResolvedWait(
+        sessionID: UUID, read: RunReadAccess, metadata: RequestMetadata, timeoutSeconds: TimeInterval
+    ) async throws -> Value {
+        let initialSnapshot = await read.snapshot(sessionID)
         if initialSnapshot.isActionableForMCPWait || timeoutSeconds <= 0 {
             return decoratedRunValue(snapshot: initialSnapshot)
         }
         return try await waitForInterestingState(
             sessionID: sessionID,
-            agentModeVM: agentModeVM,
+            read: read,
             metadata: metadata,
             timeoutSeconds: timeoutSeconds,
             stage: "waiting",
-            message: "Waiting for the agent run to finish or request input...",
-            liveSnapshot: initialSnapshot
+            message: "Waiting for the agent run to finish or request input..."
         )
     }
 
     private func executeWaitAny(args: [String: Value]) async throws -> Value {
-        let references = try parseSessionIDArray(args)
+        let references = try Self.parseSessionIDArray(args)
         let targetWindow = try requireTargetWindow()
         let agentModeVM = resolvedAgentModeViewModel(targetWindow)
         let sessionIDs = try await resolveControlSessionIDs(references, targetWindow: targetWindow, agentModeVM: agentModeVM)
@@ -1257,7 +1350,14 @@ struct AgentRunMCPToolService {
             args["timeout"],
             capturedDefaultWaitSeconds: capturedDefaultWaitSeconds
         )
-        let initialSnapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, agentModeVM: agentModeVM)
+        return try await executeResolvedWaitAny(sessionIDs: sessionIDs, read: windowReadAccess(agentModeVM), metadata: metadata, timeoutSeconds: timeoutSeconds)
+    }
+
+    func executeResolvedWaitAny(
+        sessionIDs: [UUID], read: RunReadAccess, metadata: RequestMetadata, timeoutSeconds: TimeInterval
+    ) async throws -> Value {
+        precondition(sessionIDs.count > 1, "Single-session waits must use the single-session response shape")
+        let initialSnapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, read: read)
 
         if let ready = initialSnapshots.first(where: { isInterestingSnapshot($0) }) {
             return decoratedMultiWaitValue(
@@ -1288,7 +1388,7 @@ struct AgentRunMCPToolService {
             ) {
                 try await waitForAnyInterestingState(
                     sessionIDs: sessionIDs,
-                    agentModeVM: agentModeVM,
+                    read: read,
                     timeoutSeconds: timeoutSeconds,
                     initialSnapshots: initialSnapshots,
                     waitConsumerParentRunID: waitScopeRegistration?.parentRunID
@@ -1302,7 +1402,7 @@ struct AgentRunMCPToolService {
         } catch is CancellationError {
             if let value = await waitAnyCancellationValueIfActionable(
                 sessionIDs: sessionIDs,
-                agentModeVM: agentModeVM,
+                read: read,
                 fallbackSnapshots: initialSnapshots
             ) {
                 let completion = waitScopeCompletion(from: value, fallbackSessionIDs: sessionIDs)
@@ -1354,7 +1454,7 @@ struct AgentRunMCPToolService {
     }
 
     private func executePollMany(args: [String: Value]) async throws -> Value {
-        let references = try parseSessionIDArray(args)
+        let references = try Self.parseSessionIDArray(args)
         let targetWindow = try requireTargetWindow()
         let agentModeVM = resolvedAgentModeViewModel(targetWindow)
         let sessionIDs = try await resolveControlSessionIDs(references, targetWindow: targetWindow, agentModeVM: agentModeVM)
@@ -1384,22 +1484,9 @@ struct AgentRunMCPToolService {
         return decoratedMultiPollValue(sessionIDs: sessionIDs, snapshots: snapshots, overseers: overseers)
     }
 
-    /// A cancellation never retargets after suspension, even to a successor run of the same session.
-    private struct CancelTarget {
-        let window: WindowState
-        let workspaceID: UUID
-        let session: AgentModeViewModel.TabSession
-        let sessionID: UUID
-        let binding: AgentPersistentSessionBindingIdentity
-        let control: AgentModeViewModel.AgentMCPControlContext
-        let controlGeneration: UInt64
-        let ownership: AgentRunOwnership?
-        let runID: UUID?
-        let stopFence: AgentRunStartStopFence
-        let parentSessionID: UUID?
-        let pendingStart: Bool
-        let pendingUpdatedAt: Date?
-        let scheduledProducerID: UUID?
+    func executeResolvedPollMany(sessionIDs: [UUID], read: RunReadAccess, overseers: [UUID: Value] = [:]) async -> Value {
+        let snapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, read: read)
+        return decoratedMultiPollValue(sessionIDs: sessionIDs, snapshots: snapshots, overseers: overseers)
     }
 
     private func executeCancel(args: [String: Value]) async throws -> Value {
@@ -1422,30 +1509,53 @@ struct AgentRunMCPToolService {
         do { resolvedSession = try agentModeVM.authoritativeLiveSession(for: sessionID) } catch {
             throw AgentSessionTargetOperationGuard.denialError(reference: reference)
         }
-        guard let session = resolvedSession,
-              agentModeVM.mcpRuntime.controlledWriter(sessionID: sessionID)?.session === session,
-              session.activeAgentSessionID == sessionID,
-              let binding = session.persistentSessionBindingIdentity,
-              let control = session.mcpControlContext,
-              let workspaceID = targetWindow.workspaceManager.activeWorkspaceID,
-              session.runState.isActive || session.mcpFollowUpRunPending
+
+        guard let session = resolvedSession, let workspaceID = targetWindow.workspaceManager.activeWorkspaceID,
+              let target = AgentRunCapturedCancellation(
+                  sessionID: sessionID, session: session,
+                  runtime: agentModeVM.mcpRuntime, executor: agentModeVM.linkExecutionRuntime,
+                  requireOrigin: {
+                      do {
+                          guard try requireTargetWindow() === targetWindow,
+                                !targetWindow.isClosing, !WindowStatesManager.shared.isTerminating,
+                                targetWindow.workspaceManager.activeWorkspaceID == workspaceID,
+                                try agentModeVM.authoritativeLiveSession(for: sessionID) === session
+                          else {
+                              throw AgentSessionTargetOperationGuard.denialError(sessionID: sessionID)
+                          }
+                      } catch {
+                          throw AgentSessionTargetOperationGuard.denialError(sessionID: sessionID)
+                      }
+                      try AgentSessionTargetOperationGuard.require(
+                          operation: .runCancel, caller: caller,
+                          provenance: session.hasLoadedPersistedState
+                              ? .known(targetSessionID: sessionID, parentSessionID: session.parentSessionID)
+                              : .unknown(targetSessionID: sessionID),
+                          reference: sessionID.uuidString
+                      )
+                  }
+              )
         else { throw AgentSessionTargetOperationGuard.denialError(reference: reference) }
-        let pendingStart = !session.runState.isActive && session.mcpFollowUpRunPending
-        guard pendingStart ? session.activeRunOwnership == nil
-            : (session.activeRunOwnership != nil && session.runID != nil)
-        else { throw AgentSessionTargetOperationGuard.denialError(reference: reference) }
-        let target = CancelTarget(
-            window: targetWindow, workspaceID: workspaceID, session: session, sessionID: sessionID,
-            binding: binding, control: control, controlGeneration: session.mcpControlActivationGeneration,
-            ownership: session.activeRunOwnership, runID: session.runID,
-            stopFence: AgentRunStartStopFence(session: session), parentSessionID: session.parentSessionID,
-            pendingStart: pendingStart, pendingUpdatedAt: session.mcpFollowUpRunPendingUpdatedAt,
-            scheduledProducerID: session.scheduledACPFollowUp?.id
-        )
-        try requireCurrentCancelTarget(target, caller: caller)
-        let initialSnapshot = await currentSnapshot(
-            sessionID: sessionID, registration: control.registration, agentModeVM: agentModeVM
-        )
+        return try await executeResolvedCancellation(target, metadata: metadata, snapshot: {
+            await currentSnapshot(sessionID: sessionID, registration: target.control.registration, agentModeVM: agentModeVM)
+        }, revalidateOrigin: {
+            let currentCaller = await AgentSessionTargetOperationGuard.resolveCaller(
+                metadata: metadata, targetWindow: targetWindow,
+                resolveSpawnParentSessionID: resolveSpawnParentSessionID
+            )
+            guard currentCaller == caller else {
+                throw AgentSessionTargetOperationGuard.denialError(sessionID: sessionID)
+            }
+        })
+    }
+
+    func executeResolvedCancellation(
+        _ target: AgentRunCapturedCancellation, metadata: RequestMetadata,
+        snapshot readSnapshot: () async -> AgentRunMCPSnapshot,
+        revalidateOrigin: @escaping @MainActor () async throws -> Void
+    ) async throws -> Value {
+        try target.requireCurrent()
+        let initialSnapshot = await readSnapshot()
         if initialSnapshot.status == .expired {
             throw MCPError.invalidParams(agentRunExpiredHandleRecoveryNote)
         }
@@ -1455,7 +1565,8 @@ struct AgentRunMCPToolService {
         let cancelResult = try await withHeartbeat(
             metadata.connectionID, toolName, "cancelling", "Cancelling the agent run..."
         ) {
-            try await cancelCapturedTarget(target, caller: caller, metadata: metadata)
+            try await revalidateOrigin()
+            return try await target.cancel()
         }
         if let object = cancelResult.objectValue {
             var result = try decoratedRunValue(snapshot: snapshot(from: object)).objectValue ?? object
@@ -1463,130 +1574,6 @@ struct AgentRunMCPToolService {
             return .object(result)
         }
         return cancelResult
-    }
-
-    /// Reuses the existing direct-child policy against the admitted object's own immutable provenance.
-    /// This synchronous fence is also the run owner's final admission callback.
-    private func requireCurrentCancelTarget(
-        _ target: CancelTarget, caller: DomainAgentSessionCallerIdentity
-    ) throws {
-        try Task.checkCancellation()
-        let viewModel = target.window.agentModeViewModel
-        let session = target.session
-        let resolvedSession: AgentModeViewModel.TabSession?
-        do { resolvedSession = try viewModel.authoritativeLiveSession(for: target.sessionID) } catch {
-            throw AgentSessionTargetOperationGuard.denialError(sessionID: target.sessionID)
-        }
-        guard try requireTargetWindow() === target.window,
-              !target.window.isClosing, !WindowStatesManager.shared.isTerminating,
-              target.window.workspaceManager.activeWorkspaceID == target.workspaceID,
-              resolvedSession === session,
-              viewModel.mcpRuntime.controlledWriter(sessionID: target.sessionID)?.session === session,
-              session.activeAgentSessionID == target.sessionID,
-              session.persistentSessionBindingIdentity == target.binding,
-              session.mcpControlContext == target.control,
-              session.mcpControlActivationGeneration == target.controlGeneration,
-              session.activeRunOwnership == target.ownership, session.runID == target.runID,
-              session.stopState.cancellationGeneration == target.stopFence.cancellationGeneration,
-              session.parentSessionID == target.parentSessionID,
-              !target.pendingStart || (
-                  session.mcpFollowUpRunPendingUpdatedAt == target.pendingUpdatedAt
-                      && session.scheduledACPFollowUp?.id == target.scheduledProducerID
-              ),
-              !session.terminalCommitInProgress,
-              target.pendingStart ? (!session.runState.isActive && session.mcpFollowUpRunPending) : session.runState.isActive
-        else { throw AgentSessionTargetOperationGuard.denialError(sessionID: target.sessionID) }
-        let provenance: DomainAgentSessionTargetProvenance = session.hasLoadedPersistedState
-            ? AgentSessionTargetOperationGuard.provenance(
-                for: target.sessionID, loadedParentSessionID: session.parentSessionID
-            )
-            : .unknown(targetSessionID: target.sessionID)
-        try AgentSessionTargetOperationGuard.require(
-            operation: .runCancel, caller: caller, provenance: provenance,
-            reference: target.sessionID.uuidString
-        )
-    }
-
-    private func cancelCapturedTarget(
-        _ target: CancelTarget, caller: DomainAgentSessionCallerIdentity, metadata: RequestMetadata
-    ) async throws -> Value {
-        let currentCaller = await AgentSessionTargetOperationGuard.resolveCaller(
-            metadata: metadata, targetWindow: target.window,
-            resolveSpawnParentSessionID: resolveSpawnParentSessionID
-        )
-        guard currentCaller == caller else {
-            throw AgentSessionTargetOperationGuard.denialError(sessionID: target.sessionID)
-        }
-        try requireCurrentCancelTarget(target, caller: caller)
-        let admission = AgentRunCancellationAdmission(
-            scope: target.pendingStart ? .pendingStart : .activeRun,
-            session: target.session, binding: target.binding,
-            expectedOwnership: target.ownership, expectedRunID: target.runID,
-            cancellationGeneration: target.stopFence.cancellationGeneration,
-            pendingStartFence: target.pendingStart ? target.stopFence : nil,
-            validateAndClaim: {
-                do {
-                    try requireCurrentCancelTarget(target, caller: caller)
-                    return true
-                } catch { return false }
-            }
-        )
-        let viewModel = target.window.agentModeViewModel
-        let admitted: Bool
-        var stopped = false
-        var outcomeSnapshot: AgentRunMCPSnapshot?
-        if target.pendingStart {
-            admitted = viewModel.linkExecutionRuntime.withdrawPendingStartForSessionLink(session: target.session, admission: admission)
-            if admitted { outcomeSnapshot = viewModel.mcpRuntime.mcpSnapshot(for: target.session) }
-        } else {
-            guard let ownership = target.ownership else {
-                throw AgentSessionTargetOperationGuard.denialError(sessionID: target.sessionID)
-            }
-            let recorder = AgentRunCancellationOutcomeRecorder(
-                expectedOwnership: ownership, expectedRunID: target.runID, expectedBinding: target.binding,
-                onAcceptedPrimaryPublication: { _ in
-                    stopped = true
-                    if target.session.mcpControlContext == target.control,
-                       !target.session.runState.isActive,
-                       target.session.runID == nil || target.session.runID == target.runID
-                    {
-                        outcomeSnapshot = viewModel.mcpRuntime.mcpSnapshot(
-                            for: target.session, canonicalTerminalState: .cancelled,
-                            canonicalProviderRunID: target.runID
-                        )
-                    }
-                }
-            )
-            admitted = await viewModel.linkExecutionRuntime.cancelAgentRunForSessionLink(
-                session: target.session, admission: admission, outcomeRecorder: recorder,
-                completion: .terminalPublished
-            )
-        }
-        guard admitted else { throw AgentSessionTargetOperationGuard.denialError(sessionID: target.sessionID) }
-        // The effect is settled. Read no UUID-routed store or successor snapshot after this point.
-        // Natural completion can win the terminal race; only the matching original revision may
-        // describe that outcome. The receipt still distinguishes initiation from a stopped run.
-        if outcomeSnapshot == nil,
-           target.session.persistentSessionBindingIdentity == target.binding,
-           target.session.mcpControlContext == target.control,
-           !target.session.runState.isActive,
-           target.session.runID == nil || target.session.runID == target.runID,
-           let revision = target.session.lastTerminalCommitRevision,
-           revision.ownership == target.ownership, revision.expectedRunID == target.runID
-        {
-            outcomeSnapshot = viewModel.mcpRuntime.mcpSnapshot(
-                for: target.session, canonicalTerminalState: revision.terminalState,
-                canonicalProviderRunID: target.runID
-            )
-        }
-        var result = (outcomeSnapshot ?? Self.agentRunExpiredSnapshot(sessionID: target.sessionID)).asObject()
-        result["cancellation"] = .object([
-            "run_id": target.runID.map { .string($0.uuidString) } ?? .null,
-            "initiated": .bool(!target.pendingStart),
-            "stopped": .bool(stopped),
-            "pending_start_withdrawn": .bool(target.pendingStart)
-        ])
-        return .object(result)
     }
 
     private func executeSteer(args: [String: Value]) async throws -> Value {
@@ -1719,6 +1706,21 @@ struct AgentRunMCPToolService {
         }
         await Task.yield()
 
+        return try await completeSteer(
+            args,
+            metadata: metadata,
+            snapshot: snapshot,
+            workflow: workflow,
+            delivery: delivery,
+            read: windowReadAccess(agentModeVM)
+        )
+    }
+
+    func completeSteer(
+        _ args: [String: Value], metadata: RequestMetadata, snapshot: AgentRunMCPSnapshot,
+        workflow: AgentWorkflowDefinition?, delivery: AgentMCPInstructionDispatch, read: RunReadAccess
+    ) async throws -> Value {
+        let sessionID = snapshot.sessionID
         // Steer-and-wait: optionally block until the agent reaches an interesting state
         let shouldWait: Bool = {
             if let explicit = parseBool(args["wait"]) {
@@ -1754,14 +1756,13 @@ struct AgentRunMCPToolService {
             if timeout > 0 {
                 return try await waitForInterestingState(
                     sessionID: sessionID,
-                    agentModeVM: agentModeVM,
+                    read: read,
                     metadata: metadata,
                     timeoutSeconds: timeout,
                     stage: "steering",
                     message: "Waiting for the steered run to finish or request input...",
                     workflow: workflow,
-                    initialDelivery: delivery,
-                    liveSnapshot: snapshot.status == .running ? snapshot : nil
+                    initialDelivery: delivery
                 )
             }
         }
@@ -1945,19 +1946,32 @@ struct AgentRunMCPToolService {
         )
     }
 
-    private func waitForInterestingState(
+    struct RunReadAccess {
+        let waitCursor: @MainActor @Sendable (UUID) -> AgentRunSessionStore.WaitCursor?
+        let snapshot: @MainActor @Sendable (UUID) async -> AgentRunMCPSnapshot
+        let unavailable: @MainActor @Sendable (UUID) -> AgentRunMCPSnapshot?
+    }
+
+    private func windowReadAccess(_ agentModeVM: AgentModeViewModel) -> RunReadAccess {
+        RunReadAccess(
+            waitCursor: { agentModeVM.mcpRuntime.waitCursor(sessionID: $0) },
+            snapshot: { await currentSnapshot(sessionID: $0, agentModeVM: agentModeVM) },
+            unavailable: { unavailableControlReadSnapshot(sessionID: $0, agentModeVM: agentModeVM) }
+        )
+    }
+
+    func waitForInterestingState(
         sessionID: UUID,
-        agentModeVM: AgentModeViewModel,
+        read: RunReadAccess,
         metadata: RequestMetadata,
         timeoutSeconds: TimeInterval,
         stage: String,
         message: String,
         workflow: AgentWorkflowDefinition? = nil,
-        initialDelivery: AgentModeViewModel.MCPInstructionDispatch? = nil,
-        liveSnapshot _: AgentRunMCPSnapshot? = nil
+        initialDelivery: AgentModeViewModel.MCPInstructionDispatch? = nil
     ) async throws -> Value {
-        guard let initialCursor = agentModeVM.mcpRuntime.waitCursor(sessionID: sessionID) else {
-            if let unavailable = unavailableControlReadSnapshot(sessionID: sessionID, agentModeVM: agentModeVM) {
+        guard let initialCursor = read.waitCursor(sessionID) else {
+            if let unavailable = read.unavailable(sessionID) {
                 var object = unavailable.asObject()
                 object["_meta"] = .object(["wait_result": .string("unavailable")])
                 return .object(object)
@@ -1983,7 +1997,7 @@ struct AgentRunMCPToolService {
                     }
                     let remaining = Self.timeInterval(from: clock.now.duration(to: deadline))
                     guard remaining > 0 else {
-                        let value = await timedOutWaitValue(sessionID: sessionID, agentModeVM: agentModeVM)
+                        let value = await timedOutWaitValue(sessionID: sessionID, read: read)
                         let result = Self.waitResult(from: value) ?? "timed_out"
                         completionBox.set(AgentRunWaitScopeCompletion(
                             reason: result == "startup_pending" ? .startupPending : .timedOut,
@@ -2043,13 +2057,13 @@ struct AgentRunMCPToolService {
                                 pendingSessionIDs: [sessionID],
                                 errorDescription: nil
                             ))
-                            return await supersededWaitValue(sessionID: sessionID, agentModeVM: agentModeVM)
+                            return await supersededWaitValue(sessionID: sessionID, read: read)
                         }
                         cursor = .init(registration: cursor.registration, epoch: epoch)
                     case let .terminalPublicationRejected(_, reason):
                         throw MCPError.internalError("The agent run terminal state could not be published: \(reason)")
                     case .timedOut:
-                        let value = await timedOutWaitValue(sessionID: sessionID, agentModeVM: agentModeVM)
+                        let value = await timedOutWaitValue(sessionID: sessionID, read: read)
                         let result = Self.waitResult(from: value) ?? "timed_out"
                         completionBox.set(AgentRunWaitScopeCompletion(
                             reason: result == "startup_pending" ? .startupPending : .timedOut,
@@ -2077,7 +2091,7 @@ struct AgentRunMCPToolService {
             if error is CancellationError,
                let resolution = await cancelledSingleWaitResolutionIfActionable(
                    sessionID: sessionID,
-                   agentModeVM: agentModeVM
+                   read: read
                )
             {
                 if let waitScopeRegistration {
@@ -2086,7 +2100,7 @@ struct AgentRunMCPToolService {
                 return try await finalDecoratedSingleWaitValue(
                     from: resolution.rawValue,
                     sessionID: sessionID,
-                    agentModeVM: agentModeVM,
+                    read: read,
                     workflow: workflow,
                     initialDelivery: initialDelivery
                 )
@@ -2110,7 +2124,7 @@ struct AgentRunMCPToolService {
         return try await finalDecoratedSingleWaitValue(
             from: snapshot,
             sessionID: sessionID,
-            agentModeVM: agentModeVM,
+            read: read,
             workflow: workflow,
             initialDelivery: initialDelivery
         )
@@ -2118,9 +2132,9 @@ struct AgentRunMCPToolService {
 
     private func timedOutWaitValue(
         sessionID: UUID,
-        agentModeVM: AgentModeViewModel
+        read: RunReadAccess
     ) async -> Value {
-        let snapshot = await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
+        let snapshot = await read.snapshot(sessionID)
         var object = snapshot.asObject()
         object["_meta"] = .object([
             "wait_result": .string(snapshot.isStartupPendingForMCPWait ? "startup_pending" : "timed_out")
@@ -2134,9 +2148,9 @@ struct AgentRunMCPToolService {
 
     private func supersededWaitValue(
         sessionID: UUID,
-        agentModeVM: AgentModeViewModel
+        read: RunReadAccess
     ) async -> Value {
-        let snapshot = await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
+        let snapshot = await read.snapshot(sessionID)
         var object = snapshot.asObject()
         object["_meta"] = .object([
             "wake_reason": .string("superseded_turn"),
@@ -2170,9 +2184,9 @@ struct AgentRunMCPToolService {
 
     private func cancelledSingleWaitResolutionIfActionable(
         sessionID: UUID,
-        agentModeVM: AgentModeViewModel
+        read: RunReadAccess
     ) async -> CancelledSingleWaitResolution? {
-        let snapshot = await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
+        let snapshot = await read.snapshot(sessionID)
         guard snapshot.status != .expired, snapshot.isActionableForMCPWait else { return nil }
         let value = snapshot.toValue()
         return CancelledSingleWaitResolution(
@@ -2184,7 +2198,7 @@ struct AgentRunMCPToolService {
     private func finalDecoratedSingleWaitValue(
         from rawValue: Value,
         sessionID: UUID,
-        agentModeVM: AgentModeViewModel,
+        read: RunReadAccess,
         workflow: AgentWorkflowDefinition?,
         initialDelivery: AgentModeViewModel.MCPInstructionDispatch?
     ) async throws -> Value {
@@ -2194,7 +2208,7 @@ struct AgentRunMCPToolService {
         if let object = rawValue.objectValue {
             resolvedSnapshot = try snapshot(from: object)
         } else {
-            resolvedSnapshot = await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
+            resolvedSnapshot = await read.snapshot(sessionID)
         }
         let decorated = decoratedRunValue(
             snapshot: resolvedSnapshot,
@@ -2218,10 +2232,10 @@ struct AgentRunMCPToolService {
 
     private func waitAnyCancellationValueIfActionable(
         sessionIDs: [UUID],
-        agentModeVM: AgentModeViewModel,
+        read: RunReadAccess,
         fallbackSnapshots: [AgentRunMCPSnapshot]
     ) async -> Value? {
-        let freshSnapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, agentModeVM: agentModeVM)
+        let freshSnapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, read: read)
         let snapshots = freshSnapshots.isEmpty ? fallbackSnapshots : freshSnapshots
         guard !snapshots.isEmpty else { return nil }
 
@@ -2240,13 +2254,13 @@ struct AgentRunMCPToolService {
 
     private func waitAnySteeringInterruptValue(
         sessionIDs: [UUID],
-        agentModeVM: AgentModeViewModel,
+        read: RunReadAccess,
         wake: AgentRunSessionStore.NoteworthyWake,
         latestSnapshots: [AgentRunMCPSnapshot],
         waitConsumerParentRunID: UUID?
     ) async -> Value {
         let triggeringSnapshot = wake.snapshot
-        let freshSnapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, agentModeVM: agentModeVM)
+        let freshSnapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, read: read)
         var snapshots = freshSnapshots.isEmpty ? latestSnapshots : freshSnapshots
         if snapshots.isEmpty {
             snapshots = [triggeringSnapshot]
@@ -2327,17 +2341,17 @@ struct AgentRunMCPToolService {
 
     private nonisolated func waitForAnyInterestingState(
         sessionIDs: [UUID],
-        agentModeVM: AgentModeViewModel,
+        read: RunReadAccess,
         timeoutSeconds: TimeInterval,
         initialSnapshots: [AgentRunMCPSnapshot],
         waitConsumerParentRunID: UUID?
     ) async throws -> Value {
         let cursors = await MainActor.run {
-            sessionIDs.compactMap { agentModeVM.mcpRuntime.waitCursor(sessionID: $0) }
+            sessionIDs.compactMap { read.waitCursor($0) }
         }
         guard !cursors.isEmpty else {
             for sessionID in sessionIDs {
-                if let unavailable = await unavailableControlReadSnapshot(sessionID: sessionID, agentModeVM: agentModeVM) {
+                if let unavailable = await read.unavailable(sessionID) {
                     return decoratedMultiWaitValue(
                         snapshot: unavailable, sessionIDs: sessionIDs, result: "unavailable",
                         pendingSessionIDs: sessionIDs
@@ -2356,7 +2370,7 @@ struct AgentRunMCPToolService {
             fallbackSessionID: sessionIDs[0],
             timeoutSeconds: timeoutSeconds
         )
-        let snapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, agentModeVM: agentModeVM)
+        let snapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, read: read)
         switch result.disposition {
         case let .actionable(snapshot):
             return decoratedMultiWaitValue(
@@ -2369,7 +2383,7 @@ struct AgentRunMCPToolService {
         case let .steeringInterrupted(wake):
             return await waitAnySteeringInterruptValue(
                 sessionIDs: sessionIDs,
-                agentModeVM: agentModeVM,
+                read: read,
                 wake: wake,
                 latestSnapshots: snapshots,
                 waitConsumerParentRunID: waitConsumerParentRunID
@@ -2403,7 +2417,7 @@ struct AgentRunMCPToolService {
         case .cancelled:
             if let value = await waitAnyCancellationValueIfActionable(
                 sessionIDs: sessionIDs,
-                agentModeVM: agentModeVM,
+                read: read,
                 fallbackSnapshots: snapshots
             ) {
                 return value
@@ -2568,7 +2582,7 @@ struct AgentRunMCPToolService {
             return try await finalDecoratedSingleWaitValue(
                 from: rawValue,
                 sessionID: sessionID,
-                agentModeVM: agentModeVM,
+                read: windowReadAccess(agentModeVM),
                 workflow: nil,
                 initialDelivery: nil
             )
@@ -2826,7 +2840,7 @@ struct AgentRunMCPToolService {
         )
     }
 
-    private func decoratedRunValue(
+    func decoratedRunValue(
         snapshot: AgentRunMCPSnapshot,
         workflow: AgentWorkflowDefinition? = nil,
         delivery: AgentModeViewModel.MCPInstructionDispatch? = nil,
@@ -3321,11 +3335,11 @@ struct AgentRunMCPToolService {
         return try optionalBool(in: object, key: key)
     }
 
-    private func collectCurrentSnapshots(sessionIDs: [UUID], agentModeVM: AgentModeViewModel) async -> [AgentRunMCPSnapshot] {
+    private func collectCurrentSnapshots(sessionIDs: [UUID], read: RunReadAccess) async -> [AgentRunMCPSnapshot] {
         var snapshots: [AgentRunMCPSnapshot] = []
         snapshots.reserveCapacity(sessionIDs.count)
         for sessionID in sessionIDs {
-            await snapshots.append(currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM))
+            await snapshots.append(read.snapshot(sessionID))
         }
         return snapshots
     }
@@ -3378,7 +3392,7 @@ struct AgentRunMCPToolService {
 
     /// Parses and resolves in one step, which is all `agent_run` ever needs: it has no ledger to
     /// consult between the two halves, so nothing here may observe them apart.
-    private func resolveWorkflow(args: [String: Value]) throws -> AgentWorkflowDefinition? {
+    func resolveWorkflow(args: [String: Value]) throws -> AgentWorkflowDefinition? {
         guard let reference = try AgentWorkflowReference.parse(args: args) else { return nil }
         guard let workflow = reference.resolved() else {
             throw MCPError.invalidParams(reference.notFoundMessage)
@@ -3386,7 +3400,7 @@ struct AgentRunMCPToolService {
         return workflow
     }
 
-    private func resolveMessage(_ value: Value?, name: String) throws -> String {
+    func resolveMessage(_ value: Value?, name: String) throws -> String {
         let message = normalizedString(value) ?? ""
         guard !message.isEmpty else {
             throw MCPError.invalidParams("\(name) is required.")
@@ -3704,8 +3718,8 @@ struct AgentRunMCPToolService {
         }
     }
 
-    private func parseSessionIDArray(_ args: [String: Value]) throws -> [String] {
-        if normalizedString(args["session_id"]) != nil {
+    static func parseSessionIDArray(_ args: [String: Value]) throws -> [String] {
+        if AgentMCPToolHelpers.normalizedString(args["session_id"]) != nil {
             throw MCPError.invalidParams("Specify either session_id or session_ids, not both.")
         }
         guard let raw = args["session_ids"] else {
@@ -3715,7 +3729,7 @@ struct AgentRunMCPToolService {
             throw MCPError.invalidParams("session_ids must be a non-empty array of session IDs.")
         }
         return try values.map { value -> String in
-            guard let reference = normalizedString(value) else {
+            guard let reference = AgentMCPToolHelpers.normalizedString(value) else {
                 throw MCPError.invalidParams("session_ids must contain only non-empty strings.")
             }
             return reference
@@ -3745,7 +3759,7 @@ struct AgentRunMCPToolService {
         return resolved
     }
 
-    private func requireUUID(_ value: Value?, name: String) throws -> UUID {
+    func requireUUID(_ value: Value?, name: String) throws -> UUID {
         guard let raw = normalizedString(value), let uuid = UUID(uuidString: raw) else {
             throw MCPError.invalidParams("\(name) must be a UUID string.")
         }

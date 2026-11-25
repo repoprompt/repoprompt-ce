@@ -50,7 +50,7 @@ extension AgentSessionRuntimeHost {
             return try await scope.startup.start(
                 session: session, initialMessage: message, attachments: attachments,
                 taggedFileAttachments: taggedFileAttachments, codexFallbackContext: codexFallbackContext,
-                autoEffortSelection: autoEffortSelection, directStartOptions: options,
+                autoEffortSelection: autoEffortSelection ?? options.autoEffortSelection, directStartOptions: options,
                 startOutcome: outcome, providerSwitchPreparation: providerSwitchPreparation,
                 claudeCoordinator: claudeCoordinator, links: links,
                 environment: makeStartupEnvironment(resources: resources)

@@ -136,7 +136,8 @@ package struct MCPDomainProtectedMutationToolProvider {
         guard isProtectedFamily(toolName) else { return nil }
         switch toolName {
         case "manage_selection":
-            let action = arguments["op"]?.stringValue ?? "get"
+            // Dispatch accepts case-insensitive operation names; admission must classify the same request.
+            let action = arguments["op"]?.stringValue?.lowercased() ?? "get"
             return ["add", "remove", "set", "clear", "promote", "demote"].contains(action)
                 ? .init(toolName: toolName, action: action)
                 : nil
@@ -174,7 +175,7 @@ package struct MCPDomainProtectedMutationToolProvider {
             }
             return .init(toolName: toolName, action: action)
         case "manage_worktree":
-            let action = arguments["op"]?.stringValue ?? "list"
+            let action = arguments["op"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "list"
             let mutating = ["create", "bind", "select", "unbind", "apply", "continue", "abort"].contains(action)
             let persistsVisuals = ["list", "show"].contains(action)
                 && arguments["persist_visuals"]?.boolValue == true

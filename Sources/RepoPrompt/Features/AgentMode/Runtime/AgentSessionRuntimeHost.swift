@@ -36,10 +36,38 @@ final class AgentSessionRuntimeHost {
     let claudeCoordinator: ClaudeAgentModeCoordinator
     let providerBindingService: AgentModeProviderBindingService
     let providerResources: AgentRunProviderComposition
+    let modelRouterSettingsStore: GlobalSettingsStore
+    let claudeControllerFactory: ClaudeAgentModeCoordinator.ClaudeControllerFactory?
     private(set) lazy var workspaceSwitchCleanup = AgentModeWorkspaceSwitchCleanupProvider(
         codexCoordinator: codexCoordinator, claudeCoordinator: claudeCoordinator
     )
     private(set) var workspaceActivation: AgentSessionHostWorkspaceActivation?
+    private(set) var retainedControlRegistration: AgentRunSessionStore.Registration?
+
+    func retainControlRegistration(
+        _ registration: AgentRunSessionStore.Registration,
+        onReleased: @escaping @MainActor @Sendable () -> Void
+    ) {
+        guard workspaceActivation?.retainedCarrierSessionID == registration.sessionID,
+              retainedControlRegistration != registration else { return }
+        retainedControlRegistration = registration
+        let release: @MainActor @Sendable (AgentRunSessionStore.Registration) -> Void = { [weak self] registration in
+            guard let self, retainedControlRegistration == registration else { return }
+            retainedControlRegistration = nil
+            onReleased()
+        }
+        let store = route.agentRunSessionStore
+        Task {
+            let observing = await store.observeRegistrationEnd(registration) { registration in
+                await release(registration)
+            }
+            if !observing { release(registration) }
+        }
+    }
+
+    private(set) lazy var originatingContextSource: MCPHostRouteResources.ProviderContextSource = { [weak self] runID, tabID in
+        self?.captureProviderContext(runID: runID, tabID: tabID)
+    }
 
     /// Install immutable activation/resource ownership before making any visible session. A
     /// later activation must compose another host; it cannot retarget this host's old requests.
@@ -77,9 +105,7 @@ final class AgentSessionRuntimeHost {
         }
         scope.attachments.configuration = attachments
         if route.identity.kind == .independent {
-            route.installProviderContextSource { [weak self] runID, tabID in
-                self?.captureProviderContext(runID: runID, tabID: tabID)
-            }
+            codexCoordinator.installOriginatingContextSource(originatingContextSource)
         }
         installCanonicalContinuationLauncher()
     }
@@ -104,14 +130,34 @@ final class AgentSessionRuntimeHost {
     /// existing exact drain, never onto presentation detach or Stop.
     func beginRetirement(adapters: AgentSessionHostDrainRuntime.Adapters) -> AgentSessionHostDrainRuntime {
         AgentSessionHostDrainRuntime.begin(scope: scope, owner: self, adapters: adapters, releaseResources: { [self] in
-            if let releaseExecutionRoute {
-                await workspaceActivation?.release()
-                await releaseExecutionRoute()
-            } else {
-                await route.close()
-                await workspaceActivation?.release()
-            }
+            await releaseOwnedResources()
         })
+    }
+
+    /// Only for a factory candidate that has never been published or admitted. Once the link
+    /// runtime exists, join its real effect producers even if the candidate has no sessions.
+    func discardUnpublishedVisibleCandidate() async {
+        precondition(scope.sessions.isEmpty && scope.retainedDrain == nil)
+        precondition(!AgentSessionRuntimeStore.shared.retainedExecutionHosts.contains { $0 === self })
+        if scope.linkExecution != nil {
+            beginRetirement().startIfNeeded()
+            return
+        }
+        scope.beginRetirement()
+        guard scope.releaseUnpublishedWriterClaims() else {
+            preconditionFailure("An unpublished candidate cannot own admitted effects")
+        }
+        await releaseOwnedResources()
+    }
+
+    private func releaseOwnedResources() async {
+        if let releaseExecutionRoute {
+            await workspaceActivation?.release()
+            await releaseExecutionRoute()
+        } else {
+            await route.close()
+            await workspaceActivation?.release()
+        }
     }
 
     /// The legacy launch projection is shared by the app composition root and injected fixtures.
@@ -159,20 +205,23 @@ final class AgentSessionRuntimeHost {
         connectionPolicyInstaller: @escaping AgentRunExecutionContracts.ConnectionPolicyInstaller,
         modelRouterSettingsStore: GlobalSettingsStore,
         catalogDiagnosticsSink: any AgentSessionLinkCatalogEventSink,
-        perfRecorder: any AgentModePerfRecording
+        perfRecorder: any AgentModePerfRecording, providerResources: AgentRunProviderComposition? = nil,
+        claudeControllerFactory: ClaudeAgentModeCoordinator.ClaudeControllerFactory? = nil
     ) {
         precondition(route.isLeaseManaged == (executionRouteLease != nil), "A leased route requires an execution lease")
         let releaseExecutionRoute = executionRouteLease?.transferToExecutionHost(on: route)
         precondition(executionRouteLease == nil || releaseExecutionRoute != nil, "Transfer the execution lease synchronously at acquisition")
         self.route = route
         self.releaseExecutionRoute = releaseExecutionRoute
+        self.modelRouterSettingsStore = modelRouterSettingsStore
+        self.claudeControllerFactory = claudeControllerFactory
         let routeID = route.identity.routeID
         let tools = route.toolExecutionRuntime
         runRoutingCleaner = Self.cleanRunRouting
         runToolCanceller = { tools.cancelActiveToolsForRun(runID: $0, reason: $1) }
         let providerBindingService = AgentModeProviderBindingService()
         self.providerBindingService = providerBindingService
-        providerResources = .live()
+        self.providerResources = providerResources ?? .live()
         codexCoordinator = CodexAgentModeCoordinator(
             windowID: routeID,
             routingOwner: route.identity.kind == .independent ? route : nil,
@@ -222,6 +271,7 @@ final class AgentSessionRuntimeHost {
         claudeCoordinator = ClaudeAgentModeCoordinator(
             windowID: routeID,
             workspacePathProvider: workspacePath,
+            claudeControllerFactory: claudeControllerFactory,
             awaitNoActiveMCPTools: { runID in try await tools.awaitNoActiveToolExecutions(runID: runID) },
             toolEndedCount: { runID in tools.toolEndedCount(runID: runID) },
             hasActiveMCPTools: { runID in tools.hasActiveToolExecutions(runID: runID) },
@@ -307,6 +357,23 @@ final class AgentSessionRuntimeHost {
         capabilities.sessionRuntime = scope
         capabilities.legacyRunRoutingCleanup = { [route] runID in
             route.identity.kind == .independent ? nil : .legacyWindow(runID: runID)
+        }
+        capabilities.prepareAdoptedRunRoute = { [weak scope, route] session, runID, attemptID, cleanup in
+            switch cleanup {
+            case let .legacyWindow(legacyRunID):
+                return route.identity.kind != .independent && legacyRunID == runID ? .unchanged : .refused
+            case let .registered(receipts):
+                guard session.runID == runID, !route.isClosing, let scope,
+                      let command = try? scope.admit(session: session),
+                      receipts.contains(where: { !$0.isConsumed && $0.routeOwner === route && $0.routeID == route.identity.routeID && $0.runID == runID })
+                else { return .refused }
+                // Owning a still-pending cleanup receipt does not mean the process has opened
+                // MCP. Leave its route absent; turn adoption cannot issue a connection or grant.
+                guard route.runRouteBindings.connectionID(forRunID: runID) != nil else { return .unchanged }
+                return route.renewAdoptedProviderAttempt(
+                    runID: runID, tabID: session.tabID, writer: command.identity, attemptID: attemptID, receipts: receipts
+                ) ? .renewed : .refused
+            }
         }
         capabilities.cleanupProviderRun = { [route, runToolCanceller, runRoutingCleaner] cleanup in
             await Self.performRunRoutingCleanup(
@@ -475,6 +542,14 @@ final class AgentSessionRuntimeHost {
         precondition(dependencies.windowID == routeID, "Execution must use the composed host route")
         var dependencies = dependencies
         dependencies.routingOwner = route.identity.kind == .independent ? route : nil
+        if route.identity.kind == .independent {
+            dependencies.originatingContextSource = { [weak self, originatingContextSource] in
+                guard let self else { return originatingContextSource }
+                return workspaceActivation == nil ? nil : originatingContextSource
+            }
+        } else {
+            dependencies.originatingContextSource = nil
+        }
         let execution = AgentModeRunService(
             dependencies: dependencies,
             hooks: hooks,
@@ -506,6 +581,8 @@ final class AgentSessionRuntimeHost {
             self.codexCoordinator = codexCoordinator
             self.claudeCoordinator = claudeCoordinator
             self.providerResources = providerResources
+            modelRouterSettingsStore = .shared
+            claudeControllerFactory = nil
             providerBindingService = AgentModeProviderBindingService()
             scope.installExecutableHost(self)
             codexCoordinator.setActiveAgentRunWaitDrain(activeAgentRunWaitDrain ?? makeChildAgentRunWaitDrain())

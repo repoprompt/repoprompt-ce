@@ -8,13 +8,13 @@ import XCTest
 
 @MainActor
 final class WorkspaceRootRetentionTests: XCTestCase {
-    func testUnloadDefersOnlyRetainedRootsUntilTheLastExactRelease() async throws {
+    func testPresentationDetachDefersOnlyRetainedRootsUntilTheLastExactRelease() async throws {
         let (store, first) = try await fixture()
         let secondPath = try directory()
         let second = try await store.loadRoot(path: secondPath.path)
         let a = try await store.retainRoots(ids: [first, first])
         let b = try await store.retainRoots(ids: [first])
-        await store.unloadRoots(ids: [first, second.id])
+        await store.detachRootPresentations(ids: [first, second.id])
         let retained = await store.rootRefs()
         XCTAssertEqual(retained.map(\.id), [first])
         await store.releaseRootRetention(a)
@@ -31,7 +31,7 @@ final class WorkspaceRootRetentionTests: XCTestCase {
         let roots = await store.rootRefs()
         let path = try XCTUnwrap(roots.first?.fullPath)
         let lease = try await store.retainRoots(ids: [rootID])
-        await store.unloadRoot(id: rootID)
+        await store.detachRootPresentations(ids: [rootID])
         let loaded = try await store.loadRoot(path: path)
         XCTAssertEqual(loaded.id, rootID)
         await store.releaseRootRetention(lease)
@@ -53,7 +53,7 @@ final class WorkspaceRootRetentionTests: XCTestCase {
     func testStaleLifetimeReleaseCannotUnloadReplacement() async throws {
         let (store, rootID) = try await fixture()
         let lease = try await store.retainRoots(ids: [rootID])
-        await store.unloadRoot(id: rootID)
+        await store.detachRootPresentations(ids: [rootID])
         try await store.replaceRootLifetimeForTesting(rootID: rootID)
         let stale = await store.isRootRetentionCurrent(lease)
         XCTAssertFalse(stale)
@@ -503,6 +503,39 @@ final class WorkspaceContextRootSnapshotTests: XCTestCase {
 }
 
 final class WorkspaceRootCatalogRetentionTests: XCTestCase {
+    func testDetachedRootLeavesVisibleCatalogsWithoutRevokingItsExactSessionLookup() async throws {
+        let fixture = try await makeFixture(rootCount: 1)
+        let store = fixture.store
+        let root = fixture.roots[0]
+        let reference = WorkspaceRootRef(id: root.id, name: root.name, fullPath: root.fullPath)
+        let exact: WorkspaceLookupRootScope = .validatedSessionBoundWorkspace(
+            canonicalRoots: [reference], physicalRoots: [], includesGitData: false
+        )
+        let visibleScopes: [WorkspaceLookupRootScope] = [.visibleWorkspace, .visibleWorkspacePlusGitData]
+        for scope in visibleScopes {
+            let snapshot = await store.searchCatalogSnapshot(rootScope: scope)
+            XCTAssertEqual(snapshot.files.map(\.name), ["Root0.swift"])
+        }
+        let lease = try await store.retainRoots(ids: [root.id])
+        await store.detachRootPresentations(ids: [root.id])
+        for scope in visibleScopes {
+            let snapshot = await store.searchCatalogSnapshot(rootScope: scope)
+            XCTAssertTrue(snapshot.files.isEmpty)
+        }
+        let retained = await store.searchCatalogSnapshot(rootScope: exact)
+        XCTAssertEqual(retained.files.map(\.name), ["Root0.swift"])
+        let returned = try await store.loadRoot(path: root.fullPath)
+        XCTAssertEqual(returned.id, root.id)
+        for scope in visibleScopes {
+            let snapshot = await store.searchCatalogSnapshot(rootScope: scope)
+            XCTAssertEqual(snapshot.files.map(\.name), ["Root0.swift"])
+        }
+        await store.unloadRoot(id: root.id)
+        let leaseIsCurrent = await store.isRootRetentionCurrent(lease)
+        XCTAssertFalse(leaseIsCurrent, "Authoritative root removal must revoke even a retained lifetime")
+        await store.releaseRootRetention(lease)
+    }
+
     func testModificationOnlyScopeCachePinsAreReclaimedBeforeBackstop() async throws {
         try await assertCachePinReclamation(externalReaderCount: 0)
     }

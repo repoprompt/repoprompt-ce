@@ -3,23 +3,7 @@ import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 
 extension AgentModeViewModel {
-    enum GlobalModelRoutingError: LocalizedError {
-        case unavailable
-        case noTargets
-        case failed
-        case cancelled
-        case stale
-
-        var errorDescription: String? {
-            switch self {
-            case .unavailable: "Model Router is enabled but its routing service is unavailable."
-            case .noTargets: "Model Router has no available targets for this session type."
-            case .failed: "Model Router could not choose a target."
-            case .cancelled: "Model routing was cancelled."
-            case .stale: "The Model Router policy changed while the request was in progress."
-            }
-        }
-    }
+    typealias GlobalModelRoutingError = AgentTaskRoutingPolicy.GlobalModelRoutingError
 
     private struct RoutedSelectionRollback {
         let target: AgentRoutingExecutableTarget
@@ -436,164 +420,37 @@ extension AgentModeViewModel {
         return result
     }
 
-    /// Shared pre-turn judgment. MCP calls this only before an inactive run starts, never to
-    /// change effort in the middle of an active provider turn or override an initial routed start.
     func chooseAutoEffortForUserTurn(
-        text: String,
-        session: TabSession,
-        workflow: AgentWorkflowDefinition?,
-        requestID: UUID = UUID(),
-        isSpeculative: Bool = false,
-        isRepromptReplacement: Bool = false,
+        text: String, session: TabSession, workflow: AgentWorkflowDefinition?,
+        requestID: UUID = UUID(), isSpeculative: Bool = false, isRepromptReplacement: Bool = false,
         isCurrent: @MainActor () -> Bool
     ) async -> (selection: AutoEffortTurnSelection?, audit: AgentAutomationTurnAudit.Feature) {
-        var admitted = true
-        func admit() -> Bool {
-            admitted = admitted && isCurrent()
-            return admitted
-        }
-        guard admit() else { return ineligibleAutoEffortChoice() }
-        let autoEffortConfiguration = modelRouterSettingsStore.autoEffortConfiguration()
-        guard autoEffortConfiguration.enabled else {
-            return (nil, .init(configured: false, eligible: false, judgmentRequested: false, decision: .disabled))
-        }
-        guard !session.runState.isActive,
-              AutoEffortModelPolicy.shouldJudgeWorkflow(workflow),
-              isRepromptReplacement || !text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("/"),
-              let maskedExcerpt = AutoEffortTaskSummary.make(from: text)
-        else {
-            return (nil, .init(configured: true, eligible: false, judgmentRequested: false, decision: .ineligible))
-        }
-        guard let runtime = modelRouterRuntime,
-              let backendID = autoEffortConfiguration.selectedBackendID,
-              runtime.isBackendReady(backendID)
-        else {
-            return (nil, .init(configured: true, eligible: true, judgmentRequested: false, decision: .unavailable))
-        }
-
-        let provider = session.selectedAgent
-        let modelRaw = session.selectedModelRaw
-        let selectedWorkflow = session.selectedWorkflow
-        let workflowMutationGeneration = session.userWorkflowSelectionMutationGeneration
-        let modelID: String
-        let efforts: [String]
-        let manualEffortRaw: String?
-        switch provider {
-        case .codexExec:
-            guard let base = CodexModelSpecifier(raw: modelRaw).baseModel else { return ineligibleAutoEffortChoice() }
-            let option = codexCoordinator.modelOptions(for: .codexExec).first {
-                CodexModelSpecifier(raw: $0.rawValue).baseModel?.caseInsensitiveCompare(base) == .orderedSame
-            }
-            modelID = base
-            efforts = AutoEffortModelPolicy.codexEfforts(
-                modelRaw: modelRaw,
-                advertised: option?.supportedReasoningEfforts ?? []
-            )
-            manualEffortRaw = codexCoordinator.effectiveCodexSelection(for: session).reasoningEffort
-        case .claudeCode:
-            guard let base = ClaudeModelSpecifier(raw: modelRaw).baseModel else { return ineligibleAutoEffortChoice() }
-            modelID = base
-            efforts = AutoEffortModelPolicy.claudeEfforts(
-                modelRaw: modelRaw,
-                advertised: AgentModelCatalog.supportedClaudeEfforts(
-                    forSelectedModelRaw: modelRaw,
-                    agentKind: provider
-                )
-            )
-            manualEffortRaw = claudeCoordinator.currentClaudeEffortLevel(for: session).rawValue
-        default:
-            return ineligibleAutoEffortChoice()
-        }
-        guard admit(), efforts.count >= 2 else { return ineligibleAutoEffortChoice() }
-        let judgmentID = requestID
-        if !isSpeculative {
-            session.autoEffortJudgmentID = judgmentID
-        }
-        if !isSpeculative, currentTabID == session.tabID {
-            ui.statusPills.update(makeStatusPillsSnapshot())
-        }
-        defer {
-            // Release only this operation's marker, even after claim loss. Leaving it would
-            // block successor MCP turns; a different judgment UUID is never cleared.
-            if !isSpeculative, session.autoEffortJudgmentID == judgmentID {
-                session.autoEffortJudgmentID = nil
-                if currentTabID == session.tabID {
-                    ui.statusPills.update(makeStatusPillsSnapshot())
-                }
-            }
-        }
-        guard let registration = await runtime.registry.registration(for: backendID),
-              admit(),
-              let prepared = try? AutoEffortDecisionPolicy().build(
-                  requestID: judgmentID,
-                  maskedTaskExcerpt: maskedExcerpt,
-                  selectedModelID: modelID,
-                  builtInWorkflow: workflow?.builtInWorkflow,
-                  efforts: efforts,
-                  capabilities: registration.capabilities
-              )
-        else {
-            return (nil, .init(configured: true, eligible: true, judgmentRequested: false, decision: .fallback, fallbackApplied: true))
-        }
-        let outcome = await runtime.coordinator.decide(
-            serviceID: backendID, request: prepared.request, consumerRevision: autoEffortConfiguration.revision
+        await autoEffortTurnPolicy.chooseAutoEffortForUserTurn(
+            text: text, session: session, workflow: workflow, requestID: requestID,
+            isSpeculative: isSpeculative, isRepromptReplacement: isRepromptReplacement, isCurrent: isCurrent
         )
-        let chosen = prepared.effort(for: outcome)
-        let currentAutoEffortConfiguration = modelRouterSettingsStore.autoEffortConfiguration()
-        guard admit(), currentAutoEffortConfiguration.enabled,
-              currentAutoEffortConfiguration.revision == autoEffortConfiguration.revision,
-              currentAutoEffortConfiguration.selectedBackendRawValue == autoEffortConfiguration.selectedBackendRawValue,
-              currentAutoEffortConfiguration.selectedBackendID == backendID,
-              sessions[session.tabID] === session,
-              isSpeculative || session.autoEffortJudgmentID == judgmentID,
-              session.selectedWorkflow == selectedWorkflow,
-              session.userWorkflowSelectionMutationGeneration == workflowMutationGeneration,
-              session.selectedAgent == provider,
-              session.selectedModelRaw == modelRaw,
-              !session.runState.isActive,
-              let chosen, efforts.contains(chosen)
-        else {
-            return (nil, .init(configured: true, eligible: true, judgmentRequested: true, decision: .fallback, fallbackApplied: true))
-        }
-        let currentManualEffortRaw: String? = switch provider {
-        case .codexExec: codexCoordinator.effectiveCodexSelection(for: session).reasoningEffort
-        case .claudeCode: claudeCoordinator.currentClaudeEffortLevel(for: session).rawValue
-        default: nil
-        }
-        guard admit(), currentManualEffortRaw == manualEffortRaw else {
-            return (nil, .init(configured: true, eligible: true, judgmentRequested: true, decision: .fallback, fallbackApplied: true))
-        }
-        return (
-            AutoEffortTurnSelection(
-                provider: provider,
-                selectedModelRaw: modelRaw,
-                manualEffortRaw: manualEffortRaw,
-                effortRaw: chosen,
-                backendID: backendID,
-                autoEffortRevision: autoEffortConfiguration.revision
-            ),
-            .init(
-                configured: true, eligible: true, judgmentRequested: true, decision: .selected,
-                chosenModelRaw: modelRaw, chosenEffortRaw: chosen
-            )
-        )
-    }
-
-    private func ineligibleAutoEffortChoice() -> (
-        selection: AutoEffortTurnSelection?, audit: AgentAutomationTurnAudit.Feature
-    ) {
-        (nil, .init(configured: true, eligible: false, judgmentRequested: false, decision: .ineligible))
     }
 
     func recordSubmittedAutoEffort(_ selection: AutoEffortTurnSelection, for session: TabSession) {
-        guard sessions[session.tabID] === session else { return }
-        session.autoEffortFeedback = AutoEffortTurnFeedback(
-            selection: selection,
-            previous: session.autoEffortFeedback
+        autoEffortTurnPolicy.recordSubmittedAutoEffort(selection, for: session)
+    }
+
+    private var autoEffortTurnPolicy: AgentAutoEffortTurnPolicy {
+        .init(
+            modelRouterSettingsStore: modelRouterSettingsStore, modelRouterRuntime: modelRouterRuntime,
+            codexCoordinator: codexCoordinator, claudeCoordinator: claudeCoordinator,
+            ownsSession: { self.sessions[$0.tabID] === $0 }, didChange: { session in
+                if self.currentTabID == session.tabID { self.ui.statusPills.update(self.makeStatusPillsSnapshot()) }
+            }
         )
-        if currentTabID == session.tabID {
-            ui.statusPills.update(makeStatusPillsSnapshot())
-        }
+    }
+
+    var taskRoutingPolicy: AgentTaskRoutingPolicy {
+        .init(
+            modelRouterSettingsStore: modelRouterSettingsStore, modelRouterRuntime: modelRouterRuntime,
+            availability: { self.modelRouterAvailabilityContext },
+            workspaceID: { self.workspaceManager?.activeWorkspaceID }
+        )
     }
 
     func routeSubagentTargetIfEnabled(
@@ -602,47 +459,10 @@ extension AgentModeViewModel {
         baseline: AgentRoutingExecutableTarget? = nil,
         allowUsageBalance: Bool = true
     ) async throws -> AgentRoutingExecutableTarget? {
-        let configuration = modelRouterSettingsStore.modelRouterConfiguration()
-        let fallback = { [self] in
-            baseline.flatMap { allowUsageBalance ? localUsageDecision(basedOn: $0, scope: .subagent, surface: surface)?.candidate.target : nil }
-        }
-        guard configuration.enabled else { return fallback() }
-        guard let runtime = modelRouterRuntime,
-              configuration.validity == .valid,
-              let backendID = configuration.selectedBackendID,
-              runtime.isBackendReady(backendID)
-        else { return fallback() }
-        let result = await routeModelThenEffort(
-            requestID: UUID(),
-            text: task,
-            scope: .subagent,
-            surface: surface,
-            providers: AgentTaskRoutingCandidateBuilder.providers(
-                for: .subagent, configuration: configuration, availability: modelRouterAvailabilityContext, surface: .headless
-            ),
-            configuration: configuration,
-            backendID: backendID,
-            runtime: runtime,
-            allowUsageBalance: allowUsageBalance
+        try await taskRoutingPolicy.routeSubagentTargetIfEnabled(
+            task: task, surface: surface, baseline: baseline, allowUsageBalance: allowUsageBalance
         )
-        guard modelRouterConfigurationIsCurrent(configuration, backendID: backendID) else {
-            throw GlobalModelRoutingError.stale
-        }
-        switch result.outcome {
-        case let .selected(opaqueKey, _):
-            guard let selected = result.candidates.only(where: { $0.opaqueKey == opaqueKey }),
-                  routingCandidateIsCurrent(selected)
-            else { return nil }
-            return selected.target
-        case .cancelled:
-            throw GlobalModelRoutingError.cancelled
-        case .abstained, .failed:
-            return fallback()
-        }
     }
-
-    /// Model-stage picks below this service-reported confidence fall back locally.
-    static let minimumModelRouteConfidence = 0.4
 
     func routeModelThenEffort(
         requestID: UUID,
@@ -658,166 +478,23 @@ extension AgentModeViewModel {
         capturedRoleDefaults: [AgentTaskRoutingCandidateBuilder.RoleDefaultReference]? = nil,
         balanceObserver: ((AgentTaskRoutingCandidateBuilder.Candidate, [AgentTaskRoutingCandidateBuilder.Candidate], AgentRoutingExecutableTarget) -> Void)? = nil
     ) async -> StagedTaskRoutingResult {
-        let builder = AgentTaskRoutingCandidateBuilder()
-        let snapshot = capturedSnapshot ?? builder.capture(
-            allowedProviders: providers,
-            availability: modelRouterAvailabilityContext,
-            surface: surface
+        await taskRoutingPolicy.routeModelThenEffort(
+            requestID: requestID, text: text, scope: scope, surface: surface, providers: providers,
+            configuration: configuration, backendID: backendID, runtime: runtime,
+            allowUsageBalance: allowUsageBalance, capturedSnapshot: capturedSnapshot,
+            capturedRoleDefaults: capturedRoleDefaults, balanceObserver: balanceObserver
         )
-        guard let registration = await runtime.registry.registration(for: backendID),
-              let builtModels = try? builder.build(
-                  snapshot: snapshot,
-                  roleDefaults: capturedRoleDefaults ?? agentModelRoleDefaultReferences(),
-                  maximumChoices: registration.capabilities.finiteChoice.maximumChoices,
-                  usagePeerClasses: scope == .primarySession ? AgentTaskRoutingCandidateBuilder.primarySessionUsagePeerClasses : nil
-              ), !builtModels.isEmpty
-        else {
-            return StagedTaskRoutingResult(
-                candidates: [],
-                outcome: .failed(category: .invalidRequest, retryable: false, evidence: nil)
-            )
-        }
-
-        var models = builtModels
-        var unbalancedModel: AgentTaskRoutingCandidateBuilder.Candidate?
-        var usageBalancingReason: String?
-        // Critical usage decides the provider outright: the other provider is never offered, and a
-        // single remaining model skips the decision service entirely.
-        let usageOverride = allowUsageBalance ? runtime.usageBalancer?.routerOverride(candidates: builtModels, configuration: configuration, scope: scope) : nil
-        if let usageOverride {
-            models = usageOverride.candidates
-            usageBalancingReason = usageOverride.reason
-        }
-        let firstModel = models[0]
-        var selectedModel: AgentTaskRoutingCandidateBuilder.Candidate
-        var modelEvidence: DecisionEvidence?
-        var judgmentRequested = false
-        if models.count == 1 {
-            selectedModel = firstModel
-        } else {
-            guard let modelRequest = try? ModelRouterDecisionPolicy().build(
-                requestID: requestID,
-                task: text,
-                scope: scope,
-                stage: .model,
-                directive: configuration.customInstructions,
-                candidates: models,
-                capabilities: registration.capabilities
-            ) else {
-                return StagedTaskRoutingResult(
-                    candidates: models,
-                    outcome: .failed(category: .invalidRequest, retryable: false, evidence: nil)
-                )
-            }
-            judgmentRequested = true
-            let modelOutcome = await runtime.coordinator.decide(
-                serviceID: backendID, request: modelRequest, consumerRevision: configuration.revision
-            )
-            guard case let .selected(modelKey, evidence) = modelOutcome,
-                  let match = models.only(where: { $0.opaqueKey == modelKey })
-            else { return StagedTaskRoutingResult(candidates: models, outcome: modelOutcome, judgmentRequested: true) }
-            // A low-confidence advisory pick is not trusted; keep the local selection instead.
-            if let confidence = evidence?.confidence, confidence < Self.minimumModelRouteConfidence {
-                return StagedTaskRoutingResult(
-                    candidates: models,
-                    outcome: .abstained(reasonCode: "low_confidence", evidence: evidence),
-                    judgmentRequested: true
-                )
-            }
-            selectedModel = match
-            unbalancedModel = match
-            modelEvidence = evidence
-            if usageOverride == nil, allowUsageBalance, configuration.usageBalancing.enabled, !Task.isCancelled,
-               modelRouterConfigurationIsCurrent(configuration, backendID: backendID), let advisor = runtime.usageBalancer
-            {
-                let decision = advisor.choose(selected: match, candidates: models, evidence: evidence, configuration: configuration)
-                selectedModel = decision.candidate
-                usageBalancingReason = decision.reason
-            }
-        }
-
-        balanceObserver?(unbalancedModel ?? selectedModel, models, selectedModel.target)
-        guard !Task.isCancelled else {
-            return StagedTaskRoutingResult(candidates: models, outcome: .cancelled, judgmentRequested: judgmentRequested)
-        }
-        let modelFallback = StagedTaskRoutingResult(
-            candidates: models,
-            outcome: .selected(opaqueKey: selectedModel.opaqueKey, evidence: modelEvidence),
-            judgmentRequested: judgmentRequested,
-            effortFallback: true,
-            usageBalancingReason: usageBalancingReason
-        )
-        guard let efforts = try? builder.buildEfforts(
-            for: selectedModel,
-            snapshot: snapshot,
-            allowPaidFast: configuration.allowPaidFastRouting,
-            maximumChoices: registration.capabilities.finiteChoice.maximumChoices
-        ), let firstEffort = efforts.first else {
-            return modelFallback
-        }
-        guard efforts.count > 1 else {
-            return StagedTaskRoutingResult(
-                candidates: efforts,
-                outcome: .selected(opaqueKey: firstEffort.opaqueKey, evidence: nil),
-                judgmentRequested: judgmentRequested,
-                usageBalancingReason: usageBalancingReason
-            )
-        }
-        guard let effortRequest = try? ModelRouterDecisionPolicy().build(
-            requestID: requestID,
-            task: text,
-            scope: scope,
-            stage: .effort,
-            directive: configuration.customInstructions,
-            candidates: efforts,
-            capabilities: registration.capabilities
-        ) else {
-            return modelFallback
-        }
-        judgmentRequested = true
-        let effortOutcome = await runtime.coordinator.decide(
-            serviceID: backendID, request: effortRequest, consumerRevision: configuration.revision
-        )
-        switch effortOutcome {
-        case let .selected(key, _):
-            guard let target = efforts.only(where: { $0.opaqueKey == key })?.target,
-                  configuration.allowPaidFastRouting || !AgentTaskRoutingCandidateBuilder.isPaidFast(target) else { return modelFallback }
-            return StagedTaskRoutingResult(candidates: efforts, outcome: effortOutcome, judgmentRequested: true, usageBalancingReason: usageBalancingReason)
-        case .cancelled:
-            return StagedTaskRoutingResult(candidates: models, outcome: .cancelled, judgmentRequested: judgmentRequested)
-        case .abstained, .failed:
-            return StagedTaskRoutingResult(
-                candidates: modelFallback.candidates,
-                outcome: modelFallback.outcome,
-                judgmentRequested: true,
-                effortFallback: true,
-                usageBalancingReason: usageBalancingReason
-            )
-        }
     }
 
     private func modelRouterConfigurationIsCurrent(
         _ configuration: AgentTaskRouterConfiguration,
         backendID: DecisionServiceID
     ) -> Bool {
-        let current = modelRouterSettingsStore.modelRouterConfiguration()
-        return current.enabled
-            && current.revision == configuration.revision
-            && current.selectedBackendID == backendID
+        taskRoutingPolicy.modelRouterConfigurationIsCurrent(configuration, backendID: backendID)
     }
 
     func agentModelRoleDefaultReferences() -> [AgentTaskRoutingCandidateBuilder.RoleDefaultReference] {
-        MCPAgentRoleDefaultsService.resolutions(
-            availability: modelRouterAvailabilityContext,
-            workspaceID: workspaceManager?.activeWorkspaceID
-        ).map { resolution in
-            AgentTaskRoutingCandidateBuilder.RoleDefaultReference(
-                roleLabel: resolution.roleLabel,
-                provider: resolution.effective.agent,
-                modelRaw: resolution.effective.modelRaw,
-                isUserOverride: resolution.hasStoredOverride
-            )
-        }
+        taskRoutingPolicy.agentModelRoleDefaultReferences()
     }
 
     func freshTaskRoutingEligibility(session: TabSession, text: String?) -> Bool {
@@ -857,15 +534,7 @@ extension AgentModeViewModel {
     }
 
     private func routingCandidateIsCurrent(_ candidate: AgentTaskRoutingCandidateBuilder.Candidate) -> Bool {
-        guard let scope = candidate.snapshotScope,
-              candidate.profileIdentity == RoutingModelProfileSnapshot.bundled.identity
-        else { return false }
-        let current = AgentTaskRoutingCandidateBuilder().capture(
-            allowedProviders: scope.allowedProviders,
-            availability: modelRouterAvailabilityContext,
-            surface: scope.surface
-        )
-        return current.scope == scope && current.contains(candidate.target)
+        taskRoutingPolicy.routingCandidateIsCurrent(candidate)
     }
 
     func applyRoutingTarget(_ candidate: AgentTaskRoutingCandidateBuilder.Candidate, to session: TabSession) -> Bool {

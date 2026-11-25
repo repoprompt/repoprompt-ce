@@ -20,17 +20,20 @@ package struct DomainReadSideEffectReceipt: Equatable, Sendable {
     package let context: DomainContextIdentity
     package let effectClass: DomainReadSideEffectClass
     package let revision: UInt64
+    package let savedSessionID: UUID?
 
     package init(
         operationID: UUID,
         context: DomainContextIdentity,
         effectClass: DomainReadSideEffectClass,
-        revision: UInt64
+        revision: UInt64,
+        savedSessionID: UUID? = nil
     ) {
         self.operationID = operationID
         self.context = context
         self.effectClass = effectClass
         self.revision = revision
+        self.savedSessionID = savedSessionID
     }
 }
 
@@ -42,6 +45,17 @@ package actor DomainReadSideEffectCoordinator {
     private struct LaneKey: Hashable, Sendable {
         let context: DomainContextIdentity
         let effectClass: DomainReadSideEffectClass
+        let savedSessionID: UUID?
+
+        init(handle: DomainReadContextHandle, effectClass: DomainReadSideEffectClass) {
+            context = handle.context
+            self.effectClass = effectClass
+            if case let .savedRunScoped(_, sessionID) = handle.bindingKind {
+                savedSessionID = sessionID
+            } else {
+                savedSessionID = nil
+            }
+        }
     }
 
     private struct RecordedOperation: Sendable {
@@ -70,7 +84,7 @@ package actor DomainReadSideEffectCoordinator {
         effectClass: DomainReadSideEffectClass
     ) throws -> UInt64 {
         try validate(handle)
-        return states[LaneKey(context: handle.context, effectClass: effectClass)]?.acceptedRevision ?? 0
+        return states[LaneKey(handle: handle, effectClass: effectClass)]?.acceptedRevision ?? 0
     }
 
     package func submit(
@@ -82,7 +96,7 @@ package actor DomainReadSideEffectCoordinator {
     ) throws -> DomainReadSideEffectReceipt {
         try validate(handle)
         guard !stopped else { throw DomainReadSideEffectError.stopped }
-        let key = LaneKey(context: handle.context, effectClass: effectClass)
+        let key = LaneKey(handle: handle, effectClass: effectClass)
         var state = states[key] ?? LaneState()
         if let recorded = state.operations[operationID] {
             guard recorded.fingerprint == fingerprint else {
@@ -106,7 +120,7 @@ package actor DomainReadSideEffectCoordinator {
             operationID: operationID,
             context: handle.context,
             effectClass: effectClass,
-            revision: revision
+            revision: revision, savedSessionID: key.savedSessionID
         )
         state.acceptedRevision = revision
         state.tasks[revision] = task
@@ -130,8 +144,8 @@ package actor DomainReadSideEffectCoordinator {
         receipt: DomainReadSideEffectReceipt
     ) async throws {
         try validate(handle)
-        let key = LaneKey(context: handle.context, effectClass: receipt.effectClass)
-        guard receipt.context == handle.context,
+        let key = LaneKey(handle: handle, effectClass: receipt.effectClass)
+        guard receipt.context == handle.context, receipt.savedSessionID == key.savedSessionID,
               let state = states[key],
               state.operations[receipt.operationID]?.receipt == receipt,
               let task = state.tasks[receipt.revision]
@@ -149,7 +163,7 @@ package actor DomainReadSideEffectCoordinator {
         try validate(handle)
         try Task.checkCancellation()
         guard revision > 0 else { return }
-        let key = LaneKey(context: handle.context, effectClass: effectClass)
+        let key = LaneKey(handle: handle, effectClass: effectClass)
         guard let state = states[key] else { return }
         if state.terminalRevision >= revision { return }
         guard let task = state.tasks[revision] else {

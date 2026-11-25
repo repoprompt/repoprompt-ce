@@ -198,14 +198,30 @@ public struct RemoteQuestionAnswer: Codable, Sendable, Equatable {
 /// A pending interaction deliberately contains no answer value. Secret answers are
 /// submitted as one-shot commands and are never part of snapshots, history, or events.
 public struct RemoteInteractionSummary: Codable, Sendable, Equatable {
+    private static let legacyMultipartReason = "Answer this multi-part request on your Mac."
+
+    private enum CodingKeys: String, CodingKey {
+        case id, kind, title, prompt, requiresSecureEntry, createdAt, questionnaire
+        case wireResponseUnavailableReason = "responseUnavailableReason"
+    }
+
     public let id: String
     public let kind: RemoteInteractionKind
     public let title: String?
     public let prompt: String?
     public let requiresSecureEntry: Bool
-    public let responseUnavailableReason: String?
+    private let wireResponseUnavailableReason: String?
     public let createdAt: Date
     public let questionnaire: RemoteQuestionnaire?
+
+    public var responseUnavailableReason: String? {
+        // Questionnaire-aware clients can respond to multipart prompts. Older clients
+        // read the wire reason and keep their single-answer form disabled.
+        if (questionnaire?.questions.count ?? 0) > 1, wireResponseUnavailableReason == Self.legacyMultipartReason {
+            return nil
+        }
+        return wireResponseUnavailableReason
+    }
 
     public init(
         id: String,
@@ -222,7 +238,8 @@ public struct RemoteInteractionSummary: Codable, Sendable, Equatable {
         self.title = title
         self.prompt = prompt
         self.requiresSecureEntry = requiresSecureEntry
-        self.responseUnavailableReason = responseUnavailableReason
+        self.wireResponseUnavailableReason = responseUnavailableReason
+            ?? ((questionnaire?.questions.count ?? 0) > 1 ? Self.legacyMultipartReason : nil)
         self.createdAt = createdAt
         self.questionnaire = questionnaire
     }

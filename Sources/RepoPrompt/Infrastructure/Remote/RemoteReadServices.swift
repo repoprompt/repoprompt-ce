@@ -181,20 +181,18 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
         } else {
             nil
         }
-        let allItems = Self.project(transcript: transcript, includeDetails: includeDetails)
-        if case let .exactItem(itemID) = paging,
-           !allItems.contains(where: { $0.id == itemID })
-        {
-            throw RemoteReadServiceError.transcriptItemNotFound
-        }
-        return Self.page(
+        let page = Self.page(
             sessionID: sessionID,
-            allItems: allItems,
+            rows: Self.transcriptRows(transcript: transcript, includeDetails: includeDetails),
             paging: paging,
             limit: boundedLimit,
             transcriptRevision: transcriptRevision,
             chatConfiguration: chatConfiguration
         )
+        if case .exactItem = paging, page.items.isEmpty {
+            throw RemoteReadServiceError.transcriptItemNotFound
+        }
+        return page
     }
 
     static func chatConfiguration(
@@ -418,9 +416,32 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
         transcriptRevision: UInt64? = nil,
         chatConfiguration: RemoteChatConfiguration? = nil
     ) -> RemoteTranscriptPageRecord {
+        page(
+            sessionID: sessionID,
+            rows: allItems.map { item in TranscriptRow(cursor: cursor(for: item), render: { item }) },
+            paging: paging,
+            limit: limit,
+            transcriptRevision: transcriptRevision,
+            chatConfiguration: chatConfiguration
+        )
+    }
+
+    private struct TranscriptRow {
+        let cursor: RemoteTranscriptCursor
+        let render: () -> RemoteTranscriptItem
+    }
+
+    private static func page(
+        sessionID: UUID,
+        rows: [TranscriptRow],
+        paging: RemoteTranscriptPageRequest,
+        limit: Int,
+        transcriptRevision: UInt64?,
+        chatConfiguration: RemoteChatConfiguration?
+    ) -> RemoteTranscriptPageRecord {
         switch paging {
         case let .exactItem(itemID):
-            guard let item = allItems.first(where: { $0.id == itemID }) else {
+            guard let row = rows.first(where: { $0.cursor.itemID == itemID }) else {
                 return RemoteTranscriptPageRecord(
                     sessionID: sessionID,
                     items: [],
@@ -429,17 +450,17 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
             }
             return RemoteTranscriptPageRecord(
                 sessionID: sessionID,
-                items: [item],
+                items: [row.render()],
                 transcriptRevision: transcriptRevision
             )
 
         case let .legacyForward(afterSequenceIndex):
             let start = afterSequenceIndex.map { index in
-                allItems.firstIndex(where: { $0.sequenceIndex > index }) ?? allItems.count
+                rows.firstIndex(where: { $0.cursor.sequenceIndex > index }) ?? rows.count
             } ?? 0
-            let end = min(start + limit, allItems.count)
-            let items = Array(allItems[start ..< end])
-            let hasMore = end < allItems.count
+            let end = min(start + limit, rows.count)
+            let items = rows[start ..< end].map { $0.render() }
+            let hasMore = end < rows.count
             return RemoteTranscriptPageRecord(
                 sessionID: sessionID,
                 items: items,
@@ -451,10 +472,10 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
 
         case let .recentBackward(before):
             let candidates = before.map { cursor in
-                allItems.filter { Self.cursor(for: $0) < cursor }
-            } ?? allItems
+                rows.filter { $0.cursor < cursor }
+            } ?? rows
             let pageCount = min(limit, candidates.count)
-            let items = Array(candidates.suffix(pageCount))
+            let items = candidates.suffix(pageCount).map { $0.render() }
             let hasOlder = candidates.count > pageCount
             return RemoteTranscriptPageRecord(
                 sessionID: sessionID,
@@ -469,86 +490,71 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
     }
 
     static func project(transcript: AgentTranscript, includeDetails: Bool) -> [RemoteTranscriptItem] {
-        var projected: [RemoteTranscriptItem] = []
+        transcriptRows(transcript: transcript, includeDetails: includeDetails).map { $0.render() }
+    }
+
+    private static func transcriptRows(transcript: AgentTranscript, includeDetails: Bool) -> [TranscriptRow] {
+        var rows: [TranscriptRow] = []
         for turn in transcript.turns {
+            let turnID = turn.id
+            let summaryOnly = turn.retentionTier != .full
             if let request = turn.request {
-                let displayText = AgentModeViewModel.mcpResidentTaskDisplayText(
-                    request.text, origin: request.userInputOrigin, attribution: request.crossSessionAttribution
+                let cursor = RemoteTranscriptCursor(
+                    sequenceIndex: request.sequenceIndex, timestamp: request.timestamp, itemID: request.id
                 )
-                projected.append(
-                    RemoteTranscriptItem(
+                rows.append(TranscriptRow(cursor: cursor) {
+                    let displayText = AgentModeViewModel.mcpResidentTaskDisplayText(
+                        request.text, origin: request.userInputOrigin, attribution: request.crossSessionAttribution
+                    )
+                    return RemoteTranscriptItem(
                         id: request.id,
-                        turnID: turn.id,
+                        turnID: turnID,
                         timestamp: request.timestamp,
                         sequenceIndex: request.sequenceIndex,
                         kind: .request,
                         semanticKind: .userRequest,
                         role: "user",
                         text: sanitizeVisibleText(displayText),
-                        summaryOnly: turn.retentionTier != .full,
+                        summaryOnly: summaryOnly,
                         detailAvailable: false,
                         attachments: projectAttachments(request.attachments)
                     )
-                )
+                })
             }
 
-            for activity in turn.allActivities {
-                let semanticKind = semanticKind(for: activity, conclusionActivityID: turn.conclusionActivityID)
-                let detail = includeDetails ? remoteDetail(for: activity) : nil
-                let visibleText: String? = if let execution = activity.toolExecution,
-                                              let summary = compactToolSummary(execution)
-                {
-                    sanitizeText(summary, characterLimit: 512)
-                } else if let summary = activity.toolExecution?.summaryText,
-                          !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                {
-                    sanitizeVisibleText(summary)
-                } else if activity.toolExecution != nil {
-                    nil
-                } else if activity.text.isEmpty {
-                    nil
-                } else {
-                    sanitizeVisibleText(activity.text)
-                }
-                projected.append(
-                    RemoteTranscriptItem(
-                        id: activity.id,
-                        turnID: turn.id,
-                        timestamp: activity.timestamp,
-                        sequenceIndex: activity.sequenceIndex,
-                        kind: semanticKind == .assistantAnswer ? .conclusion : .activity,
-                        semanticKind: semanticKind,
-                        role: activity.role.rawValue,
-                        text: visibleText,
-                        toolName: activity.toolExecution?.toolName,
-                        toolStatus: activity.toolExecution.map {
-                            $0.toolIsError == true ? AgentTranscriptToolStatus.failed.rawValue : $0.status.rawValue
-                        },
-                        summaryOnly: turn.retentionTier != .full || activity.toolExecution?.summaryOnly == true,
-                        detailAvailable: hasDetail(for: activity),
-                        detailText: detail.map(renderDetail),
-                        detail: detail,
-                        attachments: projectAttachments(activity.attachments)
+            let activities = turn.allActivities
+            let conclusionActivityID = turn.conclusionActivityID
+            for activity in activities {
+                let cursor = RemoteTranscriptCursor(
+                    sequenceIndex: activity.sequenceIndex, timestamp: activity.timestamp, itemID: activity.id
+                )
+                rows.append(TranscriptRow(cursor: cursor) {
+                    projectActivity(
+                        activity, turnID: turnID, conclusionActivityID: conclusionActivityID,
+                        summaryOnly: summaryOnly, includeDetails: includeDetails
                     )
-                )
+                })
             }
 
-            if turn.retentionTier != .full,
+            if summaryOnly,
                let summary = turn.summary,
                let text = summary.conclusionText
                ?? summary.compactConclusionText
                ?? summary.middleSummaryText
                ?? summary.requestText
             {
-                let summarySequenceIndex = turn.allActivities.map(\.sequenceIndex).max()
-                    ?? turn.request?.sequenceIndex
-                    ?? 0
-                projected.append(
+                let lastSequenceIndex = activities.map(\.sequenceIndex).max() ?? turn.request?.sequenceIndex ?? 0
+                let cursor = RemoteTranscriptCursor(
+                    sequenceIndex: lastSequenceIndex + 1,
+                    timestamp: turn.lastActivityAt ?? turn.startedAt,
+                    itemID: summary.middleSummaryItemID
+                )
+                rows.append(TranscriptRow(cursor: cursor) {
                     RemoteTranscriptItem(
-                        id: summary.middleSummaryItemID,
-                        turnID: turn.id,
-                        timestamp: turn.lastActivityAt ?? turn.startedAt,
-                        sequenceIndex: summarySequenceIndex + 1,
+                        id: cursor.itemID,
+                        turnID: turnID,
+                        timestamp: cursor.timestamp,
+                        sequenceIndex: cursor.sequenceIndex,
                         kind: .summary,
                         semanticKind: .summary,
                         role: "summary",
@@ -556,24 +562,70 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
                         summaryOnly: true,
                         detailAvailable: false
                     )
-                )
+                })
             }
         }
-        return projected.sorted {
-            cursor(for: $0) < cursor(for: $1)
+        return rows.sorted { $0.cursor < $1.cursor }
+    }
+
+    private static func projectActivity(
+        _ activity: AgentTranscriptActivity,
+        turnID: UUID,
+        conclusionActivityID: UUID?,
+        summaryOnly: Bool,
+        includeDetails: Bool
+    ) -> RemoteTranscriptItem {
+        let semanticKind = semanticKind(for: activity, conclusionActivityID: conclusionActivityID)
+        let detail = includeDetails ? remoteDetail(for: activity) : nil
+        let visibleText: String? = if let execution = activity.toolExecution,
+                                      let summary = compactToolSummary(execution)
+        {
+            sanitizeText(summary, characterLimit: 512)
+        } else if let summary = activity.toolExecution?.summaryText,
+                  !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            sanitizeVisibleText(summary)
+        } else if activity.toolExecution == nil, !activity.text.isEmpty {
+            sanitizeVisibleText(activity.text)
+        } else {
+            nil
         }
+        return RemoteTranscriptItem(
+            id: activity.id,
+            turnID: turnID,
+            timestamp: activity.timestamp,
+            sequenceIndex: activity.sequenceIndex,
+            kind: semanticKind == .assistantAnswer ? .conclusion : .activity,
+            semanticKind: semanticKind,
+            role: activity.role.rawValue,
+            text: visibleText,
+            toolName: activity.toolExecution?.toolName,
+            toolStatus: activity.toolExecution.map {
+                $0.toolIsError == true ? AgentTranscriptToolStatus.failed.rawValue : $0.status.rawValue
+            },
+            summaryOnly: summaryOnly || activity.toolExecution?.summaryOnly == true,
+            detailAvailable: hasDetail(for: activity),
+            detailText: detail.map(renderDetail),
+            detail: detail,
+            attachments: projectAttachments(activity.attachments)
+        )
     }
 
     static func compactToolSummary(_ execution: AgentTranscriptToolExecution) -> String? {
-        let name = normalizedToolCardName(execution.toolName)?.lowercased()
-        guard let name, [
+        guard let name = normalizedToolCardName(execution.toolName)?.lowercased() else { return nil }
+        if name == "bash" {
+            let exitCode = execution.exitCode ?? BashToolResultParser.parse(
+                raw: boundedToolPayload(execution.resultJSON), argsJSON: nil
+            ).exitCode
+            return exitCode.map { "Shell command • Exit \($0)" } ?? "Shell command"
+        }
+        guard [
             "read",
             "read_file",
             "file_search",
             "grep",
             "glob",
             "list_files",
-            "bash",
             "apply_edits",
             "apply_patch",
             "edit",
@@ -603,12 +655,6 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
             let result = ToolJSON.structuredResultObject(from: rawResult)
             if let count = result?["total_matches"] as? Int {
                 outcome = "\(count) \(count == 1 ? "match" : "matches")"
-            }
-        case "bash":
-            let shell = BashToolResultParser.parse(raw: rawResult, argsJSON: args)
-            subject = shell.command ?? subject
-            if let exitCode = execution.exitCode ?? shell.exitCode {
-                outcome = "Exit \(exitCode)"
             }
         default:
             let result = ToolJSON.structuredResultObject(from: rawResult)

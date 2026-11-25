@@ -53,8 +53,33 @@ struct AgentSelfMCPToolService {
         return AgentSelfNoopTool.acknowledgement
     }
 
+    struct LiveSelf {
+        let read: () -> AgentSelfContextSnapshot?
+        let compact: (_ note: String, _ key: String) async -> Admission
+    }
+
     func execute(args: [String: Value]) async throws -> Value {
-        guard isToolEnabled() else { throw MCPError.invalidParams("self_compact is disabled.") }
+        try await Self.execute(args: args, isEnabled: isToolEnabled) {
+            // Capture the registration-time attempt before the first suspension.
+            guard let origin = captureCallOrigin() else { throw Self.unavailableError }
+            let metadata = await captureRequestMetadata()
+            let window = try requireTargetWindow()
+            guard !window.isClosing,
+                  let endpoint = await AgentSessionTargetOperationGuard.resolveObserverEndpoint(
+                      metadata: metadata, targetWindow: window, resolveObserverEndpoint: resolveObserverEndpoint
+                  ), endpoint == origin.endpoint, endpoint.hasResolvedPersistentBinding
+            else { throw Self.unavailableError }
+            return LiveSelf(
+                read: { readSelf(window, endpoint, origin) },
+                compact: { await scheduleCompact(window, endpoint, origin, $0, $1) }
+            )
+        }
+    }
+
+    static func execute(
+        args: [String: Value], isEnabled: () -> Bool, resolveSelf: () async throws -> LiveSelf
+    ) async throws -> Value {
+        guard isEnabled() else { throw MCPError.invalidParams("self_compact is disabled.") }
         guard let op = AgentMCPToolHelpers.normalizedString(args["op"])?.lowercased() else {
             throw MCPError.invalidParams("self_compact op is required: context or compact.")
         }
@@ -66,20 +91,10 @@ struct AgentSelfMCPToolService {
         for key in args.keys.sorted() where !allowed.contains(key) {
             throw MCPError.invalidParams("self_compact \(op) does not support '\(key)'.")
         }
-        // Registration-time origin must exist before any await. The exact endpoint is resolved
-        // independently from live server routing, and must still equal that captured incarnation.
-        guard let origin = captureCallOrigin() else { throw Self.unavailableError }
-        let metadata = await captureRequestMetadata()
-        let window = try requireTargetWindow()
-        guard !window.isClosing,
-              let endpoint = await AgentSessionTargetOperationGuard.resolveObserverEndpoint(
-                  metadata: metadata, targetWindow: window, resolveObserverEndpoint: resolveObserverEndpoint
-              ), endpoint == origin.endpoint, endpoint.hasResolvedPersistentBinding
-        else { throw Self.unavailableError }
-
+        let caller = try await resolveSelf()
         switch op {
         case "context":
-            guard let snapshot = readSelf(window, endpoint, origin) else { throw Self.unavailableError }
+            guard let snapshot = caller.read() else { throw Self.unavailableError }
             return .object([
                 "result": .string("ok"),
                 "context": AgentSessionLinkResponseRenderer.contextLoadValue(snapshot.context),
@@ -89,7 +104,7 @@ struct AgentSelfMCPToolService {
             guard case let .string(note)? = args["note"] else {
                 throw MCPError.invalidParams("self_compact compact note is required as a string.")
             }
-            guard let snapshot = readSelf(window, endpoint, origin) else { throw Self.unavailableError }
+            guard let snapshot = caller.read() else { throw Self.unavailableError }
             let bytes: Int
             switch AgentSessionSelfCompactNotePolicy.validation(of: note, maximum: nil) {
             case let .valid(byteCount): bytes = byteCount
@@ -106,7 +121,7 @@ struct AgentSelfMCPToolService {
             else {
                 throw MCPError.invalidParams("self_compact compact idempotency_key is required (1...200 UTF-8 bytes).")
             }
-            let admission = await scheduleCompact(window, endpoint, origin, note, key)
+            let admission = await caller.compact(note, key)
             switch admission {
             case let .scheduled(attempt):
                 return .object([

@@ -193,6 +193,8 @@ extension PreparedAgentSessionRuntimeRegistry {
 
 @MainActor
 protocol AgentSessionLinkEndpointHost: AnyObject {
+    func retryRetainedAgentHostDrain(warningID: String) async
+
     /// Exact bounded retained-input lookup. Metadata-only lifecycle calls never copy text.
     func agentSessionLinkLocalInputSnapshot(for endpoint: DomainAgentSessionLinkEndpointIdentity, includeRecords: Bool) -> AgentSessionLinkRetainedLocalInputIndex.Snapshot?
 
@@ -615,6 +617,8 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
 /// topology at all. The defaults are the conservative ones: no descriptors, no discovery level, and a
 /// pending topology, which together mean automatic restoration never runs against such a host.
 extension AgentSessionLinkEndpointHost {
+    func retryRetainedAgentHostDrain(warningID _: String) async {}
+
     func agentSessionLinkWillActivate(_: DomainAgentSessionLinkEndpointIdentity) async {}
 
     /// Full choice discovery remains rich by default; cheap topology discovery is explicit.
@@ -2026,8 +2030,8 @@ final class AgentSessionLinkRuntimeBridge {
     }
 
     /// Records a bounded, identifier-free warning and repaints every window.
-    func reportPersistenceWarning(id: String, message: String) {
-        guard persistencePresentation.appendWarning(id: id, message: message) else {
+    func reportPersistenceWarning(id: String, message: String, canRetrySessionSettlement: Bool = false) {
+        guard persistencePresentation.appendWarning(id: id, message: message, canRetrySessionSettlement: canRetrySessionSettlement) else {
             publishPersistencePresentation()
             return
         }
@@ -2041,6 +2045,12 @@ final class AgentSessionLinkRuntimeBridge {
     func dismissPersistenceWarnings(ids: Set<String>) {
         guard persistencePresentation.dismissWarnings(ids: ids) else { return }
         publishPersistencePresentation()
+    }
+
+    func retrySessionSettlement(warningID: String) async {
+        guard !isFrozenForTermination,
+              persistencePresentation.warnings.contains(where: { $0.id == warningID && $0.canRetrySessionSettlement }) else { return }
+        await host?.retryRetainedAgentHostDrain(warningID: warningID)
     }
 
     /// One of the few permitted cleanup retry triggers.
@@ -4595,6 +4605,7 @@ final class AgentSessionLinkRuntimeBridge {
             // Seen state is generation-qualified: a fresh re-add of the same pair baselines against
             // current activity instead of inheriting an acknowledgement made under removed authority.
             monitorSeenByReference.removeValue(forKey: reference)
+            AgentSessionLinkExecutionRuntime.cancelRunStartedByRevokedLink(notice)
             // The exact grant already ended. A saved relationship's history ends only when
             // its token-qualified retirement succeeds.
             let hasDurableIntent = capturedBookkeeping[reference]?.token != nil
@@ -7063,6 +7074,16 @@ final class AgentSessionLinkRuntimeBridge {
             }
         }
         await reconcile(after: notices, capturedBookkeeping: capturedBookkeeping)
+    }
+
+    /// Synchronous endpoint fence for preparation and commits that already own consent.
+    func exactOverseeRequesterIsCurrent(_ endpoint: DomainAgentSessionLinkEndpointIdentity) -> Bool {
+        guard !isFrozenForTermination, !Task.isCancelled,
+              let candidate = host?.agentSessionLinkCandidate(for: endpoint, includeLocation: false),
+              candidate.domainEndpoint == endpoint else { return false }
+        return AgentSessionLinkEndpointEligibility.addDisabledReason(
+            candidate.eligibilityInput, roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring
+        ) == nil
     }
 
     /// Resolves and re-checks the caller for a targetless operation.

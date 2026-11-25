@@ -679,7 +679,8 @@ final class MCPHostRouteResourceTests: XCTestCase {
         let discarded = try await lease.capture(context: .init(workspaceID: workspace.id, contextID: tab.id))
         await discarded.release()
         XCTAssertTrue(lease.rootsAreCurrent, "Releasing a borrowed request must not release the activation's roots")
-        await files.unloadRoot(id: root.id)
+        await files.detachRootPresentations(ids: [root.id])
+        XCTAssertTrue(lease.rootsAreCurrent, "Presentation detachment does not revoke execution's root")
         let retained = await files.rootRefs()
         XCTAssertTrue(retained.contains { $0.id == root.id })
         await lease.release()
@@ -698,6 +699,12 @@ final class MCPHostRouteResourceTests: XCTestCase {
         await original.release()
         let successorRoots = await files.rootRefs()
         XCTAssertTrue(successorRoots.contains { $0.id == reloaded.id }, "Releasing the old receipt cannot unload a replacement lifetime")
+
+        let successor = try await resources.acquire(context: .init(workspaceID: workspace.id, contextID: tab.id), rootIDs: [reloaded.id])
+        XCTAssertTrue(successor.rootsAreCurrent)
+        await files.unloadRoot(id: reloaded.id)
+        XCTAssertFalse(successor.rootsAreCurrent, "Explicit unload revokes even the retained successor lifetime")
+        await successor.release()
     }
 
     private func makeRuntime() async throws -> MCPDomainRuntime {

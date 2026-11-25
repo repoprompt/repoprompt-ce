@@ -221,6 +221,99 @@ import XCTest
             }
         }
 
+        func testSavedHostVisitResumesLatestPresenterOnlyAfterExplicitFailedSaveRecovery() async throws {
+            let foreground = ComposeTabState(name: "Foreground")
+            let targetID = UUID()
+            let carrier = ComposeTabState(name: "Deferred saved visit", activeAgentSessionID: targetID)
+            var workspace = Fixture.model(id: Fixture.requestedID, name: "Saved visit workspace")
+            workspace.composeTabs = [foreground]
+            workspace.stashedTabs = [StashedTab(tab: carrier)]
+            workspace.activeComposeTabID = foreground.id
+            try await Fixture.run(seeds: [Fixture.model(id: Fixture.defaultID, name: "Default", isSystem: true), workspace]) { fixture in
+                try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(fixture.runtime) {
+                    let manager = WindowStatesManager.shared
+                    let first = fixture.makeWindow(), latest = fixture.makeWindow()
+                    for window in [first, latest] {
+                        await window.workspaceManager.awaitInitialized()
+                        let result = await window.workspaceManager.requestWorkspaceSwitch(to: workspace, silent: true)
+                        XCTAssertTrue(result.didSwitch)
+                        window.agentModeViewModel.preparedSessionRuntimes = manager
+                        XCTAssertEqual(window.promptManager.activeComposeTabID, foreground.id)
+                    }
+                    let active = try XCTUnwrap(latest.workspaceManager.activeWorkspace)
+                    let file = try await AgentSessionDataService.shared.saveAgentSession(AgentSession(
+                        id: targetID, workspaceID: workspace.id, composeTabID: carrier.id, name: carrier.name,
+                        items: [AgentChatItemPersist(from: AgentChatItem(kind: .assistant, text: "Original durable transcript", sequenceIndex: 0))]
+                    ), for: active)
+                    manager.beginPreparedOversightPreparation(targetID)
+                    var holdingPreparation = true
+                    @MainActor func releasePreparation() {
+                        if holdingPreparation {
+                            holdingPreparation = false
+                            manager.endPreparedOversightPreparation(targetID)
+                        }
+                    }
+                    defer { releasePreparation() }
+                    let writer = try await manager.prepareSavedOversightTarget(targetID, isStillAuthorized: { true }).get()
+                    let host = try XCTUnwrap(writer.scope.executableHost)
+                    let parent = UUID()
+                    do {
+                        let firstVisit = await first.navigateAgentDeepLinkTab(carrier.id, sessionID: targetID, workspaceID: workspace.id)
+                        XCTAssertEqual(firstVisit, .blockedByActiveDifferentSession)
+                        XCTAssertTrue(writer.scope.executableHost === host)
+                        XCTAssertFalse(writer.scope.isRetiring, "A visit cannot retire an admitted preparation")
+                        XCTAssertNil(first.agentModeViewModel.sessions[carrier.id])
+                        try FileManager.default.removeItem(at: file)
+                        try FileManager.default.createDirectory(at: file, withIntermediateDirectories: false)
+                        writer.session.organizationalParentID = parent
+                        writer.session.isDirty = true
+                        releasePreparation()
+                        try await AsyncTestWait.waitUntil("saved host drain reached retained failure") {
+                            if case .retained? = writer.scope.retainedDrain?.outcome { return true }
+                            return false
+                        }
+                        let drain = try XCTUnwrap(writer.scope.retainedDrain)
+                        XCTAssertFalse(host.route.isClosing)
+                        XCTAssertFalse(writer.scope.hasReleasedWriterClaims)
+                        let secondVisit = await latest.navigateAgentDeepLinkTab(carrier.id, sessionID: targetID, workspaceID: workspace.id)
+                        XCTAssertEqual(secondVisit, .blockedByActiveDifferentSession)
+                        XCTAssertTrue(writer.scope.retainedDrain === drain)
+                        XCTAssertEqual(first.promptManager.activeComposeTabID, foreground.id)
+                        XCTAssertEqual(latest.promptManager.activeComposeTabID, foreground.id)
+                        XCTAssertNil(latest.agentModeViewModel.sessions[carrier.id])
+                        try FileManager.default.removeItem(at: file)
+                        let warningID = WindowStatesManager.agentHostRecoveryWarningPrefix + drain.recoveryID.uuidString
+                        await manager.retryRetainedAgentHostDrain(warningID: warningID)
+                        try await AsyncTestWait.waitUntil("latest deferred visit attaches the durable transcript") {
+                            latest.promptManager.activeComposeTabID == carrier.id
+                                && latest.agentModeViewModel.sessions[carrier.id]?.permitsBoundOperationAndSave == true
+                        }
+                        XCTAssertEqual(first.promptManager.activeComposeTabID, foreground.id)
+                        XCTAssertNil(first.agentModeViewModel.sessions[carrier.id])
+                        let reattached = try XCTUnwrap(latest.agentModeViewModel.sessions[carrier.id])
+                        XCTAssertFalse(reattached === writer.session)
+                        XCTAssertEqual(reattached.activeAgentSessionID, targetID)
+                        XCTAssertEqual(reattached.organizationalParentID, parent)
+                        XCTAssertNil(reattached.activeRunOwnership)
+                        XCTAssertTrue(writer.scope.hasReleasedWriterClaims)
+                        XCTAssertTrue(host.route.isClosing)
+                        let saved = try await AgentSessionDataService.shared.loadAgentSession(id: targetID, for: active)
+                        XCTAssertEqual(saved?.organizationalParentID, parent)
+                        XCTAssertEqual(drain.outcome, .released)
+                    } catch {
+                        releasePreparation()
+                        if (try? file.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
+                            try? FileManager.default.removeItem(at: file)
+                        }
+                        let drain = host.beginFinalShutdown()
+                        drain.attemptRecovery()
+                        _ = await drain.wait(until: .now.advanced(by: .seconds(5)))
+                        throw error
+                    }
+                }
+            }
+        }
+
         // MARK: Off-main catalog preparation and its new suspension boundary
 
         func testInitialCatalogSurvivesRepeatedLocalWitnessChangesWithStaleLegacyIndex() async throws {
@@ -6092,6 +6185,9 @@ import XCTest
                 XCTAssertEqual(restored.activeAgentSessionID, sessionID)
                 XCTAssertTrue(restored.qualifiedRestorationReadiness.isAuthoritative)
                 XCTAssertEqual(owner.agentModeViewModel.ownerValidatedSessionIndex[sessionID]?.tabID, target.id)
+                let ownerHost = owner.agentModeViewModel.runtimeHost
+                XCTAssertTrue(ownerHost.scope.sessions[target.id] === restored)
+                XCTAssertFalse(mirror.agentModeViewModel.runtimeHost === ownerHost)
                 XCTAssertNotEqual(mirror.workspaceManager.activeWorkspaceID, selected.id)
                 XCTAssertEqual(mirror.workspaceManager.workspace(withID: selected.id)?.composeTabs.last?.isPinned, true)
                 let originalMirrorVersion = mirror.workspaceManager.debugStateVersionForWorkspace(selected.id)
@@ -6112,15 +6208,17 @@ import XCTest
                     let record = try XCTUnwrap(catalog.workspaces.first { $0.document.workspaceID == selected.id })
                     let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: record.document.documentBytes)
                     let disk = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: record.document.fileURL))
-                    for workspace in try [canonical, disk, XCTUnwrap(owner.workspaceManager.workspace(withID: selected.id)), XCTUnwrap(mirror.workspaceManager.workspace(withID: selected.id))] {
-                        XCTAssertEqual(workspace.composeTabs.contains { $0.id == target.id }, !archived)
-                        XCTAssertEqual(workspace.stashedTabs.contains { $0.tab.id == target.id }, archived)
+                    let ownerProjection = try XCTUnwrap(owner.workspaceManager.workspace(withID: selected.id))
+                    let mirrorProjection = try XCTUnwrap(mirror.workspaceManager.workspace(withID: selected.id))
+                    for (source, workspace) in [("canonical", canonical), ("disk", disk), ("owner", ownerProjection), ("mirror", mirrorProjection)] {
+                        XCTAssertEqual(workspace.composeTabs.contains { $0.id == target.id }, !archived, source)
+                        XCTAssertEqual(workspace.stashedTabs.contains { $0.tab.id == target.id }, archived, source)
                         let carrier = try XCTUnwrap(
                             workspace.composeTabs.first { $0.id == target.id }
                                 ?? workspace.stashedTabs.first { $0.tab.id == target.id }?.tab
                         )
-                        XCTAssertFalse(carrier.isPinned)
-                        XCTAssertEqual(carrier.activeAgentSessionID, sessionID)
+                        XCTAssertFalse(carrier.isPinned, source)
+                        XCTAssertEqual(carrier.activeAgentSessionID, sessionID, source)
                     }
                     XCTAssertEqual(organizer.state(of: sessionID)?.isArchived, archived)
                     XCTAssertEqual(
@@ -6188,23 +6286,41 @@ import XCTest
                     await manager.awaitInitialized()
                     await manager.awaitInitialWorkspaceActivationCompletion()
                     try await f.awaitCaughtUpWithCatalogBaseline(window)
+                    let workspace = try XCTUnwrap(manager.workspace(withID: Fixture.aardvarkID))
+                    let vm = window.agentModeViewModel
                     if inactiveLiveSession {
-                        XCTAssertNotEqual(manager.activeWorkspaceID, Fixture.aardvarkID)
-                        let session = AgentTabSession(tabID: target.id)
-                        window.agentModeViewModel.test_installLiveSession(session)
-                        _ = try XCTUnwrap(window.agentModeViewModel.test_installPersistentSessionBinding(
-                            sessionID: sessionID, on: session
-                        ))
+                        let payload = AgentSession(
+                            id: sessionID, workspaceID: workspace.id, composeTabID: target.id, name: target.name,
+                            autoWakeOnOversightUpdates: false
+                        )
+                        _ = try await AgentSessionDataService.shared.saveAgentSession(payload, for: workspace)
+                    }
+                    let opened = await manager.requestWorkspaceSwitch(to: workspace, silent: true)
+                    XCTAssertTrue(opened.didSwitch)
+                    let adopted = await vm.awaitWorkspaceRuntimeAdoption(expectedWorkspaceID: workspace.id)
+                    let host = try XCTUnwrap(adopted ? vm.runtimeHost : nil)
+                    f.ownAgentHostForCleanup(host)
+                    if inactiveLiveSession {
+                        let session = await vm.ensureSessionReady(tabID: target.id, reconnectActiveProviders: false, expectedWorkspaceID: workspace.id)
+                        XCTAssertEqual(session.activeAgentSessionID, sessionID)
+                        XCTAssertTrue(session.permitsBoundOperationAndSave)
                         XCTAssertFalse(session.runState.isActive, "An idle live owner still needs protection during workspace teardown")
-                        XCTAssertTrue(try window.agentModeViewModel.authoritativeLiveSession(for: sessionID) === session)
+                        let other = try XCTUnwrap(manager.workspace(withID: Fixture.requestedID))
+                        let switched = await manager.requestWorkspaceSwitch(to: other, saveState: false, silent: true)
+                        XCTAssertTrue(switched.didSwitch)
+                        let otherReady = await vm.awaitWorkspaceRuntimeAdoption(expectedWorkspaceID: other.id)
+                        XCTAssertTrue(otherReady)
+                        XCTAssertNotEqual(manager.activeWorkspaceID, Fixture.aardvarkID)
+                        XCTAssertFalse(host === vm.runtimeHost)
+                        XCTAssertTrue(host.scope.sessions[target.id] === session)
+                        XCTAssertFalse(host.scope.presentation.hasPresenter(for: session))
                     } else {
-                        manager.activeWorkspace = manager.workspace(withID: Fixture.aardvarkID)
                         XCTAssertNotEqual(
                             manager.activeWorkspace?.activeComposeTabID,
                             target.id,
                             "Every cold pin in the owned workspace is protected, not only the selected tab"
                         )
-                        XCTAssertNil(try window.agentModeViewModel.authoritativeLiveSession(for: sessionID))
+                        XCTAssertNil(try vm.authoritativeLiveSession(for: sessionID))
                     }
                     let originalVersion = manager.debugStateVersionForWorkspace(Fixture.aardvarkID)
                     let before = await f.runtime.workspaceStore.snapshot()
@@ -7356,6 +7472,15 @@ import XCTest
             let gate = Gate()
             gates.append(gate)
             return gate
+        }
+
+        func ownAgentHostForCleanup(_ host: AgentSessionRuntimeHost) {
+            ownedJoins.append {
+                guard !host.scope.hasReleasedWriterClaims else { return }
+                let drain = host.beginAuthorizedRetirement()
+                let result = await drain.wait(until: .now.advanced(by: .seconds(5)))
+                XCTAssertEqual(result, .released)
+            }
         }
 
         func startOwned<Value>(_ operation: @escaping @MainActor () async -> Value) -> Task<Value, Never> {

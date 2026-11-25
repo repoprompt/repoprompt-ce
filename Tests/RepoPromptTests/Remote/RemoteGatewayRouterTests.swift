@@ -1215,6 +1215,22 @@ final class RemoteMutationBehaviorTests: XCTestCase {
         XCTAssertEqual(session.selectedModelRaw, originalModel)
     }
 
+    func testRemoteInterviewRejectsCodexControlCommandBeforeSubmission() async throws {
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let agentMode = window.agentModeViewModel
+        let tabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.composeTabs.first?.id)
+        let session = await agentMode.ensureSessionReady(tabID: tabID)
+        session.selectedAgent = .codexExec
+
+        let result = agentMode.submitUserTurn(
+            text: "/goal", tabID: tabID, isLocalComposerInput: false, remoteInterviewFirst: true
+        )
+
+        XCTAssertEqual(result, .blocked(message: "Interview first requires a message that starts an agent turn."))
+        XCTAssertTrue(session.items.isEmpty)
+    }
+
     func testStartCommandSavesConfiguredSessionAndDeliversUploadedFile() async throws {
         let window = try await makeWindow()
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
@@ -1258,6 +1274,7 @@ final class RemoteMutationBehaviorTests: XCTestCase {
             workspaceID: workspace.id.uuidString,
             message: "Exercise the Remote launch path.",
             agentID: "claudeCode",
+            interviewFirst: true,
             attachmentIDs: [attachmentID]
         ), authorizeDispatch: {})
 
@@ -1273,7 +1290,9 @@ final class RemoteMutationBehaviorTests: XCTestCase {
             return XCTFail("Expected the uploaded file in managed attachment storage.")
         }
         let escapedPath = AgentSessionProviderInputRuntime.escapePathForAtCommand(path)
-        XCTAssertTrue(try XCTUnwrap(inputAtDispatch).contains("@\(escapedPath)"))
+        let input = try XCTUnwrap(inputAtDispatch)
+        XCTAssertTrue(input.contains("@\(escapedPath)"))
+        XCTAssertTrue(input.contains("<interview_first>"))
         XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), bytes)
     }
 
@@ -1334,7 +1353,7 @@ final class RemoteProducerParityTests: XCTestCase {
             name: "functions.exec_command", status: .failed,
             resultJSON: #"{"type":"commandExecution","command":"swift build","exitCode":1,"aggregatedOutput":"omitted output","status":"failed"}"#
         )
-        XCTAssertEqual(WindowRemoteReadService.compactToolSummary(command), "swift build • Exit 1")
+        XCTAssertEqual(WindowRemoteReadService.compactToolSummary(command), "Shell command • Exit 1")
         let patch = toolExecution(
             name: "apply_patch", status: .success,
             resultJSON: #"{"status":"success","change_count":1,"changes":[{"path":"Sources/A.swift","kind":"update","diff":"@@ -1 +1 @@\n-old\n+new"}]}"#
@@ -1801,7 +1820,7 @@ final class RemoteProducerParityTests: XCTestCase {
                 argsJSON: #"{"api_key":"raw-argument"}"#,
                 resultJSON: #"{"password":"raw-result"}"#,
                 isError: true,
-                summaryText: "Command failed"
+                summaryText: "TOKEN=shell-secret do-work"
             ),
             reasoning: "Bearer raw-reasoning"
         )
@@ -1887,7 +1906,7 @@ final class RemoteProducerParityTests: XCTestCase {
         XCTAssertEqual(sanitized.first { $0.id == answer.id }?.kind, .conclusion)
         XCTAssertEqual(sanitized.first { $0.id == substantiveAnswer.id }?.semanticKind, .assistantAnswer)
         XCTAssertEqual(sanitized.first { $0.id == failedTool.id }?.semanticKind, .error)
-        XCTAssertEqual(sanitized.first { $0.id == failedTool.id }?.text, "Command failed")
+        XCTAssertEqual(sanitized.first { $0.id == failedTool.id }?.text, "Shell command")
         XCTAssertNil(sanitized.first { $0.id == failedTool.id }?.detail)
         XCTAssertEqual(sanitized.first { $0.id == question.id }?.semanticKind, .question)
         XCTAssertNil(sanitized.first { $0.id == question.id }?.text)
@@ -1902,6 +1921,7 @@ final class RemoteProducerParityTests: XCTestCase {
         XCTAssertFalse(encodedDefault.contains("raw-result"))
         XCTAssertFalse(encodedDefault.contains("raw-reasoning"))
         XCTAssertFalse(encodedDefault.contains("request-secret"))
+        XCTAssertFalse(encodedDefault.contains("shell-secret"))
 
         let detailed = WindowRemoteReadService.project(transcript: transcript, includeDetails: true)
         let toolDetail = try XCTUnwrap(detailed.first { $0.id == failedTool.id }?.detail)
@@ -2303,6 +2323,13 @@ final class RemoteSnapshotProjectionTests: XCTestCase {
         XCTAssertEqual(questions[0].options.first?.description, "Only read files")
         XCTAssertTrue(questions[0].allowsNote)
         XCTAssertFalse(questions[1].allowsSkip)
+
+        struct LegacyInteraction: Decodable {
+            let responseUnavailableReason: String?
+        }
+        let encoded = try JSONEncoder().encode(result)
+        XCTAssertNotNil(try JSONDecoder().decode(LegacyInteraction.self, from: encoded).responseUnavailableReason)
+        XCTAssertEqual(try JSONDecoder().decode(RemoteInteractionSummary.self, from: encoded), result)
 
         let unavailable = AgentModeRemoteSessionQueryService.projectInteraction(
             interaction, createdAt: .distantPast, requiresLocalUserInput: true
