@@ -93,14 +93,33 @@ final class CodeMapArtifactBuildSchedulingTests: XCTestCase {
         private static let promotionAge: UInt64 = 100
 
         let coordinator: CodeMapArtifactBuildCoordinator
-        private let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        private let root: URL
         private let clock = OSAllocatedUnfairLock(initialState: (now: UInt64(0), step: UInt64(0)))
         private let starts = OSAllocatedUnfairLock(initialState: [BuildStart]())
         private let gate = AsyncStream<Void>.makeStream()
         private var requests: [Request] = []
 
         init() throws {
-            let store = try CodeMapArtifactStore(rootURL: root)
+            // The artifact store opens each path component without following symlinks.
+            let temporaryPath = try XCTUnwrap(FileManager.default.temporaryDirectory.path.withCString { pointer -> String? in
+                guard let resolved = realpath(pointer, nil) else { return nil }
+                defer { free(resolved) }
+                return String(cString: resolved)
+            })
+            root = URL(fileURLWithPath: temporaryPath, isDirectory: true)
+                .appendingPathComponent("CodeMapSchedulingTests-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: root,
+                withIntermediateDirectories: false,
+                attributes: [.posixPermissions: 0o700]
+            )
+            let store: CodeMapArtifactStore
+            do {
+                store = try CodeMapArtifactStore(rootURL: root)
+            } catch {
+                try? FileManager.default.removeItem(at: root)
+                throw error
+            }
             coordinator = CodeMapArtifactBuildCoordinator(
                 artifactStore: CodeMapArtifactStoreClient(
                     lookup: { _ in .miss },
