@@ -10,21 +10,28 @@ import RepoPromptWorkspaceCore
 @MainActor
 enum SessionAdminWindows {
     /// Carrier metadata can veto inconsistent identities, but cannot select or manufacture a writer.
-    static func command(for sessionID: UUID) throws -> AgentSessionRuntimeStore.Command? {
+    static func requireConsistentCarriers(sessionID: UUID, expectedWorkspaceID: UUID?) throws {
         let carriers = AgentSessionCarrierResolver.capture(
             windows: WindowStatesManager.shared.sessionRuntimeWindows, sessionIDs: [sessionID]
         )
         guard !carriers.ambiguousSessionIDs.contains(sessionID) else {
             throw SessionAdminHostError.refused(code: "target_ambiguous", detail: "Conflicting target identities prevent mutation.", nextCall: nil)
         }
-        switch AgentSessionRuntimeStore.shared.resolveWriter(sessionID: sessionID) {
-        case .unavailable(.absent): return nil
-        case .unavailable, .conflicting: throw SessionAdminHostError.sessionUnavailable
+        if let expectedWorkspaceID, carriers.affectedWorkspaceIDs(for: sessionID).contains(where: { $0 != expectedWorkspaceID }) {
+            throw SessionAdminHostError.sessionUnavailable
+        }
+    }
+
+    static func command(for sessionID: UUID) throws -> AgentSessionRuntimeStore.Command? {
+        let resolution = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: sessionID)
+        switch resolution {
         case let .unique(writer):
-            guard carriers.affectedWorkspaceIDs(for: sessionID).allSatisfy({ $0 == writer.identity.workspaceID }) else {
-                throw SessionAdminHostError.sessionUnavailable
-            }
+            try requireConsistentCarriers(sessionID: sessionID, expectedWorkspaceID: writer.identity.workspaceID)
             return try writer.admitCommand().get()
+        default:
+            try requireConsistentCarriers(sessionID: sessionID, expectedWorkspaceID: nil)
+            if case .unavailable(.absent) = resolution { return nil }
+            throw SessionAdminHostError.sessionUnavailable
         }
     }
 
@@ -75,57 +82,13 @@ enum SessionAdminWindows {
     }
 }
 
-/// A saved carrier witness, not a permission. Preparation borrows its workspace/tab in a private
-/// runtime composition; the real tab, stash and active workspace are never edited.
-@MainActor
-struct SavedOversightSessionLocation {
-    weak var window: WindowState?
-    let workspace: WorkspaceModel
-    let tab: ComposeTabState
-    let stashedTabID: UUID?
-    let entry: AgentSessionIndexEntry
-
-    var isCurrent: Bool {
-        guard let window,
-              let current = window.workspaceManager.workspace(withID: workspace.id) else { return false }
-        if window.workspaceManager.activeWorkspaceID == workspace.id,
-           let latest = window.agentModeViewModel.ownerValidatedSessionIndex[entry.id],
-           latest.tabID != entry.tabID || latest.parentSessionID != entry.parentSessionID
-           || latest.createdByOverseerSessionID != entry.createdByOverseerSessionID
-           || latest.organizationalParentID != entry.organizationalParentID
-           || latest.delegationScopeID != entry.delegationScopeID { return false }
-        let tabs = current.composeTabs.filter { $0.id == tab.id }
-        let stashes = current.stashedTabs.filter { $0.tab.id == tab.id }
-        // The target's carrier and provenance matter, not the other chat currently displayed
-        // in it. Stashing/unstashing is UI placement, not withdrawal of managed-task consent.
-        return tabs.count + stashes.count == 1
-    }
-
-    func agreesOnCarrierAndProvenance(with other: Self) -> Bool {
-        workspace.id == other.workspace.id && tab.id == other.tab.id
-            && entry.parentSessionID == other.entry.parentSessionID
-            && entry.createdByOverseerSessionID == other.entry.createdByOverseerSessionID
-            && entry.organizationalParentID == other.entry.organizationalParentID
-            && entry.delegationScopeID == other.entry.delegationScopeID
-    }
-
-    var runtimeWorkspace: WorkspaceModel {
-        var copy = workspace
-        var carrier = tab
-        carrier.name = entry.name
-        carrier.activeAgentSessionID = entry.id
-        copy.composeTabs = [carrier]
-        copy.stashedTabs = []
-        copy.activeComposeTabID = carrier.id
-        return copy
-    }
-}
-
 @MainActor
 final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
     /// Outcome of preparing a saved or never-visited session without opening its tab.
-    enum ForkPreparation: Equatable {
-        case ready, missing, ambiguous, changed, unreadable
+    enum ForkPreparation {
+        case loaded(AgentSessionRuntimeStore.Writer)
+        case ready, missing, ambiguous, changed, unreadable, providerSettingsUnavailable
+        case rootsUnavailable(WorkspaceRootReadinessFailure.Availability)
     }
 
     typealias Preparation = @MainActor (UUID, @escaping @MainActor () -> Bool) async -> ForkPreparation
@@ -136,11 +99,13 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
     /// Production preparation: the targeted-oversight path (point read, no tab focus, no provider run).
     static let savedTargetPreparation: Preparation = { target, isStillAuthorized in
         switch await WindowStatesManager.shared.prepareSavedOversightTarget(target, isStillAuthorized: isStillAuthorized) {
-        case .success: .ready
+        case let .success(writer): .loaded(writer)
         case .failure(.missing): .missing
         case .failure(.ambiguous): .ambiguous
         case .failure(.changed): .changed
         case .failure(.unreadable): .unreadable
+        case .failure(.providerSettingsUnavailable): .providerSettingsUnavailable
+        case let .failure(.rootsUnavailable(reason)): .rootsUnavailable(reason)
         }
     }
 
@@ -152,37 +117,59 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         self.preparation = preparation
     }
 
-    /// Prepares a saved or never-visited target (no tab focus, no provider run). nil when the
-    /// target is live or ready; otherwise the refusal to report.
-    private func prepareIfUnloaded(
-        _ sessionID: UUID, isStillAuthorized: @escaping @MainActor () -> Bool
-    ) async -> SessionAdminLifecycleOutcome? {
-        guard SessionAdminWindows.liveSession(sessionID) == nil, let preparation else { return nil }
+    /// The prepared writer is a receipt. Re-resolving by UUID after asynchronous preparation
+    /// could otherwise give the command to a replacement that never participated in admission.
+    static func exactPreparedCommand(
+        sessionID: UUID, preparation: Preparation?, isStillAuthorized: @escaping @MainActor () -> Bool
+    ) async throws -> AgentSessionRuntimeStore.Command? {
+        guard isStillAuthorized(), !Task.isCancelled else { throw SessionAdminHostError.authorityEnded }
+        if let expected = AppSavedAgentSessionExecution.approvedLinkOrigin.get()?.target, expected.sessionID == sessionID {
+            guard let command = try SessionAdminWindows.command(for: sessionID), command.identity == expected else {
+                throw preparationRefusal(.changed)
+            }
+            return command
+        }
+        if let command = try SessionAdminWindows.preparedCommand(for: sessionID, allowingPreparation: true) { return command }
+        guard let preparation else { return nil }
         let outcome = await preparation(sessionID, isStillAuthorized)
-        guard isStillAuthorized() else { return .blocked("Delegated authority ended while preparing the target.") }
-        return outcome == .ready ? nil : .invalid(Self.preparationDetail(outcome))
+        guard isStillAuthorized(), !Task.isCancelled else { throw SessionAdminHostError.authorityEnded }
+        switch outcome {
+        case let .loaded(writer):
+            guard writer.identity.sessionID == sessionID else { throw preparationRefusal(.changed) }
+            try SessionAdminWindows.requireConsistentCarriers(sessionID: sessionID, expectedWorkspaceID: writer.identity.workspaceID)
+            return try writer.admitCommand().get()
+        case .ready:
+            // Injection-only: no writer receipt means preparation did not establish authority.
+            return nil
+        default:
+            throw preparationRefusal(outcome)
+        }
     }
 
     static func preparationRefusal(_ reason: ForkPreparation) -> SessionAdminHostError {
         let code = switch reason {
-        case .ready, .changed: "target_changed"
+        case .ready, .loaded, .changed: "target_changed"
         case .missing: "target_missing"
         case .ambiguous: "target_ambiguous"
         case .unreadable: "target_unreadable"
+        case .providerSettingsUnavailable: "provider_settings_unavailable"
+        case .rootsUnavailable: "workspace_not_ready"
         }
-        let next: Value? = reason == .missing
-            ? .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("inventory")])])
-            : nil
+        let next: Value? = if case .missing = reason {
+            .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("inventory")])])
+        } else { nil }
         return .refused(code: code, detail: preparationDetail(reason), nextCall: next)
     }
 
     static func preparationDetail(_ reason: ForkPreparation) -> String {
         switch reason {
-        case .ready: "The source session is ready."
+        case .ready, .loaded: "The source session is ready."
         case .missing: "The source session was not found in any loaded workspace. Check its ID with session_admin inventory."
         case .ambiguous: "The source session is open in more than one place. Close the duplicate tab, then retry."
         case .changed: "The source session moved or changed while being prepared. Retry fork."
-        case .unreadable: "The source session's saved transcript could not be read, so it cannot be forked."
+        case .unreadable: "The source session's saved transcript could not be read."
+        case .providerSettingsUnavailable: "The target's provider settings did not become ready. Retry after confirming that the provider is connected."
+        case let .rootsUnavailable(reason): "The target session's workspace roots are not ready (\(reason.rawValue)). Reconcile the workspace roots and retry."
         }
     }
 
@@ -193,16 +180,16 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         manager.beginPreparedOversightPreparation(sessionID)
         var transferred = false
         defer { if !transferred { manager.endPreparedOversightPreparation(sessionID) } }
-        guard isStillAuthorized(), !Task.isCancelled else { throw SessionAdminHostError.authorityEnded }
-        if try SessionAdminWindows.command(for: sessionID) == nil {
-            guard let preparation else { throw SessionAdminHostError.sessionUnavailable }
-            let result = await preparation(sessionID, isStillAuthorized)
-            guard isStillAuthorized(), !Task.isCancelled else { throw SessionAdminHostError.authorityEnded }
-            guard result == .ready else { throw Self.preparationRefusal(result) }
+        guard let command = try await Self.exactPreparedCommand(sessionID: sessionID, preparation: preparation, isStillAuthorized: isStillAuthorized) else {
+            throw SessionAdminHostError.sessionUnavailable
         }
-        guard try SessionAdminWindows.command(for: sessionID) != nil else { throw SessionAdminHostError.sessionUnavailable }
+        try command.requireCurrent()
         transferred = true
-        return SessionAdminPlacementPreparation { manager.endPreparedOversightPreparation(sessionID) }
+        return SessionAdminPlacementPreparation(commit: { parentID, scopeID in
+            guard isStillAuthorized(), !Task.isCancelled else { throw SessionAdminHostError.authorityEnded }
+            try SessionAdminWindows.requireConsistentCarriers(sessionID: sessionID, expectedWorkspaceID: command.identity.workspaceID)
+            return try Self.commitPlacement(command: command, parentID: parentID, delegationScopeID: scopeID)
+        }, release: { manager.endPreparedOversightPreparation(sessionID) })
     }
 
     func commitOrganizationalPlacement(
@@ -211,7 +198,13 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         delegationScopeID: UUID?
     ) throws -> DelegationPlacementCommit? {
         guard let command = try SessionAdminWindows.command(for: sessionID) else { return nil }
-        return try command.commitDelegationPlacement(
+        return try Self.commitPlacement(command: command, parentID: parentID, delegationScopeID: delegationScopeID)
+    }
+
+    private static func commitPlacement(
+        command: AgentSessionRuntimeStore.Command, parentID: UUID, delegationScopeID: UUID?
+    ) throws -> DelegationPlacementCommit? {
+        try command.commitDelegationPlacement(
             organizationalParentID: parentID,
             delegationScopeID: delegationScopeID ?? command.writer.session.delegationScopeID,
             project: WindowStatesManager.shared.projectDelegationPlacement
@@ -246,23 +239,39 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         guard let initialObserver = initialObservers[observer]?.only?.domainEndpoint else {
             return .failed("observer_changed: The requesting session has no exact current binding; nothing was linked.")
         }
+        if let origin = AppSavedAgentSessionExecution.approvedLinkOrigin.get(),
+           origin.observer != initialObserver || origin.target.sessionID != target
+        {
+            return .failed("observer_changed: The approved continuation lost its original bindings; nothing was linked.")
+        }
         manager.beginPreparedOversightPreparation(target)
         defer { manager.endPreparedOversightPreparation(target) }
-        let prepared = await manager.prepareSavedOversightTarget(target, isStillAuthorized: isStillAuthorized)
-        guard isStillAuthorized(), !Task.isCancelled else { return .revoked }
-        guard case let .success(owner) = prepared,
-              let location = manager.preparedOversightLocations[target], location.isCurrent
-        else {
-            let code = if case let .failure(reason) = prepared { reason.rawValue } else { "target_binding_changed" }
+        let command: AgentSessionRuntimeStore.Command
+        do {
+            guard let prepared = try await Self.exactPreparedCommand(
+                sessionID: target, preparation: preparation, isStillAuthorized: isStillAuthorized
+            ) else { throw SessionAdminHostError.sessionUnavailable }
+            command = prepared
+        } catch SessionAdminHostError.authorityEnded {
+            return .revoked
+        } catch {
+            guard isStillAuthorized(), !Task.isCancelled else { return .revoked }
+            let code = if case let SessionAdminHostError.refused(code, _, _) = error { code } else { "target_binding_changed" }
             return .failed("\(code): The exact saved target could not be prepared. Ask the user to check whether it was deleted, moved or has conflicting saved copies; nothing was linked.")
         }
-        guard !owner.isClosing else { return .revoked }
-        // Re-read after hydration: no captured endpoint, deletion state or ambiguity claim earns a link.
-        let current = AgentSessionCarrierResolver.capture(windows: WindowStatesManager.shared.allWindows, sessionIDs: [target])
-        guard !current.ambiguousSessionIDs.contains(target),
-              (try? SessionAdminWindows.command(for: target)) != nil
-        else {
-            return .failed("target_ambiguous: Target ownership changed during preparation. Use session_admin inventory; nothing was linked.")
+        guard isStillAuthorized(), !Task.isCancelled else { return .revoked }
+        let writer = command.writer
+        if let origin = AppSavedAgentSessionExecution.approvedLinkOrigin.get() {
+            // One canonical read proves both endpoints; no target proof survives an await for
+            // the observer's placement in a different workspace.
+            let carriersAreCurrent = await AppSavedAgentSessionExecution.revalidateApprovedLinkOrigin(origin, writer: writer)
+            guard isStillAuthorized(), !Task.isCancelled else { return .revoked }
+            guard carriersAreCurrent else {
+                return .failed("target_binding_changed: A canonical carrier changed before linking; nothing was linked.")
+            }
+        }
+        guard command.isCurrent, let host = writer.scope.executableHost, !host.route.isClosing else {
+            return .failed("target_binding_changed: Target ownership changed during preparation. Use session_admin inventory; nothing was linked.")
         }
         let candidates = WindowStatesManager.shared.agentSessionLinkCandidates(
             forSessionIDs: [observer, target], includeLocation: false
@@ -271,9 +280,8 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
             return .failed("observer_changed: The requesting session's exact binding changed; nothing was linked.")
         }
         guard let targetEndpoint = candidates[target]?.only?.domainEndpoint,
-              targetEndpoint.windowID == owner.windowID,
-              targetEndpoint.workspaceID == location.workspace.id, targetEndpoint.tabID == location.tab.id,
-              location.isCurrent,
+              targetEndpoint.windowID == host.routeID,
+              targetEndpoint.workspaceID == writer.identity.workspaceID, targetEndpoint.tabID == writer.session.tabID,
               !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: target),
               !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: target)
         else { return .failed("target_unloaded_unpreparable: The exact target binding changed during preparation. Use session_admin inventory; nothing was linked.") }
@@ -328,10 +336,17 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         modelID: String,
         isStillAuthorized: @escaping @MainActor () -> Bool
     ) async -> SessionAdminLifecycleOutcome {
-        if let refusal = await prepareIfUnloaded(sessionID, isStillAuthorized: isStillAuthorized) { return refusal }
         let windows = WindowStatesManager.shared
-        guard let command = try? SessionAdminWindows.command(for: sessionID),
-              let runtime = command.writer.scope.linkExecution,
+        windows.beginPreparedOversightPreparation(sessionID)
+        defer { windows.endPreparedOversightPreparation(sessionID) }
+        let command: AgentSessionRuntimeStore.Command
+        do {
+            guard let prepared = try await Self.exactPreparedCommand(sessionID: sessionID, preparation: preparation, isStillAuthorized: isStillAuthorized) else {
+                return .blocked("The target session is not live.")
+            }
+            command = prepared
+        } catch { return Self.lifecyclePreparationFailure(error) }
+        guard let runtime = command.writer.scope.linkExecution,
               let endpoint = runtime.agentSessionLinkObserverEndpoint(tabID: command.writer.session.tabID),
               let modelCandidate = runtime.agentSessionLinkModelCandidate(for: endpoint)
         else { return .blocked("The target session is not live.") }
@@ -366,15 +381,30 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         effort: String,
         isStillAuthorized: @escaping @MainActor () -> Bool
     ) async -> SessionAdminLifecycleOutcome {
-        if let refusal = await prepareIfUnloaded(sessionID, isStillAuthorized: isStillAuthorized) { return refusal }
-        guard let command = try? SessionAdminWindows.command(for: sessionID),
-              let runtime = command.writer.scope.linkExecution
-        else {
+        let windows = WindowStatesManager.shared
+        windows.beginPreparedOversightPreparation(sessionID)
+        defer { windows.endPreparedOversightPreparation(sessionID) }
+        let command: AgentSessionRuntimeStore.Command
+        do {
+            guard let prepared = try await Self.exactPreparedCommand(sessionID: sessionID, preparation: preparation, isStillAuthorized: isStillAuthorized) else {
+                return .blocked("The target session is not live.")
+            }
+            command = prepared
+        } catch { return Self.lifecyclePreparationFailure(error) }
+        guard let runtime = command.writer.scope.linkExecution else {
             return .blocked("The target session is not live.")
         }
         return runtime.delegationSetReasoningEffort(
             command: command, effort: effort, isStillAuthorized: isStillAuthorized
         )
+    }
+
+    private static func lifecyclePreparationFailure(_ error: Error) -> SessionAdminLifecycleOutcome {
+        switch error {
+        case SessionAdminHostError.authorityEnded: .blocked("Delegated authority ended while preparing the target.")
+        case let SessionAdminHostError.refused(code, detail, _): code == "workspace_not_ready" ? .blocked(detail) : .invalid(detail)
+        default: .blocked("The target session is not live.")
+        }
     }
 
     func fork(
@@ -385,14 +415,7 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         let manager = WindowStatesManager.shared
         manager.beginPreparedOversightPreparation(sessionID)
         defer { manager.endPreparedOversightPreparation(sessionID) }
-        guard isStillAuthorized(), !Task.isCancelled else { throw SessionAdminHostError.authorityEnded }
-        if try SessionAdminWindows.preparedCommand(for: sessionID, allowingPreparation: true) == nil, let preparation {
-            let outcome = await preparation(sessionID, isStillAuthorized)
-            guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
-            guard outcome == .ready else { throw Self.preparationRefusal(outcome) }
-        }
-        guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
-        guard let command = try SessionAdminWindows.preparedCommand(for: sessionID, allowingPreparation: false) else {
+        guard let command = try await Self.exactPreparedCommand(sessionID: sessionID, preparation: preparation, isStillAuthorized: isStillAuthorized) else {
             throw SessionAdminHostError.sessionUnavailable
         }
         return try await command.writer.scope.administration.fork(
@@ -497,14 +520,9 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
     private func preparedCommand(
         _ sessionID: UUID, isStillAuthorized: @escaping @MainActor () -> Bool
     ) async throws -> AgentSessionRuntimeStore.Command {
-        guard isStillAuthorized(), !Task.isCancelled else { throw SessionAdminHostError.authorityEnded }
-        if let command = try SessionAdminWindows.preparedCommand(for: sessionID, allowingPreparation: true) {
-            return command
-        }
-        let outcome = await SessionAdminWindowsStructureHost.savedTargetPreparation(sessionID, isStillAuthorized)
-        guard isStillAuthorized(), !Task.isCancelled else { throw SessionAdminHostError.authorityEnded }
-        guard outcome == .ready else { throw SessionAdminWindowsStructureHost.preparationRefusal(outcome) }
-        guard let command = try SessionAdminWindows.preparedCommand(for: sessionID, allowingPreparation: false) else {
+        guard let command = try await SessionAdminWindowsStructureHost.exactPreparedCommand(
+            sessionID: sessionID, preparation: SessionAdminWindowsStructureHost.savedTargetPreparation, isStillAuthorized: isStillAuthorized
+        ) else {
             throw SessionAdminHostError.sessionUnavailable
         }
         return command

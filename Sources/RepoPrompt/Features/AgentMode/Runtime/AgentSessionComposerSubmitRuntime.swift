@@ -281,6 +281,7 @@ final class AgentComposerStartCancellation {
     private(set) var destinationWriterIdentity: AgentSessionRuntimeStore.WriterIdentity?
     private weak var runtime: AgentSessionComposerSubmitRuntime?
     private let allowsPendingStartWithdrawal: Bool
+    private let originatingSteerAttempt: (runID: UUID, attemptID: UUID)?
     private var preparationOwners: Set<ObjectIdentifier> = []
     private var owedDraft: String?
     private var stopFence: AgentRunStartStopFence
@@ -304,6 +305,13 @@ final class AgentComposerStartCancellation {
         self.source = source
         self.runtime = runtime
         self.allowsPendingStartWithdrawal = allowsPendingStartWithdrawal
+        if attempt.target.expectedRunState.isActive, let runID = attempt.target.expectedRunID,
+           let attemptID = attempt.target.expectedRunAttemptID
+        {
+            originatingSteerAttempt = (runID, attemptID)
+        } else {
+            originatingSteerAttempt = nil
+        }
         executorEntered = !awaitsExecutor
         stopFence = AgentRunStartStopFence(session: source)
         didLaunch = source.runState.isActive || source.activeRunOwnership != nil
@@ -343,6 +351,16 @@ final class AgentComposerStartCancellation {
         if !executorEntered { releaseRequested = true }
         finalizeIfReleased()
         return true
+    }
+
+    /// Departure may withdraw a local steer before its optimistic input is published, but not
+    /// a fresh submission that has since handed ownership to its own admitted attempt.
+    func withdrawForPresentationDeparture(on session: AgentTabSession) -> Bool {
+        if withdraw(on: session) { return true }
+        guard allowsPendingStartWithdrawal, let originatingSteerAttempt,
+              session.runState.isActive, session.runID == originatingSteerAttempt.runID,
+              session.activeRunAttemptID == originatingSteerAttempt.attemptID else { return false }
+        return cancelPresentedInput(on: session)
     }
 
     func beginExecution() -> Bool {

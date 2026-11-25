@@ -466,11 +466,30 @@ final class WorkspaceActivityCoordinator {
                 failures[workspaceID] = timeoutReason
             }
         }
+        // Some exact owners no longer have a manager. The existing workspace deletion lease
+        // fences new activation while confirmed deletion joins their durable release.
+        for workspaceID in claimed.sorted(by: { $0.uuidString < $1.uuidString }) where failures[workspaceID] == nil {
+            guard deletionLeaseIDByWorkspaceID[workspaceID] == leaseID,
+                  let token = cancellationTokensByWorkspaceID[workspaceID], token.isActive,
+                  !Task.isCancelled, clock.now < deadline
+            else {
+                failures[workspaceID] = timeoutReason
+                continue
+            }
+            let released = await AgentSessionRuntimeHost.drainRetainedHostsForWorkspaceDeletion(workspaceID: workspaceID, until: deadline) {
+                self.deletionLeaseIDByWorkspaceID[workspaceID] == leaseID && token.isActive
+            }
+            if !released || deletionLeaseIDByWorkspaceID[workspaceID] != leaseID || !token.isActive || Task.isCancelled || clock.now >= deadline {
+                failures[workspaceID] = "The workspace's Agent runtime has not finished saving and releasing its resources. Try deleting it again."
+            }
+        }
         for workspaceID in failures.keys {
             cancellationTokensByWorkspaceID[workspaceID]?.cancel()
         }
         for workspaceID in failures.keys where claimed.remove(workspaceID) != nil {
-            deletionLeaseIDByWorkspaceID.removeValue(forKey: workspaceID)
+            if deletionLeaseIDByWorkspaceID[workspaceID] == leaseID {
+                deletionLeaseIDByWorkspaceID.removeValue(forKey: workspaceID)
+            }
         }
         return DeletionClaim(
             lease: DeletionLease(id: leaseID, workspaceIDs: claimed),
@@ -612,18 +631,11 @@ class WindowStatesManager: ObservableObject {
         }
     }
 
-    // Nonvisual exact-session owners are not windows: never persist them in window restore state,
-    // present them, or include them in workspace-selection UI.
-    var preparedOversightLocations: [UUID: SavedOversightSessionLocation] = [:]
-    var preparedOversightWindows: [UUID: WindowState] = [:]
-    var preparedOversightOwnerLocations: [UUID: SavedOversightSessionLocation] = [:]
+    // Admission/visit bookkeeping only. Exact saved execution is retained by the runtime store.
     var preparedOversightPreparationInFlight: [UUID: Int] = [:]
-    var preparedOversightHandoffs: Set<UUID> = []
     var preparedOversightUIVisits: Set<UUID> = []
     var preparedOversightCleanupTask: Task<Void, Never>?
     var preparedOversightCleanupDirty = false
-    var preparedOversightCarrierSubscriptions: [UUID: AnyCancellable] = [:]
-    var retiringPreparedOversightWindows: [UUID: WindowState] = [:]
     var preparedOversightConsentPairs: [UUID: Set<AgentSessionOversightIntent>] = [:]
     var preparedOversightRunObservations: [UUID: AgentSessionLinkObservationToken] = [:]
     var preparedOversightPendingVisits: [UUID: @MainActor () async -> Void] = [:]
@@ -631,18 +643,14 @@ class WindowStatesManager: ObservableObject {
     #if DEBUG
         var test_scheduleCanonicalVisitResume: ((@escaping @MainActor () async -> Void) -> Void)?
     #endif
+    /// Presentation census only; independent routes and writers are resolved by the host store.
     var sessionRuntimeWindows: [WindowState] {
-        guard !preparedOversightWindows.isEmpty else { return allWindows }
-        return allWindows + preparedOversightWindows.compactMap { id, owner in
-            guard let witness = preparedOversightOwnerLocations[id], witness.isCurrent,
-                  let current = preparedOversightLocations[id], witness.agreesOnCarrierAndProvenance(with: current),
-                  !preparedOversightHandoffs.contains(id) else { return nil }
-            return owner
-        }
+        allWindows
     }
 
     #if DEBUG
-        var test_preparedOversightOwnerFactory: ((WorkspaceModel, WindowState) -> WindowState)?
+        var test_savedHostProviderEnvironments: [UUID: AppSavedAgentSessionExecution.ProviderEnvironment] = [:]
+        var test_savedHostRootProbeCheckpoint: WorkspaceRootDirectoryProbe.Checkpoint?
     #endif
 
     private var modelRoutingWindowIndexes: [Int: Int] = [:]
@@ -650,11 +658,6 @@ class WindowStatesManager: ObservableObject {
     /// Read-only exact lookup for configuration-only routing. Never falls back to discovery.
     func modelRoutingWindow(withID id: Int) -> WindowState? {
         guard !isTerminating else { return nil }
-        if !preparedOversightWindows.isEmpty,
-           let prepared = sessionRuntimeWindows.first(where: { $0.isPreparedSessionOwner && $0.windowID == id && !$0.isClosing })
-        {
-            return prepared
-        }
         guard let index = modelRoutingWindowIndexes[id],
               allWindows.indices.contains(index), allWindows[index].windowID == id,
               !allWindows[index].isClosing else { return nil }
@@ -1433,7 +1436,6 @@ class WindowStatesManager: ObservableObject {
     /// Lookup a window by its ID.
     func window(withID id: Int) -> WindowState? {
         allWindows.first { $0.windowID == id }
-            ?? sessionRuntimeWindows.first { $0.isPreparedSessionOwner && $0.windowID == id && !$0.isClosing }
     }
 
     /// Check if a window with the given ID exists.
@@ -1477,7 +1479,7 @@ class WindowStatesManager: ObservableObject {
             self.closingWindowReferences.removeAll { $0.value == nil }
             self.terminationWindowSnapshot = self.deduplicatedWindows(
                 self.terminationWindowSnapshot +
-                    self.allWindows + Array(self.preparedOversightWindows.values) + Array(self.retiringPreparedOversightWindows.values) +
+                    self.allWindows +
                     self.closingWindowReferences.compactMap(\.value)
             )
             self.isTerminating = true
@@ -1561,7 +1563,7 @@ class WindowStatesManager: ObservableObject {
     /// Stops MCP servers in **all** windows (unconditionally).
     /// During teardown, "running" state can be stale; we just want tools off.
     func stopAllServers() async {
-        let windowIDs = (allWindows + Array(preparedOversightWindows.values)).map(\.windowID)
+        let windowIDs = allWindows.map(\.windowID)
         await withTaskGroup(of: Void.self) { group in
             for windowID in windowIDs {
                 group.addTask { @MainActor [weak self] in
@@ -1591,7 +1593,7 @@ class WindowStatesManager: ObservableObject {
 
     func stopCodexSessionsAndSignOut() async -> CodexManagedAuthLogoutResult {
         let participants = Self.managedCodexLogoutParticipants(
-            presenters: (allWindows + Array(preparedOversightWindows.values)).map(\.agentModeViewModel),
+            presenters: allWindows.map(\.agentModeViewModel),
             retainedHosts: AgentSessionRuntimeStore.shared.retainedExecutionHosts
         )
         return await CodexManagedLogoutCoordinator.shared.stopSessionsAndSignOut(
@@ -1613,7 +1615,7 @@ class WindowStatesManager: ObservableObject {
     /// teardown before MCP servers stop.
     func shutdownAllAgentSessions() async {
         // Snapshot executable owners before any presenter close can clear membership. These
-        // hosts include detached epochs that no longer occur in the window/prepared census.
+        // hosts include detached epochs that no longer occur in the presentation census.
         canonicalDeferredVisitTickets.removeAll()
         let store = agentRuntimeStore
         var seenHosts: Set<ObjectIdentifier> = []
@@ -1630,21 +1632,16 @@ class WindowStatesManager: ObservableObject {
         _ = await OracleBackgroundInvocationRegistry.awaitDrain(oracleDrain, timeout: 2)
         closingWindowReferences.removeAll { $0.value == nil }
         let windows = deduplicatedWindows(
-            terminationWindowSnapshot + allWindows + Array(preparedOversightWindows.values) + Array(retiringPreparedOversightWindows.values) + closingWindowReferences.compactMap(\.value)
+            terminationWindowSnapshot + allWindows + closingWindowReferences.compactMap(\.value)
         )
         defer {
             terminationWindowSnapshot.removeAll()
-            preparedOversightWindows.removeAll()
-            retiringPreparedOversightWindows.removeAll()
-            preparedOversightOwnerLocations.removeAll()
-            preparedOversightLocations.removeAll()
-            preparedOversightCarrierSubscriptions.removeAll()
             preparedOversightConsentPairs.removeAll()
             preparedOversightRunObservations.values.forEach { $0.invalidate() }
             preparedOversightRunObservations.removeAll()
             preparedOversightPendingVisits.removeAll()
             preparedOversightPreparationInFlight.removeAll()
-            preparedOversightHandoffs.removeAll()
+            preparedOversightUIVisits.removeAll()
             preparedOversightCleanupTask?.cancel()
             preparedOversightCleanupTask = nil
         }
@@ -1652,16 +1649,15 @@ class WindowStatesManager: ObservableObject {
 
         // The strong snapshot owns every participant until both shutdown paths have joined.
         await withTaskGroup(of: Void.self) { group in
-            for window in windows where !window.isPreparedSessionOwner {
+            for window in windows {
                 group.addTask { @MainActor [window] in
                     await window.contextBuilderAgentViewModel.shutdownForAppTermination()
                     if !retainedHostIDs.contains(ObjectIdentifier(window.agentModeViewModel.runtimeHost)) {
-                        await window.agentModeViewModel.prepareForWindowClose()
+                        await window.agentModeViewModel.retireRuntimeForClosingOrQuit()
                     }
                 }
             }
         }
-        _ = await shutdownPreparedOversightOwners(timeout: 2)
         // One shared two-second host deadline, not a fresh budget for each controller/window.
         // Timed-out producers and their original hosts remain retained by the canonical store.
         _ = await hostShutdown.value

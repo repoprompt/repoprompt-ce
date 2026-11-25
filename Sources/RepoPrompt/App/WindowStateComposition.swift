@@ -73,6 +73,120 @@ struct WindowStateComposition {
 @MainActor
 enum WindowStateCompositionFactory {
     typealias AgentModeViewModelFactory = (Int, PromptViewModel, WorkspaceManagerViewModel, MCPServerViewModel) -> AgentModeViewModel
+    typealias VisibleAgentInstaller = @MainActor (AgentSessionRuntimeHost, AgentHostWorkspaceResources.Lease) async throws -> Void
+
+    /// Prepare one unpublished visible activation. Execution and the catalog live on its
+    /// independent route; the physical window route remains for non-Agent tools.
+    static func prepareVisibleAgentHost(
+        workspace: WorkspaceModel,
+        owner: AgentWorkspaceSessionIndexStore.SessionIndexOwner,
+        activations: AgentWorkspaceSessionIndexStore,
+        resources: AgentHostWorkspaceResources,
+        apiSettings: APISettingsViewModel,
+        settingsStore: GlobalSettingsStore,
+        runtime: MCPDomainRuntime,
+        providerResources: AgentRunProviderComposition? = nil,
+        installExecutionAndCatalog: VisibleAgentInstaller
+    ) async throws -> AgentSessionRuntimeHost {
+        guard !Task.isCancelled, owner.workspaceID == workspace.id, activations.latestSessionIndexOwner == owner,
+              let settings = APISettingsRuntimeLease.acquire(from: apiSettings)
+        else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
+        let leases = MCPHostRouteResources.LeaseOwner(
+            identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: runtime.routingCoordinator, runtime: runtime
+        )
+        guard let executionLease = leases.acquire(.execution) else {
+            settings.release()
+            throw AgentHostWorkspaceResources.Failure.authorityUnavailable
+        }
+        let route = leases.route
+        let authority = DomainWorkspaceAuthorityClient(
+            store: runtime.workspaceStore, windowID: route.identity.routeID,
+            metadataPathPolicy: runtime.configuration.metadataPathPolicy
+        )
+        let paths = AgentSessionRuntimeHost.makeSessionWorkspaceProviders { workspace.repoPaths.first }
+        let host = AgentSessionRuntimeHost(
+            route: route, executionRouteLease: executionLease,
+            workspacePath: paths.sessionWorkspacePath, runtimeWorkspacePaths: paths.codexRuntimeWorkspacePaths,
+            connectionPolicyInstaller: AgentSessionRuntimeHost.defaultConnectionPolicyInstaller,
+            modelRouterSettingsStore: settingsStore, catalogDiagnosticsSink: AppAgentSessionLinkCatalogEventSink(),
+            perfRecorder: AppAgentModePerfRecorder(), providerResources: providerResources
+        )
+        // This physical route is exclusive to the activation; the UI attaches to the scope,
+        // not the route. Disposal now waits for the one execution lease's acknowledgement.
+        await leases.requestTerminalDisposal()
+        do {
+            try Task.checkCancellation()
+            guard activations.latestSessionIndexOwner == owner else {
+                throw AgentHostWorkspaceResources.Failure.authorityUnavailable
+            }
+            let activation = try AgentSessionHostWorkspaceActivation(
+                windowID: host.routeID, authority: authority, activations: activations,
+                resources: AgentHostWorkspaceResources(files: resources.files, contexts: runtime.contextStore), settings: settings
+            )
+            try await host.installWorkspaceActivation(
+                activation, attachmentWorkspaceDirectory: FileManager.default.temporaryDirectory,
+                suppressesAttachmentPersistence: AppLaunchConfiguration.current.suppressesAgentSessionPersistence
+            )
+            try Task.checkCancellation()
+            guard activation.isPresenterCurrent else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
+            let originalRoots = try await activation.retainVisibleFileResources()
+            try await installExecutionAndCatalog(host, originalRoots)
+            let current = await authority.canonicalWorkspaceSnapshot(workspace.id)
+            try Task.checkCancellation()
+            guard let current, current.health != .removed,
+                  current.document.metadata.repoPaths == originalRoots.snapshot.document.metadata.repoPaths,
+                  activation.isPresenterCurrent, originalRoots.rootsAreCurrent,
+                  host.scope.sessions.isEmpty, host.scope.execution != nil,
+                  host.scope.linkExecution != nil, host.scope.installedInteractions != nil,
+                  host.scope.persistence.composition != nil, route.hasCurrentModelCatalogRoute
+            else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
+            return host
+        } catch {
+            await host.discardUnpublishedVisibleCandidate()
+            if host.workspaceActivation == nil { settings.release() }
+            throw error
+        }
+    }
+
+    private static func installVisibleExecution(
+        _ host: AgentSessionRuntimeHost, roots: AgentHostWorkspaceResources.Lease,
+        settings: GlobalSettingsStore, service: MCPService
+    ) async throws {
+        guard let activation = host.workspaceActivation, activation.catalogFileLease === roots,
+              let workspace = try? JSONDecoder().decode(WorkspaceModel.self, from: roots.snapshot.document.documentBytes)
+        else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
+        let storage = AgentSessionStorageInputs(
+            workspaceID: workspace.id, workspaceWithID: { $0 == workspace.id ? workspace : nil },
+            displayName: { _ in AgentSessionRestoreSupport.normalizedSessionTitle(nil) }, isSuppressed: { AppLaunchConfiguration.current.suppressesAgentSessionPersistence },
+            attachmentWorkspaceDirectory: { FileManager.default.temporaryDirectory }
+        )
+        var persistence = storage.persistenceComposition(
+            scope: host.scope, canonicalStorage: .init(workspaceID: workspace.id) { id in
+                guard let snapshot = await activation.authority.canonicalWorkspaceSnapshot(id), snapshot.health != .removed else { return nil }
+                return try? JSONDecoder().decode(WorkspaceModel.self, from: snapshot.document.documentBytes)
+            }
+        )
+        persistence.canonicalDisplayName = { workspace, tabID in
+            let tab = workspace.composeTabs.first { $0.id == tabID }
+                ?? workspace.stashedTabs.first { $0.tab.id == tabID }?.tab
+            return tab.map { AgentSessionRestoreSupport.normalizedSessionTitle($0.name) }
+        }
+        host.scope.persistence.composition = persistence
+        host.scope.persistence.observeRetainedVisibleDrain = { drain in
+            WindowStatesManager.shared.observeAgentHostDrainRecovery(drain)
+        }
+        let perf = AppAgentModePerfRecorder()
+        host.scope.persistence.perfRecorder = perf
+        try host.installHostRunExecution(
+            sessionTitle: { persistence.displayName(for: $0.tabID, in: workspace) }, settings: settings,
+            perf: perf, diagnostics: AppAgentSessionLinkCatalogEventSink()
+        )
+        host.scope.mcp.installRunRoute(id: host.routeID, bindings: host.route.runRouteBindings)
+        host.scope.mcp.codexCoordinator = host.codexCoordinator
+        host.scope.mcp.claudeCoordinator = host.claudeCoordinator
+        _ = host.scope.interactions(routeID: host.routeID, approvalStore: .shared)
+        try await host.registerHostCatalog(service: service)
+    }
 
     static func make(
         windowID: Int,
@@ -92,8 +206,7 @@ enum WindowStateCompositionFactory {
         codexModelPollingService: CodexModelPollingService = .shared,
         modelRouterRuntime injectedModelRouterRuntime: AgentTaskRouterRuntime? = nil,
         agentModeViewModelFactory: AgentModeViewModelFactory? = nil,
-        sessionRuntimeWorkspace: WorkspaceModel? = nil,
-        borrowedAPISettingsViewModel: APISettingsViewModel? = nil
+        visibleAgentProviderResources: AgentRunProviderComposition? = nil
     ) -> WindowStateComposition {
         WorkspaceContextStartupInstrumentation.install(AppWorkspaceStartupEventRecorder())
         WorkspaceExternalReadWorkHooks.install(AppWorkspaceExternalReadWorkRecorder())
@@ -125,7 +238,7 @@ enum WindowStateCompositionFactory {
             ?? AIQueriesService(keyManager: keyManager)
 
         // 3) API Settings
-        let apiSettingsViewModel = borrowedAPISettingsViewModel ?? APISettingsViewModel(
+        let apiSettingsViewModel = APISettingsViewModel(
             aiQueriesService: aiQueriesService,
             keyManager: keyManager,
             loadStoredDataOnInit: loadStoredAPISettingsDataOnInit && automaticProviderModelDiscoveryEnabled,
@@ -143,23 +256,17 @@ enum WindowStateCompositionFactory {
             windowID: windowID,
             settingsManager: settingsManager,
             storedPromptPersistence: storedPromptPersistence,
-            // The borrowed API owner is already live. A second prompt's startup refresh reloads
-            // stored connection flags over it; it must not reset the canonical live connection.
-            refreshAvailableModelsOnInit: sessionRuntimeWorkspace == nil
-                && loadStoredAPISettingsDataOnInit && automaticProviderModelDiscoveryEnabled,
+            refreshAvailableModelsOnInit: loadStoredAPISettingsDataOnInit && automaticProviderModelDiscoveryEnabled,
             perfRecorder: AppAgentModePerfRecorder()
         )
 
-        // 7) Create the workspace manager with construction-time runtime persistence ownership.
-        // A nonvisual runtime shares MCP routing, but never owns or projects the visible workspace
-        // document. Its one-carrier snapshot is read-only placement, not a second workspace writer.
-        let domainWorkspaceClient = sessionRuntimeWorkspace == nil ? domainRuntime.map {
+        // 7) The workspace manager projects the domain's workspace authority into this presenter.
+        let domainWorkspaceClient = domainRuntime.map {
             DomainWorkspaceAuthorityClient(store: $0.workspaceStore, windowID: windowID, metadataPathPolicy: $0.configuration.metadataPathPolicy)
-        } : nil
+        }
         let workspaceManager = WorkspaceManagerViewModel(
             fileManager: workspaceFilesViewModel,
             promptViewModel: promptManager,
-            sessionRuntimeWorkspace: sessionRuntimeWorkspace,
             workspaceSearchService: workspaceSearchService,
             domainWorkspaceAuthorityClient: domainWorkspaceClient,
             switchTimingPolicy: workspaceSwitchTimingPolicy,
@@ -263,9 +370,8 @@ enum WindowStateCompositionFactory {
             perfRecorder: AppAgentModePerfRecorder()
         )
 
-        // 13) Allocate the executable owner before constructing its presentation or sessions.
-        // Route/activation migration is separate: this preserves the current legacy route until
-        // independent mapping and originating cleanup can be installed together.
+        // 13) Bootstrap the presenter. A real workspace activation replaces the empty bootstrap
+        // scope with an independent canonical host before restoring or creating its sessions.
         let agentModeViewModel: AgentModeViewModel
         if let agentModeViewModelFactory {
             agentModeViewModel = agentModeViewModelFactory(windowID, promptManager, workspaceManager, mcpServer)
@@ -299,10 +405,28 @@ enum WindowStateCompositionFactory {
                 perfRecorder: AppAgentModePerfRecorder()
             )
         }
+        if agentModeViewModelFactory == nil, let domainRuntime {
+            agentModeViewModel.canonicalWorkspaceHostPreparation = { workspace, owner, activations in
+                try await prepareVisibleAgentHost(
+                    workspace: workspace, owner: owner, activations: activations,
+                    resources: workspaceResources, apiSettings: apiSettingsViewModel, settingsStore: settingsStore,
+                    runtime: domainRuntime, providerResources: visibleAgentProviderResources
+                ) { host, roots in
+                    try await installVisibleExecution(host, roots: roots, settings: settingsStore, service: sharedMCPService)
+                }
+            }
+        }
         agentModeViewModel.repromptService = .live(keyManager: keyManager)
         agentModeViewModel.preparedSessionRuntimes = WindowStatesManager.shared
         agentModeViewModel.providerSwitchExactOwnerProbe = { session in
             guard let id = session.activeAgentSessionID else { return false }
+            if let binding = session.persistentSessionBindingIdentity,
+               case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: id, expectedWorkspaceID: binding.workspaceID),
+               let host = writer.scope.executableHost, let activation = host.workspaceActivation
+            {
+                return writer.session === session && writer.isCurrent && activation.owns(scope: writer.scope, route: host.route)
+            }
+            guard domainRuntime == nil || agentModeViewModelFactory != nil else { return false }
             let census = AgentSessionCarrierResolver.capture(
                 windows: WindowStatesManager.shared.allWindows,
                 sessionIDs: [id],

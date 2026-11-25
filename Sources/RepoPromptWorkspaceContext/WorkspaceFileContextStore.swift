@@ -8243,7 +8243,9 @@ package actor WorkspaceFileContextStore {
     }
 
     package func primaryRootReadinessObservation(orderedPaths: [String]) -> WorkspacePrimaryRootReadinessObservation {
-        let primaryRoots = rootStatesByID.values.filter { $0.root.kind == .primaryWorkspace }.map {
+        let primaryRoots = rootStatesByID.values.filter {
+            $0.root.kind == .primaryWorkspace && !isDetachedRetainedRoot($0.root.id)
+        }.map {
             WorkspaceRootRef(id: $0.root.id, name: $0.root.name, fullPath: $0.root.fullPath)
         }
         var requested: [WorkspaceRootRef] = []
@@ -8260,7 +8262,9 @@ package actor WorkspaceFileContextStore {
                 continue
             }
             let ref = WorkspaceRootRef(id: id, name: root.name, fullPath: root.fullPath)
-            guard case .valid = WorkspaceLookupRootSelectorValidator.validate(canonicalRoots: [ref], physicalRoots: []) else {
+            guard !isDetachedRetainedRoot(id),
+                  case .valid = WorkspaceLookupRootSelectorValidator.validate(canonicalRoots: [ref], physicalRoots: [])
+            else {
                 missing.append(path)
                 continue
             }
@@ -12681,17 +12685,34 @@ package actor WorkspaceFileContextStore {
         await unloadRoots(ids: ready)
     }
 
+    /// An unloaded presentation no longer projects this root, even though an admitted
+    /// consumer can still query its exact retained lifetime. A new load can reattach it.
+    private func isDetachedRetainedRoot(_ rootID: UUID) -> Bool {
+        guard let state = rootStatesByID[rootID] else { return false }
+        return deferredRootUnloads.contains(.init(rootID: rootID, lifetimeID: state.lifetimeID))
+    }
+
     package func unloadRoot(id rootID: UUID) async {
         await unloadRoots(ids: [rootID])
     }
 
+    /// Authoritative removal invalidates the lifetime even if an execution still holds a receipt.
     package func unloadRoots(ids rootIDs: [UUID]) async {
+        await unloadRoots(ids: rootIDs, preservingRetainedLifetimes: false)
+    }
+
+    /// Ordinary presentation loss leaves only exact retained lifetimes loaded.
+    package func detachRootPresentations(ids rootIDs: [UUID]) async {
+        await unloadRoots(ids: rootIDs, preservingRetainedLifetimes: true)
+    }
+
+    private func unloadRoots(ids rootIDs: [UUID], preservingRetainedLifetimes: Bool) async {
         var seenRootIDs = Set<UUID>()
         let orderedRootIDs = rootIDs.filter { rootID in
             guard seenRootIDs.insert(rootID).inserted else { return false }
             guard let state = rootStatesByID[rootID] else { return true }
             let lifetime = RetainedRootLifetime(rootID: rootID, lifetimeID: state.lifetimeID)
-            if rootRetentionCounts[lifetime, default: 0] > 0 {
+            if preservingRetainedLifetimes, rootRetentionCounts[lifetime, default: 0] > 0 {
                 deferredRootUnloads.insert(lifetime)
                 return false
             }
@@ -23140,9 +23161,12 @@ package actor WorkspaceFileContextStore {
         case .visibleWorkspace, .visibleWorkspacePlusGitData, .allLoaded, .allLoadedExcludingGitData:
             var hasher = Hasher()
             hasher.combine((catalogGenerationsByScope[scope] ?? 0) &* 3 &+ scopeDiscriminator(scope))
+            let followsPresentation = scope == .visibleWorkspace || scope == .visibleWorkspacePlusGitData
             for root in rootsForPathLookupIgnoringPublishedAuthority(scope: scope) {
+                // Detach and reattach change membership without replacing a physical root.
+                if followsPresentation { hasher.combine(root.id) }
                 guard publishedSeededAuthorityFencesByRootID[root.id] != nil else { continue }
-                hasher.combine(root.id)
+                if !followsPresentation { hasher.combine(root.id) }
                 hasher.combine(publishedSeededAuthorityStatesByRootID[root.id]?.epoch ?? 0)
                 hasher.combine(publishedSeededAuthorityIsQueryable(rootID: root.id))
             }
@@ -23354,9 +23378,9 @@ package actor WorkspaceFileContextStore {
         let allRoots = roots()
         switch scope {
         case .visibleWorkspace:
-            return allRoots.filter { $0.kind == .primaryWorkspace }
+            return allRoots.filter { $0.kind == .primaryWorkspace && !isDetachedRetainedRoot($0.id) }
         case .visibleWorkspacePlusGitData:
-            return allRoots.filter { $0.kind == .primaryWorkspace || $0.kind == .workspaceGitData }
+            return allRoots.filter { ($0.kind == .primaryWorkspace || $0.kind == .workspaceGitData) && !isDetachedRetainedRoot($0.id) }
         case .allLoaded:
             return allRoots
         case .allLoadedExcludingGitData:

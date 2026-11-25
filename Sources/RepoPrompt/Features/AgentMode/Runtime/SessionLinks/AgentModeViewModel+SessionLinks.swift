@@ -385,23 +385,7 @@ extension AgentModeViewModel {
     func agentSessionLinkRunFacts(
         for candidate: AgentSessionLinkEndpointCandidate, capturedStatus: DomainAgentSessionLinkStatus
     ) -> AgentRunQuietFacts? {
-        guard case let .success(writer) = linkExecutionRuntime.transcriptWriter(for: candidate),
-              writer.session.permitsBoundOperationAndSave else { return nil }
-        let session = writer.session
-        // The snapshot's status, not owner release or a later mutable runState, chooses the cutoff.
-        let state: AgentSessionRunState = switch capturedStatus {
-        case .idle: .idle
-        case .running: .running
-        case .awaitingUser: .waitingForUser
-        }
-        guard let facts = session.quietRunFacts(capturedState: state) else { return nil }
-        let instructionWait = session.runState == .waitingForUser
-            && session.instructionContinuation != nil && session.instructionWaitID != nil
-        return AgentRunQuietFacts(
-            settledThrough: facts.settledThrough,
-            ordinaryThrough: facts.ordinaryThrough,
-            supplementalNeedsUser: session.pendingCodexHookReview != nil || instructionWait
-        )
+        linkExecutionRuntime.agentSessionLinkRunFacts(for: candidate, capturedStatus: capturedStatus)
     }
 
     /// Sanitized status projection for one live endpoint.
@@ -1721,42 +1705,8 @@ extension AgentModeViewModel {
         for endpoint: DomainAgentSessionLinkEndpointIdentity,
         hasOutboundLinks: Bool
     ) throws -> (idle: Int, running: Int, awaitingUser: Int, unavailable: Int) {
-        let notReady = MCPError.invalidParams(
-            "Live status is not ready for this session binding. Retry agent_run.poll."
+        try linkExecutionRuntime.mcpResidentLaneStateCounts(
+            for: endpoint, hasOutboundLinks: hasOutboundLinks, props: monitorPillPropsByEndpoint[endpoint]
         )
-        guard agentSessionLinkPromptInventoryHoldsByEndpoint[endpoint] == nil else { throw notReady }
-        guard hasOutboundLinks else {
-            // A grant can finish committing after the authority read but before this MainActor pass.
-            // Its current published inventory must not be flattened into a zero-lane answer.
-            if let published = agentSessionLinkPromptInventoryBySessionID[endpoint.sessionID],
-               published.endpoint == endpoint, !published.inventory.isEmpty
-            {
-                throw notReady
-            }
-            return (0, 0, 0, 0)
-        }
-        guard let props = monitorPillPropsByEndpoint[endpoint], props.endpoint == endpoint,
-              let published = agentSessionLinkPromptInventoryBySessionID[endpoint.sessionID],
-              published.endpoint == endpoint
-        else { throw notReady }
-        let references = published.inventory.items.compactMap(\.reference)
-        let rows = props.outbound
-        guard references.count == published.inventory.items.count,
-              !rows.isEmpty,
-              Set(references) == Set(rows.map {
-                  DomainAgentSessionLinkReference(linkID: $0.linkID, generation: $0.generation)
-              }),
-              rows.count == references.count
-        else { throw notReady }
-        var counts = (idle: 0, running: 0, awaitingUser: 0, unavailable: 0)
-        for row in rows {
-            switch row.status {
-            case .idle: counts.idle += 1
-            case .running: counts.running += 1
-            case .awaitingUser: counts.awaitingUser += 1
-            case .unavailable: counts.unavailable += 1
-            }
-        }
-        return counts
     }
 }

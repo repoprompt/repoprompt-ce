@@ -23,7 +23,7 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
         }
     }
 
-    func testColdSavedTargetCreatesBindsMergesAndUnbindsThroughPreparedCanonicalWriter() async throws {
+    func testColdSavedTargetCreatesBindsMergesAndUnbindsThroughCanonicalHost() async throws {
         try await exerciseColdSavedTarget(holdingRootReconciliation: false)
     }
 
@@ -51,177 +51,167 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
         withoutRepositoryRoots: Bool = false
     ) async throws {
         try await withFixture(withoutRepositoryRoots: withoutRepositoryRoots) { fixture in
-            let manager = WindowStatesManager.shared
-            let rootGate = WorkspaceAuthorityRootTestFixture.Gate()
-            let rootEntered = XCTestExpectation(description: "prepared root reconciliation held before load")
-            let admissionSettled = XCTestExpectation(description: "root readiness waiter or premature command completion")
-            admissionSettled.assertForOverFulfill = false
-            var hasRootWaiter = false
-            let originalFactory = manager.test_preparedOversightOwnerFactory
-            if holdingRootReconciliation {
-                manager.test_preparedOversightOwnerFactory = { workspace, source in
-                    let owner = WindowState.makePreparedSessionOwner(workspace: workspace, borrowing: source)
-                    owner.workspaceManager.rootProbeFailureForTesting = rootFailure
-                    var held = false
-                    owner.workspaceManager.rootReconciliationGateForTesting = { event in
-                        guard event.phase == .beforeLoad, !held else { return }
-                        held = true
+            let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+            try await CanonicalSavedWorkspaceFixture.run(workspace) { canonicalWorkspace in
+                let manager = WindowStatesManager.shared
+                let rootGate = WorkspaceAuthorityRootTestFixture.Gate()
+                let rootEntered = XCTestExpectation(description: "canonical root reconciliation held before filesystem probe")
+                let originalCheckpoint = manager.test_savedHostRootProbeCheckpoint
+                let originalMode = try FileManager.default.attributesOfItem(atPath: fixture.repository.path)[.posixPermissions]
+                if holdingRootReconciliation {
+                    manager.test_savedHostRootProbeCheckpoint = { event in
+                        guard event.phase == .beforeFileSystem else { return }
                         rootEntered.fulfill()
                         await rootGate.wait()
                     }
-                    owner.workspaceManager.rootReconciliationWaiterCountDidChangeForTesting = { count in
-                        if count > 0 {
-                            hasRootWaiter = true
-                            admissionSettled.fulfill()
-                        }
-                    }
-                    return owner
                 }
-            }
-            defer {
-                rootGate.release()
-                manager.test_preparedOversightOwnerFactory = originalFactory
-            }
-            // Keep the production prepared owner available across the three separate commands
-            // and their durable reads. The host must release its own nested hold each time;
-            // otherwise normal idle retirement may legitimately refuse the next command.
-            manager.beginPreparedOversightPreparation(fixture.sessionID)
-            @MainActor func cleanupPreparedOwner() async {
-                manager.endPreparedOversightPreparation(fixture.sessionID)
-                if let owner = manager.preparedOversightWindows[fixture.sessionID] {
-                    let released = await manager.releasePreparedOversightOwnerForVisit(sessionID: fixture.sessionID)
-                    XCTAssertTrue(released)
-                    let remainingRoots = await owner.workspaceFilesViewModel.workspaceFileContextStore.rootRefs()
-                    XCTAssertTrue(remainingRoots.isEmpty, "Retired prepared owners must not keep repository observers alive through fixture deletion")
-                }
-            }
-            do {
-                let viewModel = fixture.window.agentModeViewModel
-                let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
-                let savedSource = try await fixture.savedSession()
-                let source = try XCTUnwrap(savedSource)
-                _ = try await AgentSessionDataService.shared.saveAgentSession(source, for: workspace)
-                // Use the same real durable service as saved-target preparation, including if it can
-                // reuse the visible composition. No acknowledgement stub or post-command flush.
-                viewModel.test_setAgentSessionSaver { payload, workspace, count in
-                    try await AgentSessionDataService.shared.saveAgentSession(
-                        payload, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count
-                    )
-                }
-                viewModel.test_removeSession(tabID: fixture.session.tabID)
-                XCTAssertNil(try SessionAdminWindows.command(for: fixture.sessionID))
-                let host = SessionAdminWindowsWorktreeHost()
-                var authorized = true
-                let creating = Task { @MainActor in
-                    defer { admissionSettled.fulfill() }
-                    return try await host.createWorktree(
-                        forSession: fixture.sessionID, repoRoot: nil, branch: "e2e/cold-target", baseRef: nil,
-                        isStillAuthorized: { authorized }
-                    )
-                }
-                if holdingRootReconciliation {
-                    await fulfillment(of: [rootEntered, admissionSettled], timeout: 10)
-                    XCTAssertTrue(hasRootWaiter, "Repository discovery must join reconciliation, not report an unloaded repository as absent")
-                    if revokeAuthorization {
-                        authorized = false
-                    }
+                defer {
                     rootGate.release()
+                    manager.test_savedHostRootProbeCheckpoint = originalCheckpoint
+                    if let originalMode { try? FileManager.default.setAttributes([.posixPermissions: originalMode], ofItemAtPath: fixture.repository.path) }
                 }
-                if revokeAuthorization || rootFailure != nil || withoutRepositoryRoots {
-                    var refusal: SessionAdminHostError?
-                    do {
-                        _ = try await creating.value
-                        XCTFail("Unavailable repository roots or revoked authorization must prevent worktree creation")
-                    } catch let error as SessionAdminHostError {
-                        refusal = error
+                // Keep the same canonical writer across the commands and their durable reads.
+                manager.beginPreparedOversightPreparation(fixture.sessionID)
+                @MainActor func cleanupPreparedOwner() async {
+                    let files: WorkspaceFileContextStore? = if case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: fixture.sessionID) {
+                        writer.scope.executableHost?.workspaceActivation?.catalogFileLease?.resources.files
+                    } else { nil }
+                    manager.endPreparedOversightPreparation(fixture.sessionID)
+                    if let files {
+                        let released = await manager.releasePreparedOversightOwnerForVisit(sessionID: fixture.sessionID)
+                        XCTAssertTrue(released)
+                        let remainingRoots = await files.rootRefs()
+                        XCTAssertTrue(remainingRoots.isEmpty, "Retirement releases the exact independently owned roots")
                     }
-                    let expected: SessionAdminHostError = if revokeAuthorization {
-                        .authorityEnded
-                    } else if withoutRepositoryRoots {
-                        .invalid("The target session's workspace has no Git repository.")
-                    } else {
-                        .refused(
-                            code: "workspace_not_ready",
-                            detail: "The target session's workspace roots are not ready (accessDenied). Reconcile the workspace roots and retry.",
-                            nextCall: nil
+                }
+                do {
+                    let viewModel = fixture.window.agentModeViewModel
+                    let savedSource = try await fixture.savedSession()
+                    let source = try XCTUnwrap(savedSource)
+                    _ = try await AgentSessionDataService.shared.saveAgentSession(source, for: canonicalWorkspace)
+                    let record = try await AgentSessionDataService.shared.metadataRecordForSessionID(fixture.sessionID, for: canonicalWorkspace)
+                    XCTAssertNotNil(record)
+                    // No acknowledgement stub or post-command flush on the independent host.
+                    viewModel.test_removeSession(tabID: fixture.session.tabID)
+                    XCTAssertNil(try SessionAdminWindows.command(for: fixture.sessionID))
+                    let host = SessionAdminWindowsWorktreeHost()
+                    var authorized = true
+                    var createFinished = false
+                    let creating = Task { @MainActor in
+                        defer { createFinished = true }
+                        return try await host.createWorktree(
+                            forSession: fixture.sessionID, repoRoot: nil, branch: "e2e/cold-target", baseRef: nil,
+                            isStillAuthorized: { authorized }
                         )
                     }
-                    XCTAssertEqual(refusal, expected)
-                    if withoutRepositoryRoots {
-                        let owner = try XCTUnwrap(manager.preparedOversightWindows[fixture.sessionID])
-                        XCTAssertEqual(owner.workspaceManager.activeWorkspace?.repoPaths, [])
+                    if holdingRootReconciliation {
+                        await fulfillment(of: [rootEntered], timeout: 10)
+                        XCTAssertFalse(createFinished, "Repository discovery must wait for root reconciliation")
+                        XCTAssertNil(try SessionAdminWindows.command(for: fixture.sessionID), "Root preparation is not a writer claim")
+                        if rootFailure == .accessDenied {
+                            try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: fixture.repository.path)
+                        }
+                        if revokeAuthorization {
+                            authorized = false
+                        }
+                        rootGate.release()
                     }
-                    await cleanupPreparedOwner()
-                    XCTAssertNil(manager.preparedOversightPreparationInFlight[fixture.sessionID])
+                    if revokeAuthorization || rootFailure != nil || withoutRepositoryRoots {
+                        var refusal: SessionAdminHostError?
+                        do {
+                            _ = try await creating.value
+                            XCTFail("Unavailable repository roots or revoked authorization must prevent worktree creation")
+                        } catch let error as SessionAdminHostError {
+                            refusal = error
+                        }
+                        let expected: SessionAdminHostError = if revokeAuthorization {
+                            .authorityEnded
+                        } else if withoutRepositoryRoots {
+                            .invalid("The target session's workspace has no Git repository.")
+                        } else {
+                            .refused(
+                                code: "workspace_not_ready",
+                                detail: "The target session's workspace roots are not ready (accessDenied). Reconcile the workspace roots and retry.",
+                                nextCall: nil
+                            )
+                        }
+                        XCTAssertEqual(refusal, expected)
+                        if withoutRepositoryRoots {
+                            let owner = try XCTUnwrap(try SessionAdminWindows.command(for: fixture.sessionID)?.writer.scope.executableHost)
+                            XCTAssertEqual(owner.workspaceActivation?.catalogFileLease?.snapshot.document.metadata.repoPaths, [])
+                        }
+                        await cleanupPreparedOwner()
+                        XCTAssertNil(manager.preparedOversightPreparationInFlight[fixture.sessionID])
+                        fixture.assertForegroundUnchanged()
+                        return
+                    }
+                    let created = try await creating.value
+                    XCTAssertEqual(manager.preparedOversightPreparationInFlight[fixture.sessionID], 1)
+                    let sourcePath = URL(fileURLWithPath: created.path)
+                    try fixture.git.write("cold merge\n", to: "cold-merge.txt", at: sourcePath)
+                    try fixture.git.stage("cold-merge.txt", at: sourcePath)
+                    try fixture.git.commit("Cold target change", at: sourcePath)
+                    var published: Set<String>?
+                    _ = try await host.bindWorktree(
+                        sessionID: fixture.sessionID, worktree: created.path, repoRoot: nil,
+                        isStillAuthorized: { true }, admitBindings: { _ in }, bindingsCommitted: { published = $0 }
+                    )
+                    XCTAssertEqual(published, [created.worktreeID])
+                    let bound = try await AgentSessionDataService.shared.loadAgentSession(id: fixture.sessionID, for: canonicalWorkspace)
+                    XCTAssertEqual(bound?.worktreeBindings.map(\.worktreeID), [created.worktreeID])
+                    XCTAssertEqual(manager.preparedOversightPreparationInFlight[fixture.sessionID], 1)
+                    _ = try await host.previewMerge(sessionID: fixture.sessionID, repoRoot: nil, mergeTarget: "@main", isStillAuthorized: { true })
+                    let mergeCommand = try XCTUnwrap(SessionAdminWindows.command(for: fixture.sessionID))
+                    let mergeOperation = try mergeCommand.writer.scope.worktrees.statusMerge(command: mergeCommand, operationID: nil)
+                    let probe = MergeCommitProbe()
+                    let controller = DomainMutationCommitController(
+                        physicalMutationGuard: { await probe.physicalCheck()
+                            return nil
+                        },
+                        willCommit: { await probe.commit() }
+                    )
+                    var applyFinished = false
+                    let applying = Task { @MainActor in
+                        defer { applyFinished = true }
+                        return try await MCPDomainMutationCommitContext.controllerTaskLocal.withValue(controller) {
+                            try await host.applyMerge(sessionID: fixture.sessionID, operationID: mergeOperation.id, isStillAuthorized: { true })
+                        }
+                    }
+                    defer { applying.cancel() }
+                    try await AsyncTestWait.waitUntil("cold target merge review or early refusal") {
+                        mergeCommand.writer.session.pendingWorktreeMergeReview != nil || applyFinished
+                    }
+                    if applyFinished { _ = try await applying.value }
+                    let review = try XCTUnwrap(mergeCommand.writer.session.pendingWorktreeMergeReview)
+                    XCTAssertTrue(try XCTUnwrap(mergeCommand.writer.scope.installedInteractions).submitWorktreeMergeReviewDecision(
+                        command: mergeCommand, reviewID: review.id, decision: .accept
+                    ))
+                    _ = try await applying.value
+                    let merged = try await AgentSessionDataService.shared.loadAgentSession(id: fixture.sessionID, for: canonicalWorkspace)
+                    XCTAssertEqual(merged?.worktreeMergeOperations.first?.status, .completed)
+                    XCTAssertEqual(mergeCommand.writer.session.runState, .idle, "Standalone review must return to its original idle state")
+                    let commits = await probe.commits
+                    let physicalChecks = await probe.physicalChecks
+                    XCTAssertGreaterThan(commits, 0, "Admin root composition must forward the outer journal")
+                    XCTAssertGreaterThan(physicalChecks, 0, "Admin root composition must retain outer physical policy")
+                    XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.repository.appendingPathComponent("cold-merge.txt").path))
+                    XCTAssertEqual(manager.preparedOversightPreparationInFlight[fixture.sessionID], 1)
+                    let removed = try await host.unbindWorktrees(
+                        sessionID: fixture.sessionID, worktreeID: nil, isStillAuthorized: { true }, bindingsRemoved: { _ in }
+                    )
+                    XCTAssertEqual(removed, [created.worktreeID])
+                    let unbound = try await AgentSessionDataService.shared.loadAgentSession(id: fixture.sessionID, for: canonicalWorkspace)
+                    XCTAssertEqual(unbound?.worktreeBindings, [])
+                    XCTAssertEqual(manager.preparedOversightPreparationInFlight[fixture.sessionID], 1)
                     fixture.assertForegroundUnchanged()
-                    return
+                } catch {
+                    rootGate.release()
+                    await cleanupPreparedOwner()
+                    throw error
                 }
-                let created = try await creating.value
-                XCTAssertEqual(manager.preparedOversightPreparationInFlight[fixture.sessionID], 1)
-                let sourcePath = URL(fileURLWithPath: created.path)
-                try fixture.git.write("cold merge\n", to: "cold-merge.txt", at: sourcePath)
-                try fixture.git.stage("cold-merge.txt", at: sourcePath)
-                try fixture.git.commit("Cold target change", at: sourcePath)
-                var published: Set<String>?
-                _ = try await host.bindWorktree(
-                    sessionID: fixture.sessionID, worktree: created.path, repoRoot: nil,
-                    isStillAuthorized: { true }, admitBindings: { _ in }, bindingsCommitted: { published = $0 }
-                )
-                XCTAssertEqual(published, [created.worktreeID])
-                let bound = try await AgentSessionDataService.shared.loadAgentSession(id: fixture.sessionID, for: workspace)
-                XCTAssertEqual(bound?.worktreeBindings.map(\.worktreeID), [created.worktreeID])
-                XCTAssertEqual(manager.preparedOversightPreparationInFlight[fixture.sessionID], 1)
-                _ = try await host.previewMerge(sessionID: fixture.sessionID, repoRoot: nil, mergeTarget: "@main", isStillAuthorized: { true })
-                let mergeCommand = try XCTUnwrap(SessionAdminWindows.command(for: fixture.sessionID))
-                let mergeOperation = try mergeCommand.writer.scope.worktrees.statusMerge(command: mergeCommand, operationID: nil)
-                let probe = MergeCommitProbe()
-                let controller = DomainMutationCommitController(
-                    physicalMutationGuard: { await probe.physicalCheck()
-                        return nil
-                    },
-                    willCommit: { await probe.commit() }
-                )
-                var applyFinished = false
-                let applying = Task { @MainActor in
-                    defer { applyFinished = true }
-                    return try await MCPDomainMutationCommitContext.controllerTaskLocal.withValue(controller) {
-                        try await host.applyMerge(sessionID: fixture.sessionID, operationID: mergeOperation.id, isStillAuthorized: { true })
-                    }
-                }
-                defer { applying.cancel() }
-                try await AsyncTestWait.waitUntil("cold target merge review or early refusal") {
-                    mergeCommand.writer.session.pendingWorktreeMergeReview != nil || applyFinished
-                }
-                if applyFinished { _ = try await applying.value }
-                let review = try XCTUnwrap(mergeCommand.writer.session.pendingWorktreeMergeReview)
-                XCTAssertTrue(try XCTUnwrap(mergeCommand.writer.scope.installedInteractions).submitWorktreeMergeReviewDecision(
-                    command: mergeCommand, reviewID: review.id, decision: .accept
-                ))
-                _ = try await applying.value
-                let merged = try await AgentSessionDataService.shared.loadAgentSession(id: fixture.sessionID, for: workspace)
-                XCTAssertEqual(merged?.worktreeMergeOperations.first?.status, .completed)
-                XCTAssertEqual(mergeCommand.writer.session.runState, .idle, "Standalone review must return to its original idle state")
-                let commits = await probe.commits
-                let physicalChecks = await probe.physicalChecks
-                XCTAssertGreaterThan(commits, 0, "Admin root composition must forward the outer journal")
-                XCTAssertGreaterThan(physicalChecks, 0, "Admin root composition must retain outer physical policy")
-                XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.repository.appendingPathComponent("cold-merge.txt").path))
-                XCTAssertEqual(manager.preparedOversightPreparationInFlight[fixture.sessionID], 1)
-                let removed = try await host.unbindWorktrees(
-                    sessionID: fixture.sessionID, worktreeID: nil, isStillAuthorized: { true }, bindingsRemoved: { _ in }
-                )
-                XCTAssertEqual(removed, [created.worktreeID])
-                let unbound = try await AgentSessionDataService.shared.loadAgentSession(id: fixture.sessionID, for: workspace)
-                XCTAssertEqual(unbound?.worktreeBindings, [])
-                XCTAssertEqual(manager.preparedOversightPreparationInFlight[fixture.sessionID], 1)
-                fixture.assertForegroundUnchanged()
-            } catch {
-                rootGate.release()
                 await cleanupPreparedOwner()
-                throw error
+                XCTAssertNil(manager.preparedOversightPreparationInFlight[fixture.sessionID])
             }
-            await cleanupPreparedOwner()
-            XCTAssertNil(manager.preparedOversightPreparationInFlight[fixture.sessionID])
         }
     }
 

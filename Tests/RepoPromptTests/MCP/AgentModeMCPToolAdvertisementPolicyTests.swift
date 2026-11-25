@@ -163,7 +163,7 @@ final class AgentSessionLinkToolSchemaCacheTests: XCTestCase {
         }
     }
 
-    /// One bounded actual Agent socket workload, shared verbatim with the pristine baseline.
+    /// One bounded actual Agent socket workload with the same measured request population as the baseline.
     @MainActor
     final class AgentSessionLinkCatalogScaleTests: XCTestCase {
         func testWarmActualRouteCatalogAtApprovedScale() async throws {
@@ -181,7 +181,9 @@ final class AgentSessionLinkToolSchemaCacheTests: XCTestCase {
             var registrations: [MCPDomainToolRegistrationResult] = []
             var sessions: [(WindowState, AgentTabSession)] = []
             var connections: [PersistentMCPTestEndpoint] = []
-            var runs: [(WindowState, UUID, String)] = []
+            var workspaces: [(DomainWorkspaceAuthorityClient, WorkspaceModel, URL)] = []
+            var attempts: [(AgentTabSession, AgentRunOwnership)] = []
+            var policies: [MCPRunRoutingCleanupReceipt] = []
             var grants: [DomainAgentSessionLinkReference] = []
             let candidate = !DiscoveryArtifactConfiguration.isBaseline
             let cleanup: @MainActor () async -> Void = {
@@ -194,13 +196,25 @@ final class AgentSessionLinkToolSchemaCacheTests: XCTestCase {
                     await connection.connectionManager.stop()
                     await manager.debugRemoveConnection(connection.connectionID)
                 }
-                for (window, runID, clientName) in runs {
-                    await manager.clearClientConnectionPolicy(for: clientName, windowID: window.windowID, runID: runID)
-                    await manager.cleanupRunRoutingState(for: runID, windowID: window.windowID)
+                for policy in policies {
+                    await manager.cleanupRunRoutingState(ownedBy: policy)
+                }
+                for (session, attempt) in attempts {
+                    _ = session.endRunAttempt(ifCurrent: attempt, source: "scale fixture cleanup")
                 }
                 for window in windows {
+                    await window.agentModeViewModel.test_retireAndCancelFixture()
                     await window.tearDown()
                     WindowStatesManager.shared.unregisterWindowState(window)
+                }
+                for (authority, workspace, fileURL) in workspaces {
+                    let deleted = await authority.delete(workspaceID: workspace.id, expectedCatalogRevision: nil, expectedWorkspaceRevision: nil)
+                    XCTAssertEqual(deleted.disposition, .applied)
+                    let directory = fileURL.deletingLastPathComponent()
+                    if FileManager.default.fileExists(atPath: directory.path) {
+                        do { try FileManager.default.removeItem(at: directory) }
+                        catch { XCTFail("Remove catalog scale fixture storage: \(error)") }
+                    }
                 }
                 for registration in registrations {
                     await AppDomainRuntimeComposition.shared.unregister(registration.handle)
@@ -214,27 +228,30 @@ final class AgentSessionLinkToolSchemaCacheTests: XCTestCase {
                     try await registrations.append(AppDomainRuntimeComposition.shared.register(window.mcpServer.windowMCPToolCatalogService))
                     await window.workspaceManager.awaitInitialized()
                     var workspace = WorkspaceModel(name: "Scale window \(index)", repoPaths: [])
-                    workspace.isEphemeral = true
-                    workspace.composeTabs = (0 ..< 100).map { ComposeTabState(id: UUID(), name: "Scale chat \($0)") }
+                    workspace.composeTabs = (0 ..< 100).map {
+                        ComposeTabState(id: UUID(), name: "Scale chat \($0)", activeAgentSessionID: UUID())
+                    }
                     workspace.activeComposeTabID = workspace.composeTabs.first?.id
-                    window.workspaceManager.workspaces.append(workspace)
+                    let workspaceAuthority = DomainWorkspaceAuthorityClient(store: AppDomainRuntimeComposition.shared.runtime.workspaceStore, windowID: window.windowID)
+                    let fileURL = window.workspaceManager.workspaceFileURL(for: workspace)
+                    let created = try await workspaceAuthority.create(workspace, fileURL: fileURL)
+                    _ = try XCTUnwrap(created.disposition == .applied ? created : nil)
+                    workspaces.append((workspaceAuthority, workspace, fileURL))
+                    for tab in workspace.composeTabs {
+                        let persisted = try AgentSession(id: XCTUnwrap(tab.activeAgentSessionID), workspaceID: workspace.id, composeTabID: tab.id, name: tab.name, agentKind: AgentProviderKind.claudeCode.rawValue, autoWakeOnOversightUpdates: false)
+                        _ = try await AgentSessionDataService.shared.saveAgentSession(persisted, for: workspace)
+                    }
+                    let projection = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
+                    let refreshed = await projection.refreshForAgentAdmission()
+                    XCTAssertTrue(refreshed)
                     let switched = await window.workspaceManager.switchWorkspace(to: workspace, saveState: false)
                     XCTAssertTrue(switched.didSwitch)
-                    window.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: true)
-                    window.agentModeViewModel.test_setAgentSessionSaver { _, _, _ in
-                        FileManager.default.temporaryDirectory.appendingPathComponent("scale-\(UUID()).json")
-                    }
+                    let vm = window.agentModeViewModel
+                    let adopted = await vm.awaitWorkspaceRuntimeAdoption(expectedWorkspaceID: workspace.id)
+                    _ = try XCTUnwrap(adopted ? vm.runtimeHost : nil)
+                    window.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: false)
                     for tab in workspace.composeTabs {
-                        let session = window.agentModeViewModel.session(for: tab.id)
-                        session.selectedAgent = .claudeCode
-                        session.hasLoadedPersistedState = true
-                        session.oversight.autoWakeOnUpdates = false
-                        // This catalog workload starts with restored conversations, not unfinished creations.
-                        _ = try XCTUnwrap(window.agentModeViewModel.test_installPersistentSessionBinding(
-                            sessionID: UUID(), on: session, updateWorkspaceMetadata: true
-                        ))
-                        XCTAssertNotNil(session.operationAdmissionFailureMessage)
-                        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+                        let session = await vm.ensureSessionReady(tabID: tab.id, reconnectActiveProviders: false)
                         _ = try XCTUnwrap(
                             session.permitsBoundOperationAndSave ? session : nil,
                             "Scale participants must be restored before installing monitor grants"
@@ -249,7 +266,7 @@ final class AgentSessionLinkToolSchemaCacheTests: XCTestCase {
                     let sourceID = try XCTUnwrap(participants[source].1.activeAgentSessionID)
                     let targetID = try XCTUnwrap(participants[target].1.activeAgentSessionID)
                     guard case .added = await bridge.addMonitorLink(observerSessionID: sourceID, rawTargetSessionID: targetID.uuidString) else {
-                        return XCTFail("Scale setup grant failed")
+                        throw MCPError.internalError("Scale setup grant failed")
                     }
                     let inventory = await authority.links(forObserver: sourceID)
                     let item = try XCTUnwrap(inventory.items.first { $0.targetSessionID == targetID })
@@ -261,15 +278,19 @@ final class AgentSessionLinkToolSchemaCacheTests: XCTestCase {
                     let (window, session) = participants[index]
                     let runID = UUID()
                     let clientName = [1, 4, 13].contains(index) ? AgentProviderKind.codexMCPClientID : AgentProviderKind.claudeMCPClientID
-                    runs.append((window, runID, clientName))
                     session.installRunID(runID)
-                    await manager.installClientConnectionPolicy(
-                        for: clientName, windowID: window.windowID,
+                    attempts.append((session, session.beginRunAttempt(source: "scale catalog fixture")))
+                    let host = window.agentModeViewModel.runtimeHost
+                    XCTAssertNotEqual(host.routeID, window.windowID)
+                    let policy = await manager.installClientConnectionPolicy(
+                        for: clientName, windowID: host.routeID,
                         restrictedTools: AgentModeMCPToolPolicy.restrictedTools, oneShot: true,
                         reason: "Bounded role catalog scale", ttl: 60, tabID: session.tabID,
                         runID: runID, additionalTools: nil, purpose: .agentModeRun,
-                        taskLabelKind: index == 14 ? .explore : nil, allowsAgentExternalControlTools: false
+                        taskLabelKind: index == 14 ? .explore : nil, allowsAgentExternalControlTools: false,
+                        routingOwner: host.route, originatingContextSource: host.originatingContextSource
                     )
+                    try policies.append(XCTUnwrap(policy))
                     try await connections.append(PersistentMCPTestEndpoint.make(
                         label: "scale-\(index)", networkManager: manager,
                         clientName: clientName, requiredToolNames: [MCPWindowToolName.readFile]

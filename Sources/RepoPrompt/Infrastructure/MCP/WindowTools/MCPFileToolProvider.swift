@@ -34,6 +34,38 @@ final class MCPFileToolProvider: MCPAppToolProviding {
         }
     }
 
+    /// Request-local authority shared by physical and independently composed read routes.
+    struct ContentReadAuthority {
+        let metadata: MCPRequestMetadata
+        let lookupContext: WorkspaceLookupContext
+        let store: WorkspaceFileContextStore
+        let isRunlessOneShotHint: Bool
+        let validate: @MainActor () async throws -> Void
+        let readFile: MCPAppPhysicalCapabilityAdapters.ReadFile
+        let readArtifact: MCPAppPhysicalCapabilityAdapters.ReadSelectedAuthorizedGitArtifact
+        let search: MCPAppPhysicalCapabilityAdapters.WorkspaceSearch
+        let selectRead: @MainActor @Sendable (ToolResultDTOs.ReadFileReply, String, String) async throws -> Void
+        let selectSearch: @MainActor @Sendable (SearchMode, Int, ToolResultDTOs.SearchResultDTO, [String]) async throws -> Void
+    }
+
+    private func contentAuthority(_ authority: ReadAuthority) throws -> ContentReadAuthority {
+        let dependencies = authority.dependencies
+        return try .init(
+            metadata: authority.metadata, lookupContext: authority.lookupContext,
+            store: dependencies.context.requirePromptVM().workspaceFileContextStore,
+            isRunlessOneShotHint: authority.isRunlessOneShotHint,
+            validate: { try await self.validate(authority) },
+            readFile: dependencies.files.readFile,
+            readArtifact: dependencies.files.readSelectedAuthorizedGitArtifact,
+            search: dependencies.selection.workspaceSearch,
+            selectRead: { reply, path, physicalPath in
+                _ = try await dependencies.files.enqueueReadFileAutoSelection(reply, path, physicalPath, authority.metadata, authority.frozen)
+            }, selectSearch: { mode, lines, reply, paths in
+                _ = try await dependencies.files.enqueueFileSearchAutoSelection(mode, lines, reply, paths, authority.metadata, authority.frozen)
+            }
+        )
+    }
+
     init(runtime: MCPAppToolBinder, context: MCPAppPhysicalCapabilityAdapters.Context, selection: MCPAppPhysicalCapabilityAdapters.Selection, files: MCPAppPhysicalCapabilityAdapters.Files) {
         self.runtime = runtime
         dependencies = (context: context, selection: selection, files: files)
@@ -71,10 +103,8 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                     },
                     build: authority.dependencies.files.buildStoreBackedFileTreeResult
                 ))
-            case MCPWindowToolName.readFile:
-                try await executeReadFile(args: args, authority: authority, sideEffects: sideEffects)
-            case MCPWindowToolName.search:
-                try await executeFileSearchToolValue(args: args, authority: authority, sideEffects: sideEffects)
+            case MCPWindowToolName.readFile, MCPWindowToolName.search:
+                try await Self.executeContentRead(toolName: toolName, args: args, authority: contentAuthority(authority), sideEffects: sideEffects)
             default:
                 throw MCPError.invalidParams("Unsupported file read tool: \(toolName)")
             }
@@ -570,20 +600,25 @@ final class MCPFileToolProvider: MCPAppToolProviding {
         }
     }
 
-    private func executeReadFile(
-        args: [String: Value],
-        authority: ReadAuthority,
+    static func executeContentRead(
+        toolName: String, args: [String: Value], authority: ContentReadAuthority,
         sideEffects: MCPDomainReadSideEffectEmitter
     ) async throws -> Value {
-        try await executeReadFileBody(args: args, authority: authority, sideEffects: sideEffects)
+        switch toolName {
+        case MCPWindowToolName.readFile:
+            try await executeReadFileBody(args: args, authority: authority, sideEffects: sideEffects)
+        case MCPWindowToolName.search:
+            try await executeFileSearchToolValue(args: args, authority: authority, sideEffects: sideEffects)
+        default:
+            throw MCPError.invalidParams("Unsupported content read tool: \(toolName)")
+        }
     }
 
-    private func executeReadFileBody(
+    private static func executeReadFileBody(
         args: [String: Value],
-        authority: ReadAuthority,
+        authority: ContentReadAuthority,
         sideEffects: MCPDomainReadSideEffectEmitter
     ) async throws -> Value {
-        let dependencies = authority.dependencies
         try Task.checkCancellation()
         await MCPToolExecutionHandlerPhaseContext.report(.readFileRequestResolution)
         EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.ReadFile.providerEntered)
@@ -622,7 +657,7 @@ final class MCPFileToolProvider: MCPAppToolProviding {
         let unprojectedReadResult: MCPAppFileReadResult
         do {
             unprojectedReadResult = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerReadEnvelope) {
-                if let artifactReply = try await dependencies.files.readSelectedAuthorizedGitArtifact(
+                if let artifactReply = try await authority.readArtifact(
                     path,
                     translatedArtifactPath,
                     startLine1Based,
@@ -632,7 +667,7 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                 ) {
                     return .nonSelecting(reply: artifactReply)
                 }
-                return try await dependencies.files.readFile(
+                return try await authority.readFile(
                     exactInput,
                     startLine1Based,
                     limit,
@@ -672,7 +707,7 @@ final class MCPFileToolProvider: MCPAppToolProviding {
         case .workspace: "skipped"
         case .nonSelecting: "skipped"
         }
-        try await validate(authority)
+        try await authority.validate()
         await MCPToolExecutionHandlerPhaseContext.report(.readFileAutoSelection)
         try await EditFlowPerf.measure(
             EditFlowPerf.Stage.ReadFile.providerAutoSelect,
@@ -681,16 +716,8 @@ final class MCPFileToolProvider: MCPAppToolProviding {
             if case let .workspace(reply, absolutePhysicalPath) = readResult,
                !authority.isRunlessOneShotHint
             {
-                try await sideEffects.submitAndWait(fingerprint: "read_file_auto_selection") { [weak self] in
-                    guard let self else { throw CancellationError() }
-                    _ = try await applyReadFileSideEffect(
-                        reply: reply,
-                        requestedPath: path,
-                        absolutePhysicalPath: absolutePhysicalPath,
-                        metadata: metadata,
-                        authority: authority.frozen,
-                        files: dependencies.files
-                    )
+                try await sideEffects.submitAndWait(fingerprint: "read_file_auto_selection") { [select = authority.selectRead] in
+                    try await select(reply, path, absolutePhysicalPath)
                 }
             }
         }
@@ -699,7 +726,7 @@ final class MCPFileToolProvider: MCPAppToolProviding {
         let projectedReply = switch readResult {
         case let .workspace(reply, _), let .nonSelecting(reply): reply
         }
-        try await validate(authority)
+        try await authority.validate()
         let value = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerValueEncoding) {
             try await MCPProviderProjectionWorker.encode(
                 projectedReply,
@@ -729,9 +756,9 @@ final class MCPFileToolProvider: MCPAppToolProviding {
         )
     }
 
-    private func executeFileSearchToolValue(
+    private static func executeFileSearchToolValue(
         args: [String: Value],
-        authority: ReadAuthority,
+        authority: ContentReadAuthority,
         sideEffects: MCPDomainReadSideEffectEmitter
     ) async throws -> Value {
         EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerEntered)
@@ -744,7 +771,7 @@ final class MCPFileToolProvider: MCPAppToolProviding {
         )
 
         try Task.checkCancellation()
-        try await validate(authority)
+        try await authority.validate()
         let value = try EditFlowPerf.measure(EditFlowPerf.Stage.Search.providerValueEncoding) {
             try Value(reply)
         }
@@ -752,12 +779,11 @@ final class MCPFileToolProvider: MCPAppToolProviding {
         return value
     }
 
-    private func executeFileSearch(
+    private static func executeFileSearch(
         args: [String: Value],
-        authority: ReadAuthority,
+        authority: ContentReadAuthority,
         sideEffects: MCPDomainReadSideEffectEmitter
     ) async throws -> ToolResultDTOs.SearchResultDTO {
-        let dependencies = authority.dependencies
         try Task.checkCancellation()
         let rawPattern = args["pattern"]?.stringValue ?? ""
         let pattern = rawPattern.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -787,7 +813,6 @@ final class MCPFileToolProvider: MCPAppToolProviding {
         }
 
         let mode = SearchMode(rawValue: modeRaw) ?? .auto
-        let metadata = authority.metadata
         try Task.checkCancellation()
         let lookupContext = EditFlowPerf.measure(
             EditFlowPerf.Stage.Search.providerLookupContextResolution,
@@ -809,7 +834,7 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                 EditFlowPerf.Stage.Search.providerWorkspaceSearchAwait,
                 EditFlowPerf.Dimensions(searchMode: mode.rawValue, countOnly: countOnly)
             ) {
-                try await dependencies.selection.workspaceSearch(
+                try await authority.search(
                     pattern, mode, regex, true, maxResults, maxResults, limiters, includeExts, excludePatterns, contextLines, wholeWord, countOnly, pattern.contains(" "), lookupRootScope
                 )
             }
@@ -894,7 +919,7 @@ final class MCPFileToolProvider: MCPAppToolProviding {
         defer { endDTOBuildIfNeeded() }
 
         try Task.checkCancellation()
-        let displayStore = try dependencies.context.requirePromptVM().workspaceFileContextStore
+        let displayStore = authority.store
         let displayRootRefsSnapshot = await EditFlowPerf.measure(
             EditFlowPerf.Stage.Search.dtoRootRefSnapshotLookup,
             dtoBuildDimensions()
@@ -1101,64 +1126,19 @@ final class MCPFileToolProvider: MCPAppToolProviding {
             )
         )
         try Task.checkCancellation()
-        try await validate(authority)
+        try await authority.validate()
         try await EditFlowPerf.measure(
             EditFlowPerf.Stage.Search.providerAutoSelection,
             EditFlowPerf.Dimensions(searchMode: mode.rawValue, contextLines: contextLines)
         ) {
             if !authority.isRunlessOneShotHint {
-                try await sideEffects.submitAndWait(fingerprint: "file_search_auto_selection") { [weak self] in
-                    guard let self else { throw CancellationError() }
-                    _ = try await applyFileSearchSideEffect(
-                        mode: mode,
-                        contextLines: contextLines,
-                        reply: reply,
-                        resolvedPhysicalPaths: autoSelectionResolvedPhysicalPaths,
-                        metadata: metadata,
-                        authority: authority.frozen,
-                        files: dependencies.files
-                    )
+                try await sideEffects.submitAndWait(fingerprint: "file_search_auto_selection") { [select = authority.selectSearch] in
+                    try await select(mode, contextLines, reply, autoSelectionResolvedPhysicalPaths)
                 }
             }
         }
         EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerAutoSelectionReturned)
         return reply
-    }
-
-    private func applyReadFileSideEffect(
-        reply: ToolResultDTOs.ReadFileReply,
-        requestedPath: String,
-        absolutePhysicalPath: String,
-        metadata: MCPRequestMetadata,
-        authority: MCPFrozenFileToolAuthority,
-        files: MCPAppPhysicalCapabilityAdapters.Files
-    ) async throws -> Bool {
-        try await files.enqueueReadFileAutoSelection(
-            reply,
-            requestedPath,
-            absolutePhysicalPath,
-            metadata,
-            authority
-        )
-    }
-
-    private func applyFileSearchSideEffect(
-        mode: SearchMode,
-        contextLines: Int,
-        reply: ToolResultDTOs.SearchResultDTO,
-        resolvedPhysicalPaths: [String],
-        metadata: MCPRequestMetadata,
-        authority: MCPFrozenFileToolAuthority,
-        files: MCPAppPhysicalCapabilityAdapters.Files
-    ) async throws -> Bool {
-        try await files.enqueueFileSearchAutoSelection(
-            mode,
-            contextLines,
-            reply,
-            resolvedPhysicalPaths,
-            metadata,
-            authority
-        )
     }
 
     static func searchRetryableFailureDTO(

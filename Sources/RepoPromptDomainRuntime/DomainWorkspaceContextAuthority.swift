@@ -47,6 +47,19 @@ package struct DomainWorkspaceStore: Sendable {
         await authority.execute(command)
     }
 
+    /// A host tool changes one canonical context against its original read revisions. The
+    /// nonpersistent authority check runs after the mutation gate, before entering disk IO.
+    package func replaceWorkingContext(
+        document: DomainWorkspaceDocument, workspaceRevision: UInt64, contextRevision: UInt64,
+        connectionID: UUID, validatesOrigin: @escaping @Sendable () async -> Bool
+    ) async -> DomainCommandOutcome {
+        await authority.executeContextMutation(.init(
+            operationID: UUID(), expectedWorkspaceRevision: workspaceRevision,
+            expectedContextRevision: contextRevision, conflictRecoveryPolicy: .failClosed,
+            origin: .appMCP(connectionID: connectionID), command: .replaceWorkingDocument(document)
+        ), validatesOrigin: validatesOrigin)
+    }
+
     @discardableResult
     package func reloadExternalChanges() async -> DomainExternalReloadActivity {
         await authority.reloadExternalChanges()
@@ -111,6 +124,11 @@ package struct DomainWorkspaceStore: Sendable {
         await authority.canonicalWorkspaceSnapshot(workspaceID)
     }
 
+    /// Read a bounded set of canonical membership carriers in one actor turn.
+    package func canonicalWorkspaceSnapshots(_ workspaceIDs: Set<UUID>) async -> [UUID: DomainWorkspaceSnapshot] {
+        await authority.canonicalWorkspaceSnapshots(workspaceIDs)
+    }
+
     package func agentAdmissionSnapshot(_ workspaceID: UUID) async -> DomainWorkspaceAdmissionSnapshot {
         await authority.agentAdmissionSnapshot(workspaceID)
     }
@@ -129,6 +147,10 @@ package struct DomainContextStore {
 
     package func snapshot(_ identity: DomainContextIdentity) async -> DomainContextSnapshot? {
         await authority.contextSnapshot(identity)
+    }
+
+    func canonicalWorkspaceSnapshot(_ id: UUID) async -> DomainWorkspaceSnapshot? {
+        await authority.canonicalWorkspaceSnapshot(id)
     }
 
     package func workspaceSnapshot(_ workspaceID: UUID) async -> DomainWorkspaceSnapshot? {
@@ -440,6 +462,12 @@ actor DomainWorkspaceContextAuthority {
 
     /// Command outcomes and mutation admission must report canonical record state; the read
     /// overlay is routing-only and must never leak into recovery health or revision baselines.
+    func canonicalWorkspaceSnapshots(_ workspaceIDs: Set<UUID>) -> [UUID: DomainWorkspaceSnapshot] {
+        var snapshots: [UUID: DomainWorkspaceSnapshot] = [:]
+        for id in workspaceIDs { snapshots[id] = canonicalWorkspaceSnapshot(id) }
+        return snapshots
+    }
+
     func canonicalWorkspaceSnapshot(_ workspaceID: UUID) -> DomainWorkspaceSnapshot? {
         records[workspaceID].map(makeSnapshot)
     }
@@ -678,7 +706,16 @@ actor DomainWorkspaceContextAuthority {
         return outcome
     }
 
-    private func executeCommand(_ envelope: DomainWorkspaceCommandEnvelope, diagnosticSaveGeneration: UInt64? = nil) async -> DomainCommandOutcome {
+    func executeContextMutation(
+        _ envelope: DomainWorkspaceCommandEnvelope, validatesOrigin: @escaping @Sendable () async -> Bool
+    ) async -> DomainCommandOutcome {
+        await executeCommand(envelope, validatesOrigin: validatesOrigin)
+    }
+
+    private func executeCommand(
+        _ envelope: DomainWorkspaceCommandEnvelope, diagnosticSaveGeneration: UInt64? = nil,
+        validatesOrigin: (@Sendable () async -> Bool)? = nil
+    ) async -> DomainCommandOutcome {
         await bootstrap()
         let fingerprint = envelope.fingerprint
         let workspaceID = envelope.workspaceID
@@ -758,7 +795,7 @@ actor DomainWorkspaceContextAuthority {
                 fingerprint: fingerprint
             )
         case let .replaceWorkingDocument(document):
-            await replaceWorkingDocument(document, envelope: envelope, fingerprint: fingerprint)
+            await replaceWorkingDocument(document, envelope: envelope, fingerprint: fingerprint, validatesOrigin: validatesOrigin)
         case let .saveWorkspaceDocument(workspaceID):
             await saveWorkspace(
                 workspaceID,
@@ -2088,7 +2125,8 @@ actor DomainWorkspaceContextAuthority {
     private func replaceWorkingDocument(
         _ document: DomainWorkspaceDocument,
         envelope: DomainWorkspaceCommandEnvelope,
-        fingerprint: String
+        fingerprint: String,
+        validatesOrigin: (@Sendable () async -> Bool)?
     ) async -> DomainCommandOutcome {
         await acquireCatalogMutation()
         defer { releaseCatalogMutation() }
@@ -2199,6 +2237,11 @@ actor DomainWorkspaceContextAuthority {
                 #if DEBUG
                     await testBeforeWorkingPersistence?(document.workspaceID)
                 #endif
+                if let validatesOrigin {
+                    guard await validatesOrigin(), !Task.isCancelled else {
+                        return conflictOutcome(envelope, record: record, diagnostic: "originating_context_revoked")
+                    }
+                }
                 persisted = try await persistence.persistWorking(
                     document: document,
                     expectedRevision: before.workingRevision,

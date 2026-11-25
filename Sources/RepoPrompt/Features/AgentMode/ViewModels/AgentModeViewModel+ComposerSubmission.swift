@@ -45,15 +45,32 @@ extension AgentModeViewModel {
     }
 
     func cancelPresentedComposerSubmission(id: UUID) async {
+        guard let sourceTabID = withdrawPresentedComposerSubmission(id: id, explicitCancellation: true) else { return }
+        await cancelFreshTaskRouting(tabID: sourceTabID)
+    }
+
+    /// A departing presenter relinquishes only its unpublished local submissions. An admitted
+    /// attempt and programmatic submissions do not belong to the presenter's pending rows.
+    func withdrawUnpublishedComposerSubmissionsForPresentationLoss() {
+        for id in Array(ui.composer.pendingSubmissions.keys) {
+            _ = withdrawPresentedComposerSubmission(id: id, explicitCancellation: false)
+        }
+    }
+
+    private func withdrawPresentedComposerSubmission(id: UUID, explicitCancellation: Bool) -> UUID? {
         guard let pending = ui.composer.pendingSubmissions[id],
               let session = sessions[pending.sourceTabID],
-              let attempt = session.activeComposerSubmitAttempt, attempt.id == id else { return }
-        guard let claim = composerSubmitRuntime.cleanupClaim(attempt: attempt, session: session) else { return }
-        // Withdrawal restores runtime-owned text immediately, but an entered producer retains
-        // its receipt until its finalizer. Never manufacture a run to cancel an unsent input.
-        guard claim.cancellation.withdraw(on: session) || claim.cancellation.cancelPresentedInput(on: session) else { return }
+              let attempt = session.activeComposerSubmitAttempt, attempt.id == id,
+              let claim = composerSubmitRuntime.cleanupClaim(attempt: attempt, session: session) else { return nil }
+        // This receipt restores the draft while an entered producer still owes its own finalizer.
+        let withdrawn = if explicitCancellation {
+            claim.cancellation.withdraw(on: session) || claim.cancellation.cancelPresentedInput(on: session)
+        } else {
+            claim.cancellation.withdrawForPresentationDeparture(on: session)
+        }
+        guard withdrawn else { return nil }
         finishWithdrawnComposerSubmission(session: session, attemptID: id)
-        await cancelFreshTaskRouting(tabID: pending.sourceTabID)
+        return pending.sourceTabID
     }
 
     /// Always finish a UI handoff even if the asynchronous execution rejects a stale claim.

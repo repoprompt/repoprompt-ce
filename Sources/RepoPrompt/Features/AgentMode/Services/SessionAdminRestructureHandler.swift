@@ -525,9 +525,13 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
                 }
                 let reservation = reserve(source)
                 defer { context.scopes.release(reservation) }
-                commit = try host.commitOrganizationalPlacement(
-                    sessionID: source, parentID: destination, delegationScopeID: stampScope
-                )
+                if let preparedCommit = preparation.commit {
+                    commit = try preparedCommit(destination, stampScope)
+                } else {
+                    commit = try host.commitOrganizationalPlacement(
+                        sessionID: source, parentID: destination, delegationScopeID: stampScope
+                    )
+                }
             } catch {
                 // No placement committed for this item. Keep earlier successes and their receipts,
                 // and let later items re-validate against the placement that actually landed.

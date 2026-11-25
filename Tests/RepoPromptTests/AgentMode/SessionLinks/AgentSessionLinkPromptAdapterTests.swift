@@ -4503,7 +4503,30 @@ private actor MonitorRemovalConnection: MCPServerConnection {
     func sendProgress(tool _: String, kind _: RepoPromptProgressKind, stage _: String, message _: String) async {}
 }
 
-actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
+actor MonitorFakeNativeController: NativeAgentRuntimeControlling, MCPRunRoutingCleanupRetaining {
+    private var ownedRouting: MCPRunRoutingCleanupReceipt?
+    private var routeInstallation: Task<Void, Error>?
+    private var connectOwnedRoute: (@MainActor @Sendable (MCPRunRoutingCleanupReceipt) async throws -> Void)?
+
+    func installOwnedRouteConnector(_ connect: @escaping @MainActor @Sendable (MCPRunRoutingCleanupReceipt) async throws -> Void) {
+        connectOwnedRoute = connect
+    }
+
+    func retainRoutingCleanup(_ receipt: MCPRunRoutingCleanupReceipt) -> Bool {
+        guard let connectOwnedRoute, !receipt.isConsumed else { return false }
+        if ownedRouting == receipt { return true }
+        let previous = ownedRouting
+        let pending = routeInstallation
+        guard previous == nil || previous?.routeOwner === receipt.routeOwner else { return false }
+        ownedRouting = receipt
+        routeInstallation = Task {
+            _ = await pending?.result
+            if let previous { await ServerNetworkManager.shared.cleanupRunRoutingState(ownedBy: previous) }
+            try await connectOwnedRoute(receipt)
+        }
+        return true
+    }
+
     func emit(_ event: NativeAgentRuntimeEvent) {
         continuation?.yield(event)
     }
@@ -4617,6 +4640,7 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
         if rejectResume, existingSessionID != nil {
             throw NativeAgentRuntimeControllerError.processNotRunning
         }
+        try await routeInstallation?.value
         return NativeAgentRuntimeSessionRef(sessionID: existingSessionID ?? "monitor-native-session")
     }
 
@@ -4699,6 +4723,12 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
         configuration.replaceProcess()
         shutdownCount += 1
         continuation?.finish()
+        let installation = routeInstallation
+        let receipt = ownedRouting
+        routeInstallation = nil
+        ownedRouting = nil
+        _ = await installation?.result
+        if let receipt { await ServerNetworkManager.shared.cleanupRunRoutingState(ownedBy: receipt) }
     }
 
     func respondToPermissionRequest(id: String, decision: AgentApprovalDecision) async {
@@ -4777,6 +4807,24 @@ final class MonitorFakeCodexController: CodexSessionControllerPassiveStubDefault
     private var threadStarted = false
     private var startOrResumeHook: (@Sendable () async -> Void)?
     private var sendGate: TestReleaseFence?
+    private var routingExpectation: (runID: UUID, routeID: Int, owner: MCPHostRouteResources)?
+    private var routingReceipts: [MCPRunRoutingCleanupReceipt] = []
+    private var didShutDown = false
+
+    func expectRouting(runID: UUID, routeID: Int, owner: MCPHostRouteResources) {
+        lock.withLock { routingExpectation = (runID, routeID, owner) }
+    }
+
+    func retainRoutingCleanup(_ receipt: MCPRunRoutingCleanupReceipt) -> Bool {
+        lock.withLock {
+            guard let routingExpectation, !didShutDown, !receipt.isConsumed,
+                  receipt.managerIdentity == ObjectIdentifier(ServerNetworkManager.shared),
+                  receipt.runID == routingExpectation.runID, receipt.routeID == routingExpectation.routeID,
+                  receipt.routeOwner === routingExpectation.owner else { return false }
+            if !routingReceipts.contains(receipt) { routingReceipts.append(receipt) }
+            return true
+        }
+    }
 
     func setSendGate(_ gate: TestReleaseFence?) {
         lock.withLock { sendGate = gate }
@@ -4971,7 +5019,17 @@ final class MonitorFakeCodexController: CodexSessionControllerPassiveStubDefault
     ) async {}
 
     func shutdown() async {
+        let receipts = lock.withLock {
+            didShutDown = true
+            routingExpectation = nil
+            let receipts = routingReceipts
+            routingReceipts.removeAll()
+            return receipts
+        }
         continuation.finish()
+        for receipt in receipts {
+            await ServerNetworkManager.shared.cleanupRunRoutingState(ownedBy: receipt)
+        }
     }
 }
 

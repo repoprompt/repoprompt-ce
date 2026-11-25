@@ -90,7 +90,8 @@ struct OpenWindowsDelegationProvenanceSource: DelegationProvenanceSource {
         let carriers = AgentSessionCarrierResolver.capture(
             windows: windows, sessionIDs: sessionIDs, includeRuntimeOwners: includeRuntime
         )
-        let ids = sessionIDs ?? carriers.sessionIDs
+        let savedIDs = AgentSessionRuntimeStore.shared.retainedExecutionHosts.compactMap { $0.workspaceActivation?.retainedCarrierSessionID }
+        let ids = sessionIDs ?? carriers.sessionIDs.union(savedIDs)
         // The carrier capture already took each window's binding census for runtime owners; reuse its
         // states so one read builds one census per window.
         let runtime = includeRuntime ? windows.map {
@@ -104,6 +105,20 @@ struct OpenWindowsDelegationProvenanceSource: DelegationProvenanceSource {
             let missingPlacement = metadata.isEmpty && carriers.sessionIDs.contains(id)
             let observed = runtime.compactMap { $0[id] }
             let ambiguous = carriers.ambiguousSessionIDs.contains(id) || observed.contains(.ambiguous)
+            // A canonical carrier and its exact writer prove placement even while the owning
+            // sidebar index is absent. A disagreeing replica can veto but cannot supply proof.
+            if let canonical = canonicalWriterProvenance(for: id) {
+                var workspaces = carriers.affectedWorkspaceIDs(for: id)
+                if ambiguous || placementConflict || workspaces.contains(where: { $0 != canonical.workspaceID }) {
+                    if let workspaceID = canonical.workspaceID { workspaces.insert(workspaceID) }
+                    result.states[id] = .ambiguous
+                    result.placementConflicts[id] = workspaces
+                } else {
+                    result.states[id] = .unique
+                    result.records[id] = canonical
+                }
+                continue
+            }
             result.states[id] = ambiguous ? .ambiguous : missingPlacement ? .unproven
                 : carriers.replicatedSessionIDs.contains(id) ? .replicated
                 : carriers.uniqueLocations[id] != nil ? .unique : metadata.isEmpty ? .absent : .indexOnly
@@ -135,5 +150,22 @@ struct OpenWindowsDelegationProvenanceSource: DelegationProvenanceSource {
             )
         }
         return result
+    }
+
+    private func canonicalWriterProvenance(for id: UUID) -> DelegationSessionProvenance? {
+        guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: id),
+              let host = writer.scope.executableHost, !host.route.isClosing, (try? writer.admitCommand().get()) != nil
+        else { return nil }
+        let isSavedCarrier = host.workspaceActivation?.retainedCarrierSessionID == id && host.workspaceActivation?.isCurrent == true
+        let hasTransactionCarrier = AppSavedAgentSessionExecution.approvedLinkOrigin.get()?.canonicalWriters.contains(writer.identity) == true
+        guard isSavedCarrier || hasTransactionCarrier else { return nil }
+        let session = writer.session
+        let bindings = Set(session.worktreeBindings.map(\.worktreeID))
+        return .init(
+            sessionID: id, workspaceID: writer.identity.workspaceID, parentSessionID: session.parentSessionID,
+            createdByOverseerSessionID: session.createdByOverseerSessionID, organizationalParentID: session.organizationalParentID,
+            delegationScopeID: session.delegationScopeID, isLive: true, worktreeCount: bindings.count, boundWorktreeIDs: bindings,
+            runState: session.runState.isActive ? .running : .idle, hasUniqueRuntimeOwner: true
+        )
     }
 }

@@ -34,6 +34,65 @@ final class AppDomainRuntimeCompositionTests: XCTestCase {
         XCTAssertTrue(scope.linkExecution === installed)
     }
 
+    @MainActor
+    func testIncompleteVisibleHostPreparationReleasesItsIndependentRoute() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("VisibleHost-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let runtime = MCPDomainRuntime(configuration: .init(
+            mode: .app, profileIdentifier: "visible-host-\(UUID())", storageDirectory: directory,
+            workspaceStorageDirectory: directory.appendingPathComponent("workspaces"),
+            eventDirectory: directory.appendingPathComponent("events"),
+            temporaryDirectory: directory.appendingPathComponent("temporary"), externalReloadInterval: nil
+        ))
+        try await runtime.start()
+        addTeardownBlock {
+            _ = await runtime.shutdown()
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let root = directory.appendingPathComponent("root")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let workspace = WorkspaceModel(name: "Original", repoPaths: [root.path], customStoragePath: directory.appendingPathComponent("saved"))
+        let authority = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: 0)
+        let created = try await authority.create(
+            workspace, fileURL: runtime.configuration.workspaceStorageDirectory.appendingPathComponent("\(workspace.id.uuidString).json")
+        )
+        XCTAssertEqual(created.disposition, .applied)
+        let activations = AgentWorkspaceSessionIndexStore()
+        let owner = activations.receiveWorkspaceSwitchNotification(workspace)
+        let keys = KeyManager()
+        let settings = APISettingsViewModel(aiQueriesService: AIQueriesService(keyManager: keys), keyManager: keys, loadStoredDataOnInit: false)
+        let resources = AgentHostWorkspaceResources(
+            files: WorkspaceFileContextStore(codemapGraphIndexBuildLaunchPolicyForTesting: .disabled), contexts: runtime.contextStore
+        )
+        var candidate: AgentSessionRuntimeHost?
+        var candidateRootLease: AgentHostWorkspaceResources.Lease?
+        do {
+            _ = try await WindowStateCompositionFactory.prepareVisibleAgentHost(
+                workspace: workspace, owner: owner, activations: activations, resources: resources,
+                apiSettings: settings, settingsStore: .shared, runtime: runtime
+            ) { host, rootLease in
+                candidate = host
+                candidateRootLease = rootLease
+                XCTAssertEqual(rootLease.snapshot.document.workspaceID, workspace.id)
+                XCTAssertEqual(rootLease.snapshot.document.metadata.repoPaths, [root.path])
+                XCTAssertTrue(rootLease.rootsAreCurrent)
+                XCTAssertEqual(host.route.identity.kind, .independent)
+                XCTAssertTrue(host.route.isLeaseManaged)
+                XCTAssertTrue(host.workspaceActivation?.isPresenterCurrent == true)
+                // No execution or catalog is installed by this fixture.
+            }
+            XCTFail("A candidate without the required capabilities must not publish")
+        } catch AgentHostWorkspaceResources.Failure.authorityUnavailable {
+            let host = try XCTUnwrap(candidate)
+            try await AsyncTestWait.waitUntil("the unpublished host releases its original route") {
+                host.scope.hasReleasedWriterClaims && host.route.isClosing && host.scope.retainedDrain == nil
+            }
+            XCTAssertFalse(AgentSessionRuntimeStore.shared.retainedExecutionHosts.contains { $0 === host })
+            XCTAssertTrue(try XCTUnwrap(candidateRootLease).isReleased)
+            XCTAssertEqual(activations.latestSessionIndexOwner, owner)
+        }
+    }
+
     func testCollectLegacyRuntimeDefaultsSerializesBooleanScalarFragments() throws {
         for value in [true, false] {
             let (defaults, suiteName) = try makeIsolatedDefaults()

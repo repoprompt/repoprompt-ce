@@ -107,6 +107,30 @@ final class AgentSessionComposerSubmitRuntimeTests: XCTestCase {
         XCTAssertNil(session.activeRunAttemptID)
     }
 
+    func testPresentationDepartureWithdrawsUnsentSteerWithoutStoppingItsOriginalRun() throws {
+        let (scope, session, command) = boundFixture()
+        let runID = UUID()
+        session.installRunID(runID)
+        session.beginRunAttempt(source: "unsent-steer")
+        session.runState = .running
+        let attemptID = try XCTUnwrap(session.activeRunAttemptID)
+        let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        guard case let .claimed(claim) = scope.submissions.claim(attempt(target), command: command) else {
+            return XCTFail("Expected exact steer claim")
+        }
+        defer { scope.submissions.release(claim) }
+        claim.cancellation.oweDraftRestoration("unsent steer")
+        let stopFence = AgentRunStartStopFence(session: session)
+
+        XCTAssertTrue(claim.cancellation.withdrawForPresentationDeparture(on: session))
+        XCTAssertFalse(scope.submissions.isCurrent(claim))
+        XCTAssertEqual(session.draftText, "unsent steer")
+        XCTAssertEqual(session.runID, runID)
+        XCTAssertEqual(session.activeRunAttemptID, attemptID)
+        XCTAssertTrue(session.runState.isActive)
+        XCTAssertTrue(stopFence.permitsStart(of: session))
+    }
+
     func testInitialPreparationCapabilityDoesNotAuthorizeGenericLocationChanges() throws {
         let (scope, session, command) = boundFixture()
         let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
@@ -2288,6 +2312,27 @@ final class AutoWorkflowSubmissionTests: XCTestCase {
         XCTAssertTrue(fixture.session.items.isEmpty)
         await fixture.backend.release()
         XCTAssertTrue(fixture.viewModel.autoWorkflowJudgments.isEmpty)
+    }
+
+    func testPresentationDepartureWithdrawsOnlyUnpublishedComposerInput() async throws {
+        let unpublished = try await makeFixture(presented: true)
+        unpublished.viewModel.withdrawUnpublishedComposerSubmissionsForPresentationLoss()
+        XCTAssertTrue(unpublished.claim.cancellation.isWithdrawn)
+        XCTAssertEqual(unpublished.viewModel.draftRuntime.text(for: unpublished.session.tabID), Self.text)
+        XCTAssertNil(unpublished.session.activeRunAttemptID)
+
+        let admitted = try await makeFixture(presented: true)
+        admitted.session.beginRunAttempt(source: "presentation-departure-test")
+        admitted.session.installRunID(UUID())
+        admitted.session.runState = .running
+        let attemptID = try XCTUnwrap(admitted.session.activeRunAttemptID)
+        let runID = admitted.session.runID
+        admitted.viewModel.withdrawUnpublishedComposerSubmissionsForPresentationLoss()
+        XCTAssertFalse(admitted.claim.cancellation.isWithdrawn)
+        XCTAssertEqual(admitted.session.activeRunAttemptID, attemptID)
+        XCTAssertEqual(admitted.session.runID, runID)
+        XCTAssertTrue(admitted.session.runState.isActive)
+        admitted.session.runState = .cancelled
     }
 
     func testLatePreparationRevalidationAndRejectedSendNeverInstallAutomaticPickerState() async throws {

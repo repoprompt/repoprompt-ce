@@ -10,6 +10,156 @@ import XCTest
 #if DEBUG
     @MainActor
     final class AgentAdmissionRecoveryTests: XCTestCase {
+        func testIndependentAdmissionRecoverySavesOnlyItsFencedWorkingRemoval() async throws {
+            try await checkIndependentAdmissionRecovery(superseded: false)
+        }
+
+        func testIndependentAdmissionRecoveryDoesNotSaveSupersedingWorkingRevision() async throws {
+            try await checkIndependentAdmissionRecovery(superseded: true)
+        }
+
+        private func checkIndependentAdmissionRecovery(superseded: Bool) async throws {
+            let sessionID = UUID()
+            let provisional = ComposeTabState(name: "Provisional child", activeAgentSessionID: sessionID)
+            let peer = ComposeTabState(name: "Peer", promptText: "preserve this exact peer")
+            let workspace = WorkspaceModel(
+                name: "Independent admission recovery", repoPaths: [],
+                composeTabs: [peer, provisional], activeComposeTabID: peer.id
+            )
+            let store = try await seedIndependentWorkspace(workspace)
+            let beforeRead = await store.canonicalWorkspaceSnapshot(workspace.id)
+            let before = try XCTUnwrap(beforeRead)
+            XCTAssertTrue(before.health.acceptsMutations)
+            XCTAssertNil(before.revisions.dirtyRevision)
+
+            let identity = AgentProvisionalAdmissionIdentity(
+                recoveryID: UUID(), workspaceID: workspace.id, tabID: provisional.id,
+                sessionID: sessionID, replacementTabID: UUID()
+            )
+            var ownedCommit: AgentAdmissionRecoveryWorkingCommit?
+            let workingCommit = WorkspaceAgentAdmissionRecovery.WorkingCommit(
+                read: { ownedCommit }, record: { ownedCommit = $0 }, forget: { ownedCommit = nil }
+            )
+            let origin = DomainCommandOrigin.appMCP(connectionID: UUID())
+            let failedFirstSave = await WorkspaceAgentAdmissionRecovery.recover(
+                identity: identity, mutation: .removeTab, store: store, origin: origin,
+                decode: { try JSONDecoder().decode(WorkspaceModel.self, from: $0.documentBytes) },
+                workingCommit: workingCommit, projection: WorkspaceAgentAdmissionRecovery.independentProjection,
+                hooks: .init(allowWorkingSave: { _ in false })
+            )
+            let owned = try XCTUnwrap(ownedCommit)
+            XCTAssertEqual(failedFirstSave, .retryablePartial(owned))
+            XCTAssertEqual(owned.revision, before.revisions.workingRevision + 1)
+            let dirtyRead = await store.canonicalWorkspaceSnapshot(workspace.id)
+            let dirty = try XCTUnwrap(dirtyRead)
+            XCTAssertEqual(dirty.revisions.dirtyRevision, owned.revision)
+            XCTAssertEqual(dirty.document.contentDigest, owned.digest)
+            var interveningDocument: DomainWorkspaceDocument?
+            if superseded {
+                var changed = try JSONDecoder().decode(WorkspaceModel.self, from: dirty.document.documentBytes)
+                changed.composeTabs[0].promptText = "unrelated dirty peer edit"
+                let document = try WorkspaceAgentAdmissionDocument.encode(changed, fileURL: dirty.document.fileURL)
+                let competing = await WorkspaceAgentAdmissionDocument.execute(
+                    .replaceWorkingDocument(document), store: store, origin: .appMCP(connectionID: UUID()),
+                    expectedRevision: owned.revision
+                )
+                XCTAssertEqual(competing.disposition, .applied)
+                interveningDocument = document
+            }
+            let result = await WorkspaceAgentAdmissionRecovery.recover(
+                identity: identity, mutation: .removeTab, store: store, origin: origin,
+                decode: { try JSONDecoder().decode(WorkspaceModel.self, from: $0.documentBytes) },
+                workingCommit: workingCommit, projection: WorkspaceAgentAdmissionRecovery.independentProjection
+            )
+            XCTAssertNil(ownedCommit)
+            let afterRead = await store.canonicalWorkspaceSnapshot(workspace.id)
+            let after = try XCTUnwrap(afterRead)
+            if let interveningDocument {
+                XCTAssertEqual(result, .ownershipChanged)
+                XCTAssertEqual(after.revisions.workingRevision, owned.revision + 1)
+                XCTAssertEqual(after.revisions.dirtyRevision, after.revisions.workingRevision)
+                XCTAssertEqual(after.document.contentDigest, interveningDocument.contentDigest)
+                XCTAssertEqual(after.revisions.savedRevision, before.revisions.savedRevision)
+                return
+            }
+            XCTAssertEqual(result, .recovered(revision: owned.revision, digest: owned.digest))
+            XCTAssertNil(after.revisions.dirtyRevision)
+            XCTAssertEqual(after.revisions.workingRevision, owned.revision, "Retry must not replace the owned working bytes")
+            let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: after.document.documentBytes)
+            XCTAssertEqual(canonical.composeTabs, [peer])
+            XCTAssertEqual(canonical.activeComposeTabID, peer.id)
+            let saved = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: after.document.fileURL))
+            XCTAssertEqual(saved, canonical)
+        }
+
+        func testCanonicalBackgroundTabPublishesOnlyAfterBlockedWriterAndDiscardsExactly() async throws {
+            let foreground = ComposeTabState(name: "Foreground", promptText: "preserve original foreground")
+            let workspace = WorkspaceModel(
+                name: "Independent child admission", repoPaths: [], composeTabs: [foreground], activeComposeTabID: foreground.id
+            )
+            let store = try await seedIndependentWorkspace(workspace)
+            let allocation = AgentSessionCreationClaim(workspaceID: workspace.id)
+            let runtimeStore = AgentSessionRuntimeStore()
+            let scope = runtimeStore.makeScope()
+            let tab = ComposeTabState(name: "Child", activeAgentSessionID: allocation.sessionID)
+            var creationCommand: AgentSessionRuntimeStore.Command?
+            let coordinator = WorkspaceAgentAdmissionCoordinator()
+            let transaction = WorkspaceAgentCanonicalFreshAdmission(
+                authority: .init(store: store, windowID: -910), connectionID: UUID(), coordinator: coordinator
+            )
+            let result = try await transaction.publish(workspaceID: workspace.id, sessionID: allocation.sessionID, adapters: .init(
+                makeTab: { _ in tab }, prepareWriter: { candidate in
+                    XCTAssertEqual(candidate, tab)
+                    let session = scope.makeSession(tabID: candidate.id)
+                    session.beginPersistentBindingTransition()
+                    session.installPersistentSessionBinding(.init(
+                        tabID: session.tabID, sessionID: allocation.sessionID, workspaceID: workspace.id
+                    ))
+                    guard let handle = session.acceptFreshCreation(allocation, workspaceID: workspace.id) else { return false }
+                    scope.replaceSessions([session.tabID: session])
+                    creationCommand = try? scope.admit(session: session, expectedWorkspaceID: workspace.id, requirement: .creation(handle))
+                    XCTAssertNil(try? scope.admit(session: session, expectedWorkspaceID: workspace.id), "A provisional writer cannot run")
+                    return creationCommand != nil
+                }, ownsWriter: { creationCommand?.isCurrent == true }, validateSource: { true }, sourceIsCurrent: { true }
+            ))
+            guard case let .created(created, receipt, claim) = result else {
+                return XCTFail("The exact independent carrier did not commit: \(result)")
+            }
+            XCTAssertEqual(created, tab)
+            XCTAssertTrue(coordinator.hasActiveProvisionalSession(workspaceID: workspace.id, sessionID: allocation.sessionID))
+            let savedRead = await store.canonicalWorkspaceSnapshot(workspace.id)
+            let saved = try XCTUnwrap(savedRead)
+            XCTAssertEqual(receipt.commitEvidence, .saved(revision: saved.revisions.savedRevision, digest: saved.document.contentDigest))
+            let projected = try JSONDecoder().decode(WorkspaceModel.self, from: saved.document.documentBytes)
+            XCTAssertEqual(projected.composeTabs, [foreground, tab])
+            XCTAssertEqual(projected.activeComposeTabID, foreground.id, "Background admission may not select its carrier")
+            let removal = await transaction.discard(claim) { creationCommand?.isCurrent == true }
+            guard case .recovered = removal else { return XCTFail("Unexpected compensation: \(removal)") }
+            let compensatedRead = await store.canonicalWorkspaceSnapshot(workspace.id)
+            let compensated = try XCTUnwrap(compensatedRead)
+            XCTAssertNil(compensated.revisions.dirtyRevision)
+            let surviving = try JSONDecoder().decode(WorkspaceModel.self, from: compensated.document.documentBytes)
+            XCTAssertEqual(surviving.composeTabs, [foreground])
+            XCTAssertEqual(surviving.activeComposeTabID, foreground.id)
+            XCTAssertFalse(coordinator.hasActiveProvisionalSession(workspaceID: workspace.id, sessionID: allocation.sessionID))
+        }
+
+        private func seedIndependentWorkspace(_ workspace: WorkspaceModel) async throws -> DomainWorkspaceStore {
+            _ = try writeWorkspace(workspace)
+            try writeIndex([workspace])
+            let runtime = MCPDomainRuntime(configuration: .init(
+                mode: .app, profileIdentifier: "independent-admission-\(UUID().uuidString)",
+                storageDirectory: storageRoot.appendingPathComponent("independent-state", isDirectory: true),
+                workspaceStorageDirectory: storageRoot,
+                eventDirectory: storageRoot.appendingPathComponent("independent-events", isDirectory: true),
+                temporaryDirectory: storageRoot.appendingPathComponent("independent-tmp", isDirectory: true),
+                externalReloadInterval: nil
+            ))
+            runtimes.append(runtime)
+            try await runtime.start()
+            return runtime.workspaceStore
+        }
+
         func testAdmissionTimingUsesRealFreshAndExistingTabSaveScopes() async throws {
             for kind in [WorkspaceAgentAdmissionTiming.Kind.freshTab, .existingTab] {
                 let coordinator = WorkspaceAgentAdmissionCoordinator()

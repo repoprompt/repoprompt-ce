@@ -8,15 +8,7 @@ extension AgentModeViewModel {
         endpoint: DomainAgentSessionLinkEndpointIdentity,
         origin: AgentSelfMCPCallOrigin
     ) -> AgentSelfContextSnapshot? {
-        guard let session = origin.matchingSession(
-            endpoint: endpoint, lookup: { sessions[$0] },
-            observerEndpoint: { linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: $0) }
-        )
-        else { return nil }
-        return AgentSelfContextSnapshot(
-            context: Self.observationContextLoad(for: session),
-            selfCompact: session.selfCompactState.status
-        )
+        linkExecutionRuntime.agentSelfContextSnapshot(endpoint: endpoint, origin: origin)
     }
 
     static func agentSelfCompactNoteReadinessSnapshot(session: TabSession, requestID: UUID) -> AgentSessionLinkDeliveryReadiness.Snapshot {
