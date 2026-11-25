@@ -716,7 +716,7 @@ struct MarkdownTextView: View, Equatable {
         guard latestRequestedSignature == signature else { return }
         guard renderRequestContext.signature == signature else { return }
 
-        attributedText = compiled
+        attributedText = NSAttributedString(attributedString: compiled)
         lastPublishedSignature = signature
         lastPublishedAt = Date()
         compileTask = nil

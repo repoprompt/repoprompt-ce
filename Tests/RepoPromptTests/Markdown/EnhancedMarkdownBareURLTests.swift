@@ -219,6 +219,21 @@ final class EnhancedMarkdownBareURLTests: XCTestCase {
 
 @MainActor
 final class MarkdownPresentationUpdateTests: XCTestCase {
+    private final class TextEditRecorder: NSObject, NSTextStorageDelegate {
+        var characterEditRanges: [NSRange] = []
+
+        func textStorage(
+            _: NSTextStorage,
+            willProcessEditing editedMask: NSTextStorageEditActions,
+            range editedRange: NSRange,
+            changeInLength _: Int
+        ) {
+            if editedMask.contains(.editedCharacters) {
+                characterEditRanges.append(editedRange)
+            }
+        }
+    }
+
     func testHiddenUpdatesKeepSelectionAndRevealOnlyLatestLargeMarkdown() {
         let source = String(repeating: "## Section\n\nA **bold** paragraph with a [link](https://example.com).\n\n```swift\nlet value = 42\n```\n\n", count: 1200)
         var compiler = EnhancedMarkdownCompiler()
@@ -251,6 +266,49 @@ final class MarkdownPresentationUpdateTests: XCTestCase {
         let installedLatest = NSAttributedString(attributedString: textView.attributedString())
         render(installedLatest, visible: true)
         XCTAssertEqual(textView.contentVersion, initialVersion + 1, "An unchanged reveal must not replace text storage again")
+    }
+
+    func testStreamingAppendPreservesSelectionAndRemeasures() {
+        let textView = CodeBlockTextView()
+        textView.textContainer?.widthTracksTextView = false
+        textView.textContainer?.heightTracksTextView = false
+        let coordinator = MarkdownTextViewCoordinator()
+        func render(_ text: NSAttributedString) {
+            AttributedTextView(attributedString: text, isEditable: false, allowsTextSelection: true)
+                .updateTextView(textView, coordinator: coordinator, presentationVisible: true)
+        }
+
+        let initial = NSAttributedString(string: "中文 mixed with English 👩🏽‍💻", attributes: [.font: NSFont.systemFont(ofSize: 13)])
+        render(initial)
+        let selection = NSRange(location: 0, length: 2)
+        textView.setSelectedRange(selection)
+        let initialHeight = textView.measuredHeight(constrainedTo: 240)
+        let initialVersion = textView.contentVersion
+
+        let next = NSMutableAttributedString(attributedString: initial)
+        let suffix = NSAttributedString(string: "\n新增內容")
+        next.append(suffix)
+        let edits = TextEditRecorder()
+        textView.textStorage?.delegate = edits
+        let published = NSAttributedString(attributedString: next)
+        render(published)
+        XCTAssertEqual(textView.string, next.string)
+        XCTAssertEqual(edits.characterEditRanges, [NSRange(location: initial.length, length: suffix.length)])
+        XCTAssertEqual(textView.selectedRange(), selection)
+        XCTAssertGreaterThan(textView.measuredHeight(constrainedTo: 240), initialHeight)
+        XCTAssertEqual(textView.contentVersion, initialVersion + 1)
+
+        render(published)
+        XCTAssertEqual(textView.contentVersion, initialVersion + 1)
+
+        render(next)
+        let versionBeforeAttributeEdit = textView.contentVersion
+        next.addAttribute(.foregroundColor, value: NSColor.red, range: selection)
+        next.append(suffix)
+        render(next)
+        XCTAssertEqual(textView.string, next.string)
+        XCTAssertEqual(textView.contentVersion, versionBeforeAttributeEdit + 1)
+        XCTAssertEqual(textView.textStorage?.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor, .red)
     }
 
     func testHiddenEditableContentStillUpdates() {
