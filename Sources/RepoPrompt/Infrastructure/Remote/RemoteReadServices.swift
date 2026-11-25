@@ -495,8 +495,12 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
             for activity in turn.allActivities {
                 let semanticKind = semanticKind(for: activity, conclusionActivityID: turn.conclusionActivityID)
                 let detail = includeDetails ? remoteDetail(for: activity) : nil
-                let visibleText: String? = if let summary = activity.toolExecution?.summaryText,
-                                              !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                let visibleText: String? = if let execution = activity.toolExecution,
+                                              let summary = compactToolSummary(execution)
+                {
+                    sanitizeText(summary, characterLimit: 512)
+                } else if let summary = activity.toolExecution?.summaryText,
+                          !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 {
                     sanitizeVisibleText(summary)
                 } else if activity.toolExecution != nil {
@@ -558,6 +562,94 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
         return projected.sorted {
             cursor(for: $0) < cursor(for: $1)
         }
+    }
+
+    static func compactToolSummary(_ execution: AgentTranscriptToolExecution) -> String? {
+        let name = normalizedToolCardName(execution.toolName)?.lowercased()
+        guard let name, [
+            "read",
+            "read_file",
+            "file_search",
+            "grep",
+            "glob",
+            "list_files",
+            "bash",
+            "apply_edits",
+            "apply_patch",
+            "edit",
+            "edit_file",
+            "write_file"
+        ].contains(name)
+        else { return nil }
+
+        // Large payloads still have their original summary and expandable, size-limited detail.
+        let args = boundedToolPayload(execution.argsJSON)
+        let rawResult = boundedToolPayload(execution.resultJSON)
+        var subject = ToolCardRouter.callSubtitle(for: name, argsJSON: args) ?? execution.keyPaths.first
+        var outcome: String?
+        switch name {
+        case "read", "read_file":
+            if let read = ToolJSON.decodeResult(ToolResultDTOs.ReadFileReply.self, from: rawResult) {
+                subject = read.displayPath ?? subject
+                if read.firstLine > 0, read.lastLine >= read.firstLine {
+                    outcome = read.firstLine == read.lastLine ? "Line \(read.firstLine)" : "Lines \(read.firstLine)–\(read.lastLine)"
+                }
+            }
+        case "file_search", "grep", "glob", "list_files":
+            if subject == nil {
+                let arguments = ToolJSON.rawObject(from: args)
+                subject = (arguments?["pattern"] ?? arguments?["query"]) as? String
+            }
+            let result = ToolJSON.structuredResultObject(from: rawResult)
+            if let count = result?["total_matches"] as? Int {
+                outcome = "\(count) \(count == 1 ? "match" : "matches")"
+            }
+        case "bash":
+            let shell = BashToolResultParser.parse(raw: rawResult, argsJSON: args)
+            subject = shell.command ?? subject
+            if let exitCode = execution.exitCode ?? shell.exitCode {
+                outcome = "Exit \(exitCode)"
+            }
+        default:
+            let result = ToolJSON.structuredResultObject(from: rawResult)
+            if let patch = ToolJSON.decodeResult(ToolResultDTOs.ApplyPatchSummary.self, from: rawResult) {
+                let paths = patch.changes.map(\.path)
+                if let first = paths.first {
+                    let count = max(paths.count, patch.changeCount)
+                    subject = count == 1 ? first : "\(first) (+\(count - 1) more)"
+                }
+                if patch.summaryOnly != true {
+                    outcome = diffLineSummary(patch.changes.map(\.diff))
+                }
+            } else if let added = result?["added_lines"] as? Int, let deleted = result?["deleted_lines"] as? Int {
+                outcome = "+\(added) −\(deleted) lines"
+            } else if let total = result?["total_lines_changed"] as? Int {
+                outcome = "\(total) \(total == 1 ? "line" : "lines") changed"
+            }
+        }
+        let summary = [subject, outcome].compactMap(\.self).filter { !$0.isEmpty }.joined(separator: " • ")
+        return summary.isEmpty ? nil : summary
+    }
+
+    private static func boundedToolPayload(_ raw: String?) -> String? {
+        guard let raw, raw.utf8.prefix(65537).count <= 65536 else { return nil }
+        return sanitizeText(raw, characterLimit: 65536)
+    }
+
+    private static func diffLineSummary(_ diffs: [String]) -> String? {
+        var additions = 0
+        var deletions = 0
+        for diff in diffs {
+            var inHunk = false
+            for line in diff.split(separator: "\n", omittingEmptySubsequences: false) {
+                if line.hasPrefix("@@") { inHunk = true }
+                if line.hasPrefix("diff --git ") { inHunk = false }
+                if inHunk, line.hasPrefix("+") { additions += 1 }
+                if inHunk, line.hasPrefix("-") { deletions += 1 }
+            }
+        }
+        guard additions + deletions > 0 else { return nil }
+        return "+\(additions) −\(deletions) lines"
     }
 
     private static func projectAttachments(_ attachments: [AgentFileAttachment]) -> [RemoteTranscriptAttachment]? {

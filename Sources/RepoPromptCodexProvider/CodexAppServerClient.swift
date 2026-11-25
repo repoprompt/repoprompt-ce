@@ -1436,7 +1436,8 @@ package actor CodexAppServerClient {
             "id": receipt.requestID.jsonValue,
             "result": result
         ]
-        try sendJSONLine(payload, method: nil)
+        // Provider-request results may contain secure user input.
+        try sendJSONLine(payload, method: nil, logPayload: false)
     }
 
     package func respondToServerRequestError(
@@ -2198,13 +2199,13 @@ package actor CodexAppServerClient {
     ///
     /// Related:
     /// - ClaudeNativeProcessSessionController.sendLine (reference atomic write pattern)
-    private func sendJSONLine(_ payload: [String: Any], method: String?) throws {
+    private func sendJSONLine(_ payload: [String: Any], method: String?, logPayload: Bool = true) throws {
         guard let activeTransport, !didTerminateTransport else {
             throw lastTransportFailure ?? ClientError.processNotRunning
         }
         let process = activeTransport.process
         let data = try JSONSerialization.data(withJSONObject: payload, options: [])
-        if config.enableDebugLogging {
+        if config.enableDebugLogging, logPayload {
             if let line = String(data: data, encoding: .utf8) {
                 print("[CodexAppServer] -> \(line)")
             }

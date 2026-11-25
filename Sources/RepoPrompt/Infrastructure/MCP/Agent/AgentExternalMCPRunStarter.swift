@@ -58,6 +58,7 @@ enum AgentExternalMCPRunStarter {
         dispatchInstruction: DispatchInstruction? = nil,
         startExpiry: AgentRunStartExpiry? = nil,
         remoteAttachments: [AgentFileAttachment]? = nil,
+        remoteInterviewFirst: Bool? = nil,
         validateDispatch: (@MainActor () throws -> Void)? = nil,
         workspaceAuthority: AgentModeViewModel.MCPWorkspaceTargetAuthority? = nil
     ) async throws -> StartOutcome {
@@ -78,6 +79,7 @@ enum AgentExternalMCPRunStarter {
             dispatchInstruction: dispatchInstruction,
             startExpiry: startExpiry,
             remoteAttachments: remoteAttachments,
+            remoteInterviewFirst: remoteInterviewFirst,
             validateDispatch: validateDispatch,
             workspaceAuthority: workspaceAuthority
         )
@@ -136,6 +138,7 @@ enum AgentExternalMCPRunStarter {
         dispatchInstruction: DispatchInstruction?,
         startExpiry: AgentRunStartExpiry?,
         remoteAttachments: [AgentFileAttachment]? = nil,
+        remoteInterviewFirst: Bool? = nil,
         validateDispatch: (@MainActor () throws -> Void)? = nil,
         workspaceAuthority: AgentModeViewModel.MCPWorkspaceTargetAuthority? = nil
     ) async throws -> StartOutcome {
@@ -279,6 +282,7 @@ enum AgentExternalMCPRunStarter {
                     workflow: workflow,
                     preserveRoutedInitialEffort: preserveRoutedInitialEffort,
                     remoteAttachments: remoteAttachments,
+                    remoteInterviewFirst: remoteInterviewFirst,
                     validateInitialStart: requirePendingStart
                 )
             }

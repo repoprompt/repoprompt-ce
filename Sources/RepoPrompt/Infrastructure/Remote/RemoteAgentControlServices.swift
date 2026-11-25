@@ -248,6 +248,7 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
                 taskLabelKind: .pair,
                 workflow: workflow,
                 remoteAttachments: attachments,
+                remoteInterviewFirst: request.interviewFirst == true,
                 validateDispatch: authorizeDispatch,
                 workspaceAuthority: .init(
                     target: target, expectedWorkspaceID: workspaceID, allowMatchingControlledSession: false
@@ -519,35 +520,33 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
         else {
             throw RemoteAgentControlServiceError.invalidInteractionID
         }
-        if let reason = AgentModeRemoteSessionQueryService.projectInteraction(
+        let summary = AgentModeRemoteSessionQueryService.projectInteraction(
             interaction,
             createdAt: session.lastActivityAt,
-            supportsPlainApproval: session.pendingApproval?.supportsPlainApprove ?? true
-        )?.responseUnavailableReason {
+            supportsPlainApproval: session.pendingApproval?.supportsPlainApprove ?? true,
+            macOnlyApprovalID: session.pendingWorktreeMergeReview?.id ?? session.pendingPermissionsRequest?.id,
+            requiresLocalUserInput: session.pendingUserInputRequest?.questions.contains(where: \.isLegacyMCPToolApproval) == true
+        )
+        if let reason = summary?.responseUnavailableReason {
             throw RemoteAgentControlServiceError.commandRejected(reason)
         }
-        var answers = request.answers
-        if let secret = request.secret {
-            guard let question = session.pendingUserInputRequest?.questions.first(where: { $0.isSecret }) else {
-                throw RemoteAgentControlServiceError.commandRejected(
-                    "A secret can only be submitted for a pending secure-entry question."
-                )
+        let payload: AgentMCPInteractionResponsePayload
+        if let questionAnswers = request.questionAnswers {
+            guard let questionnaire = summary?.questionnaire,
+                  request.answers.isEmpty, request.secret == nil, request.message == nil, request.decision == nil
+            else {
+                throw RemoteAgentControlServiceError.commandRejected("The pending question does not accept these answers.")
             }
-            // Keep the secret in this one-shot in-memory payload only. It is
-            // never placed in text, logs, snapshots, events, or credentials.
-            answers[question.id] = [secret]
+            payload = try Self.questionResponsePayload(
+                questionAnswers, questionnaire: questionnaire,
+                userInput: interaction.kind == .userInput ? session.pendingUserInputRequest : nil
+            )
+        } else {
+            guard (summary?.questionnaire?.questions.count ?? 0) <= 1 else {
+                throw RemoteAgentControlServiceError.commandRejected("Answer every question before submitting.")
+            }
+            payload = try Self.plainInteractionPayload(request, userInput: session.pendingUserInputRequest)
         }
-        let responseText = request.secret == nil ? request.message ?? request.decision : nil
-        let responseArgument: AgentModeViewModel.MCPInteractionResponsePayload.ResponseArgument =
-            responseText.map(AgentModeViewModel.MCPInteractionResponsePayload.ResponseArgument.scalar) ?? .missing
-        let payload = AgentModeViewModel.MCPInteractionResponsePayload(
-            text: responseText,
-            skip: request.decision?.lowercased() == "skip",
-            explicitSkip: request.decision?.lowercased() == "skip",
-            responseArgument: responseArgument,
-            amendment: nil,
-            answersByQuestionID: answers
-        )
         guard let command = try context.agentMode.runtimeCommand(sessionID: sessionID),
               command.writer.session === session
         else {
@@ -566,6 +565,63 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
             workspaceID: workspaceID(for: context, fallback: request.workspaceID),
             sessionID: sessionID,
             context: context
+        )
+    }
+
+    private static func plainInteractionPayload(
+        _ request: RemoteCommandRequest, userInput: AgentRequestUserInputRequest?
+    ) throws -> AgentMCPInteractionResponsePayload {
+        var answers = request.answers
+        if let secret = request.secret {
+            guard let question = userInput?.questions.first(where: { $0.isSecret }) else {
+                throw RemoteAgentControlServiceError.commandRejected(
+                    "A secret can only be submitted for a pending secure-entry question."
+                )
+            }
+            // Keep the secret in this one-shot in-memory payload only. It is
+            // never placed in text, logs, snapshots, events, or credentials.
+            answers[question.id] = [secret]
+        }
+        let responseText = request.secret == nil ? request.message ?? request.decision : nil
+        let responseArgument: AgentModeViewModel.MCPInteractionResponsePayload.ResponseArgument =
+            responseText.map(AgentModeViewModel.MCPInteractionResponsePayload.ResponseArgument.scalar) ?? .missing
+        return AgentMCPInteractionResponsePayload(
+            text: responseText,
+            skip: request.decision?.lowercased() == "skip",
+            explicitSkip: request.decision?.lowercased() == "skip",
+            responseArgument: responseArgument,
+            amendment: nil,
+            answersByQuestionID: answers
+        )
+    }
+
+    static func questionResponsePayload(
+        _ answers: [String: RemoteQuestionAnswer],
+        questionnaire: RemoteQuestionnaire,
+        userInput: AgentRequestUserInputRequest?
+    ) throws -> AgentMCPInteractionResponsePayload {
+        let invalidAnswer = RemoteAgentControlServiceError.commandRejected("Check your answers and try again.")
+        guard Set(answers.keys) == Set(questionnaire.questions.map(\.id)) else { throw invalidAnswer }
+        var questionDrafts: [String: AgentAskUserAnswer] = [:]
+        var inputDrafts: [String: AgentRequestUserInputQuestionDraft] = [:]
+        for question in questionnaire.questions {
+            guard let answer = answers[question.id], question.accepts(answer) else { throw invalidAnswer }
+            let indices = answer.selectedOptionIndices
+            if userInput != nil {
+                inputDrafts[question.id] = .init(selectedOptionIndex: indices.first, note: answer.normalizedText ?? "")
+            } else {
+                questionDrafts[question.id] = .init(
+                    answers: [],
+                    selectedOptions: indices.map { question.options[$0].label },
+                    customResponse: answer.normalizedText,
+                    skipped: answer.skipped
+                )
+            }
+        }
+        return AgentMCPInteractionResponsePayload(
+            text: nil, skip: false, responseArgument: .missing, amendment: nil,
+            answersByQuestionID: userInput?.buildResponse(from: inputDrafts).answersByQuestionID ?? [:],
+            askUserAnswersByQuestionID: questionDrafts
         )
     }
 

@@ -112,6 +112,89 @@ public enum RemoteInteractionKind: String, Codable, Sendable {
     case secretInput = "secret_input"
 }
 
+public struct RemoteQuestionnaire: Codable, Sendable, Equatable {
+    public let context: String?
+    public let questions: [RemoteQuestionField]
+
+    public init(context: String? = nil, questions: [RemoteQuestionField]) {
+        self.context = context
+        self.questions = questions
+    }
+}
+
+public struct RemoteQuestionField: Codable, Sendable, Equatable, Identifiable {
+    public struct Option: Codable, Sendable, Equatable {
+        public let label: String
+        public let description: String?
+
+        public init(label: String, description: String? = nil) {
+            self.label = label
+            self.description = description
+        }
+    }
+
+    public let id: String
+    public let header: String?
+    public let prompt: String
+    public let context: String?
+    public let options: [Option]
+    public let isSecret: Bool
+    public let allowsMultiple: Bool
+    public let allowsCustom: Bool
+    public let allowsNote: Bool
+    public let allowsSkip: Bool
+
+    public init(
+        id: String, header: String? = nil, prompt: String, context: String? = nil,
+        options: [Option] = [], isSecret: Bool = false, allowsMultiple: Bool = false,
+        allowsCustom: Bool = false, allowsNote: Bool = false, allowsSkip: Bool = false
+    ) {
+        self.id = id
+        self.header = header
+        self.prompt = prompt
+        self.context = context
+        self.options = options
+        self.isSecret = isSecret
+        self.allowsMultiple = allowsMultiple
+        self.allowsCustom = allowsCustom
+        self.allowsNote = allowsNote
+        self.allowsSkip = allowsSkip
+    }
+
+    public func accepts(_ answer: RemoteQuestionAnswer) -> Bool {
+        let indices = answer.selectedOptionIndices
+        let hasText = answer.normalizedText != nil
+        if answer.skipped {
+            return allowsSkip && indices.isEmpty && !hasText
+        }
+        return Set(indices).count == indices.count
+            && indices.allSatisfy(options.indices.contains)
+            && (allowsMultiple || indices.count <= 1)
+            && (!hasText || allowsCustom)
+            && (indices.isEmpty || !hasText || allowsMultiple || allowsNote)
+            && (!indices.isEmpty || hasText)
+    }
+}
+
+/// Transient response data, including masked entries when the pending field is secret.
+/// These values belong only to the respond command and must never be recorded.
+public struct RemoteQuestionAnswer: Codable, Sendable, Equatable {
+    public let selectedOptionIndices: [Int]
+    public let text: String?
+    public let skipped: Bool
+
+    public init(selectedOptionIndices: [Int] = [], text: String? = nil, skipped: Bool = false) {
+        self.selectedOptionIndices = selectedOptionIndices
+        self.text = text
+        self.skipped = skipped
+    }
+
+    public var normalizedText: String? {
+        guard let text = text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { return nil }
+        return text
+    }
+}
+
 /// A pending interaction deliberately contains no answer value. Secret answers are
 /// submitted as one-shot commands and are never part of snapshots, history, or events.
 public struct RemoteInteractionSummary: Codable, Sendable, Equatable {
@@ -122,6 +205,7 @@ public struct RemoteInteractionSummary: Codable, Sendable, Equatable {
     public let requiresSecureEntry: Bool
     public let responseUnavailableReason: String?
     public let createdAt: Date
+    public let questionnaire: RemoteQuestionnaire?
 
     public init(
         id: String,
@@ -130,7 +214,8 @@ public struct RemoteInteractionSummary: Codable, Sendable, Equatable {
         prompt: String? = nil,
         requiresSecureEntry: Bool = false,
         responseUnavailableReason: String? = nil,
-        createdAt: Date = Date()
+        createdAt: Date = Date(),
+        questionnaire: RemoteQuestionnaire? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -139,6 +224,7 @@ public struct RemoteInteractionSummary: Codable, Sendable, Equatable {
         self.requiresSecureEntry = requiresSecureEntry
         self.responseUnavailableReason = responseUnavailableReason
         self.createdAt = createdAt
+        self.questionnaire = questionnaire
     }
 }
 
@@ -1261,10 +1347,12 @@ public struct RemoteCommandRequest: Codable, Sendable, Equatable {
     public let decision: String?
     public let answers: [String: [String]]
     public let secret: String?
+    public let questionAnswers: [String: RemoteQuestionAnswer]?
     public let agentID: String?
     public let modelID: String?
     public let reasoningEffort: String?
     public let workflowID: String?
+    public let interviewFirst: Bool?
     public let contextBuilderResponseType: String?
     public let contextBuilderExportResponse: Bool?
     public let notificationRegistration: RemoteNotificationRegistration?
@@ -1283,10 +1371,12 @@ public struct RemoteCommandRequest: Codable, Sendable, Equatable {
         decision: String? = nil,
         answers: [String: [String]] = [:],
         secret: String? = nil,
+        questionAnswers: [String: RemoteQuestionAnswer]? = nil,
         agentID: String? = nil,
         modelID: String? = nil,
         reasoningEffort: String? = nil,
         workflowID: String? = nil,
+        interviewFirst: Bool? = nil,
         contextBuilderResponseType: String? = nil,
         contextBuilderExportResponse: Bool? = nil,
         notificationRegistration: RemoteNotificationRegistration? = nil,
@@ -1304,10 +1394,12 @@ public struct RemoteCommandRequest: Codable, Sendable, Equatable {
         self.decision = decision
         self.answers = answers
         self.secret = secret
+        self.questionAnswers = questionAnswers
         self.agentID = agentID
         self.modelID = modelID
         self.reasoningEffort = reasoningEffort
         self.workflowID = workflowID
+        self.interviewFirst = interviewFirst
         self.contextBuilderResponseType = contextBuilderResponseType
         self.contextBuilderExportResponse = contextBuilderExportResponse
         self.notificationRegistration = notificationRegistration
