@@ -183,14 +183,15 @@ final class AgentSessionRuntimeHost {
                     approvalPolicyProvider: { permissionProfile.codexApprovalPolicy },
                     sandboxModeProvider: { permissionProfile.codexSandboxMode },
                     approvalReviewerProvider: { permissionProfile.codexApprovalReviewer },
-                    shellToolEnabled: permissionProfile.codexBashToolEnabled(),
+                    shellToolEnabled: permissionProfile == .mcpSafeDefaults ? true : nil,
                     suppressThirdPartyMCPServers: permissionProfile.codexSuppressesThirdPartyMCPServers,
                     capabilitiesProvider: { capabilities },
                     goalSupportEnabledProvider: { CodexGoalSupport.isEnabled },
                     reasoningSummariesEnabledProvider: { CodexReasoningSummaries.isEnabled },
                     memoriesEnabledProvider: { CodexMemories.isEnabled },
                     computerUseEnabledProvider: { computerUseEnabled },
-                    contextWindowSelection: contextWindowSelection
+                    contextWindowSelection: contextWindowSelection,
+                    readsUserConfiguredRequestPermissions: permissionProfile == .userConfigured
                 )
                 return CodexNativeSessionController(
                     client: client,

@@ -360,7 +360,6 @@ final class AgentModeRunService {
             startOutcome?.recordStartFailure(message: message)
             return .completed(nil)
         }
-        let runtimePermission = dependencies.providerRuntimePermissionResolver(selectedAgent, session.permissionProfile)
         let workspacePath: String?
         do {
             workspacePath = try workspace.resolve(bindings: session.worktreeBindings)
@@ -396,6 +395,7 @@ final class AgentModeRunService {
             return .completed(outcome)
         }
 
+        let runtimePermission = dependencies.providerRuntimePermissionResolver(selectedAgent, session.permissionProfile)
         let acpRunRequest = session.acpRunInput.makeRequest(
             workspacePath: workspacePath,
             attachments: attachments,

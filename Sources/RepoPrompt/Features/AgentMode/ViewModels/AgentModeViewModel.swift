@@ -3766,6 +3766,22 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func setupObservers() {
+        if let secureStore = providerBindingService.preferences.securePermissions {
+            NotificationCenter.default.publisher(for: .agentPermissionPresentationDidChange, object: secureStore)
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] _ in
+                    guard let self, let session = activeSession else { return }
+                    let controlsChanged = updatePermissionBindingState(from: session, syncUI: false)
+                    let guidanceChanged = refreshAutoEditPermissionGuidanceForActiveSession(syncUI: false)
+                    if controlsChanged {
+                        syncComposerUIState(tabID: session.tabID)
+                    }
+                    if controlsChanged || guidanceChanged {
+                        ui.statusPills.update(makeStatusPillsSnapshot())
+                    }
+                }
+                .store(in: &cancellables)
+        }
         OracleBackgroundInvocationRegistry.shared.availabilityChanges
             .sink { [weak self] owner in self?.refreshOracleBackgroundCancelTarget(owner: owner) }
             .store(in: &cancellables)

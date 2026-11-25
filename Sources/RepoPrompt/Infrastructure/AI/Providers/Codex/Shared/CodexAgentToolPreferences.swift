@@ -358,6 +358,10 @@ enum CodexAgentToolPreferences {
         return storedMCPServerToggles(defaults: defaults)[key] ?? false
     }
 
+    static func mcpServerEnabled(normalizedName: String, document: SecureCodexPermissionDocument) -> Bool {
+        isRepoPromptServer(normalizedName) || document.mcpServerEnabled(normalizedName: normalizedName)
+    }
+
     static func setMCPServerEnabled(
         normalizedName: String,
         isEnabled: Bool,
@@ -413,6 +417,15 @@ enum CodexAgentToolPreferences {
             }
         }
         return enabled
+    }
+
+    static func enabledMCPServerNames(
+        for entries: [MCPIntegrationHelper.CodexServerEntry],
+        document: SecureCodexPermissionDocument
+    ) -> Set<String> {
+        Set(entries.lazy.filter {
+            mcpServerEnabled(normalizedName: $0.normalizedName, document: document)
+        }.map(\.normalizedName)).union([MCPIntegrationHelper.repoPromptMCPServerName])
     }
 
     private static func storedMCPServerToggles(defaults: UserDefaults) -> [String: Bool] {
