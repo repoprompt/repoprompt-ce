@@ -28,6 +28,7 @@ package final class OpenCodeACPHeadlessAgentProvider: HeadlessAgentProvider {
         workspacePath: String? = nil,
         providerFactory: @escaping ProviderFactory,
         controllerFactory: @escaping ControllerFactory,
+        limitGrace: Duration = .seconds(15),
         selectedModel: @escaping SelectedModel
     ) {
         self.config = config
@@ -66,7 +67,8 @@ package final class OpenCodeACPHeadlessAgentProvider: HeadlessAgentProvider {
                 try parameterReport.validateNoSkippedSelections()
                 try await controller.setSessionMode(config.sessionModeID)
             },
-            approvalPolicy: .declineUnsupported
+            approvalPolicy: .declineUnsupported,
+            openCodeLimitGrace: limitGrace
         )
     }
 

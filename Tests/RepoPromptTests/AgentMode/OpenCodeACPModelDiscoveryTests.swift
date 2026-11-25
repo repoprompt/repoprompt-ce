@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import RepoPromptACPProviders
 import RepoPromptAIContracts
@@ -495,6 +496,117 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
         XCTAssertEqual(sequence.count(where: { $0.method == "session/prompt" }), 1)
     }
 
+    func testHeadlessLimitWithoutPromptReplyFailsAndReapsOpenCode() async throws {
+        try await assertHeadlessPromptLimitFailure(scenario: "halt")
+    }
+
+    func testHeadlessTypedLimitReplyFailsWithoutSurfacingRawProviderMessage() async throws {
+        try await assertHeadlessPromptLimitFailure(scenario: "error-response")
+    }
+
+    func testHeadlessTypedLimitBackoffWithoutProgressEventuallyFails() async throws {
+        try await assertHeadlessPromptLimitFailure(scenario: "retry-stall")
+    }
+
+    func testHeadlessRetryAndPromptProgressClearLimitFailure() async throws {
+        for scenario in ["retry-resumes", "halt-progress", "delayed-halt", "ordinary-long"] {
+            let (provider, pidURL) = try makeHeadlessLivenessProvider(scenario: scenario)
+            let stream = try await provider.streamAgentMessage(AgentMessage(userMessage: "hi"))
+            var stops = 0
+            do {
+                for try await event in stream where event.type == "message_stop" {
+                    stops += 1
+                }
+            } catch {
+                XCTFail("Expected success for \(scenario), got \(error)")
+            }
+            XCTAssertEqual(stops, 1, scenario)
+            try assertHeadlessProcessReaped(at: pidURL)
+        }
+    }
+
+    func testDisposingHeadlessPromptWithPendingLimitCancelsAndReapsOpenCode() async throws {
+        let (provider, pidURL) = try makeHeadlessLivenessProvider(scenario: "cancel")
+        let stream = try await provider.streamAgentMessage(AgentMessage(userMessage: "hi"))
+        let clock = ContinuousClock()
+        let deadline = clock.now + .seconds(8)
+        while !FileManager.default.fileExists(atPath: pidURL.path), clock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        if !FileManager.default.fileExists(atPath: pidURL.path) {
+            await provider.dispose()
+            return XCTFail("The fixture did not receive session/prompt")
+        }
+        await provider.dispose()
+        do {
+            for try await event in stream {
+                XCTAssertNotEqual(event.type, "message_stop")
+            }
+            XCTFail("Expected cancellation to terminate the stream")
+        } catch {
+            XCTAssertTrue(error is CancellationError, "Expected cancellation, got \(error)")
+        }
+        try assertHeadlessProcessReaped(at: pidURL)
+    }
+
+    private func assertHeadlessPromptLimitFailure(scenario: String) async throws {
+        let (provider, pidURL) = try makeHeadlessLivenessProvider(scenario: scenario)
+        let stream = try await provider.streamAgentMessage(AgentMessage(userMessage: "hi"))
+        var stops = 0
+        do {
+            for try await event in stream {
+                XCTAssertFalse(event.text?.contains("private-fixture-body") == true)
+                if event.type == "message_stop" { stops += 1 }
+            }
+            XCTFail("Expected an OpenCode limit failure for \(scenario)")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("OpenCode reached a provider rate limit or quota"), "\(error)")
+            XCTAssertFalse(error.localizedDescription.contains("private-fixture-body"))
+        }
+        XCTAssertEqual(stops, 0)
+        try assertHeadlessProcessReaped(at: pidURL)
+    }
+
+    private func makeHeadlessLivenessProvider(scenario: String) throws -> (OpenCodeACPHeadlessAgentProvider, URL) {
+        let workspace = try makeTestDirectory(name: "OpenCodeACPHeadlessLiveness")
+        let pidURL = workspace.appendingPathComponent("prompt.pid")
+        let scriptURL = workspace.appendingPathComponent("opencode")
+        try Self.headlessPinServerScript.write(to: scriptURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+        let provider = OpenCodeACPHeadlessAgentProvider(
+            config: OpenCodeAgentConfig(
+                includeRepoPromptMCPServer: false,
+                includeManagedConfigOverlay: false,
+                cleanupLegacyPersistentConfig: false,
+                toolProfile: .headless
+            ),
+            workspacePath: workspace.path,
+            providerFactory: { _ in
+                OpenCodeDiscoveryFakeProvider(
+                    commandPath: scriptURL.path,
+                    environment: ["ACP_SCENARIO": scenario, "ACP_PID_PATH": pidURL.path]
+                )
+            },
+            controllerFactory: { provider, request, diagnosticSink in
+                try ACPAgentSessionController(
+                    provider: provider, runRequest: request, diagnosticSink: diagnosticSink,
+                    allowsProviderProcessLaunchForTesting: true
+                )
+            },
+            limitGrace: .milliseconds(400),
+            selectedModel: { _ in nil }
+        )
+        return (provider, pidURL)
+    }
+
+    private func assertHeadlessProcessReaped(at pidURL: URL) throws {
+        let pid = try XCTUnwrap(Int32(String(contentsOf: pidURL, encoding: .utf8)))
+        let probe = kill(pid, 0)
+        let probeError = errno
+        XCTAssertEqual(probe, -1, "OpenCode fixture process survived stream settlement")
+        XCTAssertEqual(probeError, ESRCH)
+    }
+
     private struct RecordedRequest {
         let method: String
         let params: [String: Any]
@@ -758,6 +870,12 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
     import json
     import os
     import sys
+    import time
+    from datetime import datetime, timedelta, timezone
+    from threading import Timer
+
+    scenario = os.environ.get("ACP_SCENARIO")
+    prompt_id = None
 
     model = "ollama-cloud/kimi-k3"
     mode = "repoprompt_headless"
@@ -777,6 +895,71 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
             selector("effort", "Effort", "thought_level", effort, EFFORT_CHOICES),
         ]
 
+    def session_update(update):
+        print(json.dumps({"jsonrpc": "2.0", "method": "session/update",
+                          "params": {"sessionId": "opencode-headless-pin", "update": update}}), flush=True)
+
+    def reply(id, result):
+        print(json.dumps({"jsonrpc": "2.0", "id": id, "result": result}), flush=True)
+
+    def timestamp(offset=0):
+        date = datetime.now(timezone.utc) + timedelta(seconds=offset)
+        return date.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+    def halt(session_id, message="process", logged_at=None):
+        if os.environ.get("OPENCODE_PRINT_LOGS") == "1":
+            print(f"timestamp={logged_at or timestamp()} level=ERROR run=fixture message={json.dumps(message)} "
+                  f'session.id={session_id} error="Rate limit exceeded: private-fixture-body"',
+                  file=sys.stderr, flush=True)
+
+    def retry(delay, invalid=False):
+        session_update({"sessionUpdate": "session_info_update", "_meta": {"opencode/retry": {
+            "attempt": 1, "nextRetryAt": "invalid" if invalid else timestamp(delay),
+            "error": {"type": "provider.rate-limit", "status": 429, "message": "private-fixture-body"}}}})
+
+    def run_prompt(id):
+        if scenario == "error-response":
+            print(json.dumps({"jsonrpc": "2.0", "id": id, "error": {
+                "code": -32603, "message": "private-fixture-body",
+                "data": {"service": "session", "errorName": "provider.quota"}}}), flush=True)
+            return
+        if scenario in ("halt", "halt-progress"):
+            halt("opencode-headless-pin")
+            if scenario == "halt-progress":
+                time.sleep(0.1)
+                session_update({"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "thinking"}})
+                time.sleep(0.65)
+                reply(id, {"stopReason": "end_turn"})
+                return
+        elif scenario == "delayed-halt":
+            session_update({"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "thinking"}})
+            time.sleep(0.1)
+            halt("opencode-headless-pin", logged_at=timestamp(-2))
+            time.sleep(0.65)
+            reply(id, {"stopReason": "end_turn"})
+            return
+        elif scenario in ("retry-resumes", "retry-stall", "cancel"):
+            retry(1.1 if scenario != "cancel" else 10)
+            if scenario == "retry-stall":
+                retry(0, invalid=True)
+            if scenario == "retry-resumes":
+                time.sleep(0.75)
+                session_update({"sessionUpdate": "session_info_update", "_meta": {"opencode/retry": None}})
+                time.sleep(0.95)
+                reply(id, {"stopReason": "end_turn"})
+                return
+        elif scenario == "ordinary-long":
+            halt("opencode-headless-pin", "stream error")
+            halt("unrelated-session")
+            time.sleep(0.65)
+            reply(id, {"stopReason": "end_turn"})
+            return
+        # Failure-path regression guard. If the watchdog never fires, return an
+        # ordinary response so XCTest fails instead of waiting indefinitely.
+        timer = Timer(8, reply, args=(id, {"stopReason": "end_turn"}))
+        timer.daemon = True
+        timer.start()
+
     for line in sys.stdin:
         request = json.loads(line)
         record_path = os.environ.get("ACP_RECORD_PATH")
@@ -784,9 +967,11 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
             with open(record_path, "a") as record:
                 record.write(json.dumps(request) + "\n")
         request_id = request.get("id")
-        if request_id is None:
-            continue
         method = request.get("method")
+        if request_id is None:
+            if scenario in ("halt", "cancel") and method == "session/cancel" and prompt_id is not None:
+                reply(prompt_id, {"stopReason": "end_turn"})
+            continue
         params = request.get("params", {})
         if method == "initialize":
             result = {"agentCapabilities": {}}
@@ -803,6 +988,17 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
                 effort = params.get("value", effort)
             result = {"configOptions": options()}
         elif method == "session/prompt":
+            if scenario:
+                prompt_id = request_id
+                if scenario == "cancel":
+                    run_prompt(request_id)
+                pid_path = os.environ["ACP_PID_PATH"]
+                with open(pid_path + ".new", "w") as pid_file:
+                    pid_file.write(str(os.getpid()))
+                os.replace(pid_path + ".new", pid_path)
+                if scenario != "cancel":
+                    run_prompt(request_id)
+                continue
             print(json.dumps({"jsonrpc": "2.0", "method": "session/update",
                               "params": {"sessionId": "opencode-headless-pin", "update": {
                                   "sessionUpdate": "agent_message_chunk",
