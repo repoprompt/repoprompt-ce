@@ -61,6 +61,7 @@ public struct RemoteIrohPairingAdvertisement: Codable, Sendable, Equatable {
     public let alpn: String
     public let oneTimeSecret: String
     public let expiresAt: Date
+    public let requiresPairingConfirmation: Bool?
 
     public init(
         protocolVersion: Int = RemoteProtocol.currentVersion,
@@ -68,7 +69,8 @@ public struct RemoteIrohPairingAdvertisement: Codable, Sendable, Equatable {
         server: RemoteIrohEndpointAddress,
         alpn: String = RemoteProtocol.irohALPN,
         oneTimeSecret: String,
-        expiresAt: Date
+        expiresAt: Date,
+        requiresPairingConfirmation: Bool? = nil
     ) {
         self.protocolVersion = protocolVersion
         self.desktopInstanceID = desktopInstanceID
@@ -76,6 +78,7 @@ public struct RemoteIrohPairingAdvertisement: Codable, Sendable, Equatable {
         self.alpn = alpn
         self.oneTimeSecret = oneTimeSecret
         self.expiresAt = expiresAt
+        self.requiresPairingConfirmation = requiresPairingConfirmation
     }
 }
 
@@ -86,6 +89,7 @@ public struct RemoteIrohPairingRequest: Codable, Sendable, Equatable {
     public let clientEndpointID: String
     public let oneTimeSecret: String
     public let deviceName: String
+    public let attemptID: UUID?
 
     public init(
         protocolVersion: Int = RemoteProtocol.currentVersion,
@@ -93,7 +97,8 @@ public struct RemoteIrohPairingRequest: Codable, Sendable, Equatable {
         expectedServerEndpointID: String,
         clientEndpointID: String,
         oneTimeSecret: String,
-        deviceName: String
+        deviceName: String,
+        attemptID: UUID? = nil
     ) {
         self.protocolVersion = protocolVersion
         self.desktopInstanceID = desktopInstanceID
@@ -101,20 +106,24 @@ public struct RemoteIrohPairingRequest: Codable, Sendable, Equatable {
         self.clientEndpointID = clientEndpointID
         self.oneTimeSecret = oneTimeSecret
         self.deviceName = deviceName
+        self.attemptID = attemptID
     }
 }
 
 public struct RemoteIrohPairingResponse: Codable, Sendable, Equatable {
     public let pairingResponse: RemotePairingResponse
+    public let attemptID: UUID?
     public let serverEndpointID: String
     public let clientEndpointID: String
 
     public init(
         pairingResponse: RemotePairingResponse,
         serverEndpointID: String,
-        clientEndpointID: String
+        clientEndpointID: String,
+        attemptID: UUID? = nil
     ) {
         self.pairingResponse = pairingResponse
+        self.attemptID = attemptID
         self.serverEndpointID = serverEndpointID
         self.clientEndpointID = clientEndpointID
     }

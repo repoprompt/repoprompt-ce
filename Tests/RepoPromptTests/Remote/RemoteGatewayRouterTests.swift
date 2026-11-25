@@ -1,11 +1,11 @@
 import Foundation
 import MCP
 import RepoPromptAIContracts
-import RepoPromptDomainRuntime
-import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import RepoPromptRemoteProtocol
 import RepoPromptSecureStorage
+import RepoPromptSettingsCore
 import XCTest
 
 @MainActor
@@ -488,164 +488,225 @@ final class RemoteIrohSecurityTests: XCTestCase {
         XCTAssertEqual(Data(base64URL: issued.oneTimeSecret)?.count, 32)
     }
 
-    func testPairingSecretExpiresAndIsSingleUse() throws {
+    func testIssuedCodeCanBeUsedAfterMacRestartsBeforePrepare() throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 1800))
+        var disk = RemoteStoredPairingState()
+        let firstMac = makeManager(clock: clock) { disk = $0 }
+        let server = RemoteIrohEndpointAddress(endpointID: endpointID("a"))
+        let issued = try firstMac.issueAdvertisement(server: server)
+        let reopened = makeManager(clock: clock, storedState: disk)
+        XCTAssertEqual(reopened.restoreAdvertisement(server: server), issued)
+        _ = try prepare(pairingRequest(secret: issued.oneTimeSecret), on: reopened)
+        XCTAssertFalse(reopened.isPaired)
+    }
+
+    func testLostCredentialReplyCanResumeAfterMacRestart() throws {
         let clock = TestClock(Date(timeIntervalSince1970: 2000))
-        var persisted: [RemoteStoredDeviceCredential?] = []
-        let manager = makeManager(clock: clock) { persisted.append($0) }
-        let advertisement = try manager.issueAdvertisement(server: .init(endpointID: endpointID("a")))
-        clock.date = advertisement.expiresAt.addingTimeInterval(1)
+        var disk = RemoteStoredPairingState()
+        let firstMac = makeManager(clock: clock) { disk = $0 }
+        let issued = try firstMac.issueAdvertisement(server: .init(endpointID: endpointID("a")))
+        XCTAssertEqual(issued.requiresPairingConfirmation, true)
+        let request = pairingRequest(secret: issued.oneTimeSecret)
+        let droppedResponse = try prepare(request, on: firstMac)
+        XCTAssertFalse(firstMac.isPaired)
+        XCTAssertFalse(isAuthorized(droppedResponse, on: firstMac))
+        XCTAssertNil(disk.active)
+        XCTAssertEqual(disk.pending?.attemptID, request.attemptID)
 
-        XCTAssertThrowsError(try manager.pairIroh(
-            request: pairingRequest(secret: advertisement.oneTimeSecret),
-            authenticatedPeerEndpointID: endpointID("b"),
-            serverEndpointID: endpointID("a"),
-            desktop: desktopSummary()
-        )) { error in
-            guard case RemoteGatewaySecurityError.pairingSecretExpired = error else {
-                return XCTFail("Expected pairingSecretExpired, got \(error)")
-            }
-        }
-        XCTAssertTrue(persisted.isEmpty)
-
-        XCTAssertThrowsError(try manager.pairIroh(
-            request: pairingRequest(secret: advertisement.oneTimeSecret),
-            authenticatedPeerEndpointID: endpointID("b"),
-            serverEndpointID: endpointID("a"),
-            desktop: desktopSummary()
-        )) { error in
-            guard case RemoteGatewaySecurityError.pairingSecretInvalid = error else {
-                return XCTFail("Expected pairingSecretInvalid, got \(error)")
-            }
-        }
-    }
-
-    func testPairingReplayFailsEvenWhenCredentialPersistenceFails() throws {
-        let clock = TestClock(Date(timeIntervalSince1970: 3000))
-        let manager = makeManager(clock: clock) { _ in throw PersistenceFailure.failed }
-        let advertisement = try manager.issueAdvertisement(server: .init(endpointID: endpointID("a")))
-        let request = pairingRequest(secret: advertisement.oneTimeSecret)
-
-        XCTAssertThrowsError(try manager.pairIroh(request: request, authenticatedPeerEndpointID: endpointID("b"), serverEndpointID: endpointID("a"), desktop: desktopSummary())) { error in
-            XCTAssertTrue(error is PersistenceFailure)
-        }
-        XCTAssertThrowsError(try manager.pairIroh(request: request, authenticatedPeerEndpointID: endpointID("b"), serverEndpointID: endpointID("a"), desktop: desktopSummary())) { error in
-            guard case RemoteGatewaySecurityError.pairingSecretInvalid = error else {
-                return XCTFail("Expected consumed secret rejection, got \(error)")
-            }
-        }
-    }
-
-    func testFreshValidIrohPairingReplacesStaleOneDeviceRecord() throws {
-        let clock = TestClock(Date(timeIntervalSince1970: 3500))
-        let stale = RemoteStoredDeviceCredential(
-            deviceID: "stale-device",
-            credential: "stale-credential",
-            expiresAt: clock.date.addingTimeInterval(3600),
-            deviceName: "Old phone",
-            irohPeerEndpointID: endpointID("b")
-        )
-        var persisted: RemoteStoredDeviceCredential? = nil
-        let manager = makeManager(clock: clock, storedDevice: stale) { persisted = $0 }
-        let serverID = endpointID("a")
-        let replacementClientID = endpointID("c")
-        let issued = try manager.issueAdvertisement(server: RemoteIrohEndpointAddress(endpointID: serverID))
-
-        let response = try manager.pairIroh(
-            request: RemoteIrohPairingRequest(
-                desktopInstanceID: "desktop",
-                expectedServerEndpointID: serverID,
-                clientEndpointID: replacementClientID,
-                oneTimeSecret: issued.oneTimeSecret,
-                deviceName: "Replacement phone"
-            ),
-            authenticatedPeerEndpointID: replacementClientID,
-            serverEndpointID: serverID,
-            desktop: desktopSummary()
-        )
-
-        XCTAssertNotEqual(response.pairingResponse.deviceID, stale.deviceID)
-        XCTAssertEqual(persisted?.deviceID, response.pairingResponse.deviceID)
-        XCTAssertEqual(persisted?.irohPeerEndpointID, replacementClientID)
-        XCTAssertFalse(manager.isAuthorizedIroh(
-            authorizationHeader: "Bearer \(stale.credential)",
-            deviceID: stale.deviceID,
-            authenticatedPeerEndpointID: stale.irohPeerEndpointID
-        ))
-        XCTAssertTrue(manager.isAuthorizedIroh(
-            authorizationHeader: "Bearer \(response.pairingResponse.credential)",
-            deviceID: response.pairingResponse.deviceID,
-            authenticatedPeerEndpointID: replacementClientID
-        ))
-    }
-
-    func testIrohPairingAuthenticatesBothEndpointBindingsBeforeConsumingSecret() throws {
-        let clock = TestClock(Date(timeIntervalSince1970: 4000))
-        var persisted: RemoteStoredDeviceCredential? = nil
-        let manager = makeManager(clock: clock) { persisted = $0 }
-        let serverID = endpointID("a")
-        let clientID = endpointID("b")
-        let issued = try manager.issueAdvertisement(server: RemoteIrohEndpointAddress(endpointID: serverID))
-        let request = RemoteIrohPairingRequest(
+        let restoredState = try RemoteStoredPairingState.decode(JSONEncoder().encode(disk))
+        let reopenedMac = makeManager(clock: clock, storedState: restoredState) { disk = $0 }
+        XCTAssertThrowsError(try prepare(pairingRequest(secret: issued.oneTimeSecret), on: reopenedMac))
+        let competingPeer = RemoteIrohPairingRequest(
             desktopInstanceID: "desktop",
-            expectedServerEndpointID: serverID,
-            clientEndpointID: clientID,
+            expectedServerEndpointID: endpointID("a"),
+            clientEndpointID: endpointID("c"),
             oneTimeSecret: issued.oneTimeSecret,
-            deviceName: "Phone"
+            deviceName: "Other phone",
+            attemptID: request.attemptID
         )
+        XCTAssertThrowsError(try prepare(competingPeer, on: reopenedMac, peer: endpointID("c")))
+        XCTAssertEqual(try prepare(request, on: reopenedMac), droppedResponse)
+        XCTAssertFalse(reopenedMac.isPaired)
+        XCTAssertFalse(isAuthorized(droppedResponse, on: reopenedMac))
+    }
 
-        XCTAssertThrowsError(try manager.pairIroh(
-            request: request,
-            authenticatedPeerEndpointID: endpointID("c"),
-            serverEndpointID: serverID,
-            desktop: desktopSummary()
-        )) { error in
-            guard case RemoteGatewaySecurityError.endpointBindingInvalid = error else {
-                return XCTFail("Expected endpointBindingInvalid, got \(error)")
+    func testLostFinalAcknowledgementReturnsTheSameResultAfterMacRestart() throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 3000))
+        var disk = RemoteStoredPairingState()
+        let manager = makeManager(clock: clock) { disk = $0 }
+        let advertised = try manager.issueAdvertisement(server: .init(endpointID: endpointID("a")))
+        let response = try prepare(pairingRequest(secret: advertised.oneTimeSecret), on: manager)
+        let confirmation = try confirmation(for: response)
+
+        XCTAssertThrowsError(try confirm(confirmation, on: manager, peer: endpointID("c")))
+        XCTAssertFalse(manager.isPaired)
+        XCTAssertTrue(try confirm(confirmation, on: manager))
+        XCTAssertTrue(manager.isPaired)
+        XCTAssertTrue(isAuthorized(response, on: manager))
+        let committed = disk
+        XCTAssertNil(committed.pending)
+
+        clock.date = clock.date.addingTimeInterval(2)
+        let reopenedMac = makeManager(clock: clock, storedState: committed) { _ in
+            XCTFail("Confirm retry must not write or renew a credential")
+        }
+        XCTAssertThrowsError(try confirm(confirmation, on: reopenedMac, peer: endpointID("c")))
+        XCTAssertFalse(try confirm(confirmation, on: reopenedMac))
+        XCTAssertTrue(isAuthorized(response, on: reopenedMac))
+    }
+
+    func testFailedPhoneSaveLeavesOnlyAnExpiringAttemptAndAllowsNewCode() throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 3500))
+        let manager = makeManager(clock: clock)
+        let issued = try manager.issueAdvertisement(server: .init(endpointID: endpointID("a")))
+        let request = pairingRequest(secret: issued.oneTimeSecret)
+        let response = try prepare(request, on: manager)
+        // The phone Keychain save fails and the app stops before submitting a confirmation.
+        XCTAssertEqual(manager.status, .pending(deviceName: "Phone", expiresAt: clock.date.addingTimeInterval(300)))
+        XCTAssertFalse(manager.isPaired)
+        XCTAssertFalse(isAuthorized(response, on: manager))
+        clock.date = clock.date.addingTimeInterval(301)
+        XCTAssertEqual(manager.status, .attemptExpired)
+        XCTAssertThrowsError(try confirm(confirmation(for: response), on: manager))
+        let replacement = try manager.issueAdvertisement(server: .init(endpointID: endpointID("a")))
+        XCTAssertThrowsError(try confirm(confirmation(for: response), on: manager))
+        let next = try prepare(pairingRequest(secret: replacement.oneTimeSecret), on: manager)
+        XCTAssertNotEqual(next.pairingResponse.deviceID, response.pairingResponse.deviceID)
+        XCTAssertFalse(manager.isPaired)
+    }
+
+    func testPrepareAndConfirmationRemainRetryableAfterDesktopStorageFailure() throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 4000))
+        var shouldFail = false
+        var disk = RemoteStoredPairingState()
+        let manager = makeManager(clock: clock) {
+            if shouldFail {
+                throw PersistenceFailure.failed
+            }
+            disk = $0
+        }
+        let issued = try manager.issueAdvertisement(server: .init(endpointID: endpointID("a")))
+        let request = pairingRequest(secret: issued.oneTimeSecret)
+        let initial = disk
+        shouldFail = true
+        XCTAssertThrowsError(try prepare(request, on: manager))
+        XCTAssertEqual(disk, initial)
+        shouldFail = false
+        let receipt = try prepare(request, on: manager)
+        let confirmation = try confirmation(for: receipt)
+        shouldFail = true
+        XCTAssertThrowsError(try confirm(confirmation, on: manager))
+        XCTAssertNil(disk.active)
+        XCTAssertFalse(isAuthorized(receipt, on: manager))
+        shouldFail = false
+        XCTAssertTrue(try confirm(confirmation, on: manager))
+        XCTAssertTrue(manager.isPaired)
+    }
+
+    func testExpiredQRAndLegacyPrepareCannotActivateNewDevice() throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 4600))
+        let manager = makeManager(clock: clock)
+        let issued = try manager.issueAdvertisement(server: .init(endpointID: endpointID("a")))
+        let legacy = pairingRequest(secret: issued.oneTimeSecret, attemptID: nil)
+        XCTAssertThrowsError(try prepare(legacy, on: manager)) { error in
+            guard case RemoteGatewaySecurityError.confirmationRequired = error else {
+                return XCTFail("Expected legacy pairing to require an app update")
             }
         }
+        clock.date = issued.expiresAt
+        XCTAssertEqual(manager.status, .codeExpired)
+        XCTAssertThrowsError(try prepare(pairingRequest(secret: issued.oneTimeSecret), on: manager))
+        XCTAssertFalse(manager.isPaired)
+    }
 
-        let response = try manager.pairIroh(
-            request: request,
-            authenticatedPeerEndpointID: clientID,
-            serverEndpointID: serverID,
-            desktop: desktopSummary()
+    func testExpiredActiveCredentialAllowsReplacementAndLegacyStorageLoads() throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 5000))
+        let legacy = RemoteStoredDeviceCredential(
+            deviceID: "old-phone", credential: "legacy-bearer", expiresAt: clock.date.addingTimeInterval(60),
+            deviceName: "Old phone", irohPeerEndpointID: endpointID("b")
         )
-        XCTAssertEqual(response.serverEndpointID, serverID)
-        XCTAssertEqual(response.clientEndpointID, clientID)
-        XCTAssertEqual(persisted?.irohPeerEndpointID, clientID)
-        XCTAssertTrue(manager.isAuthorizedIroh(
-            authorizationHeader: "Bearer \(response.pairingResponse.credential)",
-            deviceID: response.pairingResponse.deviceID,
-            authenticatedPeerEndpointID: clientID
-        ))
-
-        XCTAssertThrowsError(try manager.pairIroh(
-            request: request,
-            authenticatedPeerEndpointID: clientID,
-            serverEndpointID: serverID,
-            desktop: desktopSummary()
-        ))
+        let decoded = try RemoteStoredPairingState.decode(JSONEncoder().encode(legacy))
+        let manager = makeManager(clock: clock, storedState: decoded)
+        XCTAssertTrue(manager.isPaired)
+        XCTAssertThrowsError(try manager.issueAdvertisement(server: .init(endpointID: endpointID("a"))))
+        clock.date = legacy.expiresAt
+        XCTAssertEqual(manager.status, .credentialExpired)
+        let issued = try manager.issueAdvertisement(server: .init(endpointID: endpointID("a")))
+        let receipt = try prepare(pairingRequest(secret: issued.oneTimeSecret), on: manager)
+        XCTAssertFalse(manager.isPaired)
+        XCTAssertTrue(try confirm(confirmation(for: receipt), on: manager))
     }
 
     func testPersistedPairingFieldsAreBoundedAndEndpointIDsAreCanonical() throws {
         let clock = TestClock(Date(timeIntervalSince1970: 6500))
-        var persisted: RemoteStoredDeviceCredential?
-        let manager = makeManager(clock: clock) { persisted = $0 }
+        var disk = RemoteStoredPairingState()
+        let manager = makeManager(clock: clock) { disk = $0 }
         let advertisement = try manager.issueAdvertisement(server: .init(endpointID: endpointID("a")))
         let request = pairingRequest(secret: advertisement.oneTimeSecret, deviceName: String(repeating: "📱", count: 512))
-        XCTAssertThrowsError(try manager.pairIroh(
-            request: request,
-            authenticatedPeerEndpointID: "invalid-endpoint",
-            serverEndpointID: endpointID("a"),
-            desktop: desktopSummary()
-        ))
-        _ = try manager.pairIroh(
-            request: request,
-            authenticatedPeerEndpointID: endpointID("b"),
-            serverEndpointID: endpointID("a"),
-            desktop: desktopSummary()
+        XCTAssertThrowsError(try prepare(request, on: manager, peer: "invalid-endpoint"))
+        _ = try prepare(request, on: manager)
+        XCTAssertEqual(disk.pending?.credential.deviceName.count, RemotePairingManager.maximumDeviceNameCharacters)
+    }
+
+    func testFailedFirstSyncDoesNotReportConnected() throws {
+        let now = Date(timeIntervalSince1970: 6750)
+        var firstConnection = RemoteIrohGatewayAdapter.SyncState(sessionID: UUID())
+        firstConnection.recordActivity(at: now)
+        XCTAssertEqual(firstConnection.readiness(at: now), .syncing)
+        let lostSnapshotTicket = try XCTUnwrap(firstConnection.issueTicket())
+        XCTAssertEqual(firstConnection.readiness(at: now), .syncing)
+
+        var reconnect = RemoteIrohGatewayAdapter.SyncState(sessionID: UUID())
+        let newTicket = try XCTUnwrap(reconnect.issueTicket())
+        XCTAssertFalse(reconnect.confirm(lostSnapshotTicket, at: now))
+        XCTAssertEqual(reconnect.readiness(at: now), .offline)
+        XCTAssertTrue(reconnect.confirm(newTicket, at: now))
+        XCTAssertTrue(reconnect.confirm(newTicket, at: now))
+        XCTAssertEqual(reconnect.readiness(at: now), .connected)
+        XCTAssertEqual(reconnect.readiness(at: now.addingTimeInterval(26)), .offline)
+    }
+
+    func testLegacyPhoneShowsActivityWithoutClaimingConfirmedSync() {
+        let now = Date(timeIntervalSince1970: 6800)
+        var legacy = RemoteIrohGatewayAdapter.SyncState(sessionID: nil)
+        legacy.recordActivity(at: now)
+        XCTAssertEqual(legacy.readiness(at: now), .legacyActive)
+        XCTAssertNil(legacy.issueTicket())
+        XCTAssertFalse(legacy.confirm(UUID(), at: now))
+        XCTAssertEqual(legacy.readiness(at: now.addingTimeInterval(26)), .offline)
+    }
+
+    func testCorruptStorageCanBeResetAfterDurableWrite() throws {
+        var disk: Data? = Data("damaged".utf8)
+        var failWrites = true
+        let manager = RemotePairingManager(
+            desktopInstanceID: "desktop", now: Date.init, randomBytes: { Data(repeating: 43, count: $0) },
+            reloadStoredState: { try disk.map(RemoteStoredPairingState.decode) ?? .init() },
+            persistState: { state in
+                if failWrites {
+                    throw PersistenceFailure.failed
+                }
+                disk = try JSONEncoder().encode(state)
+            }
         )
-        XCTAssertEqual(persisted?.deviceName.count, RemotePairingManager.maximumDeviceNameCharacters)
+        XCTAssertEqual(manager.status, .storageUnreadable)
+        XCTAssertThrowsError(try manager.resetUnreadableStorage())
+        XCTAssertEqual(manager.status, .storageUnreadable)
+        failWrites = false
+        try manager.resetUnreadableStorage()
+        manager.retryStorageRead()
+        XCTAssertEqual(manager.status, .idle)
+        XCTAssertNoThrow(try manager.issueAdvertisement(server: .init(endpointID: endpointID("a"))))
+    }
+
+    func testTemporaryKeychainFailureCannotResetPairing() {
+        let manager = RemotePairingManager(
+            desktopInstanceID: "desktop", now: Date.init, randomBytes: { Data(repeating: 43, count: $0) },
+            reloadStoredState: { throw PersistenceFailure.failed },
+            persistState: { _ in XCTFail("An inaccessible Keychain item must not be replaced") }
+        )
+        XCTAssertEqual(manager.status, .storageUnavailable)
+        XCTAssertThrowsError(try manager.resetUnreadableStorage())
     }
 
     func testRevokedCredentialStaysUnavailableAfterReopeningStorage() throws {
@@ -663,6 +724,43 @@ final class RemoteIrohSecurityTests: XCTestCase {
         XCTAssertEqual(try reopened.read(.remotePairedDevice), replacement)
     }
 
+    func testUnpairAllowsSamePhoneToConfirmFreshPairingAfterRestart() throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 6800))
+        let server = RemoteIrohEndpointAddress(endpointID: endpointID("a"))
+        var disk = RemoteStoredPairingState()
+        var nextByte: UInt8 = 0
+        let randomBytes: (Int) -> Data = { count in
+            nextByte += 1
+            return Data(repeating: nextByte, count: count)
+        }
+        let manager = makeManager(clock: clock, randomBytes: randomBytes) { disk = $0 }
+        let oldCode = try manager.issueAdvertisement(server: server)
+        let oldRequest = pairingRequest(secret: oldCode.oneTimeSecret)
+        let oldResponse = try prepare(oldRequest, on: manager)
+        let oldConfirmation = try confirmation(for: oldResponse)
+        XCTAssertTrue(try confirm(oldConfirmation, on: manager))
+        XCTAssertTrue(isAuthorized(oldResponse, on: manager))
+
+        try manager.revokeDevice()
+        XCTAssertEqual(manager.status, .idle)
+        XCTAssertFalse(isAuthorized(oldResponse, on: manager))
+
+        let restoredState = try RemoteStoredPairingState.decode(JSONEncoder().encode(disk))
+        let reopened = makeManager(clock: clock, storedState: restoredState, randomBytes: randomBytes) { disk = $0 }
+        XCTAssertEqual(reopened.status, .idle)
+        let newCode = try reopened.issueAdvertisement(server: server)
+        XCTAssertNotEqual(newCode.oneTimeSecret, oldCode.oneTimeSecret)
+        XCTAssertThrowsError(try prepare(oldRequest, on: reopened))
+
+        let replacement = try prepare(pairingRequest(secret: newCode.oneTimeSecret), on: reopened)
+        XCTAssertEqual(replacement.clientEndpointID, oldResponse.clientEndpointID)
+        XCTAssertThrowsError(try confirm(oldConfirmation, on: reopened))
+        XCTAssertFalse(isAuthorized(replacement, on: reopened))
+        XCTAssertTrue(try confirm(confirmation(for: replacement), on: reopened))
+        XCTAssertTrue(isAuthorized(replacement, on: reopened))
+        XCTAssertFalse(isAuthorized(oldResponse, on: reopened))
+    }
+
     func testFailedDurableRevocationRetainsPairedAuthorizationState() {
         let clock = TestClock(Date(timeIntervalSince1970: 7000))
         let stored = RemoteStoredDeviceCredential(
@@ -672,7 +770,7 @@ final class RemoteIrohSecurityTests: XCTestCase {
             deviceName: "Phone",
             irohPeerEndpointID: endpointID("a")
         )
-        let manager = makeManager(clock: clock, storedDevice: stored) { _ in
+        let manager = makeManager(clock: clock, storedState: .init(active: stored)) { _ in
             throw PersistenceFailure.failed
         }
 
@@ -728,25 +826,66 @@ final class RemoteIrohSecurityTests: XCTestCase {
 
     private func makeManager(
         clock: TestClock,
-        storedDevice: RemoteStoredDeviceCredential? = nil,
-        persist: @escaping (RemoteStoredDeviceCredential?) throws -> Void = { _ in }
+        storedState: RemoteStoredPairingState = .init(),
+        randomBytes: @escaping (Int) -> Data = { count in Data(repeating: UInt8(count), count: count) },
+        persist: @escaping (RemoteStoredPairingState) throws -> Void = { _ in }
     ) -> RemotePairingManager {
         RemotePairingManager(
             desktopInstanceID: "desktop",
-            storedDevice: storedDevice,
+            storedState: storedState,
             now: { clock.date },
-            randomBytes: { count in Data(repeating: UInt8(count), count: count) },
-            persistStoredDevice: persist
+            randomBytes: randomBytes,
+            persistState: persist
         )
     }
 
-    private func pairingRequest(secret: String, deviceName: String = "Phone") -> RemoteIrohPairingRequest {
+    private func pairingRequest(
+        secret: String, deviceName: String = "Phone", attemptID: UUID? = UUID()
+    ) -> RemoteIrohPairingRequest {
         RemoteIrohPairingRequest(
             desktopInstanceID: "desktop",
             expectedServerEndpointID: endpointID("a"),
             clientEndpointID: endpointID("b"),
             oneTimeSecret: secret,
-            deviceName: deviceName
+            deviceName: deviceName,
+            attemptID: attemptID
+        )
+    }
+
+    private func prepare(
+        _ request: RemoteIrohPairingRequest, on manager: RemotePairingManager, peer: String? = nil
+    ) throws -> RemoteIrohPairingResponse {
+        try manager.pairIroh(
+            request: request, authenticatedPeerEndpointID: peer ?? endpointID("b"),
+            serverEndpointID: endpointID("a"), desktop: desktopSummary()
+        )
+    }
+
+    private func confirmation(for response: RemoteIrohPairingResponse) throws -> RemotePairingConfirmation {
+        try RemotePairingConfirmation(
+            attemptID: XCTUnwrap(response.attemptID),
+            authentication: .init(
+                desktopInstanceID: "desktop",
+                expectedServerEndpointID: response.serverEndpointID,
+                deviceID: response.pairingResponse.deviceID,
+                credential: response.pairingResponse.credential
+            )
+        )
+    }
+
+    private func confirm(
+        _ confirmation: RemotePairingConfirmation, on manager: RemotePairingManager, peer: String? = nil
+    ) throws -> Bool {
+        try manager.confirmIroh(
+            confirmation, authenticatedPeerEndpointID: peer ?? endpointID("b"), serverEndpointID: endpointID("a")
+        )
+    }
+
+    private func isAuthorized(_ response: RemoteIrohPairingResponse, on manager: RemotePairingManager) -> Bool {
+        manager.isAuthorizedIroh(
+            authorizationHeader: "Bearer \(response.pairingResponse.credential)",
+            deviceID: response.pairingResponse.deviceID,
+            authenticatedPeerEndpointID: response.clientEndpointID
         )
     }
 

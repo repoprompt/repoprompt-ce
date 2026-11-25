@@ -160,11 +160,12 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: |
+            .build/checkouts
             .build/repositories
             Packages/RepoPromptAgentProviders/.build
-          # Restore root Git mirrors only. SwiftPM must create the workspace state,
-          # checkouts and installed binary targets together in each scratch directory.
-          key: support-${{ steps.support-toolchain.outputs.key }}
+          # Resolve a fresh root workspace so SwiftPM discovers the artifacts
+          # available on this runner. Keep dependency mirrors and provider output.
+          key: support-repositories-v1-${{ steps.support-toolchain.outputs.key }}
 
       - name: Invalidate cached admission evidence before any build or selftest
         id: invalidate-cached-admission-evidence-before-any-build-or-selftest
@@ -175,14 +176,25 @@ jobs:
         id: binaries-cache
         uses: actions/cache/restore@v6
         with:
-          path: ~/Library/Caches/org.swift.swiftpm/artifacts
-          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-downloads-v2-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/*/Package.swift', 'Packages/*/Package.resolved', 'Vendor/*/Package.swift') }}
+          path: |
+            .build/artifacts
+            .build/swiftbuild/artifacts
+            Packages/RepoPromptAgentProviders/.build/artifacts
+            ~/Library/Caches/org.swift.swiftpm/artifacts
+          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-binaries-v2-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/RepoPromptAgentProviders/Package.swift', 'Packages/RepoPromptAgentProviders/Package.resolved', 'Packages/RepoPromptIrohTransport/Package.swift') }}
 
       - name: Resolve dependency downloads with bounded retries
         id: resolve-dependency-downloads-with-bounded-retries
         run: |
           python3 Scripts/ci_resolve_packages.py
           python3 Scripts/ci_resolve_packages.py --scratch-path .build/swiftbuild
+          for scratch in .build .build/swiftbuild; do
+            plist="$scratch/artifacts/repopromptirohtransport/IrohTransportFFI/IrohTransportFFI.xcframework/Info.plist"
+            if [[ ! -s "$plist" ]]; then
+              echo "::error::SwiftPM resolution did not materialize $plist"
+              exit 1
+            fi
+          done
           python3 Scripts/ci_resolve_packages.py --root Packages/RepoPromptAgentProviders
 
       - name: Verify macOS process supervision and platform tooling
@@ -339,7 +351,11 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.binaries-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
-          path: ~/Library/Caches/org.swift.swiftpm/artifacts
+          path: |
+            .build/artifacts
+            .build/swiftbuild/artifacts
+            Packages/RepoPromptAgentProviders/.build/artifacts
+            ~/Library/Caches/org.swift.swiftpm/artifacts
           key: ${{ steps.binaries-cache.outputs.cache-primary-key }}
 
       # One compatible main seed; PRs restore only. Root products/receipts are
@@ -350,6 +366,7 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: |
+            .build/checkouts
             .build/repositories
             Packages/RepoPromptAgentProviders/.build
           key: ${{ steps.rootbundles-cache.outputs.cache-primary-key }}
