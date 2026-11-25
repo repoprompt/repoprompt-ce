@@ -1882,6 +1882,54 @@ final class MCPReadMutationPathContractTests: XCTestCase {
             XCTAssertEqual(try String(contentsOf: targetURL, encoding: .utf8), "recreated\n")
         }
 
+        func testExactMaterializationWaitsForSuccessorCleanupBeforePublishing() async throws {
+            let rootURL = try makeTemporaryDirectory(name: "ChainedCodemapCleanup")
+            let targetURL = rootURL.appendingPathComponent("Target.swift")
+            try write("Target.swift\n", to: rootURL.appendingPathComponent(".repo_ignore"))
+            try write("target\n", to: targetURL)
+            let store = WorkspaceFileContextStore()
+            let root = try await store.loadRoot(path: rootURL.path)
+            let namespace = await WorkspaceExactFileNamespace.identity(
+                roots: store.rootRefs(scope: .visibleWorkspace)
+            )
+            let first = MCPPathContractReleaseGate(name: "first CodeMap cleanup")
+            let successor = MCPPathContractReleaseGate(name: "successor CodeMap cleanup")
+            addTeardownBlock {
+                first.release()
+                successor.release()
+            }
+            let installedFirst = await store.installCodemapCleanupFlightForTesting(rootID: root.id) {
+                await first.enterAndWait()
+            }
+            XCTAssertTrue(installedFirst)
+            let task = Task {
+                try await store.resolveExactExistingWorkspaceFile(
+                    WorkspaceExactFileInput.parse(targetURL.path), namespace: namespace
+                )
+            }
+            defer { task.cancel() }
+            try await MCPPathContractAsyncWait.waitUntil("first cleanup waiter registration", timeout: 10) {
+                await store.codemapCleanupWaiterCountForTesting(rootID: root.id) == 1
+            }
+            let installedSuccessor = await store.installCodemapCleanupFlightForTesting(
+                rootID: root.id, chainAfterExisting: true
+            ) {
+                await successor.enterAndWait()
+            }
+            XCTAssertTrue(installedSuccessor)
+            first.release()
+            try await MCPPathContractAsyncWait.waitUntil("successor cleanup waiter registration", timeout: 10) {
+                await store.codemapCleanupWaiterCountForTesting(rootID: root.id) == 1
+            }
+            let before = await store.file(rootID: root.id, relativePath: "Target.swift")
+            XCTAssertNil(before)
+            successor.release()
+            guard case let .matched(match) = try await task.value else {
+                return XCTFail("Expected exact resolution after both cleanup flights drained")
+            }
+            XCTAssertEqual(match.file.standardizedFullPath, StandardizedPath.absolute(targetURL.path))
+        }
+
         func testCancellationDuringCodemapCleanupSettlesAndAllowsSubsequentMaterialization() async throws {
             let rootURL = try makeTemporaryDirectory(name: "CancelledCodemapCleanup")
             let targetURL = rootURL.appendingPathComponent("Target.swift")
