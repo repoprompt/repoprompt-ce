@@ -79,6 +79,38 @@ enum CodexAgentToolPreferences {
         let enabledMCPServerNames: Set<String>
     }
 
+    typealias RequestPermissions = (
+        approvalPolicy: ApprovalPolicy,
+        sandboxMode: SandboxMode,
+        approvalReviewer: ApprovalReviewer
+    )
+
+    /// Resolves Codex launch and request decisions through the canonical secure store.
+    struct SecurePermissionReader {
+        private let secureStore: AgentPermissionSecureStore
+
+        init(secureStore: AgentPermissionSecureStore = .shared) {
+            self.secureStore = secureStore
+        }
+
+        func snapshot(for entries: [MCPIntegrationHelper.CodexServerEntry]) async -> Snapshot {
+            let document = await secureStore.readOffMain { $0.codexPermissions() }
+            return Snapshot(
+                bashToolEnabled: document.bashToolEnabled ?? false,
+                searchToolEnabled: CodexAgentToolPreferences.searchToolEnabled(),
+                approvalPolicy: document.approvalPolicy(),
+                sandboxMode: document.sandboxMode(),
+                approvalReviewer: document.approvalReviewer(),
+                enabledMCPServerNames: CodexAgentToolPreferences.enabledMCPServerNames(for: entries, document: document)
+            )
+        }
+
+        func requestPermissions() async -> RequestPermissions {
+            let document = await secureStore.readOffMain { $0.codexPermissions() }
+            return (document.approvalPolicy(), document.sandboxMode(), document.approvalReviewer())
+        }
+    }
+
     private static let bashToolEnabledKey = "codexAgentTools.bash.enabled"
     private static let searchToolEnabledKey = "codexAgentTools.search.enabled"
     private static let approvalPolicyKey = "codexAgentTools.bash.approvalPolicy"

@@ -752,7 +752,7 @@ final class CodexNativeSessionController {
         var approvalPolicyProvider: () -> CodexAgentToolPreferences.ApprovalPolicy
         var sandboxModeProvider: () -> CodexAgentToolPreferences.SandboxMode
         var approvalReviewerProvider: () -> CodexAgentToolPreferences.ApprovalReviewer = { CodexAgentToolPreferences.approvalReviewer() }
-        var userConfiguredPermissionStore: AgentPermissionSecureStore?
+        var userConfiguredPermissionReader: CodexAgentToolPreferences.SecurePermissionReader?
         var authTokensRefreshHandler: ChatgptAuthTokensRefreshHandler?
         /// Process-level reasoning summary override for app-server launch.
         /// Nil preserves Codex process defaults; non-nil values are explicit process overrides.
@@ -800,7 +800,7 @@ final class CodexNativeSessionController {
             computerUseClientPathProvider: @escaping () -> String? = { CodexNativeSessionController.computerUseClientPath() },
             mcpServerEntriesProvider: @escaping () -> [MCPIntegrationHelper.CodexServerEntry] = { MCPIntegrationHelper.codexMCPServerEntries() },
             contextWindowSelection: CodexContextWindowPreferences.Selection = .codexDefault,
-            securePermissions: AgentPermissionSecureStore = .shared,
+            permissionReader: CodexAgentToolPreferences.SecurePermissionReader = .init(),
             readsUserConfiguredRequestPermissions: Bool = false
         ) -> Options {
             Options(
@@ -815,7 +815,8 @@ final class CodexNativeSessionController {
                             computerUseEnabled: computerUseEnabledProvider()
                         )
                     }
-                    let permissions = await securePermissions.readOffMain { $0.codexPermissions() }
+                    let entries = mcpServerEntriesProvider()
+                    let permissions = await permissionReader.snapshot(for: entries)
                     return CodexNativeSessionController.defaultAppServerConfigOverrides(
                         shellToolEnabled: shellToolEnabled,
                         suppressThirdPartyMCPServers: suppressThirdPartyMCPServers,
@@ -825,15 +826,15 @@ final class CodexNativeSessionController {
                         memoriesEnabled: featurePolicy.memoriesEnabled,
                         computerUseEnabled: featurePolicy.computerUseEnabled,
                         computerUseClientPath: computerUseClientPathProvider(),
-                        serverEntries: mcpServerEntriesProvider(),
+                        serverEntries: entries,
                         contextWindowSelection: contextWindowSelection,
-                        permissionDocument: permissions
+                        permissionSnapshot: permissions
                     )
                 },
                 approvalPolicyProvider: approvalPolicyProvider,
                 sandboxModeProvider: sandboxModeProvider,
                 approvalReviewerProvider: approvalReviewerProvider,
-                userConfiguredPermissionStore: readsUserConfiguredRequestPermissions ? securePermissions : nil,
+                userConfiguredPermissionReader: readsUserConfiguredRequestPermissions ? permissionReader : nil,
                 authTokensRefreshHandler: nil,
                 processModelReasoningSummary: nil,
                 capabilitiesProvider: capabilitiesProvider,
@@ -3442,17 +3443,13 @@ final class CodexNativeSessionController {
         )
     }
 
-    private func requestPermissions() async -> (
-        approvalPolicy: CodexAgentToolPreferences.ApprovalPolicy,
-        sandboxMode: CodexAgentToolPreferences.SandboxMode,
-        approvalReviewer: CodexAgentToolPreferences.ApprovalReviewer
-    ) {
-        if let store = options.userConfiguredPermissionStore {
-            let document = await store.readOffMain { $0.codexPermissions() }
+    private func requestPermissions() async -> CodexAgentToolPreferences.RequestPermissions {
+        if let reader = options.userConfiguredPermissionReader {
+            let permissions = await reader.requestPermissions()
             return (
-                computerUseRequiresUserReview ? .onRequest : document.approvalPolicy(),
-                document.sandboxMode(),
-                computerUseRequiresUserReview ? .user : document.approvalReviewer()
+                computerUseRequiresUserReview ? .onRequest : permissions.approvalPolicy,
+                permissions.sandboxMode,
+                computerUseRequiresUserReview ? .user : permissions.approvalReviewer
             )
         }
         return (effectiveApprovalPolicy, options.sandboxModeProvider(), effectiveApprovalReviewer)
@@ -9876,16 +9873,16 @@ final class CodexNativeSessionController {
         computerUseClientPath: String? = computerUseClientPath(),
         serverEntries: [MCPIntegrationHelper.CodexServerEntry] = MCPIntegrationHelper.codexMCPServerEntries(),
         contextWindowSelection: CodexContextWindowPreferences.Selection = .codexDefault,
-        permissionDocument: SecureCodexPermissionDocument? = nil
+        permissionSnapshot: CodexAgentToolPreferences.Snapshot? = nil
     ) -> [String: Any] {
         let readyComputerUse = computerUseEnabled && computerUseClientPath != nil && !hasReservedComputerUseEntry(serverEntries)
-        let permissions = permissionDocument ?? AgentPermissionSecureStore.shared.codexPermissions()
+        let permissions = permissionSnapshot ?? CodexAgentToolPreferences.snapshot(for: serverEntries)
         let modelReasoningSummary = reasoningSummariesEnabled.map {
             $0 ? CodexOverrides.ReasoningSummary.auto : .none
         }
         let toolPolicy = defaultAppServerToolPolicy(
-            shellToolEnabled: shellToolEnabled ?? permissions.bashToolEnabled ?? false,
-            webSearchRequestEnabled: CodexAgentToolPreferences.searchToolEnabled(),
+            shellToolEnabled: shellToolEnabled ?? permissions.bashToolEnabled,
+            webSearchRequestEnabled: permissions.searchToolEnabled,
             modelReasoningSummary: modelReasoningSummary
         )
         var overrides = CodexOverrides.appServerConfigMap(
@@ -9902,7 +9899,7 @@ final class CodexNativeSessionController {
         }
         let mcpOverrides = appServerMCPServerOverrides(
             serverEntries: serverEntries,
-            enabledMCPServerNames: CodexAgentToolPreferences.enabledMCPServerNames(for: serverEntries, document: permissions),
+            enabledMCPServerNames: permissions.enabledMCPServerNames,
             suppressThirdPartyMCPServers: suppressThirdPartyMCPServers,
             computerUseEnabled: readyComputerUse,
             computerUseClientPath: computerUseClientPath

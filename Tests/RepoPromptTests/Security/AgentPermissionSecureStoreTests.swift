@@ -516,7 +516,7 @@ final class AgentPermissionSecureStoreTests: XCTestCase {
         let store = makeStore(secureStrings: secureStrings)
         let options = CodexNativeSessionController.Options.agentModeDefault(
             mcpServerEntriesProvider: { [] },
-            securePermissions: store
+            permissionReader: .init(secureStore: store)
         )
         let configTask = Task {
             let config = await options.configOverridesProvider()
@@ -549,7 +549,7 @@ final class AgentPermissionSecureStoreTests: XCTestCase {
             }
             let store = makeStore(secureStrings: secureStrings)
             let options = CodexNativeSessionController.Options.agentModeDefault(
-                securePermissions: store,
+                permissionReader: .init(secureStore: store),
                 readsUserConfiguredRequestPermissions: true
             )
             let controller = CodexNativeSessionController(
