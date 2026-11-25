@@ -63,9 +63,16 @@ import XCTest
                     }
 
                     // A catalogued file can resolve and reach the edit engine while cleanup is held.
+                    let temporarySentinel = "let catalogueControl = true"
                     let control = try await survivor.callTool(
                         name: MCPWindowToolName.applyEdits,
-                        arguments: ["path": context.fileURL.path, "search": context.sentinel, "replace": context.sentinel]
+                        arguments: [
+                            "path": context.fileURL.path,
+                            "edits": [
+                                ["search": context.sentinel, "replace": temporarySentinel],
+                                ["search": temporarySentinel, "replace": context.sentinel]
+                            ]
+                        ]
                     )
                     XCTAssertFalse(control.rawJSON.contains("\"isError\":true"), control.rawJSON)
                     XCTAssertTrue(try Self.toolResultText(control).contains("no net change"))
