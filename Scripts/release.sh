@@ -13,6 +13,7 @@ cd "$ROOT_DIR"
 source "$CONTROL_PLANE_SCRIPTS_DIR/load_release_metadata.sh"
 source "$CONTROL_PLANE_SCRIPTS_DIR/release_sentry_symbols.sh"
 load_release_metadata "$ROOT_DIR"
+configure_release_sentry_symbol_mappings "$APP_NAME"
 
 DIST_DIR="${DIST_DIR:-$ROOT_DIR/dist}"
 APP_BUNDLE="$ROOT_DIR/.build/release/$APP_NAME.app"
@@ -577,10 +578,7 @@ upload_required_sentry_symbols() {
     upload_release_sentry_symbols \
         "$SENTRY_SYMBOLS_DIR" \
         "$CONTROL_PLANE_SCRIPTS_DIR/upload_sentry_debug_symbols.sh" \
-        "$APP_NAME.dSYM" \
-        "$APP_NAME" \
-        "repoprompt-mcp.dSYM" \
-        "repoprompt-mcp"
+        "${RELEASE_SENTRY_SYMBOL_MAPPINGS[@]}"
 }
 
 package_release_candidate() {
@@ -693,10 +691,7 @@ stage_validate() {
     validate_public_app "$APP_BUNDLE" "$BUILD_ARTIFACT_MANIFEST" "Release staging"
     require_release_sentry_symbols_when_enabled \
         "$SENTRY_SYMBOLS_DIR" \
-        "$APP_NAME.dSYM" \
-        "$APP_NAME" \
-        "repoprompt-mcp.dSYM" \
-        "repoprompt-mcp"
+        "${RELEASE_SENTRY_SYMBOL_MAPPINGS[@]}"
 }
 
 # Phase 5: write the secret-free staged archive and its checksum into dist/.
@@ -711,10 +706,7 @@ stage_archive() {
     stage_release_sentry_symbols \
         "$SENTRY_SYMBOLS_DIR" \
         "$stage_root/.build/sentry-symbols/release" \
-        "$APP_NAME.dSYM" \
-        "$APP_NAME" \
-        "repoprompt-mcp.dSYM" \
-        "repoprompt-mcp"
+        "${RELEASE_SENTRY_SYMBOL_MAPPINGS[@]}"
     cp "$ROOT_DIR/version.env" "$ROOT_DIR/LICENSE" "$ROOT_DIR/THIRD_PARTY_NOTICES.md" "$stage_root/"
     cp -R "$ROOT_DIR/ThirdPartyLicenses" "$stage_root/"
     printf '%s\n' "$RELEASE_COMMIT" > "$stage_root/RELEASE_COMMIT"
@@ -773,10 +765,7 @@ publish_staged_release() {
     verify_release_sentry_symbol_uuids_before_signing \
         "$SENTRY_SYMBOLS_DIR" \
         "$APP_BUNDLE" \
-        "$APP_NAME.dSYM" \
-        "$APP_NAME" \
-        "repoprompt-mcp.dSYM" \
-        "repoprompt-mcp"
+        "${RELEASE_SENTRY_SYMBOL_MAPPINGS[@]}"
     REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         "$CONTROL_PLANE_SCRIPTS_DIR/sign_staged_release.sh"
     prepare_dist
