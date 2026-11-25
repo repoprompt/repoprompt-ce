@@ -168,6 +168,14 @@ final class RemovedFolderIndexRebuildTests: XCTestCase {
         index.insertFolder(originalFolder, standardizedOwnerRootKey: root)
         index.insertFile(originalFile, standardizedOwnerRootKey: root)
         assertSameIndex(index, as: reference)
+        // Reading the default bucket during insertion does not store it.
+        XCTAssertNil(index.filePathsByRoot[nestedRoot])
+
+        reference.filePathsByRoot[nestedRoot] = []
+        index.filePathsByRoot[nestedRoot] = []
+        reference.insertFolder(nested, rootKey: nestedRoot + "/")
+        index.insertFolder(nested, standardizedOwnerRootKey: nestedRoot)
+        assertSameIndex(index, as: reference)
         XCTAssertEqual(index.filePathsByRoot[nestedRoot], [])
 
         reference.insertFolder(replacementFolder, rootKey: nestedRoot + "/./")
