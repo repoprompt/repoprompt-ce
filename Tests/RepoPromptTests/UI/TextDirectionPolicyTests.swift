@@ -86,14 +86,14 @@ final class CodeBlockDirectionTests: XCTestCase {
     private func codeLineBounds(_ preview: some View, direction: LayoutDirection) throws -> [CGRect] {
         let renderer = ImageRenderer(
             content: preview
-                .foregroundStyle(.red)
+                .foregroundColor(.red)
                 .frame(width: 300)
                 .environment(\.layoutDirection, direction)
         )
         renderer.scale = 1
         let bitmap = try NSBitmapImageRep(cgImage: XCTUnwrap(renderer.cgImage))
 
-        // The code inherits red while the copy and disclosure controls set their own colors.
+        // Use the same foreground color modifier as the controls so their local colors win.
         // Group consecutive rows of code ink so each line is checked independently.
         var lines: [CGRect] = []
         var currentLine = CGRect.null
