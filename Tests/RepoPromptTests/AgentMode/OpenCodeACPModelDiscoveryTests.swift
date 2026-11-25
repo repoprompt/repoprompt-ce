@@ -1,6 +1,6 @@
 import Darwin
 import Foundation
-import RepoPromptACPProviders
+@testable import RepoPromptACPProviders
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
@@ -525,6 +525,65 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
         }
     }
 
+    func testExpiredHeadlessLimitCancelsAndIgnoresDeliveredLatePromptReply() async throws {
+        let (provider, workspace, pidURL) = try makeHeadlessLivenessFixture(scenario: "halt")
+        let lateReply = expectation(description: "The cancelled prompt reply reached the controller")
+        lateReply.assertForOverFulfill = false
+        let request = ACPRunRequest(
+            agentKind: .openCode,
+            modelString: nil,
+            workspacePath: workspace.path,
+            resumeSessionID: nil,
+            attachments: [],
+            taskLabelKind: nil
+        )
+        let controller = try ACPAgentSessionController(
+            provider: provider,
+            runRequest: request,
+            diagnosticSink: { event in
+                if case let .inboundJSON(line) = event, line.contains("\"fixture\": \"cancel-reply\"") {
+                    lateReply.fulfill()
+                }
+            },
+            allowsProviderProcessLaunchForTesting: true
+        )
+        await controller.enableOpenCodeHeadlessPromptLimitHandling(grace: .milliseconds(400))
+        let events = await controller.currentEventsStream()
+        do {
+            _ = try await controller.bootstrap()
+        } catch {
+            await controller.shutdown()
+            throw error
+        }
+
+        do {
+            try await controller.prompt(AgentMessage(userMessage: "hi"))
+            XCTFail("The limit must settle the pending request before the fixture replies")
+        } catch {
+            XCTAssertTrue(error is OpenCodeACPPromptLimit, "Expected the limit failure, got \(error)")
+        }
+
+        // The fixture marks the reply it sends in response to session/cancel.
+        // Keep the controller alive until it receives that RPC.
+        await fulfillment(of: [lateReply], timeout: 5)
+        await controller.shutdown()
+        var terminalCount = 0
+        for await event in events {
+            switch event {
+            case let .terminal(state, _):
+                XCTAssertEqual(state, .failed)
+                terminalCount += 1
+            case let .stream(result):
+                XCTAssertNotEqual(result.type, "error", "A retired reply must not become a protocol violation")
+                XCTAssertNotEqual(result.type, "message_stop", "A retired reply must not settle the prompt again")
+            default:
+                break
+            }
+        }
+        XCTAssertEqual(terminalCount, 1)
+        try assertHeadlessProcessReaped(at: pidURL)
+    }
+
     func testDisposingHeadlessPromptWithPendingLimitCancelsAndReapsOpenCode() async throws {
         let (provider, pidURL) = try makeHeadlessLivenessProvider(scenario: "cancel")
         let stream = try await provider.streamAgentMessage(AgentMessage(userMessage: "hi"))
@@ -568,11 +627,7 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
     }
 
     private func makeHeadlessLivenessProvider(scenario: String) throws -> (OpenCodeACPHeadlessAgentProvider, URL) {
-        let workspace = try makeTestDirectory(name: "OpenCodeACPHeadlessLiveness")
-        let pidURL = workspace.appendingPathComponent("prompt.pid")
-        let scriptURL = workspace.appendingPathComponent("opencode")
-        try Self.headlessPinServerScript.write(to: scriptURL, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+        let (fixture, workspace, pidURL) = try makeHeadlessLivenessFixture(scenario: scenario)
         let provider = OpenCodeACPHeadlessAgentProvider(
             config: OpenCodeAgentConfig(
                 includeRepoPromptMCPServer: false,
@@ -581,12 +636,7 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
                 toolProfile: .headless
             ),
             workspacePath: workspace.path,
-            providerFactory: { _ in
-                OpenCodeDiscoveryFakeProvider(
-                    commandPath: scriptURL.path,
-                    environment: ["ACP_SCENARIO": scenario, "ACP_PID_PATH": pidURL.path]
-                )
-            },
+            providerFactory: { _ in fixture },
             controllerFactory: { provider, request, diagnosticSink in
                 try ACPAgentSessionController(
                     provider: provider, runRequest: request, diagnosticSink: diagnosticSink,
@@ -597,6 +647,19 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
             selectedModel: { _ in nil }
         )
         return (provider, pidURL)
+    }
+
+    private func makeHeadlessLivenessFixture(scenario: String) throws -> (OpenCodeDiscoveryFakeProvider, URL, URL) {
+        let workspace = try makeTestDirectory(name: "OpenCodeACPHeadlessLiveness")
+        let pidURL = workspace.appendingPathComponent("prompt.pid")
+        let scriptURL = workspace.appendingPathComponent("opencode")
+        try Self.headlessPinServerScript.write(to: scriptURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+        let provider = OpenCodeDiscoveryFakeProvider(
+            commandPath: scriptURL.path,
+            environment: ["ACP_SCENARIO": scenario, "ACP_PID_PATH": pidURL.path]
+        )
+        return (provider, workspace, pidURL)
     }
 
     private func assertHeadlessProcessReaped(at pidURL: URL) throws {
@@ -970,7 +1033,7 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
         method = request.get("method")
         if request_id is None:
             if scenario in ("halt", "cancel") and method == "session/cancel" and prompt_id is not None:
-                reply(prompt_id, {"stopReason": "end_turn"})
+                reply(prompt_id, {"stopReason": "end_turn", "_meta": {"fixture": "cancel-reply"}})
             continue
         params = request.get("params", {})
         if method == "initialize":
