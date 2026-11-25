@@ -1,4 +1,5 @@
 import Combine
+import os
 import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
@@ -299,15 +300,16 @@ final class AgentModelsSettingsViewModelStaleEditTests: XCTestCase {
         }
     }
 
-    func testAcceptedGuidanceSaveCanRemainPendingInExistingPersistenceWarning() throws {
-        var failWrites = false
-        let fixture = try makeFixture(shouldFailSave: { failWrites })
+    func testAcceptedGuidanceSaveCanRemainPendingInExistingPersistenceWarning() async throws {
+        let failWrites = OSAllocatedUnfairLock(initialState: false)
+        let fixture = try makeFixture(shouldFailSave: { failWrites.withLock { $0 } })
         let viewModel = makeViewModel(fixture: fixture, workspaceID: nil)
         viewModel.oracleReconciliationGuidanceDraft = "pending save"
-        failWrites = true
-        XCTAssertTrue(viewModel.saveOracleReconciliationGuidanceDraft(), "Accepted in memory, not a durability receipt.")
-        XCTAssertEqual(fixture.store.persistenceBlockReason, .saveFailed)
+        failWrites.withLock { $0 = true }
+        XCTAssertTrue(viewModel.saveOracleReconciliationGuidanceDraft(), "The live edit should be accepted immediately.")
         XCTAssertEqual(fixture.store.globalAgentModelsProfile().oracleReconciliationGuidance, "pending save")
+        await fixture.store.settleDeferredProfileSavesForTermination()
+        XCTAssertEqual(fixture.store.persistenceBlockReason, .saveFailed)
         XCTAssertEqual(viewModel.oracleReconciliationGuidanceDraft, "pending save")
         XCTAssertFalse(viewModel.oracleGuidanceHasConflict)
     }
@@ -328,7 +330,7 @@ final class AgentModelsSettingsViewModelStaleEditTests: XCTestCase {
         )
     }
 
-    private func makeFixture(shouldFailSave: @escaping () -> Bool = { false }) throws -> (store: GlobalSettingsStore, apiSettings: APISettingsViewModel) {
+    private func makeFixture(shouldFailSave: @escaping @Sendable () -> Bool = { false }) throws -> (store: GlobalSettingsStore, apiSettings: APISettingsViewModel) {
         let temp = FileManager.default.temporaryDirectory
             .appendingPathComponent("AgentModelsSettingsViewModelStaleEditTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
@@ -343,12 +345,13 @@ final class AgentModelsSettingsViewModelStaleEditTests: XCTestCase {
             defaults: defaults,
             fileStore: GlobalSettingsFileStore(
                 fileURL: temp.appendingPathComponent("Settings/globalSettings.json"),
-                atomicWriter: { data, url in
+                atomicWriter: { @Sendable data, url in
                     if shouldFailSave() { throw CocoaError(.fileWriteUnknown) }
                     try data.write(to: url, options: .atomic)
                 }
             )
         )
+        addTeardownBlock { await store.settleDeferredProfileSavesForTermination() }
         let keyManager = KeyManager(secureService: SecureKeysService(secureStorage: TestSecureStorageBackend()))
         let apiSettings = APISettingsViewModel(
             aiQueriesService: AIQueriesService(keyManager: keyManager),
