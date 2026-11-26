@@ -890,6 +890,7 @@ public struct RemoteTranscriptItem: Codable, Sendable, Equatable, Identifiable {
     public let detailText: String?
     public let detail: RemoteTranscriptDetail?
     public let attachments: [RemoteTranscriptAttachment]?
+    public let diffSummary: RemoteTranscriptDiffSummary?
 
     public init(
         id: UUID,
@@ -906,7 +907,8 @@ public struct RemoteTranscriptItem: Codable, Sendable, Equatable, Identifiable {
         detailAvailable: Bool = false,
         detailText: String? = nil,
         detail: RemoteTranscriptDetail? = nil,
-        attachments: [RemoteTranscriptAttachment]? = nil
+        attachments: [RemoteTranscriptAttachment]? = nil,
+        diffSummary: RemoteTranscriptDiffSummary? = nil
     ) {
         self.id = id
         self.turnID = turnID
@@ -923,6 +925,7 @@ public struct RemoteTranscriptItem: Codable, Sendable, Equatable, Identifiable {
         self.detailText = detailText
         self.detail = detail
         self.attachments = attachments
+        self.diffSummary = diffSummary
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -941,27 +944,107 @@ public struct RemoteTranscriptItem: Codable, Sendable, Equatable, Identifiable {
         case detailText
         case detail
         case attachments
+        case diffSummary
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        self.init(
-            id: try container.decode(UUID.self, forKey: .id),
-            turnID: try container.decode(UUID.self, forKey: .turnID),
-            timestamp: try container.decode(Date.self, forKey: .timestamp),
-            sequenceIndex: try container.decode(Int.self, forKey: .sequenceIndex),
-            kind: try container.decode(RemoteTranscriptItemKind.self, forKey: .kind),
-            semanticKind: try container.decodeIfPresent(RemoteTranscriptSemanticKind.self, forKey: .semanticKind),
-            role: try container.decode(String.self, forKey: .role),
-            text: try container.decodeIfPresent(String.self, forKey: .text),
-            toolName: try container.decodeIfPresent(String.self, forKey: .toolName),
-            toolStatus: try container.decodeIfPresent(String.self, forKey: .toolStatus),
-            summaryOnly: try container.decode(Bool.self, forKey: .summaryOnly),
-            detailAvailable: try container.decode(Bool.self, forKey: .detailAvailable),
-            detailText: try container.decodeIfPresent(String.self, forKey: .detailText),
-            detail: try container.decodeIfPresent(RemoteTranscriptDetail.self, forKey: .detail),
-            attachments: try container.decodeIfPresent([RemoteTranscriptAttachment].self, forKey: .attachments)
+        try self.init(
+            id: container.decode(UUID.self, forKey: .id),
+            turnID: container.decode(UUID.self, forKey: .turnID),
+            timestamp: container.decode(Date.self, forKey: .timestamp),
+            sequenceIndex: container.decode(Int.self, forKey: .sequenceIndex),
+            kind: container.decode(RemoteTranscriptItemKind.self, forKey: .kind),
+            semanticKind: container.decodeIfPresent(RemoteTranscriptSemanticKind.self, forKey: .semanticKind),
+            role: container.decode(String.self, forKey: .role),
+            text: container.decodeIfPresent(String.self, forKey: .text),
+            toolName: container.decodeIfPresent(String.self, forKey: .toolName),
+            toolStatus: container.decodeIfPresent(String.self, forKey: .toolStatus),
+            summaryOnly: container.decode(Bool.self, forKey: .summaryOnly),
+            detailAvailable: container.decode(Bool.self, forKey: .detailAvailable),
+            detailText: container.decodeIfPresent(String.self, forKey: .detailText),
+            detail: container.decodeIfPresent(RemoteTranscriptDetail.self, forKey: .detail),
+            attachments: container.decodeIfPresent([RemoteTranscriptAttachment].self, forKey: .attachments),
+            diffSummary: container.decodeIfPresent(RemoteTranscriptDiffSummary.self, forKey: .diffSummary)
         )
+    }
+}
+
+public struct RemoteRecordedQuestionExchange: Codable, Sendable, Equatable {
+    public enum Outcome: String, Codable, Sendable {
+        case answered
+        case skipped
+        case timedOut = "timed_out"
+    }
+
+    public struct Question: Codable, Sendable, Equatable {
+        public let header: String?
+        public let prompt: String
+        public let answer: String?
+        public let skipped: Bool
+
+        public init(header: String? = nil, prompt: String, answer: String? = nil, skipped: Bool = false) {
+            self.header = header
+            self.prompt = prompt
+            self.answer = answer
+            self.skipped = skipped
+        }
+    }
+
+    public let title: String?
+    public let questions: [Question]
+    public let outcome: Outcome
+
+    public init(title: String? = nil, questions: [Question], outcome: Outcome) {
+        self.title = title
+        self.questions = questions
+        self.outcome = outcome
+    }
+}
+
+public struct RemoteTranscriptDiffSummary: Codable, Sendable, Equatable {
+    public let fileCount: Int
+    public let singleFilePath: String?
+    public let additions: Int?
+    public let deletions: Int?
+    public let isTruncated: Bool
+
+    public init(
+        fileCount: Int,
+        singleFilePath: String? = nil,
+        additions: Int? = nil,
+        deletions: Int? = nil,
+        isTruncated: Bool = false
+    ) {
+        self.fileCount = fileCount
+        self.singleFilePath = singleFilePath
+        self.additions = additions
+        self.deletions = deletions
+        self.isTruncated = isTruncated
+    }
+}
+
+public struct RemoteTranscriptDiffPreview: Codable, Sendable, Equatable {
+    public struct File: Codable, Sendable, Equatable {
+        public let path: String
+        public let additions: Int?
+        public let deletions: Int?
+        public let patch: String?
+
+        public init(path: String, additions: Int? = nil, deletions: Int? = nil, patch: String? = nil) {
+            self.path = path
+            self.additions = additions
+            self.deletions = deletions
+            self.patch = patch
+        }
+    }
+
+    public let files: [File]
+    public let isTruncated: Bool
+
+    public init(files: [File], isTruncated: Bool = false) {
+        self.files = files
+        self.isTruncated = isTruncated
     }
 }
 
@@ -974,6 +1057,8 @@ public struct RemoteTranscriptDetail: Codable, Sendable, Equatable {
     public let exitCode: Int?
     public let summaryText: String?
     public let toolIsError: Bool?
+    public let questionExchange: RemoteRecordedQuestionExchange?
+    public let diffPreview: RemoteTranscriptDiffPreview?
 
     public init(
         argumentsJSON: String? = nil,
@@ -983,7 +1068,9 @@ public struct RemoteTranscriptDetail: Codable, Sendable, Equatable {
         processID: String? = nil,
         exitCode: Int? = nil,
         summaryText: String? = nil,
-        toolIsError: Bool? = nil
+        toolIsError: Bool? = nil,
+        questionExchange: RemoteRecordedQuestionExchange? = nil,
+        diffPreview: RemoteTranscriptDiffPreview? = nil
     ) {
         self.argumentsJSON = argumentsJSON
         self.resultJSON = resultJSON
@@ -993,6 +1080,8 @@ public struct RemoteTranscriptDetail: Codable, Sendable, Equatable {
         self.exitCode = exitCode
         self.summaryText = summaryText
         self.toolIsError = toolIsError
+        self.questionExchange = questionExchange
+        self.diffPreview = diffPreview
     }
 }
 

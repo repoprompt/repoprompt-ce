@@ -6,6 +6,7 @@ import RepoPromptDomainRuntime
 import RepoPromptRemoteProtocol
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
+import RepoPromptVCS
 import XCTest
 
 @MainActor
@@ -1355,6 +1356,188 @@ final class RemoteMutationBehaviorTests: XCTestCase {
 
 @MainActor
 final class RemoteProducerParityTests: XCTestCase {
+    func testRecordedQuestionsProjectLiveAndSavedExchangesWithoutRawToolPayloads() throws {
+        let arguments = """
+        {"title":"Badge setup","questions":[
+            {"id":"shape","header":"Shape","question":"What shape should the badge be?"},
+            {"id":"placement","header":"Placement","question":"Where should the badge appear?"},
+            {"id":"notes","header":"Notes","question":"Any other notes?"}
+        ]}
+        """
+        let result = """
+        {"answers":{
+            "shape":{"answers":["Square"]},
+            "placement":{"answers":["Sidebar","Header"]},
+            "notes":{"skipped":true}
+        },"timed_out":false,"skipped":false}
+        """
+        let stored = try XCTUnwrap(
+            AgentAskUserTranscriptExchange.decode(argsJSON: arguments, resultJSON: result)?
+                .persistedResultJSON(statusWord: "success", summaryText: "ask_user • success", byteBudget: 4096)
+        )
+        let executions = [
+            toolExecution(name: "mcp__RepoPrompt__ask_user", status: .success, argsJSON: arguments, resultJSON: result),
+            toolExecution(name: "ask_user", status: .success, resultJSON: stored),
+            toolExecution(
+                name: "ask_user",
+                status: .success,
+                argsJSON: arguments,
+                resultJSON: #"{"answers":{},"timed_out":true}"#
+            ),
+            toolExecution(
+                name: "ask_user",
+                status: .success,
+                argsJSON: arguments,
+                resultJSON: #"{"status":"success"}"#
+            )
+        ]
+        let timestamp = Date(timeIntervalSinceReferenceDate: 100)
+        let activities = executions.enumerated().map { index, execution in
+            AgentTranscriptActivity(
+                id: fixedUUID(960 + index), timestamp: timestamp, sequenceIndex: index,
+                role: index == 1 ? .assistant : .toolExecution, itemKind: .toolResult,
+                text: index == 1 ? "Previously recorded answer" : "", toolExecution: execution,
+                isSubstantiveAssistant: index == 1, sealsAssistantBoundary: index == 0
+            )
+        }
+        let transcript = AgentTranscript(
+            turns: [.init(
+                id: fixedUUID(965), request: nil, responseSpans: [.init(startedAt: timestamp, activities: activities)],
+                startedAt: timestamp
+            )],
+            nextSequenceIndex: activities.count
+        )
+
+        let collapsed = WindowRemoteReadService.project(transcript: transcript, includeDetails: false)
+        let expanded = WindowRemoteReadService.project(transcript: transcript, includeDetails: true)
+        XCTAssertEqual(collapsed.map(\.semanticKind), [.question, .question, .question, .question])
+        XCTAssertTrue(collapsed.allSatisfy { $0.kind == .activity })
+        XCTAssertEqual(collapsed.map(\.text), [
+            "Shape: Square · Placement: Sidebar, Header · Notes: Skipped",
+            "Shape: Square · Placement: Sidebar, Header · Notes: Skipped",
+            "Timed out",
+            nil
+        ])
+        XCTAssertTrue(collapsed.allSatisfy { $0.detail == nil })
+        let exchange = try XCTUnwrap(expanded.first?.detail?.questionExchange)
+        XCTAssertEqual(exchange.title, "Badge setup")
+        XCTAssertEqual(exchange.questions[1].prompt, "Where should the badge appear?")
+        XCTAssertEqual(exchange.questions[1].answer, "Sidebar, Header")
+        XCTAssertTrue(exchange.questions[2].skipped)
+        XCTAssertEqual(expanded[1].detail?.questionExchange, exchange)
+        XCTAssertEqual(expanded[2].detail?.questionExchange?.outcome, .timedOut)
+        XCTAssertNil(expanded[3].detail?.questionExchange)
+        XCTAssertNil(expanded[0].detail?.argumentsJSON)
+        XCTAssertNil(expanded[0].detail?.resultJSON)
+        XCTAssertNil(expanded[0].detailText)
+    }
+
+    func testLiveTranscriptRecoversGitPreviewAfterToolResultCompaction() async throws {
+        let diff = try await MCPGitToolProjection.makeDiffDTO(
+            compare: "uncommitted",
+            detail: "patches",
+            changedFiles: [VCSUncommittedFile(path: "README.md", status: "M", additions: 2, deletions: 1)],
+            perFilePatches: ["README.md": "--- a/README.md\n+++ b/README.md\n@@ -1 +1,2 @@\n-old\n+new\n+extra\n"],
+            maxLinesForPatches: 100
+        )
+        let resultJSON = try String(decoding: JSONEncoder().encode(
+            ToolResultDTOs.GitToolReplyDTO(op: "diff", diff: diff)
+        ), as: UTF8.self)
+        let result = AgentChatItem.toolResult(
+            name: "git", invocationID: UUID(),
+            argsJSON: #"{"op":"diff","detail":"patches","path":"README.md"}"#,
+            resultJSON: resultJSON, isError: false, sequenceIndex: 1
+        )
+        let agentMode = AgentModeViewModel(
+            testWindowID: -993, testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in preconditionFailure("No provider is needed") },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            mcpServerEnabler: { true }
+        )
+        let tabID = UUID()
+        let workspaceManager = AgentSessionLinkEndpointTestSupport.installWorkspace(
+            on: agentMode, tabID: tabID, name: "Remote live diff"
+        )
+        let session = AgentModeViewModel.TabSession(tabID: tabID)
+        let sessionID = UUID()
+        agentMode.test_installLiveSession(session)
+        _ = try XCTUnwrap(agentMode.test_installPersistentSessionBinding(sessionID: sessionID, on: session))
+        session.setItemsSilently([.user("Show the README diff", sequenceIndex: 0), result], reason: .testOverride)
+        session.compactSummaryOnlyToolResultsAndAlignEphemeralPayloadMap()
+        session.transcript = AgentTranscriptIO.buildTranscript(from: session.items, compact: false)
+        let compacted = try XCTUnwrap(session.transcript.allActivities.first { $0.id == result.id }?.toolExecution?.resultJSON)
+        XCTAssertTrue(AgentTranscriptToolNormalizer.isSummaryOnly(raw: compacted))
+        XCTAssertEqual(agentMode.rawToolResultPayloadForRendering(tabID: tabID, itemID: result.id), resultJSON)
+
+        let service = WindowRemoteReadService(contexts: [(agentMode, workspaceManager)])
+        let page = try await service.transcript(
+            sessionID: sessionID, paging: .recentBackward(before: nil), limit: 20, includeDetails: false
+        )
+        let collapsed = try XCTUnwrap(page.items.first { $0.id == result.id })
+        XCTAssertEqual(collapsed.diffSummary, .init(fileCount: 1, singleFilePath: "README.md", additions: 2, deletions: 1))
+        XCTAssertNil(collapsed.detail)
+
+        let expanded = try await service.transcript(
+            sessionID: sessionID, paging: .exactItem(result.id), limit: 1, includeDetails: true
+        )
+        let detail = try XCTUnwrap(expanded.items.first?.detail)
+        let preview = try XCTUnwrap(detail.diffPreview)
+        let patch = try XCTUnwrap(preview.files.first?.patch)
+        XCTAssertTrue(patch.contains("@@ -1 +1,2 @@\n-old\n+new\n+extra"))
+        XCTAssertFalse(preview.isTruncated)
+        XCTAssertEqual(detail.resultJSON, compacted)
+    }
+
+    func testRecordedDiffUsesDesktopCardPatchAndKeepsLargeGitSummaries() throws {
+        let edit = #"""
+        {"structuredContent":{"status":"success","edits_requested":1,"edits_applied":1,
+        "added_lines":1,"deleted_lines":1,"card_unified_diff":"--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-old\n+new"}}
+        """#
+        let gitPatch = "-old\n+first change\n+" + String(repeating: "x", count: 13000)
+        let gitPatchJSON = try String(decoding: JSONEncoder().encode(gitPatch), as: UTF8.self)
+        let git = #"""
+        {"op":"diff","diff":{"compare":"uncommitted","oneliner":"1 file","totals":{"files":1,"insertions":2,"deletions":1},
+        "files":[{"path":"Sources/A.swift","status":"modified","insertions":2,"deletions":1,
+        "hunks":[{"header":"@@ -1 +1,2 @@","old_start":1,"new_start":1,"patch":\#(gitPatchJSON)}]}]}}
+        """#
+        let executions = [
+            toolExecution(name: "apply_edits", status: .success, argsJSON: #"{"path":"/project/README.md"}"#, resultJSON: edit),
+            toolExecution(name: "git", status: .success, resultJSON: git),
+            toolExecution(name: "git", status: .success, resultJSON: #"{"op":"status"}"#)
+        ]
+        let timestamp = Date(timeIntervalSinceReferenceDate: 100)
+        let activities = executions.enumerated().map { index, execution in
+            AgentTranscriptActivity(
+                id: fixedUUID(980 + index), timestamp: timestamp, sequenceIndex: index,
+                role: .toolExecution, itemKind: .toolResult, text: "", toolExecution: execution,
+                sealsAssistantBoundary: index == 0
+            )
+        }
+        let transcript = AgentTranscript(
+            turns: [.init(
+                id: fixedUUID(985), request: nil, responseSpans: [.init(startedAt: timestamp, activities: activities)],
+                startedAt: timestamp
+            )],
+            nextSequenceIndex: activities.count
+        )
+
+        let collapsed = WindowRemoteReadService.project(transcript: transcript, includeDetails: false)
+        let expanded = WindowRemoteReadService.project(transcript: transcript, includeDetails: true)
+        XCTAssertEqual(collapsed[0].kind, .activity)
+        XCTAssertEqual(collapsed[0].semanticKind, .compactActivity)
+        XCTAssertEqual(collapsed[0].diffSummary, .init(fileCount: 1, singleFilePath: "README.md", additions: 1, deletions: 1))
+        XCTAssertEqual(collapsed[1].diffSummary, .init(fileCount: 1, singleFilePath: "Sources/A.swift", additions: 2, deletions: 1))
+        XCTAssertNil(collapsed[2].diffSummary)
+        XCTAssertTrue(collapsed.allSatisfy { $0.detail == nil })
+        XCTAssertEqual(expanded.map(\.diffSummary), collapsed.map(\.diffSummary))
+        XCTAssertEqual(expanded[0].detail?.diffPreview?.files.first?.patch, "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-old\n+new")
+        let preview = try XCTUnwrap(expanded[1].detail?.diffPreview)
+        XCTAssertTrue(preview.isTruncated)
+        XCTAssertEqual(preview.files.first?.patch, "@@ -1 +1,2 @@\n-old\n+first change")
+        XCTAssertNil(expanded[2].detail?.diffPreview)
+        XCTAssertEqual(try JSONDecoder().decode([RemoteTranscriptItem].self, from: JSONEncoder().encode(expanded)), expanded)
+    }
+
     func testCompactToolSummariesIncludeResultMetadataWithoutFullOutput() {
         let read = toolExecution(
             name: "read_file", status: .success, argsJSON: #"{"path":"Sources/A.swift"}"#,
