@@ -11503,6 +11503,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         nativePreparedTurn: NativeSlashPreparedUserTurn? = nil,
         preserveRoutedInitialEffort: Bool = false,
         remoteAttachments: [AgentFileAttachment]? = nil,
+        remoteInterviewFirst: Bool? = nil,
         validateInitialStart: (@MainActor () throws -> Void)? = nil
     ) async throws -> MCPInstructionDispatch {
         guard let originalWriter = mcpRuntime.controlledWriter(sessionID: sessionID),
@@ -11596,6 +11597,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if remoteAttachments?.isEmpty == false, delivery != .startedRun {
             throw MCPError.invalidParams("Wait for the current run to finish before sending attachments.")
         }
+        if remoteInterviewFirst == true, delivery != .startedRun {
+            throw MCPError.invalidParams("Interview first is only available when starting a new chat.")
+        }
         let submittedAutoEffortSelection = delivery == .startedRun ? autoEffortSelection : nil
         let submittedAutoEffortAudit = delivery == .startedRun
             ? autoEffortChoice?.audit
@@ -11633,6 +11637,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         codexAttemptID: codexAttemptID,
                         autoEffortAudit: submittedAutoEffortAudit,
                         isLocalComposerInput: false,
+                        remoteInterviewFirst: remoteInterviewFirst,
                         scheduledProviderSwitchSubmission: { pendingSwitchSubmission = $0 }
                     )
                 }
@@ -11644,6 +11649,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     autoEffortAudit: submittedAutoEffortAudit,
                     isLocalComposerInput: false,
                     remoteAttachments: remoteAttachments,
+                    remoteInterviewFirst: remoteInterviewFirst,
                     scheduledProviderSwitchSubmission: { pendingSwitchSubmission = $0 }
                 )
             }
@@ -15447,6 +15453,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         isLocalComposerInput: Bool = true,
         providerSwitchClaim: AgentComposerSubmitClaim? = nil,
         remoteAttachments: [AgentFileAttachment]? = nil,
+        remoteInterviewFirst: Bool? = nil,
         scheduledProviderSwitchSubmission: ((Task<UserTurnSubmissionResult, Never>) -> Void)? = nil
     ) -> UserTurnSubmissionResult {
         let session = session(for: tabID)
@@ -15460,7 +15467,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard !trimmedText.isEmpty || !attachmentsToSend.isEmpty || !taggedFilesToSend.isEmpty else {
             return .blocked(message: "")
         }
-        if let nativeSlashCommand = resolvedNativeSlashCommand(in: trimmedText, session: session),
+        let nativeSlashCommand = resolvedNativeSlashCommand(in: trimmedText, session: session)
+        if remoteInterviewFirst == true, nativeSlashCommand?.command.behavior == .controlPlane {
+            return .blocked(message: "Interview first requires a message that starts an agent turn.")
+        }
+        if let nativeSlashCommand,
            nativeSlashCommand.command == .computerUse,
            CodexComputerUseWorkflow.isOffCommand(argumentsText: nativeSlashCommand.argumentsText)
         {
@@ -15507,7 +15518,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let activeWorkflow = effectiveWorkflow(session: session, autoWorkflow: autoWorkflow)
         let restorationSelectedWorkflowMutationGeneration = session.userWorkflowSelectionMutationGeneration
         let nativePreparedTurn: NativeSlashPreparedUserTurn?
-        if let nativeSlashCommand = resolvedNativeSlashCommand(in: trimmedText, session: session) {
+        if let nativeSlashCommand {
             if let validationFailure = validateNativeSlashCommandUsage(
                 nativeSlashCommand,
                 session: session,
@@ -15631,6 +15642,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
                     stopFence: stopFence,
                     isLocalComposerInput: isLocalComposerInput,
+                    remoteInterviewFirst: remoteInterviewFirst,
                     providerSwitchClaim: providerSwitchClaim
                 )
             }
@@ -15657,6 +15669,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             restorationSelectedWorkflow: restorationSelectedWorkflow,
             restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
             isLocalComposerInput: isLocalComposerInput,
+            remoteInterviewFirst: remoteInterviewFirst,
             providerSwitchClaim: providerSwitchClaim,
             scheduledProviderSwitchSubmission: scheduledProviderSwitchSubmission
         )
@@ -15689,6 +15702,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         restorationSelectedWorkflowMutationGeneration: UInt64? = nil,
         stopFence: AgentRunStartStopFence,
         isLocalComposerInput: Bool = true,
+        remoteInterviewFirst: Bool? = nil,
         providerSwitchClaim: AgentComposerSubmitClaim? = nil
     ) async -> UserTurnSubmissionResult {
         let session = originalWriter.session
@@ -15752,6 +15766,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
             stopFence: stopFence,
             isLocalComposerInput: isLocalComposerInput,
+            remoteInterviewFirst: remoteInterviewFirst,
             providerSwitchClaim: providerSwitchClaim,
             scheduledProviderSwitchSubmission: { pending = $0 }
         )
@@ -16294,6 +16309,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         delegationDecisionBatch: AgentDelegationDecisionBatch? = nil,
         stopFence: AgentRunStartStopFence? = nil,
         isLocalComposerInput: Bool = true,
+        remoteInterviewFirst: Bool? = nil,
         providerSwitchPreparation: ProviderSwitchSendPreparation? = nil,
         providerSwitchClaim: AgentComposerSubmitClaim? = nil,
         preparedTaggedInput: String? = nil,
@@ -16360,7 +16376,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let unexpandedWrappedText = composeOrdinaryUserTurnText(
             managedTurn?.providerText ?? nativePreparedTurn?.providerText ?? trimmedText,
             computerUseArmed: nativePreparedTurn == nil && computerUseArmedAtComposition,
-            includesInterview: managedTurn == nil && interviewFirst
+            includesInterview: managedTurn == nil && (remoteInterviewFirst ?? interviewFirst)
                 && (session.items.isEmpty || !session.items.contains(where: { $0.kind == .assistant })),
             workflow: activeWorkflow,
             includeBuiltInCleanupGuidance: GlobalSettingsStore.shared.showBuiltInWorkflowCleanupGuidance()
@@ -16480,6 +16496,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         restorationSelectedWorkflow: restorationSelectedWorkflow,
                         restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
                         managedTurn: managedTurn, stopFence: capturedStop, isLocalComposerInput: isLocalComposerInput,
+                        remoteInterviewFirst: remoteInterviewFirst,
                         providerSwitchPreparation: preparation, providerSwitchClaim: claim,
                         preparedTaggedInput: preparedInput
                     )
@@ -16512,7 +16529,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 session.pendingTaggedFileAttachments.removeAll { fileIDs.contains($0.id) }
             }
         }
-        if managedTurn == nil, interviewFirst, nativePreparedTurn == nil,
+        if managedTurn == nil, remoteInterviewFirst == nil, interviewFirst, nativePreparedTurn == nil,
            isLocalComposerInput || providerSwitchPreparation != nil,
            session.items.isEmpty || !session.items.contains(where: { $0.kind == .assistant }) { interviewFirst = false }
         let codexCompactionInFlight = session.selectedAgent == .codexExec
