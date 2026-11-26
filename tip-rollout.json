@@ -8,8 +8,8 @@
   "predecessors": [
     {
       "role": "transition",
-      "tag": "tip-d4c0d678b31d",
-      "rolloutManifestSha256": "f5cdfa3f92d6f67074dfe09e3c3aac6431377ea49ee741c33df4beb95a7b7519"
+      "tag": "tip-36e1c395d620",
+      "rolloutManifestSha256": "a4da4157e811dfd4d5c287876ba0c121e01bac55747043eebaf4af54d32aff1c"
     },
     {
       "role": "preparer",
