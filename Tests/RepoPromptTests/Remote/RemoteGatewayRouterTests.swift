@@ -752,19 +752,36 @@ final class RemoteIrohSecurityTests: XCTestCase {
         XCTAssertTrue(manager.isPaired)
     }
 
-    func testExpiredQRAndLegacyPrepareCannotActivateNewDevice() throws {
+    func testLegacyHelloPairsOnceAndPreservesTheCredentialAcrossRestart() throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 4600))
+        var disk = RemoteStoredPairingState()
+        let manager = makeManager(clock: clock, persist: { disk = $0 })
+        let issued = try manager.issueAdvertisement(server: .init(endpointID: endpointID("a")))
+        let legacy = pairingRequest(secret: issued.oneTimeSecret, attemptID: nil)
+        XCTAssertThrowsError(try prepare(legacy, on: manager, peer: endpointID("c")))
+        let receipt = try prepare(legacy, on: manager)
+        XCTAssertNil(receipt.attemptID)
+        XCTAssertNil(disk.pending)
+        XCTAssertNil(disk.advertisement)
+        XCTAssertTrue(isAuthorized(receipt, on: manager))
+        XCTAssertThrowsError(try prepare(legacy, on: manager))
+        let restored = makeManager(clock: clock, storedState: disk)
+        XCTAssertTrue(isAuthorized(receipt, on: restored))
+    }
+
+    func testLegacyHelloCannotReplacePendingConfirmationOrUseExpiredCode() throws {
         let clock = TestClock(Date(timeIntervalSince1970: 4600))
         let manager = makeManager(clock: clock)
         let issued = try manager.issueAdvertisement(server: .init(endpointID: endpointID("a")))
-        let legacy = pairingRequest(secret: issued.oneTimeSecret, attemptID: nil)
-        XCTAssertThrowsError(try prepare(legacy, on: manager)) { error in
-            guard case RemoteGatewaySecurityError.confirmationRequired = error else {
-                return XCTFail("Expected legacy pairing to require an app update")
-            }
-        }
-        clock.date = issued.expiresAt
+        let receipt = try prepare(pairingRequest(secret: issued.oneTimeSecret), on: manager)
+        XCTAssertThrowsError(try prepare(pairingRequest(secret: issued.oneTimeSecret, attemptID: nil), on: manager))
+        XCTAssertFalse(isAuthorized(receipt, on: manager))
+        XCTAssertTrue(try confirm(confirmation(for: receipt), on: manager))
+        try manager.revokeDevice()
+        let next = try manager.issueAdvertisement(server: .init(endpointID: endpointID("a")))
+        clock.date = next.expiresAt
         XCTAssertEqual(manager.status, .codeExpired)
-        XCTAssertThrowsError(try prepare(pairingRequest(secret: issued.oneTimeSecret), on: manager))
+        XCTAssertThrowsError(try prepare(pairingRequest(secret: next.oneTimeSecret, attemptID: nil), on: manager))
         XCTAssertFalse(manager.isPaired)
     }
 

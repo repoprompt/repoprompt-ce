@@ -367,14 +367,13 @@ final class RemoteIrohGatewayAdapter {
         }
 
         switch frame.kind {
-        case .pairingHello:
-            pairing?.attemptID = frame.messageID
-            throw RemoteIrohGatewayAdapterError.remote(RemoteGatewaySecurityError.confirmationRequired.response)
-
-        case .pairingPrepare:
+        case .pairingHello, .pairingPrepare:
             pairing?.failure = .decodeRequest
-            let hello = try frame.decodedPayload(as: RemotePairingHello.self, expectedKind: .pairingPrepare)
-            pairing?.attemptID = hello.request.attemptID
+            let hello = try frame.decodedPayload(as: RemotePairingHello.self, expectedKind: frame.kind)
+            guard (frame.kind == .pairingPrepare) == (hello.request.attemptID != nil) else {
+                throw RemoteIrohGatewayAdapterError.malformedPayload
+            }
+            pairing?.attemptID = hello.request.attemptID ?? frame.messageID
             pairing?.failure = .rejected
             let routed = await router.route(
                 .pairIroh(hello.request, authenticatedPeerEndpointID: peerEndpointID),
@@ -483,7 +482,11 @@ final class RemoteIrohGatewayAdapter {
                 ticket = current.sync.issueTicket()
                 sessions[peerEndpointID] = current
             }
-            let rpcResponse = rpcResponse(from: routed, syncTicket: ticket)
+            let rpcResponse = rpcResponse(
+                from: routed,
+                syncTicket: ticket,
+                compressSnapshot: rpc.operation == .snapshot && rpc.acceptsCompressedSnapshot == true
+            )
             return try RemoteWireFrame(
                 kind: .rpcResponse,
                 messageID: frame.messageID,
@@ -654,10 +657,14 @@ final class RemoteIrohGatewayAdapter {
         return data
     }
 
-    private func rpcResponse(from response: RemoteGatewayResponse, syncTicket: UUID?) -> RemoteRPCResponse {
+    private func rpcResponse(
+        from response: RemoteGatewayResponse,
+        syncTicket: UUID?,
+        compressSnapshot: Bool
+    ) -> RemoteRPCResponse {
         switch response.content {
         case let .json(data):
-            RemoteRPCResponse(result: data, syncTicket: syncTicket)
+            RemoteRPCResponse(result: data, syncTicket: syncTicket, compressSnapshot: compressSnapshot)
         case let .error(error):
             RemoteRPCResponse(error: error)
         case .events:

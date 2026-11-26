@@ -401,6 +401,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                         desktop: desktopSummary
                     )
                     refreshPairingStatus()
+                    if request.attemptID == nil { invalidatePreviousPairingSessions() }
                     pairingCode = nil
                     lastError = nil
                     return .success(response)
@@ -418,9 +419,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                     serverEndpointID: irohAdapter.currentAddress?.endpointID ?? ""
                 )
                 if promoted {
-                    commandGeneration &+= 1
-                    controlService?.clearAttachmentUploads()
-                    irohAdapter.revokePeerSessions()
+                    invalidatePreviousPairingSessions()
                     pairingCode = nil
                     lastError = nil
                 }
@@ -431,6 +430,12 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                 return result
             }
         )
+    }
+
+    private func invalidatePreviousPairingSessions() {
+        commandGeneration &+= 1
+        controlService?.clearAttachmentUploads()
+        irohAdapter.revokePeerSessions()
     }
 
     private func startEventPolling() {
