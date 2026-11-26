@@ -2,8 +2,7 @@ import Foundation
 import RepoPromptRemoteProtocol
 
 enum RemoteSnapshotBootstrap {
-    /// Leave room for both base64 layers, JSON escaping, the wire header, and the sync ticket.
-    static let maximumJSONBytes = RemoteWireProtocol.maximumServerResponseFrameBytes / 8
+    static let maximumJSONBytes = RemoteWireProtocol.maximumSnapshotJSONBytes
 
     static func encode(_ snapshot: RemoteSnapshot, with encoder: JSONEncoder) throws -> Data {
         let full = try encoder.encode(snapshot)

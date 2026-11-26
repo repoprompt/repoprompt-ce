@@ -177,16 +177,28 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
                             try await host.applyMerge(sessionID: fixture.sessionID, operationID: mergeOperation.id, isStillAuthorized: { true })
                         }
                     }
-                    defer { applying.cancel() }
-                    try await AsyncTestWait.waitUntil("cold target merge review or early refusal") {
-                        mergeCommand.writer.session.pendingWorktreeMergeReview != nil || applyFinished
+                    do {
+                        // Admission probes real Git checkouts before it can publish the review.
+                        try await AsyncTestWait.waitUntil("cold target merge review or early refusal", timeout: 20) {
+                            mergeCommand.writer.session.pendingWorktreeMergeReview != nil || applyFinished
+                        }
+                        if applyFinished {
+                            _ = try await applying.value
+                        }
+                        let review = try XCTUnwrap(mergeCommand.writer.session.pendingWorktreeMergeReview)
+                        let interactions = try XCTUnwrap(mergeCommand.writer.scope.installedInteractions)
+                        let accepted = interactions.submitWorktreeMergeReviewDecision(command: mergeCommand, reviewID: review.id, decision: .accept)
+                        if !accepted {
+                            applying.cancel()
+                        }
+                        XCTAssertTrue(accepted)
+                        _ = try await applying.value
+                    } catch {
+                        // Release the command's preparation claim before retiring its host.
+                        applying.cancel()
+                        _ = await applying.result
+                        throw error
                     }
-                    if applyFinished { _ = try await applying.value }
-                    let review = try XCTUnwrap(mergeCommand.writer.session.pendingWorktreeMergeReview)
-                    XCTAssertTrue(try XCTUnwrap(mergeCommand.writer.scope.installedInteractions).submitWorktreeMergeReviewDecision(
-                        command: mergeCommand, reviewID: review.id, decision: .accept
-                    ))
-                    _ = try await applying.value
                     let merged = try await AgentSessionDataService.shared.loadAgentSession(id: fixture.sessionID, for: canonicalWorkspace)
                     XCTAssertEqual(merged?.worktreeMergeOperations.first?.status, .completed)
                     XCTAssertEqual(mergeCommand.writer.session.runState, .idle, "Standalone review must return to its original idle state")

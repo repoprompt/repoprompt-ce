@@ -133,7 +133,7 @@ struct RemoteSettingsView: View {
                         Text("Open RepoPrompt Remote on your phone to reconnect and finish syncing.")
                             .foregroundStyle(.secondary)
                     } else if gateway.phoneReadiness == .legacyActive {
-                        Text("Update RepoPrompt Remote on your phone to confirm its first sync.")
+                        Text("This phone is active. Sync confirmation turns on automatically when both apps support it.")
                             .foregroundStyle(.secondary)
                     }
                     Button("Unpair phone", role: .destructive) {
