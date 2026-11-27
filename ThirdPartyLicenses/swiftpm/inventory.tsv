@@ -4,6 +4,7 @@ jsonschema	1.3.0	https://github.com/loopwork-ai/JSONSchema.git	jsonschema/
 keyboardshortcuts	2.3.0	https://github.com/sindresorhus/KeyboardShortcuts.git	keyboardshortcuts/
 networkimage	6.0.1	https://github.com/gonzalezreal/NetworkImage	networkimage/
 ontology	0.6.0	https://github.com/loopwork-ai/ontology.git	ontology/
+repoprompt-remote	fcd581ad13b63329bb3cd600ff0b448e6feed750	https://github.com/repoprompt/repoprompt-remote.git	repoprompt-remote/
 sentry-cocoa	9.17.1	https://github.com/getsentry/sentry-cocoa	sentry-cocoa/
 swift-algorithms	1.2.1	https://github.com/apple/swift-algorithms.git	swift-algorithms/
 swift-asn1	1.7.0	https://github.com/apple/swift-asn1.git	swift-asn1/
