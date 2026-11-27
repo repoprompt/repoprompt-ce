@@ -1108,6 +1108,133 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         try await runVisibleLifetimeWitness(switchWorkspace: false, submission: .composerWithHiddenRow)
     }
 
+    func testWorkspaceActivationFailureSettlesAndRetriesWithoutLosingDraftOrSavedSession() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("AgentActivationRetry-\(UUID())")
+        let runtime = MCPDomainRuntime(configuration: .init(
+            mode: .app, profileIdentifier: "activation-retry-\(UUID())", storageDirectory: directory,
+            workspaceStorageDirectory: directory.appendingPathComponent("workspaces"),
+            eventDirectory: directory.appendingPathComponent("events"),
+            temporaryDirectory: directory.appendingPathComponent("tmp"), externalReloadInterval: nil
+        ))
+        try await runtime.start()
+        addTeardownBlock {
+            _ = await runtime.shutdown()
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        defer { GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false) }
+        let transport = MCPService(controller: ServerController(), hostBootstrapOperation: {}, controllerStartOperation: {}, controllerFullShutdownOperation: {})
+        addTeardownBlock { await transport.fullShutdown() }
+        let providerResources = AgentRunProviderComposition(
+            headless: { _, _ in preconditionFailure("Retry must not start a provider") },
+            acp: { _, _ in
+                XCTFail("Retry must not start a provider")
+                return nil
+            },
+            controller: { try ACPAgentSessionController(provider: $0, runRequest: $1, allowsProviderProcessLaunchForTesting: true) }
+        )
+        let sessionID = UUID()
+        let tab = ComposeTabState(activeAgentSessionID: sessionID)
+        var workspace = WorkspaceModel(name: "Activation retry", repoPaths: [], customStoragePath: directory.appendingPathComponent("sessions"))
+        workspace.composeTabs = [tab]
+        workspace.activeComposeTabID = tab.id
+        let authority = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: 0)
+        _ = try await authority.create(
+            workspace, fileURL: runtime.configuration.workspaceStorageDirectory.appendingPathComponent("\(workspace.id.uuidString).json")
+        )
+        let savedFile = try await AgentSessionDataService.shared.saveAgentSession(.init(
+            id: sessionID, workspaceID: workspace.id, composeTabID: tab.id, name: "Saved conversation", itemCount: 0
+        ), for: workspace)
+        let savedBytes = try Data(contentsOf: savedFile)
+        let window = makeVisibleLifetimeWindow(runtime: runtime, providerResources: providerResources, transport: transport)
+        let agent = window.agentModeViewModel
+        let prepare = try XCTUnwrap(agent.canonicalWorkspaceHostPreparation)
+        var preparationAttempts = 0
+        agent.canonicalWorkspaceHostPreparation = { candidate, owner, activations in
+            if candidate.id == workspace.id {
+                preparationAttempts += 1
+                if preparationAttempts == 1 { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
+            }
+            return try await prepare(candidate, owner, activations)
+        }
+        try await activateVisibleLifetimeWorkspace(workspace, in: window, expectsHost: false)
+        let navigation = AgentModeNavigationController(isSystemWorkspaceMode: workspace.isSystemWorkspace)
+        navigation.onAppear(isSystem: workspace.isSystemWorkspace, windowState: window, agentModeVM: agent)
+        let outgoing = agent.runtimeHost
+        guard case let .workspaceActivationFailed(initialOwner) = agent.ui.transcript.snapshot.panePresentation else {
+            return XCTFail("A refused workspace activation must finish restoring and offer Retry")
+        }
+        XCTAssertNil(agent.activeSessionLoadInProgressTabID)
+        XCTAssertNil(agent.makeComposerSubmitTarget(tabID: tab.id, session: nil))
+        agent.storeDraftText(for: tab.id, "Keep this draft")
+        let outgoingTabIDs = Set(outgoing.scope.sessions.keys)
+
+        var service = AgentRunMCPToolService(
+            toolName: MCPWindowToolName.agentRun,
+            captureRequestMetadata: { .init(connectionID: nil, clientName: nil, windowID: window.windowID) },
+            requireTargetWindow: { window },
+            resolveRequestedTabID: { _ in nil },
+            resolveSpawnParentSourceTabID: { _ in nil },
+            resolveSpawnParentSessionID: { _, _ in nil },
+            withHeartbeat: { _, _, _, _, operation in try await operation() },
+            startRun: { _, _, _, _, _, _, _, _, _, _, _, _, _ in throw MCPError.internalError("Unexpected run dispatch") }
+        )
+        service.resolveOracleReviewLaunchSource = { _, window in
+            .init(
+                snapshot: .init(
+                    route: .explicitWindowActiveCompose, windowID: window.windowID, workspaceID: workspace.id,
+                    tabID: tab.id, selectionRevision: 0, promptText: "", selection: tab.selection,
+                    sourceAgentSessionID: sessionID, routedRunID: nil
+                ),
+                source: .unavailable(.init(
+                    delegationID: UUID(), sourceTabID: tab.id, workspaceID: workspace.id,
+                    sourceAgentSessionID: sessionID, sourceAgentRunID: nil,
+                    reason: .sourceCaptureFailed("Workspace activation test")
+                ))
+            )
+        }
+        let model = AgentModelCatalog.defaultModelRaw(for: .openCode, availability: agent.agentAvailabilityContext)
+        for request: [String: Value] in [
+            ["op": .string("start"), "model_id": .string("\(AgentProviderKind.openCode.rawValue):\(model)"), "message": .string("Start"), "detach": .bool(true)],
+            ["op": .string("steer"), "session_id": .string(sessionID.uuidString), "message": .string("Continue"), "wait": .bool(false)]
+        ] {
+            do {
+                _ = try await service.execute(args: request)
+                XCTFail("Agent Run must refuse until the workspace host is ready")
+            } catch {
+                guard case let MCPError.invalidParams(message) = error else { return XCTFail("Unexpected error: \(error)") }
+                XCTAssertEqual(message, "Agent Mode could not start for this workspace. Use Retry in Agent Mode, then run this command again.")
+            }
+        }
+        XCTAssertTrue(agent.runtimeHost === outgoing)
+        XCTAssertEqual(Set(outgoing.scope.sessions.keys), outgoingTabIDs)
+        XCTAssertNil(outgoing.scope.sessions[tab.id])
+
+        let activity = window.workspaceManager.workspaceActivityCoordinator
+        let retirement = try XCTUnwrap(activity.claimLaneRetirement(workspaceID: workspace.id))
+        await agent.retryWorkspaceActivation(initialOwner)
+        activity.releaseLaneRetirement(workspaceID: workspace.id, claimID: retirement)
+        guard case let .workspaceActivationFailed(retryOwner) = agent.ui.transcript.snapshot.panePresentation else {
+            return XCTFail("A refused retry must settle and offer another Retry")
+        }
+        XCTAssertNotEqual(retryOwner, initialOwner)
+        XCTAssertEqual(agent.draftRuntime.text(for: tab.id), "Keep this draft")
+        await agent.retryWorkspaceActivation(initialOwner)
+        XCTAssertEqual(preparationAttempts, 1, "An old Retry action cannot start another activation")
+
+        await agent.retryWorkspaceActivation(retryOwner)
+        XCTAssertFalse(agent.isAwaitingWorkspaceAdoption)
+        XCTAssertFalse(agent.runtimeHost === outgoing)
+        let session = await agent.ensureSessionReady(tabID: tab.id)
+        XCTAssertEqual(session.activeAgentSessionID, sessionID)
+        XCTAssertTrue(session.hasLoadedPersistedState)
+        XCTAssertNotNil(agent.makeComposerSubmitTarget(tabID: tab.id, session: session))
+        XCTAssertEqual(agent.draftRuntime.text(for: tab.id), "Keep this draft")
+        XCTAssertEqual(window.workspaceManager.activeAgentSessionID(forTabID: tab.id), sessionID)
+        XCTAssertEqual(try Data(contentsOf: savedFile), savedBytes)
+    }
+
     func testRemoteFollowUpReachesVisibleSessionOnIndependentHost() async throws {
         try await runVisibleLifetimeWitness(switchWorkspace: false, submission: .remoteFollowUp)
     }
