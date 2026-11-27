@@ -604,7 +604,12 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
     }
 
     private func resetCodexWatchdogState(_ session: AgentTabSession) {
+        clearCodexWatchdogOwnedStatus(for: session)
+        // Controller replacement can keep the same turn alive; its capacity notice stays shown
+        // once. The key names a unique turn, so carrying it across resets never hides a new turn.
+        let capacityNoticeTurnKey = session.codexWatchdogState.capacityNoticeTurnKey
         session.codexWatchdogState = .init()
+        session.codexWatchdogState.capacityNoticeTurnKey = capacityNoticeTurnKey
     }
 
     private func recordCodexWatchdogProgress(
@@ -617,6 +622,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         session.codexWatchdogState.lastAmbiguousProbeKind = nil
         session.codexWatchdogState.lastAmbiguousProbeFingerprint = nil
         session.codexWatchdogState.ambiguousActiveProbeCount = 0
+        session.codexWatchdogState.activeTurnGrace = nil
+        clearCodexWatchdogOwnedStatus(for: session)
         guard session.runState.isActive else {
             return
         }
@@ -627,6 +634,108 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             ?? session.codexLastEventAt
             ?? session.lastUserMessageAt
             ?? session.lastActivityAt
+    }
+
+    static let codexStillInProgressStatusText = "Still working — no updates from Codex for 5 min."
+    static let codexCapacityRetryNoticeText =
+        "Model at capacity. Codex is retrying automatically; this can take several minutes."
+
+    static func codexCapacityRetryStatusText(attempt: Int, maxAttempts: Int) -> String {
+        "Model at capacity. Codex retries automatically (\(attempt)/\(maxAttempts))."
+    }
+
+    /// How long an unchanged active turn may stay silent before reattach: a silent extension
+    /// or a provider capacity backoff. Twice the recovery threshold (600 s in production).
+    private var codexActiveTurnGraceInterval: TimeInterval {
+        codexStallWatchdogRecoveryThreshold * 2
+    }
+
+    /// Codex marks a provider capacity rejection in a retry notice's details
+    /// ("Selected model is at capacity. …") or, structurally, as `serverOverloaded`.
+    static func isCodexCapacityRetryNotification(
+        _ notification: CodexNativeSessionController.ErrorNotification
+    ) -> Bool {
+        if let details = notification.additionalDetails,
+           details.range(of: "selected model is at capacity", options: .caseInsensitive) != nil
+        {
+            return true
+        }
+        guard let info = notification.codexErrorInfo else { return false }
+        let normalized = info.lowercased().filter { $0 != "_" && $0 != "-" }
+        return normalized.contains("serveroverloaded")
+    }
+
+    /// Parses Codex's "Reconnecting... n/m" retry notice into its retry number and limit.
+    static func codexRetryAttempt(fromReconnectMessage message: String) -> (attempt: Int, maxAttempts: Int)? {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.lowercased().hasPrefix("reconnecting"),
+              let range = trimmed.range(of: #"(\d+)\s*/\s*(\d+)"#, options: .regularExpression)
+        else {
+            return nil
+        }
+        let parts = trimmed[range].split(separator: "/").map {
+            Int($0.trimmingCharacters(in: .whitespaces))
+        }
+        guard parts.count == 2,
+              let attempt = parts[0],
+              let maxAttempts = parts[1],
+              attempt >= 1,
+              attempt <= maxAttempts
+        else {
+            return nil
+        }
+        return (attempt, maxAttempts)
+    }
+
+    private func setCodexWatchdogOwnedStatus(
+        _ text: String,
+        source: AgentTabSession.RunningStatusSource,
+        session: AgentTabSession
+    ) {
+        setRunningStatus(text, source: source, session: session, urgent: true)
+        session.codexWatchdogState.ownedStatusText = text
+    }
+
+    /// Removes a watchdog-owned pill unless another status already replaced it.
+    private func clearCodexWatchdogOwnedStatus(for session: AgentTabSession) {
+        guard let owned = session.codexWatchdogState.ownedStatusText else { return }
+        session.codexWatchdogState.ownedStatusText = nil
+        if session.runningStatusText == owned {
+            setRunningStatus(nil, source: nil, session: session, urgent: true)
+        }
+    }
+
+    /// Renews the active-turn grace for a provider capacity retry and appends the capacity
+    /// notice once per turn. Runs after the event preamble recorded progress.
+    private func noteCodexCapacityRetry(
+        session: AgentTabSession,
+        notificationTurnID: String?,
+        now: Date = Date()
+    ) {
+        session.codexWatchdogState.activeTurnGrace = .init(
+            until: now.addingTimeInterval(codexActiveTurnGraceInterval),
+            reason: .capacityRetry
+        )
+        recordCodexWatchdogTransition("capacityGraceRenewed", session: session)
+        let turnKey = Self.nonEmptyTrimmed(session.codexAuthoritativeActiveTurn?.turnID)
+            ?? Self.nonEmptyTrimmed(notificationTurnID)
+            ?? session.activeRunAttemptID.map { "attempt:\($0.uuidString)" }
+            ?? "run"
+        guard session.codexWatchdogState.capacityNoticeTurnKey != turnKey else { return }
+        session.codexWatchdogState.capacityNoticeTurnKey = turnKey
+        session.appendItem(AgentChatItem.system(
+            Self.codexCapacityRetryNoticeText,
+            sequenceIndex: session.nextSequenceIndex
+        ))
+        presentationRuntime.requestUIRefresh(for: session, urgent: true)
+        persistenceRuntime?.scheduleSave(for: session)
+    }
+
+    private static func nonEmptyTrimmed(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+            return nil
+        }
+        return trimmed
     }
 
     private func codexWatchdogAttemptRemainsCurrent(
@@ -1310,11 +1419,46 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             )
             return false
         }
+        if activeTurnGraceDefersReattach(session: session, referenceDate: referenceDate, now: now) {
+            return false
+        }
         _ = deferCodexWatchdogUntilNextProbeWindow(
             for: session,
             reason: "active-reattach",
             now: now
         )
+        return true
+    }
+
+    /// An unchanged active turn may be healthy but silent, e.g. while Codex sleeps through a
+    /// provider retry backoff. A live grace keeps probing every probe window instead of
+    /// reattaching; the first silent stretch of each progress generation earns one extension.
+    /// Expired grace falls through to the existing reattach path.
+    private func activeTurnGraceDefersReattach(
+        session: AgentTabSession,
+        referenceDate: Date,
+        now: Date
+    ) -> Bool {
+        let state = session.codexWatchdogState
+        let grace: AgentModeViewModel.CodexWatchdogState.ActiveTurnGrace
+        if let existing = state.activeTurnGrace {
+            guard existing.until > now else { return false }
+            grace = existing
+            recordCodexWatchdogTransition("activeTurnGraceDeferred", session: session)
+        } else {
+            guard state.stillInProgressGraceGeneration != state.progressGeneration else { return false }
+            let until = referenceDate.addingTimeInterval(codexActiveTurnGraceInterval)
+            guard until > now else { return false }
+            grace = .init(until: until, reason: .stillInProgress)
+            setCodexWatchdogOwnedStatus(Self.codexStillInProgressStatusText, source: .transport, session: session)
+            session.codexWatchdogState.activeTurnGrace = grace
+            session.codexWatchdogState.stillInProgressGraceGeneration = state.progressGeneration
+            recordCodexWatchdogTransition("activeTurnGraceGranted", session: session)
+        }
+        _ = deferCodexWatchdogUntilNextProbeWindow(for: session, reason: "active-turn-grace", now: now)
+        if let suppressUntil = session.codexWatchdogState.suppressUntil, suppressUntil > grace.until {
+            session.codexWatchdogState.suppressUntil = grace.until
+        }
         return true
     }
 
@@ -10104,7 +10248,9 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             }
             await handleCodexErrorEvent(
                 notification.message, willRetry: willRetry, session: session, sourceController: sourceController,
-                cancelEventTask: !dispatchedOnEventTask
+                cancelEventTask: !dispatchedOnEventTask,
+                isCapacityRetry: Self.isCodexCapacityRetryNotification(notification),
+                notificationTurnID: notification.turnID
             )
         case let .error(message):
             let willRetry = Self.isRetriableStreamErrorMessage(message)
@@ -10120,9 +10266,11 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         }
     }
 
+    /// `isCapacityRetry` marks a notice Codex attributes to a provider capacity rejection.
     private func handleCodexErrorEvent(
         _ message: String, willRetry: Bool, session: AgentTabSession,
-        sourceController: (any CodexSessionControlling)?, cancelEventTask: Bool
+        sourceController: (any CodexSessionControlling)?, cancelEventTask: Bool,
+        isCapacityRetry: Bool = false, notificationTurnID: String? = nil
     ) async {
         if willRetry, session.runState.isActive {
             if let ownership = session.activeRunOwnership {
@@ -10133,7 +10281,20 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                     retryIntent: .providerManaged
                 )
             }
-            setRunningStatus(message, source: .reconnect, session: session, urgent: true)
+            if isCapacityRetry {
+                noteCodexCapacityRetry(session: session, notificationTurnID: notificationTurnID)
+            }
+            if isCapacityRetry,
+               let retry = Self.codexRetryAttempt(fromReconnectMessage: message)
+            {
+                setCodexWatchdogOwnedStatus(
+                    Self.codexCapacityRetryStatusText(attempt: retry.attempt, maxAttempts: retry.maxAttempts),
+                    source: .reconnect,
+                    session: session
+                )
+            } else {
+                setRunningStatus(message, source: .reconnect, session: session, urgent: true)
+            }
             presentationRuntime.setAgentRunActive(session, isActive: true)
             presentationRuntime.requestUIRefresh(for: session, urgent: true, scope: .runtimeMetrics)
             return

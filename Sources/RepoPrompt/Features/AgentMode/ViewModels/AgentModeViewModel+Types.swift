@@ -526,6 +526,25 @@ extension AgentModeViewModel {
         var lastAmbiguousProbeKind: String?
         var lastAmbiguousProbeFingerprint: String?
         var ambiguousActiveProbeCount: Int = 0
+        /// Extra time granted to an unchanged active turn before the watchdog may reattach.
+        /// Read only by the active-turn probe decision; real Codex progress clears it.
+        var activeTurnGrace: ActiveTurnGrace?
+        /// Progress generation that already used the one-time "still in progress" extension.
+        var stillInProgressGraceGeneration: UInt64?
+        /// Watchdog-owned status pill text, cleared with the grace when Codex progresses.
+        var ownedStatusText: String?
+        /// Turn that already received the capacity transcript notice; survives watchdog resets.
+        var capacityNoticeTurnKey: String?
+
+        struct ActiveTurnGrace: Equatable {
+            enum Reason: Equatable {
+                case stillInProgress
+                case capacityRetry
+            }
+
+            var until: Date
+            var reason: Reason
+        }
     }
 
     enum CodexNativeStartupDisposition: Equatable {
