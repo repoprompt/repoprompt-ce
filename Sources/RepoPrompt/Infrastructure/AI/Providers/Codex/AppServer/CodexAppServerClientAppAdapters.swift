@@ -26,6 +26,7 @@ extension CodexAppServerClient {
         },
         launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot = CodexRuntimeAuthority.currentLaunchSnapshot(),
         provisionsRepoPromptMCPOnStart: Bool = true,
+        workspaceVoiceOnly: Bool = false,
         optOutNotificationMethods: [String] = [],
         processExitObserverFactory: @escaping @Sendable (pid_t) -> ChildProcessExitObserver = {
             ChildProcessExitObserver.observe(pid: $0)
@@ -38,7 +39,8 @@ extension CodexAppServerClient {
                 computerUseRuntimeUnavailableMessage: computerUseRuntimeUnavailableMessage,
                 processEnvironmentBuilder: processEnvironmentBuilder,
                 runtimeStatePreparer: runtimeStatePreparer,
-                launchSnapshot: launchSnapshot
+                launchSnapshot: launchSnapshot,
+                workspaceVoiceOnly: workspaceVoiceOnly
             ),
             writeFrameHandler: writeFrameHandler,
             livenessProbe: livenessProbe,
@@ -95,6 +97,7 @@ struct CodexAppServerAppLaunchHost: CodexAppServerLaunchHost {
     let processEnvironmentBuilder: @Sendable (ProcessEnvironmentRequest) async -> ProcessEnvironmentResult
     let runtimeStatePreparer: @Sendable (CodexRuntimeAuthority.Runtime) throws -> Void
     let launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot
+    var workspaceVoiceOnly: Bool = false
 
     var applicationVersion: String {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
@@ -138,13 +141,32 @@ struct CodexAppServerAppLaunchHost: CodexAppServerLaunchHost {
                 )
             }
         }
-        return CodexOverrides.cliConfigArgs(
+        let arguments = CodexOverrides.cliConfigArgs(
             toolPolicy: .init(
                 toolOutputTokenLimit: MCPIntegrationHelper.desiredCodexToolOutputTokenLimit,
                 modelReasoningSummary: reasoningSummary
             ),
             featurePolicy: featurePolicy
         ) + rolloutCompressionArguments(for: runtime)
+        guard workspaceVoiceOnly else { return arguments }
+
+        // This process exposes the voice coordinator's dynamic tools. Keep its
+        // existing Codex account and remove tools inherited from the user's profile.
+        let configURL = runtime.statePaths.codexHome.appendingPathComponent("config.toml")
+        let config = FileManager.default.fileExists(atPath: configURL.path)
+            ? try String(contentsOf: configURL, encoding: .utf8)
+            : ""
+        let mcpOverrides = CodexIntegrationConfiguration.mcpServerEntries(from: config).map {
+            "mcp_servers.\($0.cliPathComponent).enabled=false"
+        }
+        let voiceOverrides = [
+            "features.shell_tool=false", "features.unified_exec=false", "features.code_mode=false",
+            "features.code_mode_only=false", "features.apps=false", "features.plugins=false",
+            "features.memories=false", "features.multi_agent=false", "features.multi_agent_v2=false",
+            "features.hooks=false", "features.tool_suggest=false",
+            "web_search=\"disabled\""
+        ]
+        return arguments + (mcpOverrides + voiceOverrides).flatMap { ["-c", $0] }
     }
 
     private func rolloutCompressionArguments(for runtime: CodexProviderRuntime.Runtime) -> [String] {

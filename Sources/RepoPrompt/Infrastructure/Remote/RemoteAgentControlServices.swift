@@ -414,13 +414,22 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
     private func continueRun(
         _ request: RemoteCommandRequest,
         files: [RemoteAttachmentUploads.File],
-        authorizeDispatch: @escaping RemoteDispatchAuthorization
+        authorizeDispatch: @escaping RemoteDispatchAuthorization,
+        voiceTarget: (context: WindowContext, workspaceID: UUID)? = nil
     ) async throws -> RemoteCommandResponse {
         let sessionID = try requiredSessionID(request.sessionID)
-        let context = try await contextForSession(
-            sessionID, requestedWorkspaceID: request.workspaceID, authorizeDispatch: authorizeDispatch
-        )
-        let expectedWorkspaceID = try workspaceID(for: context, fallback: request.workspaceID)
+        let context: WindowContext
+        let expectedWorkspaceID: UUID
+        if let voiceTarget {
+            context = voiceTarget.context
+            expectedWorkspaceID = voiceTarget.workspaceID
+            try authorizeDispatch()
+        } else {
+            context = try await contextForSession(
+                sessionID, requestedWorkspaceID: request.workspaceID, authorizeDispatch: authorizeDispatch
+            )
+            expectedWorkspaceID = try workspaceID(for: context, fallback: request.workspaceID)
+        }
         let target = try await context.agentMode.mcpResolveOrCreateSessionTarget(
             tabID: nil,
             sessionID: sessionID,
@@ -430,6 +439,11 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
         )
         defer { context.agentMode.mcpAcceptSessionTarget(target) }
         let session = await context.agentMode.ensureSessionReady(tabID: target.tabID)
+        if voiceTarget != nil, let pending = context.agentMode.mcpRuntime.mcpPendingInteraction(for: session),
+           pending.kind != .instruction
+        {
+            throw RemoteAgentControlServiceError.commandRejected("This chat is waiting for a response in RepoPrompt.")
+        }
         let message = try requiredMessage(request.message, allowsEmpty: !files.isEmpty)
         try context.agentMode.requireCurrentMCPWorkspaceTarget(target, expectedWorkspaceID: expectedWorkspaceID)
         if !files.isEmpty, session.runState.isActive || session.instructionContinuation != nil {
@@ -489,6 +503,39 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
             workspaceID: workspaceID(for: context, fallback: request.workspaceID),
             sessionID: sessionID,
             context: context
+        )
+    }
+
+    func continueWorkspaceVoiceChat(
+        workspaceID: UUID,
+        sessionID: UUID,
+        message: String,
+        isAuthorized: @escaping () -> Bool
+    ) async throws -> RemoteCommandResponse {
+        guard let manager = windowStatesManager, isAuthorized() else { throw RemoteWorkspaceVoiceError.unavailable }
+        let windows = manager.allWindows.filter {
+            !$0.isClosing && $0.workspaceManager.activeWorkspaceID == workspaceID
+        }
+        let window = windows.first(where: { window in
+            window.agentModeViewModel.sessions.values.contains { $0.activeAgentSessionID == sessionID }
+        }) ?? windows.first
+        guard let window else { throw RemoteWorkspaceVoiceError.workspaceClosed }
+
+        let authorizeDispatch: RemoteDispatchAuthorization = {
+            try Task.checkCancellation()
+            guard isAuthorized(), !window.isClosing, window.workspaceManager.activeWorkspaceID == workspaceID else {
+                throw RemoteWorkspaceVoiceError.unavailable
+            }
+        }
+        let context = WindowContext(window: window)
+        guard await canResolveSession(sessionID, in: context) else {
+            throw RemoteAgentControlServiceError.sessionNotFound
+        }
+        return try await continueRun(
+            RemoteCommandRequest(operation: .followUp, workspaceID: workspaceID.uuidString, sessionID: sessionID, message: message),
+            files: [],
+            authorizeDispatch: authorizeDispatch,
+            voiceTarget: (context, workspaceID)
         )
     }
 

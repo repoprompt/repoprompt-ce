@@ -42,7 +42,8 @@ final class RemoteGatewayController: NSObject, ObservableObject {
     private static let defaultAuthorityKey = "RepoPrompt.remote.defaultAuthority"
 
     private weak var windowStatesManager: WindowStatesManager?
-    private var controlService: (any RemoteAgentControlService)?
+    private var controlService: WindowRemoteAgentControlService?
+    private let workspaceVoice = RemoteWorkspaceVoiceService()
     private let pairingManager = RemotePairingManager()
     private let irohIdentityStore = RemoteIrohIdentityStore()
     let availabilityController = RemoteAvailabilityController()
@@ -127,6 +128,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
             }
             if !RemoteAuthorizationState(defaultLevel: newValue).allows(.control) {
                 controlService?.clearAttachmentUploads()
+                workspaceVoice.invalidate()
             }
             UserDefaults.standard.set(newValue.rawValue, forKey: Self.defaultAuthorityKey)
         }
@@ -180,6 +182,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
 
     func stop() {
         commandGeneration &+= 1
+        workspaceVoice.invalidate()
         controlService?.clearAttachmentUploads()
         eventPollTask?.cancel()
         eventPollTask = nil
@@ -242,6 +245,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
 
     private func publishPairingRevocation() {
         commandGeneration &+= 1
+        workspaceVoice.invalidate()
         controlService?.clearAttachmentUploads()
         irohAdapter.revokePeerSessions()
         refreshPairingStatus()
@@ -428,12 +432,79 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                 let result = await snapshot(bootstrap: true)
                 lastSnapshotAt = Date()
                 return result
+            },
+            workspaceVoice: { [unowned self] request, context in
+                try workspaceVoice.handle(request) {
+                    try makeWorkspaceVoiceAccess(workspaceID: request.workspaceID, context: context)
+                }
+            }
+        )
+    }
+
+    private func voiceWindows(_ workspaceID: UUID) -> [WindowState] {
+        windowStatesManager?.allWindows.filter {
+            !$0.isClosing && $0.workspaceManager.activeWorkspaceID == workspaceID
+                && $0.workspaceManager.activeWorkspace?.isEphemeral == false
+        } ?? []
+    }
+
+    private func makeWorkspaceVoiceAccess(
+        workspaceID: UUID,
+        context: RemoteGatewayRequestContext
+    ) throws -> RemoteWorkspaceVoiceAccess {
+        guard let workspace = voiceWindows(workspaceID).first?.workspaceManager.activeWorkspace else {
+            throw RemoteWorkspaceVoiceError.workspaceClosed
+        }
+        let generation = commandGeneration
+        let isAuthorized = { [weak self] in
+            guard let self else { return false }
+            return commandGeneration == generation && authorizationState.allows(.control)
+                && requestRouter.isAuthorized(context) && !voiceWindows(workspaceID).isEmpty
+        }
+        let readService = { [weak self] () throws -> WindowRemoteReadService in
+            guard let self, isAuthorized() else { throw RemoteWorkspaceVoiceError.unavailable }
+            return WindowRemoteReadService(
+                contexts: voiceWindows(workspaceID).map { ($0.agentModeViewModel, $0.workspaceManager) },
+                revisionTracker: transcriptRevisionTracker,
+                workspaceScope: workspaceID
+            )
+        }
+        let liveSessions = { [weak self] in
+            self?.lastPublishedSnapshot?.sessions.filter {
+                $0.isLive && UUID(uuidString: $0.workspaceID) == workspaceID
+            } ?? []
+        }
+        return RemoteWorkspaceVoiceAccess(
+            workspaceID: workspaceID,
+            name: workspace.name,
+            isAuthorized: isAuthorized,
+            liveSessions: liveSessions,
+            history: { request in
+                try await readService().history(
+                    request,
+                    including: liveSessions().map(RemoteWorkspaceVoiceChatTools.historyEntry(for:))
+                )
+            },
+            transcript: { sessionID, before in
+                try await readService().transcript(
+                    sessionID: sessionID, paging: .recentBackward(before: before),
+                    limit: 12, includeDetails: false
+                )
+            },
+            message: { [weak self] sessionID, message, leaseIsValid in
+                guard let self, let controlService, isAuthorized(), leaseIsValid() else {
+                    throw RemoteWorkspaceVoiceError.unavailable
+                }
+                return try await controlService.continueWorkspaceVoiceChat(
+                    workspaceID: workspaceID, sessionID: sessionID, message: message, isAuthorized: { isAuthorized() && leaseIsValid() }
+                )
             }
         )
     }
 
     private func invalidatePreviousPairingSessions() {
         commandGeneration &+= 1
+        workspaceVoice.invalidate()
         controlService?.clearAttachmentUploads()
         irohAdapter.revokePeerSessions()
     }

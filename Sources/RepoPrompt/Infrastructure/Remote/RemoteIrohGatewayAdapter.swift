@@ -611,6 +611,8 @@ final class RemoteIrohGatewayAdapter {
             ))
         case .imageAttachment:
             return try .imageAttachment(decodePayload(RemoteImageAttachmentRequest.self, from: rpc.payload))
+        case .workspaceVoice:
+            return try .workspaceVoice(decodePayload(RemoteWorkspaceVoiceRequest.self, from: rpc.payload))
         case .command:
             return try .command(
                 decodePayload(RemoteCommandRequest.self, from: rpc.payload),

@@ -31,6 +31,7 @@ enum RemoteGatewayRequest {
     case history(RemoteHistoryRPCRequest)
     case transcript(RemoteGatewayTranscriptRequest)
     case imageAttachment(RemoteImageAttachmentRequest)
+    case workspaceVoice(RemoteWorkspaceVoiceRequest)
     case events(after: UInt64?)
     case command(RemoteCommandRequest, endpoint: RemoteGatewayCommandEndpoint)
 }
@@ -90,6 +91,7 @@ struct RemoteGatewayRoutingServices {
     var commandGeneration: () -> UInt64
     var execute: (RemoteCommandRequest, @escaping RemoteDispatchAuthorization) async -> RemoteGatewayCommandResult
     var eventCursor: () async -> UInt64
+    var workspaceVoice: (RemoteWorkspaceVoiceRequest, RemoteGatewayRequestContext) throws -> RemoteWorkspaceVoiceStatus
 
     init(
         authorize: @escaping (RemoteGatewayRequestContext) -> Bool,
@@ -110,7 +112,10 @@ struct RemoteGatewayRoutingServices {
         confirmIroh: @escaping (RemotePairingConfirmation, String) throws -> Void = { _, _ in
             throw RemoteGatewayRouterError.irohUnavailable
         },
-        bootstrapSnapshot: (() async -> RemoteSnapshot?)? = nil
+        bootstrapSnapshot: (() async -> RemoteSnapshot?)? = nil,
+        workspaceVoice: @escaping (RemoteWorkspaceVoiceRequest, RemoteGatewayRequestContext) throws -> RemoteWorkspaceVoiceStatus = { _, _ in
+            throw RemoteWorkspaceVoiceError.unavailable
+        }
     ) {
         self.confirmIroh = confirmIroh
         self.authorize = authorize
@@ -127,6 +132,7 @@ struct RemoteGatewayRoutingServices {
         self.commandGeneration = commandGeneration
         self.execute = execute
         self.eventCursor = eventCursor
+        self.workspaceVoice = workspaceVoice
     }
 }
 
@@ -274,6 +280,21 @@ final class RemoteGatewayRequestRouter {
                     .init(code: "image_unavailable", message: "The image is unavailable on the Mac.", retryable: true),
                     status: 404
                 )
+            }
+
+        case let .workspaceVoice(request):
+            guard request.isValid else {
+                return .error(.init(code: "invalid_voice_request", message: "Invalid voice session request."), status: 400)
+            }
+            guard services.authorizationState().allows(.control) else {
+                return .error(.init(code: "forbidden", message: "Workspace Voice requires Control permission on the Mac."), status: 403)
+            }
+            do {
+                return try encode(services.workspaceVoice(request, context))
+            } catch let error as RemoteWorkspaceVoiceError {
+                return .error(.init(code: "workspace_voice", message: error.localizedDescription), status: 409)
+            } catch {
+                return .error(.init(code: "workspace_voice", message: "The Mac could not open Workspace Voice."), status: 503)
             }
 
         case let .events(cursor):

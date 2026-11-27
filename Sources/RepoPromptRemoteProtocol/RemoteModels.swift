@@ -455,6 +455,7 @@ public struct RemoteCatalogMetadata: Codable, Sendable, Equatable {
     public let supportsStartSelection: Bool
     public let supportsSessionConfiguration: Bool
     public let supportsAttachments: Bool?
+    public let supportsWorkspaceVoice: Bool?
 
     public init(
         defaultAgentID: String? = nil,
@@ -462,7 +463,8 @@ public struct RemoteCatalogMetadata: Codable, Sendable, Equatable {
         toolCatalog: RemoteToolCatalog? = nil,
         supportsStartSelection: Bool = false,
         supportsSessionConfiguration: Bool = false,
-        supportsAttachments: Bool? = nil
+        supportsAttachments: Bool? = nil,
+        supportsWorkspaceVoice: Bool? = nil
     ) {
         self.defaultAgentID = defaultAgentID
         self.defaultSelection = defaultSelection
@@ -470,6 +472,7 @@ public struct RemoteCatalogMetadata: Codable, Sendable, Equatable {
         self.supportsStartSelection = supportsStartSelection
         self.supportsSessionConfiguration = supportsSessionConfiguration
         self.supportsAttachments = supportsAttachments
+        self.supportsWorkspaceVoice = supportsWorkspaceVoice
     }
 }
 
