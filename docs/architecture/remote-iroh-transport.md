@@ -8,7 +8,8 @@ gateway lifecycle, session state, permissions, and command execution.
 - `RemoteGatewayController` owns enablement, startup/shutdown, QR state, event production, and diagnostics.
 - `RemoteGatewayRequestRouter` is the only application router. The adapter uses the snapshot/read/control services, authority mapping, transcript paging, replay buffer, and `RemoteErrorResponse` vocabulary.
 - `RemoteIrohGatewayAdapter` owns the Swift side of the Rust endpoint, authenticated hello/pairing preflight, framed RPC/event serialization, and connection/path diagnostics.
-- `RepoPromptIrohTransport` owns Iroh, QUIC streams, four-byte bounded framing, staged connection policy, deadlines, and cryptographically authenticated peer endpoint IDs. It does not persist identity or application data.
+- `RepoPromptRemoteNetworking` owns the shared Iroh endpoint lifecycle, pinned-peer dialing, stream admission, framing, path observation, deadlines and read retries. The Rust bridge isolates a stream failure from the rest of the authenticated connection.
+- The desktop adapter supplies product authorization, routing and snapshot projection. The phone supplies Keychain storage, lifecycle and presentation.
 
 ## Identity and pairing
 

@@ -104,9 +104,7 @@ protocol RemoteAgentControlService: AnyObject {
     func clearAttachmentUploads()
 }
 
-/// Direct in-process adapter for the Remote gateway. It intentionally calls
-/// the same typed Agent Mode control surface used by the desktop's MCP adapter,
-/// without creating an MCP request, socket connection, or serialized tool call.
+/// Direct in-process adapter for paired Remote commands and Agent Mode session writers.
 @MainActor
 final class WindowRemoteAgentControlService: RemoteAgentControlService {
     private weak var windowStatesManager: WindowStatesManager?
@@ -186,7 +184,16 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
     static func remoteRejectionMessage(for error: MCPError) -> String {
         switch error {
         case let .invalidParams(detail):
-            detail ?? "The requested command is not valid for this agent session."
+            switch detail ?? "The requested command is not valid for this agent session." {
+            case AgentModeViewModel.mcpResidentTargetError, AgentModeViewModel.mcpResidentBusyError:
+                "This chat is busy or changing. Refresh the conversation and try again."
+            case AgentModeViewModel.mcpResidentProtectedError:
+                "Respond to the pending request or stop the run before sending another message."
+            case AgentModeViewModel.mcpResidentUnconfirmedError:
+                "The message may already be in the chat. Refresh the conversation before sending it again."
+            case let message:
+                message
+            }
         case .urlElicitationRequired:
             "The agent requires an additional sign-in or setup step on the Mac."
         case .connectionClosed, .transportError:
@@ -310,7 +317,9 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
                 tabID: nil,
                 sessionID: sessionID,
                 createIfNeeded: true,
-                sessionName: nil
+                sessionName: nil,
+                expectedWorkspaceID: workspaceID(for: context, fallback: request.workspaceID),
+                purpose: .remoteCommand
             )
             defer { context.agentMode.mcpAcceptSessionTarget(target) }
             guard let session = context.agentMode.sessions[target.tabID],
@@ -372,7 +381,8 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
             sessionID: sessionID,
             createIfNeeded: true,
             sessionName: nil,
-            expectedWorkspaceID: expectedWorkspaceID
+            expectedWorkspaceID: expectedWorkspaceID,
+            purpose: .remoteCommand
         )
         defer { context.agentMode.mcpAcceptSessionTarget(target) }
         let resolved = try await context.agentMode.mcpConfigureRemoteSession(
@@ -417,6 +427,7 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
         authorizeDispatch: @escaping RemoteDispatchAuthorization
     ) async throws -> RemoteCommandResponse {
         let sessionID = try requiredSessionID(request.sessionID)
+        let message = try requiredMessage(request.message, allowsEmpty: !files.isEmpty)
         let context = try await contextForSession(
             sessionID, requestedWorkspaceID: request.workspaceID, authorizeDispatch: authorizeDispatch
         )
@@ -426,67 +437,43 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
             sessionID: sessionID,
             createIfNeeded: true,
             sessionName: nil,
-            expectedWorkspaceID: expectedWorkspaceID
+            expectedWorkspaceID: expectedWorkspaceID,
+            purpose: .remoteCommand
         )
         defer { context.agentMode.mcpAcceptSessionTarget(target) }
         let session = await context.agentMode.ensureSessionReady(tabID: target.tabID)
-        let message = try requiredMessage(request.message, allowsEmpty: !files.isEmpty)
-        try context.agentMode.requireCurrentMCPWorkspaceTarget(target, expectedWorkspaceID: expectedWorkspaceID)
+        let validateTarget: RemoteDispatchAuthorization = {
+            try authorizeDispatch()
+            guard self.windowStatesManager?.window(withID: context.window.windowID) === context.window,
+                  !context.window.isClosing, !WindowStatesManager.shared.isTerminating
+            else {
+                throw RemoteAgentControlServiceError.sessionNotFound
+            }
+            try context.agentMode.requireCurrentMCPWorkspaceTarget(target, expectedWorkspaceID: expectedWorkspaceID)
+        }
+        try validateTarget()
         if !files.isEmpty, session.runState.isActive || session.instructionContinuation != nil {
             throw RemoteAgentControlServiceError.commandRejected("Wait for the current run to finish before sending attachments.")
         }
-        try authorizeDispatch()
         let attachments = try await importAttachments(files, sessionID: sessionID, workspaceID: expectedWorkspaceID, in: context)
-        try context.agentMode.requireCurrentMCPWorkspaceTarget(target, expectedWorkspaceID: expectedWorkspaceID)
-        if let resident = try context.agentMode.mcpResidentTarget(sessionID: sessionID) {
-            _ = try await context.agentMode.mcpSubmitResidentTask(
-                resident,
-                text: message,
-                workflow: nil,
-                remoteAttachments: attachments,
-                windowIsAvailable: {
-                    (try? authorizeDispatch()) != nil
-                        && context.window === resident.window
-                        && !context.window.isClosing && !WindowStatesManager.shared.isTerminating
-                }
-            )
-            return await response(request: request, workspaceID: expectedWorkspaceID, sessionID: sessionID, context: context)
-        }
-        let activatedContext: AgentModeViewModel.AgentMCPControlContext? = if session.mcpControlContext?.sessionID != sessionID {
-            try await context.agentMode.mcpActivateControlContext(
-                forTabID: target.tabID,
-                sessionID: sessionID,
-                originatingConnectionID: nil,
-                taskLabelKind: .pair,
-                startPending: false,
-                markSessionAsMCPOriginated: true
-            )
-        } else {
-            nil
-        }
-        do {
-            try context.agentMode.requireCurrentMCPWorkspaceTarget(
-                target, expectedWorkspaceID: expectedWorkspaceID
-            )
+        try validateTarget()
+        if context.agentMode.mcpRuntime.controlledWriter(sessionID: sessionID)?.session === session {
             _ = try await context.agentMode.mcpDispatchInstruction(
                 sessionID: sessionID,
                 text: message,
                 allowStartingRun: true,
                 remoteAttachments: attachments,
-                validateInitialStart: authorizeDispatch
+                validateInitialStart: validateTarget
             )
-        } catch {
-            if let activatedContext {
-                _ = await context.agentMode.mcpDeactivateOwnedControlContext(
-                    sessionID: sessionID,
-                    expectedContext: activatedContext
-                )
-            }
-            throw error
+        } else {
+            _ = try await context.agentMode.submitRemoteSessionMessage(
+                to: session, sessionID: sessionID, workspaceID: expectedWorkspaceID,
+                text: message, attachments: attachments, validateDispatch: validateTarget
+            )
         }
-        return try await response(
+        return await response(
             request: request,
-            workspaceID: workspaceID(for: context, fallback: request.workspaceID),
+            workspaceID: expectedWorkspaceID,
             sessionID: sessionID,
             context: context
         )
@@ -507,7 +494,8 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
             sessionID: sessionID,
             createIfNeeded: false,
             sessionName: nil,
-            expectedWorkspaceID: expectedWorkspaceID
+            expectedWorkspaceID: expectedWorkspaceID,
+            purpose: .remoteCommand
         )
         defer { context.agentMode.mcpAcceptSessionTarget(target) }
         let session = await context.agentMode.ensureSessionReady(tabID: target.tabID)
@@ -648,7 +636,8 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
             sessionID: sessionID,
             createIfNeeded: false,
             sessionName: nil,
-            expectedWorkspaceID: expectedWorkspaceID
+            expectedWorkspaceID: expectedWorkspaceID,
+            purpose: .remoteCommand
         )
         defer { context.agentMode.mcpAcceptSessionTarget(target) }
         let session = await context.agentMode.ensureSessionReady(tabID: target.tabID)

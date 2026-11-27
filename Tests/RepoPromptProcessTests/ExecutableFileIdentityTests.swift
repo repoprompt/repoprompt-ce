@@ -23,7 +23,7 @@ final class ExecutableFileIdentityTests: XCTestCase {
 
         for testCase in cases {
             XCTAssertTrue(
-                ExecutableFileIdentity.permitsHomebrewAdminGroupWritableDirectory(
+                ExecutableFileIdentity.permitsAdminGroupWritableDirectory(
                     canonicalPath: testCase.canonicalPath,
                     directoryPath: testCase.directoryPath,
                     mode: 0o775,
@@ -61,7 +61,7 @@ final class ExecutableFileIdentityTests: XCTestCase {
 
         for testCase in cases {
             XCTAssertFalse(
-                ExecutableFileIdentity.permitsHomebrewAdminGroupWritableDirectory(
+                ExecutableFileIdentity.permitsAdminGroupWritableDirectory(
                     canonicalPath: testCase.canonicalPath,
                     directoryPath: testCase.directoryPath,
                     mode: testCase.mode,
@@ -70,6 +70,50 @@ final class ExecutableFileIdentityTests: XCTestCase {
                     effectiveUID: effectiveUID
                 ),
                 "Expected trust boundary violation to be rejected: \(testCase.name)"
+            )
+        }
+    }
+
+    func testPermitsRootOwnedAdminGroupWritableApplicationsAncestor() {
+        XCTAssertTrue(
+            ExecutableFileIdentity.permitsAdminGroupWritableDirectory(
+                canonicalPath: "/Applications/Antigravity.app/Contents/Resources/app/bin/antigravity",
+                directoryPath: "/Applications",
+                mode: 0o775,
+                ownerUID: 0,
+                groupGID: 80,
+                effectiveUID: 501
+            )
+        )
+    }
+
+    func testApplicationsExceptionRejectsTrustBoundaryViolations() {
+        let canonicalPath = "/Applications/Antigravity.app/Contents/MacOS/Antigravity"
+        let cases: [(name: String, executable: String, directory: String, mode: mode_t, owner: uid_t, group: gid_t)] = [
+            ("current user owns Applications", canonicalPath, "/Applications", 0o775, 501, 80),
+            ("non-admin group", canonicalPath, "/Applications", 0o775, 0, 20),
+            ("world writable", canonicalPath, "/Applications", 0o777, 0, 80),
+            ("outside app bundle", "/Applications/Tools/bin/cli", "/Applications", 0o775, 0, 80),
+            ("executable named like an app", "/Applications/cli.app", "/Applications", 0o775, 0, 80),
+            ("bundle lookalike", "/Applications/App.app-backup/Contents/MacOS/cli", "/Applications", 0o775, 0, 80),
+            ("group-writable bundle", canonicalPath, "/Applications/Antigravity.app", 0o775, 0, 80),
+            ("group-writable bundle descendant", canonicalPath, "/Applications/Antigravity.app/Contents", 0o775, 0, 80),
+            ("lookalike directory", "/Applications-Other/App.app/Contents/MacOS/cli", "/Applications-Other", 0o775, 0, 80),
+            ("canonical target outside Applications", "/Applications-Other/App.app/Contents/MacOS/cli", "/Applications", 0o775, 0, 80),
+            ("user Applications directory", "/Users/example/Applications/App.app/Contents/MacOS/cli", "/Users/example/Applications", 0o775, 0, 80)
+        ]
+
+        for testCase in cases {
+            XCTAssertFalse(
+                ExecutableFileIdentity.permitsAdminGroupWritableDirectory(
+                    canonicalPath: testCase.executable,
+                    directoryPath: testCase.directory,
+                    mode: testCase.mode,
+                    ownerUID: testCase.owner,
+                    groupGID: testCase.group,
+                    effectiveUID: 501
+                ),
+                "Expected Applications trust boundary violation to be rejected: \(testCase.name)"
             )
         }
     }
