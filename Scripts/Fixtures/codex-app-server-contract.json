@@ -2063,7 +2063,8 @@
         "includeStartupContext",
         "codexResponseHandoffMode",
         "prompt"
-      ]
+      ],
+      "maySend": ["voice"]
     },
     {
       "union": "ClientRequest.json",
@@ -2083,6 +2084,22 @@
         },
         {
           "path": "sdp",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "union": "ServerNotification.json",
+      "method": "thread/realtime/transcript/delta",
+      "consumedParams": [
+        {
+          "path": "threadId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "role",
           "presence": "required",
           "nullable": false
         }

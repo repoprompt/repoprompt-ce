@@ -491,14 +491,36 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                     limit: 12, includeDetails: false
                 )
             },
-            dispatch: { [weak self] sessionID, message, leaseIsValid in
+            dispatch: { [weak self] request, leaseIsValid in
                 guard let self, let controlService, isAuthorized(), leaseIsValid() else {
                     throw RemoteWorkspaceVoiceError.unavailable
                 }
-                return try await controlService.dispatchWorkspaceVoiceChat(
-                    workspaceID: workspaceID, sessionID: sessionID, message: message,
-                    isAuthorized: { isAuthorized() && leaseIsValid() }
-                )
+                let required = RemoteGatewayRequestRouter.requiredAuthority(for: request.operation)
+                return try await controlService.dispatchWorkspaceVoiceCommand(request, workspaceID: workspaceID) {
+                    try Task.checkCancellation()
+                    guard isAuthorized(), leaseIsValid() else { throw RemoteWorkspaceVoiceError.unavailable }
+                    guard self.authorizationState.allows(required) else {
+                        throw RemoteAgentControlServiceError.commandRejected("Changing Mac-wide tools requires Danger permission on the Mac.")
+                    }
+                }
+            },
+            catalog: { [weak self] in
+                guard let self, isAuthorized(), let primary = voiceWindows(workspaceID).first else {
+                    throw RemoteWorkspaceVoiceError.unavailable
+                }
+                let windows = windowStatesManager?.allWindows.filter { !$0.isClosing && $0 !== primary } ?? []
+                return await DesktopRemoteCatalogService(
+                    agentModes: ([primary] + windows).map(\.agentModeViewModel)
+                ).remoteCatalog()
+            },
+            browse: { [weak self] operation, path in
+                guard let self, isAuthorized(), let window = voiceWindows(workspaceID).first else {
+                    throw RemoteWorkspaceVoiceError.unavailable
+                }
+                return try await RemoteWorkspaceVoiceFiles(window: window, workspaceID: workspaceID).execute(operation, path: path)
+            },
+            canConfigureTools: { [weak self] in
+                self?.authorizationState.allows(.danger) == true
             }
         )
     }

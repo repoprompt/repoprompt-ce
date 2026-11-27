@@ -1,5 +1,6 @@
 import Foundation
 @_spi(TestSupport) @testable import RepoPromptApp
+import RepoPromptCodexProvider
 import RepoPromptRemoteProtocol
 import XCTest
 
@@ -40,9 +41,10 @@ final class RemoteWorkspaceVoiceTests: XCTestCase {
                 reads.append(id)
                 return .init(sessionID: id, items: [])
             },
-            dispatch: { id, text, authorized in
-                let id = try XCTUnwrap(id)
-                XCTAssertEqual(text, "Run the regression test.")
+            dispatch: { request, authorized in
+                let id = try XCTUnwrap(request.sessionID)
+                XCTAssertEqual(request.operation, .followUp)
+                XCTAssertEqual(request.message, "Run the regression test.")
                 XCTAssertTrue(authorized())
                 messages.append(id)
                 return .init(commandID: UUID(), accepted: true, workspaceID: workspaceID.uuidString, sessionID: id)
@@ -88,10 +90,13 @@ final class RemoteWorkspaceVoiceTests: XCTestCase {
                 return .init(entries: [], workspaceID: workspaceID)
             },
             transcript: { id, _ in .init(sessionID: id, items: []) },
-            dispatch: { id, text, authorized in
-                XCTAssertNil(id)
+            dispatch: { request, authorized in
+                XCTAssertNil(request.sessionID)
+                XCTAssertEqual(request.operation, .startRun)
+                XCTAssertEqual(request.modelID, "gpt-6-astra")
+                XCTAssertEqual(request.reasoningEffort, "high")
                 XCTAssertTrue(authorized())
-                starts.append(text)
+                try starts.append(XCTUnwrap(request.message))
                 return .init(
                     commandID: UUID(), accepted: true,
                     workspaceID: workspaceID.uuidString, sessionID: newChatID, runState: .working
@@ -100,7 +105,9 @@ final class RemoteWorkspaceVoiceTests: XCTestCase {
         )
         var leaseIsValid = true
         let tools = RemoteWorkspaceVoiceChatTools(workspace: access, leaseIsValid: { leaseIsValid })
-        let reply = try await tools.execute("start_chat", arguments: ["message": .string("  Review my changes.  ")])
+        let reply = try await tools.execute("start_chat", arguments: [
+            "message": .string("  Review my changes.  "), "model_id": .string("gpt-6-astra"), "effort": .string("high")
+        ])
         XCTAssertTrue(reply.contains(newChatID.uuidString))
         do {
             _ = try await tools.execute("start_chat", arguments: [:])
@@ -129,7 +136,7 @@ final class RemoteWorkspaceVoiceTests: XCTestCase {
             liveSessions: { [] },
             history: { _ in .init(entries: [], workspaceID: workspaceID) },
             transcript: { id, _ in .init(sessionID: id, items: []) },
-            dispatch: { _, _, _ in throw RemoteWorkspaceVoiceError.unavailable }
+            dispatch: { _, _ in throw RemoteWorkspaceVoiceError.unavailable }
         )
         func request(
             _ action: RemoteWorkspaceVoiceRequest.Action, id: UUID, peer: String = "paired-phone",
@@ -173,5 +180,88 @@ final class RemoteWorkspaceVoiceTests: XCTestCase {
             throw RemoteWorkspaceVoiceError.unavailable
         }
         XCTAssertEqual(delayed, end)
+    }
+
+    func testVoiceConfiguresTheMostRecentWorkspaceChatAndSendsOneCommand() async throws {
+        let workspaceID = UUID()
+        let chatID = UUID()
+        let entry = RemoteHistoryEntry(
+            id: chatID, workspaceID: workspaceID.uuidString, sessionName: "Todo", lastActivityAt: Date()
+        )
+        var requests: [RemoteCommandRequest] = []
+        var dispatched: [UUID] = []
+        let tools = RemoteWorkspaceVoiceChatTools(
+            workspace: .init(
+                workspaceID: workspaceID, name: "Garden Notes", isAuthorized: { true }, liveSessions: { [] },
+                history: { request in
+                    XCTAssertEqual(request.workspaceID, workspaceID)
+                    XCTAssertEqual(request.limit, 1)
+                    return .init(entries: [entry], workspaceID: workspaceID)
+                },
+                transcript: { id, _ in .init(sessionID: id, items: []) },
+                dispatch: { request, _ in
+                    requests.append(request)
+                    return .init(
+                        commandID: request.commandID, accepted: true, workspaceID: workspaceID.uuidString, sessionID: chatID,
+                        resolvedSelection: .init(agentID: "codexExec", modelID: "gpt-6-astra", reasoningEffort: "high")
+                    )
+                }
+            ),
+            leaseIsValid: { true },
+            didDispatch: { dispatched.append($0) }
+        )
+        let result = try await tools.execute("send_to_chat", arguments: [
+            "chat_id": .string("most_recent"), "model_id": .string("gpt-6-astra"),
+            "effort": .string("high"), "message": .string("Build a todo list.")
+        ])
+        XCTAssertTrue(result.contains("gpt-6-astra"))
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests.first?.sessionID, chatID)
+        XCTAssertEqual(requests.first?.reasoningEffort, "high")
+        XCTAssertEqual(requests.first?.message, "Build a todo list.")
+        XCTAssertEqual(dispatched, [chatID])
+    }
+
+    func testVoiceToolChangeRequiresDangerAndUsesTheCurrentMacWideRevision() async throws {
+        let workspaceID = UUID()
+        var hasDanger = false
+        var requests: [RemoteCommandRequest] = []
+        let search = RemoteToolSettingDescriptor(id: "search", displayName: "Search", category: "tools", isEnabled: true)
+        let access = RemoteWorkspaceVoiceAccess(
+            workspaceID: workspaceID, name: "Garden Notes", isAuthorized: { true }, liveSessions: { [] },
+            history: { _ in .init(entries: [], workspaceID: workspaceID) },
+            transcript: { id, _ in .init(sessionID: id, items: []) },
+            dispatch: { request, _ in
+                requests.append(request)
+                return .init(
+                    commandID: request.commandID, accepted: true, workspaceID: workspaceID.uuidString,
+                    resolvedToolCatalog: .init(
+                        providerID: "codexExec", revision: 8,
+                        settings: [.init(id: "search", displayName: "Search", category: "tools", isEnabled: false)], isMutable: true
+                    )
+                )
+            },
+            catalog: {
+                .init(
+                    workflows: [], agents: [],
+                    metadata: .init(toolCatalog: .init(providerID: "codexExec", revision: 7, settings: [search], isMutable: true))
+                )
+            },
+            canConfigureTools: { hasDanger }
+        )
+        let tools = RemoteWorkspaceVoiceChatTools(workspace: access, leaseIsValid: { true })
+        let arguments: [String: CodexJSONValue] = ["setting_id": .string("search"), "enabled": .bool(false)]
+        do {
+            _ = try await tools.execute("set_tool", arguments: arguments)
+            XCTFail("Control permission cannot change Mac-wide tools.")
+        } catch RemoteAgentControlServiceError.commandRejected {
+            XCTAssertTrue(requests.isEmpty)
+        }
+        hasDanger = true
+        _ = try await tools.execute("set_tool", arguments: arguments)
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests.first?.operation, .configureTools)
+        XCTAssertNil(requests.first?.sessionID)
+        XCTAssertEqual(requests.first?.toolMutation, .init(settingID: "search", enabled: false, expectedRevision: 7))
     }
 }
