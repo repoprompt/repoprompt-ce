@@ -669,7 +669,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             }
             let stop = try XCTUnwrap(claim.cancellation.pendingStartFence(for: f.session))
             let item = AgentChatItem.user("Original row", sequenceIndex: f.session.nextSequenceIndex)
-            let receipt = try XCTUnwrap(submissions.captureCanonicalPublication(claim: claim, host: host, item: item))
+            let receipt = try XCTUnwrap(submissions.captureCanonicalPublication(claim: claim, host: host, session: f.session, item: item))
             let rollback = host.scope.turnTiming.recordAgentTurnUserAnchor(for: f.session, userItem: item)
             let previousObserver = f.session.onSourceItemsChanged
             f.session.onSourceItemsChanged = { session, mutation in
@@ -741,7 +741,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                 return XCTFail("Expected the original composer claim: \(change)")
             }
             let item = AgentChatItem.user("Canonical local input", sequenceIndex: f.session.nextSequenceIndex)
-            let publication = try XCTUnwrap(submissions.captureCanonicalPublication(claim: claim, host: host, item: item))
+            let publication = try XCTUnwrap(submissions.captureCanonicalPublication(claim: claim, host: host, session: f.session, item: item))
             let rollback = host.scope.turnTiming.recordAgentTurnUserAnchor(for: f.session, userItem: item)
             f.session.appendItem(item)
             claim.cancellation.recordOptimisticInput(item.id, on: f.session)
@@ -1363,6 +1363,14 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             XCTAssertTrue(agent.sidebarLiveOverseerRelations().contains(.init(overseerSessionID: observerID, overseenSessionID: sessionID)))
             XCTAssertTrue(WindowStatesManager.shared.agentSessionLinkSetRoutineWakeInterval(enabled: true, seconds: 300, for: observer))
             XCTAssertTrue(agent.currentMonitorPillProps(tabID: siblingTab.id).routineWakeIntervalEnabled)
+            let poll = try await bridge.authorizeTarget(
+                operation: .monitorPoll, observerEndpoint: observer, targetSessionID: sessionID
+            ).get()
+            let snooze = await bridge.autoWakeSnoozeProjection(
+                observerEndpoint: observer, targetSessionID: sessionID,
+                expectedReference: .init(linkID: poll.lease.linkID, generation: poll.lease.linkGeneration)
+            )
+            XCTAssertNil(try snooze.get())
             return
         }
         let prompt = "Retain the originating provider"
