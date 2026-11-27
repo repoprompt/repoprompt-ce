@@ -140,12 +140,12 @@ final class RemoteWorkspaceVoiceTests: XCTestCase {
         )
         func request(
             _ action: RemoteWorkspaceVoiceRequest.Action, id: UUID, peer: String = "paired-phone",
-            openWorkspace: () throws -> RemoteWorkspaceVoiceAccess
+            openWorkspace: @escaping @MainActor () async throws -> RemoteWorkspaceVoiceAccess
         ) throws -> RemoteWorkspaceVoiceStatus {
             try service.handle(.init(
                 action: action, callID: id, workspaceID: workspaceID,
                 offerSDP: action == .start ? "v=0\r\n" : nil
-            ), peerEndpointID: peer, openWorkspace: openWorkspace)
+            ), peerEndpointID: peer, isAuthorized: { true }, openWorkspace: openWorkspace)
         }
         func unexpectedWorkspaceOpen() throws -> RemoteWorkspaceVoiceAccess {
             XCTFail("This request must not open a workspace.")
@@ -169,17 +169,74 @@ final class RemoteWorkspaceVoiceTests: XCTestCase {
         let workspaceID = UUID()
         let end = try service.handle(.init(
             action: .end, callID: callID, workspaceID: workspaceID
-        ), peerEndpointID: "paired-phone") {
+        ), peerEndpointID: "paired-phone", isAuthorized: { true }) {
             XCTFail("End must not open the workspace.")
             throw RemoteWorkspaceVoiceError.unavailable
         }
         let delayed = try service.handle(.init(
             action: .start, callID: callID, workspaceID: workspaceID, offerSDP: "v=0\r\n"
-        ), peerEndpointID: "paired-phone") {
+        ), peerEndpointID: "paired-phone", isAuthorized: { true }) {
             XCTFail("A delayed start reopened an ended call.")
             throw RemoteWorkspaceVoiceError.unavailable
         }
         XCTAssertEqual(delayed, end)
+    }
+
+    func testWorkspaceVoiceReportsOpeningAndSharesOneAsynchronousAttempt() async throws {
+        let service = RemoteWorkspaceVoiceService()
+        defer { service.invalidate() }
+        let callID = UUID()
+        let workspaceID = UUID()
+        let start = RemoteWorkspaceVoiceRequest(
+            action: .start, callID: callID, workspaceID: workspaceID, offerSDP: "v=0\r\n"
+        )
+        var attempts = 0
+        let opening = try service.handle(start, peerEndpointID: "paired-phone", isAuthorized: { true }) {
+            attempts += 1
+            throw RemoteAgentControlServiceError.commandRejected("The workspace is still being restored.")
+        }
+        let duplicate = try service.handle(start, peerEndpointID: "paired-phone", isAuthorized: { true }) {
+            XCTFail("A repeated start must share the pending opening attempt.")
+            throw RemoteWorkspaceVoiceError.unavailable
+        }
+        XCTAssertEqual(opening, duplicate)
+        XCTAssertEqual(opening.phase, .connecting)
+        XCTAssertEqual(opening.message, "Opening workspace on the Mac…")
+
+        let poll = RemoteWorkspaceVoiceRequest(action: .status, callID: callID, workspaceID: workspaceID)
+        var settled = opening
+        for _ in 0 ..< 100 {
+            await Task.yield()
+            settled = try service.handle(poll, peerEndpointID: "paired-phone", isAuthorized: { true }) {
+                XCTFail("A status request must not open a workspace.")
+                throw RemoteWorkspaceVoiceError.unavailable
+            }
+            if settled.phase == .failed { break }
+        }
+        XCTAssertEqual(settled.phase, .failed)
+        XCTAssertEqual(settled.message, "The workspace is still being restored.")
+        XCTAssertEqual(attempts, 1)
+    }
+
+    func testEndingWorkspaceVoiceImmediatelyCancelsOpening() async throws {
+        let service = RemoteWorkspaceVoiceService()
+        let callID = UUID()
+        let workspaceID = UUID()
+        let start = RemoteWorkspaceVoiceRequest(
+            action: .start, callID: callID, workspaceID: workspaceID, offerSDP: "v=0\r\n"
+        )
+        func unexpectedOpen() throws -> RemoteWorkspaceVoiceAccess {
+            XCTFail("An ended call cannot open a workspace.")
+            throw RemoteWorkspaceVoiceError.unavailable
+        }
+        _ = try service.handle(
+            start, peerEndpointID: "paired-phone", isAuthorized: { true }, openWorkspace: unexpectedOpen
+        )
+        let ended = try service.handle(.init(
+            action: .end, callID: callID, workspaceID: workspaceID
+        ), peerEndpointID: "paired-phone", isAuthorized: { true }, openWorkspace: unexpectedOpen)
+        await Task.yield()
+        XCTAssertEqual(ended.phase, .ended)
     }
 
     func testVoiceConfiguresTheMostRecentWorkspaceChatAndSendsOneCommand() async throws {

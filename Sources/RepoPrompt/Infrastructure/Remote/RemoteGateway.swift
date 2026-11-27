@@ -434,8 +434,16 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                 return result
             },
             workspaceVoice: { [unowned self] request, context in
-                try workspaceVoice.handle(request, peerEndpointID: context.endpointID) {
-                    try makeWorkspaceVoiceAccess(workspaceID: request.workspaceID, context: context)
+                let generation = commandGeneration
+                let isAuthorized: @MainActor () -> Bool = { [weak self] in
+                    guard let self else { return false }
+                    return commandGeneration == generation && authorizationState.allows(.control)
+                        && requestRouter.isAuthorized(context)
+                }
+                return try workspaceVoice.handle(request, peerEndpointID: context.endpointID, isAuthorized: isAuthorized) { [weak self] in
+                    guard let self else { throw RemoteWorkspaceVoiceError.unavailable }
+                    try await openWorkspaceForVoice(request.workspaceID, isAuthorized: isAuthorized)
+                    return try makeWorkspaceVoiceAccess(workspaceID: request.workspaceID, isCallAuthorized: isAuthorized)
                 }
             }
         )
@@ -448,18 +456,57 @@ final class RemoteGatewayController: NSObject, ObservableObject {
         } ?? []
     }
 
+    private func openWorkspaceForVoice(_ workspaceID: UUID, isAuthorized: @MainActor () -> Bool) async throws {
+        guard let manager = windowStatesManager else { throw RemoteWorkspaceVoiceError.unavailable }
+        func requireAccess() throws {
+            try Task.checkCancellation()
+            guard isAuthorized(), !manager.isTerminating else { throw RemoteWorkspaceVoiceError.unavailable }
+        }
+
+        try requireAccess()
+        if !voiceWindows(workspaceID).isEmpty { return }
+        guard manager.allWindows.contains(where: { window in
+            guard !window.isClosing, let workspace = window.workspaceManager.workspace(withID: workspaceID) else { return false }
+            return !workspace.isEphemeral && workspace.consolidatedIntoWorkspaceID == nil
+        }) else { throw RemoteAgentControlServiceError.workspaceNotFound }
+
+        _ = await manager.waitForWindowRestoreBeforeWorkspaceLink(workspaceID: workspaceID)
+        try requireAccess()
+        if !voiceWindows(workspaceID).isEmpty { return }
+
+        // Open into a fresh window so the user's other workspace stays available.
+        let window = try await manager.openNewMainWindow(
+            deferringInitialAgentSystemWorkspaceRefresh: true, matchingRestoreWorkspaceID: workspaceID
+        )
+        defer { window.agentModeViewModel.finishInitialSystemWorkspaceSessionListRefreshDeferral() }
+        await window.workspaceManager.awaitInitialized()
+        _ = await manager.waitForWindowRestoreBeforeWorkspaceLink(workspaceID: workspaceID, openedWindowID: window.windowID)
+        try requireAccess()
+        if !voiceWindows(workspaceID).isEmpty { return }
+        guard !window.isClosing, manager.allWindows.contains(where: { $0 === window }),
+              let target = window.workspaceManager.workspace(withID: workspaceID), !target.isEphemeral
+        else { throw RemoteAgentControlServiceError.workspaceNotFound }
+        if let current = window.workspaceManager.activeWorkspace, !current.isSystemWorkspace || !current.repoPaths.isEmpty {
+            throw RemoteAgentControlServiceError.commandRejected("The new Mac window is already in use. Try starting voice again.")
+        }
+        let result = await window.workspaceManager.requestWorkspaceSwitch(
+            to: target, saveState: true, reason: "remote_workspace_voice", silent: true
+        )
+        try requireAccess()
+        guard !voiceWindows(workspaceID).isEmpty else {
+            throw RemoteAgentControlServiceError.commandRejected(result.message ?? "The Mac could not open this workspace.")
+        }
+    }
+
     private func makeWorkspaceVoiceAccess(
         workspaceID: UUID,
-        context: RemoteGatewayRequestContext
+        isCallAuthorized: @escaping @MainActor () -> Bool
     ) throws -> RemoteWorkspaceVoiceAccess {
         guard let workspace = voiceWindows(workspaceID).first?.workspaceManager.activeWorkspace else {
             throw RemoteWorkspaceVoiceError.workspaceClosed
         }
-        let generation = commandGeneration
         let isAuthorized = { [weak self] in
-            guard let self else { return false }
-            return commandGeneration == generation && authorizationState.allows(.control)
-                && requestRouter.isAuthorized(context) && !voiceWindows(workspaceID).isEmpty
+            isCallAuthorized() && self?.voiceWindows(workspaceID).isEmpty == false
         }
         let readService = { [weak self] () throws -> WindowRemoteReadService in
             guard let self, isAuthorized() else { throw RemoteWorkspaceVoiceError.unavailable }

@@ -13,7 +13,7 @@ enum RemoteWorkspaceVoiceError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .unavailable: "This Workspace Voice session is unavailable."
-        case .workspaceClosed: "Open this workspace on the Mac to start Workspace Voice."
+        case .workspaceClosed: "The selected workspace is no longer open on the Mac."
         case .busy: "End the current Workspace Voice call first."
         case .unknownChat: "That chat could not be found in this workspace. Search for it again."
         case .invalidToolArguments: "The workspace tool received an invalid request."
@@ -48,10 +48,12 @@ final class RemoteWorkspaceVoiceService {
     func handle(
         _ request: RemoteWorkspaceVoiceRequest,
         peerEndpointID: String,
-        openWorkspace: () throws -> RemoteWorkspaceVoiceAccess
+        isAuthorized: @escaping @MainActor () -> Bool,
+        openWorkspace: @escaping @MainActor () async throws -> RemoteWorkspaceVoiceAccess
     ) throws -> RemoteWorkspaceVoiceStatus {
+        guard isAuthorized() else { throw RemoteWorkspaceVoiceError.unavailable }
         let current = call
-        let matches = current?.id == request.callID && current?.workspace.workspaceID == request.workspaceID
+        let matches = current?.id == request.callID && current?.workspaceID == request.workspaceID
             && current?.peerEndpointID == peerEndpointID
         if current?.id == request.callID, !matches { throw RemoteWorkspaceVoiceError.unavailable }
         switch request.action {
@@ -65,15 +67,14 @@ final class RemoteWorkspaceVoiceService {
                 throw RemoteWorkspaceVoiceError.busy
             }
             guard let offerSDP = request.offerSDP else { throw RemoteWorkspaceVoiceError.invalidToolArguments }
-            let workspace = try openWorkspace()
-            guard workspace.workspaceID == request.workspaceID, workspace.isAuthorized() else {
-                throw RemoteWorkspaceVoiceError.workspaceClosed
-            }
             // The same paired phone can explicitly begin a fresh call after relaunching.
             invalidate()
-            let next = Call(id: request.callID, peerEndpointID: peerEndpointID, workspace: workspace)
+            let next = Call(
+                id: request.callID, peerEndpointID: peerEndpointID, workspaceID: request.workspaceID,
+                isAuthorized: isAuthorized
+            )
             call = next
-            next.start(offerSDP: offerSDP, voice: request.voice)
+            next.start(offerSDP: offerSDP, voice: request.voice, openWorkspace: openWorkspace)
             return next.status
         case .status:
             if endedCallIDs.contains(request.callID) { return endedStatus(for: request) }
@@ -112,7 +113,9 @@ extension RemoteWorkspaceVoiceService {
 
         let id: UUID
         let peerEndpointID: String
-        let workspace: RemoteWorkspaceVoiceAccess
+        let workspaceID: UUID
+        private let isAuthorized: @MainActor () -> Bool
+        private var workspace: RemoteWorkspaceVoiceAccess?
         private let client = CodexAppServerClient(provisionsRepoPromptMCPOnStart: false, workspaceVoiceOnly: true)
         private var phase: RemoteWorkspaceVoiceStatus.Phase = .connecting
         private var threadID: String?
@@ -129,10 +132,13 @@ extension RemoteWorkspaceVoiceService {
         private var expiry: Task<Void, Never>?
         private var toolResults: [String: ToolResult] = [:]
 
-        init(id: UUID, peerEndpointID: String, workspace: RemoteWorkspaceVoiceAccess) {
+        init(
+            id: UUID, peerEndpointID: String, workspaceID: UUID, isAuthorized: @escaping @MainActor () -> Bool
+        ) {
             self.id = id
             self.peerEndpointID = peerEndpointID
-            self.workspace = workspace
+            self.workspaceID = workspaceID
+            self.isAuthorized = isAuthorized
         }
 
         var isOpen: Bool {
@@ -141,17 +147,36 @@ extension RemoteWorkspaceVoiceService {
 
         var status: RemoteWorkspaceVoiceStatus {
             .init(
-                callID: id, workspaceID: workspace.workspaceID, phase: phase,
-                answerSDP: answerSDP, lines: lines, message: errorMessage,
+                callID: id, workspaceID: workspaceID, phase: phase,
+                answerSDP: answerSDP, lines: lines,
+                message: phase == .connecting && workspace == nil ? "Opening workspace on the Mac…" : errorMessage,
                 activity: phase == .ready ? toolActivity ?? activity : nil,
                 workingChatID: workingChatID
             )
         }
 
-        func start(offerSDP: String, voice: RemoteWorkspaceVoicePreset?) {
+        func start(
+            offerSDP: String, voice: RemoteWorkspaceVoicePreset?,
+            openWorkspace: @escaping @MainActor () async throws -> RemoteWorkspaceVoiceAccess
+        ) {
             renew()
             startup = Task { [weak self] in
                 guard let self else { return }
+                do {
+                    try requireAccess()
+                    let workspace = try await openWorkspace()
+                    try requireAccess()
+                    guard workspace.workspaceID == workspaceID, workspace.isAuthorized() else {
+                        throw RemoteWorkspaceVoiceError.workspaceClosed
+                    }
+                    self.workspace = workspace
+                } catch {
+                    if !Task.isCancelled {
+                        let message = (error as? LocalizedError)?.errorDescription ?? "The Mac could not open this workspace."
+                        finish(.failed, message: message)
+                    }
+                    return
+                }
                 do {
                     try await open(offerSDP: offerSDP, voice: voice)
                 } catch {
@@ -242,7 +267,7 @@ extension RemoteWorkspaceVoiceService {
 
         private func receive(_ event: CodexAppServerClient.Notification) {
             guard isOpen, let threadID, event.params["threadId"] == .string(threadID) else { return }
-            guard workspace.isAuthorized() else {
+            guard hasAccess() else {
                 finish(.failed, message: "Workspace Voice lost access to this workspace.")
                 return
             }
@@ -302,7 +327,7 @@ extension RemoteWorkspaceVoiceService {
 
         func renew() {
             guard isOpen else { return }
-            guard workspace.isAuthorized() else {
+            guard hasAccess() else {
                 finish(.failed, message: "Workspace Voice lost access to this workspace.")
                 return
             }
@@ -345,7 +370,7 @@ extension RemoteWorkspaceVoiceService {
         }
 
         private func hasAccess() -> Bool {
-            isOpen && workspace.isAuthorized()
+            isOpen && isAuthorized() && (workspace?.isAuthorized() ?? true)
         }
 
         private struct ToolResult {
@@ -355,7 +380,7 @@ extension RemoteWorkspaceVoiceService {
 
         private func respond(to request: CodexAppServerClient.ServerRequest) async {
             guard request.method == "item/tool/call",
-                  let threadID, request.params["threadId"] == .string(threadID),
+                  let workspace, let threadID, request.params["threadId"] == .string(threadID),
                   case let .string(callID) = request.params["callId"],
                   case let .string(tool) = request.params["tool"],
                   case let .object(arguments) = request.params["arguments"]
