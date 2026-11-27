@@ -50,11 +50,11 @@ extension AgentSessionRuntimeHost {
                   $0.metadata.identity == .init(workspaceID: workspaceID, contextID: session.tabID) && $0.health != .removed
               })
         else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
-        var workspace = try JSONDecoder().decode(WorkspaceModel.self, from: snapshot.document.documentBytes)
-        let indices = workspace.composeTabs.indices.filter { workspace.composeTabs[$0].id == session.tabID }
-        guard workspace.id == workspaceID, indices.count == 1, let index = indices.first,
-              workspace.composeTabs[index].activeAgentSessionID == nil,
-              !workspace.stashedTabs.contains(where: { $0.tab.id == session.tabID })
+        let baselineWorkspace = try JSONDecoder().decode(WorkspaceModel.self, from: snapshot.document.documentBytes)
+        let indices = baselineWorkspace.composeTabs.indices.filter { baselineWorkspace.composeTabs[$0].id == session.tabID }
+        guard baselineWorkspace.id == workspaceID, indices.count == 1, let index = indices.first,
+              baselineWorkspace.composeTabs[index].activeAgentSessionID == nil,
+              !baselineWorkspace.stashedTabs.contains(where: { $0.tab.id == session.tabID })
         else { throw AgentHostWorkspaceResources.Failure.contextUnavailable }
 
         // No suspension between allocation, binding installation, and creation admission. The
@@ -76,17 +76,49 @@ extension AgentSessionRuntimeHost {
             else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
         }
         do {
-            workspace.composeTabs[index].activeAgentSessionID = allocation.sessionID
-            workspace.composeTabs[index].lastModified = Date()
-            let document = try await WorkspaceFileDecodeCache.shared.documentPreparation.document(
-                for: workspace, fileURL: snapshot.document.fileURL
-            )
-            try requireOrigin()
-            let publication = try await authority.replaceWorkingFailClosed(
-                document, expectedWorkspaceRevision: snapshot.revisions.workingRevision
-            )
-            try requireOrigin()
-            guard publication.disposition == .applied || publication.disposition == .unchanged || publication.disposition == .deduplicated else {
+            let maxPublicationAttempts = 4
+            var currentSnapshot = snapshot
+            var currentWorkspace = baselineWorkspace
+            var currentIndex = index
+            var published = false
+            for attempt in 0 ..< maxPublicationAttempts {
+                var candidate = currentWorkspace
+                candidate.composeTabs[currentIndex].activeAgentSessionID = allocation.sessionID
+                candidate.composeTabs[currentIndex].lastModified = Date()
+                let document = try await WorkspaceFileDecodeCache.shared.documentPreparation.document(
+                    for: candidate, fileURL: currentSnapshot.document.fileURL
+                )
+                try requireOrigin()
+                let publication = try await authority.replaceWorkingFailClosed(
+                    document, expectedWorkspaceRevision: currentSnapshot.revisions.workingRevision
+                )
+                try requireOrigin()
+                if publication.disposition == .applied || publication.disposition == .unchanged || publication.disposition == .deduplicated {
+                    published = true
+                    break
+                }
+                guard publication.disposition == .conflict,
+                      publication.errorCode == .stateConflict,
+                      attempt + 1 < maxPublicationAttempts,
+                      let latest = await authority.canonicalWorkspaceSnapshot(workspaceID),
+                      latest.isExecutionEquivalent(to: snapshot),
+                      let latestWorkspace = try? JSONDecoder().decode(WorkspaceModel.self, from: latest.document.documentBytes)
+                else {
+                    throw AgentHostWorkspaceResources.Failure.contextUnavailable
+                }
+                try requireOrigin()
+                let latestIndices = latestWorkspace.composeTabs.indices.filter { latestWorkspace.composeTabs[$0].id == session.tabID }
+                guard latestWorkspace.id == workspaceID, latestIndices.count == 1, let latestIndex = latestIndices.first,
+                      latestWorkspace.composeTabs[latestIndex].activeAgentSessionID == nil,
+                      !latestWorkspace.stashedTabs.contains(where: { $0.tab.id == session.tabID })
+                else {
+                    throw AgentHostWorkspaceResources.Failure.contextUnavailable
+                }
+                currentSnapshot = latest
+                currentWorkspace = latestWorkspace
+                currentIndex = latestIndex
+            }
+            guard published else {
                 throw AgentHostWorkspaceResources.Failure.contextUnavailable
             }
             if initialLocation != .local {

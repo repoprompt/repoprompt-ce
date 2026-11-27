@@ -42,10 +42,13 @@ struct AgentHostWorkspaceResources {
         let retention = try await files.retainRoots(ids: rootIDs)
         do {
             try Task.checkCancellation()
-            guard await contexts.workspaceSnapshot(workspaceID) == snapshot else { throw Failure.contextChanged }
+            guard let latest = await contexts.workspaceSnapshot(workspaceID),
+                  latest.isExecutionEquivalent(to: snapshot),
+                  admits(latest)
+            else { throw Failure.contextChanged }
             guard await files.isRootRetentionCurrent(retention) else { throw Failure.rootsChanged }
             try Task.checkCancellation()
-            return Lease(resources: self, snapshot: snapshot, roots: requestedRoots, retention: retention)
+            return Lease(resources: self, snapshot: latest, roots: requestedRoots, retention: retention)
         } catch {
             await files.releaseRootRetention(retention)
             throw error
@@ -84,7 +87,9 @@ struct AgentHostWorkspaceResources {
 
         func isCurrent() async -> Bool {
             guard rootsAreCurrent,
-                  await resources.contexts?.workspaceSnapshot(snapshot.document.workspaceID) == snapshot else { return false }
+                  let current = await resources.contexts?.workspaceSnapshot(snapshot.document.workspaceID),
+                  current.isExecutionEquivalent(to: snapshot)
+            else { return false }
             return await retainedRootsAreCurrent()
         }
 
@@ -106,10 +111,13 @@ struct AgentHostWorkspaceResources {
             guard Set(current.document.metadata.repoPaths.map { ($0 as NSString).standardizingPath }) == originalPaths,
                   await resources.files.isRootRetentionCurrent(retention), rootsAreCurrent
             else { throw Failure.rootsChanged }
-            guard await resources.contexts?.workspaceSnapshot(workspaceID) == current else { throw Failure.contextChanged }
+            guard let latest = await resources.contexts?.workspaceSnapshot(workspaceID),
+                  latest.isExecutionEquivalent(to: current),
+                  admits(latest)
+            else { throw Failure.contextChanged }
             try Task.checkCancellation()
             guard rootsAreCurrent else { throw Failure.rootsChanged }
-            return Lease(resources: resources, snapshot: current, roots: roots, retention: retention, rootOwner: rootOwner ?? self)
+            return Lease(resources: resources, snapshot: latest, roots: roots, retention: retention, rootOwner: rootOwner ?? self)
         }
 
         func release() async {
@@ -117,5 +125,60 @@ struct AgentHostWorkspaceResources {
             isReleased = true
             if rootOwner == nil { await resources.files.releaseRootRetention(retention) }
         }
+    }
+}
+
+extension WorkspaceModel {
+    /// Returns a copy with presentation/metadata-only fields normalized so two canonical
+    /// snapshots can be compared for execution- and structure-relevant equality.
+    ///
+    /// Normalized fields mirror `WorkspaceManagerViewModel.ComposeTabPresentation` (`name`,
+    /// `lastModified`, `isPinned`, `pinnedOrder`, `sidebarGroup`, `sidebarGroupOrder`) plus
+    /// workspace save/focus metadata (`dateModified`, `lastUsed`, `activeComposeTabID`).
+    /// Workspace identity, name, roots, storage paths, stashed tabs, tab membership, carrier
+    /// bindings (`activeAgentSessionID`), selections, prompt text, and context configuration
+    /// remain exact so real workspace or context conflicts still fail closed.
+    func normalizedForExecutionEquivalence() -> WorkspaceModel {
+        var copy = self
+        let sentinelDate = Date(timeIntervalSince1970: 0)
+        copy.dateModified = sentinelDate
+        copy.lastUsed = sentinelDate
+        copy.activeComposeTabID = nil
+        for index in copy.composeTabs.indices {
+            copy.composeTabs[index].name = ""
+            copy.composeTabs[index].lastModified = sentinelDate
+            copy.composeTabs[index].isPinned = false
+            copy.composeTabs[index].pinnedOrder = nil
+            copy.composeTabs[index].sidebarGroup = nil
+            copy.composeTabs[index].sidebarGroupOrder = nil
+        }
+        return copy
+    }
+}
+
+extension DomainWorkspaceSnapshot {
+    /// Returns true when `other` represents the same execution and structural workspace state,
+    /// ignoring compose-tab presentation and workspace save/focus metadata-only edits.
+    func isExecutionEquivalent(to other: DomainWorkspaceSnapshot) -> Bool {
+        if self == other { return true }
+        guard health != .removed, other.health != .removed, health == other.health,
+              document.workspaceID == other.document.workspaceID,
+              document.fileURL == other.document.fileURL,
+              document.metadata.repoPaths == other.document.metadata.repoPaths,
+              contexts.count == other.contexts.count
+        else { return false }
+        for (lhs, rhs) in zip(contexts, other.contexts) {
+            guard lhs.metadata.identity == rhs.metadata.identity,
+                  lhs.health != .removed, rhs.health != .removed,
+                  lhs.health == rhs.health
+            else { return false }
+        }
+        if document.documentBytes == other.document.documentBytes { return true }
+        guard let lhsWorkspace = try? JSONDecoder().decode(WorkspaceModel.self, from: document.documentBytes),
+              let rhsWorkspace = try? JSONDecoder().decode(WorkspaceModel.self, from: other.document.documentBytes),
+              !lhsWorkspace.composeTabsDecodeWasLossy,
+              !rhsWorkspace.composeTabsDecodeWasLossy
+        else { return false }
+        return lhsWorkspace.normalizedForExecutionEquivalence() == rhsWorkspace.normalizedForExecutionEquivalence()
     }
 }

@@ -1,5 +1,11 @@
 import Foundation
+import RepoPromptACPProviders
+import RepoPromptAIContracts
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
+import RepoPromptInstrumentation
+import RepoPromptSettingsCore
+import RepoPromptWorkspaceContext
 import XCTest
 
 @MainActor
@@ -432,5 +438,478 @@ final class AgentSidebarRestoreCharacterizationTests: XCTestCase {
 
     private func id(_ number: Int) -> UUID {
         UUID(uuidString: "00000000-0000-0000-0000-\(String(format: "%012d", number))")!
+    }
+}
+
+private actor PinRaceGate {
+    private var entered = false
+    private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
+    private var opened = false
+    private var openWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func pauseOnce() async {
+        if opened { return }
+        entered = true
+        let waiters = enteredWaiters
+        enteredWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
+        await withCheckedContinuation { continuation in
+            if opened {
+                continuation.resume()
+            } else {
+                openWaiters.append(continuation)
+            }
+        }
+    }
+
+    func waitUntilEntered() async {
+        if entered { return }
+        await withCheckedContinuation { continuation in
+            if entered {
+                continuation.resume()
+            } else {
+                enteredWaiters.append(continuation)
+            }
+        }
+    }
+
+    func open() {
+        opened = true
+        let waiters = openWaiters
+        openWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+}
+
+@MainActor
+final class AgentSessionPinDuringInitTests: XCTestCase {
+    private struct Harness {
+        let host: AgentSessionRuntimeHost
+        let session: AgentTabSession
+        let links: AgentSessionLinkExecutionRuntime
+        let provider: AgentSessionLinkCapturingACPProvider
+        let authority: DomainWorkspaceAuthorityClient
+        let workspaceID: UUID
+        let tabID: UUID
+        let fileURL: URL
+        let files: WorkspaceFileContextStore
+        let domain: MCPDomainRuntime
+        let settingsLease: APISettingsRuntimeLease
+        let activations: AgentWorkspaceSessionIndexStore
+    }
+
+    func testPinDuringFreshCreationPreservesPinAndCompletesBinding() async throws {
+        let gate = PinRaceGate()
+        let harness = try await makeHarness(
+            boundCanonicalCarrier: false,
+            commandWillExecute: { envelope in
+                if case .replaceWorkingDocument = envelope.command {
+                    await gate.pauseOnce()
+                }
+            }
+        )
+        let submission = try claimFreshSubmission(in: harness)
+        defer { _ = harness.host.scope.submissions.release(submission) }
+
+        let pending = Task {
+            try await harness.host.prepareFreshCreation(submission: submission, rootIDs: [])
+        }
+        await gate.waitUntilEntered()
+        let createdSessionID = try XCTUnwrap(harness.session.activeAgentSessionID)
+
+        // Simulate PromptViewModel.setComposeTabsPinned -> workspace save landing while
+        // prepareFreshCreation is between canonical snapshot capture and carrier write.
+        try await mutateCanonicalWorkspace(in: harness) { workspace in
+            let index = try XCTUnwrap(workspace.composeTabs.firstIndex(where: { $0.id == harness.tabID }))
+            workspace.composeTabs[index].isPinned = true
+            workspace.composeTabs[index].pinnedOrder = 0
+            workspace.composeTabs[index].lastModified = Date().addingTimeInterval(5)
+            workspace.dateModified = Date().addingTimeInterval(5)
+        }
+
+        await gate.open()
+
+        let prepared = try await pending.value
+        XCTAssertTrue(prepared.command.isCurrent)
+        XCTAssertEqual(prepared.command.writer.identity.sessionID, createdSessionID)
+        XCTAssertTrue(prepared.stopFence.permitsStart(of: harness.session))
+        XCTAssertTrue(harness.session.permitsBoundOperationAndSave)
+
+        let latestSnapshot = await harness.authority.canonicalWorkspaceSnapshot(harness.workspaceID)
+        let snapshot = try XCTUnwrap(latestSnapshot)
+        let persistedWorkspace = try JSONDecoder().decode(WorkspaceModel.self, from: snapshot.document.documentBytes)
+        let persistedTab = try XCTUnwrap(persistedWorkspace.composeTabs.first(where: { $0.id == harness.tabID }))
+        XCTAssertEqual(persistedTab.activeAgentSessionID, createdSessionID)
+        XCTAssertTrue(persistedTab.isPinned, "Fresh creation rebase must preserve the concurrent pin state")
+        XCTAssertEqual(persistedTab.pinnedOrder, 0)
+    }
+
+    func testPinDuringRunStartDoesNotAbortFirstMessage() async throws {
+        let harness = try await makeHarness(boundCanonicalCarrier: true)
+        let command = try harness.host.scope.admit(session: harness.session)
+        let resources = try await harness.host.captureStartupResources(for: command, rootIDs: [])
+        let gate = PinRaceGate()
+        var validationCalls = 0
+        resources.test_beforeValidation = {
+            validationCalls += 1
+            if validationCalls == 1 {
+                await gate.pauseOnce()
+            }
+        }
+        let environment = try harness.host.makeStartupEnvironment(resources: resources)
+        let outcome = AgentRunStartOutcomeRecorder()
+
+        let runTask = Task {
+            _ = await harness.host.scope.startup.start(
+                session: harness.session,
+                initialMessage: "First message while pinning",
+                startOutcome: outcome,
+                claudeCoordinator: harness.host.claudeCoordinator,
+                links: harness.links,
+                environment: environment
+            )
+        }
+        await gate.waitUntilEntered()
+
+        // Simulate pinning the initializing tab while RunStart is awaiting resource validation.
+        try await mutateCanonicalWorkspace(in: harness) { workspace in
+            let index = try XCTUnwrap(workspace.composeTabs.firstIndex(where: { $0.id == harness.tabID }))
+            workspace.composeTabs[index].isPinned = true
+            workspace.composeTabs[index].pinnedOrder = 0
+            workspace.composeTabs[index].sidebarGroup = "Active"
+            workspace.composeTabs[index].sidebarGroupOrder = 0
+            workspace.dateModified = Date().addingTimeInterval(5)
+        }
+
+        await gate.open()
+        await runTask.value
+        XCTAssertTrue(outcome.outcome.didStart, "Pinning during run start must not cancel or abort the first message")
+        try await routeScriptedHostProvider(harness.session)
+        await harness.session.agentTask?.value
+
+        XCTAssertEqual(harness.provider.promptedMessages.count, 1)
+        XCTAssertTrue(harness.provider.promptedMessages.first?.userMessage.contains("First message while pinning") == true)
+    }
+
+    func testRealConflictDuringFreshCreationAndRunStartStillFailsClosed() async throws {
+        // 1. Fresh creation fails closed when execution-relevant tab content changes concurrently.
+        let creationGate = PinRaceGate()
+        let creationHarness = try await makeHarness(
+            boundCanonicalCarrier: false,
+            commandWillExecute: { envelope in
+                if case .replaceWorkingDocument = envelope.command {
+                    await creationGate.pauseOnce()
+                }
+            }
+        )
+        let submission = try claimFreshSubmission(in: creationHarness)
+        defer { _ = creationHarness.host.scope.submissions.release(submission) }
+
+        let pendingCreation = Task {
+            try await creationHarness.host.prepareFreshCreation(submission: submission, rootIDs: [])
+        }
+        await creationGate.waitUntilEntered()
+
+        try await mutateCanonicalWorkspace(in: creationHarness) { workspace in
+            let index = try XCTUnwrap(workspace.composeTabs.firstIndex(where: { $0.id == creationHarness.tabID }))
+            workspace.composeTabs[index].promptText = "Conflicting prompt edit"
+        }
+
+        await creationGate.open()
+        do {
+            _ = try await pendingCreation.value
+            XCTFail("Real content conflict during fresh creation must still fail closed")
+        } catch AgentHostWorkspaceResources.Failure.contextUnavailable {}
+
+        // 2. Run start fails closed when execution-relevant tab content changes concurrently.
+        let runHarness = try await makeHarness(boundCanonicalCarrier: true)
+        let command = try runHarness.host.scope.admit(session: runHarness.session)
+        let resources = try await runHarness.host.captureStartupResources(for: command, rootIDs: [])
+        let runGate = PinRaceGate()
+        var validations = 0
+        resources.test_beforeValidation = {
+            validations += 1
+            if validations == 1 {
+                await runGate.pauseOnce()
+            }
+        }
+        let environment = try runHarness.host.makeStartupEnvironment(resources: resources)
+        let outcome = AgentRunStartOutcomeRecorder()
+
+        let pendingRun = Task {
+            _ = await runHarness.host.scope.startup.start(
+                session: runHarness.session,
+                initialMessage: "Should abort on prompt conflict",
+                startOutcome: outcome,
+                claudeCoordinator: runHarness.host.claudeCoordinator,
+                links: runHarness.links,
+                environment: environment
+            )
+        }
+        await runGate.waitUntilEntered()
+
+        try await mutateCanonicalWorkspace(in: runHarness) { workspace in
+            let index = try XCTUnwrap(workspace.composeTabs.firstIndex(where: { $0.id == runHarness.tabID }))
+            workspace.composeTabs[index].promptText = "Changed prompt during start"
+        }
+
+        await runGate.open()
+        await pendingRun.value
+
+        XCTAssertFalse(outcome.outcome.didStart)
+        XCTAssertTrue(runHarness.provider.promptedMessages.isEmpty)
+    }
+
+    // MARK: - Helpers
+
+    private func routeScriptedHostProvider(_ session: AgentTabSession) async throws {
+        let runID = try XCTUnwrap(session.runID)
+        let controller = try XCTUnwrap(session.acpController)
+        let controllerHost = await controller.hostForRoutingHandoff(expectedRunID: runID)
+        let appHost = try XCTUnwrap(controllerHost as? ACPAgentSessionAppHost)
+        var captured: MCPRunRoutingCleanupReceipt?
+        try await AsyncTestWait.waitUntil("original ACP controller routing receipt") {
+            captured = appHost.test_originatingRoutingCleanupReceipt()
+            return captured != nil
+        }
+        let receipt = try XCTUnwrap(captured)
+        XCTAssertEqual(receipt.runID, runID)
+        XCTAssertFalse(receipt.isConsumed)
+        let generation = try XCTUnwrap(receipt.routingWaitGeneration)
+        await MCPRoutingWaiter.notifyRouted(runID: runID, generation: generation)
+    }
+
+    private func claimFreshSubmission(in harness: Harness) throws -> AgentSessionComposerSubmitClaim {
+        let session = harness.session
+        session.installPersistentSessionBinding(nil)
+        if let runID = session.runID {
+            session.clearRunID(ifCurrent: runID)
+        }
+        let target = AgentComposerSubmitTarget(
+            tabID: session.tabID,
+            route: .createAgentSessionFromSourceTab,
+            expectedSourceTabSessionIdentity: ObjectIdentifier(session),
+            expectedSourceAgentSessionID: nil,
+            expectedPersistentBindingIdentity: nil,
+            expectedBindingTransitionGeneration: session.bindingTransitionGeneration,
+            expectedRunState: .idle,
+            expectedRunID: nil,
+            expectedRunAttemptID: nil,
+            expectedSubmissionToken: session.composerSubmissionToken,
+            expectedInitialStartLocation: .local
+        )
+        guard case let .claimed(submission) = harness.host.scope.submissions.claim(
+            .init(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: "first message"),
+            publishesPresentation: false
+        ) else {
+            throw NSError(domain: "AgentSessionPinDuringInitTests", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "Expected local fresh-creation claim"
+            ])
+        }
+        return submission
+    }
+
+    private func mutateCanonicalWorkspace(
+        in harness: Harness,
+        mutate: (inout WorkspaceModel) throws -> Void
+    ) async throws {
+        // Use an independent authority client so we don't trigger the host client's test gate.
+        let writer = DomainWorkspaceAuthorityClient(store: harness.domain.workspaceStore, windowID: harness.host.routeID + 1)
+        let current = await writer.canonicalWorkspaceSnapshot(harness.workspaceID)
+        let snapshot = try XCTUnwrap(current)
+        var workspace = try JSONDecoder().decode(WorkspaceModel.self, from: snapshot.document.documentBytes)
+        try mutate(&workspace)
+        let result = try await writer.replaceWorkingFailClosed(
+            workspace,
+            fileURL: snapshot.document.fileURL,
+            expectedWorkspaceRevision: snapshot.revisions.workingRevision
+        )
+        XCTAssertTrue(
+            result.disposition == .applied || result.disposition == .unchanged || result.disposition == .deduplicated,
+            "Expected concurrent workspace mutation to apply, got \(result.disposition) (\(String(describing: result.errorCode)))"
+        )
+    }
+
+    private func makeHarness(
+        boundCanonicalCarrier: Bool,
+        commandWillExecute: (@Sendable (DomainWorkspaceCommandEnvelope) async -> Void)? = nil
+    ) async throws -> Harness {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("PinDuringInit-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let domain = MCPDomainRuntime(configuration: .init(
+            mode: .app,
+            profileIdentifier: "pin-init-\(UUID())",
+            storageDirectory: directory,
+            workspaceStorageDirectory: directory.appendingPathComponent("workspaces"),
+            eventDirectory: directory.appendingPathComponent("events"),
+            temporaryDirectory: directory.appendingPathComponent("tmp"),
+            externalReloadInterval: nil
+        ))
+        try await domain.start()
+        addTeardownBlock {
+            _ = await domain.shutdown()
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let script = try AgentSessionLinkACPServerScript.write(to: directory)
+        let provider = AgentSessionLinkCapturingACPProvider(
+            providerID: .openCode,
+            commandPath: script.path,
+            environment: [:]
+        )
+        let routeIdentity = MCPRouteIdentityAllocator.allocateHost()
+        let route = MCPHostRouteResources(identity: routeIdentity, coordinator: nil)
+        let policy: AgentRunExecutionContracts.ConnectionPolicyInstaller = { _, _, _, _, _, _, _, runID, _, _, _, _, _ in
+            if let runID {
+                await MCPRoutingWaiter.notifyRouted(runID: runID)
+            }
+        }
+        let codex = CodexAgentModeCoordinator(
+            windowID: route.identity.routeID,
+            runtimeWorkspacePathsProvider: { _ in .uniform(nil) },
+            codexControllerFactory: { _, _, _, _, _, _, _, _, _ in preconditionFailure("ACP must not construct Codex") },
+            connectionPolicyInstaller: policy,
+            shouldManageCodexTooling: false,
+            codexHookApprovalSettings: GlobalSettingsStore.shared
+        )
+        let host = AgentSessionRuntimeHost(
+            route: route,
+            codexCoordinator: codex,
+            claudeCoordinator: .init(windowID: route.identity.routeID, workspacePathProvider: { _ in directory.path }),
+            providerResources: .init(
+                headless: { _, _ in preconditionFailure("ACP must not construct headless provider") },
+                acp: { _, _ in provider },
+                controller: {
+                    try ACPAgentSessionController(provider: $0, runRequest: $1, allowsProviderProcessLaunchForTesting: true)
+                }
+            ),
+            runRoutingCleaner: { _, _, _ in },
+            runToolCanceller: { _, _ in 0 }
+        )
+
+        var workspace = WorkspaceModel(
+            name: "Pin during init",
+            repoPaths: [],
+            customStoragePath: directory.appendingPathComponent("saved")
+        )
+        let sessionID = UUID()
+        var tab = ComposeTabState()
+        tab.activeAgentSessionID = boundCanonicalCarrier ? sessionID : nil
+        tab.promptText = "Initial prompt"
+        let unrelated = ComposeTabState()
+        workspace.composeTabs = [unrelated, tab]
+        let fileURL = directory.appendingPathComponent("workspace.json")
+
+        var authority = DomainWorkspaceAuthorityClient(store: domain.workspaceStore, windowID: host.routeID)
+        let created = try await authority.create(workspace, fileURL: fileURL)
+        XCTAssertTrue(created.disposition == .applied || created.disposition == .unchanged || created.disposition == .deduplicated)
+
+        let files = WorkspaceFileContextStore(codemapGraphIndexBuildLaunchPolicyForTesting: .disabled)
+        let keys = KeyManager()
+        let settings = APISettingsViewModel(
+            aiQueriesService: AIQueriesService(keyManager: keys),
+            keyManager: keys,
+            loadStoredDataOnInit: false
+        )
+        settings.isOpenCodeConnected = true
+        let settingsLease = try XCTUnwrap(APISettingsRuntimeLease.acquire(from: settings))
+        addTeardownBlock {
+            await MainActor.run { settingsLease.release() }
+        }
+
+        let activations = AgentWorkspaceSessionIndexStore()
+        activations.receiveWorkspaceSwitchNotification(workspace)
+        authority.commandWillExecuteForTesting = commandWillExecute
+        try await host.installWorkspaceActivation(
+            .init(
+                windowID: host.routeID,
+                authority: authority,
+                activations: activations,
+                resources: .init(files: files, contexts: domain.contextStore),
+                settings: settingsLease
+            ),
+            attachmentWorkspaceDirectory: directory,
+            suppressesAttachmentPersistence: false
+        )
+
+        let links = try host.installCanonicalLinkExecution(
+            skillCatalog: AgentSkillCatalog(),
+            perfRecorder: NoopAgentModePerfRecorder(),
+            diagnostics: NoopAgentSessionLinkCatalogEventSink()
+        )
+
+        let session = AgentTabSession(tabID: tab.id)
+        if boundCanonicalCarrier {
+            session.installPersistentSessionBinding(.init(tabID: tab.id, sessionID: sessionID, workspaceID: workspace.id))
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            session.hasLoadedPersistedState = true
+        }
+        session.selectedAgent = .openCode
+        session.oversight.autoWakeOnUpdates = false
+        session.oversight.routineWakeIntervalEnabled = false
+        host.scope.replaceSessions([session.tabID: session])
+
+        host.scope.persistence.composition = AgentSessionStorageInputs(
+            workspaceID: workspace.id,
+            workspaceWithID: { $0 == workspace.id ? workspace : nil },
+            displayName: { _ in "Pin during init" },
+            isSuppressed: { false },
+            attachmentWorkspaceDirectory: { directory }
+        ).persistenceComposition(
+            scope: host.scope,
+            canonicalStorage: .init(workspaceID: workspace.id, contexts: domain.contextStore)
+        )
+        _ = host.scope.interactions(routeID: host.routeID, approvalStore: ApplyEditsApprovalStore())
+        let execution = host.makeExecution(
+            dependencies: .init(
+                windowID: host.routeID,
+                connectionPolicyInstaller: policy,
+                expectedPIDPolicyArmer: { _ in true },
+                mcpServerEnabler: { true },
+                codexCoordinator: codex,
+                claudeCoordinator: host.claudeCoordinator,
+                shouldManageCodexTooling: false,
+                providerRuntimePermissionResolver: { [binding = host.providerBindingService] in
+                    binding.runtimePermission(for: $0, profile: $1)
+                },
+                bindPendingOracleReviewContext: { _, _ in },
+                cancelMCPToolsForRun: { _, _ in },
+                awaitNoActiveMCPTools: { _ in },
+                activeAgentRunWaitQuery: { _ in false },
+                childAgentRunWaitDrainTimeoutSeconds: 0.01
+            ),
+            inputEnvironmentForSession: { _ in host.canonicalInputEnvironment(for: session) },
+            sessionTitle: { _ in "Pin during init" },
+            prepareLaunch: { nil },
+            perfRecorder: NoopAgentModePerfRecorder()
+        )
+        host.scope.installExecution(execution)
+
+        addTeardownBlock { @MainActor in
+            await session.agentTask?.value
+            await session.acpController?.shutdown()
+            await host.scope.persistence.flushSave(for: session.tabID)
+            await host.workspaceActivation?.release()
+            await route.close()
+        }
+
+        return Harness(
+            host: host,
+            session: session,
+            links: links,
+            provider: provider,
+            authority: authority,
+            workspaceID: workspace.id,
+            tabID: tab.id,
+            fileURL: fileURL,
+            files: files,
+            domain: domain,
+            settingsLease: settingsLease,
+            activations: activations
+        )
     }
 }

@@ -187,7 +187,8 @@ final class AgentSessionHostWorkspaceActivation {
             guard let workspace = try? JSONDecoder().decode(WorkspaceModel.self, from: snapshot.document.documentBytes) else { return false }
             return savedTarget.carrier(in: workspace) != nil
         }
-        guard await authority.canonicalWorkspaceSnapshot(workspaceID) == lease.snapshot, isCurrent,
+        guard let current = await authority.canonicalWorkspaceSnapshot(workspaceID),
+              current.isExecutionEquivalent(to: lease.snapshot), isCurrent,
               !Task.isCancelled, catalogFileLease == nil
         else {
             await lease.release()
@@ -384,7 +385,9 @@ final class AgentSessionHostWorkspaceActivation {
         }
         do {
             if savedTarget != nil {
-                guard await authority.canonicalWorkspaceSnapshot(workspaceID) == lease.snapshot else {
+                guard let current = await authority.canonicalWorkspaceSnapshot(workspaceID),
+                      current.isExecutionEquivalent(to: lease.snapshot)
+                else {
                     throw AgentHostWorkspaceResources.Failure.contextChanged
                 }
             }
