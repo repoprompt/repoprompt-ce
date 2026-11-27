@@ -1223,13 +1223,19 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         await agent.retryWorkspaceActivation(initialOwner)
         XCTAssertEqual(preparationAttempts, 1, "An old Retry action cannot start another activation")
 
+        var didFinishTabActivation = false
+        agent.test_afterTabActivationContinuation = { tabID, _ in
+            if tabID == tab.id { didFinishTabActivation = true }
+        }
+        defer { agent.test_afterTabActivationContinuation = nil }
         await agent.retryWorkspaceActivation(retryOwner)
         XCTAssertFalse(agent.isAwaitingWorkspaceAdoption)
         XCTAssertFalse(agent.runtimeHost === outgoing)
-        let session = await agent.ensureSessionReady(tabID: tab.id)
+        try await AsyncTestWait.waitUntil("finish the recovered tab's activation") { didFinishTabActivation }
+        let session = try XCTUnwrap(agent.sessions[tab.id])
         XCTAssertEqual(session.activeAgentSessionID, sessionID)
         XCTAssertTrue(session.hasLoadedPersistedState)
-        XCTAssertNotNil(agent.makeComposerSubmitTarget(tabID: tab.id, session: session))
+        XCTAssertEqual(agent.ui.composer.props.submitTarget?.tabID, tab.id)
         XCTAssertEqual(agent.draftRuntime.text(for: tab.id), "Keep this draft")
         XCTAssertEqual(window.workspaceManager.activeAgentSessionID(forTabID: tab.id), sessionID)
         XCTAssertEqual(try Data(contentsOf: savedFile), savedBytes)

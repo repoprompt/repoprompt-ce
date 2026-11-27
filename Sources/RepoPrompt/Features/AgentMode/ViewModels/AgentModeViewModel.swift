@@ -6923,16 +6923,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
-    /// Owner qualification shared by the pane target and the sidebar's owner-pending projection.
-    func transcriptPaneTargetOwner() -> AgentTranscriptPaneTarget.Owner {
+    private func sessionIndexPresentationOwner() -> AgentTranscriptPaneTarget.Owner {
         let emitted = emittedActiveWorkspace
-        return if let owner = refusedWorkspaceActivationOwner {
-            .activationFailed(owner)
-        } else if canonicalWorkspaceHostPreparation != nil, isAwaitingWorkspaceAdoption,
-                  let workspaceID = activeWorkspaceIDForSessionIndexOwnership
-        {
-            .awaitingOwner(workspaceID: workspaceID)
-        } else if let owner = currentPaneOwner,
+        return if let owner = currentPaneOwner,
                   emitted == nil || emitted?.workspaceID == owner.workspaceID
         {
             .owner(owner)
@@ -6944,6 +6937,18 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         } else {
             .noWorkspace
         }
+    }
+
+    private func transcriptPaneTargetOwner() -> AgentTranscriptPaneTarget.Owner {
+        if let owner = refusedWorkspaceActivationOwner {
+            return .activationFailed(owner)
+        }
+        if canonicalWorkspaceHostPreparation != nil, isAwaitingWorkspaceAdoption,
+           let workspaceID = activeWorkspaceIDForSessionIndexOwnership
+        {
+            return .awaitingOwner(workspaceID: workspaceID)
+        }
+        return sessionIndexPresentationOwner()
     }
 
     func transcriptPaneInput(tabID: UUID?, session: TabSession?) -> AgentTranscriptPanePresentation.Input {
@@ -13287,9 +13292,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         sessionIndexStore.ownerValidatedSidebarRestoreBaseline
     }
 
-    /// Active switch/queued adoption has not installed its owner: the pane's awaiting-owner target.
+    /// Sidebar rows need the current index owner. Execution host readiness gates the transcript.
     var isSidebarOwnerPending: Bool {
-        if case .awaitingOwner = transcriptPaneTargetOwner() {
+        if case .awaitingOwner = sessionIndexPresentationOwner() {
             true
         } else {
             false
