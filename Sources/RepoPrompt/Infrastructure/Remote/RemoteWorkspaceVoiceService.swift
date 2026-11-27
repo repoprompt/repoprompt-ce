@@ -95,7 +95,7 @@ final class RemoteWorkspaceVoiceService {
         guard let call else { return }
         call.finish(.ended)
         rememberEnded(call.id)
-        call = nil
+        self.call = nil
     }
 }
 
@@ -126,7 +126,9 @@ extension RemoteWorkspaceVoiceService {
             self.workspace = workspace
         }
 
-        var isOpen: Bool { phase == .connecting || phase == .ready }
+        var isOpen: Bool {
+            phase == .connecting || phase == .ready
+        }
 
         var status: RemoteWorkspaceVoiceStatus {
             .init(
@@ -235,7 +237,7 @@ extension RemoteWorkspaceVoiceService {
                 guard case let .string(role) = event.params["role"],
                       let speaker = RemoteWorkspaceVoiceLine.Speaker(rawValue: role),
                       case let .string(text) = event.params["text"], !text.isEmpty else { return }
-                lines.append(.init(speaker: speaker, text: String(text.prefix(2_000))))
+                lines.append(.init(speaker: speaker, text: String(text.prefix(2000))))
                 if lines.count > 12 { lines.removeFirst(lines.count - 12) }
             case "thread/realtime/error":
                 let detail: String? = if case let .string(message) = event.params["message"] { message } else { nil }
@@ -249,22 +251,21 @@ extension RemoteWorkspaceVoiceService {
 
         private func failCodexVoice(detail: String?) {
             guard isOpen else { return }
-            let boundedDetail = String((detail ?? "No error detail").prefix(1_000))
+            let boundedDetail = String((detail ?? "No error detail").prefix(1000))
             Self.logger.error("Codex realtime failure: \(boundedDetail, privacy: .private)")
             let reason = boundedDetail.lowercased()
-            let message: String
-            if reason.contains("rate_limit") || reason.contains("429 too many requests") {
-                message = "Codex voice is rate-limited. Try again in a moment."
+            let message = if reason.contains("rate_limit") || reason.contains("429 too many requests") {
+                "Codex voice is rate-limited. Try again in a moment."
             } else if reason.contains("invalid sdp") || reason.contains("invalid offer") {
-                message = "Codex rejected the iPhone’s audio connection. Try starting voice again."
+                "Codex rejected the iPhone’s audio connection. Try starting voice again."
             } else if reason.contains("session.model") || reason.contains("require conversational realtime")
                 || reason.contains("model_not_found")
             {
-                message = "Codex rejected the voice session configuration."
+                "Codex rejected the voice session configuration."
             } else if reason.contains("401 unauthorized") || reason.contains("403 forbidden") {
-                message = "Codex rejected access to voice for this session."
+                "Codex rejected access to voice for this session."
             } else {
-                message = "Codex couldn’t open the voice connection. Try again."
+                "Codex couldn’t open the voice connection. Try again."
             }
             Self.logger.info("Workspace Voice reported: \(message, privacy: .public)")
             finish(.failed, message: message)

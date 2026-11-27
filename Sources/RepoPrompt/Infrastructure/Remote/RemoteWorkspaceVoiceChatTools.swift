@@ -46,13 +46,13 @@ struct RemoteWorkspaceVoiceChatTools {
                 try requireAccess()
                 let messages: [[String: String]] = page.items.compactMap {
                     guard let text = $0.text, !text.isEmpty else { return nil }
-                    return ["role": $0.role, "text": String(text.prefix(1_200))]
+                    return ["role": $0.role, "text": String(text.prefix(1200))]
                 }
                 return try json([
                     "title": chat.sessionName,
                     "run_state": chat.runState.rawValue,
                     "messages": messages,
-                    "older": try encodeCursor(page.olderCursor) as Any? ?? NSNull()
+                    "older": encodeCursor(page.olderCursor) as Any? ?? NSNull()
                 ])
             }
             let response = try await dispatch(to: chatID, message: string("message"))
@@ -69,7 +69,7 @@ struct RemoteWorkspaceVoiceChatTools {
 
     private func dispatch(to chatID: UUID?, message: String?) async throws -> RemoteCommandResponse {
         let text = message?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !text.isEmpty, text.utf8.count <= 12_000 else {
+        guard !text.isEmpty, text.utf8.count <= 12000 else {
             throw RemoteWorkspaceVoiceError.invalidToolArguments
         }
         let response = try await workspace.dispatch(chatID, text, leaseIsValid)
@@ -102,7 +102,7 @@ struct RemoteWorkspaceVoiceChatTools {
             "chats": chats,
             "active_chats": activeChats,
             "active_count": active.count,
-            "older": try encodeCursor(page.olderCursor) as Any? ?? NSNull()
+            "older": encodeCursor(page.olderCursor) as Any? ?? NSNull()
         ])
     }
 
@@ -141,7 +141,7 @@ struct RemoteWorkspaceVoiceChatTools {
         try String(decoding: JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]), as: UTF8.self)
     }
 
-    private func encodeCursor<T: Encodable>(_ cursor: T?) throws -> String? {
+    private func encodeCursor(_ cursor: (some Encodable)?) throws -> String? {
         try cursor.map { try JSONEncoder().encode($0).base64EncodedString() }
     }
 
