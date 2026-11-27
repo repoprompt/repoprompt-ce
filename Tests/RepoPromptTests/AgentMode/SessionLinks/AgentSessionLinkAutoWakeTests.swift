@@ -1263,6 +1263,11 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         let provider = AgentSessionLinkCapturingACPProvider(providerID: .openCode, commandPath: script.path, environment: [
             "ACP_HOLD_METHOD": "session/prompt", "ACP_RESPONSE_GATE": gate.path
         ])
+        let backgroundReply = "Completed while another chat is selected."
+        if submission.switchesDuringStartup {
+            provider.environment["ACP_ASSISTANT_TEXT_ON_PROMPT"] = backgroundReply
+            provider.usesDefaultNormalizer = true
+        }
         defer { gate.release() }
         let providerResources = AgentRunProviderComposition(
             headless: { _, _ in preconditionFailure("The fixture only launches ACP") }, acp: { _, _ in provider },
@@ -1473,7 +1478,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                 XCTAssertEqual(try host.scope.admit(session: session).identity, command.identity)
                 try await host.scope.persistence.flushSaveRequired(writer: command.writer).get()
                 let persisted = try await AgentSessionDataService.shared.loadAgentSession(id: sessionID, for: workspace)
-                XCTAssertTrue(persisted?.toLiveItems().contains { $0.kind == .assistant } == true)
+                XCTAssertTrue(persisted?.toLiveItems().contains { $0.kind == .assistant && $0.text == backgroundReply } == true)
                 if let linkedSend {
                     let delivery = await linkedSend.delivery.value
                     guard case let .receipt(receipt) = delivery else { return XCTFail("Oversight send did not produce a receipt") }
