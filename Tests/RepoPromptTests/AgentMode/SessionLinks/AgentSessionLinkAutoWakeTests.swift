@@ -1439,8 +1439,23 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                 runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date()
             ))
             let bridge = AgentSessionLinkRuntimeBridge(authority: authority, host: WindowStatesManager.shared, toolAdvertisementInvalidator: { _ in })
+            var notifiedTargetIDs: [UUID] = []
+            let notification = NotificationCenter.default.publisher(
+                for: .agentSessionLinkOverseerProjectionDidChange, object: agent
+            ).sink { _ in
+                notifiedTargetIDs = agent.monitorPillPropsByEndpoint[endpoint]?.outbound.map(\.targetSessionID) ?? []
+            }
             let result = await bridge.addMonitorLink(observerSessionID: sessionID, rawTargetSessionID: siblingID.uuidString)
             guard case .added = result else { return XCTFail("Expected an outbound link, got \(result)") }
+            await bridge.test_settleProjections()
+            withExtendedLifetime(notification) {
+                XCTAssertEqual(notifiedTargetIDs, [siblingID], "The presenter notification must observe the updated cache")
+            }
+            XCTAssertEqual(agent.monitorPillPropsByEndpoint[endpoint]?.outbound.map(\.targetSessionID), [siblingID])
+            let hud = AgentNavigationHUDSnapshotBuilder.currentWindowSnapshot(windowState: window)
+            let hudItem = try XCTUnwrap(hud.items.first { $0.tabID == tab.id })
+            XCTAssertEqual(hudItem.windowID, window.windowID)
+            XCTAssertEqual(hudItem.overseenSessionCount, 1, "Role lookup must use the independent host route")
             executor.test_agentSessionLinkHasActiveOutboundLink = { await bridge.hasActiveOutboundLink(observerEndpoint: $0) }
             outboundLink = (bridge, endpoint)
             do {
