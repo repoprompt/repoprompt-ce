@@ -128,8 +128,9 @@ final class AgentSessionHostWorkspaceActivation {
     func validateExecutionInput(
         lease: AgentHostWorkspaceResources.Lease, command: AgentSessionRuntimeStore.Command
     ) async -> Bool {
+        // Recheck the lease's read source, including edits to this carrier before a workspace save.
         guard isCurrent, command.isCurrent, await lease.retainedRootsAreCurrent(),
-              let current = await authority.canonicalWorkspaceSnapshot(command.identity.workspaceID),
+              let current = await authority.store.workspaceSnapshot(command.identity.workspaceID),
               isCurrent, command.isCurrent, lease.rootsAreCurrent, !Task.isCancelled
         else { return false }
         return executionInputMatches(lease.snapshot, current, command: command)
@@ -416,7 +417,9 @@ final class AgentSessionHostWorkspaceActivation {
         }
         do {
             if savedTarget != nil {
-                guard await validateExecutionInput(lease: lease, command: command) else {
+                guard let canonical = await authority.canonicalWorkspaceSnapshot(workspaceID),
+                      executionInputMatches(lease.snapshot, canonical, command: command), lease.rootsAreCurrent
+                else {
                     throw AgentHostWorkspaceResources.Failure.contextChanged
                 }
             }
