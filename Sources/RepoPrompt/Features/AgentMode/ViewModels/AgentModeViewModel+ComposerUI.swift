@@ -122,7 +122,7 @@ extension AgentModeViewModel {
     }
 
     func makeComposerSubmitTarget(tabID: UUID?, session: TabSession?) -> AgentComposerSubmitTarget? {
-        guard let tabID else { return nil }
+        guard let tabID, refusedWorkspaceActivationOwner == nil else { return nil }
         let resolvedSession: TabSession
         if let heldSession = session ?? sessions[tabID] {
             resolvedSession = heldSession
