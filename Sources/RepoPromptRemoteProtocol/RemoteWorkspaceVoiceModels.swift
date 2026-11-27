@@ -1,9 +1,5 @@
 import Foundation
 
-public extension RemoteProtocol {
-    static let workspaceVoicePath = versionedPath + "/workspace_voice"
-}
-
 /// Signaling and a short-lived control lease for one workspace. Media travels over WebRTC.
 public struct RemoteWorkspaceVoiceRequest: Codable, Sendable, Equatable {
     public enum Action: String, Codable, Sendable {
