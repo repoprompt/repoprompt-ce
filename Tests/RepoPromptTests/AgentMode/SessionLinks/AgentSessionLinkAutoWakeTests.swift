@@ -1112,6 +1112,10 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         try await runVisibleLifetimeWitness(switchWorkspace: false, submission: .remoteFollowUp)
     }
 
+    func testRemoteFollowUpPreservesOverseerBindingAndLink() async throws {
+        try await runVisibleLifetimeWitness(switchWorkspace: false, submission: .remoteFollowUp, withOutboundLink: true)
+    }
+
     func testVisibleWorkspaceRoundTripPreservesDispatchedAttempt() async throws {
         try await runVisibleLifetimeWitness(switchWorkspace: true)
     }
@@ -1195,7 +1199,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         switchWorkspace: Bool, failFinalSave: Bool = false, leaveOtherWindowOpen: Bool = false,
         holdFirstSave: Bool = false, explicitStop: Bool = false, detachedShutdown: DetachedShutdown? = nil,
         revokeLinkStartedRun: Bool = false, revokeDuringLinkSave: Bool = false, heldTool: VisibleHeldTool? = nil,
-        submission: VisibleSubmission = .composer
+        submission: VisibleSubmission = .composer, withOutboundLink: Bool = false
     ) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("VisibleAgentLifetime-\(UUID())")
         let gitFixture = heldTool == .fileEdit ? try ReviewGitRepositoryFixture(name: "VisibleHost", parentDirectory: directory) : nil
@@ -1247,8 +1251,9 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         tab.activeAgentSessionID = holdFirstSave ? nil : sessionID
         var workspace = WorkspaceModel(name: "Original", repoPaths: [root.path], customStoragePath: directory.appendingPathComponent("first"))
         var siblingTab = ComposeTabState()
-        if revokeLinkStartedRun { siblingTab.activeAgentSessionID = UUID() }
-        workspace.composeTabs = detachedShutdown == .sessionDeletion || revokeLinkStartedRun ? [tab, siblingTab] : [tab]
+        if revokeLinkStartedRun || withOutboundLink { siblingTab.activeAgentSessionID = UUID() }
+        workspace.composeTabs = detachedShutdown == .sessionDeletion || revokeLinkStartedRun || withOutboundLink
+            ? [tab, siblingTab] : [tab]
         workspace.activeComposeTabID = tab.id
         let second = WorkspaceModel(name: "Other", repoPaths: otherRoot.map { [$0.path] } ?? [], customStoragePath: directory.appendingPathComponent("second"))
         let authority = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: 0)
@@ -1287,6 +1292,33 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         session.oversight.autoWakeOnUpdates = false
         agent.test_installLiveSession(session)
         let command = try host.scope.admit(session: session)
+        let outboundLink: (AgentSessionLinkRuntimeBridge, DomainAgentSessionLinkEndpointIdentity)?
+        if withOutboundLink {
+            let siblingID = try XCTUnwrap(siblingTab.activeAgentSessionID)
+            let sibling = host.scope.makeSession(tabID: siblingTab.id)
+            sibling.installPersistentSessionBinding(.init(tabID: siblingTab.id, sessionID: siblingID, workspaceID: workspace.id))
+            sibling.recordRestorationAuthoritative(.persistedPayloadApplied)
+            sibling.hasLoadedPersistedState = true
+            agent.test_installLiveSession(sibling)
+            let executor = try XCTUnwrap(host.scope.linkExecution)
+            let endpoint = try XCTUnwrap(executor.agentSessionLinkObserverEndpoint(tabID: tab.id))
+            let authority = DomainAgentSessionLinkAuthority(identity: .init(
+                runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date()
+            ))
+            let bridge = AgentSessionLinkRuntimeBridge(authority: authority, host: WindowStatesManager.shared, toolAdvertisementInvalidator: { _ in })
+            let result = await bridge.addMonitorLink(observerSessionID: sessionID, rawTargetSessionID: siblingID.uuidString)
+            guard case .added = result else { return XCTFail("Expected an outbound link, got \(result)") }
+            executor.test_agentSessionLinkHasActiveOutboundLink = { await bridge.hasActiveOutboundLink(observerEndpoint: $0) }
+            outboundLink = (bridge, endpoint)
+            do {
+                _ = try await agent.mcpPreflightResidentActivation(sessionID: sessionID)
+                XCTFail("An actual MCP activation must still refuse to adopt the overseer")
+            } catch {
+                XCTAssertTrue(String(describing: error).contains("MCP activation would revoke its oversight links"))
+            }
+        } else {
+            outboundLink = nil
+        }
         let rootIDs = try await activation.loadedRootIDs(for: command, route: host.route)
         XCTAssertEqual(rootIDs.count, 1)
         let resources = try await host.captureStartupResources(for: command, rootIDs: rootIDs)
@@ -1387,6 +1419,13 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                 let response = try await remoteSubmission.value
                 XCTAssertTrue(response.accepted)
                 XCTAssertEqual(response.sessionID, sessionID)
+                XCTAssertNil(session.mcpControlContext)
+                XCTAssertFalse(session.isMCPOriginated)
+                XCTAssertEqual(try host.scope.admit(session: session).identity, command.identity)
+                if let (bridge, endpoint) = outboundLink {
+                    let linkIsActive = await bridge.hasActiveOutboundLink(observerEndpoint: endpoint)
+                    XCTAssertTrue(linkIsActive, "A Remote follow-up must preserve the outbound oversight link")
+                }
             }
             XCTAssertEqual(provider.promptedMessages.count, 1)
             XCTAssertTrue(provider.promptedMessages[0].userMessage.contains(prompt))
