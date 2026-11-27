@@ -112,6 +112,7 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
         var persistedSavedAt: Date?
         var liveMutationRevision: UInt64?
         var liveOwnerID: ObjectIdentifier?
+        var liveToolResults: [UUID: String] = [:]
         var chatConfiguration: RemoteChatConfiguration?
         let includesChatConfiguration = switch paging {
         case .recentBackward(before: nil), .legacyForward(afterSequenceIndex: nil): true
@@ -123,6 +124,7 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
                 transcript = liveSession.transcript
                 liveMutationRevision = liveSession.remoteTranscriptMutationRevision
                 liveOwnerID = ObjectIdentifier(liveSession)
+                liveToolResults = liveSession.ephemeralToolResultPayloadByItemID
                 if includesChatConfiguration {
                     let capabilities = context.agentMode.mcpSessionSelectionCapabilities(
                         tabID: liveSession.tabID, sessionID: sessionID,
@@ -137,9 +139,13 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
                 }
                 break
             }
+        }
 
-            for workspace in context.workspaceManager.workspaces where !workspace.isEphemeral {
-                if let persisted = try? await AgentSessionDataService.shared.loadAgentSession(id: sessionID, for: workspace) {
+        if transcript == nil {
+            persistedSearch: for context in contexts {
+                for workspace in context.workspaceManager.workspaces where !workspace.isEphemeral {
+                    guard let persisted = try? await AgentSessionDataService.shared.loadAgentSession(id: sessionID, for: workspace)
+                    else { continue }
                     transcript = persisted.transcript ?? .empty
                     persistedSavedAt = persisted.savedAt
                     if includesChatConfiguration {
@@ -159,10 +165,9 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
                             reasoningEffort: persisted.agentReasoningEffort, capabilities: capabilities
                         )
                     }
-                    break
+                    break persistedSearch
                 }
             }
-            if transcript != nil { break }
         }
 
         guard let transcript else {
@@ -183,7 +188,7 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
         }
         let page = Self.page(
             sessionID: sessionID,
-            rows: Self.transcriptRows(transcript: transcript, includeDetails: includeDetails),
+            rows: Self.transcriptRows(transcript: transcript, includeDetails: includeDetails, liveToolResults: liveToolResults),
             paging: paging,
             limit: boundedLimit,
             transcriptRevision: transcriptRevision,
@@ -493,7 +498,9 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
         transcriptRows(transcript: transcript, includeDetails: includeDetails).map { $0.render() }
     }
 
-    private static func transcriptRows(transcript: AgentTranscript, includeDetails: Bool) -> [TranscriptRow] {
+    private static func transcriptRows(
+        transcript: AgentTranscript, includeDetails: Bool, liveToolResults: [UUID: String] = [:]
+    ) -> [TranscriptRow] {
         var rows: [TranscriptRow] = []
         for turn in transcript.turns {
             let turnID = turn.id
@@ -531,7 +538,8 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
                 rows.append(TranscriptRow(cursor: cursor) {
                     projectActivity(
                         activity, turnID: turnID, conclusionActivityID: conclusionActivityID,
-                        summaryOnly: summaryOnly, includeDetails: includeDetails
+                        summaryOnly: summaryOnly, includeDetails: includeDetails,
+                        liveToolResult: liveToolResults[activity.id]
                     )
                 })
             }
@@ -573,12 +581,26 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
         turnID: UUID,
         conclusionActivityID: UUID?,
         summaryOnly: Bool,
-        includeDetails: Bool
+        includeDetails: Bool,
+        liveToolResult: String?
     ) -> RemoteTranscriptItem {
-        let semanticKind = semanticKind(for: activity, conclusionActivityID: conclusionActivityID)
-        let detail = includeDetails ? remoteDetail(for: activity) : nil
-        let visibleText: String? = if let execution = activity.toolExecution,
-                                      let summary = compactToolSummary(execution)
+        let questionExchange = activity.toolExecution.flatMap(recordedQuestionExchange(for:))
+        // Desktop cards also use the session's retained result after the live transcript compacts.
+        let diff = activity.toolExecution.flatMap {
+            recordedDiff(for: $0, resultJSON: liveToolResult ?? $0.resultJSON, includeDetails: includeDetails)
+        }
+        let semanticKind: RemoteTranscriptSemanticKind = if questionExchange != nil {
+            .question
+        } else if diff != nil {
+            .compactActivity
+        } else {
+            semanticKind(for: activity, conclusionActivityID: conclusionActivityID)
+        }
+        let detail = includeDetails ? remoteDetail(for: activity, questionExchange: questionExchange, diffPreview: diff?.preview) : nil
+        let visibleText: String? = if let questionExchange {
+            recordedQuestionPreview(questionExchange)
+        } else if let execution = activity.toolExecution,
+                  let summary = compactToolSummary(execution)
         {
             sanitizeText(summary, characterLimit: 512)
         } else if let summary = activity.toolExecution?.summaryText,
@@ -605,14 +627,203 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
             },
             summaryOnly: summaryOnly || activity.toolExecution?.summaryOnly == true,
             detailAvailable: hasDetail(for: activity),
-            detailText: detail.map(renderDetail),
+            detailText: questionExchange == nil && diff == nil ? detail.map(renderDetail) : nil,
             detail: detail,
-            attachments: projectAttachments(activity.attachments)
+            attachments: projectAttachments(activity.attachments),
+            diffSummary: diff?.summary
         )
+    }
+
+    private static func isAskUserTool(_ name: String?) -> Bool {
+        let legacyPrefix = "mcp__repoprompt__"
+        guard var normalized = normalizedToolCardName(name)?.lowercased() else { return false }
+        if normalized.hasPrefix(legacyPrefix) {
+            normalized.removeFirst(legacyPrefix.count)
+        }
+        return switch normalized {
+        case "ask_user", "ask_user_question", "askuserquestion": true
+        default: false
+        }
+    }
+
+    private static func recordedQuestionExchange(for execution: AgentTranscriptToolExecution) -> RemoteRecordedQuestionExchange? {
+        // Provider input can include secret fields. Only project the transcript's ask_user record.
+        guard isAskUserTool(execution.toolName),
+              let resultJSON = execution.resultJSON,
+              let exchange = AgentAskUserTranscriptExchange.decode(
+                  argsJSON: execution.argsJSON, resultJSON: resultJSON
+              )
+        else { return nil }
+
+        let questions = exchange.questions.map { question in
+            let answer = exchange.answers[question.id]
+            let skipped = exchange.skipped || answer?.skipped == true
+            return RemoteRecordedQuestionExchange.Question(
+                header: question.header.map { sanitizeText($0, characterLimit: 120) },
+                prompt: sanitizeText(question.question, characterLimit: 1200),
+                answer: skipped ? nil : answer?.text.map { sanitizeText($0, characterLimit: 1200) },
+                skipped: skipped
+            )
+        }
+        let outcome: RemoteRecordedQuestionExchange.Outcome
+        if exchange.timedOut {
+            outcome = .timedOut
+        } else if questions.allSatisfy(\.skipped) {
+            outcome = .skipped
+        } else {
+            guard questions.contains(where: { $0.answer != nil || $0.skipped }) else { return nil }
+            outcome = .answered
+        }
+        return RemoteRecordedQuestionExchange(
+            title: exchange.title.map { sanitizeText($0, characterLimit: 240) },
+            questions: questions,
+            outcome: outcome
+        )
+    }
+
+    private static func recordedQuestionPreview(_ exchange: RemoteRecordedQuestionExchange) -> String {
+        switch exchange.outcome {
+        case .skipped: return "Skipped"
+        case .timedOut: return "Timed out"
+        case .answered:
+            let previews = exchange.questions.enumerated().compactMap { index, question -> String? in
+                guard let answer = question.skipped ? "Skipped" : question.answer else { return nil }
+                let preview = answer.split(whereSeparator: \.isNewline).joined(separator: " ")
+                let label = question.header ?? (exchange.questions.count > 1 ? "Q\(index + 1)" : nil)
+                return label.map { "\($0): \(preview)" } ?? preview
+            }
+            return sanitizeText(previews.joined(separator: " · "), characterLimit: 240)
+        }
+    }
+
+    private static func recordedQuestionDetails(_ exchange: RemoteRecordedQuestionExchange) -> String {
+        var sections = [exchange.title].compactMap(\.self)
+        sections += exchange.questions.enumerated().map { index, question in
+            let answer = if question.skipped {
+                "Skipped"
+            } else if let answer = question.answer {
+                answer
+            } else {
+                exchange.outcome == .timedOut ? "Timed out" : "No answer recorded"
+            }
+            let prompt = sanitizeText(question.prompt, characterLimit: 320)
+            let response = sanitizeText(answer, characterLimit: 320)
+            return "Question \(index + 1)\n\(prompt)\nAnswer\n\(response)"
+        }
+        return sanitizeDetailText(sections.joined(separator: "\n\n"))
+    }
+
+    private typealias RecordedDiff = (summary: RemoteTranscriptDiffSummary, preview: RemoteTranscriptDiffPreview?)
+    private static let diffPreviewFileLimit = 12
+
+    private static func recordedDiff(
+        for execution: AgentTranscriptToolExecution, resultJSON: String?, includeDetails: Bool
+    ) -> RecordedDiff? {
+        guard execution.status != .failed, execution.toolIsError != true,
+              let name = normalizedToolCardName(execution.toolName)?.lowercased().components(separatedBy: "__").last,
+              name == "git" || name == "apply_edits",
+              let resultJSON = sizeLimitedToolPayload(resultJSON)
+        else { return nil }
+
+        switch name {
+        case "apply_edits":
+            return recordedEditDiff(for: execution, resultJSON: resultJSON, includeDetails: includeDetails)
+        case "git":
+            guard let result = ToolJSON.decodeResult(ToolResultDTOs.GitToolReplyDTO.self, from: resultJSON),
+                  result.op == "diff", result.error == nil
+            else { return nil }
+            return recordedGitDiff(result, includeDetails: includeDetails)
+        default:
+            return nil
+        }
+    }
+
+    private static func recordedEditDiff(
+        for execution: AgentTranscriptToolExecution, resultJSON: String?, includeDetails: Bool
+    ) -> RecordedDiff? {
+        guard let edit = ToolJSON.decodeResult(ToolResultDTOs.EditSummary.self, from: resultJSON),
+              let patch = edit.displayUnifiedDiff
+        else { return nil }
+        let args = ToolJSON.decodeArgs(ToolArgsDTOs.ApplyEditsArgs.self, from: sizeLimitedToolPayload(execution.argsJSON))
+        let path = (args?.path ?? execution.keyPaths.first).map(diffDisplayPath)
+        let summary = RemoteTranscriptDiffSummary(
+            fileCount: 1, singleFilePath: path, additions: edit.addedLines, deletions: edit.deletedLines
+        )
+        let preview = includeDetails ? boundedDiffPreview([
+            .init(path: path ?? "Diff", additions: edit.addedLines, deletions: edit.deletedLines, patch: patch)
+        ], isTruncated: false) : nil
+        return (summary, preview)
+    }
+
+    private static func recordedGitDiff(
+        _ result: ToolResultDTOs.GitToolReplyDTO, includeDetails: Bool
+    ) -> RecordedDiff? {
+        let repoDiffs = result.repos?.compactMap { repo in repo.diff.map { (repo.repoName, $0) } } ?? []
+        let diffs = result.diff.map { [(nil as String?, $0)] } ?? repoDiffs
+        let totals = result.aggregate?.totals ?? result.diff?.totals
+        guard let fileCount = totals?.files ?? result.summary?.files else { return nil }
+        let recordedFileCount = diffs.reduce(0) { $0 + ($1.1.files?.count ?? 0) }
+        let isTruncated = recordedFileCount > diffPreviewFileLimit || diffs.contains { $0.1.truncated == true }
+        let files = diffs.lazy.flatMap { repoName, diff in
+            (diff.files ?? []).lazy.map { file in (repoName, file) }
+        }
+        let summary = RemoteTranscriptDiffSummary(
+            fileCount: fileCount,
+            singleFilePath: fileCount == 1 ? files.first.map { diffDisplayPath($0.1.path) } : nil,
+            additions: totals?.insertions ?? result.summary?.insertions,
+            deletions: totals?.deletions ?? result.summary?.deletions,
+            isTruncated: isTruncated
+        )
+        let preview = includeDetails ? boundedDiffPreview(files.prefix(diffPreviewFileLimit).map { repoName, file in
+            let path = diffDisplayPath(file.path)
+            return .init(
+                path: repoName.map { sanitizeText($0, characterLimit: 120) + "/" + path } ?? path,
+                additions: file.insertions,
+                deletions: file.deletions,
+                patch: file.hunks?.map { "\($0.header)\n\($0.patch)" }.joined(separator: "\n")
+            )
+        }, isTruncated: isTruncated) : nil
+        return (summary, preview)
+    }
+
+    private static func diffDisplayPath(_ path: String) -> String {
+        let displayPath = path.hasPrefix("/") ? (path as NSString).lastPathComponent : path
+        return sanitizeText(displayPath, characterLimit: 240)
+    }
+
+    private static func boundedDiffPreview(
+        _ files: [RemoteTranscriptDiffPreview.File], isTruncated: Bool
+    ) -> RemoteTranscriptDiffPreview {
+        var remainingBytes = 12000
+        var isTruncated = isTruncated
+        let boundedFiles = files.map { file in
+            guard let patch = file.patch, !patch.isEmpty else { return file }
+            let lines = patch.split(separator: "\n", maxSplits: 400, omittingEmptySubsequences: false)
+            var redactedLines: [String] = []
+            for line in lines.prefix(400) {
+                guard line.utf8.prefix(remainingBytes + 1).count <= remainingBytes else { break }
+                let redacted = sanitizeText(String(line), characterLimit: 12000)
+                let size = redacted.utf8.count + 1
+                guard size <= remainingBytes else { break }
+                remainingBytes -= size
+                redactedLines.append(redacted)
+            }
+            if redactedLines.count < lines.count { isTruncated = true }
+            return RemoteTranscriptDiffPreview.File(
+                path: file.path, additions: file.additions, deletions: file.deletions,
+                patch: redactedLines.isEmpty ? nil : redactedLines.joined(separator: "\n")
+            )
+        }
+        return RemoteTranscriptDiffPreview(files: boundedFiles, isTruncated: isTruncated)
     }
 
     static func compactToolSummary(_ execution: AgentTranscriptToolExecution) -> String? {
         guard let name = normalizedToolCardName(execution.toolName)?.lowercased() else { return nil }
+        if name == "git" || name.hasSuffix("__git") {
+            guard execution.summaryOnly else { return nil }
+            let result = ToolJSON.structuredResultObject(from: boundedToolPayload(execution.resultJSON))
+            return result.flatMap { AgentToolCardRenderSummary(summaryOnlyObject: $0)?.inlineSummaryText }
+        }
         if name == "bash" {
             let exitCode = execution.exitCode ?? BashToolResultParser.parse(
                 raw: boundedToolPayload(execution.resultJSON), argsJSON: nil
@@ -677,9 +888,16 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
         return summary.isEmpty ? nil : summary
     }
 
+    private static let maxToolPayloadBytes = 65536
+
+    /// Reject oversized JSON before decoding; clipping it would produce an invalid payload.
+    private static func sizeLimitedToolPayload(_ raw: String?) -> String? {
+        guard let raw, raw.utf8.prefix(maxToolPayloadBytes + 1).count <= maxToolPayloadBytes else { return nil }
+        return raw
+    }
+
     private static func boundedToolPayload(_ raw: String?) -> String? {
-        guard let raw, raw.utf8.prefix(65537).count <= 65536 else { return nil }
-        return sanitizeText(raw, characterLimit: 65536)
+        sizeLimitedToolPayload(raw).map { sanitizeText($0, characterLimit: maxToolPayloadBytes) }
     }
 
     private static func diffLineSummary(_ diffs: [String]) -> String? {
@@ -737,8 +955,10 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
         {
             return .error
         }
-        switch activity.toolExecution?.toolName?.lowercased() {
-        case "ask_user", "request_user_input":
+        let toolName = activity.toolExecution?.toolName
+        if isAskUserTool(toolName) { return .question }
+        switch toolName?.lowercased() {
+        case "request_user_input":
             return .question
         case "request_permission", "request_permissions":
             return .permission
@@ -762,9 +982,20 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
             || execution.summaryText != nil
     }
 
-    private static func remoteDetail(for activity: AgentTranscriptActivity) -> RemoteTranscriptDetail? {
+    private static func remoteDetail(
+        for activity: AgentTranscriptActivity,
+        questionExchange: RemoteRecordedQuestionExchange?,
+        diffPreview: RemoteTranscriptDiffPreview?
+    ) -> RemoteTranscriptDetail? {
         guard hasDetail(for: activity) else { return nil }
         let execution = activity.toolExecution
+        if let questionExchange {
+            return RemoteTranscriptDetail(
+                resultJSON: recordedQuestionDetails(questionExchange),
+                toolIsError: execution?.toolIsError,
+                questionExchange: questionExchange
+            )
+        }
         return RemoteTranscriptDetail(
             argumentsJSON: execution?.argsJSON.map(sanitizeDetailText),
             resultJSON: execution?.resultJSON.map(sanitizeDetailText),
@@ -773,7 +1004,8 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
             processID: execution?.processID,
             exitCode: execution?.exitCode,
             summaryText: execution?.summaryText.map(sanitizeDetailText),
-            toolIsError: execution?.toolIsError
+            toolIsError: execution?.toolIsError,
+            diffPreview: diffPreview
         )
     }
 
