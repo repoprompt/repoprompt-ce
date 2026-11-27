@@ -446,7 +446,7 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
                 remoteAttachments: attachments,
                 windowIsAvailable: {
                     (try? authorizeDispatch()) != nil
-                        && context.window.windowID == resident.endpoint.windowID
+                        && context.window === resident.window
                         && !context.window.isClosing && !WindowStatesManager.shared.isTerminating
                 }
             )

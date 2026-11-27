@@ -16679,8 +16679,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if let observerEndpoint = linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: tabID) {
             linkExecutionRuntime.cancelAgentSessionLinkAutoWake(for: observerEndpoint, reason: .localUserWon)
         }
-        updateBindingsFromSession(session)
-        persistenceRuntime.scheduleSave(for: tabID)
+        // Refreshing the active transcript can compact source rows and advance the revision.
+        // Admit the canonical dispatch against its append receipt before doing that work.
+        defer {
+            if canonicalLocalDispatch, runtimeHost === canonicalHost, sessions[tabID] === session {
+                updateBindingsFromSession(session)
+            }
+        }
+        if !canonicalLocalDispatch { updateBindingsFromSession(session) }
+        persistenceRuntime.scheduleSave(for: session)
 
         let steeringMessage = trimmedText.isEmpty ? nil : (repromptedText == nil ? trimmedText : unexpandedWrappedText)
         if session.runState == .running,

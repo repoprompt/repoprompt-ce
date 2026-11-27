@@ -1444,7 +1444,7 @@ struct AgentRunMCPToolService {
             targetWindow: targetWindow, agentModeVM: agentModeVM, metadata: metadata
         )
         guard !targetWindow.isClosing, !WindowStatesManager.shared.isTerminating,
-              targetWindow.windowID == target.endpoint.windowID,
+              targetWindow === target.window,
               agentModeVM.mcpResidentTargetIsCurrent(target)
         else { throw MCPError.invalidParams(AgentModeViewModel.mcpResidentTargetError) }
         return try (
@@ -1596,7 +1596,7 @@ struct AgentRunMCPToolService {
             let delivery = try await agentModeVM.mcpSubmitResidentTask(
                 resident, text: text, workflow: workflow,
                 windowIsAvailable: {
-                    targetWindow.windowID == resident.endpoint.windowID
+                    targetWindow === resident.window
                         && !targetWindow.isClosing && !WindowStatesManager.shared.isTerminating
                 }
             )

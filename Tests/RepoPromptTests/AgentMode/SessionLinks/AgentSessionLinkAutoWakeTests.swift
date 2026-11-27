@@ -8,6 +8,7 @@ import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 @testable import RepoPromptMCPServer
+import RepoPromptRemoteProtocol
 import RepoPromptSettingsCore
 import RepoPromptWorkspaceContext
 import XCTest
@@ -1103,6 +1104,14 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         try await runVisibleLifetimeWitness(switchWorkspace: false)
     }
 
+    func testVisibleComposerDispatchesWhenTranscriptRefreshDropsHiddenRows() async throws {
+        try await runVisibleLifetimeWitness(switchWorkspace: false, submission: .composerWithHiddenRow)
+    }
+
+    func testRemoteFollowUpReachesVisibleSessionOnIndependentHost() async throws {
+        try await runVisibleLifetimeWitness(switchWorkspace: false, submission: .remoteFollowUp)
+    }
+
     func testVisibleWorkspaceRoundTripPreservesDispatchedAttempt() async throws {
         try await runVisibleLifetimeWitness(switchWorkspace: true)
     }
@@ -1178,10 +1187,15 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         case workspaceDeletion, workspaceDeletionDuringSwitch, quit, sessionDeletion
     }
 
+    private enum VisibleSubmission {
+        case composer, composerWithHiddenRow, remoteFollowUp
+    }
+
     private func runVisibleLifetimeWitness(
         switchWorkspace: Bool, failFinalSave: Bool = false, leaveOtherWindowOpen: Bool = false,
         holdFirstSave: Bool = false, explicitStop: Bool = false, detachedShutdown: DetachedShutdown? = nil,
-        revokeLinkStartedRun: Bool = false, revokeDuringLinkSave: Bool = false, heldTool: VisibleHeldTool? = nil
+        revokeLinkStartedRun: Bool = false, revokeDuringLinkSave: Bool = false, heldTool: VisibleHeldTool? = nil,
+        submission: VisibleSubmission = .composer
     ) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("VisibleAgentLifetime-\(UUID())")
         let gitFixture = heldTool == .fileEdit ? try ReviewGitRepositoryFixture(name: "VisibleHost", parentDirectory: directory) : nil
@@ -1328,9 +1342,37 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             XCTAssertEqual(saved?.transcript?.turns.compactMap { $0.request?.text }, [prompt])
             return
         }
+        var remoteSubmission: Task<RemoteCommandResponse, Error>?
+        defer { remoteSubmission?.cancel() }
         if revocation == nil {
-            let submitted = await agent.submitUserTurnCreatingSessionIfNeeded(text: prompt, target: target)
-            guard submitted == .submitted else { return XCTFail("Composer did not accept the run: \(submitted)") }
+            switch submission {
+            case .composer:
+                let submitted = await agent.submitUserTurnCreatingSessionIfNeeded(text: prompt, target: target)
+                guard submitted == .submitted else { return XCTFail("Composer did not accept the run: \(submitted)") }
+            case .composerWithHiddenRow:
+                let attempt = AgentComposerSubmitAttempt(
+                    id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: prompt
+                )
+                guard case let .claimed(claim) = agent.claimComposerSubmitAttempt(attempt) else {
+                    return XCTFail("Expected the visible composer claim")
+                }
+                let hidden = AgentChatItem.toolCall(name: "set_status", argsJSON: "{}")
+                session.setItemsSilently([hidden], reason: .testOverride)
+                let result = agent.submitUserTurn(
+                    text: prompt, tabID: tab.id, composerOrigin: .localComposer, providerSwitchClaim: claim
+                )
+                agent.releaseComposerSubmitClaim(claim)
+                guard result == .submitted else { return XCTFail("Expected dispatch during transcript reconciliation: \(result)") }
+                XCTAssertFalse(session.items.contains { $0.id == hidden.id })
+            case .remoteFollowUp:
+                let service = WindowRemoteAgentControlService(windowStatesManager: .shared)
+                remoteSubmission = Task {
+                    try await service.execute(.init(
+                        operation: .followUp, workspaceID: workspace.id.uuidString,
+                        sessionID: sessionID, message: prompt
+                    ), authorizeDispatch: {})
+                }
+            }
         }
         try await AsyncTestWait.waitUntil("launch the originating ACP attempt") {
             session.agentTask != nil && session.runID != nil && session.acpController != nil
@@ -1340,6 +1382,19 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         let controller = try XCTUnwrap(session.acpController)
         let routingReceipt = try await routeScriptedHostProvider(session)
         try await gate.waitUntilEntered()
+        if submission != .composer {
+            if let remoteSubmission {
+                let response = try await remoteSubmission.value
+                XCTAssertTrue(response.accepted)
+                XCTAssertEqual(response.sessionID, sessionID)
+            }
+            XCTAssertEqual(provider.promptedMessages.count, 1)
+            XCTAssertTrue(provider.promptedMessages[0].userMessage.contains(prompt))
+            XCTAssertEqual(session.items.count(where: { $0.kind == .user && $0.text.contains(prompt) }), 1)
+            gate.release()
+            await task.value
+            return
+        }
         let started = await transport.dashboardSnapshot()
         XCTAssertTrue(started.isRunning, "The originating provider demand starts transport with Auto Start off")
         XCTAssertFalse(GlobalSettingsStore.shared.mcpAutoStart())
