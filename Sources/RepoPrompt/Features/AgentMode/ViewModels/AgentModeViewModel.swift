@@ -8828,6 +8828,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
+    enum MCPSessionTargetPurpose {
+        case controlActivation
+        case remoteCommand
+    }
+
     func mcpResolveOrCreateSessionTarget(
         tabID: UUID?,
         sessionID: UUID?,
@@ -8836,7 +8841,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         parentSessionID: UUID? = nil,
         inheritWorktreeBindings: Bool = false,
         expectedWorkspaceID: UUID? = nil,
-        creationKind: MCPSessionCreationKind = .mcpControlled
+        creationKind: MCPSessionCreationKind = .mcpControlled,
+        purpose: MCPSessionTargetPurpose = .controlActivation
     ) async throws -> MCPSessionTarget {
         if isAwaitingWorkspaceAdoption, await !awaitWorkspaceRuntimeAdoption(expectedWorkspaceID: expectedWorkspaceID) {
             try Task.checkCancellation()
@@ -8889,7 +8895,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 parentSessionID: parentSessionID,
                 inheritWorktreeBindings: inheritWorktreeBindings,
                 expectedWorkspaceID: expectedWorkspaceID,
-                creationKind: creationKind
+                creationKind: creationKind,
+                purpose: purpose
             )
             if creationKind.retainsPublishedSession {
                 publishedLaneTarget = target
@@ -9089,7 +9096,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         parentSessionID: UUID?,
         inheritWorktreeBindings: Bool,
         expectedWorkspaceID: UUID?,
-        creationKind: MCPSessionCreationKind
+        creationKind: MCPSessionCreationKind,
+        purpose: MCPSessionTargetPurpose
     ) async throws -> MCPSessionTarget {
         guard !isAwaitingWorkspaceAdoption else {
             throw MCPError.invalidParams(TabSession.loadingAdmissionFailureMessage)
@@ -9109,7 +9117,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 parentSessionID: parentSessionID,
                 inheritWorktreeBindings: inheritWorktreeBindings,
                 expectedWorkspaceID: expectedWorkspaceID,
-                discardAuthorityID: discardAuthorityID
+                discardAuthorityID: discardAuthorityID,
+                purpose: purpose
             )
 
         case let .session(sessionID):
@@ -9130,7 +9139,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     parentSessionID: indexedParentSessionID ?? parentSessionID,
                     inheritWorktreeBindings: inheritWorktreeBindings,
                     expectedWorkspaceID: expectedWorkspaceID,
-                    discardAuthorityID: discardAuthorityID
+                    discardAuthorityID: discardAuthorityID,
+                    purpose: purpose
                 )
             }
             guard createIfNeeded else {
@@ -9190,11 +9200,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     parentWasLocallyRepresentedAtAdmissionStart: parentWasLocallyRepresentedAtAdmissionStart
                 )
                 try requireCurrentAgentSessionLifecycleAdmission(provisionalTarget)
-                applySpawnParentSessionID(
-                    effectiveParentSessionID,
-                    to: hydrated,
-                    inheritWorktreeBindings: inheritWorktreeBindings
-                )
+                if purpose == .controlActivation {
+                    applySpawnParentSessionID(
+                        effectiveParentSessionID,
+                        to: hydrated,
+                        inheritWorktreeBindings: inheritWorktreeBindings
+                    )
+                }
                 return provisionalTarget
             } catch {
                 _ = await mcpDiscardSessionTarget(provisionalTarget)
@@ -9218,7 +9230,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     parentSessionID: parentSessionID,
                     inheritWorktreeBindings: inheritWorktreeBindings,
                     expectedWorkspaceID: expectedWorkspaceID,
-                    discardAuthorityID: discardAuthorityID
+                    discardAuthorityID: discardAuthorityID,
+                    purpose: purpose
                 )
             }
             guard createsBinding, createIfNeeded, let intendedSessionID = resolvedSessionID else {
@@ -9412,7 +9425,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         parentSessionID: UUID?,
         inheritWorktreeBindings: Bool,
         expectedWorkspaceID: UUID?,
-        discardAuthorityID: UUID
+        discardAuthorityID: UUID,
+        purpose: MCPSessionTargetPurpose
     ) async throws -> MCPSessionTarget {
         try requireFrozenMCPSessionBinding(
             tabID: tabID,
@@ -9421,7 +9435,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             requiresHydratedRuntime: false
         )
         let admittedWindow = WindowStatesManager.shared.window(withID: windowID)
-        let residentActivationTarget = try await mcpPreflightResidentActivation(sessionID: sessionID, admittedWindow: admittedWindow)
+        // Remote commands use the existing session writer. Only an ownership transfer needs the link fence.
+        let residentActivationTarget: MCPResidentTarget? = if purpose == .controlActivation {
+            try await mcpPreflightResidentActivation(sessionID: sessionID, admittedWindow: admittedWindow)
+        } else {
+            nil
+        }
         try requireLocalMCPRuntimeWriter(sessionID: sessionID, expectedWorkspaceID: expectedWorkspaceID)
         let hydrated = await ensureSessionReady(tabID: tabID)
         #if DEBUG
@@ -9442,14 +9461,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 "The requested Agent session runtime changed while its target was prepared."
             )
         }
-        let hydratedActivationTarget: MCPResidentTarget? = if let residentActivationTarget {
-            residentActivationTarget
-        } else {
-            try await mcpPreflightResidentActivation(sessionID: sessionID, admittedWindow: admittedWindow)
+        if purpose == .controlActivation {
+            let hydratedActivationTarget: MCPResidentTarget? = if let residentActivationTarget {
+                residentActivationTarget
+            } else {
+                try await mcpPreflightResidentActivation(sessionID: sessionID, admittedWindow: admittedWindow)
+            }
+            try mcpRequireActivationOwnerFence(hydratedActivationTarget, session: hydrated)
         }
-        try mcpRequireActivationOwnerFence(hydratedActivationTarget, session: hydrated)
         let resolvedSessionID = sessionID
-        let indexedParentSessionID = ownerValidatedSessionIndex[resolvedSessionID]?.parentSessionID
         let target = MCPSessionTarget(
             tabID: hydrated.tabID,
             sessionID: resolvedSessionID,
@@ -9471,11 +9491,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             .init(tabID: target.tabID, identity: lifecycleIdentity),
             intent: .providerStart
         )
-        applySpawnParentSessionID(
-            hydrated.parentSessionID ?? indexedParentSessionID ?? parentSessionID,
-            to: hydrated,
-            inheritWorktreeBindings: inheritWorktreeBindings
-        )
+        if purpose == .controlActivation {
+            let indexedParentSessionID = ownerValidatedSessionIndex[resolvedSessionID]?.parentSessionID
+            applySpawnParentSessionID(
+                hydrated.parentSessionID ?? indexedParentSessionID ?? parentSessionID,
+                to: hydrated,
+                inheritWorktreeBindings: inheritWorktreeBindings
+            )
+        }
         return target
     }
 
