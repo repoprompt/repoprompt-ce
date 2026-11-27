@@ -40,7 +40,7 @@ jobs:
             .build/swiftbuild/artifacts
             Packages/RepoPromptAgentProviders/.build/artifacts
             ~/Library/Caches/org.swift.swiftpm/artifacts
-          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-binaries-v2-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/RepoPromptAgentProviders/Package.swift', 'Packages/RepoPromptAgentProviders/Package.resolved', 'Packages/RepoPromptIrohTransport/Package.swift') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-binaries-v2-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/RepoPromptAgentProviders/Package.swift', 'Packages/RepoPromptAgentProviders/Package.resolved') }}
 
       - name: Resolve Sentry dependency downloads with bounded retries
         env:
