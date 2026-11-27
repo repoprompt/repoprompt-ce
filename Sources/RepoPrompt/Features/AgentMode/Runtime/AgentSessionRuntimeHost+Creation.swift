@@ -101,7 +101,7 @@ extension AgentSessionRuntimeHost {
                       publication.errorCode == .stateConflict,
                       attempt + 1 < maxPublicationAttempts,
                       let latest = await authority.canonicalWorkspaceSnapshot(workspaceID),
-                      latest.isExecutionEquivalent(to: snapshot),
+                      latest.isInSameExecutionLineage(as: snapshot),
                       let latestWorkspace = try? JSONDecoder().decode(WorkspaceModel.self, from: latest.document.documentBytes)
                 else {
                     throw AgentHostWorkspaceResources.Failure.contextUnavailable

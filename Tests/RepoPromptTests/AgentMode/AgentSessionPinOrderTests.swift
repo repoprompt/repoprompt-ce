@@ -664,6 +664,98 @@ final class AgentSessionPinDuringInitTests: XCTestCase {
         XCTAssertTrue(runHarness.provider.promptedMessages.isEmpty)
     }
 
+    func testChangeThenRevertWithoutIntermediateValidationInvalidatesLeaseAndFreshCreation() async throws {
+        // 1. Run start lease must stay permanently invalidated across an A -> B -> A' change-then-revert
+        //    even when validate() is never called while B is active.
+        let runHarness = try await makeHarness(boundCanonicalCarrier: true)
+        let command = try runHarness.host.scope.admit(session: runHarness.session)
+        let resources = try await runHarness.host.captureStartupResources(for: command, rootIDs: [])
+        let rawOriginalSnapshot = await runHarness.authority.canonicalWorkspaceSnapshot(runHarness.workspaceID)
+        let originalSnapshot = try XCTUnwrap(rawOriginalSnapshot)
+        let originalWorkspace = try JSONDecoder().decode(
+            WorkspaceModel.self,
+            from: originalSnapshot.document.documentBytes
+        )
+        let runGate = PinRaceGate()
+        var validations = 0
+        resources.test_beforeValidation = {
+            validations += 1
+            if validations == 1 {
+                await runGate.pauseOnce()
+            }
+        }
+        let environment = try runHarness.host.makeStartupEnvironment(resources: resources)
+        let outcome = AgentRunStartOutcomeRecorder()
+
+        let pendingRun = Task {
+            _ = await runHarness.host.scope.startup.start(
+                session: runHarness.session,
+                initialMessage: "Should abort after ABA change-then-revert",
+                startOutcome: outcome,
+                claudeCoordinator: runHarness.host.claudeCoordinator,
+                links: runHarness.links,
+                environment: environment
+            )
+        }
+        await runGate.waitUntilEntered()
+
+        // Mutate A -> B (execution-relevant prompt change) and immediately revert B -> A'
+        // with matching bytes, with zero intermediate validate() calls.
+        try await mutateCanonicalWorkspace(in: runHarness) { workspace in
+            let index = try XCTUnwrap(workspace.composeTabs.firstIndex(where: { $0.id == runHarness.tabID }))
+            workspace.composeTabs[index].promptText = "Transient real edit"
+        }
+        try await mutateCanonicalWorkspace(in: runHarness) { workspace in
+            workspace = originalWorkspace
+        }
+
+        await runGate.open()
+        await pendingRun.value
+
+        XCTAssertFalse(outcome.outcome.didStart, "An A -> B -> A' revert must permanently invalidate an in-flight run start")
+        XCTAssertTrue(runHarness.provider.promptedMessages.isEmpty)
+        let stillValid = await resources.validate()
+        XCTAssertFalse(stillValid, "A stale lease cannot become current again through matching bytes")
+
+        // 2. Fresh creation must also fail closed across an A -> B -> A' change-then-revert.
+        let creationGate = PinRaceGate()
+        let creationHarness = try await makeHarness(
+            boundCanonicalCarrier: false,
+            commandWillExecute: { envelope in
+                if case .replaceWorkingDocument = envelope.command {
+                    await creationGate.pauseOnce()
+                }
+            }
+        )
+        let rawCreationOriginalSnapshot = await creationHarness.authority.canonicalWorkspaceSnapshot(creationHarness.workspaceID)
+        let creationOriginalSnapshot = try XCTUnwrap(rawCreationOriginalSnapshot)
+        let creationOriginalWorkspace = try JSONDecoder().decode(
+            WorkspaceModel.self,
+            from: creationOriginalSnapshot.document.documentBytes
+        )
+        let submission = try claimFreshSubmission(in: creationHarness)
+        defer { _ = creationHarness.host.scope.submissions.release(submission) }
+
+        let pendingCreation = Task {
+            try await creationHarness.host.prepareFreshCreation(submission: submission, rootIDs: [])
+        }
+        await creationGate.waitUntilEntered()
+
+        try await mutateCanonicalWorkspace(in: creationHarness) { workspace in
+            let index = try XCTUnwrap(workspace.composeTabs.firstIndex(where: { $0.id == creationHarness.tabID }))
+            workspace.composeTabs[index].promptText = "Transient real edit"
+        }
+        try await mutateCanonicalWorkspace(in: creationHarness) { workspace in
+            workspace = creationOriginalWorkspace
+        }
+
+        await creationGate.open()
+        do {
+            _ = try await pendingCreation.value
+            XCTFail("Fresh creation must fail closed across an A -> B -> A' change-then-revert")
+        } catch AgentHostWorkspaceResources.Failure.contextUnavailable {}
+    }
+
     // MARK: - Helpers
 
     private func routeScriptedHostProvider(_ session: AgentTabSession) async throws {

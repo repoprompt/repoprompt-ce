@@ -188,7 +188,7 @@ final class AgentSessionHostWorkspaceActivation {
             return savedTarget.carrier(in: workspace) != nil
         }
         guard let current = await authority.canonicalWorkspaceSnapshot(workspaceID),
-              current.isExecutionEquivalent(to: lease.snapshot), isCurrent,
+              current.isInSameExecutionLineage(as: lease.snapshot), isCurrent,
               !Task.isCancelled, catalogFileLease == nil
         else {
             await lease.release()
@@ -386,7 +386,7 @@ final class AgentSessionHostWorkspaceActivation {
         do {
             if savedTarget != nil {
                 guard let current = await authority.canonicalWorkspaceSnapshot(workspaceID),
-                      current.isExecutionEquivalent(to: lease.snapshot)
+                      current.isInSameExecutionLineage(as: lease.snapshot)
                 else {
                     throw AgentHostWorkspaceResources.Failure.contextChanged
                 }

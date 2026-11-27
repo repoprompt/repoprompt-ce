@@ -43,7 +43,7 @@ struct AgentHostWorkspaceResources {
         do {
             try Task.checkCancellation()
             guard let latest = await contexts.workspaceSnapshot(workspaceID),
-                  latest.isExecutionEquivalent(to: snapshot),
+                  latest.isInSameExecutionLineage(as: snapshot),
                   admits(latest)
             else { throw Failure.contextChanged }
             guard await files.isRootRetentionCurrent(retention) else { throw Failure.rootsChanged }
@@ -63,6 +63,7 @@ struct AgentHostWorkspaceResources {
         private let retention: WorkspaceFileContextStore.RootRetention
         private let rootOwner: Lease?
         private(set) var isReleased = false
+        private var isInvalidated = false
 
         fileprivate init(resources: AgentHostWorkspaceResources, snapshot: DomainWorkspaceSnapshot, roots: [WorkspaceRootRef], retention: WorkspaceFileContextStore.RootRetention, rootOwner: Lease? = nil) {
             self.resources = resources
@@ -86,11 +87,18 @@ struct AgentHostWorkspaceResources {
         }
 
         func isCurrent() async -> Bool {
-            guard rootsAreCurrent,
+            guard !isInvalidated, rootsAreCurrent,
                   let current = await resources.contexts?.workspaceSnapshot(snapshot.document.workspaceID),
-                  current.isExecutionEquivalent(to: snapshot)
-            else { return false }
-            return await retainedRootsAreCurrent()
+                  current.isInSameExecutionLineage(as: snapshot)
+            else {
+                isInvalidated = true
+                return false
+            }
+            let rootsValid = await retainedRootsAreCurrent()
+            if !rootsValid {
+                isInvalidated = true
+            }
+            return rootsValid
         }
 
         /// A request captures fresh canonical bytes while borrowing this activation's existing
@@ -112,7 +120,7 @@ struct AgentHostWorkspaceResources {
                   await resources.files.isRootRetentionCurrent(retention), rootsAreCurrent
             else { throw Failure.rootsChanged }
             guard let latest = await resources.contexts?.workspaceSnapshot(workspaceID),
-                  latest.isExecutionEquivalent(to: current),
+                  latest.isInSameExecutionLineage(as: current),
                   admits(latest)
             else { throw Failure.contextChanged }
             try Task.checkCancellation()
@@ -128,57 +136,29 @@ struct AgentHostWorkspaceResources {
     }
 }
 
-extension WorkspaceModel {
-    /// Returns a copy with presentation/metadata-only fields normalized so two canonical
-    /// snapshots can be compared for execution- and structure-relevant equality.
-    ///
-    /// Normalized fields mirror `WorkspaceManagerViewModel.ComposeTabPresentation` (`name`,
-    /// `lastModified`, `isPinned`, `pinnedOrder`, `sidebarGroup`, `sidebarGroupOrder`) plus
-    /// workspace save/focus metadata (`dateModified`, `lastUsed`, `activeComposeTabID`).
-    /// Workspace identity, name, roots, storage paths, stashed tabs, tab membership, carrier
-    /// bindings (`activeAgentSessionID`), selections, prompt text, and context configuration
-    /// remain exact so real workspace or context conflicts still fail closed.
-    func normalizedForExecutionEquivalence() -> WorkspaceModel {
-        var copy = self
-        let sentinelDate = Date(timeIntervalSince1970: 0)
-        copy.dateModified = sentinelDate
-        copy.lastUsed = sentinelDate
-        copy.activeComposeTabID = nil
-        for index in copy.composeTabs.indices {
-            copy.composeTabs[index].name = ""
-            copy.composeTabs[index].lastModified = sentinelDate
-            copy.composeTabs[index].isPinned = false
-            copy.composeTabs[index].pinnedOrder = nil
-            copy.composeTabs[index].sidebarGroup = nil
-            copy.composeTabs[index].sidebarGroupOrder = nil
-        }
-        return copy
-    }
-}
-
 extension DomainWorkspaceSnapshot {
-    /// Returns true when `other` represents the same execution and structural workspace state,
-    /// ignoring compose-tab presentation and workspace save/focus metadata-only edits.
-    func isExecutionEquivalent(to other: DomainWorkspaceSnapshot) -> Bool {
-        if self == other { return true }
-        guard health != .removed, other.health != .removed, health == other.health,
-              document.workspaceID == other.document.workspaceID,
-              document.fileURL == other.document.fileURL,
-              document.metadata.repoPaths == other.document.metadata.repoPaths,
-              contexts.count == other.contexts.count
+    /// Returns true when `self` belongs to the same unbroken presentation-only lineage as `baseline`:
+    /// same workspace identity/file/roots/health/contexts, monotonic working revision, and identical
+    /// store-maintained `executionRevision` and `executionContentDigest`. Any intermediate
+    /// execution-relevant edit—even one later reverted to matching bytes—advances `executionRevision`
+    /// permanently and fails closed here.
+    func isInSameExecutionLineage(as baseline: DomainWorkspaceSnapshot) -> Bool {
+        if self == baseline { return true }
+        guard health != .removed, baseline.health != .removed, health == baseline.health,
+              document.workspaceID == baseline.document.workspaceID,
+              document.fileURL == baseline.document.fileURL,
+              document.metadata.repoPaths == baseline.document.metadata.repoPaths,
+              revisions.workingRevision >= baseline.revisions.workingRevision,
+              executionRevision == baseline.executionRevision,
+              document.executionContentDigest == baseline.document.executionContentDigest,
+              contexts.count == baseline.contexts.count
         else { return false }
-        for (lhs, rhs) in zip(contexts, other.contexts) {
+        for (lhs, rhs) in zip(contexts, baseline.contexts) {
             guard lhs.metadata.identity == rhs.metadata.identity,
                   lhs.health != .removed, rhs.health != .removed,
                   lhs.health == rhs.health
             else { return false }
         }
-        if document.documentBytes == other.document.documentBytes { return true }
-        guard let lhsWorkspace = try? JSONDecoder().decode(WorkspaceModel.self, from: document.documentBytes),
-              let rhsWorkspace = try? JSONDecoder().decode(WorkspaceModel.self, from: other.document.documentBytes),
-              !lhsWorkspace.composeTabsDecodeWasLossy,
-              !rhsWorkspace.composeTabsDecodeWasLossy
-        else { return false }
-        return lhsWorkspace.normalizedForExecutionEquivalence() == rhsWorkspace.normalizedForExecutionEquivalence()
+        return true
     }
 }
