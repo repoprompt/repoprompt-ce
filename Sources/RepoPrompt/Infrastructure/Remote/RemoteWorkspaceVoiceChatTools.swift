@@ -25,6 +25,15 @@ struct RemoteWorkspaceVoiceChatTools {
             let historyCursor: RemoteHistoryCursor? = try decodeCursor(string("before"))
             return try await listChats(query: string("query"), before: historyCursor)
 
+        case "start_chat":
+            let response = try await dispatch(to: nil, message: string("message"))
+            guard let sessionID = response.sessionID else { throw RemoteWorkspaceVoiceError.unavailable }
+            return try json([
+                "accepted": true,
+                "chat_id": sessionID.uuidString,
+                "run_state": response.runState?.rawValue as Any? ?? NSNull()
+            ])
+
         case "read_chat", "send_to_chat":
             guard let reference = string("chat_id"), let chatID = UUID(uuidString: reference) else {
                 throw RemoteWorkspaceVoiceError.invalidToolArguments
@@ -46,13 +55,7 @@ struct RemoteWorkspaceVoiceChatTools {
                     "older": try encodeCursor(page.olderCursor) as Any? ?? NSNull()
                 ])
             }
-            let message = string("message")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            guard !message.isEmpty, message.utf8.count <= 12_000 else {
-                throw RemoteWorkspaceVoiceError.invalidToolArguments
-            }
-            let response = try await workspace.message(chatID, message, leaseIsValid)
-            try requireAccess()
-            guard response.accepted else { throw RemoteWorkspaceVoiceError.unavailable }
+            let response = try await dispatch(to: chatID, message: string("message"))
             return try json([
                 "accepted": true,
                 "title": chat.sessionName,
@@ -62,6 +65,20 @@ struct RemoteWorkspaceVoiceChatTools {
         default:
             throw RemoteWorkspaceVoiceError.invalidToolArguments
         }
+    }
+
+    private func dispatch(to chatID: UUID?, message: String?) async throws -> RemoteCommandResponse {
+        let text = message?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !text.isEmpty, text.utf8.count <= 12_000 else {
+            throw RemoteWorkspaceVoiceError.invalidToolArguments
+        }
+        let response = try await workspace.dispatch(chatID, text, leaseIsValid)
+        try requireAccess()
+        guard response.accepted,
+              response.workspaceID.flatMap(UUID.init(uuidString:)) == workspace.workspaceID,
+              chatID == nil || response.sessionID == chatID
+        else { throw RemoteWorkspaceVoiceError.unavailable }
+        return response
     }
 
     private func listChats(query: String?, before: RemoteHistoryCursor?) async throws -> String {
@@ -152,11 +169,14 @@ struct RemoteWorkspaceVoiceChatTools {
                 "before": "The opaque older cursor from the previous result, for the same query."
             ]),
             tool("read_chat", "Read a chat's recent transcript, whether or not it is active.", fields: [
-                "chat_id": "ID returned by list_chats.",
+                "chat_id": "ID returned by list_chats or start_chat.",
                 "before": "The opaque older cursor from the previous read of this chat."
             ], required: ["chat_id"]),
+            tool("start_chat", "Start a new Codex chat in this workspace only when explicitly asked.", fields: [
+                "message": "The caller's first instruction for this new chat."
+            ], required: ["message"]),
             tool("send_to_chat", "Deliver the caller's explicit instruction to an existing chat. A running chat is steered. A saved chat is resumed.", fields: [
-                "chat_id": "ID returned by list_chats.",
+                "chat_id": "ID returned by list_chats or start_chat.",
                 "message": "The caller's instruction for this chat."
             ], required: ["chat_id", "message"])
         ]

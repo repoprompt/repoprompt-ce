@@ -434,7 +434,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                 return result
             },
             workspaceVoice: { [unowned self] request, context in
-                try workspaceVoice.handle(request) {
+                try workspaceVoice.handle(request, peerEndpointID: context.endpointID) {
                     try makeWorkspaceVoiceAccess(workspaceID: request.workspaceID, context: context)
                 }
             }
@@ -491,12 +491,13 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                     limit: 12, includeDetails: false
                 )
             },
-            message: { [weak self] sessionID, message, leaseIsValid in
+            dispatch: { [weak self] sessionID, message, leaseIsValid in
                 guard let self, let controlService, isAuthorized(), leaseIsValid() else {
                     throw RemoteWorkspaceVoiceError.unavailable
                 }
-                return try await controlService.continueWorkspaceVoiceChat(
-                    workspaceID: workspaceID, sessionID: sessionID, message: message, isAuthorized: { isAuthorized() && leaseIsValid() }
+                return try await controlService.dispatchWorkspaceVoiceChat(
+                    workspaceID: workspaceID, sessionID: sessionID, message: message,
+                    isAuthorized: { isAuthorized() && leaseIsValid() }
                 )
             }
         )
