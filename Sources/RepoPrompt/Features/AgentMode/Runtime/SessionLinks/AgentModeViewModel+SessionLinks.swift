@@ -536,45 +536,13 @@ extension AgentModeViewModel {
         return session.oversight.autoWakeTargetSessionIDs
     }
 
-    /// Writes that setting to one exact observer incarnation.
-    ///
-    /// Endpoint-checked before the write, marked dirty so the existing scheduled persistence saves
-    /// it, and mirrored into the owner-validated index immediately so a sidebar rebuild or a cold
-    /// reseed cannot resurrect the previous value.
     @discardableResult
     func agentSessionLinkSetAutoWakeOnUpdatesEnabled(
         _ enabled: Bool,
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> Bool {
-        guard linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
-              let session = sessions[endpoint.tabID],
-              session.hasLoadedPersistedState
-        else {
-            return false
-        }
-        guard session.oversight.autoWakeOnUpdates != enabled else { return true }
-        session.oversight.autoWakeOnUpdates = enabled
-        session.isDirty = true
-        persistenceRuntime.scheduleSave(for: endpoint.tabID)
-        if var entry = ownerValidatedSessionIndex[endpoint.sessionID] {
-            entry.autoWakeOnOversightUpdates = enabled
-            sessionIndexStore.applyLocalUpsert(entry)
-        }
-        // Re-enabling is an explicit recovery action and clears only failure suppression; it invents
-        // no admission basis, so a lane with no genuinely new content stays silent. Disabling never
-        // clears the queue and does not preemptively cancel: the shared selection fence below retracts
-        // routine status/overflow attempts while retaining exact purposeful attention, which is not
-        // governed by routine Auto-wake selection.
-        if enabled {
-            linkExecutionRuntime.agentSessionLinkClearAutoWakeSuppression(for: endpoint)
-        }
-        // Turning the master off may leave granular lanes effective, and turning it on selects every
-        // lane at once. Either way the resulting per-target selection is fenced synchronously here
-        // rather than waiting for the projection this signal schedules.
-        linkExecutionRuntime.agentSessionLinkFenceAutoWakeSelectionChange(for: endpoint)
-        ui.statusPills.update(makeStatusPillsSnapshot())
-        session.monitorObservationSignal.send(())
-        return true
+        _ = persistenceRuntime
+        return linkExecutionRuntime.setWakePolicy(.automaticUpdates(enabled), for: endpoint)
     }
 
     @discardableResult
@@ -582,95 +550,43 @@ extension AgentModeViewModel {
         _ targetSessionIDs: Set<UUID>,
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> Bool {
-        guard linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
-              let session = sessions[endpoint.tabID],
-              session.hasLoadedPersistedState
-        else { return false }
-        guard session.oversight.autoWakeTargetSessionIDs != targetSessionIDs else { return true }
-        session.oversight.autoWakeTargetSessionIDs = targetSessionIDs
-        session.isDirty = true
-        persistenceRuntime.scheduleSave(for: endpoint.tabID)
-        if var entry = ownerValidatedSessionIndex[endpoint.sessionID] {
-            entry.agentSessionLinkAutoWakeTargetSessionIDs = targetSessionIDs
-            sessionIndexStore.applyLocalUpsert(entry)
-        }
-        // Baselines newly selected lanes at the epoch they hold now and retracts an attempt this
-        // change made ineligible, both before the republication can observe a target that moved in
-        // between.
-        linkExecutionRuntime.agentSessionLinkFenceAutoWakeSelectionChange(for: endpoint)
-        ui.statusPills.update(makeStatusPillsSnapshot())
-        session.monitorObservationSignal.send(())
-        return true
+        _ = persistenceRuntime
+        return linkExecutionRuntime.setWakePolicy(.selectedTargets(targetSessionIDs), for: endpoint)
     }
 
-    /// Writes this observer's minimum routine wake interval to one exact incarnation.
-    ///
-    /// Uses the existing save/index path and reevaluates pending work without clearing failure
-    /// suppression. Disabling retains both the chosen duration and the last wake stamp.
     @discardableResult
     func agentSessionLinkSetRoutineWakeInterval(
         enabled: Bool,
         seconds: Int,
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> Bool {
-        guard linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
-              let session = sessions[endpoint.tabID],
-              session.hasLoadedPersistedState
-        else {
-            return false
-        }
-        let normalizedSeconds = AgentSessionLinkRoutineWakeInterval.normalized(seconds)
-        guard session.oversight.routineWakeIntervalEnabled != enabled
-            || session.oversight.routineWakeIntervalSeconds != normalizedSeconds
-        else {
-            return true
-        }
-        session.oversight.routineWakeIntervalEnabled = enabled
-        session.oversight.routineWakeIntervalSeconds = normalizedSeconds
-        session.isDirty = true
-        persistenceRuntime.scheduleSave(for: endpoint.tabID)
-        if var entry = ownerValidatedSessionIndex[endpoint.sessionID] {
-            entry.routineWakeIntervalEnabled = enabled
-            entry.routineWakeIntervalSeconds = normalizedSeconds
-            sessionIndexStore.applyLocalUpsert(entry)
-        }
-        // Fences an attempt this change just made ineligible and replays exactly one evaluation of
-        // the retained snapshot, which is also where the shared deadline is re-armed.
-        linkExecutionRuntime.agentSessionLinkNoteRoutineWakeIntervalChanged(for: endpoint)
-        // Oversight preferences have no mirrored-field invalidation in a full binding refresh.
-        ui.statusPills.update(makeStatusPillsSnapshot())
-        session.monitorObservationSignal.send(())
-        return true
+        _ = persistenceRuntime
+        return linkExecutionRuntime.setWakePolicy(.routineInterval(enabled: enabled, seconds: seconds), for: endpoint)
     }
 
-    /// Saves periodic idle policy without changing notification selection or snoozes.
     @discardableResult
     func agentSessionLinkSetPeriodicIdleWake(
         enabled: Bool,
         seconds: Int,
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> Bool {
-        guard linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
-              let session = sessions[endpoint.tabID],
-              session.hasLoadedPersistedState
-        else { return false }
-        let normalizedSeconds = AgentSessionLinkPeriodicWakeInterval.normalized(seconds)
-        guard session.oversight.periodicIdleWakeEnabled != enabled
-            || session.oversight.periodicIdleWakeIntervalSeconds != normalizedSeconds
-        else { return true }
-        session.oversight.periodicIdleWakeEnabled = enabled
-        session.oversight.periodicIdleWakeIntervalSeconds = normalizedSeconds
-        session.isDirty = true
-        persistenceRuntime.scheduleSave(for: endpoint.tabID)
-        if var entry = ownerValidatedSessionIndex[endpoint.sessionID] {
-            entry.periodicIdleWakeEnabled = enabled
-            entry.periodicIdleWakeIntervalSeconds = normalizedSeconds
+        _ = persistenceRuntime
+        return linkExecutionRuntime.setWakePolicy(.periodicIdle(enabled: enabled, seconds: seconds), for: endpoint)
+    }
+
+    func agentSessionLinkWakePolicyDidChange(_ session: AgentTabSession) {
+        guard sessions[session.tabID] === session, let id = session.activeAgentSessionID else { return }
+        if var entry = ownerValidatedSessionIndex[id] {
+            let policy = session.oversight
+            entry.autoWakeOnOversightUpdates = policy.autoWakeOnUpdates
+            entry.agentSessionLinkAutoWakeTargetSessionIDs = policy.autoWakeTargetSessionIDs
+            entry.routineWakeIntervalEnabled = policy.routineWakeIntervalEnabled
+            entry.routineWakeIntervalSeconds = policy.routineWakeIntervalSeconds
+            entry.periodicIdleWakeEnabled = policy.periodicIdleWakeEnabled
+            entry.periodicIdleWakeIntervalSeconds = policy.periodicIdleWakeIntervalSeconds
             sessionIndexStore.applyLocalUpsert(entry)
         }
-        linkExecutionRuntime.agentSessionLinkReconcilePeriodicWake(for: endpoint)
-        ui.statusPills.update(makeStatusPillsSnapshot())
-        session.monitorObservationSignal.send(())
-        return true
+        syncStatusPillsUIStateIfMonitorStale()
     }
 
     @discardableResult
@@ -881,27 +797,9 @@ extension AgentModeViewModel {
         // view performs from ever addressing a different incarnation than the rows it is showing.
         var props = agentSessionLinkOverlayingAutoWakePolicy(props, endpoint: endpoint)
         props.endpoint = endpoint
-        // One tab of one window holds at most one live incarnation
-        // (`agentSessionLinkObserverEndpoint(tabID:)` resolves exactly one), so any *other* entry
-        // filed under this tab is a superseded incarnation that nothing can read again. Collecting it
-        // here rather than waiting for the tab to close is what keeps repeated in-place rebinds from
-        // accumulating one unreachable projection per binding generation: the close-time sweep is the
-        // only other collector, and a rebind never closes the tab.
-        let superseded = monitorPillPropsByEndpoint.keys.filter { cached in
-            cached.tabID == endpoint.tabID && cached != endpoint
+        if runtimeSessionStore.presentation.storeMonitorProjection(props, for: endpoint) {
+            agentSessionLinkProjectionDidChange()
         }
-        agentSessionLinkMutateProjectionStorage { stored in
-            for stale in superseded {
-                stored.removeValue(forKey: stale)
-            }
-            stored[endpoint] = props
-        }
-    }
-
-    func agentSessionLinkWillActivate(_ endpoint: DomainAgentSessionLinkEndpointIdentity) async {
-        guard linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
-              let session = sessions[endpoint.tabID] else { return }
-        await codexCoordinator.awaitCodexComputerUseRetirement(for: session.tabID)
     }
 
     /// Names also invalidate archived/unlinked consumers whose exact projection props are equal.
@@ -913,9 +811,8 @@ extension AgentModeViewModel {
     /// Applies one logical exact-projection storage transaction and publishes one presentation
     /// invalidation only after every write and removal is visible.
     ///
-    /// This is the sole mutation boundary for `monitorPillPropsByEndpoint`. The status-pill snapshot
-    /// is synchronized before the notification so every consumer can immediately re-read the same
-    /// completed state. Equal replacements are true no-ops and publish nothing.
+    /// Synchronize both presentation consumers after the host committed its projection.
+    /// The status-pill snapshot is ready before the sidebar observes the notification.
     ///
     /// The snapshot's only storage-derived field is `monitor`. The full snapshot (Model Router
     /// availability, execution location, ...) is rebuilt only when the published `monitor` differs
@@ -936,9 +833,11 @@ extension AgentModeViewModel {
             sidebarCreatorDisplayNames = creatorNames
         }
         monitorPillPropsByEndpoint = updated
-        if propsChanged {
-            agentSessionLinkReconcileOversightColourSlots()
-        }
+        agentSessionLinkProjectionDidChange(reconcileRoles: propsChanged)
+    }
+
+    func agentSessionLinkProjectionDidChange(reconcileRoles: Bool = true) {
+        if reconcileRoles { agentSessionLinkReconcileOversightColourSlots() }
         syncStatusPillsUIStateIfMonitorStale()
         NotificationCenter.default.post(
             name: .agentSessionLinkOverseerProjectionDidChange,
@@ -999,7 +898,7 @@ extension AgentModeViewModel {
                 roles[tab.id] = agentSessionLinkOversightRole(
                     tabID: tab.id,
                     expectedSessionID: expectedSessionID,
-                    endpoint: identity.monitorEndpoint(windowID: windowID)
+                    endpoint: identity.monitorEndpoint(windowID: linkExecutionRuntime.routeID)
                 )
             }
         }

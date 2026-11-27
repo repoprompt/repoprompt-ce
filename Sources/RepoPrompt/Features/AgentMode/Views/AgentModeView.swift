@@ -5781,11 +5781,15 @@ private struct AgentSessionRestorationRecoveryView: View {
                 case .preparing:
                     Text("This new session is being prepared.").font(.callout)
                 case .readyToPersist:
-                    Text("This prepared session has not been saved yet.").font(.callout)
-                    Spacer(minLength: 8)
-                    Button("Retry Saving") {
-                        guard let handle = viewModel.captureSessionCreationRetry(for: session) else { return }
-                        Task { await viewModel.retrySessionInitialSave(handle) }
+                    if session.isSavingInitialConfiguration {
+                        Text("Saving this new session…").font(.callout)
+                    } else {
+                        Text("This prepared session has not been saved yet.").font(.callout)
+                        Spacer(minLength: 8)
+                        Button("Retry Saving") {
+                            guard let handle = viewModel.captureSessionCreationRetry(for: session) else { return }
+                            Task { await viewModel.retrySessionInitialSave(handle) }
+                        }
                     }
                 case let .failedBeforeConfiguration(message):
                     Text(message).font(.callout)

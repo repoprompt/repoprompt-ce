@@ -106,6 +106,35 @@ final class AgentSessionHostWorkspaceActivation {
         return tab
     }
 
+    /// Compare the inputs the run borrows from the workspace. The selected tab, pin
+    /// state and unrelated document revisions are independent of this command.
+    private func executionInputMatches(
+        _ captured: DomainWorkspaceSnapshot, _ current: DomainWorkspaceSnapshot,
+        command: AgentSessionRuntimeStore.Command
+    ) -> Bool {
+        let before = captured.document.metadata
+        let after = current.document.metadata
+        guard captured.document.fileURL == current.document.fileURL,
+              before.repoPaths == after.repoPaths, before.customStoragePath == after.customStoragePath,
+              before.isSystemWorkspace == after.isSystemWorkspace, before.isEphemeral == after.isEphemeral,
+              before.consolidatedIntoWorkspaceID == after.consolidatedIntoWorkspaceID,
+              !captured.health.acceptsMutations || current.health.acceptsMutations,
+              let original = executionTab(in: captured, command: command),
+              let live = executionTab(in: current, command: command)
+        else { return false }
+        return live.selection == original.selection && live.promptText == original.promptText
+    }
+
+    func validateExecutionInput(
+        lease: AgentHostWorkspaceResources.Lease, command: AgentSessionRuntimeStore.Command
+    ) async -> Bool {
+        guard isCurrent, command.isCurrent, await lease.retainedRootsAreCurrent(),
+              let current = await authority.canonicalWorkspaceSnapshot(command.identity.workspaceID),
+              isCurrent, command.isCurrent, lease.rootsAreCurrent, !Task.isCancelled
+        else { return false }
+        return executionInputMatches(lease.snapshot, current, command: command)
+    }
+
     /// Only pre-installation and presenter attachment follow the window's latest epoch. Once
     /// bound, this exact host keeps its resources across unrelated presentation changes. Losing
     /// that binding never falls back to a newly selected presenter or host.
@@ -295,7 +324,7 @@ final class AgentSessionHostWorkspaceActivation {
             lookupSource: .init(activeAgentSessionID: command.identity.sessionID, worktreeBindings: bindings),
             workspacePaths: lease.snapshot.document.metadata.repoPaths, isCurrent: current,
             validate: {
-                guard current(), await lease.isCurrent() else { return false }
+                guard current(), await self.validateExecutionInput(lease: lease, command: command) else { return false }
                 return current()
             }
         ), selection: tab.selection, promptText: tab.promptText)
@@ -375,16 +404,19 @@ final class AgentSessionHostWorkspaceActivation {
         }
         let workspaceID = command.identity.workspaceID
         let admits: (DomainWorkspaceSnapshot) -> Bool = { self.executionTab(in: $0, command: command) != nil }
+        let matchesSnapshot: (DomainWorkspaceSnapshot, DomainWorkspaceSnapshot) -> Bool = {
+            self.executionInputMatches($0, $1, command: command)
+        }
         let roots = Set(rootIDs)
         let existing = rootLeases[roots].flatMap { $0.rootsAreCurrent ? $0 : nil }
         let lease: AgentHostWorkspaceResources.Lease = if let existing {
-            try await existing.capture(workspaceID: workspaceID, admits: admits)
+            try await existing.capture(workspaceID: workspaceID, matchesSnapshot: matchesSnapshot, admits: admits)
         } else {
-            try await resources.acquire(workspaceID: workspaceID, rootIDs: rootIDs, admits: admits)
+            try await resources.acquire(workspaceID: workspaceID, rootIDs: rootIDs, matchesSnapshot: matchesSnapshot, admits: admits)
         }
         do {
             if savedTarget != nil {
-                guard await authority.canonicalWorkspaceSnapshot(workspaceID) == lease.snapshot else {
+                guard await validateExecutionInput(lease: lease, command: command) else {
                     throw AgentHostWorkspaceResources.Failure.contextChanged
                 }
             }

@@ -416,11 +416,8 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
     func independentLinkRuntime(
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> AgentSessionLinkExecutionRuntime? {
-        guard !isTerminating,
-              case let .unique(writer) = agentRuntimeStore.resolveWriter(sessionID: endpoint.sessionID, expectedWorkspaceID: endpoint.workspaceID),
-              let host = writer.scope.executableHost, host.route.identity.kind == .independent,
-              host.routeID == endpoint.windowID, host.workspaceActivation?.isCurrent == true,
-              let runtime = writer.scope.linkExecution, runtime.admit(endpoint: endpoint) != nil else { return nil }
+        guard let runtime = agentSessionLinkCommandRuntime(for: endpoint),
+              runtime.scope?.executableHost?.route.identity.kind == .independent else { return nil }
         return runtime
     }
 
@@ -642,8 +639,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         _ enabled: Bool,
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> Bool {
-        guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else { return false }
-        return viewModel.agentSessionLinkSetAutoWakeOnUpdatesEnabled(enabled, for: endpoint)
+        setAgentSessionLinkWakePolicy(.automaticUpdates(enabled), for: endpoint)
     }
 
     @discardableResult
@@ -651,8 +647,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         _ targetSessionIDs: Set<UUID>,
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> Bool {
-        guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else { return false }
-        return viewModel.agentSessionLinkSetAutoWakeTargetSessionIDs(targetSessionIDs, for: endpoint)
+        setAgentSessionLinkWakePolicy(.selectedTargets(targetSessionIDs), for: endpoint)
     }
 
     @discardableResult
@@ -661,12 +656,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         seconds: Int,
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> Bool {
-        guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else { return false }
-        return viewModel.agentSessionLinkSetRoutineWakeInterval(
-            enabled: enabled,
-            seconds: seconds,
-            for: endpoint
-        )
+        setAgentSessionLinkWakePolicy(.routineInterval(enabled: enabled, seconds: seconds), for: endpoint)
     }
 
     @discardableResult
@@ -675,15 +665,23 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         seconds: Int,
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> Bool {
-        guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else { return false }
-        return viewModel.agentSessionLinkSetPeriodicIdleWake(
-            enabled: enabled,
-            seconds: seconds,
-            for: endpoint
-        )
+        setAgentSessionLinkWakePolicy(.periodicIdle(enabled: enabled, seconds: seconds), for: endpoint)
     }
 
-    /// Routes one `Wake now` request to the view model that *is* this exact incarnation.
+    private func setAgentSessionLinkWakePolicy(
+        _ change: AgentSessionLinkExecutionRuntime.WakePolicyChange,
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> Bool {
+        guard let runtime = agentSessionLinkCommandRuntime(for: endpoint) else { return false }
+        if runtime.scope?.persistence.composition == nil,
+           let legacyPresenter = agentSessionLinkOwningViewModel(for: endpoint)
+        {
+            _ = legacyPresenter.persistenceRuntime
+        }
+        return runtime.setWakePolicy(change, for: endpoint)
+    }
+
+    /// Routes one `Wake now` request to the executor that owns this exact incarnation.
     ///
     /// Same addressing rule as the policy writes above: a superseded incarnation must not have a turn
     /// reserved on the live one that replaced it.
@@ -691,10 +689,10 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
     func agentSessionLinkRequestManualWakeNow(
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> AgentMonitorWakeNowOutcome {
-        guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else {
+        guard let runtime = agentSessionLinkCommandRuntime(for: endpoint) else {
             return .refused(.observerUnavailable)
         }
-        return viewModel.linkExecutionRuntime.agentSessionLinkRequestManualWakeNow(for: endpoint)
+        return runtime.agentSessionLinkRequestManualWakeNow(for: endpoint)
     }
 
     @discardableResult
@@ -714,7 +712,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         return viewModel.agentSessionLinkSetWaitingOn(waitingOn, for: endpoint)
     }
 
-    /// Routes one pure Auto-wake snooze read to the view model that *is* this exact incarnation.
+    /// Reads the exact observer's policy, even while its host has no current presenter.
     ///
     /// Addressed exactly like every other endpoint-scoped call here: a session UUID is not an address,
     /// and an in-place rebind keeps that UUID while advancing the binding generations. A retired or
@@ -724,17 +722,17 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         targetSessionID: UUID,
         expectedReference: DomainAgentSessionLinkReference
     ) -> Result<AgentSessionLinkAutoWakeSnoozeProjection?, AgentSessionLinkAutoWakeSnoozeFailure> {
-        guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else {
+        guard let runtime = agentSessionLinkCommandRuntime(for: endpoint) else {
             return .failure(.observerUnavailable)
         }
-        return viewModel.linkExecutionRuntime.agentSessionLinkAutoWakeSnoozeProjection(
+        return runtime.agentSessionLinkAutoWakeSnoozeProjection(
             endpoint: endpoint,
             targetSessionID: targetSessionID,
             expectedReference: expectedReference
         )
     }
 
-    /// Routes one Auto-wake snooze mutation to the view model that *is* this exact incarnation.
+    /// Routes one Auto-wake snooze mutation to the executor that owns this exact incarnation.
     ///
     /// The same-session-UUID replacement case is the one this exists to refuse: a stale monitor row or
     /// a late MCP call naming a superseded incarnation must not install or clear policy on the live
@@ -746,10 +744,10 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         command: AgentSessionLinkAutoWakeSnoozeCommand,
         origin: AgentSessionLinkAutoWakeSnoozeOrigin
     ) -> Result<AgentSessionLinkAutoWakeSnoozeMutationOutcome, AgentSessionLinkAutoWakeSnoozeFailure> {
-        guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else {
+        guard let runtime = agentSessionLinkCommandRuntime(for: endpoint) else {
             return .failure(.observerUnavailable)
         }
-        return viewModel.linkExecutionRuntime.agentSessionLinkMutateAutoWakeSnooze(
+        return runtime.agentSessionLinkMutateAutoWakeSnooze(
             endpoint: endpoint,
             targetSessionID: targetSessionID,
             expectedReference: expectedReference,
@@ -783,7 +781,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         )
     }
 
-    /// Routes an Oversee projection to the one window/tab that *is* this endpoint incarnation.
+    /// Routes an Oversee projection to the exact host that owns this endpoint incarnation.
     ///
     /// Previously this fanned out to every non-closing window holding a session with the same UUID.
     /// Duplicate live incarnations are explicitly modelled (the resolver refuses them as
@@ -793,8 +791,8 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         _ props: AgentMonitorPillProps,
         to endpoint: DomainAgentSessionLinkEndpointIdentity
     ) {
-        if let runtime = independentLinkRuntime(for: endpoint), props.endpoint == endpoint {
-            runtime.residentMonitorPropsBySessionID[endpoint.sessionID] = props.outbound.isEmpty ? nil : props
+        if let runtime = independentLinkRuntime(for: endpoint) {
+            runtime.publishMonitorProjection(props, to: endpoint)
         } else if let viewModel = agentSessionLinkOwningViewModel(for: endpoint) {
             viewModel.agentSessionLinkPublishProjection(props, to: endpoint)
         } else {
@@ -832,8 +830,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
     }
 
     func agentSessionLinkWillActivate(_ endpoint: DomainAgentSessionLinkEndpointIdentity) async {
-        guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else { return }
-        await viewModel.agentSessionLinkWillActivate(endpoint)
+        await agentSessionLinkCommandRuntime(for: endpoint)?.prepareForLinkActivation(endpoint)
     }
 
     func agentSessionLinkWithholdPromptInventory(
@@ -934,15 +931,22 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         )
     }
 
-    /// Resolves the command runtime through the process writer authority. The endpoint's route ID
-    /// is an incarnation fence, not a window-selection instruction. Existing liveness probes retain
-    /// presentation-close refusal until the separate presentation-lifetime cutover.
+    /// Commands use the exact process writer and its route, whether or not a window presents it.
     private func agentSessionLinkCommandRuntime(for candidate: AgentSessionLinkEndpointCandidate) -> AgentSessionLinkExecutionRuntime? {
+        agentSessionLinkCommandRuntime(for: candidate.domainEndpoint)
+    }
+
+    private func agentSessionLinkCommandRuntime(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> AgentSessionLinkExecutionRuntime? {
         guard !isTerminating,
-              case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
-                  sessionID: candidate.sessionID, expectedWorkspaceID: candidate.workspaceID
-              ), let runtime = writer.scope.linkExecution,
-              runtime.admit(candidate) != nil else { return nil }
+              case let .unique(writer) = agentRuntimeStore.resolveWriter(
+                  sessionID: endpoint.sessionID, expectedWorkspaceID: endpoint.workspaceID
+              ), let runtime = writer.scope.linkExecution else { return nil }
+        if let host = writer.scope.executableHost, host.route.identity.kind == .independent {
+            guard host.routeID == endpoint.windowID, host.workspaceActivation?.isCurrent == true else { return nil }
+        }
+        guard runtime.admit(endpoint: endpoint) != nil else { return nil }
         return runtime
     }
 
@@ -1027,9 +1031,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         if let runtime = independentLinkRuntime(for: endpoint) {
             guard runtime.agentSessionLinkActivateOverseer(for: endpoint, expected: expected) else { return false }
             if let session = runtime.sessions[endpoint.tabID] {
-                for window in allWindows where !window.isClosing && window.agentModeViewModel.runtimeSessionStore === runtime.scope {
-                    window.agentModeViewModel.agentSessionLinkRepaintCurrentPillIfOwned(session)
-                }
+                runtime.scope?.presentation.oversightBindingChanged(session)
             }
             return true
         }

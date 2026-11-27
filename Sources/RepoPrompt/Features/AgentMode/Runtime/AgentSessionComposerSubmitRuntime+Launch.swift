@@ -1,29 +1,38 @@
 import Foundation
 
 extension AgentSessionComposerSubmitRuntime {
-    /// Original publication evidence only. It cannot admit a command after revocation.
-    struct PublicationCleanup {
+    /// The exact command and user input admitted to this publication. The transcript revision
+    /// qualifies rollback. Forward dispatch checks the submitted row and the writer directly.
+    @MainActor
+    struct CanonicalPublication {
         let attemptID: UUID
+        let command: AgentSessionRuntimeStore.Command
         let membership: AgentSessionRuntimeStore.Membership
         let item: AgentChatItem
         let expectedSourceRevision: Int
         let draftGeneration: UInt64
         let workflowGeneration: UInt64
+
+        var acceptedInputIndex: Int? {
+            let items = command.writer.session.items
+            guard let index = items.lastIndex(where: { $0.kind == .user }), items[index] == item else { return nil }
+            return index
+        }
     }
 
     func captureCanonicalPublication(
-        claim: AgentSessionComposerSubmitClaim, host: AgentSessionRuntimeHost, item: AgentChatItem
-    ) -> PublicationCleanup? {
+        claim: AgentSessionComposerSubmitClaim, host: AgentSessionRuntimeHost,
+        session: AgentTabSession, item: AgentChatItem
+    ) -> CanonicalPublication? {
         let owner = claim.scope
-        let session = claim.sourceSession
         guard owner.submissions === self, host.scope === owner, owner.executableHost === host,
-              host.workspaceActivation?.isCurrent == true, isCurrent(claim),
-              let command = claim.command, command.writer.scope === owner,
-              command.writer.session === session, command.isCurrent,
+              host.workspaceActivation?.isCurrent == true,
+              let command = dispatchCommand(for: claim, on: session),
               let membership = owner.membership(of: session), !session.items.contains(where: { $0.id == item.id })
         else { return nil }
         return .init(
             attemptID: claim.attempt.id,
+            command: command,
             membership: membership,
             item: item,
             expectedSourceRevision: session.sourceItemsRevision &+ 1,
@@ -34,7 +43,7 @@ extension AgentSessionComposerSubmitRuntime {
 
     /// An immutable submitted payload, not an admission or a second submission ledger.
     struct PreparedTurn {
-        let publication: PublicationCleanup
+        let publication: CanonicalPublication
         let message: String
         let attachments: [AgentFileAttachment]
         let taggedFiles: [AgentTaggedFileAttachment]
@@ -56,15 +65,19 @@ extension AgentSessionComposerSubmitRuntime {
         _ turn: PreparedTurn, claim: AgentSessionComposerSubmitClaim, message: String
     ) -> Bool {
         let owner = claim.scope
-        let session = claim.sourceSession
         let receipt = turn.publication
-        guard owner.submissions === self, claim.attempt.id == receipt.attemptID,
+        let session = receipt.command.writer.session
+        guard owner.submissions === self, receipt.command.writer.scope === owner,
+              claim.attempt.id == receipt.attemptID,
               owner.membership(of: session)?.identity == receipt.membership.identity,
               turn.userItemID == receipt.item.id,
               session.sourceItemsRevision == receipt.expectedSourceRevision,
               session.items.contains(receipt.item),
               session.draftMutationGeneration == receipt.draftGeneration
-              || (session.draftText.isEmpty && session.draftMutationGeneration == claim.cancellation.ownedDraftClearGeneration),
+              || (
+                  session === claim.sourceSession && session.draftText.isEmpty
+                      && session.draftMutationGeneration == claim.cancellation.ownedDraftClearGeneration
+              ),
               session.userWorkflowSelectionMutationGeneration == receipt.workflowGeneration
         else { return false }
         // Preserve owed user data before row removal can synchronously notify a presenter.
@@ -103,23 +116,22 @@ extension AgentSessionComposerSubmitRuntime {
         rejectedPresentation: ((String) -> Void)? = nil
     ) -> CanonicalSubmission {
         let owner = claim.scope
-        let session = claim.sourceSession
+        let publication = turn.publication
+        let command = publication.command
+        let session = command.writer.session
         guard owner.submissions === self, host.scope === owner, owner.executableHost === host,
               host.workspaceActivation?.isCurrent == true, isCurrent(claim),
-              let command = claim.command, command.writer.session === session,
               command.writer.scope === owner, command.isCurrent,
-              let membership = owner.membership(of: session), membership.identity == turn.publication.membership.identity,
-              claim.attempt.id == turn.publication.attemptID,
-              session.sourceItemsRevision == turn.publication.expectedSourceRevision,
-              session.items.contains(turn.publication.item)
+              session.composerStartCancellation === claim.cancellation, publication.membership.isCurrent,
+              claim.attempt.id == publication.attemptID, publication.acceptedInputIndex != nil,
+              let stop = turn.options.stopFence ?? claim.cancellation.pendingStartFence(for: session),
+              stop.permitsStart(of: session)
         else {
             return .refused(recovered: rollbackCanonicalPublication(
                 turn, claim: claim, message: "The originating submission changed before provider dispatch."
             ))
         }
         let agent = session.selectedAgent
-        let stop = turn.options.stopFence ?? claim.cancellation.pendingStartFence(for: session)
-            ?? AgentRunStartStopFence(session: session)
         let ticket = agent == .codexExec ? session.codexDispatchSerialGate.issueTicket() : nil
         let fallback = ticket.map { ticket in
             AgentTabSession.CodexFallbackSubmissionContext(
@@ -129,7 +141,7 @@ extension AgentSessionComposerSubmitRuntime {
                 stopFence: stop, isLocalUserInput: true
             )
         }
-        claim.cancellation.retainProducer()
+        claim.cancellation.admitProducer()
         return .queued(Task { [self, host] in
             defer { claim.cancellation.releaseProducer() }
             defer { session.settleLocalComposerOrigin(turn.options.localComposerCandidate, disposition: .retained) }
@@ -139,7 +151,9 @@ extension AgentSessionComposerSubmitRuntime {
             defer { if let ticket { session.codexDispatchSerialGate.finish(ticket) } }
             var options = turn.options
             options.stopFence = stop
-            let result: CodexAgentModeCoordinator.NativeSendOutcome? = if command.isCurrent, isCurrent(claim), session.selectedAgent == agent,
+            let result: CodexAgentModeCoordinator.NativeSendOutcome? = if command.isCurrent,
+                                                                          session.composerStartCancellation === claim.cancellation,
+                                                                          !claim.cancellation.isWithdrawn, session.selectedAgent == agent,
                                                                           stop.permitsStart(of: session), !Task.isCancelled
             {
                 await host.startCanonicalRequest(
@@ -159,11 +173,11 @@ extension AgentSessionComposerSubmitRuntime {
                 case .cancelled?: "Codex send was cancelled before provider dispatch."
                 default: nil
                 }
-                if let message, owner.membership(of: session)?.identity == membership.identity {
+                if let message, publication.membership.isCurrent {
                     if rollbackCanonicalPublication(turn, claim: claim, message: message) {
                         rejectedPresentation?(message)
                     }
-                } else if message == nil, owner.membership(of: session)?.identity == membership.identity {
+                } else if message == nil, publication.membership.isCurrent {
                     session.deferredActiveAgentRunTimerRollback = nil
                 }
             }

@@ -1857,6 +1857,9 @@ final class AgentSessionLinkRuntimeBridge {
             for chain in Array(chains.values) {
                 await chain.tail?.value
             }
+            // Tests that inspect projected rows or passive notices join the downstream work
+            // explicitly. Agent reads join the target publication alone.
+            await refreshTask?.value
         }
 
         func test_refreshStatus(sessionIDs: Set<UUID>) async {
@@ -4827,7 +4830,9 @@ final class AgentSessionLinkRuntimeBridge {
             guard chains[sessionID] === chain, chain.scheduledFrame?.sourceSequence == sequence,
                   chain.endpoint == endpoint, self.host === host,
                   !isFrozenForTermination else { return }
-            await requestProjectionRefresh(.sessions(Set(observers)))
+            // Readiness and status are already committed. UI and prompt projections may
+            // converge independently of the next target publication and of wait callers.
+            _ = enqueueProjectionRefresh(.sessions(Set(observers)))
         }
     }
 
@@ -4844,11 +4849,12 @@ final class AgentSessionLinkRuntimeBridge {
     /// Scopes merge rather than overwrite: a status-only refresh queued behind a membership change
     /// must not narrow that pending full rebuild.
     private func requestProjectionRefresh(_ scope: ProjectionRefreshScope = .full) async {
+        await enqueueProjectionRefresh(scope).value
+    }
+
+    private func enqueueProjectionRefresh(_ scope: ProjectionRefreshScope) -> Task<Void, Never> {
         pendingRefreshScope = pendingRefreshScope?.merged(with: scope) ?? scope
-        if let refreshTask {
-            await refreshTask.value
-            return
-        }
+        if let refreshTask { return refreshTask }
         let task = Task { [weak self] in
             guard let self else { return }
             while let scope = pendingRefreshScope {
@@ -4858,7 +4864,7 @@ final class AgentSessionLinkRuntimeBridge {
             refreshTask = nil
         }
         refreshTask = task
-        await task.value
+        return task
     }
 
     private func performProjectionRefresh(_ scope: ProjectionRefreshScope) async {
@@ -7181,14 +7187,15 @@ final class AgentSessionLinkRuntimeBridge {
             return chain
         }
         await host.agentSessionLinkRefreshSubagentCensus(for: targets.map(\.candidate))
-        for chain in owners {
-            guard chains[chain.endpoint.sessionID] === chain else { continue }
+        let publications = owners.compactMap { chain -> Task<Void, Never>? in
+            guard chains[chain.endpoint.sessionID] === chain else { return nil }
             let candidate = host.agentSessionLinkCandidate(for: chain.endpoint, includeLocation: false)
             // No suspension between the exact host read and ownership-guarded sampling.
             publishTargetSnapshot(endpoint: chain.endpoint, originatingChain: chain, lookup: .resolved(candidate))
+            return chain.tail
         }
-        for chain in owners {
-            await chain.tail?.value
+        for publication in publications {
+            await publication.value
         }
     }
 

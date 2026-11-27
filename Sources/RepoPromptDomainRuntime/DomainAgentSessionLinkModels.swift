@@ -994,6 +994,8 @@ package enum DomainAgentSessionLinkDeliveryState: String, CaseIterable, Hashable
     case runStartFailed = "run_start_failed"
     /// A managed `steer` the provider confirmed it accepted into the target's active turn.
     case steered
+    /// The ACP prompt was written to the provider transport. Its turn outcome is still pending.
+    case providerPromptWritten = "provider_prompt_written"
     /// A managed `steer` accepted into the target's interrupt-steering queue. The provider receives
     /// it at the next safe interruption point of the active turn.
     case queuedInterrupt = "queued_interrupt"

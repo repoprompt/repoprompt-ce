@@ -13152,6 +13152,25 @@ class WorkspaceManagerViewModel: ObservableObject {
         _ = await pollAndSaveStateWithOutcomeAsync(source: source)
     }
 
+    /// The new Agent writer needs its carrier in canonical storage before its first
+    /// payload write. Join the regular workspace save owner, then read back the
+    /// binding that matters even if a pin or selection edit superseded the document.
+    func persistForegroundAgentCarrier(_ binding: AgentPersistentSessionBindingIdentity) async -> Bool {
+        guard let workspaceID = binding.workspaceID, activeWorkspaceID == workspaceID,
+              activeAgentSessionID(forTabID: binding.tabID, inWorkspaceID: workspaceID) == binding.sessionID
+        else { return false }
+        _ = await pollAndSaveStateWithOutcomeAsync(
+            workspaceID: workspaceID, source: .agentSessionLifecycleAdmission, publishWorkingCapture: false
+        )
+        guard let stored = await durableWorkspaceForMutationReadback(workspaceID: workspaceID),
+              activeWorkspaceID == workspaceID,
+              activeAgentSessionID(forTabID: binding.tabID, inWorkspaceID: workspaceID) == binding.sessionID
+        else { return false }
+        let matches = stored.composeTabs.filter { $0.id == binding.tabID || $0.activeAgentSessionID == binding.sessionID }
+        return matches.count == 1 && matches.first?.id == binding.tabID && matches.first?.activeAgentSessionID == binding.sessionID
+            && !stored.stashedTabs.contains { $0.tab.id == binding.tabID || $0.tab.activeAgentSessionID == binding.sessionID }
+    }
+
     /// A point read of durable bytes, independent of local save-version bookkeeping. Canonical
     /// working state is journaled and survives restart even when the saved file is still older.
     /// This read never publishes a projection or advances this manager's authority baseline.

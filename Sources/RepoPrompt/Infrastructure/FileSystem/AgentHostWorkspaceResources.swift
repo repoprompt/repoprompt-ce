@@ -24,7 +24,9 @@ struct AgentHostWorkspaceResources {
     /// Saved starts prove a carrier in the canonical document, including stashed tabs which
     /// intentionally are not selectable domain contexts.
     func acquire(
-        workspaceID: UUID, rootIDs: [UUID], admits: (DomainWorkspaceSnapshot) -> Bool
+        workspaceID: UUID, rootIDs: [UUID],
+        matchesSnapshot: (DomainWorkspaceSnapshot, DomainWorkspaceSnapshot) -> Bool = (==),
+        admits: (DomainWorkspaceSnapshot) -> Bool
     ) async throws -> Lease {
         try Task.checkCancellation()
         guard let contexts else { throw Failure.authorityUnavailable }
@@ -42,7 +44,8 @@ struct AgentHostWorkspaceResources {
         let retention = try await files.retainRoots(ids: rootIDs)
         do {
             try Task.checkCancellation()
-            guard await contexts.workspaceSnapshot(workspaceID) == snapshot else { throw Failure.contextChanged }
+            guard let current = await contexts.workspaceSnapshot(workspaceID), matchesSnapshot(snapshot, current)
+            else { throw Failure.contextChanged }
             guard await files.isRootRetentionCurrent(retention) else { throw Failure.rootsChanged }
             try Task.checkCancellation()
             return Lease(resources: self, snapshot: snapshot, roots: requestedRoots, retention: retention)
@@ -96,7 +99,11 @@ struct AgentHostWorkspaceResources {
             }
         }
 
-        func capture(workspaceID: UUID, admits: (DomainWorkspaceSnapshot) -> Bool) async throws -> Lease {
+        func capture(
+            workspaceID: UUID,
+            matchesSnapshot: (DomainWorkspaceSnapshot, DomainWorkspaceSnapshot) -> Bool = (==),
+            admits: (DomainWorkspaceSnapshot) -> Bool
+        ) async throws -> Lease {
             try Task.checkCancellation()
             guard rootsAreCurrent, workspaceID == snapshot.document.workspaceID,
                   let current = await resources.contexts?.workspaceSnapshot(workspaceID),
@@ -106,7 +113,8 @@ struct AgentHostWorkspaceResources {
             guard Set(current.document.metadata.repoPaths.map { ($0 as NSString).standardizingPath }) == originalPaths,
                   await resources.files.isRootRetentionCurrent(retention), rootsAreCurrent
             else { throw Failure.rootsChanged }
-            guard await resources.contexts?.workspaceSnapshot(workspaceID) == current else { throw Failure.contextChanged }
+            guard let confirmed = await resources.contexts?.workspaceSnapshot(workspaceID), matchesSnapshot(current, confirmed)
+            else { throw Failure.contextChanged }
             try Task.checkCancellation()
             guard rootsAreCurrent else { throw Failure.rootsChanged }
             return Lease(resources: resources, snapshot: current, roots: roots, retention: retention, rootOwner: rootOwner ?? self)

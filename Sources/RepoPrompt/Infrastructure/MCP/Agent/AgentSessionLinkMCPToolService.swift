@@ -2271,7 +2271,7 @@ enum AgentSessionLinkResponseRenderer {
     /// Stable delivery receipt. Identical for a duplicate retry except for `duplicate: true`.
     static func sendReceiptValue(_ receipt: DomainAgentSessionLinkSendReceipt) -> Value {
         .object([
-            "result": .string("delivered"),
+            "result": .string(receipt.deliveryState == .providerPromptWritten ? "submitted" : "delivered"),
             "session_id": .string(receipt.targetSessionID.uuidString),
             "target_session_id": .string(receipt.targetSessionID.uuidString),
             "target_item_id": .string(receipt.targetItemID),

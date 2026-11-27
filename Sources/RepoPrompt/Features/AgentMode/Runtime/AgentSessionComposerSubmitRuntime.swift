@@ -1,7 +1,7 @@
 import Foundation
 
-/// A transient claim retains its originating scope, not a presentation. Existing-session claims
-/// also pin command admission; unbound local creation keeps the same object through its first bind.
+/// A transient claim retains the source of the draft. Execution uses the existing source writer
+/// or the one exact destination writer installed by the first-send handoff.
 @MainActor
 struct AgentSessionComposerSubmitClaim {
     let attempt: AgentComposerSubmitAttempt
@@ -137,14 +137,16 @@ final class AgentSessionComposerSubmitRuntime {
               claim.sourceSession.composerStartCancellation === claim.cancellation,
               !claim.cancellation.isWithdrawn else { return false }
         if let command = claim.command { return command.isCurrent }
-        // Local creation deliberately acquires its first persistent binding after claiming input.
-        // Its creation owner and run-start admission remain responsible for that binding's effects.
         guard claim.attempt.target.route == .createAgentSessionFromSourceTab,
               !claim.sourceSession.bindingTransitionInProgress else { return false }
-        guard let sessionID = claim.sourceSession.activeAgentSessionID else { return true }
-        guard case let .unique(writer) = scope.resolveWriter(sessionID: sessionID),
-              writer.scope === scope, writer.session === claim.sourceSession else { return false }
-        return writer.isCurrent
+        if let sessionID = claim.sourceSession.activeAgentSessionID {
+            // In-place creation binds its original membership. It cannot acquire another
+            // output writer through a handoff after the original source has been bound.
+            guard claim.cancellation.destinationWriterIdentity == nil,
+                  case let .unique(writer) = scope.resolveWriter(sessionID: sessionID),
+                  writer.scope === scope, writer.session === claim.sourceSession, writer.isCurrent else { return false }
+        }
+        return claim.cancellation.destinationWriterIdentity == nil || firstSendWriter(for: claim) != nil
     }
 
     /// Record this claim's own draft consumption before publishing the empty composer. Later
@@ -172,18 +174,56 @@ final class AgentSessionComposerSubmitRuntime {
         return true
     }
 
-    func alias(_ claim: AgentSessionComposerSubmitClaim, to destination: AgentTabSession) -> Bool {
+    func alias(
+        _ claim: AgentSessionComposerSubmitClaim,
+        to destination: AgentTabSession,
+        requirement: AgentSessionRuntimeStore.CommandRequirement = .restored
+    ) -> Bool {
         guard isCurrent(claim), let scope, scope.sessions[destination.tabID] === destination,
+              claim.attempt.target.route == .createAgentSessionFromSourceTab, claim.sourceSession !== destination,
+              claim.sourceSession.activeAgentSessionID == nil, claim.cancellation.destinationWriterIdentity == nil,
               destination.composerStartCancellation == nil,
               let id = destination.activeAgentSessionID,
               case let .unique(writer) = scope.resolveWriter(sessionID: id),
-              writer.session === destination, writer.isCurrent,
+              writer.scope === scope, writer.session === destination,
+              case .success = writer.admitCommand(requirement),
               !destination.runState.isActive, destination.activeRunOwnership == nil else { return false }
         claim.cancellation.alias(to: destination, identity: writer.identity)
         destination.composerStartCancellation = claim.cancellation
         destination.noteMonitorObservationInputsChanged()
         scope.presentation.composerClaimChanged(destination)
         return true
+    }
+
+    private func firstSendWriter(for claim: AgentSessionComposerSubmitClaim) -> AgentSessionRuntimeStore.Writer? {
+        guard let scope, claim.scope === scope,
+              let destination = claim.cancellation.destination,
+              destination.composerStartCancellation === claim.cancellation,
+              let identity = claim.cancellation.destinationWriterIdentity,
+              let writer = scope.originatingWriter(identity: identity, session: destination),
+              writer.isCurrent else { return nil }
+        return writer
+    }
+
+    func commitFirstSendCreation(
+        _ handle: AgentSessionCreationHandle, claim: AgentSessionComposerSubmitClaim
+    ) async -> AgentSessionSaveCoreResult {
+        guard isCurrent(claim),
+              let writer = firstSendWriter(for: claim), writer.session === handle.session
+        else {
+            return .deferred("The session creation owner changed.")
+        }
+        return await writer.scope.persistence.commitConfiguredCreation(handle, writer: writer)
+    }
+
+    func dispatchCommand(
+        for claim: AgentSessionComposerSubmitClaim, on session: AgentTabSession
+    ) -> AgentSessionRuntimeStore.Command? {
+        guard isCurrent(claim) else { return nil }
+        let command = claim.command ?? firstSendWriter(for: claim).flatMap { try? $0.admitCommand().get() }
+        guard let command, command.writer.session === session,
+              session.composerStartCancellation === claim.cancellation, command.isCurrent else { return nil }
+        return command
     }
 
     fileprivate func isCurrent(_ cancellation: AgentComposerStartCancellation, on session: AgentTabSession) -> Bool {
@@ -292,6 +332,7 @@ final class AgentComposerStartCancellation {
     private var producerCount = 0
     private(set) var isWithdrawn = false
     private(set) var didLaunch: Bool
+    private(set) var hasAdmittedProducer = false
     private(set) var didRestoreDraft = false
     fileprivate(set) var ownedDraftClearGeneration: UInt64?
     private(set) var isFinalized = false
@@ -356,6 +397,7 @@ final class AgentComposerStartCancellation {
     /// Departure may withdraw a local steer before its optimistic input is published, but not
     /// a fresh submission that has since handed ownership to its own admitted attempt.
     func withdrawForPresentationDeparture(on session: AgentTabSession) -> Bool {
+        guard !hasAdmittedProducer else { return false }
         if withdraw(on: session) { return true }
         guard allowsPendingStartWithdrawal, let originatingSteerAttempt,
               session.runState.isActive, session.runID == originatingSteerAttempt.runID,
@@ -451,6 +493,11 @@ final class AgentComposerStartCancellation {
     /// Register before creating a child task, not on its first scheduled actor turn.
     func retainProducer() {
         producerCount += 1
+    }
+
+    func admitProducer() {
+        hasAdmittedProducer = true
+        retainProducer()
     }
 
     func releaseProducer() {

@@ -3104,6 +3104,7 @@ class PromptViewModel: ObservableObject {
         strategy: ComposeTabCreationStrategy = .duplicateCurrent,
         name: String? = nil,
         freshAgentSessionID: UUID? = nil,
+        schedulesWorkspaceSave: Bool = true,
         onCreated: (@MainActor (ComposeTabState) -> Bool)? = nil
     ) async -> ForegroundComposeTabCreationResult {
         guard
@@ -3139,7 +3140,7 @@ class PromptViewModel: ObservableObject {
         }
 
         manager.markWorkspaceDirty()
-        manager.pollAndSaveState()
+        if schedulesWorkspaceSave { manager.pollAndSaveState() }
         guard manager.workspaces.indices.contains(index),
               manager.workspaces[index].id == workspace.id,
               manager.workspaces[index].composeTabs.contains(where: { $0.id == newTab.id })
@@ -3157,6 +3158,7 @@ class PromptViewModel: ObservableObject {
     @MainActor
     func createBlankComposeTab(
         createAgentSession: Bool = false,
+        schedulesWorkspaceSave: Bool = true,
         onAgentSessionCreated: (@MainActor (ComposeTabState, AgentSessionCreationClaim) -> Bool)? = nil
     ) async -> ForegroundComposeTabCreationResult {
         let creation: AgentSessionCreationClaim?
@@ -3166,7 +3168,9 @@ class PromptViewModel: ObservableObject {
         } else {
             creation = nil
         }
-        return await createComposeTab(strategy: .blank, freshAgentSessionID: creation?.sessionID) { tab in
+        return await createComposeTab(
+            strategy: .blank, freshAgentSessionID: creation?.sessionID, schedulesWorkspaceSave: schedulesWorkspaceSave
+        ) { tab in
             if let creation { return onAgentSessionCreated?(tab, creation) ?? false }
             return true
         }

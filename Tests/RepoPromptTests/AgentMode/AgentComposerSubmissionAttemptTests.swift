@@ -29,6 +29,32 @@ final class AgentSessionComposerSubmitRuntimeTests: XCTestCase {
         .init(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: "")
     }
 
+    private func firstSendTarget(_ source: AgentTabSession) -> AgentComposerSubmitTarget {
+        .init(
+            tabID: source.tabID, route: .createAgentSessionFromSourceTab,
+            expectedSourceTabSessionIdentity: ObjectIdentifier(source), expectedSourceAgentSessionID: nil,
+            expectedPersistentBindingIdentity: nil, expectedBindingTransitionGeneration: source.bindingTransitionGeneration,
+            expectedRunState: .idle, expectedRunID: nil, expectedRunAttemptID: nil,
+            expectedSubmissionToken: source.composerSubmissionToken, expectedInitialStartLocation: .local
+        )
+    }
+
+    func testAdmittedComposerIgnoresPresenterDepartureAndStillHonorsStop() throws {
+        let (scope, session, command) = boundFixture()
+        let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        guard case let .claimed(claim) = scope.submissions.claim(attempt(target), command: command) else {
+            return XCTFail("Expected a composer claim")
+        }
+        claim.cancellation.admitProducer()
+        defer { claim.cancellation.releaseProducer() }
+        defer { scope.submissions.release(claim) }
+        let fence = try XCTUnwrap(claim.cancellation.pendingStartFence(for: session))
+        XCTAssertFalse(claim.cancellation.withdrawForPresentationDeparture(on: session))
+        XCTAssertTrue(fence.permitsStart(of: session))
+        XCTAssertTrue(claim.cancellation.withdraw(on: session))
+        XCTAssertFalse(fence.permitsStart(of: session))
+    }
+
     func testPendingCapabilityPrecedesPublicationAndNeverManufacturesAnAttempt() throws {
         let (scope, session, command) = boundFixture()
         let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
@@ -175,16 +201,18 @@ final class AgentSessionComposerSubmitRuntimeTests: XCTestCase {
     }
 
     func testDestinationAliasWithdrawsSourceAndRebindingFailsClosed() throws {
-        let (scope, source, command) = boundFixture()
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let source = AgentTabSession(tabID: UUID())
         let destination = AgentTabSession(tabID: UUID())
         scope.replaceSessions([source.tabID: source, destination.tabID: destination])
         destination.installPersistentSessionBinding(.init(tabID: destination.tabID, sessionID: UUID(), workspaceID: UUID()))
         destination.hasLoadedPersistedState = true
         destination.recordRestorationAuthoritative(.persistedPayloadApplied)
-        let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
-        guard case let .claimed(claim) = scope.submissions.claim(attempt(target), command: command) else { return XCTFail("Expected claim") }
+        guard case let .claimed(claim) = scope.submissions.claim(attempt(firstSendTarget(source))) else { return XCTFail("Expected claim") }
         defer { scope.submissions.release(claim) }
         XCTAssertTrue(scope.submissions.alias(claim, to: destination))
+        XCTAssertNil(scope.submissions.dispatchCommand(for: claim, on: source))
+        XCTAssertTrue(scope.submissions.dispatchCommand(for: claim, on: destination)?.isCurrent == true)
         claim.cancellation.oweDraftRestoration("source draft")
         destination.draftText = "destination draft"
         let fence = try XCTUnwrap(claim.cancellation.pendingStartFence(for: destination))
@@ -196,10 +224,11 @@ final class AgentSessionComposerSubmitRuntimeTests: XCTestCase {
         XCTAssertTrue(scope.submissions.release(claim))
         XCTAssertNil(destination.composerStartCancellation)
 
-        let nextTarget = try XCTUnwrap(scope.submissions.programmaticTarget(command))
-        guard case let .claimed(next) = scope.submissions.claim(attempt(nextTarget), command: command) else { return XCTFail("Expected successor") }
+        guard case let .claimed(next) = scope.submissions.claim(attempt(firstSendTarget(source))) else { return XCTFail("Expected successor") }
         defer { scope.submissions.release(next) }
-        source.installPersistentSessionBinding(.init(tabID: source.tabID, sessionID: UUID(), workspaceID: UUID()))
+        XCTAssertTrue(scope.submissions.alias(next, to: destination))
+        destination.installPersistentSessionBinding(.init(tabID: destination.tabID, sessionID: UUID(), workspaceID: UUID()))
+        XCTAssertNil(scope.submissions.dispatchCommand(for: next, on: destination))
         XCTAssertFalse(next.cancellation.canWithdraw(on: source))
         XCTAssertFalse(next.cancellation.withdraw(on: source))
     }
@@ -283,14 +312,14 @@ final class AgentSessionComposerSubmitRuntimeTests: XCTestCase {
 
     func testDestinationCapabilitySurvivesSourceRemovalThenCleansUpIndependently() throws {
         func prepare() throws -> (AgentSessionRuntimeStore.Scope, AgentTabSession, AgentComposerStartCancellation) {
-            let (scope, source, command) = boundFixture()
-            let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
-            guard case let .claimed(claim) = scope.submissions.claim(attempt(target), command: command) else { throw NSError(domain: "pending", code: 1) }
+            let scope = AgentSessionRuntimeStore().makeScope()
+            let source = AgentTabSession(tabID: UUID())
             let destination = AgentTabSession(tabID: UUID())
             scope.replaceSessions([source.tabID: source, destination.tabID: destination])
             destination.installPersistentSessionBinding(.init(tabID: destination.tabID, sessionID: UUID(), workspaceID: UUID()))
             destination.hasLoadedPersistedState = true
             destination.recordRestorationAuthoritative(.persistedPayloadApplied)
+            guard case let .claimed(claim) = scope.submissions.claim(attempt(firstSendTarget(source))) else { throw NSError(domain: "pending", code: 1) }
             XCTAssertTrue(scope.submissions.alias(claim, to: destination))
             claim.cancellation.retainProducer()
             scope.submissions.release(claim)
@@ -373,14 +402,7 @@ final class AgentSessionComposerSubmitRuntimeTests: XCTestCase {
         let session = AgentTabSession(tabID: UUID())
         scope.replaceSessions([session.tabID: session])
         session.hasLoadedPersistedState = true
-        let target = AgentComposerSubmitTarget(
-            tabID: session.tabID, route: .createAgentSessionFromSourceTab,
-            expectedSourceTabSessionIdentity: ObjectIdentifier(session), expectedSourceAgentSessionID: nil,
-            expectedPersistentBindingIdentity: nil, expectedBindingTransitionGeneration: session.bindingTransitionGeneration,
-            expectedRunState: .idle, expectedRunID: nil, expectedRunAttemptID: nil,
-            expectedSubmissionToken: session.composerSubmissionToken, expectedInitialStartLocation: .local
-        )
-        guard case let .claimed(claim) = scope.submissions.claim(attempt(target)) else { return XCTFail("Expected local claim") }
+        guard case let .claimed(claim) = scope.submissions.claim(attempt(firstSendTarget(session))) else { return XCTFail("Expected local claim") }
         XCTAssertNil(claim.command)
         session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: UUID(), workspaceID: UUID()))
         XCTAssertTrue(scope.submissions.isCurrent(claim))
@@ -2314,25 +2336,11 @@ final class AutoWorkflowSubmissionTests: XCTestCase {
         XCTAssertTrue(fixture.viewModel.autoWorkflowJudgments.isEmpty)
     }
 
-    func testPresentationDepartureWithdrawsOnlyUnpublishedComposerInput() async throws {
-        let unpublished = try await makeFixture(presented: true)
-        unpublished.viewModel.withdrawUnpublishedComposerSubmissionsForPresentationLoss()
-        XCTAssertTrue(unpublished.claim.cancellation.isWithdrawn)
-        XCTAssertEqual(unpublished.viewModel.draftRuntime.text(for: unpublished.session.tabID), Self.text)
-        XCTAssertNil(unpublished.session.activeRunAttemptID)
-
-        let admitted = try await makeFixture(presented: true)
-        admitted.session.beginRunAttempt(source: "presentation-departure-test")
-        admitted.session.installRunID(UUID())
-        admitted.session.runState = .running
-        let attemptID = try XCTUnwrap(admitted.session.activeRunAttemptID)
-        let runID = admitted.session.runID
-        admitted.viewModel.withdrawUnpublishedComposerSubmissionsForPresentationLoss()
-        XCTAssertFalse(admitted.claim.cancellation.isWithdrawn)
-        XCTAssertEqual(admitted.session.activeRunAttemptID, attemptID)
-        XCTAssertEqual(admitted.session.runID, runID)
-        XCTAssertTrue(admitted.session.runState.isActive)
-        admitted.session.runState = .cancelled
+    func testUnsubmittedDraftReturnsWhenComposerCloses() async throws {
+        let fixture = try await makeFixture(presented: true)
+        fixture.viewModel.withdrawUnpublishedComposerSubmissionsForPresentationLoss()
+        XCTAssertTrue(fixture.claim.cancellation.isWithdrawn)
+        XCTAssertEqual(fixture.viewModel.draftRuntime.text(for: fixture.session.tabID), Self.text)
     }
 
     func testLatePreparationRevalidationAndRejectedSendNeverInstallAutomaticPickerState() async throws {
