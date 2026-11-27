@@ -1357,11 +1357,22 @@ final class RemoteMutationBehaviorTests: XCTestCase {
 @MainActor
 final class RemoteProducerParityTests: XCTestCase {
     func testRecordedQuestionsProjectLiveAndSavedExchangesWithoutRawToolPayloads() throws {
+        struct LegacyTranscriptRow: Decodable {
+            struct Detail: Decodable {
+                let argumentsJSON: String?
+                let resultJSON: String?
+                let keyPaths: [String]
+            }
+
+            let text: String?
+            let detail: Detail?
+        }
+
         let arguments = """
-        {"title":"Badge setup","questions":[
+        {"title":"Badge setup","provider_context":"internal test metadata","questions":[
             {"id":"shape","header":"Shape","question":"What shape should the badge be?"},
             {"id":"placement","header":"Placement","question":"Where should the badge appear?"},
-            {"id":"notes","header":"Notes","question":"Any other notes?"}
+            {"id":"notes","header":"Notes","question":"Any other notes? Bearer fixture-only-value"}
         ]}
         """
         let result = """
@@ -1428,8 +1439,22 @@ final class RemoteProducerParityTests: XCTestCase {
         XCTAssertEqual(expanded[2].detail?.questionExchange?.outcome, .timedOut)
         XCTAssertNil(expanded[3].detail?.questionExchange)
         XCTAssertNil(expanded[0].detail?.argumentsJSON)
-        XCTAssertNil(expanded[0].detail?.resultJSON)
         XCTAssertNil(expanded[0].detailText)
+
+        // Older iOS builds ignore questionExchange and display detail.resultJSON
+        // even when the collapsed row already has text.
+        let legacyRows = try JSONDecoder().decode([LegacyTranscriptRow].self, from: JSONEncoder().encode(expanded))
+        XCTAssertNotNil(legacyRows[0].text)
+        XCTAssertNil(legacyRows[0].detail?.argumentsJSON)
+        XCTAssertEqual(legacyRows[0].detail?.keyPaths, [])
+        let legacyResult = try XCTUnwrap(legacyRows[0].detail?.resultJSON)
+        XCTAssertTrue(legacyResult.contains("What shape should the badge be?\nAnswer\nSquare"))
+        XCTAssertTrue(legacyResult.contains("Where should the badge appear?\nAnswer\nSidebar, Header"))
+        XCTAssertTrue(legacyResult.contains("Bearer [REDACTED]\nAnswer\nSkipped"))
+        XCTAssertFalse(legacyResult.contains("fixture-only-value"))
+        XCTAssertFalse(legacyResult.contains("internal test metadata"))
+        XCTAssertEqual(legacyRows[1].detail?.resultJSON, legacyResult)
+        XCTAssertTrue(try XCTUnwrap(legacyRows[2].detail?.resultJSON).contains("Answer\nTimed out"))
     }
 
     func testLiveTranscriptRecoversGitPreviewAfterToolResultCompaction() async throws {
@@ -1486,6 +1511,23 @@ final class RemoteProducerParityTests: XCTestCase {
         XCTAssertTrue(patch.contains("@@ -1 +1,2 @@\n-old\n+new\n+extra"))
         XCTAssertFalse(preview.isTruncated)
         XCTAssertEqual(detail.resultJSON, compacted)
+
+        let oversizedResult = resultJSON.replacingOccurrences(of: "+new", with: "+" + String(repeating: "界", count: 23000))
+        XCTAssertLessThan(oversizedResult.count, 65536)
+        XCTAssertGreaterThan(oversizedResult.utf8.count, 65536)
+        session.replaceEphemeralToolResultPayloadMap([result.id: oversizedResult], liveItemIDs: [result.id])
+
+        let boundedPage = try await service.transcript(
+            sessionID: sessionID, paging: .recentBackward(before: nil), limit: 20, includeDetails: false
+        )
+        let boundedRow = try XCTUnwrap(boundedPage.items.first { $0.id == result.id })
+        XCTAssertNil(boundedRow.diffSummary)
+        XCTAssertTrue(try XCTUnwrap(boundedRow.text).contains("1 files (+2 -1)"))
+        let boundedDetails = try await service.transcript(
+            sessionID: sessionID, paging: .exactItem(result.id), limit: 1, includeDetails: true
+        )
+        XCTAssertNil(boundedDetails.items.first?.detail?.diffPreview)
+        XCTAssertEqual(boundedDetails.items.first?.detail?.resultJSON, compacted)
     }
 
     func testRecordedDiffUsesDesktopCardPatchAndKeepsLargeGitSummaries() throws {

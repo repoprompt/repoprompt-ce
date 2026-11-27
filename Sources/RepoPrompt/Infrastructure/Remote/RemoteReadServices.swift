@@ -696,6 +696,23 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
         }
     }
 
+    private static func recordedQuestionDetails(_ exchange: RemoteRecordedQuestionExchange) -> String {
+        var sections = [exchange.title].compactMap(\.self)
+        sections += exchange.questions.enumerated().map { index, question in
+            let answer = if question.skipped {
+                "Skipped"
+            } else if let answer = question.answer {
+                answer
+            } else {
+                exchange.outcome == .timedOut ? "Timed out" : "No answer recorded"
+            }
+            let prompt = sanitizeText(question.prompt, characterLimit: 320)
+            let response = sanitizeText(answer, characterLimit: 320)
+            return "Question \(index + 1)\n\(prompt)\nAnswer\n\(response)"
+        }
+        return sanitizeDetailText(sections.joined(separator: "\n\n"))
+    }
+
     private typealias RecordedDiff = (summary: RemoteTranscriptDiffSummary, preview: RemoteTranscriptDiffPreview?)
     private static let diffPreviewFileLimit = 12
 
@@ -703,7 +720,9 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
         for execution: AgentTranscriptToolExecution, resultJSON: String?, includeDetails: Bool
     ) -> RecordedDiff? {
         guard execution.status != .failed, execution.toolIsError != true,
-              let name = normalizedToolCardName(execution.toolName)?.lowercased().components(separatedBy: "__").last
+              let name = normalizedToolCardName(execution.toolName)?.lowercased().components(separatedBy: "__").last,
+              name == "git" || name == "apply_edits",
+              let resultJSON = sizeLimitedToolPayload(resultJSON)
         else { return nil }
 
         switch name {
@@ -725,7 +744,7 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
         guard let edit = ToolJSON.decodeResult(ToolResultDTOs.EditSummary.self, from: resultJSON),
               let patch = edit.displayUnifiedDiff
         else { return nil }
-        let args = ToolJSON.decodeArgs(ToolArgsDTOs.ApplyEditsArgs.self, from: execution.argsJSON)
+        let args = ToolJSON.decodeArgs(ToolArgsDTOs.ApplyEditsArgs.self, from: sizeLimitedToolPayload(execution.argsJSON))
         let path = (args?.path ?? execution.keyPaths.first).map(diffDisplayPath)
         let summary = RemoteTranscriptDiffSummary(
             fileCount: 1, singleFilePath: path, additions: edit.addedLines, deletions: edit.deletedLines
@@ -800,6 +819,11 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
 
     static func compactToolSummary(_ execution: AgentTranscriptToolExecution) -> String? {
         guard let name = normalizedToolCardName(execution.toolName)?.lowercased() else { return nil }
+        if name == "git" || name.hasSuffix("__git") {
+            guard execution.summaryOnly else { return nil }
+            let result = ToolJSON.structuredResultObject(from: boundedToolPayload(execution.resultJSON))
+            return result.flatMap { AgentToolCardRenderSummary(summaryOnlyObject: $0)?.inlineSummaryText }
+        }
         if name == "bash" {
             let exitCode = execution.exitCode ?? BashToolResultParser.parse(
                 raw: boundedToolPayload(execution.resultJSON), argsJSON: nil
@@ -864,9 +888,16 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
         return summary.isEmpty ? nil : summary
     }
 
+    private static let maxToolPayloadBytes = 65536
+
+    /// Reject oversized JSON before decoding; clipping it would produce an invalid payload.
+    private static func sizeLimitedToolPayload(_ raw: String?) -> String? {
+        guard let raw, raw.utf8.prefix(maxToolPayloadBytes + 1).count <= maxToolPayloadBytes else { return nil }
+        return raw
+    }
+
     private static func boundedToolPayload(_ raw: String?) -> String? {
-        guard let raw, raw.utf8.prefix(65537).count <= 65536 else { return nil }
-        return sanitizeText(raw, characterLimit: 65536)
+        sizeLimitedToolPayload(raw).map { sanitizeText($0, characterLimit: maxToolPayloadBytes) }
     }
 
     private static func diffLineSummary(_ diffs: [String]) -> String? {
@@ -959,7 +990,11 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
         guard hasDetail(for: activity) else { return nil }
         let execution = activity.toolExecution
         if let questionExchange {
-            return RemoteTranscriptDetail(toolIsError: execution?.toolIsError, questionExchange: questionExchange)
+            return RemoteTranscriptDetail(
+                resultJSON: recordedQuestionDetails(questionExchange),
+                toolIsError: execution?.toolIsError,
+                questionExchange: questionExchange
+            )
         }
         return RemoteTranscriptDetail(
             argumentsJSON: execution?.argsJSON.map(sanitizeDetailText),
