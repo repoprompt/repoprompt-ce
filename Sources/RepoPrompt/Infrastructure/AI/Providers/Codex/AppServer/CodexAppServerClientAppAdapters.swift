@@ -164,7 +164,7 @@ struct CodexAppServerAppLaunchHost: CodexAppServerLaunchHost {
             "features.code_mode_only=false", "features.apps=false", "features.plugins=false",
             "features.memories=false", "features.multi_agent=false", "features.multi_agent_v2=false",
             "features.hooks=false", "features.tool_suggest=false",
-            "web_search=\"disabled\""
+            "web_search=\"disabled\"", "realtime.type=\"conversational\""
         ]
         return arguments + (mcpOverrides + voiceOverrides).flatMap { ["-c", $0] }
     }

@@ -2055,6 +2055,7 @@
       "alwaysSent": [
         "threadId",
         "voiceSessionId",
+        "version",
         "outputModality",
         "transport",
         "transport.type",
@@ -2114,6 +2115,11 @@
       "consumedParams": [
         {
           "path": "threadId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "message",
           "presence": "required",
           "nullable": false
         }

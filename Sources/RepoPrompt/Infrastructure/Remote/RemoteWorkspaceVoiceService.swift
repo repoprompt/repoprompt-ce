@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import RepoPromptCodexProvider
 import RepoPromptRemoteProtocol
 
@@ -85,6 +86,8 @@ final class RemoteWorkspaceVoiceService {
 extension RemoteWorkspaceVoiceService {
     @MainActor
     private final class Call {
+        private static let logger = Logger(subsystem: "com.pvncher.repoprompt.ce", category: "WorkspaceVoice")
+
         let id: UUID
         let workspace: RemoteWorkspaceVoiceAccess
         private let client = CodexAppServerClient(provisionsRepoPromptMCPOnStart: false, workspaceVoiceOnly: true)
@@ -121,7 +124,7 @@ extension RemoteWorkspaceVoiceService {
                 do {
                     try await open(offerSDP: offerSDP)
                 } catch {
-                    finish(.failed, message: "Codex could not start voice. Check the Codex sign-in on the Mac and try again.")
+                    failCodexVoice(detail: error.localizedDescription)
                 }
             }
         }
@@ -180,6 +183,8 @@ extension RemoteWorkspaceVoiceService {
             _ = try await client.request(method: "thread/realtime/start", params: [
                 "threadId": threadID,
                 "voiceSessionId": id.uuidString,
+                // Codex defaults an unspecified WebRTC request to V1. V3 enables commentary handoffs.
+                "version": "v3",
                 "outputModality": "audio",
                 "transport": ["type": "webrtc", "sdp": offerSDP],
                 "includeStartupContext": false,
@@ -213,12 +218,36 @@ extension RemoteWorkspaceVoiceService {
                 lines.append(.init(speaker: speaker, text: String(text.prefix(2_000))))
                 if lines.count > 12 { lines.removeFirst(lines.count - 12) }
             case "thread/realtime/error":
-                finish(.failed, message: "Codex voice is unavailable for this session. Check the Mac’s Codex sign-in.")
+                let detail: String? = if case let .string(message) = event.params["message"] { message } else { nil }
+                failCodexVoice(detail: detail)
             case "thread/realtime/closed":
                 finish(.ended)
             default:
                 break
             }
+        }
+
+        private func failCodexVoice(detail: String?) {
+            guard isOpen else { return }
+            let boundedDetail = String((detail ?? "No error detail").prefix(1_000))
+            Self.logger.error("Codex realtime failure: \(boundedDetail, privacy: .private)")
+            let reason = boundedDetail.lowercased()
+            let message: String
+            if reason.contains("rate_limit") || reason.contains("429 too many requests") {
+                message = "Codex voice is rate-limited. Try again in a moment."
+            } else if reason.contains("invalid sdp") || reason.contains("invalid offer") {
+                message = "Codex rejected the iPhone’s audio connection. Try starting voice again."
+            } else if reason.contains("session.model") || reason.contains("require conversational realtime")
+                || reason.contains("model_not_found")
+            {
+                message = "Codex rejected the voice session configuration."
+            } else if reason.contains("401 unauthorized") || reason.contains("403 forbidden") {
+                message = "Codex rejected access to voice for this session."
+            } else {
+                message = "Codex couldn’t open the voice connection. Try again."
+            }
+            Self.logger.info("Workspace Voice reported: \(message, privacy: .public)")
+            finish(.failed, message: message)
         }
 
         func renew() {
