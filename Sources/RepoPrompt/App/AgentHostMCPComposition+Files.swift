@@ -34,7 +34,7 @@ extension AgentSessionRuntimeHost {
         }
         let connection = try route.fileReadConnection(metadata: invocation.metadata, workspaceID: base.snapshot.document.workspaceID)
         guard let command = hostFileCommand(connection) else { throw MCPFileToolAuthorityFailure.superseded }
-        let lease = try await base.capture(workspaceID: command.identity.workspaceID) {
+        let lease = try await base.capture(workspaceID: command.identity.workspaceID, authority: .canonical) {
             activation.executionTab(in: $0, command: command) != nil
         }
         guard let tab = activation.executionTab(in: lease.snapshot, command: command) else {
@@ -50,7 +50,7 @@ extension AgentSessionRuntimeHost {
             guard lifetime != nil else { throw MCPFileToolAuthorityFailure.worktreeScopeUnavailable }
         } else { lifetime = nil }
         let selectionCommit = HostSelectionCommitReceipt()
-        let originalPaths = Set(lease.roots.map { ($0.fullPath as NSString).standardizingPath })
+        let originalPaths = Set(lease.roots.compactMap { StandardizedPath.canonicalWorkspaceRootPath($0.fullPath) })
         let currentWorkspace: @MainActor @Sendable () async throws -> DomainWorkspaceSnapshot = { [weak self] in
             try Task.checkCancellation()
             guard let self, await lease.retainedRootsAreCurrent(),
@@ -65,7 +65,7 @@ extension AgentSessionRuntimeHost {
                   hostFileCommand(connection)?.identity == command.identity,
                   current.health != .removed, !lease.snapshot.health.acceptsMutations || current.health.acceptsMutations,
                   current.document.fileURL == lease.snapshot.document.fileURL,
-                  Set(current.document.metadata.repoPaths.map { ($0 as NSString).standardizingPath }) == originalPaths,
+                  current.document.metadata.canonicalLoadableRepoPathSet == originalPaths,
                   activation.executionTab(in: current, command: command)?.selection == (selectionCommit.selection ?? tab.selection)
             else { throw MCPFileToolAuthorityFailure.superseded }
             // isCurrent() also checks disk before this last authority read. The lifetime

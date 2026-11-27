@@ -43,12 +43,14 @@ package enum DomainBinding: Codable, Equatable {
     case context(DomainContextIdentity, explicit: Bool)
     case appPresentationWindow(Int)
     case runScoped(runID: UUID, context: DomainContextIdentity)
+    /// App-managed canonical host run; resolves against canonical records, never read overlays.
+    case canonicalRunScoped(runID: UUID, context: DomainContextIdentity)
     /// App-managed saved carrier; never a presentation context or direct-headless launch token.
     case savedRunScoped(runID: UUID, context: DomainContextIdentity, sessionID: UUID)
 
     var isRunScoped: Bool {
         switch self {
-        case .runScoped, .savedRunScoped: true
+        case .runScoped, .canonicalRunScoped, .savedRunScoped: true
         default: false
         }
     }
@@ -292,6 +294,27 @@ package actor DomainRoutingCoordinator {
         case let .runScoped(runID, context):
             contextIdentity = context
             bindingKind = .runScoped(runID: runID)
+        case let .canonicalRunScoped(runID, context):
+            guard let resolved = await canonicalContextSnapshot(context) else {
+                throw DomainReadContextResolutionError.contextUnavailable
+            }
+            if case .removed = resolved.context.health {
+                throw DomainReadContextResolutionError.contextRemoved
+            }
+            guard !isStopped, connections[registration.connectionID] == current else {
+                throw DomainReadContextResolutionError.staleConnectionGeneration
+            }
+            return DomainReadContextHandle(
+                runtimeID: identity.runtimeID,
+                runtimeGeneration: identity.lifecycleGeneration,
+                connectionID: registration.connectionID,
+                connectionGeneration: registration.generation,
+                context: context,
+                workspaceRevision: resolved.workspace.revisions.workingRevision,
+                contextRevision: resolved.context.revisions.workingRevision,
+                routingRevision: revision,
+                bindingKind: .runScoped(runID: runID)
+            )
         case let .savedRunScoped(runID, context, sessionID):
             guard let workspace = await savedCarrierWorkspace(context, sessionID: sessionID) else {
                 throw DomainReadContextResolutionError.contextUnavailable
@@ -341,6 +364,16 @@ package actor DomainRoutingCoordinator {
             routingRevision: revision,
             bindingKind: bindingKind
         )
+    }
+
+    private func canonicalContextSnapshot(
+        _ context: DomainContextIdentity
+    ) async -> (workspace: DomainWorkspaceSnapshot, context: DomainContextSnapshot)? {
+        guard let workspace = await contextStore.canonicalWorkspaceSnapshot(context.workspaceID),
+              workspace.health != .removed,
+              let matched = workspace.contexts.first(where: { $0.metadata.identity == context })
+        else { return nil }
+        return (workspace, matched)
     }
 
     private func savedCarrierWorkspace(_ context: DomainContextIdentity, sessionID: UUID) async -> DomainWorkspaceSnapshot? {
@@ -512,6 +545,12 @@ package actor DomainRoutingCoordinator {
         switch binding {
         case let .context(context, _), let .runScoped(_, context):
             contextExists = await contextStore.snapshot(context) != nil
+        case let .canonicalRunScoped(_, context):
+            if let resolved = await canonicalContextSnapshot(context), resolved.context.health != .removed {
+                contextExists = true
+            } else {
+                contextExists = false
+            }
         case let .savedRunScoped(_, context, sessionID):
             contextExists = await savedCarrierWorkspace(context, sessionID: sessionID) != nil
         case .appPresentationWindow, .unbound:
@@ -533,7 +572,7 @@ package actor DomainRoutingCoordinator {
             return finish(operationID, disposition: .rejected, diagnostic: "run_scoped_binding_is_immutable")
         }
         switch binding {
-        case .context, .runScoped, .savedRunScoped:
+        case .context, .runScoped, .canonicalRunScoped, .savedRunScoped:
             guard contextExists else {
                 return finish(operationID, disposition: .rejected, diagnostic: "context_unavailable")
             }

@@ -144,8 +144,8 @@ struct MCPFileReadResources {
             let store = lease.resources.files
             let usesRetainedRoots = hostExecutionTab != nil
             let roots = if usesRetainedRoots { lease.roots } else { await store.rootRefs(scope: .visibleWorkspace) }
-            guard Set(roots.map { ($0.fullPath as NSString).standardizingPath })
-                == Set(lease.snapshot.document.metadata.repoPaths.map { ($0 as NSString).standardizingPath })
+            guard Set(roots.compactMap { StandardizedPath.canonicalWorkspaceRootPath($0.fullPath) })
+                == lease.snapshot.document.metadata.canonicalLoadableRepoPathSet
             else {
                 throw MCPFileToolAuthorityFailure.mismatchedProjection
             }
@@ -168,9 +168,14 @@ struct MCPFileReadResources {
                 let expectedContext = selectionReceipt.workspace?.contexts.first(where: { $0.metadata.identity == context })?.revisions.workingRevision
                     ?? handle.contextRevision
                 let refreshed = try await route.fileReadHandle(for: connection)
-                let retained = if selectionReceipt.workspace != nil {
-                    await lease.resources.contexts?.workspaceSnapshot(context.workspaceID) == expectedWorkspace
-                } else { await lease.isCurrent() }
+                let retained: Bool
+                if selectionReceipt.workspace != nil {
+                    let authority: AgentHostWorkspaceResources.SnapshotAuthority = hostExecutionTab != nil ? .canonical : lease.snapshotAuthority
+                    let snapshotMatches = await lease.resources.workspaceSnapshot(for: context.workspaceID, authority: authority) == expectedWorkspace
+                    retained = snapshotMatches ? await lease.retainedRootsAreCurrent() : false
+                } else {
+                    retained = await lease.isCurrent()
+                }
                 let rootSetIsCurrent = if usesRetainedRoots { true } else { await Set(store.rootRefs(scope: .visibleWorkspace)) == Set(roots) }
                 guard refreshed.runtimeID == handle.runtimeID, refreshed.runtimeGeneration == handle.runtimeGeneration,
                       refreshed.connectionGeneration == handle.connectionGeneration, refreshed.bindingKind == handle.bindingKind,
@@ -213,7 +218,7 @@ struct MCPFileReadResources {
             } else if tool == MCPWindowToolName.getFileTree {
                 value = try await executeTree(
                     args: args, store: store, lookup: lookup, selection: selection,
-                    isRootless: lease.snapshot.document.metadata.repoPaths.isEmpty, validate: validate
+                    isRootless: lease.snapshot.document.metadata.canonicalLoadableRepoPaths.isEmpty, validate: validate
                 )
             } else {
                 guard let contentEffects else { throw MCPFileToolAuthorityFailure.unavailable }

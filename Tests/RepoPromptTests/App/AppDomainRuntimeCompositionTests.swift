@@ -1,8 +1,10 @@
 import AppKit
 import Foundation
+import MCP
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptFoundation
+import RepoPromptMCPServer
 import RepoPromptPersistence
 import RepoPromptSettingsCore
 import RepoPromptShared
@@ -91,6 +93,536 @@ final class AppDomainRuntimeCompositionTests: XCTestCase {
             XCTAssertTrue(try XCTUnwrap(candidateRootLease).isReleased)
             XCTAssertEqual(activations.latestSessionIndexOwner, owner)
         }
+    }
+
+    @MainActor
+    func testPrepareVisibleAgentHostSucceedsWithNonDefaultFileSystemSettings() async throws {
+        let fixture = try await makeVisibleHostPreparationFixture()
+        fixture.settingsStore.setRespectRepoIgnore(false, commit: false)
+        fixture.settingsStore.setRespectCursorignore(false, commit: false)
+        fixture.settingsStore.setSkipSymlinks(false, commit: false)
+        let loaded = try await fixture.files.loadRoot(
+            path: fixture.root.path,
+            fileSystemSettings: fixture.settingsStore.fileSystemSettingsSnapshot()
+        )
+        addTeardownBlock { await fixture.files.unloadRoot(id: loaded.id) }
+
+        let host = try await WindowStateCompositionFactory.prepareVisibleAgentHost(
+            workspace: fixture.workspace,
+            owner: fixture.owner,
+            activations: fixture.activations,
+            resources: fixture.resources,
+            apiSettings: fixture.apiSettings,
+            settingsStore: fixture.settingsStore,
+            runtime: fixture.runtime
+        ) { host, roots in
+            try await self.installTestVisibleExecution(
+                host, roots: roots, settings: fixture.settingsStore, service: fixture.mcpService
+            )
+        }
+        addTeardownBlock { @MainActor in await self.retireVisibleHost(host) }
+
+        XCTAssertTrue(host.workspaceActivation?.catalogFileLease?.rootsAreCurrent == true)
+        XCTAssertEqual(host.workspaceActivation?.catalogFileLease?.roots.map(\.id), [loaded.id])
+        XCTAssertTrue(host.route.hasCurrentModelCatalogRoute)
+        await retireVisibleHost(host)
+    }
+
+    @MainActor
+    func testPrepareVisibleAgentHostSucceedsWhenReadOverlayExistsAndKeepsCanonicalRunRouting() async throws {
+        let fixture = try await makeVisibleHostPreparationFixture()
+        let canonicalBeforeValue = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspace.id)
+        let canonicalBefore = try XCTUnwrap(canonicalBeforeValue)
+
+        var overlayWorkspace = fixture.workspace
+        overlayWorkspace.name = "Transient Read Overlay"
+        let overlayDocument = try DomainWorkspaceDocument.decode(
+            documentBytes: JSONEncoder().encode(overlayWorkspace),
+            fileURL: fixture.workspaceURL
+        )
+        let overlay = await fixture.runtime.workspaceStore.registerReadDocument(overlayDocument)
+        let overlayObserved = await fixture.runtime.workspaceStore.workspaceSnapshot(fixture.workspace.id)
+        XCTAssertEqual(overlayObserved, overlay)
+        XCTAssertNotEqual(overlay, canonicalBefore)
+
+        let host = try await WindowStateCompositionFactory.prepareVisibleAgentHost(
+            workspace: fixture.workspace,
+            owner: fixture.owner,
+            activations: fixture.activations,
+            resources: fixture.resources,
+            apiSettings: fixture.apiSettings,
+            settingsStore: fixture.settingsStore,
+            runtime: fixture.runtime
+        ) { host, roots in
+            try await self.installTestVisibleExecution(
+                host, roots: roots, settings: fixture.settingsStore, service: fixture.mcpService
+            )
+        }
+        addTeardownBlock { @MainActor in await self.retireVisibleHost(host) }
+
+        let catalogLease = try XCTUnwrap(host.workspaceActivation?.catalogFileLease)
+        XCTAssertEqual(catalogLease.snapshotAuthority, .canonical)
+        XCTAssertEqual(catalogLease.snapshot, canonicalBefore)
+        XCTAssertTrue(host.route.hasCurrentModelCatalogRoute)
+
+        let runID = UUID()
+        let connectionID = UUID()
+        let tab = try XCTUnwrap(fixture.workspace.composeTabs.first)
+        var tabContext = MCPTabContextSnapshot(
+            tabID: tab.id,
+            windowID: host.routeID,
+            workspaceID: fixture.workspace.id,
+            promptText: "",
+            selection: .init(),
+            selectedMetaPromptIDs: [],
+            tabName: tab.name,
+            runID: runID,
+            activeAgentSessionID: nil,
+            explicitlyBound: false
+        )
+        tabContext.routeOwnerIdentity = ObjectIdentifier(host.route)
+        host.route.publishBinding(connectionID: connectionID, context: tabContext)
+        await host.route.settleRoutingPublications()
+
+        let registration = try await fixture.runtime.routingCoordinator.currentRegistration(connectionID: connectionID)
+        let handle = try await fixture.runtime.routingCoordinator.resolveReadContext(connection: registration)
+        XCTAssertEqual(handle.bindingKind, .runScoped(runID: runID))
+        XCTAssertEqual(handle.workspaceRevision, canonicalBefore.revisions.workingRevision)
+        XCTAssertNotEqual(handle.workspaceRevision, overlay.revisions.workingRevision)
+
+        await retireVisibleHost(host)
+    }
+
+    @MainActor
+    func testCanonicalHostAndOverlayPresentationFileReadsCoexistAcrossReadOverlay() async throws {
+        let fixture = try await makeVisibleHostPreparationFixture()
+        let canonicalOnlyFile = fixture.root.appendingPathComponent("canonical-only.txt")
+        let overlayOnlyFile = fixture.root.appendingPathComponent("overlay-only.txt")
+        let noteFile = fixture.root.appendingPathComponent("note.txt")
+        try Data("from canonical".utf8).write(to: canonicalOnlyFile)
+        try Data("from overlay".utf8).write(to: overlayOnlyFile)
+
+        let sessionID = UUID()
+        var canonicalWorkspace = fixture.workspace
+        let initialTab = try XCTUnwrap(canonicalWorkspace.composeTabs.first)
+        var canonicalTab = initialTab
+        canonicalTab.activeAgentSessionID = sessionID
+        canonicalTab.selection = StoredSelection(selectedPaths: [canonicalOnlyFile.path])
+        canonicalWorkspace.composeTabs = [canonicalTab]
+        canonicalWorkspace.activeComposeTabID = canonicalTab.id
+
+        let beforeSaveValue = await fixture.authority.canonicalWorkspaceSnapshot(fixture.workspace.id)
+        let beforeSave = try XCTUnwrap(beforeSaveValue)
+        let saved = try await fixture.authority.save(
+            canonicalWorkspace,
+            fileURL: fixture.workspaceURL,
+            expectedWorkspaceRevision: beforeSave.revisions.workingRevision,
+            expectedContentDigest: beforeSave.document.contentDigest
+        )
+        XCTAssertEqual(saved.disposition, .applied)
+        let canonicalSnapshotValue = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspace.id)
+        let canonicalSnapshot = try XCTUnwrap(canonicalSnapshotValue)
+
+        var overlayWorkspace = canonicalWorkspace
+        overlayWorkspace.name = "Transient Read Overlay"
+        var overlayTab = canonicalTab
+        overlayTab.selection = StoredSelection(selectedPaths: [overlayOnlyFile.path])
+        overlayWorkspace.composeTabs = [overlayTab]
+        let overlayDocument = try DomainWorkspaceDocument.decode(
+            documentBytes: JSONEncoder().encode(overlayWorkspace),
+            fileURL: fixture.workspaceURL
+        )
+        let overlaySnapshot = await fixture.runtime.workspaceStore.registerReadDocument(overlayDocument)
+        XCTAssertNotEqual(overlaySnapshot.revisions.workingRevision, canonicalSnapshot.revisions.workingRevision)
+
+        let host = try await WindowStateCompositionFactory.prepareVisibleAgentHost(
+            workspace: canonicalWorkspace,
+            owner: fixture.owner,
+            activations: fixture.activations,
+            resources: fixture.resources,
+            apiSettings: fixture.apiSettings,
+            settingsStore: fixture.settingsStore,
+            runtime: fixture.runtime
+        ) { host, roots in
+            try await self.installTestVisibleExecution(
+                host, roots: roots, settings: fixture.settingsStore, service: fixture.mcpService
+            )
+        }
+        addTeardownBlock { @MainActor in await self.retireVisibleHost(host) }
+
+        let catalogLease = try XCTUnwrap(host.workspaceActivation?.catalogFileLease)
+        let session = host.scope.makeSession(tabID: canonicalTab.id)
+        session.installPersistentSessionBinding(.init(
+            tabID: canonicalTab.id, sessionID: sessionID, workspaceID: canonicalWorkspace.id
+        ))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        session.hasLoadedPersistedState = true
+        let hostRunID = UUID()
+        session.installRunID(hostRunID)
+        host.scope.replaceSessions([canonicalTab.id: session])
+        let command = try host.scope.admit(session: session, expectedWorkspaceID: canonicalWorkspace.id)
+
+        let hostConnectionID = UUID()
+        var hostTabContext = MCPTabContextSnapshot(
+            tabID: canonicalTab.id,
+            windowID: host.routeID,
+            workspaceID: canonicalWorkspace.id,
+            promptText: "",
+            selection: canonicalTab.selection,
+            selectedMetaPromptIDs: [],
+            tabName: canonicalTab.name,
+            runID: hostRunID,
+            activeAgentSessionID: sessionID,
+            explicitlyBound: false
+        )
+        hostTabContext.routeOwnerIdentity = ObjectIdentifier(host.route)
+        hostTabContext.modelWriterAtBinding = .captured(command.identity)
+        host.route.runRouteBindings.tabContextByConnectionID[hostConnectionID] = hostTabContext
+        host.route.publishBinding(connectionID: hostConnectionID, context: hostTabContext)
+        await host.route.settleRoutingPublications()
+
+        let hostFileReads = host.makeHostFileReadResources(catalogLease)
+        let hostTreeBinding = try XCTUnwrap(hostFileReads.binding(named: MCPWindowToolName.getFileTree, route: host.route))
+        let hostReadBinding = try XCTUnwrap(hostFileReads.binding(named: MCPWindowToolName.readFile, route: host.route))
+
+        let hostTreeInvocation = ToolInvocationContext.trustedLocal(
+            toolName: MCPWindowToolName.getFileTree,
+            metadata: .init(connectionID: hostConnectionID, clientName: nil, windowID: host.routeID)
+        )
+        let hostTreeValue = try await MCPInvocationContextBridge.withInvocation(hostTreeInvocation) {
+            try await hostTreeBinding(["mode": .string("selected")])
+        }
+        XCTAssertNil(hostTreeValue.objectValue?["error_code"], String(describing: hostTreeValue))
+        let hostTree = try XCTUnwrap(hostTreeValue.objectValue?["tree"]?.stringValue)
+        XCTAssertTrue(hostTree.contains("canonical-only.txt"), hostTree)
+        XCTAssertFalse(hostTree.contains("overlay-only.txt"), hostTree)
+
+        let hostReadInvocation = ToolInvocationContext.trustedLocal(
+            toolName: MCPWindowToolName.readFile,
+            metadata: .init(connectionID: hostConnectionID, clientName: nil, windowID: host.routeID)
+        )
+        let hostReadValue = try await MCPInvocationContextBridge.withInvocation(hostReadInvocation) {
+            try await hostReadBinding(["path": .string(noteFile.path)])
+        }
+        XCTAssertNil(hostReadValue.objectValue?["error_code"], String(describing: hostReadValue))
+        let hostContent = try XCTUnwrap(hostReadValue.objectValue?["content"]?.stringValue)
+        XCTAssertTrue(hostContent.contains("synthetic"), hostContent)
+
+        let presentationRoute = MCPHostRouteResources(
+            identity: MCPRouteIdentityAllocator.allocateHost(),
+            coordinator: fixture.runtime.routingCoordinator,
+            runtime: fixture.runtime
+        )
+        XCTAssertFalse(presentationRoute.isLeaseManaged)
+        let overlayLease = try await fixture.resources.acquire(
+            context: .init(workspaceID: canonicalWorkspace.id, contextID: canonicalTab.id),
+            rootIDs: catalogLease.roots.map(\.id)
+        )
+        addTeardownBlock { @MainActor in
+            await presentationRoute.close()
+            await overlayLease.release()
+        }
+        XCTAssertEqual(overlayLease.snapshotAuthority, .readOverlay)
+        XCTAssertEqual(overlayLease.snapshot, overlaySnapshot)
+
+        let overlayRunID = UUID()
+        let overlayConnectionID = UUID()
+        var overlayTabContext = MCPTabContextSnapshot(
+            tabID: canonicalTab.id,
+            windowID: presentationRoute.identity.routeID,
+            workspaceID: canonicalWorkspace.id,
+            promptText: "",
+            selection: overlayTab.selection,
+            selectedMetaPromptIDs: [],
+            tabName: overlayTab.name,
+            runID: overlayRunID,
+            activeAgentSessionID: sessionID,
+            explicitlyBound: false
+        )
+        overlayTabContext.routeOwnerIdentity = ObjectIdentifier(presentationRoute)
+        presentationRoute.runRouteBindings.tabContextByConnectionID[overlayConnectionID] = overlayTabContext
+        presentationRoute.publishBinding(connectionID: overlayConnectionID, context: overlayTabContext)
+        await presentationRoute.settleRoutingPublications()
+
+        let overlayFileReads = MCPFileReadResources(workspace: overlayLease, settings: fixture.settingsStore)
+        let overlayTreeBinding = try XCTUnwrap(
+            overlayFileReads.binding(named: MCPWindowToolName.getFileTree, route: presentationRoute)
+        )
+        let overlayTreeInvocation = ToolInvocationContext.trustedLocal(
+            toolName: MCPWindowToolName.getFileTree,
+            metadata: .init(connectionID: overlayConnectionID, clientName: nil, windowID: presentationRoute.identity.routeID)
+        )
+        let overlayTreeValue = try await MCPInvocationContextBridge.withInvocation(overlayTreeInvocation) {
+            try await overlayTreeBinding(["mode": .string("selected")])
+        }
+        XCTAssertNil(overlayTreeValue.objectValue?["error_code"], String(describing: overlayTreeValue))
+        let overlayTree = try XCTUnwrap(overlayTreeValue.objectValue?["tree"]?.stringValue)
+        XCTAssertTrue(overlayTree.contains("overlay-only.txt"), overlayTree)
+        XCTAssertFalse(overlayTree.contains("canonical-only.txt"), overlayTree)
+
+        await presentationRoute.close()
+        await overlayLease.release()
+        await retireVisibleHost(host)
+    }
+
+    @MainActor
+    func testPrepareVisibleAgentHostSucceedsAcrossConcurrentLastUsedAndSaveDuringRootRetention() async throws {
+        let fixture = try await makeVisibleHostPreparationFixture()
+        let beforeValue = await fixture.authority.canonicalWorkspaceSnapshot(fixture.workspace.id)
+        let before = try XCTUnwrap(beforeValue)
+
+        var resources = fixture.resources
+        var didCommitConcurrentSave = false
+        resources.test_afterRetainRootsBeforeRecheck = {
+            guard !didCommitConcurrentSave else { return }
+            didCommitConcurrentSave = true
+            var updated = fixture.workspace
+            updated.lastUsed = Date().addingTimeInterval(60)
+            let outcome = try? await fixture.authority.save(
+                updated,
+                fileURL: fixture.workspaceURL,
+                expectedWorkspaceRevision: before.revisions.workingRevision,
+                expectedContentDigest: before.document.contentDigest
+            )
+            XCTAssertEqual(outcome?.disposition, .applied)
+        }
+
+        let host = try await WindowStateCompositionFactory.prepareVisibleAgentHost(
+            workspace: fixture.workspace,
+            owner: fixture.owner,
+            activations: fixture.activations,
+            resources: resources,
+            apiSettings: fixture.apiSettings,
+            settingsStore: fixture.settingsStore,
+            runtime: fixture.runtime
+        ) { host, roots in
+            try await self.installTestVisibleExecution(
+                host, roots: roots, settings: fixture.settingsStore, service: fixture.mcpService
+            )
+        }
+        addTeardownBlock { @MainActor in await self.retireVisibleHost(host) }
+
+        XCTAssertTrue(didCommitConcurrentSave)
+        let afterValue = await fixture.authority.canonicalWorkspaceSnapshot(fixture.workspace.id)
+        let after = try XCTUnwrap(afterValue)
+        XCTAssertGreaterThan(after.revisions.workingRevision, before.revisions.workingRevision)
+        XCTAssertNil(after.revisions.dirtyRevision)
+        XCTAssertEqual(host.workspaceActivation?.catalogFileLease?.snapshot.revisions, after.revisions)
+        XCTAssertTrue(host.workspaceActivation?.catalogFileLease?.rootsAreCurrent == true)
+
+        await retireVisibleHost(host)
+    }
+
+    @MainActor
+    func testPrepareVisibleAgentHostBootstrapsBeforeReadingCanonicalWorkspace() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("VisibleHostBootstrap-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+
+        let root = directory.appendingPathComponent("root", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let workspacesDir = directory.appendingPathComponent("workspaces", isDirectory: true)
+        let eventsDir = directory.appendingPathComponent("events", isDirectory: true)
+        let tempDir = directory.appendingPathComponent("temporary", isDirectory: true)
+        let profileID = "visible-host-bootstrap-\(UUID())"
+
+        var workspace = WorkspaceModel(
+            name: "PreBootstrap",
+            repoPaths: [root.path],
+            customStoragePath: directory.appendingPathComponent("saved", isDirectory: true)
+        )
+        workspace.composeTabs = [ComposeTabState()]
+        let workspaceURL = workspacesDir.appendingPathComponent("\(workspace.id.uuidString).json")
+
+        let seedRuntime = MCPDomainRuntime(configuration: .init(
+            mode: .app, profileIdentifier: profileID, storageDirectory: directory,
+            workspaceStorageDirectory: workspacesDir, eventDirectory: eventsDir,
+            temporaryDirectory: tempDir, externalReloadInterval: nil
+        ))
+        try await seedRuntime.start()
+        let seedAuthority = DomainWorkspaceAuthorityClient(store: seedRuntime.workspaceStore, windowID: 0)
+        let created = try await seedAuthority.create(workspace, fileURL: workspaceURL)
+        XCTAssertEqual(created.disposition, .applied)
+        _ = await seedRuntime.shutdown()
+
+        let coldRuntime = MCPDomainRuntime(configuration: .init(
+            mode: .app, profileIdentifier: profileID, storageDirectory: directory,
+            workspaceStorageDirectory: workspacesDir, eventDirectory: eventsDir,
+            temporaryDirectory: tempDir, externalReloadInterval: nil
+        ))
+        addTeardownBlock { _ = await coldRuntime.shutdown() }
+
+        let beforeBootstrap = await coldRuntime.workspaceStore.canonicalWorkspaceSnapshot(workspace.id)
+        XCTAssertNil(beforeBootstrap, "Cold runtime must not have bootstrapped before host preparation")
+
+        let (defaults, suiteName) = try makeIsolatedDefaults()
+        addTeardownBlock { defaults.removePersistentDomain(forName: suiteName) }
+        let settingsStore = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: directory.appendingPathComponent("settings.json"))
+        )
+        let activations = AgentWorkspaceSessionIndexStore()
+        let owner = activations.receiveWorkspaceSwitchNotification(workspace)
+        let keys = KeyManager()
+        let apiSettings = APISettingsViewModel(
+            aiQueriesService: AIQueriesService(keyManager: keys), keyManager: keys, loadStoredDataOnInit: false
+        )
+        let files = WorkspaceFileContextStore(codemapGraphIndexBuildLaunchPolicyForTesting: .disabled)
+        let resources = AgentHostWorkspaceResources(files: files, contexts: coldRuntime.contextStore)
+        let mcpService = MCPService(
+            hostBootstrapOperation: {}, controllerStartOperation: {}, controllerFullShutdownOperation: {}
+        )
+
+        let host = try await WindowStateCompositionFactory.prepareVisibleAgentHost(
+            workspace: workspace,
+            owner: owner,
+            activations: activations,
+            resources: resources,
+            apiSettings: apiSettings,
+            settingsStore: settingsStore,
+            runtime: coldRuntime
+        ) { host, roots in
+            try await self.installTestVisibleExecution(
+                host, roots: roots, settings: settingsStore, service: mcpService
+            )
+        }
+        addTeardownBlock { @MainActor in await self.retireVisibleHost(host) }
+
+        let afterBootstrap = await coldRuntime.workspaceStore.canonicalWorkspaceSnapshot(workspace.id)
+        XCTAssertNotNil(afterBootstrap)
+        XCTAssertTrue(host.workspaceActivation?.catalogFileLease?.rootsAreCurrent == true)
+        XCTAssertTrue(host.route.hasCurrentModelCatalogRoute)
+
+        await retireVisibleHost(host)
+    }
+
+    @MainActor
+    private struct VisibleHostPreparationFixture {
+        let directory: URL
+        let root: URL
+        let workspace: WorkspaceModel
+        let workspaceURL: URL
+        let runtime: MCPDomainRuntime
+        let authority: DomainWorkspaceAuthorityClient
+        let activations: AgentWorkspaceSessionIndexStore
+        let owner: AgentWorkspaceSessionIndexStore.SessionIndexOwner
+        let apiSettings: APISettingsViewModel
+        let settingsStore: GlobalSettingsStore
+        let files: WorkspaceFileContextStore
+        let resources: AgentHostWorkspaceResources
+        let mcpService: MCPService
+    }
+
+    @MainActor
+    private func makeVisibleHostPreparationFixture() async throws -> VisibleHostPreparationFixture {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("VisibleHost-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let runtime = MCPDomainRuntime(configuration: .init(
+            mode: .app, profileIdentifier: "visible-host-\(UUID())", storageDirectory: directory,
+            workspaceStorageDirectory: directory.appendingPathComponent("workspaces"),
+            eventDirectory: directory.appendingPathComponent("events"),
+            temporaryDirectory: directory.appendingPathComponent("temporary"), externalReloadInterval: nil
+        ))
+        try await runtime.start()
+        addTeardownBlock {
+            _ = await runtime.shutdown()
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let root = directory.appendingPathComponent("root", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("synthetic".utf8).write(to: root.appendingPathComponent("note.txt"))
+        var workspace = WorkspaceModel(
+            name: "Original",
+            repoPaths: [root.path],
+            customStoragePath: directory.appendingPathComponent("saved", isDirectory: true)
+        )
+        workspace.composeTabs = [ComposeTabState()]
+        let workspaceURL = runtime.configuration.workspaceStorageDirectory.appendingPathComponent("\(workspace.id.uuidString).json")
+        let authority = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: 0)
+        let created = try await authority.create(workspace, fileURL: workspaceURL)
+        XCTAssertEqual(created.disposition, .applied)
+
+        let (defaults, suiteName) = try makeIsolatedDefaults()
+        addTeardownBlock { defaults.removePersistentDomain(forName: suiteName) }
+        let settingsStore = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: directory.appendingPathComponent("settings.json"))
+        )
+        let activations = AgentWorkspaceSessionIndexStore()
+        let owner = activations.receiveWorkspaceSwitchNotification(workspace)
+        let keys = KeyManager()
+        let apiSettings = APISettingsViewModel(
+            aiQueriesService: AIQueriesService(keyManager: keys), keyManager: keys, loadStoredDataOnInit: false
+        )
+        let files = WorkspaceFileContextStore(codemapGraphIndexBuildLaunchPolicyForTesting: .disabled)
+        let resources = AgentHostWorkspaceResources(files: files, contexts: runtime.contextStore)
+        let mcpService = MCPService(
+            hostBootstrapOperation: {}, controllerStartOperation: {}, controllerFullShutdownOperation: {}
+        )
+        return VisibleHostPreparationFixture(
+            directory: directory,
+            root: root,
+            workspace: workspace,
+            workspaceURL: workspaceURL,
+            runtime: runtime,
+            authority: authority,
+            activations: activations,
+            owner: owner,
+            apiSettings: apiSettings,
+            settingsStore: settingsStore,
+            files: files,
+            resources: resources,
+            mcpService: mcpService
+        )
+    }
+
+    @MainActor
+    private func installTestVisibleExecution(
+        _ host: AgentSessionRuntimeHost,
+        roots: AgentHostWorkspaceResources.Lease,
+        settings: GlobalSettingsStore,
+        service: MCPService
+    ) async throws {
+        guard let activation = host.workspaceActivation, activation.catalogFileLease === roots,
+              let workspace = try? JSONDecoder().decode(WorkspaceModel.self, from: roots.snapshot.document.documentBytes)
+        else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
+        let storage = AgentSessionStorageInputs(
+            workspaceID: workspace.id,
+            workspaceWithID: { $0 == workspace.id ? workspace : nil },
+            displayName: { _ in AgentSessionRestoreSupport.normalizedSessionTitle(nil) },
+            isSuppressed: { true },
+            attachmentWorkspaceDirectory: { FileManager.default.temporaryDirectory }
+        )
+        host.scope.persistence.composition = storage.persistenceComposition(
+            scope: host.scope,
+            canonicalStorage: .init(workspaceID: workspace.id) { id in
+                guard let snapshot = await activation.authority.canonicalWorkspaceSnapshot(id),
+                      snapshot.health != .removed else { return nil }
+                return try? JSONDecoder().decode(WorkspaceModel.self, from: snapshot.document.documentBytes)
+            }
+        )
+        let perf = AppAgentModePerfRecorder()
+        host.scope.persistence.perfRecorder = perf
+        try host.installHostRunExecution(
+            sessionTitle: { _ in AgentSessionRestoreSupport.normalizedSessionTitle(nil) },
+            settings: settings,
+            perf: perf,
+            diagnostics: AppAgentSessionLinkCatalogEventSink()
+        )
+        host.scope.mcp.installRunRoute(id: host.routeID, bindings: host.route.runRouteBindings)
+        host.scope.mcp.codexCoordinator = host.codexCoordinator
+        host.scope.mcp.claudeCoordinator = host.claudeCoordinator
+        _ = host.scope.interactions(routeID: host.routeID, approvalStore: .shared)
+        try await host.registerHostCatalog(service: service)
+    }
+
+    @MainActor
+    private func retireVisibleHost(_ host: AgentSessionRuntimeHost) async {
+        guard !host.scope.hasReleasedWriterClaims else { return }
+        let drain = host.beginRetirement()
+        drain.attemptRecovery()
+        let settled = await drain.wait(until: .now.advanced(by: .seconds(5)))
+        XCTAssertEqual(settled, .released)
     }
 
     func testCollectLegacyRuntimeDefaultsSerializesBooleanScalarFragments() throws {

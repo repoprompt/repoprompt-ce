@@ -85,7 +85,9 @@ final class AgentSessionComposerSubmitRuntime {
         if let pending = session.composerStartCancellation { return .rejected(.activeAttemptExists(activeAttemptID: pending.attemptID)) }
         if let active = session.activeComposerSubmitAttempt { return .rejected(.activeAttemptExists(activeAttemptID: active.id)) }
         guard !scope.isRetiring, !scope.hasReleasedWriterClaims else { return .rejected(.targetRejected(reason: "writer_retiring")) }
-        if session.restorationAdmissionFailureMessage != nil { return .rejected(.targetRejected(reason: "restoration_unavailable")) }
+        if scope.isAwaitingWorkspaceAdoption || session.isAwaitingWorkspaceAdoption || session.restorationAdmissionFailureMessage != nil {
+            return .rejected(.targetRejected(reason: "restoration_unavailable"))
+        }
         guard session.composerSubmissionToken == target.expectedSubmissionToken else { return .rejected(.targetRejected(reason: "submission_token_mismatch")) }
         if let presentationRejection { return .rejected(.targetRejected(reason: presentationRejection)) }
 
@@ -104,7 +106,8 @@ final class AgentSessionComposerSubmitRuntime {
             else { return .rejected(.targetRejected(reason: "writer_unavailable")) }
             command = admitted
         case .createAgentSessionFromSourceTab:
-            guard suppliedCommand == nil, session.activeAgentSessionID == nil,
+            guard suppliedCommand == nil, !scope.isAwaitingWorkspaceAdoption, !session.isAwaitingWorkspaceAdoption,
+                  session.activeAgentSessionID == nil,
                   target.expectedSourceAgentSessionID == nil, session.persistentSessionBindingIdentity == nil,
                   !session.bindingTransitionInProgress,
                   session.bindingTransitionGeneration == target.expectedBindingTransitionGeneration,

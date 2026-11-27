@@ -149,7 +149,7 @@ package struct DomainContextStore {
         await authority.contextSnapshot(identity)
     }
 
-    func canonicalWorkspaceSnapshot(_ id: UUID) async -> DomainWorkspaceSnapshot? {
+    package func canonicalWorkspaceSnapshot(_ id: UUID) async -> DomainWorkspaceSnapshot? {
         await authority.canonicalWorkspaceSnapshot(id)
     }
 

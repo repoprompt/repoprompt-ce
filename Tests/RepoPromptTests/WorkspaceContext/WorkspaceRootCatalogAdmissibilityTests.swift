@@ -1,7 +1,9 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptInstrumentation
+import RepoPromptSettingsCore
 @testable import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 import XCTest
@@ -60,6 +62,325 @@ final class WorkspaceRootRetentionTests: XCTestCase {
         await store.releaseRootRetention(lease)
         let after = await store.rootRefs()
         XCTAssertEqual(after.map(\.id), [rootID])
+    }
+
+    func testLoadOrJoinPrimaryRootJoinsExistingRootLoadedWithNonDefaultFileSystemSettings() async throws {
+        let path = try directory()
+        let store = WorkspaceFileContextStore(codemapGraphIndexBuildLaunchPolicyForTesting: .disabled)
+        let nonDefault = FileSystemSettingsSnapshot(
+            respectRepoIgnore: false,
+            respectCursorignore: false,
+            globalIgnoreDefaults: "",
+            enableHierarchicalIgnores: false,
+            skipSymlinks: false,
+            showEmptyFolders: false
+        )
+        let defaults = FileSystemSettingsSnapshot(
+            respectRepoIgnore: true,
+            respectCursorignore: true,
+            globalIgnoreDefaults: "",
+            enableHierarchicalIgnores: true,
+            skipSymlinks: true,
+            showEmptyFolders: false
+        )
+        let loaded = try await store.loadRoot(
+            path: path.path,
+            kind: .primaryWorkspace,
+            fileSystemSettings: nonDefault
+        )
+        addTeardownBlock { await store.unloadRoot(id: loaded.id) }
+
+        do {
+            _ = try await store.loadRoot(path: path.path, kind: .primaryWorkspace, fileSystemSettings: defaults)
+            XCTFail("Presentation loadRoot must still reject mismatched RootLoadConfiguration")
+        } catch let error as WorkspaceFileContextStoreError {
+            XCTAssertEqual(error, .rootAlreadyLoadedWithDifferentConfiguration(loaded.standardizedFullPath))
+        }
+
+        let joined = try await store.loadOrJoinPrimaryRoot(path: path.path, fileSystemSettings: defaults)
+        XCTAssertEqual(joined.id, loaded.id)
+    }
+
+    func testLoadOrJoinPrimaryRootLoadsAbsentRootWithProvidedFileSystemSettings() async throws {
+        let path = try directory()
+        let store = WorkspaceFileContextStore(codemapGraphIndexBuildLaunchPolicyForTesting: .disabled)
+        let nonDefault = FileSystemSettingsSnapshot(
+            respectRepoIgnore: false,
+            respectCursorignore: false,
+            globalIgnoreDefaults: "",
+            enableHierarchicalIgnores: false,
+            skipSymlinks: false,
+            showEmptyFolders: false
+        )
+        let loaded = try await store.loadOrJoinPrimaryRoot(path: path.path, fileSystemSettings: nonDefault)
+        addTeardownBlock { await store.unloadRoot(id: loaded.id) }
+
+        let presentationJoin = try await store.loadRoot(
+            path: path.path,
+            kind: .primaryWorkspace,
+            fileSystemSettings: nonDefault
+        )
+        XCTAssertEqual(presentationJoin.id, loaded.id)
+    }
+
+    func testLoadOrJoinPrimaryRootFailsClosedOnSessionWorktreeAndGitDataKinds() async throws {
+        let worktreePath = try directory()
+        let gitDataPath = try directory()
+        let store = WorkspaceFileContextStore(codemapGraphIndexBuildLaunchPolicyForTesting: .disabled)
+        let settings = FileSystemSettingsSnapshot(
+            respectRepoIgnore: true,
+            respectCursorignore: true,
+            globalIgnoreDefaults: "",
+            enableHierarchicalIgnores: true,
+            skipSymlinks: true,
+            showEmptyFolders: false
+        )
+        let worktreeRoot = try await store.loadRoot(path: worktreePath.path, kind: .sessionWorktree)
+        let gitDataRoot = try await store.loadRoot(path: gitDataPath.path, kind: .workspaceGitData)
+        addTeardownBlock {
+            await store.unloadRoots(ids: [worktreeRoot.id, gitDataRoot.id])
+        }
+
+        for existing in [worktreeRoot, gitDataRoot] {
+            do {
+                _ = try await store.loadOrJoinPrimaryRoot(path: existing.fullPath, fileSystemSettings: settings)
+                XCTFail("loadOrJoinPrimaryRoot must refuse non-primary root kind \(existing.kind)")
+            } catch let error as WorkspaceFileContextStoreError {
+                XCTAssertEqual(error, .rootAlreadyLoadedWithDifferentConfiguration(existing.standardizedFullPath))
+            }
+        }
+    }
+
+    func testLoadOrJoinPrimaryRootPreservesDeferredUnloadOnDetachedRetainedRoot() async throws {
+        let (store, rootID) = try await fixture()
+        let roots = await store.rootRefs()
+        let path = try XCTUnwrap(roots.first?.fullPath)
+        let lease = try await store.retainRoots(ids: [rootID])
+        await store.detachRootPresentations(ids: [rootID])
+
+        let visibleBefore = await store.rootRefs(scope: .visibleWorkspace)
+        XCTAssertTrue(visibleBefore.isEmpty)
+
+        let settings = FileSystemSettingsSnapshot(
+            respectRepoIgnore: false,
+            respectCursorignore: false,
+            globalIgnoreDefaults: "",
+            enableHierarchicalIgnores: false,
+            skipSymlinks: false,
+            showEmptyFolders: false
+        )
+        let joined = try await store.loadOrJoinPrimaryRoot(path: path, fileSystemSettings: settings)
+        XCTAssertEqual(joined.id, rootID)
+
+        let visibleAfterJoin = await store.rootRefs(scope: .visibleWorkspace)
+        XCTAssertTrue(visibleAfterJoin.isEmpty, "Non-presentation join must not reattach a detached root")
+
+        // Candidate discards without retaining; releasing the original lease must still unload cleanly.
+        await store.releaseRootRetention(lease)
+        let final = await store.rootRefs()
+        XCTAssertTrue(final.isEmpty, "Deferred unload must remain intact so discarded candidates cannot leak roots")
+    }
+
+    func testLoadOrJoinPrimaryRootNonOwningCancellationDoesNotCancelSharedInFlightLoad() async throws {
+        actor InFlightRootLoadGate {
+            private var entered = false
+            private var released = false
+            private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
+            private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+            func hold() async {
+                entered = true
+                let waiters = enteredWaiters
+                enteredWaiters.removeAll()
+                waiters.forEach { $0.resume() }
+                guard !released else { return }
+                await withCheckedContinuation { releaseWaiters.append($0) }
+            }
+
+            func waitUntilEntered() async {
+                guard !entered else { return }
+                await withCheckedContinuation { enteredWaiters.append($0) }
+            }
+
+            func release() {
+                released = true
+                let waiters = releaseWaiters
+                releaseWaiters.removeAll()
+                waiters.forEach { $0.resume() }
+            }
+        }
+
+        let path = try directory()
+        let canonicalPath = try XCTUnwrap(StandardizedPath.canonicalWorkspaceRootPath(path.path))
+        let store = WorkspaceFileContextStore(codemapGraphIndexBuildLaunchPolicyForTesting: .disabled)
+        let nonDefault = FileSystemSettingsSnapshot(
+            respectRepoIgnore: false,
+            respectCursorignore: false,
+            globalIgnoreDefaults: "",
+            enableHierarchicalIgnores: false,
+            skipSymlinks: false,
+            showEmptyFolders: false
+        )
+        let defaults = FileSystemSettingsSnapshot(
+            respectRepoIgnore: true,
+            respectCursorignore: true,
+            globalIgnoreDefaults: "",
+            enableHierarchicalIgnores: true,
+            skipSymlinks: true,
+            showEmptyFolders: false
+        )
+        let gate = InFlightRootLoadGate()
+        await store.setRootLoadWillStartHandler { startedPath in
+            guard startedPath == canonicalPath else { return }
+            await gate.hold()
+        }
+        addTeardownBlock {
+            await store.setRootLoadWillStartHandler(nil)
+            await gate.release()
+        }
+
+        let ownerTask = Task {
+            try await store.loadRoot(
+                path: path.path,
+                kind: .primaryWorkspace,
+                fileSystemSettings: nonDefault,
+                cancelUnderlyingLoadOnCallerCancellation: true
+            )
+        }
+        await gate.waitUntilEntered()
+
+        let joiningTask = Task {
+            try await store.loadOrJoinPrimaryRoot(
+                path: path.path,
+                fileSystemSettings: defaults,
+                cancelUnderlyingLoadOnCallerCancellation: false
+            )
+        }
+        // Let the joining waiter enter the store actor and attach to the in-flight load.
+        for _ in 0 ..< 4 {
+            await Task.yield()
+            _ = await store.rootRefs()
+        }
+
+        joiningTask.cancel()
+        do {
+            _ = try await joiningTask.value
+            XCTFail("Cancelling a non-owning joining waiter must throw CancellationError promptly while load is held")
+        } catch is CancellationError {
+            // Expected: waiter unblocks without cancelling the shared visible root load.
+        }
+
+        await gate.release()
+        let loaded = try await ownerTask.value
+        addTeardownBlock { await store.unloadRoot(id: loaded.id) }
+        XCTAssertEqual(loaded.kind, .primaryWorkspace)
+        XCTAssertEqual(loaded.standardizedFullPath, canonicalPath)
+
+        let visibleRoots = await store.rootRefs(scope: .visibleWorkspace)
+        XCTAssertEqual(visibleRoots.map(\.id), [loaded.id])
+
+        let joinedAfterCompletion = try await store.loadOrJoinPrimaryRoot(
+            path: path.path,
+            fileSystemSettings: defaults,
+            cancelUnderlyingLoadOnCallerCancellation: false
+        )
+        XCTAssertEqual(joinedAfterCompletion.id, loaded.id)
+    }
+
+    func testCanonicalWorkspaceRootPathsAndLoadableMetadataNormalizeWhitespaceTildeSystemAndProbe() async throws {
+        let dir = try directory()
+        let canonicalDir = try XCTUnwrap(StandardizedPath.canonicalWorkspaceRootPath(dir.path))
+        XCTAssertEqual(StandardizedPath.canonicalWorkspaceRootPath("  \(dir.path)/  "), canonicalDir)
+        XCTAssertEqual(StandardizedPath.canonicalWorkspaceRootPath("/private/tmp/"), "/tmp")
+        if canonicalDir.hasPrefix("/var/") || canonicalDir.hasPrefix("/tmp/") {
+            XCTAssertEqual(StandardizedPath.canonicalWorkspaceRootPath("/private\(canonicalDir)/"), canonicalDir)
+        }
+        XCTAssertNil(StandardizedPath.canonicalWorkspaceRootPath(""))
+        XCTAssertNil(StandardizedPath.canonicalWorkspaceRootPath("   "))
+        XCTAssertNil(StandardizedPath.canonicalWorkspaceRootPath("file://\(dir.path)"))
+        XCTAssertNil(StandardizedPath.canonicalWorkspaceRootPath("\(dir.path)\0bad"))
+        XCTAssertEqual(
+            StandardizedPath.canonicalWorkspaceRootPaths(["  \(dir.path)/  ", dir.path, "", "file://\(dir.path)"]),
+            [canonicalDir]
+        )
+
+        let systemMetadata = DomainWorkspaceMetadata(
+            workspaceID: UUID(),
+            schemaVersion: 1,
+            dateModified: Date(),
+            lastUsed: Date(),
+            name: "Default",
+            repoPaths: [dir.path],
+            customStoragePath: nil,
+            isSystemWorkspace: true,
+            isHiddenInMenus: false,
+            isEphemeral: false,
+            activeContextID: nil,
+            contexts: []
+        )
+        XCTAssertTrue(systemMetadata.loadableRepoPaths.isEmpty)
+        XCTAssertTrue(systemMetadata.canonicalLoadableRepoPaths.isEmpty)
+        XCTAssertTrue(systemMetadata.canonicalLoadableRepoPathSet.isEmpty)
+
+        let userMetadata = DomainWorkspaceMetadata(
+            workspaceID: UUID(),
+            schemaVersion: 1,
+            dateModified: Date(),
+            lastUsed: Date(),
+            name: "Synthetic",
+            repoPaths: ["  \(dir.path)/  ", dir.path],
+            customStoragePath: nil,
+            isSystemWorkspace: false,
+            isHiddenInMenus: false,
+            isEphemeral: false,
+            activeContextID: nil,
+            contexts: []
+        )
+        XCTAssertEqual(userMetadata.canonicalLoadableRepoPaths, [canonicalDir])
+        XCTAssertEqual(userMetadata.canonicalLoadableRepoPathSet, [canonicalDir])
+
+        let store = WorkspaceFileContextStore(codemapGraphIndexBuildLaunchPolicyForTesting: .disabled)
+        let settings = FileSystemSettingsSnapshot(
+            respectRepoIgnore: false,
+            respectCursorignore: true,
+            globalIgnoreDefaults: "",
+            enableHierarchicalIgnores: false,
+            skipSymlinks: true,
+            showEmptyFolders: false
+        )
+        let loaded = try await store.loadRoot(path: "  \(dir.path)/  ", kind: .primaryWorkspace, fileSystemSettings: settings)
+        addTeardownBlock { await store.unloadRoot(id: loaded.id) }
+        let joined = try await store.loadOrJoinPrimaryRoot(path: dir.path, fileSystemSettings: settings)
+        XCTAssertEqual(joined.id, loaded.id)
+
+        let probeFailure = try await WorkspaceRootDirectoryProbe().run(
+            paths: ["  \(dir.path)/  ", "~"],
+            attemptID: UUID(),
+            checkpoint: nil
+        )
+        XCTAssertNil(probeFailure)
+    }
+
+    func testWorkspaceFilesViewModelSyncsInitialFlagsFromInjectedSettingsStore() throws {
+        let dir = try directory()
+        let suiteName = "RepoPromptCE.unit-settings.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        addTeardownBlock { defaults.removePersistentDomain(forName: suiteName) }
+        let settingsStore = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: dir.appendingPathComponent("settings.json"))
+        )
+        settingsStore.setRespectRepoIgnore(false, commit: false)
+        settingsStore.setRespectCursorignore(false, commit: false)
+        settingsStore.setEnableHierarchicalIgnores(false, commit: false)
+        settingsStore.setSkipSymlinks(false, commit: false)
+
+        let store = WorkspaceFileContextStore(codemapGraphIndexBuildLaunchPolicyForTesting: .disabled)
+        let filesVM = WorkspaceFilesViewModel(workspaceFileContextStore: store, settingsStore: settingsStore)
+        XCTAssertFalse(filesVM.respectRepoIgnore)
+        XCTAssertFalse(filesVM.respectCursorignore)
+        XCTAssertFalse(filesVM.enableHierarchicalIgnores)
+        XCTAssertFalse(filesVM.skipSymlinks)
     }
 
     private func fixture() async throws -> (WorkspaceFileContextStore, UUID) {

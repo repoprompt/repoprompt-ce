@@ -2670,6 +2670,7 @@ import XCTest
         }
 
         private static func close(_ window: WindowState) async {
+            await window.agentModeViewModel.test_retireAndCancelFixture()
             window.beginClose()
             await window.tearDown()
             WindowStatesManager.shared.unregisterWindowState(window)
@@ -2782,6 +2783,7 @@ import XCTest
                     workspaceFileURL: workspaceFileURL
                 )
             } catch {
+                await window.agentModeViewModel.test_retireAndCancelFixture()
                 window.beginClose()
                 await window.tearDown()
                 WindowStatesManager.shared.unregisterWindowState(window)
@@ -2861,11 +2863,13 @@ import XCTest
             guard !isClosed else { return }
             isClosed = true
             for peer in peerWindows.reversed() {
+                await peer.agentModeViewModel.test_retireAndCancelFixture()
                 peer.beginClose()
                 await peer.tearDown()
                 WindowStatesManager.shared.unregisterWindowState(peer)
             }
             peerWindows.removeAll()
+            await window.agentModeViewModel.test_retireAndCancelFixture()
             window.beginClose()
             await window.tearDown()
             WindowStatesManager.shared.unregisterWindowState(window)
