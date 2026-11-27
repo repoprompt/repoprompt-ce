@@ -1148,6 +1148,23 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         try await runVisibleLifetimeWitness(switchWorkspace: false, submission: .oversightProjection)
     }
 
+    func testWakePolicyRequiresTheRestoredWriterAfterRebind() throws {
+        let f = try fixture()
+        let transition = f.session.beginPersistentBindingTransition()
+        f.session.finishPersistentBindingTransition(generation: transition)
+        let current = try XCTUnwrap(f.runtime.agentSessionLinkObserverEndpoint(tabID: f.session.tabID))
+        XCTAssertNotEqual(f.endpoint, current)
+        XCTAssertFalse(f.runtime.setWakePolicy(.automaticUpdates(true), for: f.endpoint))
+        XCTAssertFalse(f.runtime.setWakePolicy(.automaticUpdates(true), for: current))
+        XCTAssertFalse(f.session.oversight.autoWakeOnUpdates)
+
+        f.session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        f.session.hasLoadedPersistedState = true
+        XCTAssertFalse(f.runtime.setWakePolicy(.automaticUpdates(true), for: f.endpoint))
+        XCTAssertTrue(f.runtime.setWakePolicy(.automaticUpdates(true), for: current))
+        XCTAssertTrue(f.session.oversight.autoWakeOnUpdates)
+    }
+
     func testCanonicalOversightSendSurvivesSwitchAndDeliversOnce() async throws {
         try await runVisibleLifetimeWitness(switchWorkspace: false, submission: .oversightWhileSwitchingTabs)
     }

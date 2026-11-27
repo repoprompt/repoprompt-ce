@@ -112,6 +112,9 @@ final class AgentSessionHostWorkspaceActivation {
         _ captured: DomainWorkspaceSnapshot, _ current: DomainWorkspaceSnapshot,
         command: AgentSessionRuntimeStore.Command
     ) -> Bool {
+        // A saved target's placement comes from the canonical document revision. Matching
+        // bytes after removal and reinsertion cannot renew the old carrier receipt.
+        if savedTarget != nil { return captured == current }
         let before = captured.document.metadata
         let after = current.document.metadata
         guard captured.document.fileURL == current.document.fileURL,
