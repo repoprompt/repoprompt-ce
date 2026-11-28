@@ -967,14 +967,12 @@ struct AgentComposerView: View, Equatable {
                         inputText: localInputText,
                         hasMessages: false, // Disable resend in agent mode - just show greyed send button
                         sendWhenEmpty: hasPendingAttachments,
-                        sendTooltip: actions.sendTitle ?? (repromptPresentation == nil ? "Send Message (Return)" : "Send Current Text (Return)"),
+                        sendTooltip: disabledSendTooltip ?? (actions.sendTitle ?? (repromptPresentation == nil ? "Send Message (Return)" : "Send Current Text (Return)")),
                         foregroundColor: .accentColor,
                         sendAction: sendMessage,
                         resendAction: {}
                     )
                     .disabled(!canSubmitToRenderedTarget)
-                    .contentShape(Rectangle())
-                    .hoverTooltip(disabledSendTooltip)
                     .transaction { transaction in
                         transaction.animation = nil
                     }

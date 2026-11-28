@@ -9,6 +9,7 @@ import RepoPromptPersistence
 import RepoPromptSettingsCore
 import RepoPromptShared
 @testable import RepoPromptWorkspaceContext
+import RepoPromptWorkspaceCore
 import SQLite3
 import XCTest
 
@@ -414,6 +415,113 @@ final class AppDomainRuntimeCompositionTests: XCTestCase {
     }
 
     @MainActor
+    func testCanonicalCarrierAdmissionAndWorktreePreparationNormalizeWhitespaceAndDuplicateRepoPaths() async throws {
+        let fixture = try await makeVisibleHostPreparationFixture { root in
+            ["  \(root.path)  ", root.path]
+        }
+        let sessionID = UUID()
+        var canonicalWorkspace = fixture.workspace
+        var canonicalTab = try XCTUnwrap(canonicalWorkspace.composeTabs.first)
+        canonicalTab.activeAgentSessionID = sessionID
+        canonicalWorkspace.composeTabs = [canonicalTab]
+        canonicalWorkspace.activeComposeTabID = canonicalTab.id
+
+        let beforeSaveValue = await fixture.authority.canonicalWorkspaceSnapshot(fixture.workspace.id)
+        let beforeSave = try XCTUnwrap(beforeSaveValue)
+        let saved = try await fixture.authority.save(
+            canonicalWorkspace,
+            fileURL: fixture.workspaceURL,
+            expectedWorkspaceRevision: beforeSave.revisions.workingRevision,
+            expectedContentDigest: beforeSave.document.contentDigest
+        )
+        XCTAssertEqual(saved.disposition, .applied)
+
+        let host = try await WindowStateCompositionFactory.prepareVisibleAgentHost(
+            workspace: canonicalWorkspace,
+            owner: fixture.owner,
+            activations: fixture.activations,
+            resources: fixture.resources,
+            apiSettings: fixture.apiSettings,
+            settingsStore: fixture.settingsStore,
+            runtime: fixture.runtime
+        ) { host, roots in
+            try await self.installTestVisibleExecution(
+                host, roots: roots, settings: fixture.settingsStore, service: fixture.mcpService
+            )
+        }
+        addTeardownBlock { @MainActor in await self.retireVisibleHost(host) }
+
+        let session = host.scope.makeSession(tabID: canonicalTab.id)
+        session.installPersistentSessionBinding(.init(
+            tabID: canonicalTab.id, sessionID: sessionID, workspaceID: canonicalWorkspace.id
+        ))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        session.hasLoadedPersistedState = true
+        let runID = UUID()
+        session.installRunID(runID)
+        host.scope.replaceSessions([canonicalTab.id: session])
+        let command = try host.scope.admit(session: session, expectedWorkspaceID: canonicalWorkspace.id)
+
+        let connectionID = UUID()
+        var tabContext = MCPTabContextSnapshot(
+            tabID: canonicalTab.id,
+            windowID: host.routeID,
+            workspaceID: canonicalWorkspace.id,
+            promptText: "",
+            selection: canonicalTab.selection,
+            selectedMetaPromptIDs: [],
+            tabName: canonicalTab.name,
+            runID: runID,
+            activeAgentSessionID: sessionID,
+            explicitlyBound: false
+        )
+        tabContext.routeOwnerIdentity = ObjectIdentifier(host.route)
+        tabContext.modelWriterAtBinding = .captured(command.identity)
+        host.route.runRouteBindings.tabContextByConnectionID[connectionID] = tabContext
+        host.route.publishBinding(connectionID: connectionID, context: tabContext)
+        await host.route.settleRoutingPublications()
+        await ServerNetworkManager.shared.debugSeedConnectionRunRouting(
+            connectionID: connectionID,
+            runID: runID,
+            purpose: .agentModeRun,
+            windowID: host.routeID
+        )
+
+        let invocation = ToolInvocationContext.trustedLocal(
+            toolName: MCPWindowToolName.agentRun,
+            metadata: .init(connectionID: connectionID, clientName: nil, windowID: host.routeID)
+        )
+        let admission = try await AgentRunHostAdmission(host: host, invocation: invocation)
+        let snapshot = try await admission.canonicalSnapshot()
+        let canonicalRoot = try XCTUnwrap(StandardizedPath.canonicalWorkspaceRootPath(fixture.root.path))
+        XCTAssertEqual(
+            Set(snapshot.document.metadata.canonicalLoadableRepoPaths.compactMap {
+                DomainMutationPathFence.canonicalPath($0)
+            }),
+            [canonicalRoot]
+        )
+
+        let coordinator = AgentMCPStartWorktreeCoordinator(
+            operationName: "agent_run.start",
+            vcsService: .shared,
+            gitTargetResolver: .init(),
+            startupPhaseEventSink: AppWorktreeStartupPhaseEventSink()
+        )
+        let preparedRoot = try await AgentRunHostStartTransaction.prepareWorktree(
+            coordinator.parseRequest(args: [:]),
+            from: admission,
+            host: host,
+            command: command,
+            stopFence: AgentRunStartStopFence(session: session),
+            proposedParentID: sessionID,
+            requireTarget: {}
+        )
+        XCTAssertEqual(preparedRoot, canonicalRoot)
+
+        await retireVisibleHost(host)
+    }
+
+    @MainActor
     func testPrepareVisibleAgentHostBootstrapsBeforeReadingCanonicalWorkspace() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("VisibleHostBootstrap-\(UUID())")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -514,7 +622,9 @@ final class AppDomainRuntimeCompositionTests: XCTestCase {
     }
 
     @MainActor
-    private func makeVisibleHostPreparationFixture() async throws -> VisibleHostPreparationFixture {
+    private func makeVisibleHostPreparationFixture(
+        repoPaths: ((URL) -> [String])? = nil
+    ) async throws -> VisibleHostPreparationFixture {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("VisibleHost-\(UUID())")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let runtime = MCPDomainRuntime(configuration: .init(
@@ -533,7 +643,7 @@ final class AppDomainRuntimeCompositionTests: XCTestCase {
         try Data("synthetic".utf8).write(to: root.appendingPathComponent("note.txt"))
         var workspace = WorkspaceModel(
             name: "Original",
-            repoPaths: [root.path],
+            repoPaths: repoPaths?(root) ?? [root.path],
             customStoragePath: directory.appendingPathComponent("saved", isDirectory: true)
         )
         workspace.composeTabs = [ComposeTabState()]

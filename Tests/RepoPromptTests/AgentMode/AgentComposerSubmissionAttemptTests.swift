@@ -2732,6 +2732,8 @@ final class AgentComposerProjectionEquivalenceTests: XCTestCase {
         XCTAssertNil(vm.refusedWorkspaceActivationOwner)
         XCTAssertNil(vm.makeComposerSubmitTarget(tabID: freshTab.id, session: nil))
         XCTAssertTrue(vm.sessions.isEmpty)
+        XCTAssertNil(vm.ui.composer.props.submitTarget)
+        XCTAssertEqual(vm.ui.composer.props.submitDisabledReason, "Wait for this workspace to finish loading.")
 
         let adoptingPropsFirst = vm.makeComposerProps(tabID: freshTab.id)
         let adoptingPropsSecond = vm.makeComposerProps(tabID: freshTab.id)
@@ -2772,6 +2774,34 @@ final class AgentComposerProjectionEquivalenceTests: XCTestCase {
             AgentModeViewModel.workspaceActivationFailureMessage
         )
         XCTAssertNotEqual(refusedPropsFirst.submitDisabledReason, adoptingPropsFirst.submitDisabledReason)
+
+        // 3. Retry re-entering preparation immediately replaces the stale refusal reason with loading state.
+        let retryEnteredPreparation = expectation(description: "re-entered canonicalWorkspaceHostPreparation on Retry")
+        var releaseRetryPreparation: CheckedContinuation<Void, Never>?
+        vm.canonicalWorkspaceHostPreparation = { _, _, _ in
+            await withCheckedContinuation { continuation in
+                releaseRetryPreparation = continuation
+                retryEnteredPreparation.fulfill()
+            }
+            throw StubPreparationFailure()
+        }
+        defer { releaseRetryPreparation?.resume() }
+
+        let retryOwner = vm.test_receiveWorkspaceSwitchNotification(workspace)
+        let retryTask = Task { @MainActor in
+            await vm.test_handleWorkspaceSwitch(workspace, owner: retryOwner)
+        }
+        await fulfillment(of: [retryEnteredPreparation], timeout: 2)
+
+        XCTAssertTrue(vm.isAwaitingWorkspaceAdoption)
+        XCTAssertNil(vm.refusedWorkspaceActivationOwner)
+        XCTAssertTrue(vm.sessions.isEmpty)
+        XCTAssertNil(vm.ui.composer.props.submitTarget)
+        XCTAssertEqual(vm.ui.composer.props.submitDisabledReason, "Wait for this workspace to finish loading.")
+
+        releaseRetryPreparation?.resume()
+        releaseRetryPreparation = nil
+        await retryTask.value
 
         await vm.test_retireAndCancelFixture()
     }

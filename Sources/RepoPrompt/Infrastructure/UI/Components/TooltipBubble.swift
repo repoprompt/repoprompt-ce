@@ -92,8 +92,7 @@ private struct HoverTooltipModifier: ViewModifier {
         content
             .background(AnchorGeometryView(refreshID: anchorRefreshID, onUpdate: rt.updateAnchor))
             .onHover { inside in
-                guard let tooltipContent else { return }
-                if inside, showTooltips {
+                if inside, showTooltips, let tooltipContent {
                     // Scrolling does not relayout the anchor; force a fresh report.
                     anchorRefreshID &+= 1
                     rt.schedulePresentation(after: showDelay, isEnabled: { showTooltips }) { [weak rt = rt, placement, preset] owner, rect in
