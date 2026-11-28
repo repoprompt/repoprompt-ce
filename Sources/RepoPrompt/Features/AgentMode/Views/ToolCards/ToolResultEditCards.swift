@@ -70,7 +70,7 @@ struct ApplyEditsResultCard: View {
     private func buildPresentation() -> Presentation {
         let dto = ToolJSON.decode(ToolResultDTOs.EditSummary.self, from: item.toolResultJSON)
         let args = ToolJSON.decodeArgs(ToolArgsDTOs.ApplyEditsArgs.self, from: item.toolArgsJSON)
-        let displayDiff = Self.resolvedDisplayDiff(from: dto)
+        let displayDiff = dto?.displayUnifiedDiff
         let status = resolvedStatus(from: dto)
         return Presentation(
             dto: dto,
@@ -82,15 +82,8 @@ struct ApplyEditsResultCard: View {
         )
     }
 
-    private static func resolvedDisplayDiff(from dto: ToolResultDTOs.EditSummary?) -> String? {
-        guard let dto else { return nil }
-        if let diff = dto.cardUnifiedDiff, !diff.isEmpty { return diff }
-        if let diff = dto.unifiedDiff, !diff.isEmpty { return diff }
-        return nil
-    }
-
     private static func hasCompactDisplayDiff(_ dto: ToolResultDTOs.EditSummary?) -> Bool {
-        resolvedDisplayDiff(from: dto)?.isEmpty == false
+        dto?.displayUnifiedDiff != nil
     }
 
     private func buildSummary(dto: ToolResultDTOs.EditSummary?, diff: String?, path: String?) -> String {

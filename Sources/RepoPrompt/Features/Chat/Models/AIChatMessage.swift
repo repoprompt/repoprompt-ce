@@ -21,6 +21,7 @@ struct AIChatMessage: Identifiable, Equatable {
     let sequenceIndex: Int
     private(set) var isFinalized: Bool = false
     private(set) var reasoningContent: String = ""
+    private(set) var reasoningRevisionCount = 0
 
     /// The user's selected file paths at the time this message was created.
     private(set) var allowedFilePaths: [String] = []
@@ -83,7 +84,9 @@ struct AIChatMessage: Identifiable, Equatable {
     }
 
     mutating func updateReasoningContent(_ newReasoning: String) {
+        guard reasoningContent != newReasoning else { return }
         reasoningContent = newReasoning
+        reasoningRevisionCount &+= 1
         revisionCount += 1
     }
 

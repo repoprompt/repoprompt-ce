@@ -188,6 +188,12 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
         else { return }
         let normalized = systemText.lowercased()
         guard normalized.hasPrefix("context compacted") else { return }
+        if session.selectedAgent == .claudeCode {
+            session.claudeCompactBoundaryID = UUID()
+            if let conversation = session.providerSessionID, !conversation.isEmpty {
+                session.claudeWakeCompactionSpentConversation = conversation
+            }
+        }
         session.contextCompactedAt = Date()
         // compact_boundary reports pre_tokens, not the size of the compacted context.
         // Invalidate both ring fallbacks and this turn's pre-boundary observation while

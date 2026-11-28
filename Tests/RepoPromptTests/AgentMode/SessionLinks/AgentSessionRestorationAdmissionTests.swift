@@ -115,6 +115,49 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
         }
     }
 
+    func testSupersededVisitCannotCommitRebindAfterWorktreeRelease() async throws {
+        let fixture = try await makeFixture()
+        let sourceTab = await fixture.vm.createAndActivateSessionTab()
+        let targetTab = await fixture.vm.createAndActivateSessionTab()
+        let source = try XCTUnwrap(fixture.vm.sessions[XCTUnwrap(sourceTab)])
+        let target = try XCTUnwrap(fixture.vm.sessions[XCTUnwrap(targetTab)])
+        let sourceBinding = try XCTUnwrap(source.persistentSessionBindingIdentity)
+        let targetBinding = try XCTUnwrap(target.persistentSessionBindingIdentity)
+        let registry = WindowStatesManager.makeForTesting(windowSessionFileURL: fixture.root.appendingPathComponent("windows.json"))
+        fixture.vm.preparedSessionRuntimes = registry
+        let intent = try XCTUnwrap(registry.beginRuntimeVisitIntent(sourceBinding.sessionID))
+        let gate = TestReleaseFence(name: "rebind worktree release")
+        fixture.vm.test_afterRebindWorktreeRelease = { await gate.enterAndWait() }
+        let rebind = Task { @MainActor in
+            try await fixture.vm.test_rebindPersistentSession(sourceBinding.sessionID, to: target, visitIntent: intent)
+        }
+        defer {
+            gate.release()
+            fixture.vm.test_afterRebindWorktreeRelease = nil
+        }
+        guard await gate.waitUntilEntered() else { return XCTFail("Rebind never reached the worktree release barrier") }
+        XCTAssertEqual(source.persistentSessionBindingIdentity, sourceBinding)
+        XCTAssertEqual(target.persistentSessionBindingIdentity, targetBinding)
+
+        let newerIntent = try XCTUnwrap(registry.beginRuntimeVisitIntent(sourceBinding.sessionID))
+        XCTAssertNotEqual(newerIntent, intent)
+        gate.release()
+        do {
+            _ = try await rebind.value
+            XCTFail("A superseded visit must leave both bindings intact")
+        } catch {
+            XCTAssertEqual(error as? AgentModeViewModel.PersistentBindingMutationError, .staleTransition)
+        }
+        XCTAssertEqual(source.persistentSessionBindingIdentity, sourceBinding)
+        XCTAssertEqual(target.persistentSessionBindingIdentity, targetBinding)
+        XCTAssertEqual(fixture.manager.activeAgentSessionID(forTabID: source.tabID), sourceBinding.sessionID)
+        XCTAssertEqual(fixture.manager.activeAgentSessionID(forTabID: target.tabID), targetBinding.sessionID)
+        XCTAssertTrue(source.qualifiedRestorationReadiness.isAuthoritative)
+        XCTAssertFalse(source.bindingTransitionInProgress)
+        XCTAssertFalse(target.bindingTransitionInProgress)
+        XCTAssertTrue(fixture.providerRequests.events.isEmpty)
+    }
+
     func testHydrationReadCannotSettleAReacquiredSameObjectWriter() async throws {
         for outcome in ["payload", "missing", "error", "revision"] {
             let fixture = try await makeFixture()

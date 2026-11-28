@@ -178,10 +178,10 @@ final class DelegationScopeRuntime: ObservableObject {
     private struct DecisionDelivery {
         let tabID: UUID
         let stopFence: AgentRunStartStopFence
-        var messages: [String]
+        var messages: [AgentDelegationDecisionBatch.Decision]
         var observation: AnyCancellable?
         var isDelivering = false
-        var pendingStart: (text: String, delivery: AgentSessionLinkSendDelivery)?
+        var pendingStart: (batch: AgentDelegationDecisionBatch, delivery: AgentSessionLinkSendDelivery)?
         var retryScheduled = false
         var startRetryAttempts = 0
     }
@@ -807,6 +807,20 @@ final class DelegationScopeRuntime: ObservableObject {
         return .success(request)
     }
 
+    /// Read an existing exact outcome before asking the target whether it can admit *new* work.
+    /// This neither allocates a request nor treats revocation as permission to replay an effect.
+    func retainedOverseeInitialOutcome(
+        requesterSessionID: UUID, targetSessionID: UUID, reason: String, idempotencyKey: String
+    ) -> Result<Value, DelegationScopeRequestError>? {
+        guard availability != .terminating,
+              let requestID = requestIDByKey["\(requesterSessionID.uuidString)|\(idempotencyKey)"],
+              let request = requests[requestID], let outcome = overseeInitialOutcomes[requestID] else { return nil }
+        return request.matches(
+            kind: .session(targetSessionID: targetSessionID), capabilities: [.observe, .control, .restructure],
+            guardrails: .init(), expiresInSeconds: nil, reason: reason
+        ) ? .success(outcome) : .failure(.idempotencyConflict)
+    }
+
     func beginOverseeInitialOutcome(requestID: UUID) {
         guard requests[requestID]?.state == .pending else { return }
         overseeInitialRequests.insert(requestID)
@@ -923,7 +937,7 @@ final class DelegationScopeRuntime: ObservableObject {
 
     func notifyOverseeContinuation(
         sessionID: UUID, tabID: UUID, requestID: UUID, result: String, continuing: Bool = false,
-        deliveredNothing: Bool = false
+        deliveredNothing: Bool = false, outcome: String? = nil, targetSessionID: UUID? = nil
     ) {
         // A task that delivered nothing (refused or failed before any effect) must not absorb a
         // corrected retry as though it were a recently completed assignment. Decided from the
@@ -931,7 +945,10 @@ final class DelegationScopeRuntime: ObservableObject {
         if deliveredNothing {
             overseeContinuationTasks.removeValue(forKey: requestID)
         }
-        enqueueDecision(sessionID: sessionID, tabID: tabID, result: result, identifier: requestID, automaticContinuation: continuing)
+        enqueueDecision(
+            sessionID: sessionID, tabID: tabID, result: result, identifier: requestID,
+            automaticContinuation: continuing, outcome: outcome, targetSessionID: targetSessionID
+        )
     }
 
     /// Approves a just-recorded pending request from the user's standing consent: "Grant all for
@@ -1006,7 +1023,8 @@ final class DelegationScopeRuntime: ObservableObject {
             tabID: request.requesterTabID,
             result: "granted",
             identifier: record.id,
-            automaticContinuation: continuation != nil
+            automaticContinuation: continuation != nil,
+            targetSessionID: record.grant.kind.exactNoticeTargetSessionID
         )
     }
 
@@ -1108,7 +1126,8 @@ final class DelegationScopeRuntime: ObservableObject {
                 sessionID: request.requesterSessionID,
                 tabID: request.requesterTabID,
                 result: "denied",
-                identifier: request.id
+                identifier: request.id,
+                targetSessionID: request.kind.exactNoticeTargetSessionID
             )
         }
         return result
@@ -1124,7 +1143,8 @@ final class DelegationScopeRuntime: ObservableObject {
             sessionID: request.requesterSessionID,
             tabID: request.requesterTabID,
             result: "denied",
-            identifier: request.id
+            identifier: request.id,
+            targetSessionID: request.kind.exactNoticeTargetSessionID
         )
     }
 
@@ -1237,7 +1257,13 @@ final class DelegationScopeRuntime: ObservableObject {
         }
         didChange(grantees: Set(expired.map(\.grant.granteeSessionID)), invalidated: expired.map(\.id))
         for notice in notices {
-            enqueueDecision(sessionID: notice.record.grant.granteeSessionID, tabID: notice.tabID, result: "expired", identifier: notice.record.id)
+            enqueueDecision(
+                sessionID: notice.record.grant.granteeSessionID,
+                tabID: notice.tabID,
+                result: "expired",
+                identifier: notice.record.id,
+                targetSessionID: notice.record.grant.kind.exactNoticeTargetSessionID
+            )
         }
     }
 
@@ -1293,14 +1319,18 @@ final class DelegationScopeRuntime: ObservableObject {
                 sessionID: record.grant.granteeSessionID,
                 tabID: tabID,
                 result: "revoked",
-                identifier: record.id
+                identifier: record.id,
+                targetSessionID: record.grant.kind.exactNoticeTargetSessionID
             )
         }
     }
 
     /// This is an app-owned decision notification, not target attention or an oversight grant.
     /// It never traverses the passive reducer, changes wake policy, or interrupts a running turn.
-    private func enqueueDecision(sessionID: UUID, tabID: UUID?, result: String, identifier: UUID, automaticContinuation: Bool = false) {
+    private func enqueueDecision(
+        sessionID: UUID, tabID: UUID?, result: String, identifier: UUID, automaticContinuation: Bool = false,
+        outcome: String? = nil, targetSessionID: UUID? = nil
+    ) {
         if result == "granted", !announcedGrantDecisions.insert(identifier).inserted { return }
         let guidance = automaticContinuation
             ? "The app is automatically continuing the approved exact-target oversight request. Do not duplicate its link/message or ask the user for a filler turn; its result will resume you."
@@ -1339,7 +1369,7 @@ final class DelegationScopeRuntime: ObservableObject {
                 }
             decisions[sessionID] = DecisionDelivery(tabID: tabID, stopFence: AgentRunStartStopFence(session: session), messages: [], observation: observation)
         }
-        decisions[sessionID]?.messages.append(text)
+        decisions[sessionID]?.messages.append(.init(outcome: outcome ?? result, targetSessionID: targetSessionID, text: text))
         // Approval must finish its authority mutation before a provider can observe the result.
         Task { @MainActor [weak self] in self?.drainDecisions(sessionID: sessionID) }
     }
@@ -1363,10 +1393,10 @@ final class DelegationScopeRuntime: ObservableObject {
         }
         if pending.pendingStart == nil { decisions[sessionID]?.messages = [] }
         decisions[sessionID]?.isDelivering = true
-        let text = pending.pendingStart?.text ?? pending.messages.joined(separator: "\n")
+        let batch = pending.pendingStart?.batch ?? AgentDelegationDecisionBatch(decisions: pending.messages)
         Task { @MainActor [weak self] in
             let outcome = await presentation.window.agentModeViewModel.submitDelegationDecision(
-                text, tabID: pending.tabID, expectedSessionID: sessionID,
+                batch, tabID: pending.tabID, expectedSessionID: sessionID,
                 stopFence: pending.stopFence, resuming: pending.pendingStart?.delivery
             )
             guard let self, var current = decisions[sessionID], current.stopFence == pending.stopFence else { return }
@@ -1380,7 +1410,7 @@ final class DelegationScopeRuntime: ObservableObject {
                 current.startRetryAttempts = 0
             case .retry:
                 if pending.pendingStart == nil { current.messages = pending.messages + current.messages }
-            case let .persisted(delivery): current.pendingStart = (text, delivery)
+            case let .persisted(delivery): current.pendingStart = (batch, delivery)
             }
             if current.messages.isEmpty, current.pendingStart == nil {
                 decisions.removeValue(forKey: sessionID)
@@ -1527,5 +1557,12 @@ final class DelegationScopeRuntime: ObservableObject {
                 if requestIDByKey[scopedKey] == id { requestIDByKey.removeValue(forKey: scopedKey) }
             }
         }
+    }
+}
+
+private extension DomainDelegationScopeKind {
+    var exactNoticeTargetSessionID: UUID? {
+        guard case let .session(targetSessionID) = self else { return nil }
+        return targetSessionID
     }
 }

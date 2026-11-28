@@ -545,12 +545,6 @@ final class AgentSessionStreamRuntime {
                 // System messages - skip lifecycle messages that don't need UI display.
                 // Preserve Claude reasoning previews until the next reasoning or assistant message.
                 if let text = result.text, !text.isEmpty {
-                    if session.selectedAgent == .antigravity,
-                       text.trimmingCharacters(in: .whitespacesAndNewlines)
-                       .range(of: #"^I\d{4}\s+\d+\s"#, options: .regularExpression) != nil
-                    {
-                        break
-                    }
                     usage.nonCodexContextUsageEstimator(for: session.selectedAgent)?.ingestSystemSignal(text, session: session)
                     flushPendingAssistantDelta(session)
                     endActiveAssistantSegment(session)

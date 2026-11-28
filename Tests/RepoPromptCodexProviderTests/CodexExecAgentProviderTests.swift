@@ -145,7 +145,7 @@ final class CodexExecAgentProviderTests: XCTestCase {
 
     func testEntryCapturePrecedesCacheSuspensionAndPolicyReadsFollowIt() async throws {
         let executable = try script("printf '%s\\n' '{\"type\":\"turn.completed\"}'\n")
-        let gate = ExecCacheGate()
+        let gate = ExecFixtureGate()
         let reached = expectation(description: "broken cache awaited")
         let host = ExecHost(executable: executable, cacheGate: gate, cacheReached: reached)
         let provider = makeProvider(host)
@@ -176,14 +176,37 @@ final class CodexExecAgentProviderTests: XCTestCase {
           *) printf '%s\\n' '{"type":"turn.completed"}'; exit 0 ;;
         esac
         """)
-        let host = ExecHost(executable: executable)
-        let results = try await run(makeProvider(host))
+        let thirdClearGate = ExecFixtureGate()
+        let thirdClearReached = expectation(description: "third physical PID clear reached")
+        let cleared = expectation(description: "all physical PIDs cleared")
+        cleared.expectedFulfillmentCount = 3
+        cleared.assertForOverFulfill = true
+        let host = ExecHost(executable: executable, cleared: cleared) {
+            thirdClearReached.fulfill()
+            await thirdClearGate.wait()
+        }
+        let provider = makeProvider(host)
+        addTeardownBlock {
+            await thirdClearGate.release()
+            await provider.dispose()
+        }
+
+        let results = try await run(provider, releasing: thirdClearGate)
+        await fulfillment(of: [thirdClearReached], timeout: 10)
+        // The stream has ended while physical cleanup is still in the third callback.
+        XCTAssertEqual(host.events.count(where: { $0 == "pid-clear" }), 2)
+        await thirdClearGate.release()
+        await fulfillment(of: [cleared], timeout: 10)
+
         XCTAssertEqual(try String(contentsOfFile: count, encoding: .utf8), "3")
         XCTAssertEqual(results.count(where: { $0.type == "message_stop" }), 1)
         XCTAssertEqual(results.count(where: { $0.text?.contains("Retrying with fallback") == true }), 1)
         XCTAssertEqual(host.events.count(where: { $0 == "preflight" }), 3)
         XCTAssertEqual(host.events.count(where: { $0 == "tracking-stop" }), 3)
-        XCTAssertEqual(host.events.count(where: { $0 == "pid-clear" }), 3)
+        XCTAssertEqual(host.events.filter { $0 == "pid-start" || $0 == "pid-clear" }, [
+            "pid-start", "pid-clear", "pid-start", "pid-clear", "pid-start", "pid-clear"
+        ])
+        XCTAssertEqual(host.clearedPIDs, host.startedPIDs)
         XCTAssertEqual(host.events.filter { $0.hasPrefix("model:") }, ["model:requested", "model:fallback", "model:fallback"])
         XCTAssertEqual(host.events.filter { $0.hasPrefix("server-policy:") }, ["server-policy:", "server-policy:", "server-policy:broken"])
         XCTAssertEqual(host.events.count(where: { $0 == "cache-add:broken" }), 1)
@@ -270,18 +293,11 @@ final class CodexExecAgentProviderTests: XCTestCase {
         CodexExecAgentProvider(config: .init(commandName: host.runtime.executableURL.path, additionalPathHints: [], modelString: "requested", enableDebugLogging: false, fullAccess: false), host: host)
     }
 
-    private func run(_ provider: CodexExecAgentProvider, releasing gate: ExecCacheGate? = nil, releasingFIFO fifo: URL? = nil) async throws -> [AIStreamResult] {
-        // Match existing subprocess-test watchdogs: success is event-driven; expiry is a failure.
-        let watchdog = Task {
-            do { try await Task.sleep(for: .seconds(10)) } catch { return false }
-            XCTFail("Codex Exec fixture exceeded its bounded deadline")
-            await gate?.release()
-            if let fifo { self.releaseFixtureFIFO(fifo) }
-            await provider.dispose()
-            return true
-        }
-        do {
-            let results = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
+    private func run(_ provider: CodexExecAgentProvider, releasing gate: ExecFixtureGate? = nil, releasingFIFO fifo: URL? = nil) async throws -> [AIStreamResult] {
+        let finished = XCTestExpectation(description: "Codex Exec fixture stream finished")
+        let consumer = Task {
+            defer { finished.fulfill() }
+            return try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
                 let stream = try await provider.streamAgentMessage(AgentMessage(systemPrompt: "system", userMessage: "user"), runID: UUID())
                 var results: [AIStreamResult] = []
                 for try await result in stream {
@@ -289,14 +305,17 @@ final class CodexExecAgentProviderTests: XCTestCase {
                 }
                 return results
             }
-            watchdog.cancel()
-            if await watchdog.value { throw ExecFixtureFailure.deadline }
-            return results
-        } catch {
-            watchdog.cancel()
-            if await watchdog.value { throw ExecFixtureFailure.deadline }
-            throw error
         }
+
+        guard await XCTWaiter.fulfillment(of: [finished], timeout: 10) == .completed else {
+            XCTFail("Codex Exec fixture exceeded its bounded deadline")
+            consumer.cancel()
+            await gate?.release()
+            if let fifo { releaseFixtureFIFO(fifo) }
+            await provider.dispose()
+            throw ExecFixtureFailure.deadline
+        }
+        return try await consumer.value
     }
 
     private func releaseFixtureFIFO(_ fifo: URL) {
@@ -349,11 +368,15 @@ private final class ExecHost: CodexExecAgentHost, CodexExecToolTracking {
     private let started: XCTestExpectation?
     private let stopped: XCTestExpectation?
     private let cleared: XCTestExpectation?
-    private let cacheGate: ExecCacheGate?
+    private let cacheGate: ExecFixtureGate?
     private let cacheReached: XCTestExpectation?
+    private let beforeThirdClear: (@Sendable () async -> Void)?
+    private var clearInvocations = 0
+    private var registeredPIDs: [Int32] = []
+    private var finalizedPIDs: [Int32] = []
     let runtime: CodexProviderRuntime.Runtime
 
-    init(executable: URL = URL(fileURLWithPath: "/fixture/codex"), available: Bool = true, running: Bool = true, ensureSuccess: Bool = true, started: XCTestExpectation? = nil, stopped: XCTestExpectation? = nil, cleared: XCTestExpectation? = nil, cacheGate: ExecCacheGate? = nil, cacheReached: XCTestExpectation? = nil) {
+    init(executable: URL = URL(fileURLWithPath: "/fixture/codex"), available: Bool = true, running: Bool = true, ensureSuccess: Bool = true, started: XCTestExpectation? = nil, stopped: XCTestExpectation? = nil, cleared: XCTestExpectation? = nil, cacheGate: ExecFixtureGate? = nil, cacheReached: XCTestExpectation? = nil, beforeThirdClear: (@Sendable () async -> Void)? = nil) {
         self.available = available
         self.running = running
         self.ensureSuccess = ensureSuccess
@@ -362,11 +385,20 @@ private final class ExecHost: CodexExecAgentHost, CodexExecToolTracking {
         self.cleared = cleared
         self.cacheGate = cacheGate
         self.cacheReached = cacheReached
+        self.beforeThirdClear = beforeThirdClear
         runtime = .init(executableURL: executable, version: .init(major: 0, minor: 156, patch: 0), source: .externalOverride, statePaths: .init(codexHome: URL(fileURLWithPath: "/fixture/home"), sqliteHome: URL(fileURLWithPath: "/fixture/sqlite")))
     }
 
     var events: [String] {
         lock.withLock { recorded }
+    }
+
+    var startedPIDs: [Int32] {
+        lock.withLock { registeredPIDs }
+    }
+
+    var clearedPIDs: [Int32] {
+        lock.withLock { finalizedPIDs }
     }
 
     private func record(_ event: String) {
@@ -456,12 +488,23 @@ private final class ExecHost: CodexExecAgentHost, CodexExecToolTracking {
     }
 
     func registerExpectedPID(_ pid: Int32, runID: UUID) async {
-        record("pid-start")
+        lock.withLock {
+            registeredPIDs.append(pid)
+            recorded.append("pid-start")
+        }
         started?.fulfill()
     }
 
     func clearExpectedPID(_ pid: Int32, runID: UUID) async {
-        record("pid-clear")
+        let invocation = lock.withLock {
+            clearInvocations += 1
+            return clearInvocations
+        }
+        if invocation == 3 { await beforeThirdClear?() }
+        lock.withLock {
+            finalizedPIDs.append(pid)
+            recorded.append("pid-clear")
+        }
         cleared?.fulfill()
     }
 
@@ -479,7 +522,7 @@ private enum ExecFixtureFailure: Error {
     case deadline
 }
 
-private actor ExecCacheGate {
+private actor ExecFixtureGate {
     private var released = false
     private var continuation: CheckedContinuation<Void, Never>?
 

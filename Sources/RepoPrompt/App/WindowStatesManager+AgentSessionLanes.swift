@@ -291,6 +291,9 @@ extension WindowStatesManager {
     func agentSessionLinkLaneProvenance(
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> UUID? {
+        if let runtime = independentLinkRuntime(for: endpoint) {
+            return runtime.sessions[endpoint.tabID]?.createdByOverseerSessionID
+        }
         guard !isTerminating,
               let window = window(withID: endpoint.windowID),
               !window.isClosing

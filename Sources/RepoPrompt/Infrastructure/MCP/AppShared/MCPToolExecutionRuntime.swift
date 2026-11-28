@@ -61,6 +61,9 @@ final class MCPToolExecutionRuntime {
     @MainActor
     private var activeToolExecutionIDsByConnectionID: [UUID: Set<UUID>] = [:]
 
+    typealias WaitPublication = (snapshot: AgentRunMCPSnapshot, cursor: AgentRunSessionStore.WaitCursor)
+    typealias WaitPublicationSource = @MainActor (UUID) -> WaitPublication?
+
     @MainActor
     private struct AgentRunWaitScope {
         let token: UUID
@@ -69,6 +72,7 @@ final class MCPToolExecutionRuntime {
         let startedAt: Date
         let timeoutSeconds: TimeInterval
         let metadata: MCPRequestMetadata
+        let exactPublication: WaitPublicationSource?
     }
 
     @MainActor
@@ -370,7 +374,16 @@ final class MCPToolExecutionRuntime {
         }
         steeringDebugLog("[AgentRunSteeringWake] parent wake child agent_run waiters source=\(source) parentRunID=\(runID) childSessions=\(sessionIDs.map(\.uuidString).sorted().joined(separator: ",")) active=\(debugActiveTools(for: runID))")
         for sessionID in sessionIDs {
-            guard let publication = publicationForSessionID(sessionID) else {
+            let matchingScopes = agentRunWaitScopesByToken.values.filter {
+                $0.parentRunID == runID && $0.childSessionIDs.contains(sessionID)
+            }
+            // Independent children may live on different routes. Use only their admitted
+            // publication sources. A displaced exact source cannot fall back to a tab lookup.
+            var publications = matchingScopes.compactMap { $0.exactPublication?(sessionID) }
+            if matchingScopes.contains(where: { $0.exactPublication == nil }), let legacy = publicationForSessionID(sessionID) {
+                publications.append(legacy)
+            }
+            guard !publications.isEmpty else {
                 steeringDebugLog("[AgentRunSteeringWake] parent wake skipped missing child snapshot source=\(source) parentRunID=\(runID) childSessionID=\(sessionID)")
                 continue
             }
@@ -379,14 +392,16 @@ final class MCPToolExecutionRuntime {
                     await beforeAgentRunWaiterWakeForTesting(runID, sessionID)
                 }
             #endif
-            let validatedSteeringOriginRunID = steeringOriginRunID()
-            await AgentRunSessionStore.wakeCurrentWaiters(
-                publication.snapshot,
-                cursor: publication.cursor,
-                reason: .steeringRequested,
-                steeringMessage: steeringMessage,
-                steeringOriginRunID: validatedSteeringOriginRunID
-            )
+            var woken: Set<AgentRunSessionStore.WaitCursor> = []
+            for publication in publications where woken.insert(publication.cursor).inserted {
+                await AgentRunSessionStore.wakeCurrentWaiters(
+                    publication.snapshot,
+                    cursor: publication.cursor,
+                    reason: .steeringRequested,
+                    steeringMessage: steeringMessage,
+                    steeringOriginRunID: steeringOriginRunID()
+                )
+            }
         }
         await Task.yield()
         steeringDebugLog("[AgentRunSteeringWake] parent wake yielded source=\(source) parentRunID=\(runID)")
@@ -438,7 +453,8 @@ final class MCPToolExecutionRuntime {
         parentRunID: UUID,
         metadata: MCPRequestMetadata,
         sessionIDs: Set<UUID>,
-        timeoutSeconds: TimeInterval
+        timeoutSeconds: TimeInterval,
+        exactPublication: WaitPublicationSource? = nil
     ) -> AgentRunWaitScopeRegistration {
         let token = UUID()
         // The caller already froze its resolved wait; stale-scope purging must age against that
@@ -449,7 +465,8 @@ final class MCPToolExecutionRuntime {
             childSessionIDs: sessionIDs,
             startedAt: Date(),
             timeoutSeconds: timeoutSeconds,
-            metadata: metadata
+            metadata: metadata,
+            exactPublication: exactPublication
         )
         agentRunWaitScopesByToken[token] = scope
         for sessionID in sessionIDs {

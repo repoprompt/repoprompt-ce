@@ -418,7 +418,7 @@ enum DebugStateBootstrap {
                     let data = try derived(url, kind: baseline ? "agent-session-baseline" : "agent-session-retained") { builder, bytes in
                         guard var session = try JSONSerialization.jsonObject(with: bytes) as? [String: Any] else { throw DebugStateSnapshot.Failure.unsafeFile }
                         if baseline {
-                            for key in ["providerSessionID", "providerCleanupHandle", "codexConversationID", "codexRolloutPath", "codexMcpSessionKey", "delegationScopeID", "lastRunState", "selfCompactState"] {
+                            for key in ["providerSessionID", "providerCleanupHandle", "codexConversationID", "codexRolloutPath", "codexInstructionMode", "codexMcpSessionKey", "delegationScopeID", "lastRunState", "selfCompactState"] {
                                 session.removeValue(forKey: key)
                             }
                             for key in ["autoWakeOnOversightUpdates", "routineWakeIntervalEnabled", "periodicIdleWakeEnabled"] {

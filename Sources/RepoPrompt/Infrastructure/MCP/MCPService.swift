@@ -170,17 +170,27 @@ actor MCPService: Sendable {
 
     /// ──────────────────────────────────────────────
     func start() async throws {
-        try await ensureTransportRunning()
+        try await start(requiring: nil)
     }
 
-    private func ensureTransportRunning() async throws {
-        while let teardown = activeTeardownAttempt {
-            await teardown.task.value
-            if activeTeardownAttempt?.id == teardown.id {
-                activeTeardownAttempt = nil
+    /// An independent route supplies its catalog demand; explicit app startup needs no route.
+    /// A retired route cannot resurrect the listener while waiting for an earlier teardown.
+    func start(requiring demand: (@Sendable () async -> Bool)?) async throws {
+        while true {
+            while let teardown = activeTeardownAttempt {
+                await teardown.task.value
+                if activeTeardownAttempt?.id == teardown.id {
+                    activeTeardownAttempt = nil
+                }
             }
+            try Task.checkCancellation()
+            let generation = lifecycleGeneration
+            if let demand, await !demand() { throw LifecycleError.startSuperseded }
+            try Task.checkCancellation()
+            // A teardown/start can enter during the demand check. Do not admit a new start
+            // until that generation has settled and the live requester has been checked again.
+            if activeTeardownAttempt == nil, generation == lifecycleGeneration { break }
         }
-        try Task.checkCancellation()
         guard !state.isRunning else { return }
 
         let attempt: StartAttempt

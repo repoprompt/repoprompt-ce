@@ -177,6 +177,48 @@ make dev-codex-schema-check                         # unlaned generated-schema c
 
 Lane detail: the mutating `format` daemon job also claims `build` (it rewrites files the compiler reads); non-mutating `format-check` and `lint` use only `style`; read-only `format-tools-status` is intentionally unlaned so it never queues behind a build.
 
+Conductor retains terminal job artifacts for up to 24 hours, with a target of
+200 terminal jobs per daemon after a one-hour grace period. Queued, running,
+and actively awaited jobs are not subject to these limits. Each new job log
+is capped at 16 MiB; when full it keeps the first 4 MiB and recent output, with
+an omission marker. The normal job result and timing receipt remain separate.
+
+An updated daemon checks storage at startup and roughly hourly, including when
+idle. `./conductor status` shows what it reclaimed. `./conductor storage report`
+is a read-only JSON estimate: it does not start or contact a daemon and does not
+purge the real store. It counts only files it can prove safe offline, not all
+bytes in the directory. Disk estimates are not guarantees of freed APFS blocks.
+State folders are keyed by resolved checkout path, not by job. An idle sibling
+bucket must pass its startup-lock and daemon-evidence checks before cleanup.
+Legacy buckets without checkout provenance, and buckets for still-existing
+checkouts, are eligible only for exact, expired artifacts with a matching terminal
+receipt. Missing checkouts with recorded provenance can also lose old incomplete
+logs after a clean stop. Evidence of a running daemon, a crash with stale process
+markers, unsafe paths, and unknown files is left alone. Tiny lock inodes and
+checkout records remain so older clients cannot acquire a different lock inode.
+A state-directory override opts out of sibling discovery. Socket overrides do
+not determine the storage path or bypass the daemon-evidence checks.
+
+The selected BuildCache store expires known seeds unused for 14 days and targets
+4 GiB across legacy and current entries. Set
+`REPOPROMPT_DEV_BUILD_CACHE_LIMIT_BYTES` in the daemon's startup environment;
+use the same setting for daemons sharing a cache. Active key holders defer
+eviction; unknown data is not counted as garbage. A queued build does not reserve
+a seed: it may take a cold build if the seed expires before it starts. The sweep
+removes known legacy seeds, seeds for missing checkouts, and seeds whose recorded
+source commit is missing locally or more than 100 commits behind the checkout's
+HEAD. An inconclusive Git probe does not establish obsolescence. Under budget
+pressure, prefer the newest seed per active checkout, then keep recently used
+seeds within the remaining budget. Seeds larger than the budget are not published.
+New seeds live
+under `checkout-v2/` (including in custom stores) so older sweepers cannot remove
+them; their keys include the resolved checkout path, since SwiftPM products can
+contain absolute paths. The eviction rename prevents even an interrupted sweep
+from exposing a partial seed. Cache locks and generation metadata are kept;
+repo `.build` directories, the debug app, and worktrees are not retention targets.
+An existing compatible daemon can keep serving old and new clients; the new
+policy takes effect when a daemon running the updated script starts normally.
+
 Daemon lanes coordinate daemon-submitted operations only; they do not freeze source files against editor changes, direct commands, or edits from another agent. Avoid starting a coordinated build or relaunch while another actor is editing the same checkout. If compilation fails because an input file was modified during the build, wait for edits/builds to settle before retrying; for stable compiler errors, fix them and retry. A compile/rebuild failure is not lifecycle supersession.
 
 Async/reconnectable jobs (so work survives reconnects and is shareable by key):

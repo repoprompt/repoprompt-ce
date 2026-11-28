@@ -446,6 +446,7 @@ extension AgentModeViewModel {
         let cleanup: ProviderConversationCleanupHandle?
         let codexID: String?
         let rollout: String?
+        let codexInstructionMode: CodexThreadInstructionMode?
         let codexModel: String?
         let codexEffort: String?
         let computerUseActivation: CodexComputerUseActivation?
@@ -463,6 +464,7 @@ extension AgentModeViewModel {
             cleanup = session.providerCleanupHandle
             codexID = session.codexConversationID
             rollout = session.codexRolloutPath
+            codexInstructionMode = session.codexInstructionMode
             codexModel = session.codexModel
             codexEffort = session.codexReasoningEffort
             computerUseActivation = session.pendingCodexComputerUseActivation
@@ -480,6 +482,7 @@ extension AgentModeViewModel {
             session.providerCleanupHandle = cleanup
             session.codexConversationID = codexID
             session.codexRolloutPath = rollout
+            session.codexInstructionMode = codexInstructionMode
             session.codexModel = codexModel
             session.codexReasoningEffort = codexEffort
             session.pendingCodexComputerUseActivation = computerUseActivation

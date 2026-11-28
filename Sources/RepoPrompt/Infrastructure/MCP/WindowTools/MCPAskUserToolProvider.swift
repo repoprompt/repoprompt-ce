@@ -508,7 +508,7 @@ final class MCPAskUserToolProvider: MCPAppToolProviding {
         return bool
     }
 
-    private static func askUserResponseValue(_ response: AgentAskUserResponse, includeLegacyResponse: Bool) -> Value {
+    static func askUserResponseValue(_ response: AgentAskUserResponse, includeLegacyResponse: Bool) -> Value {
         var object: [String: Value] = [
             "answers": .object(response.answersByQuestionID.reduce(into: [String: Value]()) { partialResult, entry in
                 partialResult[entry.key] = askUserAnswerValue(entry.value)

@@ -141,6 +141,15 @@ actor AgentSessionDataService {
         }
     }
 
+    /// Unknown or malformed modes decode as nil so one bad value cannot fail the header.
+    private struct LenientCodexInstructionMode: Decodable {
+        let value: CodexThreadInstructionMode?
+
+        init(from decoder: Decoder) throws {
+            value = (try? String(from: decoder)).flatMap(CodexThreadInstructionMode.init(rawValue:))
+        }
+    }
+
     private struct AgentSessionHeader: Decodable {
         let id: UUID
         let serializationVersion: Int?
@@ -156,6 +165,9 @@ actor AgentSessionDataService {
         let agentReasoningEffort: String?
         let acpModelParameterSelections: [ACPModelParameterSelection]?
         let lastRunState: String?
+        let originWorkflowID: String?
+        let originWorkflowDisplayName: String?
+        let lastRunStartedAt: Date?
         let providerSessionID: String?
         let providerCleanupHandle: ProviderConversationCleanupHandle?
         let autoEditEnabled: Bool
@@ -169,6 +181,7 @@ actor AgentSessionDataService {
         let periodicIdleWakeIntervalSeconds: Int?
         let codexConversationID: String?
         let codexRolloutPath: String?
+        let codexInstructionMode: LenientCodexInstructionMode?
         let codexModel: String?
         let codexReasoningEffort: String?
         let codexContextWindow: Int?
@@ -177,6 +190,7 @@ actor AgentSessionDataService {
         let codexMcpSessionKey: String?
         /// Decoded leniently: one malformed capacity must not fail the header of an otherwise valid file.
         let contextWindowCapacity: LenientContextWindowCapacity?
+        let claudeWakeCompactionSpentConversation: String?
         let parentSessionID: UUID?
         let createdByOverseerSessionID: UUID?
         let organizationalParentID: UUID?
@@ -185,6 +199,7 @@ actor AgentSessionDataService {
         let worktreeMergeOperations: [AgentSessionWorktreeMergeOperation]?
         let pendingHandoffProviderSwitchDelivery: AgentProviderSwitchDelivery?
         let pendingHandoffPayload: String?
+        let pendingHandoffAwaitsLocalClaudeOverflowInput: Bool?
         let pendingHandoffCreatedAt: Date?
         let pendingHandoffSourceItemID: UUID?
         let pendingHandoffDefersProviderLockUntilSend: Bool?
@@ -1146,16 +1161,25 @@ actor AgentSessionDataService {
 
     private func metadataRecords(
         for workspace: WorkspaceModel,
-        limit: Int? = nil
+        limit: Int? = nil,
+        verifyInventory: Bool = false
     ) async throws -> [AgentSessionMetadataRecord] {
-        let index = try await metadataIndex(for: workspace, mode: .backfillIfMissing)
+        var index = try await metadataIndex(for: workspace, mode: .backfillIfMissing)
+        if verifyInventory, let current = index, let folder = try existingAgentSessionsFolder(for: workspace),
+           try metadataIndexNeedsFilenameReconciliation(current, folder: folder)
+        {
+            index = try await reconcileMetadataIndex(folder: folder)
+        }
         let records = index?.entries.sortedForAgentSessionMetadataIndex() ?? []
         guard let limit else { return records }
         return Array(records.prefix(max(limit, 0)))
     }
 
-    func indexedAgentSessionMetadataRecords(for workspace: WorkspaceModel) async throws -> [AgentSessionMetadataRecord] {
-        try await metadataRecords(for: workspace)
+    func indexedAgentSessionMetadataRecords(
+        for workspace: WorkspaceModel,
+        verifyInventory: Bool = false
+    ) async throws -> [AgentSessionMetadataRecord] {
+        try await metadataRecords(for: workspace, verifyInventory: verifyInventory)
     }
 
     func sidebarStreamMetadataRecords(for workspace: WorkspaceModel) async throws -> [AgentSessionMetadataRecord] {
@@ -1495,6 +1519,9 @@ actor AgentSessionDataService {
                 agentReasoningEffort: header.agentReasoningEffort,
                 acpModelParameterSelections: header.acpModelParameterSelections ?? [],
                 lastRunState: AgentSessionRestoreSupport.coldRestoredLastRunStateRaw(header.lastRunState),
+                originWorkflowID: header.originWorkflowID,
+                originWorkflowDisplayName: header.originWorkflowDisplayName,
+                lastRunStartedAt: header.lastRunStartedAt,
                 providerSessionID: header.providerSessionID,
                 providerCleanupHandle: header.providerCleanupHandle,
                 autoEditEnabled: header.autoEditEnabled,
@@ -1506,6 +1533,7 @@ actor AgentSessionDataService {
                 periodicIdleWakeIntervalSeconds: header.periodicIdleWakeIntervalSeconds ?? AgentSessionLinkPeriodicWakeInterval.defaultSeconds,
                 codexConversationID: header.codexConversationID,
                 codexRolloutPath: header.codexRolloutPath,
+                codexInstructionMode: header.codexInstructionMode?.value,
                 codexModel: header.codexModel,
                 codexReasoningEffort: header.codexReasoningEffort,
                 codexContextWindow: header.codexContextWindow,
@@ -1513,12 +1541,14 @@ actor AgentSessionDataService {
                 codexTotalTotalTokens: header.codexTotalTotalTokens,
                 codexMcpSessionKey: header.codexMcpSessionKey,
                 contextWindowCapacity: header.contextWindowCapacity?.value,
+                claudeWakeCompactionSpentConversation: header.claudeWakeCompactionSpentConversation,
                 parentSessionID: header.parentSessionID,
                 createdByOverseerSessionID: header.createdByOverseerSessionID,
                 organizationalParentID: header.organizationalParentID,
                 delegationScopeID: header.delegationScopeID,
                 pendingHandoffProviderSwitchDelivery: header.pendingHandoffProviderSwitchDelivery,
                 pendingHandoffPayload: header.pendingHandoffPayload,
+                pendingHandoffAwaitsLocalClaudeOverflowInput: header.pendingHandoffAwaitsLocalClaudeOverflowInput,
                 pendingHandoffCreatedAt: header.pendingHandoffCreatedAt,
                 pendingHandoffSourceItemID: header.pendingHandoffSourceItemID,
                 pendingHandoffDefersProviderLockUntilSend: header.pendingHandoffDefersProviderLockUntilSend ?? false,

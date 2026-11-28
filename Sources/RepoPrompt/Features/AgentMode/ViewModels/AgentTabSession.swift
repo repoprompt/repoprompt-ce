@@ -212,9 +212,13 @@ final class AgentTabSession: ObservableObject {
     }
 
     var transcript: AgentTranscript = .empty {
-        didSet { localInputCanonicalCommitPending = true }
+        didSet {
+            localInputCanonicalCommitPending = true
+            remoteTranscriptMutationRevision &+= 1
+        }
     }
 
+    private(set) var remoteTranscriptMutationRevision: UInt64 = 0
     var baseTranscriptProjection: AgentTranscriptProjection = .empty
     var fullTranscriptProjection: AgentTranscriptProjection = .empty
     var workingTranscriptProjection: AgentTranscriptProjection = .empty
@@ -365,6 +369,39 @@ final class AgentTabSession: ObservableObject {
     }
 
     var activeAgentRunStartedAt: Date?
+    /// Durable identity of the workflow applied to the first accepted run.
+    var originWorkflowID: String?
+    var originWorkflowDisplayName: String?
+    /// Durable start time of the most recently accepted run. Do not derive
+    /// this from `activeAgentRunStartedAt`, which is cleared at run end.
+    var lastRunStartedAt: Date?
+
+    @discardableResult
+    func recordRunMetadataIfAccepted(
+        wasActiveBeforeStart: Bool,
+        dispatchAccepted: Bool,
+        workflow: AgentWorkflowDefinition?,
+        startedAt: Date
+    ) -> Bool {
+        guard !wasActiveBeforeStart, dispatchAccepted else { return false }
+        return recordAcceptedRunMetadata(workflow: workflow, startedAt: startedAt)
+    }
+
+    @discardableResult
+    func recordAcceptedRunMetadata(
+        workflow: AgentWorkflowDefinition?,
+        startedAt: Date = Date()
+    ) -> Bool {
+        let previous = (originWorkflowID, originWorkflowDisplayName, lastRunStartedAt)
+        if lastRunStartedAt == nil, let workflow {
+            originWorkflowID = workflow.id
+            originWorkflowDisplayName = workflow.displayName
+        }
+        lastRunStartedAt = startedAt
+        return previous.0 != originWorkflowID
+            || previous.1 != originWorkflowDisplayName
+            || previous.2 != lastRunStartedAt
+    }
 
     /// Last Auto Effort service choice submitted for this tab, plus a transient in-flight indication.
     /// Neither changes the user's manual model/effort selection or persisted session state.
@@ -960,6 +997,7 @@ final class AgentTabSession: ObservableObject {
     /// below (`installRunID`, `clearRunID(ifCurrent:)`) or the
     /// host-authoritative `AgentModeProcessRunIdentity.clearProcessRunID(for:)`.
     let runLifecycle = AgentRunAttemptLifecycle()
+    var linkStartedAttempt: AgentSessionLinkExecutionRuntime.LinkStartedAttempt?
 
     var runID: UUID? {
         runLifecycle.currentRunID
@@ -1160,7 +1198,46 @@ final class AgentTabSession: ObservableObject {
     }
 
     /// Provider session ID for resumption (e.g., Claude CLI session_id)
-    var providerSessionID: String?
+    var providerSessionID: String? {
+        didSet {
+            if providerSessionID != oldValue, selectedAgent == .claudeCode {
+                invalidateClaudeWakeUsage(includingWindow: true)
+            }
+        }
+    }
+
+    /// The conversation whose current high-pressure episode already received maintenance.
+    /// Retired only by measured headroom or replaced by evidence for another conversation.
+    var claudeWakeCompactionSpentConversation: String? {
+        didSet {
+            if claudeWakeCompactionSpentConversation != oldValue { isDirty = true }
+        }
+    }
+
+    /// Only an actual provider compact boundary advances this (not a `compacting` status).
+    var claudeCompactBoundaryID: UUID?
+
+    /// A successful compact must not start a compact/wake loop if the conversation refills.
+    var claudeOverflowRecoveryAttemptedConversation: String?
+
+    var activeClaudeContextAutoWakeHold: ClaudeContextAutoWakeHold? {
+        guard let hold = oversight.claudeContextAutoWakeHold,
+              hold.blocks(provider: selectedAgent, conversationID: providerSessionID) else { return nil }
+        return hold
+    }
+
+    var claudeContextBlocksAutoWake: Bool {
+        activeClaudeContextAutoWakeHold != nil || pendingHandoff.awaitsLocalClaudeOverflowInput
+    }
+
+    /// Recovery may release only the hold it actually repaired.
+    @discardableResult
+    func clearClaudeContextAutoWakeHold(matching hold: ClaudeContextAutoWakeHold) -> Bool {
+        guard oversight.claudeContextAutoWakeHold == hold else { return false }
+        oversight.claudeContextAutoWakeHold = nil
+        noteMonitorObservationInputsChanged()
+        return true
+    }
 
     var providerCleanupHandle: ProviderConversationCleanupHandle?
     var providerTokenUsageByTurn: [AgentTokenUsagePersist] = []
@@ -1185,6 +1262,7 @@ final class AgentTabSession: ObservableObject {
     var activeNonCodexTurnTokenAccumulator: AgentModeViewModel.NonCodexTurnTokenAccumulator?
 
     func beginProviderInitiatedTurnAccounting() {
+        invalidateClaudeWakeUsage()
         activeNonCodexTurnTokenAccumulator = .init()
     }
 
@@ -1348,6 +1426,16 @@ final class AgentTabSession: ObservableObject {
         }
     }
 
+    /// The last occupancy describes the last input, never an unmeasured successor. A new
+    /// controller or conversation must also re-vouch for the effective window.
+    func invalidateClaudeWakeUsage(includingWindow: Bool = false) {
+        guard selectedAgent == .claudeCode else { return }
+        batchingContextVouchSignals {
+            vouchedContextCount = nil
+            if includingWindow { vouchedContextWindow = nil }
+        }
+    }
+
     /// Withdraws the count vouch (the stored figure stays in the ring) and re-evaluates the window
     /// vouch against `modelContextWindow`, republishing at most once for both.
     func withdrawContextCountVouch(notingWindow modelContextWindow: Int?) {
@@ -1379,7 +1467,7 @@ final class AgentTabSession: ObservableObject {
 
     /// Bumped by every write to `vouchedContextCount`, including a withdrawal that leaves it `nil`, so
     /// a restore can prove no report touched the count since it was withdrawn.
-    private var contextCountVouchRevision: UInt64 = 0
+    private(set) var contextCountVouchRevision: UInt64 = 0
 
     /// A count vouch withdrawn at a compaction dispatch, with the revision the withdrawal produced.
     struct WithdrawnContextCountVouch {
@@ -1552,10 +1640,14 @@ final class AgentTabSession: ObservableObject {
     var codexSessionLinkCatalogRepairCycle: AgentSessionLinkCodexCatalogRepair.Cycle?
     /// Retained across controller replacements, but not persisted across cold restoration.
     var codexContextWindowSelection: CodexContextWindowPreferences.Selection?
+    /// How the current Codex conversation's base instructions were chosen; persisted with the
+    /// conversation identity and nil for conversations saved before it was recorded.
+    var codexInstructionMode: CodexThreadInstructionMode?
 
     func clearCodexConversationIdentity() {
         codexConversationID = nil
         codexContextWindowSelection = nil
+        codexInstructionMode = nil
     }
 
     func codexContextWindowForBinding(current: CodexContextWindowPreferences.Selection) -> CodexContextWindowPreferences.Selection {
@@ -1591,7 +1683,14 @@ final class AgentTabSession: ObservableObject {
         pendingCodexComputerUseActivation != nil
     }
 
-    var claudeController: (any NativeAgentRuntimeControlling)?
+    var claudeController: (any NativeAgentRuntimeControlling)? {
+        didSet {
+            if oldValue.map({ ObjectIdentifier($0 as AnyObject) }) != claudeController.map({ ObjectIdentifier($0 as AnyObject) }) {
+                invalidateClaudeWakeUsage(includingWindow: true)
+            }
+        }
+    }
+
     var acpController: ACPAgentSessionController?
     /// Retained input, not liveness: use only with its exact ownership and restoration binding.
     var acpWorkspaceAdmission: AgentACPWorkspaceAdmission?
