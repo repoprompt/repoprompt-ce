@@ -662,9 +662,12 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         provider.usesDefaultNormalizer = true
         let command = try host.scope.admit(session: session)
         XCTAssertFalse(host.scope.presentation.hasPresenter(for: session))
+        let rowID = UUID()
+        let sourceModel = session.selectedModelRaw
+        let handoffRevision = session.pendingHandoffRevision
         let result = await host.scope.handoff.generateProviderSwitchSummary(
             .init(
-                rowID: UUID(), destination: .codexExec, model: "destination-model",
+                rowID: rowID, destination: .codexExec, model: "destination-model",
                 wordLimit: 100, stopFence: AgentRunStartStopFence(session: session)
             ), command: command
         )
@@ -673,8 +676,11 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         try await routeScriptedHostProvider(session)
         await producer.value
         guard case let .generated(text, revision)? = host.scope.handoff.providerSwitchSummary(for: session)?.outcome else {
-            let summary = host.scope.handoff.providerSwitchSummary(for: session)
-            return XCTFail("Expected terminal Summary without a sheet. Outcome: \(String(describing: summary?.outcome)). Run: \(session.runState). Turns: \(session.transcript.turns.count).")
+            let receipt = host.scope.handoff.providerSwitchSummary(for: session)
+            let turn = session.transcript.turns.first { $0.request?.id == rowID }
+            let terminal = session.lastTerminalCommitRevision?.terminalState.rawValue ?? "missing"
+            XCTFail("Expected terminal Summary. Receipt: \(receipt != nil). Provider model current: \(session.selectedModelRaw == sourceModel). Handover revision current: \(session.pendingHandoffRevision == handoffRevision). Terminal: \(terminal). Row found: \(turn != nil). Row completed: \(turn?.completedAt != nil).")
+            return
         }
         XCTAssertEqual(text, reply)
         XCTAssertEqual(revision, session.sourceItemsRevision)

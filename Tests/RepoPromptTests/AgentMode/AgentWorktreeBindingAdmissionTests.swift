@@ -929,8 +929,8 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         let original = fixture.session.worktreeBindings
         let next = try makeNextBinding(fixture)
         var recorded = false
-        let scheduled = try await fixture.viewModel.scheduleSelfWorktreeRelocation(
-            [next], forSessionID: fixture.sessionID,
+        let scheduled = try await fixture.scheduleSelfWorktreeRelocation(
+            [next],
             originRunID: turn.runID, originRunAttemptID: turn.ownership.attemptID,
             beforeRecord: { recorded = true }
         )
@@ -958,23 +958,23 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
             }
             if duringRecord {
                 do {
-                    _ = try await fixture.viewModel.scheduleSelfWorktreeRelocation(
-                        [next], forSessionID: fixture.sessionID,
+                    _ = try await fixture.scheduleSelfWorktreeRelocation(
+                        [next],
                         originRunID: turn.runID, originRunAttemptID: turn.ownership.attemptID,
                         beforeRecord: { replaceWriter() }
                     )
                     XCTFail("The old request cannot schedule on the reacquired writer")
                 } catch {}
             } else {
-                _ = try await fixture.viewModel.scheduleSelfWorktreeRelocation(
-                    [next], forSessionID: fixture.sessionID,
+                _ = try await fixture.scheduleSelfWorktreeRelocation(
+                    [next],
                     originRunID: turn.runID, originRunAttemptID: turn.ownership.attemptID
                 )
                 await endTurn(fixture, turn, state: .completed)
                 replaceWriter()
                 let items = fixture.session.items.count
                 fixture.viewModel.test_selfWorktreeRelocationContinuationStarter = { _, _ in XCTFail("No successor continuation") }
-                fixture.viewModel.selfWorktreeRelocationTerminalSettled(
+                fixture.viewModel.runtimeSessionStore.worktrees.selfWorktreeRelocationTerminalSettled(
                     session: fixture.session, revision: revision(turn, state: .completed),
                     publication: .accepted(successorEpoch: nil), teardownSettled: { true }
                 )
@@ -992,8 +992,8 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
             defer { fixture.git.cleanup() }
             let turn = try await liveSelfTurn(fixture)
             let next = try makeNextBinding(fixture)
-            _ = try await fixture.viewModel.scheduleSelfWorktreeRelocation(
-                [next], forSessionID: fixture.sessionID,
+            _ = try await fixture.scheduleSelfWorktreeRelocation(
+                [next],
                 originRunID: turn.runID, originRunAttemptID: turn.ownership.attemptID
             )
             await endTurn(fixture, turn, state: .completed)
@@ -1010,7 +1010,7 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
                 throw SaveFailure.expected
             }
             fixture.viewModel.test_selfWorktreeRelocationContinuationStarter = { _, _ in XCTFail("No successor continuation") }
-            fixture.viewModel.selfWorktreeRelocationTerminalSettled(
+            fixture.viewModel.runtimeSessionStore.worktrees.selfWorktreeRelocationTerminalSettled(
                 session: fixture.session, revision: revision(turn, state: .completed),
                 publication: .accepted(successorEpoch: nil), teardownSettled: { true }
             )
@@ -1030,15 +1030,15 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         defer { fixture.git.cleanup() }
         let turn = try await liveSelfTurn(fixture)
         let original = fixture.session.worktreeBindings
-        _ = try await fixture.viewModel.scheduleSelfWorktreeRelocation(
-            [makeNextBinding(fixture)], forSessionID: fixture.sessionID,
+        _ = try await fixture.scheduleSelfWorktreeRelocation(
+            [makeNextBinding(fixture)],
             originRunID: turn.runID, originRunAttemptID: turn.ownership.attemptID
         )
         await endTurn(fixture, turn, state: .completed)
         let command = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID))
         command.writer.scope.worktrees.captureResources = { _ in nil }
         fixture.viewModel.test_selfWorktreeRelocationContinuationStarter = { _, _ in XCTFail("No unavailable-workspace continuation") }
-        fixture.viewModel.selfWorktreeRelocationTerminalSettled(
+        fixture.viewModel.runtimeSessionStore.worktrees.selfWorktreeRelocationTerminalSettled(
             session: fixture.session, revision: revision(turn, state: .completed),
             publication: .accepted(successorEpoch: nil), teardownSettled: { true }
         )
@@ -1083,8 +1083,8 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
             let turn = try await liveSelfTurn(fixture)
             let next = try makeNextBinding(fixture)
             let previous = fixture.session.worktreeBindings
-            _ = try await fixture.viewModel.scheduleSelfWorktreeRelocation(
-                [next], forSessionID: fixture.sessionID,
+            _ = try await fixture.scheduleSelfWorktreeRelocation(
+                [next],
                 originRunID: turn.runID, originRunAttemptID: turn.ownership.attemptID
             )
             let links = fixture.viewModel.linkExecutionRuntime
@@ -1111,8 +1111,8 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         defer { fixture.git.cleanup() }
         let turn = try await liveSelfTurn(fixture)
         let next = try makeNextBinding(fixture)
-        _ = try await fixture.viewModel.scheduleSelfWorktreeRelocation(
-            [next], forSessionID: fixture.sessionID,
+        _ = try await fixture.scheduleSelfWorktreeRelocation(
+            [next],
             originRunID: turn.runID, originRunAttemptID: turn.ownership.attemptID
         )
         fixture.viewModel.test_setAgentSessionSaver { _, _, _ in fixture.git.sandbox.appendingPathComponent("session.json") }
@@ -1185,15 +1185,15 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
             defer { fixture.git.cleanup() }
             let turn = try await liveSelfTurn(fixture)
             let original = fixture.session.worktreeBindings
-            _ = try await fixture.viewModel.scheduleSelfWorktreeRelocation(
-                [makeNextBinding(fixture)], forSessionID: fixture.sessionID,
+            _ = try await fixture.scheduleSelfWorktreeRelocation(
+                [makeNextBinding(fixture)],
                 originRunID: turn.runID, originRunAttemptID: turn.ownership.attemptID
             )
             fixture.viewModel.test_selfWorktreeRelocationContinuationStarter = { _, _ in
                 XCTFail("A dropped switch must not start a continuation (\(state))")
             }
             await endTurn(fixture, turn, state: state)
-            fixture.viewModel.selfWorktreeRelocationTerminalSettled(
+            fixture.viewModel.runtimeSessionStore.worktrees.selfWorktreeRelocationTerminalSettled(
                 session: fixture.session, revision: revision(turn, state: state, successor: successor),
                 publication: .accepted(successorEpoch: nil), teardownSettled: { true }
             )
@@ -1212,8 +1212,8 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
             defer { fixture.git.cleanup() }
             let turn = try await liveSelfTurn(fixture)
             let original = fixture.session.worktreeBindings
-            _ = try await fixture.viewModel.scheduleSelfWorktreeRelocation(
-                [makeNextBinding(fixture)], forSessionID: fixture.sessionID,
+            _ = try await fixture.scheduleSelfWorktreeRelocation(
+                [makeNextBinding(fixture)],
                 originRunID: turn.runID, originRunAttemptID: turn.ownership.attemptID
             )
             fixture.viewModel.test_selfWorktreeRelocationContinuationStarter = { _, _ in
@@ -1223,7 +1223,7 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
             // Before: Stop lands while the barrier awaits publication. After: the apply task has
             // not run yet. Either way the fence captured at scheduling withdraws the switch.
             if stopBeforeHook { fixture.session.stopState.invalidateQueuedDeliveries() }
-            fixture.viewModel.selfWorktreeRelocationTerminalSettled(
+            fixture.viewModel.runtimeSessionStore.worktrees.selfWorktreeRelocationTerminalSettled(
                 session: fixture.session, revision: revision(turn, state: .completed),
                 publication: .accepted(successorEpoch: nil), teardownSettled: { true }
             )
@@ -1243,14 +1243,14 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         let fixture = try await durableFixture()
         defer { fixture.git.cleanup() }
         let turn = try await liveSelfTurn(fixture)
-        let staleAttempt = try await fixture.viewModel.scheduleSelfWorktreeRelocation(
-            [makeNextBinding(fixture)], forSessionID: fixture.sessionID,
+        let staleAttempt = try await fixture.scheduleSelfWorktreeRelocation(
+            [makeNextBinding(fixture)],
             originRunID: turn.runID, originRunAttemptID: UUID()
         )
         XCTAssertNil(staleAttempt, "Only the exact live origin attempt may defer; others keep the active-run rejection")
         let visualOnly = Self.copyBinding(fixture.session.worktreeBindings[0], visualLabel: "Presentation only")
-        let presentation = try await fixture.viewModel.scheduleSelfWorktreeRelocation(
-            [visualOnly], forSessionID: fixture.sessionID,
+        let presentation = try await fixture.scheduleSelfWorktreeRelocation(
+            [visualOnly],
             originRunID: turn.runID, originRunAttemptID: turn.ownership.attemptID
         )
         XCTAssertNil(presentation, "Presentation-only changes apply immediately through the ordinary transition")
@@ -1267,8 +1267,8 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         let turn = try await liveSelfTurn(fixture)
         let next = try makeNextBinding(fixture)
         let movedA = [next, rootB]
-        let first = try await fixture.viewModel.scheduleSelfWorktreeRelocation(
-            movedA, forSessionID: fixture.sessionID,
+        let first = try await fixture.scheduleSelfWorktreeRelocation(
+            movedA,
             originRunID: turn.runID, originRunAttemptID: turn.ownership.attemptID
         )
         let pending = try XCTUnwrap(first)
@@ -1282,8 +1282,8 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         for (label, desired) in followUps {
             var committed = false
             do {
-                _ = try await fixture.viewModel.scheduleSelfWorktreeRelocation(
-                    desired, forSessionID: fixture.sessionID,
+                _ = try await fixture.scheduleSelfWorktreeRelocation(
+                    desired,
                     originRunID: turn.runID, originRunAttemptID: turn.ownership.attemptID,
                     beforeRecord: { committed = true }
                 )
@@ -1297,11 +1297,11 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         }
 
         // The provider's no-op and presentation-only paths use the same owner guard before committing.
-        XCTAssertThrowsError(try fixture.viewModel.requireNoPendingSelfWorktreeRelocation(
-            forSessionID: fixture.sessionID, originRunAttemptID: turn.ownership.attemptID
+        XCTAssertThrowsError(try AgentSessionWorktreeRuntime.requireNoPendingSelfWorktreeRelocation(
+            in: fixture.session, originRunAttemptID: turn.ownership.attemptID
         ))
-        XCTAssertNoThrow(try fixture.viewModel.requireNoPendingSelfWorktreeRelocation(
-            forSessionID: fixture.sessionID, originRunAttemptID: UUID()
+        XCTAssertNoThrow(try AgentSessionWorktreeRuntime.requireNoPendingSelfWorktreeRelocation(
+            in: fixture.session, originRunAttemptID: UUID()
         ), "Only the turn that scheduled the switch is limited")
         XCTAssertEqual(fixture.session.pendingSelfWorktreeRelocation?.desiredBindings, movedA)
         XCTAssertEqual(fixture.session.worktreeBindings, [rootA, rootB], "Nothing applies before the turn ends")
@@ -1942,6 +1942,18 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         let viewModel: AgentModeViewModel
         let session: AgentModeViewModel.TabSession
         let sessionID: UUID
+
+        @MainActor
+        func scheduleSelfWorktreeRelocation(
+            _ bindings: [AgentSessionWorktreeBinding], originRunID: UUID,
+            originRunAttemptID: UUID, beforeRecord: @MainActor () async throws -> Void = {}
+        ) async throws -> AgentSelfWorktreeRelocation? {
+            let admission = try XCTUnwrap(viewModel.admitWorktreeTransition(forSessionID: sessionID))
+            return try await admission.command.writer.scope.worktrees.scheduleSelfWorktreeRelocation(
+                bindings, admission: admission, originRunID: originRunID,
+                originRunAttemptID: originRunAttemptID, beforeRecord: beforeRecord
+            )
+        }
     }
 
     private func durableFixture(windowID: Int = -991) async throws -> DurableFixture {

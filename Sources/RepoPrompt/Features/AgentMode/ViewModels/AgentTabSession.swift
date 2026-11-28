@@ -508,7 +508,7 @@ final class AgentTabSession: ObservableObject {
 
     /// Runtime-only: an execution-worktree change this session requested for itself from its own
     /// live turn, applied at that turn's completed terminal boundary and then continued
-    /// automatically. Owned by `AgentModeViewModel+SelfWorktreeRelocation`.
+    /// automatically. Owned by `AgentSessionWorktreeRuntime`.
     var pendingSelfWorktreeRelocation: AgentSelfWorktreeRelocation? {
         didSet {
             if oldValue != pendingSelfWorktreeRelocation {

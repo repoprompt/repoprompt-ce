@@ -816,7 +816,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
     ) async throws -> AgentSelfWorktreeRelocation? {
         try request.admission.requireCurrent()
         if let origin = selfRunOrigin(for: request.sessionID),
-           let scheduled = try await AgentModeViewModel.scheduleSelfWorktreeRelocation(
+           let scheduled = try await request.admission.command.writer.scope.worktrees.scheduleSelfWorktreeRelocation(
                desiredBindings, admission: request.admission,
                originRunID: origin.runID,
                originRunAttemptID: origin.runAttemptID,
@@ -852,7 +852,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
     private func requireNoPendingSelfRelocation(_ request: BindingRequest) throws {
         try request.admission.requireCurrent()
         guard let origin = selfRunOrigin(for: request.sessionID) else { return }
-        try AgentModeViewModel.requireNoPendingSelfWorktreeRelocationForSession(
+        try AgentSessionWorktreeRuntime.requireNoPendingSelfWorktreeRelocation(
             in: request.admission.session, originRunAttemptID: origin.runAttemptID
         )
     }
