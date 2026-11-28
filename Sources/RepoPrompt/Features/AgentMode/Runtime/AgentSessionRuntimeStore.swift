@@ -528,7 +528,7 @@ final class AgentSessionRuntimeStore {
             !saveQueue.inFlightSessionIDs.isEmpty || attachments.hasPendingRetention
                 || worktrees.pendingTransitions != 0 || continuation.hasPendingStarts
                 || installedInteractions?.hasPendingEffects == true || !sessionDeletionDrains.isEmpty
-                || linkExecution?.pendingManagedInputEffects.isEmpty == false
+                || linkExecution?.pendingInputEffects.isEmpty == false
                 || linkExecution?.pendingSendEffects.isEmpty == false
                 || linkExecution?.pendingStopEffects.isEmpty == false
                 || linkExecution?.pendingSelfCompactEffects.isEmpty == false

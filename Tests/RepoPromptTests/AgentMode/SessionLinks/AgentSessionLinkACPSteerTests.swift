@@ -1221,7 +1221,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         fixture.session.appendItem(prior)
         let next = AgentChatItem.user("new steer", sequenceIndex: fixture.session.nextSequenceIndex)
         XCTAssertEqual(
-            fixture.viewModel.interruptedACPProviderText(for: fixture.session, before: next), exact
+            AgentSessionLinkExecutionRuntime.interruptedACPProviderText(for: fixture.session, before: next), exact
         )
         let restored = AgentChatItemPersist(from: prior).toItem()
         XCTAssertEqual(restored.dispatchedProviderText, exact)
@@ -1282,10 +1282,10 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
             crossSessionAttribution: attribution
         ))
         let next = AgentChatItem.user("new steer", sequenceIndex: fixture.session.nextSequenceIndex)
-        XCTAssertNil(fixture.viewModel.interruptedACPProviderText(for: fixture.session, before: next))
+        XCTAssertNil(AgentSessionLinkExecutionRuntime.interruptedACPProviderText(for: fixture.session, before: next))
         fixture.session.appendItem(.user("local message", sequenceIndex: fixture.session.nextSequenceIndex))
         let afterLocal = AgentChatItem.user("another steer", sequenceIndex: fixture.session.nextSequenceIndex)
-        XCTAssertNotNil(fixture.viewModel.interruptedACPProviderText(for: fixture.session, before: afterLocal))
+        XCTAssertNotNil(AgentSessionLinkExecutionRuntime.interruptedACPProviderText(for: fixture.session, before: afterLocal))
     }
 
     func testExistingRoutesAndUnavailableStateStayUnchanged() async throws {

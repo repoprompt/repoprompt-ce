@@ -64,6 +64,7 @@ var repoPromptAppDependencies: [Target.Dependency] = [
     "RepoPromptAIContracts",
     "RepoPromptWorkspaceContext",
     "RepoPromptDomainRuntime",
+    "RepoPromptAgentRuntime",
     "RepoPromptFoundation",
     "RepoPromptProcess",
     "RepoPromptInstrumentation",
@@ -259,6 +260,17 @@ let package = Package(
             dependencies: ["RepoPromptProviderQuota"],
             path: "Tests/RepoPromptProviderQuotaTests",
             swiftSettings: swift6LanguageMode
+        ),
+        .target(
+            name: "RepoPromptAgentRuntime",
+            dependencies: ["RepoPromptDomainRuntime", "RepoPromptInstrumentation"],
+            path: "Sources/RepoPromptAgentRuntime",
+            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+        ),
+        .testTarget(
+            name: "RepoPromptAgentRuntimeTests",
+            dependencies: ["RepoPromptAgentRuntime"],
+            path: "Tests/RepoPromptAgentRuntimeTests"
         ),
         .target(
             name: "RepoPromptDomainRuntime",

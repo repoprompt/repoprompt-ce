@@ -7,15 +7,10 @@ import RepoPromptWorkspaceCore
 extension AgentSessionWorktreeRuntime {
     func mergeAuthorizedRoots(_ admission: Admission) async throws -> [WorkspaceRootRef] {
         try admission.requireCurrent()
-        guard let store = admission.resources.store else {
-            throw MCPError.invalidParams("Worktree merge requires an authorized workspace root.")
-        }
-        let lookup = await AgentSessionProviderInputRuntime.WorkspaceSource(
-            store: store,
-            lookupSource: .init(activeAgentSessionID: admission.command.identity.sessionID, worktreeBindings: admission.bindings)
-        ).lookupContext()
-        try admission.requireCurrent()
-        var roots = await store.rootRefs(scope: lookup.rootScope)
+        let lookup = try await admission.resources.lookup(for: .init(
+            activeAgentSessionID: admission.command.identity.sessionID, worktreeBindings: admission.bindings
+        ))
+        var roots = lookup.roots
         try admission.requireCurrent()
         var seen = Set(roots.map { GitRepoRootAuthorization.canonicalPath($0.standardizedFullPath) })
         for binding in admission.bindings {

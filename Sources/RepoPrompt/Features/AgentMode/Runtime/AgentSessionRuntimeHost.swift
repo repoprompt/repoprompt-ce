@@ -479,7 +479,6 @@ final class AgentSessionRuntimeHost {
         dependencies: AgentModeRunService.Dependencies,
         inputEnvironmentForSession: @escaping @MainActor (AgentTabSession) -> AgentSessionLinkExecutionRuntime.ManagedInputEnvironment,
         sessionTitle: @escaping @MainActor (AgentTabSession) -> String,
-        providerSwitchGenerationSettled: @escaping @MainActor (AgentTabSession) -> Void = { _ in },
         prepareLaunch: @escaping @MainActor () -> AgentSessionRunContinuationRuntime.Launch?,
         perfRecorder: any AgentModePerfRecording
     ) -> AgentModeRunService {
@@ -519,12 +518,12 @@ final class AgentSessionRuntimeHost {
                     await links.drainPendingSendEffects(for: session)
                     return await publication.publishTerminalCommit(revision, successorKind: successorKind, for: session)
                 },
-                onSelfCompactTerminalSettled: { [worktrees = scope.worktrees] session, revision, result, teardownSettled in
+                onSelfCompactTerminalSettled: { [worktrees = scope.worktrees, handoff = scope.handoff] session, revision, result, teardownSettled in
                     links.agentSelfCompactTerminalSettled(
                         session: session, revision: revision, publication: result, teardownSettled: teardownSettled
                     )
                     links.providerSwitchRunSettled(session, revision: revision, publication: result)
-                    providerSwitchGenerationSettled(session)
+                    handoff.settleProviderSwitchSummary(session)
                     worktrees.selfWorktreeRelocationTerminalSettled(
                         session: session, revision: revision, publication: result, teardownSettled: teardownSettled
                     )

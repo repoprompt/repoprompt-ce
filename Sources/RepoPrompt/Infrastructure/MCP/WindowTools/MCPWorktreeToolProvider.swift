@@ -351,9 +351,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
 
         let logicalRoot = try await logicalRoot(for: context)
         let logicalRootPath = logicalRoot.standardizedFullPath
-        var mutationRootMappings = await context.lookupContext.domainMutationPhysicalRootMappings(
-            store: discovery.store
-        )
+        var mutationRootMappings = discovery.mutationRootMappings
         mutationRootMappings.append(
             .init(
                 canonicalRoot: logicalRootPath,
@@ -1111,7 +1109,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         let allRepos: [GitRepoDescriptor]
         let visibleRoots: [WorkspaceRootRef]
         let lookupContext: WorkspaceLookupContext
-        let store: WorkspaceFileContextStore
+        let mutationRootMappings: [DomainMutationPhysicalRootMapping]
         var validate: (@MainActor () async throws -> Void)?
     }
 
@@ -1136,13 +1134,9 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         if let canonicalCommand {
             guard let command = canonicalCommand(invocationContext) else { throw MCPFileToolAuthorityFailure.unavailable }
             let admission = try await ExecutionAdmission(command).resolve()
-            guard let store = admission.resources.store else { throw MCPFileToolAuthorityFailure.unavailable }
-            try await admission.resources.awaitRootReadiness()
             let source = AgentWorkspaceLookupContextSource(activeAgentSessionID: command.identity.sessionID, worktreeBindings: admission.bindings)
-            let roots = await store.rootRefs(scope: .visibleWorkspace)
-            let lookup = try await AgentWorkspaceLookupContextResolver.requiredLookupContext(source: source, visibleRoots: roots, store: store)
-            let lookupRoots = await store.rootRefs(scope: lookup.rootScope)
-            let repos = await discoverGitRepos(in: lookupRoots)
+            let lookup = try await admission.resources.lookup(for: source)
+            let repos = await discoverGitRepos(in: lookup.roots)
             let validate: @MainActor () async throws -> Void = {
                 try await admission.resources.validatePlacement?()
                 guard canonicalCommand(invocationContext)?.identity == command.identity, !Task.isCancelled else {
@@ -1153,8 +1147,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             try await validate()
             return DiscoveryContext(metadata: invocationContext.metadata, election: .init(
                 workspaceID: command.identity.workspaceID, declaredRepoPaths: admission.resources.declaredRepoPaths,
-                bindingSource: source, lookupContext: lookup, lookupRoots: lookupRoots
-            ), allRepos: repos, visibleRoots: lookupRoots, lookupContext: lookup, store: store, validate: validate)
+                bindingSource: source, lookupContext: lookup.context, lookupRoots: lookup.roots
+            ), allRepos: repos, visibleRoots: lookup.roots, lookupContext: lookup.context, mutationRootMappings: lookup.mappings, validate: validate)
         }
         let dependencies = try physicalDependencies()
         guard let workspaceManager = dependencies.context.workspaceManager,
@@ -1177,7 +1171,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         let store = try dependencies.context.requirePromptVM().workspaceFileContextStore
         let visibleRoots = await store.rootRefs(scope: lookupContext.rootScope)
         let allRepos = await discoverGitRepos(in: visibleRoots)
-        return DiscoveryContext(
+        return await DiscoveryContext(
             metadata: metadata,
             election: .init(
                 workspaceID: workspace?.id,
@@ -1191,7 +1185,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             ),
             allRepos: allRepos,
             visibleRoots: visibleRoots,
-            lookupContext: lookupContext, store: store
+            lookupContext: lookupContext, mutationRootMappings: lookupContext.domainMutationPhysicalRootMappings(store: store)
         )
     }
 

@@ -48,7 +48,7 @@ private struct AgentProviderSwitchChrome: View {
             get: {
                 guard let tabID, let session = viewModel.sessions[tabID],
                       let preview = viewModel.providerSwitchPreview else { return false }
-                return preview.session === session
+                return preview.matches(session)
             },
             set: { if !$0 { viewModel.cancelProviderSwitchPreview() } }
         )) {
@@ -117,7 +117,7 @@ private struct AgentProviderSwitchBanner: View {
             .providerSwitchBannerStyle()
         }
         if let outcome = viewModel.providerSwitchBackgroundOutcome,
-           outcome.session === session, outcome.binding == session.currentRestorationBindingToken
+           outcome.matches(session)
         {
             HStack {
                 Text("Change didn't finish. Check this chat before trying again.")
@@ -157,7 +157,7 @@ struct AgentProviderSwitchPreview: View {
     @State private var armedPreviewKey: String?
 
     private func forceKey(_ preview: AgentModeViewModel.ProviderSwitchPreview) -> String {
-        "\(preview.session.tabID.uuidString)|\(preview.destination.rawValue)|\(preview.model)|\(preview.isReview)"
+        "\(preview.tabID.uuidString)|\(preview.destination.rawValue)|\(preview.model)|\(preview.isReview)"
     }
 
     /// View-only copy: never echo transport errors or agent-directed refusal text.

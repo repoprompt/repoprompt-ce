@@ -123,7 +123,7 @@ final class AgentSessionHostStartupResources {
         }
         return .init(store: lease.resources.files, lookupSource: .init(
             activeAgentSessionID: origin.writer.identity.sessionID, worktreeBindings: worktreeBindings
-        ), workspacePaths: workspacePaths, isCurrent: { self.isCurrent }, validate: { await self.validate() })
+        ), workspacePaths: workspacePaths, retainedRoots: lease, isCurrent: { self.isCurrent }, validate: { await self.validate() })
     }
 
     func initialThreadInput(for session: AgentTabSession) async throws -> AgentSessionProviderInputRuntime.InitialThreadInput? {

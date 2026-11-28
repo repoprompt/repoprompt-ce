@@ -1731,9 +1731,11 @@ final class AgentTabSession: ObservableObject {
         runLifecycle.lastTerminalPublicationResult
     }
 
-    var runAttemptTerminalResources: AgentRunAttemptTerminalResources? {
-        runLifecycle.terminalResources
-    }
+    #if DEBUG
+        var runAttemptTerminalResources: AgentRunAttemptTerminalResources? {
+            runLifecycle.test_terminalResources
+        }
+    #endif
 
     /// Handoff payload (injected into provider-facing text on first user send).
     /// Cleared only after the provider accepts the turn.

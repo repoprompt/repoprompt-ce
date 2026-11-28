@@ -49,15 +49,13 @@ extension AgentSessionWorktreeRuntime {
             try requireOrigin()
         }
         try requireOrigin()
-        guard let primaryRoot = admission.resources.declaredRepoPaths.first,
-              let store = admission.resources.store
-        else {
+        guard let primaryRoot = admission.resources.declaredRepoPaths.first else {
             throw InitialPreparationError.unavailable("Execution location requires an active Git-backed project workspace. Select Work locally or open a Git workspace.")
         }
         let primaryPath = AgentWorktreeRuntimeWorkspaceResolver.standardizedWorkspacePath((primaryRoot as NSString).expandingTildeInPath) ?? primaryRoot
-        let visibleRoots = await store.rootRefs(scope: .visibleWorkspace)
+        let logicalRoots = try await admission.resources.logicalRoots()
         try await validateOrigin()
-        guard let logicalRoot = visibleRoots.first(where: {
+        guard let logicalRoot = logicalRoots.first(where: {
             (AgentWorktreeRuntimeWorkspaceResolver.standardizedWorkspacePath($0.standardizedFullPath) ?? $0.standardizedFullPath) == primaryPath
         }) else {
             throw InitialPreparationError.unavailable("Execution location requires the primary workspace root to be loaded before starting this thread. Select Work locally or reload the workspace.")

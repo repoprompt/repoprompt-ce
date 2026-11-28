@@ -30,6 +30,7 @@
         "RepoPromptC",
         "RepoPromptCodeMapCore",
         "RepoPromptDomainRuntime",
+        "RepoPromptAgentRuntime",
         "RepoPromptFoundation",
         "RepoPromptInstrumentation",
         "RepoPromptProcess",
@@ -138,6 +139,16 @@
       "allowed_dependencies": [
         "RepoPromptProviderQuota"
       ]
+    },
+    "RepoPromptAgentRuntime": {
+      "source_root": "Sources/RepoPromptAgentRuntime",
+      "allowed_dependencies": ["RepoPromptDomainRuntime", "RepoPromptInstrumentation"],
+      "test_target": "RepoPromptAgentRuntimeTests",
+      "app_free_tests": true
+    },
+    "RepoPromptAgentRuntimeTests": {
+      "source_root": "Tests/RepoPromptAgentRuntimeTests",
+      "allowed_dependencies": ["RepoPromptAgentRuntime"]
     },
     "RepoPromptDomainRuntime": {
       "source_root": "Sources/RepoPromptDomainRuntime",

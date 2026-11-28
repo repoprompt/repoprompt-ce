@@ -400,9 +400,7 @@ extension AgentSessionWorktreeRuntime {
     private func refreshMergeTarget(_ target: GitWorktreeMergeEndpoint, admission: Admission) async {
         await VCSService.shared.invalidateCache(for: target.url)
         guard admission.command.writer.isCurrent, admission.resources.isCurrent() else { return }
-        if let store = admission.resources.store {
-            _ = await store.awaitAppliedIngressForExplicitRequest(userPath: target.path, fallbackScope: .allLoaded)
-        }
+        await admission.resources.refreshMergedWorktree(at: target.path)
         guard admission.command.writer.isCurrent, admission.resources.isCurrent() else { return }
         let scope = admission.command.writer.scope
         scope.presentation.worktreeOperationsChanged(admission.session)

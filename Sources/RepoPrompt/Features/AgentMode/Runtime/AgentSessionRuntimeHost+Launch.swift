@@ -47,7 +47,7 @@ extension AgentSessionRuntimeHost {
             guard requestIsCurrent(), resources.isCurrent else {
                 throw AgentHostWorkspaceResources.Failure.authorityUnavailable
             }
-            return try await scope.startup.start(
+            let result = try await scope.startup.start(
                 session: session, initialMessage: message, attachments: attachments,
                 taggedFileAttachments: taggedFileAttachments, codexFallbackContext: codexFallbackContext,
                 autoEffortSelection: autoEffortSelection ?? options.autoEffortSelection, directStartOptions: options,
@@ -55,10 +55,16 @@ extension AgentSessionRuntimeHost {
                 claudeCoordinator: claudeCoordinator, links: links,
                 environment: makeStartupEnvironment(resources: resources)
             )
+            if agent == .codexExec, result == nil {
+                let message = "The originating session did not reach Codex dispatch."
+                outcome?.recordStartFailure(message: message)
+                return .preDispatchRejected(message: message)
+            }
+            return result
         } catch {
             let message = "The originating session or its canonical launch resources are no longer available."
             outcome?.recordStartFailure(message: message)
-            return .failed(message: message)
+            return .preDispatchRejected(message: message)
         }
     }
 

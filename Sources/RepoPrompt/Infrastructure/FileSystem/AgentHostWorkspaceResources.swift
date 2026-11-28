@@ -143,6 +143,15 @@ struct AgentHostWorkspaceResources {
             return rootsAreCurrent
         }
 
+        func lookupContext(for source: AgentWorkspaceLookupContextSource) async throws -> WorkspaceLookupContext {
+            guard await retainedRootsAreCurrent() else { throw Failure.rootsChanged }
+            let lookup = try await AgentWorkspaceLookupContextResolver.requiredLookupContext(
+                source: source, visibleRoots: roots, store: resources.files, usesRetainedRoots: true
+            )
+            guard await retainedRootsAreCurrent() else { throw Failure.rootsChanged }
+            return lookup
+        }
+
         func isCurrent(requiresExactSnapshot: Bool = false) async -> Bool {
             guard !isInvalidated, rootsAreCurrent,
                   let current = await resources.workspaceSnapshot(

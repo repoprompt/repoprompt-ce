@@ -81,7 +81,7 @@ final class AgentSessionPersistenceRuntime {
         let isSuppressed: () -> Bool
         let bypassesSuppression: () -> Bool
         let isPreparedSavedHost: () -> Bool
-        let saveAdmission: (AgentTabSession) -> String?
+        var saveAdmission: (AgentTabSession) -> String? = { _ in nil }
         let creationIsCurrent: (AgentSessionCreationHandle) -> Bool
         let admitBinding: (AgentTabSession) -> Admission?
         var isRestoringConfiguration: () -> Bool = { false }
@@ -384,6 +384,9 @@ final class AgentSessionPersistenceRuntime {
                let id = session.activeAgentSessionID, AgentSessionDeletionRegistry.shared.blocksNewOversight(sessionID: id)
             {
                 return .deferred("The saved target is being deleted or has been deleted; its retired runtime cannot write it back.")
+            }
+            if scope?.handoff.providerSwitchBlocksSave(for: session) == true {
+                return .deferred(AgentSessionLinkSendFailure.targetBusy.rawValue)
             }
             if let refusal = composition?.saveAdmission(session) { return .deferred(refusal) }
             if let handle = effectiveCreationSave?.handle {

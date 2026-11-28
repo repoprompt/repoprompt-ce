@@ -11114,7 +11114,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
         }
     }
 
-    func testReplicaMetadataMismatchOmitsOnlyConflictingSession() async throws {
+    func testReplicaSaveDateDriftRetainsSessionAndUsesLatestActivity() async throws {
         try await MCPSharedServerTestLease.shared.withLease { _ in
             try await withCarrierWindows(count: 2) { windows in
                 let target = UUID(), healthy = UUID()
@@ -11130,9 +11130,10 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 for ordered in [windows, Array(windows.reversed())] {
                     let source = LiveAgentSessionInventorySource(scanner: Scanner(), windows: { ordered }, links: { ([], []) })
                     let snapshot = try await source.snapshot(read: .init(loadedOnly: true))
-                    XCTAssertEqual(Set(snapshot.records.keys), [healthy])
-                    XCTAssertEqual(snapshot.unresolvedSessions, [target: "replica_mismatch"])
-                    XCTAssertFalse(snapshot.recordsComplete)
+                    XCTAssertEqual(Set(snapshot.records.keys), [healthy, target])
+                    XCTAssertEqual(snapshot.records[target]?.lastActivityAt, Date(timeIntervalSince1970: 21))
+                    XCTAssertTrue(snapshot.unresolvedSessions.isEmpty)
+                    XCTAssertTrue(snapshot.recordsComplete)
                 }
             }
         }

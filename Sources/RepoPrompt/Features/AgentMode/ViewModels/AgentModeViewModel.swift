@@ -309,7 +309,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private static let lastUsedModelsByAgentKey = "agentMode.lastUsedModelsByAgent"
 
     @Published var providerSwitchPreview: ProviderSwitchPreview?
-    @Published var providerSwitchMutation: ProviderSwitchMutation?
+    var providerSwitchMutation: AgentSessionHandoffRuntime.ProviderSwitchMutation? {
+        runtimeSessionStore.handoff.providerSwitchMutation
+    }
+
     @Published var providerSwitchBackgroundOutcome: ProviderSwitchBackgroundOutcome?
     #if DEBUG
         var test_providerSwitchRetirement: (@MainActor (TabSession) async -> Void)?
@@ -2230,6 +2233,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     guard let self, sessions[session.tabID] === session, currentTabID == session.tabID else { return }
                     refreshAutoEditPermissionGuidanceForActiveSession()
                 },
+                providerSwitchSummary: { [weak self] tabID in
+                    guard let self, let session = sessions[tabID] else { return }
+                    providerSwitchGenerationSettled(session)
+                },
                 worktreeOperations: { [weak self] session in
                     guard let self, sessions[session.tabID] === session else { return }
                     publishWorktreeMergeOperationsChange(in: session)
@@ -3616,20 +3623,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             sessionTitle: { [weak manager = workspaceManager] session in
                 AgentSessionRestoreSupport.normalizedSessionTitle(manager?.composeTabName(with: session.tabID))
             },
-            providerSwitchGenerationSettled: { [weak self] session in self?.providerSwitchGenerationSettled(session) },
             prepareLaunch: { [weak self] in self?.makeFollowUpLaunch() },
             perfRecorder: perfRecorder
-        )
-    }
-
-    private func scheduleTypedACPFollowUpRun(
-        session: TabSession,
-        instruction: TabSession.PendingInstruction,
-        capturedStopFence: AgentRunStartStopFence? = nil
-    ) {
-        runtimeSessionStore.continuation.scheduleTypedACPFollowUp(
-            session: session, instruction: instruction, capturedStopFence: capturedStopFence,
-            launch: makeFollowUpLaunch()
         )
     }
 
@@ -14827,13 +14822,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             isSuppressed: { [weak self] in self?.suppressesAgentSessionPersistence ?? false },
             bypassesSuppression: { [weak self] in self?.bypassesAgentSessionPersistenceSuppressionForTesting ?? false },
             isPreparedSavedHost: { [weak self] in self?.workspaceManager?.isSessionRuntimeProjection == true },
-            saveAdmission: { [weak self] session in
-                guard let self else { return "The session owner is unavailable." }
-                if let mutation = providerSwitchMutation, mutation.session === session, !mutation.allowsSave {
-                    return AgentSessionLinkSendFailure.targetBusy.rawValue
-                }
-                return nil
-            },
             creationIsCurrent: { [weak self] handle in self?.freshSessionCreationIsCurrent(handle) == true },
             admitBinding: { [weak self] session in
                 guard let self else { return nil }
@@ -15940,216 +15928,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         persistenceRuntime.scheduleSave(for: tabID)
     }
 
-    private func waitingInstructionReadinessErrorMessage(
-        _ readiness: ProviderInputRouteReadiness
-    ) -> String {
-        switch readiness {
-        case .unavailable:
-            "RepoPrompt MCP route qualification was unavailable. Your instruction was restored."
-        case .superseded:
-            "RepoPrompt MCP route qualification changed before dispatch. Your instruction was restored."
-        case .cancelled:
-            "The instruction was cancelled before provider dispatch and was restored."
-        case .notRequired, .ready:
-            "The instruction was not sent and was restored."
-        }
-    }
-
-    private func rollbackWaitingInstructionSubmission(
-        repromptedText: String? = nil,
-        tabID: UUID,
-        session: TabSession,
-        userItemID: UUID,
-        turnRuntimeAnchorRollback: AgentTurnUserAnchorRollbackState,
-        draftText: String,
-        attachments: [AgentFileAttachment],
-        taggedFiles: [AgentTaggedFileAttachment],
-        selectedWorkflow: AgentWorkflowDefinition?,
-        selectedWorkflowMutationGeneration: UInt64?,
-        managedTurn: AgentNoncomposerTurn? = nil,
-        message: String
-    ) {
-        guard sessions[tabID] === session else {
-            managedTurn?.sink.resolve(.unconfirmed(message: message))
-            return
-        }
-        removeUnconfirmedOptimisticCodexUserItem(
-            session: session,
-            tabID: tabID,
-            itemID: userItemID,
-            reason: "waiting instruction was not accepted by the provider"
-        )
-        rollbackAgentTurnUserAnchor(turnRuntimeAnchorRollback, session: session)
-        // A managed steer reports the withdrawal to its overseer and leaves the target user's
-        // composer exactly as it was.
-        if let managedTurn {
-            managedTurn.sink.resolve(.notAccepted(message: message))
-            return
-        }
-        restoreRejectedManualSubmissionComposerState(
-            repromptedText: repromptedText,
-            tabID: tabID,
-            session: session,
-            draftText: draftText,
-            attachments: attachments,
-            taggedFiles: taggedFiles,
-            selectedWorkflow: selectedWorkflow,
-            selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
-            message: message
-        )
-    }
-
-    private func dispatchWaitingInstructionSubmission(
-        repromptedText: String? = nil,
-        tabID: UUID,
-        session: TabSession,
-        text: String,
-        attachments: [AgentFileAttachment],
-        taggedFiles: [AgentTaggedFileAttachment],
-        userItemID: UUID,
-        turnRuntimeAnchorRollback: AgentTurnUserAnchorRollbackState,
-        draftText: String,
-        selectedWorkflow: AgentWorkflowDefinition?,
-        selectedWorkflowMutationGeneration: UInt64?,
-        managedTurn: AgentNoncomposerTurn? = nil,
-        localComposerCandidate: UUID? = nil,
-        skipsSlashExpansion: Bool = false,
-        providerTaggedFiles: [AgentTaggedFileAttachment]? = nil
-    ) {
-        let expectedOwnership = session.activeRunOwnership
-        let expectedWaitID = session.instructionWaitID
-        let instructionCommand = linkExecutionRuntime.instructionCommand(for: session)
-        let expectedControllerID = session.codexController.map(ObjectIdentifier.init)
-        let dispatchID = AgentSessionLinkPromptDispatchID.waitingContinuation(
-            waitID: expectedWaitID ?? session.tabID
-        )
-        let dispatchTicket = session.codexDispatchSerialGate.issueTicket()
-        Task { @MainActor [weak self, weak session] in
-            guard let self, let session else {
-                session?.codexDispatchSerialGate.cancel(dispatchTicket)
-                managedTurn?.sink.resolve(.unconfirmed(
-                    message: "The overseen session closed before its waiting instruction was delivered."
-                ))
-                return
-            }
-            defer { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) }
-            guard await session.codexDispatchSerialGate.awaitTurn(dispatchTicket) else {
-                managedTurn?.sink.resolve(.unconfirmed(
-                    message: "The overseen session stopped dispatching before its waiting instruction was delivered."
-                ))
-                return
-            }
-            defer {
-                session.codexDispatchSerialGate.finish(dispatchTicket)
-            }
-
-            @MainActor func rollback(message: String) {
-                rollbackWaitingInstructionSubmission(
-                    repromptedText: repromptedText,
-                    tabID: tabID,
-                    session: session,
-                    userItemID: userItemID,
-                    turnRuntimeAnchorRollback: turnRuntimeAnchorRollback,
-                    draftText: draftText,
-                    attachments: attachments,
-                    taggedFiles: taggedFiles,
-                    selectedWorkflow: selectedWorkflow,
-                    selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
-                    managedTurn: managedTurn,
-                    message: message
-                )
-            }
-            @MainActor func rollbackUndispatched(message: String) {
-                linkExecutionRuntime.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
-                rollback(message: message)
-            }
-
-            let stillOwnsContinuation = {
-                guard let instructionCommand, let expectedWaitID,
-                      self.linkExecutionRuntime.ownsInstructionWait(command: instructionCommand, waitID: expectedWaitID)
-                else { return false }
-                return self.sessions[tabID] === session
-                    && (
-                        expectedOwnership.map { session.isCurrentRunAttemptForCurrentBinding($0) && session.quietLedger.isOpen(owner: $0) }
-                            ?? (session.activeRunOwnership == nil)
-                    )
-                    && session.instructionContinuation != nil
-                    && session.instructionWaitID == expectedWaitID
-                    && session.codexController.map(ObjectIdentifier.init) == expectedControllerID
-            }
-            guard stillOwnsContinuation() else {
-                rollback(message: "The waiting request changed before dispatch. Your instruction was restored.")
-                return
-            }
-
-            var taggedFileFailures: [AgentSessionProviderInputRuntime.ExplicitFileFailure] = []
-            let augmentedText = await augmentUserMessageForProviderSend(
-                text,
-                attachments: attachments,
-                taggedFileAttachments: providerTaggedFiles ?? taggedFiles,
-                agent: session.selectedAgent,
-                session: session,
-                skipsSlashExpansion: skipsSlashExpansion,
-                onTaggedFileFailures: { taggedFileFailures = $0 },
-                shouldPublishCatalog: stillOwnsContinuation
-            )
-            guard stillOwnsContinuation() else {
-                rollback(message: "The waiting request changed before dispatch. Your instruction was restored.")
-                return
-            }
-
-            let readiness = await linkExecutionRuntime.qualifyProviderInputRoute(for: session)
-            guard readiness.allowsDispatch else {
-                rollbackUndispatched(message: waitingInstructionReadinessErrorMessage(readiness))
-                return
-            }
-            guard linkExecutionRuntime.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: readiness) else {
-                rollbackUndispatched(message: "RepoPrompt MCP routing changed before provider dispatch. Your instruction was restored.")
-                return
-            }
-            guard stillOwnsContinuation() else {
-                rollbackUndispatched(message: "The waiting request changed before dispatch. Your instruction was restored.")
-                return
-            }
-
-            let monitoring = linkExecutionRuntime.agentSessionLinkDecoratedProviderText(
-                augmentedText,
-                session: session,
-                dispatchID: dispatchID
-            )
-            guard !monitoring.mustAbortDispatch else {
-                rollbackUndispatched(message: "RepoPrompt MCP catalog input was unavailable. Your instruction was restored.")
-                return
-            }
-            let inputProof = await linkExecutionRuntime.agentSessionLinkProveProviderInput(for: session, claim: monitoring.claim)
-            guard monitoring.claim?.localInput == nil || (
-                stillOwnsContinuation() && !Task.isCancelled &&
-                    linkExecutionRuntime.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: readiness)
-            )
-            else {
-                rollback(message: "The waiting request changed before dispatch. Your instruction was restored.")
-                return
-            }
-            guard stillOwnsContinuation(), let instructionCommand, let expectedWaitID,
-                  linkExecutionRuntime.resumeWaitingInstructionContinuation(
-                      command: instructionCommand, waitID: expectedWaitID,
-                      providerText: monitoring.text,
-                      claim: monitoring.claim,
-                      origin: .user,
-                      inputProof: inputProof,
-                      undecoratedProviderText: augmentedText
-                  )
-            else {
-                // (A managed steer's rollback below settles its sink and skips the composer.)
-                rollbackUndispatched(message: "The waiting request changed before dispatch. Your instruction was restored.")
-                return
-            }
-            AgentSessionProviderInputRuntime.recordTaggedFileFailures(taggedFileFailures, session: session, scope: runtimeSessionStore)
-            session.deferredActiveAgentRunTimerRollback = nil
-            managedTurn?.sink.resolve(.delivered(.deliveredToWaitingInstruction))
-        }
-    }
-
     // MARK: - Managed cross-session steer
 
     private var runtimeInputEnvironmentSource: @MainActor () -> AgentSessionLinkExecutionRuntime.ManagedInputEnvironment {
@@ -16657,28 +16435,29 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
         userItem.delegationDecisionBatch = delegationDecisionBatch
         let canonicalPublication: AgentSessionComposerSubmitRuntime.CanonicalPublication?
+        let turnRuntimeAnchorRollback: AgentTurnUserAnchorRollbackState
+        let localComposerCandidate: UUID?
+        let acceptedSwitchPreparation = providerSwitchPreparation?.accepting(userItem.id, session: session)
+        let registersLocalComposerOrigin = composerOrigin == .localComposer && isLocalComposerInput
+            && managedTurn == nil && codexAttemptID == nil && !trimmedText.isEmpty
         if canonicalLocalDispatch {
             guard let originalHost = canonicalHost, let claim = providerSwitchClaim,
-                  let publication = originalHost.scope.submissions.captureCanonicalPublication(
-                      claim: claim, host: originalHost, session: session, item: userItem
+                  let accepted = originalHost.scope.submissions.publishCanonicalInput(
+                      userItem, claim: claim, host: originalHost, registersLocalComposerOrigin: registersLocalComposerOrigin
                   ) else { return .blocked(message: Self.staleComposerSubmitTargetMessage) }
-            canonicalPublication = publication
-        } else { canonicalPublication = nil }
-        let acceptedSwitchPreparation = providerSwitchPreparation?.accepting(userItem.id, session: session)
-        let turnRuntimeAnchorRollback = recordAgentTurnUserAnchor(for: session, userItem: userItem)
-        session.appendItem(userItem)
-        if isLocalComposerInput, managedTurn == nil, codexAttemptID == nil {
-            session.composerStartCancellation?.recordOptimisticInput(userItem.id, on: session)
-        }
-        // Only the validated composer ingress supplies this positive token. Shared MCP/API
-        // defaults and attachment-only synthetic bubble labels never qualify.
-        let publishedIndex = canonicalLocalDispatch ? canonicalPublication?.acceptedInputIndex : session.items.indices.last
-        let localComposerCandidate: UUID? = if composerOrigin == .localComposer, isLocalComposerInput, managedTurn == nil, codexAttemptID == nil,
-                                               !trimmedText.isEmpty, let publishedIndex
-        {
-            session.registerLocalComposerCandidate(itemID: userItem.id, at: publishedIndex)
+            canonicalPublication = accepted.publication
+            turnRuntimeAnchorRollback = accepted.anchorRollback
+            localComposerCandidate = accepted.localComposerCandidate
         } else {
-            nil
+            canonicalPublication = nil
+            turnRuntimeAnchorRollback = recordAgentTurnUserAnchor(for: session, userItem: userItem)
+            session.appendItem(userItem)
+            if isLocalComposerInput, managedTurn == nil, codexAttemptID == nil {
+                session.composerStartCancellation?.recordOptimisticInput(userItem.id, on: session)
+            }
+            localComposerCandidate = if registersLocalComposerOrigin, let index = session.items.indices.last {
+                session.registerLocalComposerCandidate(itemID: userItem.id, at: index)
+            } else { nil }
         }
         func dispatchCanonicalPreparedTurn() -> UserTurnSubmissionResult {
             guard let claim = providerSwitchClaim, let originalHost = canonicalHost,
@@ -16721,7 +16500,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
         }
         if let publication = canonicalPublication, let originalHost = canonicalHost, let claim = providerSwitchClaim,
-           publishedIndex == nil || !originalHost.scope.submissions.isCurrent(claim)
+           publication.acceptedInputIndex == nil || !originalHost.scope.submissions.isCurrent(claim)
            || originalHost.workspaceActivation?.isCurrent != true || !publication.command.isCurrent
         {
             // Synchronous publication may revoke admission. Handle its original receipt before
@@ -16820,22 +16599,22 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
 
         @MainActor func dispatchWaitingInstruction() {
-            dispatchWaitingInstructionSubmission(
-                repromptedText: repromptedText,
-                tabID: tabID,
-                session: session,
-                text: wrappedText,
-                attachments: attachmentsToSend,
-                taggedFiles: taggedFilesToSend,
-                userItemID: userItem.id,
-                turnRuntimeAnchorRollback: turnRuntimeAnchorRollback,
-                draftText: restorationDraftText,
-                selectedWorkflow: restorationSelectedWorkflow,
-                selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
-                managedTurn: managedTurn,
-                localComposerCandidate: localComposerCandidate,
-                skipsSlashExpansion: providerSkipsSlashExpansion,
-                providerTaggedFiles: providerTaggedFiles
+            let originalLinks = linkExecutionRuntime
+            originalLinks.dispatchLocalWaitingInstruction(
+                session: session, text: wrappedText, row: userItem, providerTaggedFiles: providerTaggedFiles ?? taggedFilesToSend,
+                rollback: turnRuntimeAnchorRollback, draftText: restorationDraftText,
+                workflow: restorationSelectedWorkflow, workflowGeneration: restorationSelectedWorkflowMutationGeneration, localComposerCandidate: localComposerCandidate,
+                skipsSlashExpansion: providerSkipsSlashExpansion, managedTurn: managedTurn,
+                rejectedPresentation: { [weak self] message in
+                    guard let self, linkExecutionRuntime === originalLinks else { return }
+                    if currentTabID == tabID { selectedWorkflow = session.selectedWorkflow }
+                    if let repromptedText {
+                        repromptUIStore.recoveries[tabID] = .init(
+                            text: repromptedText, originalDraft: restorationDraftText, reason: message,
+                            draftAtInvalidation: draftRuntime.text(for: tabID)
+                        )
+                    }
+                }
             )
         }
 
@@ -17162,27 +16941,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return UserTurnSubmissionResult.submitted
     }
 
-    func interruptedACPProviderText(for session: TabSession, before steeringUserItem: AgentChatItem) -> String? {
-        guard let interruptedUserItem = session.items.last(where: {
-            $0.kind == .user && $0.sequenceIndex < steeringUserItem.sequenceIndex
-        }) else {
-            return nil
-        }
-        // New attributed rows retain the exact payload passed to the provider. Legacy attributed
-        // rows lack a provable envelope and must still be omitted rather than impersonated.
-        if let dispatched = interruptedUserItem.dispatchedProviderText {
-            return dispatched
-        }
-        guard interruptedUserItem.crossSessionAttribution == nil else { return nil }
-        let rendered = AgentSessionProviderInputRuntime.renderProviderMessage(
-            text: interruptedUserItem.text,
-            attachments: interruptedUserItem.attachments,
-            agent: session.selectedAgent
-        )
-        let trimmed = rendered.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
     private func activeProviderSteeringRoute(
         for session: TabSession,
         attachments: [AgentFileAttachment] = []
@@ -17223,39 +16981,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return true
     }
 
-    private func settleRejectedACPSteeringSubmission(
-        id: UUID,
-        session: TabSession,
-        stopFence: AgentRunStartStopFence
-    ) {
-        guard stopFence.permitsStart(of: session),
-              let queuedIndex = session.pendingACPSteeringInstructions.firstIndex(where: { $0.id == id })
-        else { return }
-        let queued = session.pendingACPSteeringInstructions.remove(at: queuedIndex)
-        let instruction = TabSession.PendingInstruction(
-            providerText: queued.providerText,
-            localDraftText: queued.managed == nil ? queued.draftText : nil,
-            stopFence: stopFence,
-            skipsSlashExpansion: queued.skipsSlashExpansion
-        )
-        if session.runState.isActive {
-            session.pendingInstructions.insert(instruction, at: 0)
-            queued.managed?.sink.resolve(.delivered(.queuedFollowUp))
-        } else if session.runState == .completed, session.acpController != nil {
-            queued.managed?.sink.resolve(.delivered(.queuedFollowUp))
-            scheduleTypedACPFollowUpRun(
-                session: session, instruction: instruction, capturedStopFence: instruction.stopFence
-            )
-        } else {
-            // A rejected ACP steer remains a provider follow-up, never a composer draft.
-            session.pendingInstructions.insert(instruction, at: 0)
-            queued.managed?.sink.resolve(.delivered(.queuedFollowUp))
-            session.isDirty = true
-            updateBindingsFromSession(session)
-            persistenceRuntime.scheduleSave(for: session.tabID)
-        }
-    }
-
     private func submitActiveProviderSteering(
         _ route: ActiveProviderSteeringRoute,
         session: TabSession,
@@ -17279,7 +17004,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             // Claude native steering. The run service waits for MCP tools to go idle,
             // sends session/cancel, waits for the active ACP prompt to settle, then
             // submits the steering session/prompt. Do not prompt directly here.
-            let interruptedPromptProviderText = interruptedACPProviderText(for: session, before: userItem)
+            let interruptedPromptProviderText = AgentSessionLinkExecutionRuntime.interruptedACPProviderText(for: session, before: userItem)
             let steering = TabSession.ACPSteeringInstruction(
                 id: UUID(),
                 targetRunID: session.runID,
@@ -17302,24 +17027,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 skipsSlashExpansion: skipsSlashExpansion,
                 providerTaggedFileAttachments: providerTaggedFiles
             )
-            session.pendingACPSteeringInstructions.append(steering)
-            session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained)
-            Self.steeringDebugLog("[AgentRunSteeringWake] ACP steering queued tab=\(session.tabID) runID=\(String(describing: session.runID)) attempt=\(String(describing: session.activeRunAttemptID)) queue=\(session.pendingACPSteeringInstructions.count) mcpDispatch=\(session.isMCPInstructionDispatchInProgress)")
-            guard !session.isMCPInstructionDispatchInProgress else {
-                Self.steeringDebugLog("[AgentRunSteeringWake] ACP steering flush owned by MCP dispatch tab=\(session.tabID) queue=\(session.pendingACPSteeringInstructions.count)")
-                return true
-            }
-            let producerStopFence = AgentRunStartStopFence(session: session)
-            Task { [weak self, weak session] in
-                guard let self, let session, producerStopFence.permitsStart(of: session) else { return }
-                let accepted = await runService.submitQueuedACPSteeringIfSupported(session: session)
-                guard producerStopFence.permitsStart(of: session) else { return }
-                guard !accepted else { return }
-                settleRejectedACPSteeringSubmission(
-                    id: steering.id, session: session, stopFence: producerStopFence
-                )
-            }
-            return true
+            let owner = runtimeSessionStore
+            let service = runService
+            let command = linkExecutionRuntime.instructionCommand(for: session)
+            return linkExecutionRuntime.enqueueACPSteering(
+                steering, session: session, owner: owner, service: service, localComposerCandidate: localComposerCandidate,
+                admitted: { command?.isCurrent ?? (owner.executableHost?.workspaceActivation == nil) }
+            )
         case .claudeNativeInterrupt:
             return runtimeSessionStore.startup.queueClaudeSteering(
                 session: session, service: runService, wrappedText: wrappedText,

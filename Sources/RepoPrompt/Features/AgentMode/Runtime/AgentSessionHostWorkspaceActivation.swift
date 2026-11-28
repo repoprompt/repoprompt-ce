@@ -344,7 +344,7 @@ final class AgentSessionHostWorkspaceActivation {
         return .init(workspace: .init(
             store: resources.files,
             lookupSource: .init(activeAgentSessionID: command.identity.sessionID, worktreeBindings: bindings),
-            workspacePaths: lease.snapshot.document.metadata.repoPaths, isCurrent: current,
+            workspacePaths: lease.snapshot.document.metadata.repoPaths, retainedRoots: lease, isCurrent: current,
             validate: {
                 guard current(), await self.validateExecutionInput(lease: lease, command: command) else { return false }
                 return current()
@@ -378,10 +378,16 @@ final class AgentSessionHostWorkspaceActivation {
     }
 
     func captureWorktreeAdmission(
-        command: AgentSessionRuntimeStore.Command, rootIDs: [UUID], route: MCPHostRouteResources
+        command: AgentSessionRuntimeStore.Command, route: MCPHostRouteResources
     ) async throws -> AgentSessionWorktreeRuntime.Admission {
+        try command.requireCurrent()
+        guard owns(scope: command.writer.scope, route: route), !route.isClosing, let base = catalogFileLease else {
+            throw AgentHostWorkspaceResources.Failure.authorityUnavailable
+        }
         let bindings = command.writer.session.worktreeBindings
-        let lease = try await captureLease(command: command, rootIDs: rootIDs, route: route)
+        let lease = try await base.capture(workspaceID: command.identity.workspaceID, authority: .canonical) {
+            self.executionTab(in: $0, command: command) != nil
+        }
         let workspace = try JSONDecoder().decode(WorkspaceModel.self, from: lease.snapshot.document.documentBytes)
         guard !workspace.isSystemWorkspace, executionTab(in: lease.snapshot, command: command) != nil
         else { throw AgentHostWorkspaceResources.Failure.contextUnavailable }
@@ -411,7 +417,7 @@ final class AgentSessionHostWorkspaceActivation {
         let admission = AgentSessionWorktreeRuntime.Admission(command: command, resources: .init(
             store: resources.files, fallbackWorkspacePath: workspace.repoPaths.first,
             declaredRepoPaths: workspace.repoPaths, storageDirectory: workspace.customStoragePath,
-            awaitRootReadiness: validatePlacement, validatePlacement: validatePlacement, isCurrent: current
+            retainedRoots: lease, awaitRootReadiness: validatePlacement, validatePlacement: validatePlacement, isCurrent: current
         ), bindings: bindings)
         try admission.requireCurrent()
         return admission

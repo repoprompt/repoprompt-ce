@@ -516,7 +516,7 @@ final class AgentSessionPinDuringInitTests: XCTestCase {
         defer { _ = harness.host.scope.submissions.release(submission) }
 
         let pending = Task {
-            try await harness.host.prepareFreshCreation(submission: submission, rootIDs: [])
+            try await harness.host.prepareFreshCreation(submission: submission)
         }
         await gate.waitUntilEntered()
         let createdSessionID = try XCTUnwrap(harness.session.activeAgentSessionID)
@@ -610,7 +610,7 @@ final class AgentSessionPinDuringInitTests: XCTestCase {
         defer { _ = creationHarness.host.scope.submissions.release(submission) }
 
         let pendingCreation = Task {
-            try await creationHarness.host.prepareFreshCreation(submission: submission, rootIDs: [])
+            try await creationHarness.host.prepareFreshCreation(submission: submission)
         }
         await creationGate.waitUntilEntered()
 
@@ -737,7 +737,7 @@ final class AgentSessionPinDuringInitTests: XCTestCase {
         defer { _ = creationHarness.host.scope.submissions.release(submission) }
 
         let pendingCreation = Task {
-            try await creationHarness.host.prepareFreshCreation(submission: submission, rootIDs: [])
+            try await creationHarness.host.prepareFreshCreation(submission: submission)
         }
         await creationGate.waitUntilEntered()
 

@@ -765,8 +765,8 @@ print_matches \
 # class (AgentTabSession) and uses provider-neutral domain terminal command
 # vocabulary directly.
 terminal_session_neutral_files=(
-  "Sources/RepoPrompt/Features/AgentMode/Runtime/AgentRunTerminalSessionBinding.swift"
-  "Sources/RepoPrompt/Features/AgentMode/Runtime/AgentRunTerminalCommitBarrier.swift"
+  "Sources/RepoPromptAgentRuntime/AgentRunTerminalSessionBinding.swift"
+  "Sources/RepoPromptAgentRuntime/AgentRunTerminalCommitBarrier.swift"
 )
 for path in "${terminal_session_neutral_files[@]}"; do
   if [[ ! -f "$path" ]]; then

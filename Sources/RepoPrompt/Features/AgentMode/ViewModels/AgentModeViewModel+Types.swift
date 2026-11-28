@@ -831,10 +831,7 @@ extension AgentModeViewModel {
         }
     }
 
-    enum ExecutionLocationChangeConfirmation: Equatable {
-        case startedThreadRestart
-        case activeRunStop
-    }
+    typealias ExecutionLocationChangeConfirmation = AgentSessionWorktreeRuntime.Confirmation
 
     enum ExecutionLocationChangeResult: Equatable {
         case applied
@@ -852,11 +849,7 @@ extension AgentModeViewModel {
         let provider: AgentProviderKind
     }
 
-    enum WorktreeBindingTransitionIntent {
-        case initialSend
-        case userExecutionLocationChange(confirmation: ExecutionLocationChangeConfirmation?)
-        case externalManagement
-    }
+    typealias WorktreeBindingTransitionIntent = AgentSessionWorktreeRuntime.Intent
 
     /// Internal for cross-file AgentModeViewModel extension access after the mechanical file split.
     struct PendingUserTurnState: Equatable {

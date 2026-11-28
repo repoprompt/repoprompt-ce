@@ -53,8 +53,13 @@ final class AgentSessionLinkExecutionRuntime {
 
     var pendingSelfCompactEffects: [UUID: SelfCompactEffect] = [:]
     var pendingSendEffects: [UUID: PendingSendEffect] = [:]
+    struct PendingInputEffect {
+        let sessionIdentity: ObjectIdentifier
+        let join: @MainActor () async -> Void
+    }
+
     /// Provider producers join separately from terminal-save effects to avoid a terminal cycle.
-    var pendingManagedInputEffects: [UUID: PendingSendEffect] = [:]
+    var pendingInputEffects: [UUID: PendingInputEffect] = [:]
     var pendingStopEffects: [UUID: PendingSendEffect] = [:]
     let routeID: Int
     let commands: Commands

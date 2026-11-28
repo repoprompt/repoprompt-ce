@@ -36,6 +36,7 @@ final class AgentSessionPresentationRuntime {
         var oversightProjection: ((AgentTabSession) -> Void)?
         var oversightPolicy: ((AgentTabSession) -> Void)?
         var permissions: ((AgentTabSession) -> Void)?
+        var providerSwitchSummary: ((UUID) -> Void)?
         var worktreeOperations: ((AgentTabSession) -> Void)?
         var draftChanged: ((AgentTabSession, String) -> Void)?
         var draftRestored: ((AgentTabSession, AgentComposerDraftRestorationEvent) -> Void)?
@@ -233,6 +234,10 @@ final class AgentSessionPresentationRuntime {
 
     func elapsedTimeChanged(_ session: AgentTabSession) {
         sink(for: session)?.elapsedTime?(session)
+    }
+
+    func providerSwitchSummaryChanged(_ session: AgentTabSession) {
+        sink(for: session)?.providerSwitchSummary?(session.tabID)
     }
 
     func bindingChanged(_ session: AgentTabSession) {

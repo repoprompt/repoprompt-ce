@@ -716,12 +716,14 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
         /// Physical uniqueness is established by the shared carrier capture. Runtime is compared
         /// separately here; every other rendered fact must still agree across window replicas.
         let record: DomainAgentSessionInventoryRecord
+        var lastActivityAt: Date
         var runtime = LoadedRuntimeEvidence()
 
         mutating func merge(
-            record: DomainAgentSessionInventoryRecord, observation: LoadedRuntimeObservation
+            record: DomainAgentSessionInventoryRecord, lastActivityAt: Date, observation: LoadedRuntimeObservation
         ) -> Bool {
             guard self.record == record else { return false }
+            self.lastActivityAt = max(self.lastActivityAt, lastActivityAt)
             runtime.observe(observation)
             return true
         }
@@ -738,7 +740,7 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
                 parentSessionID: record.parentSessionID,
                 createdByOverseerSessionID: record.createdByOverseerSessionID,
                 organizationalParentID: record.organizationalParentID,
-                createdAt: record.createdAt, lastActivityAt: record.lastActivityAt,
+                createdAt: record.createdAt, lastActivityAt: lastActivityAt,
                 worktreeCount: record.worktreeCount
             )
         }
@@ -833,17 +835,17 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
                 createdByOverseerSessionID: entry?.createdByOverseerSessionID,
                 organizationalParentID: entry?.organizationalParentID,
                 createdAt: history?.firstActivityAt,
-                lastActivityAt: lastActivity,
+                lastActivityAt: .distantPast,
                 worktreeCount: entry?.worktreeBindingSummaries.count ?? history?.worktreeBindingSummaries.count ?? 0
             )
             if var existing = projections[sessionID] {
-                if existing.merge(record: record, observation: observation) {
+                if existing.merge(record: record, lastActivityAt: lastActivity, observation: observation) {
                     projections[sessionID] = existing
                 } else {
                     unresolved[sessionID] = AgentSessionInventoryReadFailure.Reason.replicaMismatch.rawValue
                 }
             } else {
-                var projection = LoadedCarrierProjection(record: record)
+                var projection = LoadedCarrierProjection(record: record, lastActivityAt: lastActivity)
                 projection.runtime.observe(observation)
                 projections[sessionID] = projection
             }

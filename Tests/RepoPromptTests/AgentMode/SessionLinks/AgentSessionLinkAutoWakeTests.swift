@@ -652,6 +652,42 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         tools.endAgentRunWaitScope(unrelatedWait.token, completion: completion)
     }
 
+    func testCanonicalProviderSwitchSummarySettlesWithoutPresenter() async throws {
+        let (host, fixture, _, provider, _, _, _) = try await hostStartupFixture(
+            canonicalWorkspace: true, boundCanonicalCarrier: true, canonicalInput: true
+        )
+        let session = fixture.session
+        let reply = "Summary of the originating session."
+        provider.environment["ACP_ASSISTANT_TEXT_ON_PROMPT"] = reply
+        provider.usesDefaultNormalizer = true
+        let command = try host.scope.admit(session: session)
+        let request = try XCTUnwrap(AgentProviderHandover.summaryRequest(wordLimit: 100))
+        let row = AgentChatItem.user(request, sequenceIndex: session.nextSequenceIndex)
+        XCTAssertFalse(host.scope.presentation.hasPresenter(for: session))
+        XCTAssertTrue(host.scope.handoff.registerProviderSwitchSummary(
+            command: command, rowID: row.id, destination: .codexExec, model: "destination-model"
+        ))
+        session.appendItem(row)
+        session.isDirty = true
+        try await host.scope.persistence.flushSaveRequired(writer: command.writer).get()
+        let outcome = AgentRunStartOutcomeRecorder()
+        _ = await fixture.runtime.startAgentRun(
+            command: command, initialMessage: request,
+            directStartOptions: .init(ignoresPendingHandoff: true, initialUserItemID: row.id),
+            startOutcome: outcome, providerSwitchPreparation: nil
+        )
+        guard outcome.outcome.didStart else { return XCTFail("The original host must start the summary") }
+        try await routeScriptedHostProvider(session)
+        await session.agentTask?.value
+        guard case let .generated(text, revision)? = host.scope.handoff.providerSwitchSummary(for: session)?.outcome else {
+            return XCTFail("The canonical terminal event must settle Summary without a sheet")
+        }
+        XCTAssertEqual(text, reply)
+        XCTAssertEqual(revision, session.sourceItemsRevision)
+        XCTAssertEqual(provider.promptedMessages.count, 1)
+        XCTAssertNil(session.pendingHandoff.payload)
+    }
+
     func testCanonicalComposerPublicationRefusalUsesPrepublicationCleanupOnly() async throws {
         for change in ["claim", "claim-existing-draft", "membership", "draft", "workflow", "reused-row"] {
             let (host, f, _, provider, _, _, _) = try await hostStartupFixture(
@@ -721,6 +757,61 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             submissions.release(claim)
             XCTAssertTrue(claim.cancellation.isFinalized, change)
         }
+    }
+
+    func testCanonicalActiveCodexInputOutlivesItsComposerClaim() async throws {
+        let controller = MonitorFakeCodexController(dispatches: MonitorCodexDispatchRecorder())
+        let (host, fixture, _, _, _, _, _) = try await hostStartupFixture(
+            canonicalWorkspace: true, boundCanonicalCarrier: true, canonicalInput: true,
+            codexController: controller
+        )
+        let session = fixture.session
+        session.selectedAgent = .codexExec
+        let command = try host.scope.admit(session: session)
+        let started = await host.startCanonicalRequest(
+            command: command, message: "First test message", options: .default, outcome: nil
+        )
+        XCTAssertEqual(started, .sent)
+        guard started == .sent else { return }
+        controller.markActiveTurn(id: "turn-1")
+        await host.codexCoordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "turn-1"), session: session, sourceController: controller)
+        XCTAssertTrue(session.runState.isActive)
+        XCTAssertEqual(session.codexAuthoritativeActiveTurn?.turnID, "turn-1")
+        let ticket = session.codexDispatchSerialGate.issueTicket()
+        let entered = await session.codexDispatchSerialGate.awaitTurn(ticket)
+        XCTAssertTrue(entered)
+
+        let submissions = host.scope.submissions
+        let target = try XCTUnwrap(submissions.programmaticTarget(command))
+        let message = "Second test message"
+        let attempt = AgentComposerSubmitAttempt(
+            id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: message
+        )
+        guard case let .claimed(claim) = submissions.claim(attempt, command: command) else {
+            session.codexDispatchSerialGate.finish(ticket)
+            return XCTFail("Expected the local input claim")
+        }
+        let row = AgentChatItem.user(message, sequenceIndex: session.nextSequenceIndex)
+        let accepted = try XCTUnwrap(submissions.publishCanonicalInput(
+            row, claim: claim, host: host, registersLocalComposerOrigin: true
+        ))
+        let submission = submissions.submitCanonicalTurn(.init(
+            publication: accepted.publication, message: message, attachments: [], taggedFiles: [], providerTaggedFiles: [],
+            userItemID: row.id, draftText: message, workflow: nil, workflowMutationGeneration: nil,
+            anchorRollback: accepted.anchorRollback, autoEffortSelection: nil,
+            options: .init(localComposerCandidate: accepted.localComposerCandidate), providerSwitchPreparation: nil
+        ), claim: claim, host: host)
+        submissions.release(claim)
+        XCTAssertNil(session.composerStartCancellation, "Another input must be admissible while the provider queue is held")
+        session.codexDispatchSerialGate.finish(ticket)
+        guard case let .queued(producer) = submission else { return XCTFail("Expected the admitted input producer") }
+
+        let outcome = await producer.value
+        XCTAssertEqual(outcome, .sent)
+        XCTAssertEqual(controller.startedTurns.count, 1)
+        XCTAssertEqual(controller.steeredTurns.count, 1)
+        XCTAssertTrue(controller.steeredTurns.first?.contains(message) == true)
+        XCTAssertEqual(session.items.count(where: { $0.id == row.id }), 1)
     }
 
     func testCanonicalComposerProducerRetainsOriginalHostAndWriterAcrossScheduling() async throws {
@@ -808,6 +899,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                 } else if change == "codex-new-draft" {
                     XCTAssertEqual(f.session.draftText, "Newer draft after owned clear")
                     XCTAssertTrue(f.session.items.contains { $0.id == item.id })
+                    XCTAssertTrue(f.session.items.contains { $0.recoveryDiagnostic?.outcome == "notDispatched" })
                 } else if codex {
                     XCTAssertEqual(f.session.draftText, "Original local draft")
                     XCTAssertFalse(f.session.items.contains { $0.id == item.id })
@@ -1524,11 +1616,11 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         try await runVisibleLifetimeWitness(switchWorkspace: true, heldTool: .question)
     }
 
-    func testLastWindowCloseKeepsOriginatingProtectedFileEditAndGit() async throws {
+    func testLastWindowCloseKeepsOriginatingProtectedFileEditGitAndWorktrees() async throws {
         try await runVisibleLifetimeWitness(switchWorkspace: false, heldTool: .fileEdit)
     }
 
-    func testWorkspaceSwitchKeepsOriginatingProtectedFileEditAndGit() async throws {
+    func testWorkspaceSwitchKeepsOriginatingProtectedFileEditGitAndWorktrees() async throws {
         try await runVisibleLifetimeWitness(switchWorkspace: true, heldTool: .fileEdit)
     }
 
@@ -1575,9 +1667,9 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         let otherRoot: URL?
         if let gitFixture {
             root = try gitFixture.makeRepository(named: "original-root", files: ["Witness.swift": VisibleHeldTool.uneditedSource])
-            let decoy = directory.appendingPathComponent("other-root", isDirectory: true)
-            try gitFixture.write(VisibleHeldTool.uneditedSource, to: "Witness.swift", at: decoy)
-            otherRoot = decoy
+            let originalWorktree = directory.appendingPathComponent("original-worktree", isDirectory: true)
+            _ = try gitFixture.runGit(["worktree", "add", "-b", "original-host-only", originalWorktree.path], at: root)
+            otherRoot = try gitFixture.makeRepository(named: "other-root", files: ["Witness.swift": VisibleHeldTool.uneditedSource])
         } else {
             root = directory.appendingPathComponent("original-root")
             otherRoot = nil
@@ -1938,6 +2030,10 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             addTeardownBlock { _ = await switching.result }
             guard await suspension.waitUntilEntered() else { return XCTFail("Switch did not prepare B") }
             XCTAssertTrue(agent.runtimeHost === host)
+            XCTAssertEqual(window.workspaceManager.activeWorkspaceID, second.id)
+            let provenance = OpenWindowsDelegationProvenanceSource(windows: { [window] })
+            XCTAssertEqual(provenance.resolutionState(for: sessionID), .unique)
+            XCTAssertEqual(provenance.placement(for: sessionID)?.workspaceID, workspace.id)
             try assertOriginalAttempt()
             try await assertExplicitDetachedShutdown(
                 .workspaceDeletion, host: host, session: session, attemptID: attemptID, workspaceID: workspace.id,
@@ -2002,7 +2098,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                 gate.release()
                 await revoke.value
                 await task.value
-                await host.scope.linkExecution?.drainPendingManagedInputEffects(for: session)
+                await host.scope.linkExecution?.drainPendingInputEffects(for: session)
                 XCTAssertEqual(session.runState, .cancelled)
                 XCTAssertEqual(session.lastTerminalCommitRevision?.ownership.attemptID, attemptID)
                 XCTAssertTrue(command.writer.ownsPersistentClaim)
@@ -2260,6 +2356,10 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             do {
                 let diff = try await invoke("git", ["op": .string("diff"), "detail": .string("patches")])
                 XCTAssertTrue(String(describing: diff).contains("+func visibleHostWitness() -> Int { 43 }"), "\(diff)")
+                let worktrees = try await invoke("manage_worktree", ["op": .string("list")])
+                let branches = worktrees.objectValue?["worktrees"]?.arrayValue?.compactMap { $0.objectValue?["branch"]?.stringValue }
+                XCTAssertEqual(Set(branches ?? []), ["main", "original-host-only"])
+                XCTAssertFalse(String(describing: worktrees).contains(otherFile.deletingLastPathComponent().path), "\(worktrees)")
             } catch {
                 XCTFail("Git failed on the retained originating root: \(error)")
                 throw error
@@ -3045,7 +3145,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                 if change == "saveStop" { _ = await gate.requirement() }
                 return saved
             }
-            let pending = Task { try await host.prepareFreshCreation(submission: submission, rootIDs: []) }
+            let pending = Task { try await host.prepareFreshCreation(submission: submission) }
             await gate.waitUntilEntered()
             let createdID = try XCTUnwrap(session.activeAgentSessionID)
             switch change {
@@ -3119,7 +3219,6 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         let captured = MCPWorktreeToolProvider.ExecutionAdmission(command)
         let admission = try await captured.resolve()
         XCTAssertEqual(admission.command.identity, command.identity)
-        XCTAssertNotNil(admission.resources.store)
         try admission.requireCurrent()
 
         let current = await authority.canonicalWorkspaceSnapshot(command.identity.workspaceID)
@@ -3235,7 +3334,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
     /// the external provider is scripted; startup is never intercepted or delegated to a VM.
     private func hostStartupFixture(
         canonicalWorkspace: Bool = false, boundCanonicalCarrier: Bool = false, canonicalInput: Bool = false,
-        registersProviderRoute: Bool = false,
+        registersProviderRoute: Bool = false, codexController: MonitorFakeCodexController? = nil,
         makeResponseGate: ((URL) throws -> AgentSessionLinkACPResponseGate)? = nil,
         commandWillExecute: (@Sendable (DomainWorkspaceCommandEnvelope) async -> Void)? = nil
     ) async throws -> (
@@ -3271,7 +3370,10 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         }
         let codex = CodexAgentModeCoordinator(
             windowID: route.identity.routeID, runtimeWorkspacePathsProvider: { _ in .uniform(nil) },
-            codexControllerFactory: { _, _, _, _, _, _, _, _, _ in preconditionFailure("ACP must not construct Codex") },
+            codexControllerFactory: { _, _, _, _, _, _, _, _, _ in
+                guard let codexController else { preconditionFailure("ACP must not construct Codex") }
+                return codexController
+            },
             connectionPolicyInstaller: policy, shouldManageCodexTooling: false, codexHookApprovalSettings: GlobalSettingsStore.shared
         )
         let host = AgentSessionRuntimeHost(
@@ -3304,6 +3406,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         let keys = KeyManager()
         let settings = APISettingsViewModel(aiQueriesService: AIQueriesService(keyManager: keys), keyManager: keys, loadStoredDataOnInit: false)
         settings.isOpenCodeConnected = true
+        if codexController != nil { settings.isCodexConnected = true }
         let settingsLease = try XCTUnwrap(APISettingsRuntimeLease.acquire(from: settings))
         addTeardownBlock { await lease.release()
             await MainActor.run { settingsLease.release() }
@@ -3312,10 +3415,14 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         activations.receiveWorkspaceSwitchNotification(workspace)
         if canonicalWorkspace {
             authority.commandWillExecuteForTesting = commandWillExecute
-            try await host.installWorkspaceActivation(.init(
+            let activation = try AgentSessionHostWorkspaceActivation(
                 windowID: host.routeID, authority: authority, activations: activations,
                 resources: .init(files: files, contexts: domain.contextStore), settings: settingsLease
-            ), attachmentWorkspaceDirectory: directory, suppressesAttachmentPersistence: false)
+            )
+            try await host.installWorkspaceActivation(
+                activation, attachmentWorkspaceDirectory: directory, suppressesAttachmentPersistence: false
+            )
+            try await activation.retainHostFileResources(rootIDs: [])
         }
         if canonicalInput {
             XCTAssertTrue(host.scope.sessions.isEmpty)
@@ -3347,7 +3454,14 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             prepareLaunch: { nil }, perfRecorder: NoopAgentModePerfRecorder()
         )
         host.scope.installExecution(execution)
+        if codexController != nil {
+            host.installCodexRuntime(
+                codex, routeID: route.identity.routeID, approvalStore: ApplyEditsApprovalStore(),
+                links: f.runtime, mcpServerEnabler: { true }, modelRouterSettingsStore: .shared
+            )
+        }
         addTeardownBlock { @MainActor in
+            await f.session.codexController?.shutdown()
             await f.session.agentTask?.value
             await f.session.acpController?.shutdown()
             await host.scope.persistence.flushSave(for: f.session.tabID)

@@ -254,7 +254,7 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
             runtime.captureResources = { command in
                 guard let resources = originalCapture(command) else { return nil }
                 return .init(
-                    store: resources.store,
+                    store: resources.test_store,
                     fallbackWorkspacePath: resources.fallbackWorkspacePath,
                     declaredRepoPaths: resources.declaredRepoPaths,
                     awaitRootReadiness: resources.awaitRootReadiness,

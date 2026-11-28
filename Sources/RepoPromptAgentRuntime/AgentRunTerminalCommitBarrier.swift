@@ -2,54 +2,74 @@ import Foundation
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 
-extension AgentSessionRunState {
-    var isTerminalForCommit: Bool {
-        self == .completed || self == .cancelled || self == .failed
-    }
+package struct AgentRunTerminalCommitRevision: Equatable {
+    package let commitID: UUID
+    package let ownership: AgentRunOwnership
+    package let terminalState: AgentSessionRunState
+    package let failureReason: DomainAgentRunSnapshot.FailureReason?
+    package let expectedRunID: UUID?
+    package let sourceItemsRevision: Int
+    package let assistantDeltaFlushGeneration: UInt64
+    package let providerDrainGeneration: UInt64
+    package let mcpPublicationEnvelope: AgentRunTerminalPublicationEnvelope?
+    package let successorKind: AgentRunEpochTransitionKind?
+    package let providerSuccessorID: UUID?
 
-    /// MCP snapshot status equivalent of a committed terminal run state.
-    var mcpTerminalSnapshotStatus: DomainAgentRunSnapshot.Status? {
-        switch self {
-        case .completed: .completed
-        case .failed: .failed
-        case .cancelled: .cancelled
-        case .idle, .running, .waitingForUser, .waitingForQuestion, .waitingForApproval: nil
-        }
+    package init(
+        commitID: UUID,
+        ownership: AgentRunOwnership,
+        terminalState: AgentSessionRunState,
+        failureReason: DomainAgentRunSnapshot.FailureReason?,
+        expectedRunID: UUID?,
+        sourceItemsRevision: Int,
+        assistantDeltaFlushGeneration: UInt64,
+        providerDrainGeneration: UInt64,
+        mcpPublicationEnvelope: AgentRunTerminalPublicationEnvelope?,
+        successorKind: AgentRunEpochTransitionKind?,
+        providerSuccessorID: UUID?
+    ) {
+        self.commitID = commitID
+        self.ownership = ownership
+        self.terminalState = terminalState
+        self.failureReason = failureReason
+        self.expectedRunID = expectedRunID
+        self.sourceItemsRevision = sourceItemsRevision
+        self.assistantDeltaFlushGeneration = assistantDeltaFlushGeneration
+        self.providerDrainGeneration = providerDrainGeneration
+        self.mcpPublicationEnvelope = mcpPublicationEnvelope
+        self.successorKind = successorKind
+        self.providerSuccessorID = providerSuccessorID
     }
-}
-
-struct AgentRunTerminalCommitRevision: Equatable {
-    let commitID: UUID
-    let ownership: AgentRunOwnership
-    let terminalState: AgentSessionRunState
-    let failureReason: DomainAgentRunSnapshot.FailureReason?
-    let expectedRunID: UUID?
-    let sourceItemsRevision: Int
-    let assistantDeltaFlushGeneration: UInt64
-    let providerDrainGeneration: UInt64
-    let mcpPublicationEnvelope: AgentRunTerminalPublicationEnvelope?
-    let successorKind: AgentRunEpochTransitionKind?
-    let providerSuccessorID: UUID?
 }
 
 @MainActor
-final class AgentRunTerminalCommitBarrier {
-    struct ProviderSuccessor {
+package final class AgentRunTerminalCommitBarrier {
+    package struct ProviderSuccessor {
         let id: UUID
         let transitionKind: AgentRunEpochTransitionKind
         let consumeAfterPublication: (
             AgentRunTerminalCommitRevision,
             AgentRunTerminalPublicationResult
         ) -> Bool
+
+        package init(
+            id: UUID,
+            transitionKind: AgentRunEpochTransitionKind,
+            consumeAfterPublication: @escaping (AgentRunTerminalCommitRevision, AgentRunTerminalPublicationResult) -> Bool
+        ) {
+            self.id = id
+            self.transitionKind = transitionKind
+            self.consumeAfterPublication = consumeAfterPublication
+        }
     }
 
-    enum TerminalAnchor {
+    package enum TerminalAnchor {
         case automatic
         case none
         case exact(UUID)
     }
 
-    struct Request {
+    package struct Request {
         // This request carries no concrete app session class. Its domain command values
         // carry no settlement authority; the exact-object binding applies them
         // through host-owned capabilities.
@@ -74,7 +94,7 @@ final class AgentRunTerminalCommitBarrier {
         let prepareProviderState: () -> (@MainActor () async -> Void)?
         let postCommit: (_ revision: AgentRunTerminalCommitRevision, _ publicationResult: AgentRunTerminalPublicationResult) -> Void
 
-        init(
+        package init(
             binding: AgentRunTerminalSessionBinding,
             ownership: AgentRunOwnership,
             expectedRunID: UUID?,
@@ -144,12 +164,12 @@ final class AgentRunTerminalCommitBarrier {
 
     private let perfRecorder: any AgentModePerfRecording
 
-    init(perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()) {
+    package init(perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()) {
         self.perfRecorder = perfRecorder
     }
 
     @discardableResult
-    func commit(_ request: Request) async -> AgentRunTerminalCommitRevision? {
+    package func commit(_ request: Request) async -> AgentRunTerminalCommitRevision? {
         let binding = request.binding
         let lifecycle = binding.lifecycle
         guard request.terminalState == .completed
@@ -506,7 +526,7 @@ final class AgentRunTerminalCommitBarrier {
 
     /// Read-only settlement evidence for an idle-only provider transition. An idle label is not
     /// sufficient while an accepted attempt or any owned teardown for this tab remains.
-    func isSettled(tabID: UUID, lifecycle: AgentRunAttemptLifecycle, hasAcceptedWork: Bool) -> Bool {
+    package func isSettled(tabID: UUID, lifecycle: AgentRunAttemptLifecycle, hasAcceptedWork: Bool) -> Bool {
         !lifecycle.terminalCommitInProgress && lifecycle.activeOwnership == nil && !hasAcceptedWork
             && !terminalTeardownTasks.keys.contains { $0.binding.tabID == tabID }
     }
@@ -514,24 +534,24 @@ final class AgentRunTerminalCommitBarrier {
     /// A snapshot of this owner's actual producers, not a tab lookup performed after an await.
     /// Capturing is allowed only after terminal publication leaves the active commit phase.
     /// Joining cannot cancel a producer or adopt a later same-tab teardown.
-    struct TeardownReceipt {
-        let ownerships: [AgentRunOwnership]
+    package struct TeardownReceipt {
+        package let ownerships: [AgentRunOwnership]
         fileprivate let tasks: [Task<Void, Never>]
 
-        func waitForCompletion() async {
+        package func waitForCompletion() async {
             for task in tasks {
                 await task.value
             }
         }
     }
 
-    func captureTerminalTeardown(tabID: UUID, lifecycle: AgentRunAttemptLifecycle) -> TeardownReceipt? {
+    package func captureTerminalTeardown(tabID: UUID, lifecycle: AgentRunAttemptLifecycle) -> TeardownReceipt? {
         guard !lifecycle.terminalCommitInProgress, lifecycle.activeOwnership == nil else { return nil }
         let captured = terminalTeardownTasks.filter { $0.key.binding.tabID == tabID }
         return TeardownReceipt(ownerships: Array(captured.keys), tasks: Array(captured.values))
     }
 
-    func awaitTerminalPublication(
+    package func awaitTerminalPublication(
         for ownership: AgentRunOwnership,
         lifecycle: AgentRunAttemptLifecycle
     ) async {
@@ -545,7 +565,7 @@ final class AgentRunTerminalCommitBarrier {
         }
     }
 
-    func awaitTerminalTeardown(
+    package func awaitTerminalTeardown(
         for ownership: AgentRunOwnership,
         lifecycle: AgentRunAttemptLifecycle
     ) async {

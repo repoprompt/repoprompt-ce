@@ -7,7 +7,7 @@ extension AgentSessionRuntimeHost {
     /// cancellation before entering this operation; neither a carrier CAS nor its snapshot
     /// grants provider admission. A committed carrier is never rolled back or replayed on refusal.
     func prepareFreshCreation(
-        submission: AgentSessionComposerSubmitClaim, rootIDs: [UUID]
+        submission: AgentSessionComposerSubmitClaim
     ) async throws -> (command: AgentSessionRuntimeStore.Command, stopFence: AgentRunStartStopFence) {
         let session = submission.sourceSession
         // A new local composer binding is still a presenter-origin action. Retained restored
@@ -122,7 +122,7 @@ extension AgentSessionRuntimeHost {
                 throw AgentHostWorkspaceResources.Failure.contextUnavailable
             }
             if initialLocation != .local {
-                let admission = try await resources.captureWorktreeAdmission(command: command, rootIDs: rootIDs, route: route)
+                let admission = try await resources.captureWorktreeAdmission(command: command, route: route)
                 try requireOrigin()
                 try await scope.worktrees.prepareInitialExecutionLocation(
                     initialLocation, admission: admission,

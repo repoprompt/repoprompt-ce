@@ -1778,7 +1778,7 @@ final class AgentModeRunService {
         let expectedRunID = session.runID
         let provider = session.provider
         let acpController = session.acpController
-        let hasAttemptTerminalResources = session.runAttemptTerminalResources?.ownership == ownership
+        let hasAttemptTerminalResources = session.runLifecycle.hasTerminalResources(for: ownership)
         let codexCancellationTarget = session.selectedAgent == .codexExec
             ? dependencies.codexCoordinator.captureCodexCancellationTarget(
                 session,
