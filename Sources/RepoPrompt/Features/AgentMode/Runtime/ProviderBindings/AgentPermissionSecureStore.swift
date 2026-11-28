@@ -492,6 +492,11 @@ final class AgentPermissionSecureStore: @unchecked Sendable {
         return snapshot
     }
 
+    /// Reads the last committed Codex document without waiting on the store or starting a load.
+    func cachedCodexPermissions() -> SecureCodexPermissionDocument? {
+        presentationLock.withLock { presentedDocuments.codex }
+    }
+
     private func loadProviderPermissionsLocked(
         _ providerID: AgentProviderBindingID,
         deferred effects: inout DeferredSideEffects
