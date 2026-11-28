@@ -2424,6 +2424,62 @@ import XCTest
             }
         }
 
+        func testWorkspaceMetadataSaveRebasesAfterPeerProjection() async throws {
+            for rename in [true, false] {
+                try await withProjectionSaveFixture { fixture in
+                    let manager = fixture.manager
+                    let initial = try XCTUnwrap(manager.workspace(withID: fixture.workspace.id))
+                    let prepared = expectation(description: "metadata save prepared")
+                    let finished = expectation(description: "metadata save finished")
+                    let gate = WorkspaceDeleteSuspensionGate()
+                    manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { id, _, remaining in
+                        guard id == initial.id, remaining == 1 else { return }
+                        prepared.fulfill()
+                        await gate.wait()
+                    }
+                    let notifications = NotificationCenter.default.publisher(for: .workspaceListDidChange)
+                        .filter { $0.userInfo?["managerID"] is UUID }
+                        .first()
+                        .sink { _ in finished.fulfill() }
+                    defer {
+                        notifications.cancel()
+                        manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil)
+                        Task { await gate.open() }
+                    }
+                    if rename {
+                        manager.renameWorkspace(initial, newName: "Renamed workspace")
+                    } else {
+                        manager.setWorkspaceHidden(initial, hidden: true)
+                    }
+                    try await self.awaitSaveCheckpoint(prepared)
+                    let generation = fixture.bridge.projectionObservationStateForTesting.generation
+                    _ = try await self.restoreArchivedTabRemotely(in: fixture)
+                    let catalog = await fixture.runtime.workspaceStore.snapshot()
+                    let checkpoint = await fixture.observer.waitForProjection(
+                        afterGeneration: generation, through: catalog.publicationSequence, requireCatalogApplication: true
+                    )
+                    _ = try XCTUnwrap(checkpoint)
+                    let projected = try XCTUnwrap(manager.workspace(withID: initial.id))
+                    XCTAssertEqual(projected.name, initial.name)
+                    XCTAssertFalse(projected.isHiddenInMenus)
+                    XCTAssertTrue(projected.composeTabs.contains { $0.id == fixture.restoredTab.id })
+
+                    await gate.open()
+                    try await self.awaitSaveCheckpoint(finished)
+                    let snapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(initial.id)
+                    let saved = try XCTUnwrap(snapshot)
+                    let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: saved.document.documentBytes)
+                    XCTAssertEqual(canonical.name, rename ? "Renamed workspace" : initial.name)
+                    XCTAssertEqual(canonical.isHiddenInMenus, !rename)
+                    XCTAssertEqual(canonical.composeTabs, projected.composeTabs)
+                    XCTAssertNil(saved.revisions.dirtyRevision)
+                    XCTAssertEqual(manager.workspace(withID: initial.id)?.name, canonical.name)
+                    XCTAssertEqual(manager.workspace(withID: initial.id)?.isHiddenInMenus, canonical.isHiddenInMenus)
+                    try await self.assertCanonicalAndDiskRemain(saved, in: fixture)
+                }
+            }
+        }
+
         func testPreparationDriftRecapturesOnceAndPersistsTheLatestModel() async throws {
             try await assertPreparationDrift(changeCount: 1)
         }

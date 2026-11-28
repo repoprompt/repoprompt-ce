@@ -9,14 +9,48 @@ import RepoPromptWorkspaceCore
 struct AgentHostWorkspaceResources {
     enum Failure: Error { case authorityUnavailable, contextUnavailable, rootsChanged, contextChanged }
 
+    enum SnapshotAuthority {
+        case canonical
+        case readOverlay
+    }
+
     let files: WorkspaceFileContextStore
     let contexts: DomainContextStore?
+
+    #if DEBUG
+        /// Deterministic suspension point right after root retention, before post-retention validation.
+        var test_afterRetainRootsBeforeRecheck: (@MainActor () async -> Void)?
+    #endif
+
+    func withContexts(_ contexts: DomainContextStore?) -> AgentHostWorkspaceResources {
+        var copy = AgentHostWorkspaceResources(files: files, contexts: contexts)
+        #if DEBUG
+            copy.test_afterRetainRootsBeforeRecheck = test_afterRetainRootsBeforeRecheck
+        #endif
+        return copy
+    }
+
+    func workspaceSnapshot(
+        for workspaceID: UUID,
+        authority: SnapshotAuthority
+    ) async -> DomainWorkspaceSnapshot? {
+        switch authority {
+        case .canonical:
+            await contexts?.canonicalWorkspaceSnapshot(workspaceID)
+        case .readOverlay:
+            await contexts?.workspaceSnapshot(workspaceID)
+        }
+    }
 
     /// Roots must already have been loaded through this store's ordinary bounded load API and
     /// cover the canonical workspace paths. An actually empty workspace needs no root retention.
     /// This retains resources and a read receipt, NOT writer, mutation, consent or run admission.
-    func acquire(context identity: DomainContextIdentity, rootIDs: [UUID]) async throws -> Lease {
-        try await acquire(workspaceID: identity.workspaceID, rootIDs: rootIDs) { snapshot in
+    func acquire(
+        context identity: DomainContextIdentity,
+        rootIDs: [UUID],
+        authority: SnapshotAuthority = .readOverlay
+    ) async throws -> Lease {
+        try await acquire(workspaceID: identity.workspaceID, rootIDs: rootIDs, authority: authority) { snapshot in
             snapshot.contexts.contains { $0.metadata.identity == identity && $0.health != .removed }
         }
     }
@@ -24,28 +58,43 @@ struct AgentHostWorkspaceResources {
     /// Saved starts prove a carrier in the canonical document, including stashed tabs which
     /// intentionally are not selectable domain contexts.
     func acquire(
-        workspaceID: UUID, rootIDs: [UUID], admits: (DomainWorkspaceSnapshot) -> Bool
+        workspaceID: UUID,
+        rootIDs: [UUID],
+        authority: SnapshotAuthority = .canonical,
+        admits: (DomainWorkspaceSnapshot) -> Bool
     ) async throws -> Lease {
         try Task.checkCancellation()
-        guard let contexts else { throw Failure.authorityUnavailable }
-        guard let snapshot = await contexts.workspaceSnapshot(workspaceID),
+        guard contexts != nil else { throw Failure.authorityUnavailable }
+        guard let snapshot = await workspaceSnapshot(for: workspaceID, authority: authority),
               snapshot.health != .removed, admits(snapshot)
         else { throw Failure.contextUnavailable }
         let roots = await files.rootRefs()
-        let paths = Set(snapshot.document.metadata.repoPaths.map { ($0 as NSString).standardizingPath })
+        let paths = snapshot.document.metadata.canonicalLoadableRepoPathSet
         let requestedIDs = Set(rootIDs)
         let requestedRoots = roots.filter { requestedIDs.contains($0.id) }
+        let retainedRootPathSet = Set(requestedRoots.compactMap { StandardizedPath.canonicalWorkspaceRootPath($0.fullPath) })
         guard requestedRoots.count == requestedIDs.count,
-              Set(requestedRoots.map { ($0.fullPath as NSString).standardizingPath }) == paths
+              retainedRootPathSet == paths
         else { throw Failure.rootsChanged }
         try Task.checkCancellation()
         let retention = try await files.retainRoots(ids: rootIDs)
         do {
+            #if DEBUG
+                await test_afterRetainRootsBeforeRecheck?()
+            #endif
             try Task.checkCancellation()
-            guard await contexts.workspaceSnapshot(workspaceID) == snapshot else { throw Failure.contextChanged }
-            guard await files.isRootRetentionCurrent(retention) else { throw Failure.rootsChanged }
+            guard let after = await workspaceSnapshot(for: workspaceID, authority: authority),
+                  after.health != .removed,
+                  after.isInSameExecutionLineage(as: snapshot), admits(after)
+            else { throw Failure.contextChanged }
+            guard after.document.metadata.canonicalLoadableRepoPathSet == retainedRootPathSet,
+                  await files.isRootRetentionCurrent(retention)
+            else { throw Failure.rootsChanged }
             try Task.checkCancellation()
-            return Lease(resources: self, snapshot: snapshot, roots: requestedRoots, retention: retention)
+            return Lease(
+                resources: self, snapshot: after, snapshotAuthority: authority,
+                roots: requestedRoots, retention: retention
+            )
         } catch {
             await files.releaseRootRetention(retention)
             throw error
@@ -56,14 +105,24 @@ struct AgentHostWorkspaceResources {
     final class Lease {
         let resources: AgentHostWorkspaceResources
         let snapshot: DomainWorkspaceSnapshot
+        let snapshotAuthority: SnapshotAuthority
         let roots: [WorkspaceRootRef]
         private let retention: WorkspaceFileContextStore.RootRetention
         private let rootOwner: Lease?
         private(set) var isReleased = false
+        private var isInvalidated = false
 
-        fileprivate init(resources: AgentHostWorkspaceResources, snapshot: DomainWorkspaceSnapshot, roots: [WorkspaceRootRef], retention: WorkspaceFileContextStore.RootRetention, rootOwner: Lease? = nil) {
+        fileprivate init(
+            resources: AgentHostWorkspaceResources,
+            snapshot: DomainWorkspaceSnapshot,
+            snapshotAuthority: SnapshotAuthority,
+            roots: [WorkspaceRootRef],
+            retention: WorkspaceFileContextStore.RootRetention,
+            rootOwner: Lease? = nil
+        ) {
             self.resources = resources
             self.snapshot = snapshot
+            self.snapshotAuthority = snapshotAuthority
             self.roots = roots
             self.retention = retention
             self.rootOwner = rootOwner
@@ -82,10 +141,22 @@ struct AgentHostWorkspaceResources {
             return rootsAreCurrent
         }
 
-        func isCurrent() async -> Bool {
-            guard rootsAreCurrent,
-                  await resources.contexts?.workspaceSnapshot(snapshot.document.workspaceID) == snapshot else { return false }
-            return await retainedRootsAreCurrent()
+        func isCurrent(requiresExactSnapshot: Bool = false) async -> Bool {
+            guard !isInvalidated, rootsAreCurrent,
+                  let current = await resources.workspaceSnapshot(
+                      for: snapshot.document.workspaceID, authority: snapshotAuthority
+                  ),
+                  current.isInSameExecutionLineage(as: snapshot),
+                  !requiresExactSnapshot || current == snapshot
+            else {
+                isInvalidated = true
+                return false
+            }
+            let rootsValid = await retainedRootsAreCurrent()
+            if !rootsValid {
+                isInvalidated = true
+            }
+            return rootsValid && !isInvalidated
         }
 
         /// A request captures fresh canonical bytes while borrowing this activation's existing
@@ -96,20 +167,34 @@ struct AgentHostWorkspaceResources {
             }
         }
 
-        func capture(workspaceID: UUID, admits: (DomainWorkspaceSnapshot) -> Bool) async throws -> Lease {
+        func capture(
+            workspaceID: UUID,
+            authority: SnapshotAuthority? = nil,
+            admits: (DomainWorkspaceSnapshot) -> Bool
+        ) async throws -> Lease {
+            let effectiveAuthority = authority ?? snapshotAuthority
             try Task.checkCancellation()
             guard rootsAreCurrent, workspaceID == snapshot.document.workspaceID,
-                  let current = await resources.contexts?.workspaceSnapshot(workspaceID),
+                  let current = await resources.workspaceSnapshot(for: workspaceID, authority: effectiveAuthority),
                   current.health != .removed, admits(current)
             else { throw Failure.contextUnavailable }
-            let originalPaths = Set(snapshot.document.metadata.repoPaths.map { ($0 as NSString).standardizingPath })
-            guard Set(current.document.metadata.repoPaths.map { ($0 as NSString).standardizingPath }) == originalPaths,
+            let retainedRootPathSet = Set(roots.compactMap { StandardizedPath.canonicalWorkspaceRootPath($0.fullPath) })
+            guard current.document.metadata.canonicalLoadableRepoPathSet == retainedRootPathSet,
                   await resources.files.isRootRetentionCurrent(retention), rootsAreCurrent
             else { throw Failure.rootsChanged }
-            guard await resources.contexts?.workspaceSnapshot(workspaceID) == current else { throw Failure.contextChanged }
+            guard let after = await resources.workspaceSnapshot(for: workspaceID, authority: effectiveAuthority),
+                  after.health != .removed,
+                  after.isInSameExecutionLineage(as: current), admits(after)
+            else { throw Failure.contextChanged }
+            guard after.document.metadata.canonicalLoadableRepoPathSet == retainedRootPathSet else {
+                throw Failure.rootsChanged
+            }
             try Task.checkCancellation()
             guard rootsAreCurrent else { throw Failure.rootsChanged }
-            return Lease(resources: resources, snapshot: current, roots: roots, retention: retention, rootOwner: rootOwner ?? self)
+            return Lease(
+                resources: resources, snapshot: after, snapshotAuthority: effectiveAuthority,
+                roots: roots, retention: retention, rootOwner: rootOwner ?? self
+            )
         }
 
         func release() async {
@@ -117,5 +202,32 @@ struct AgentHostWorkspaceResources {
             isReleased = true
             if rootOwner == nil { await resources.files.releaseRootRetention(retention) }
         }
+    }
+}
+
+extension DomainWorkspaceSnapshot {
+    /// Returns true when `self` belongs to the same unbroken presentation-only lineage as `baseline`:
+    /// same workspace identity/file/roots/health/contexts, monotonic working revision, and identical
+    /// store-maintained `executionRevision` and `executionContentDigest`. Any intermediate
+    /// execution-relevant edit—even one later reverted to matching bytes—advances `executionRevision`
+    /// permanently and fails closed here.
+    func isInSameExecutionLineage(as baseline: DomainWorkspaceSnapshot) -> Bool {
+        if self == baseline { return true }
+        guard health != .removed, baseline.health != .removed, health == baseline.health,
+              document.workspaceID == baseline.document.workspaceID,
+              document.fileURL == baseline.document.fileURL,
+              document.metadata.repoPaths == baseline.document.metadata.repoPaths,
+              revisions.workingRevision >= baseline.revisions.workingRevision,
+              executionRevision == baseline.executionRevision,
+              document.executionContentDigest == baseline.document.executionContentDigest,
+              contexts.count == baseline.contexts.count
+        else { return false }
+        for (lhs, rhs) in zip(contexts, baseline.contexts) {
+            guard lhs.metadata.identity == rhs.metadata.identity,
+                  lhs.health != .removed, rhs.health != .removed,
+                  lhs.health == rhs.health
+            else { return false }
+        }
+        return true
     }
 }

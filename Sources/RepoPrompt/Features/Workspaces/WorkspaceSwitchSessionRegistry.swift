@@ -62,12 +62,18 @@ final class WorkspaceSwitchSessionRegistry {
         return WorkspaceSwitchSessionSnapshot(items: items)
     }
 
-    func cancelActiveSessions() async {
-        await cancelActiveSessions(for: nil)
+    func cancelActiveSessions(excluding provider: (any WorkspaceSwitchSessionProvider)? = nil) async {
+        await cancelActiveSessions(for: nil, excluding: provider)
     }
 
     func cancelActiveSessions(for deletionToken: WorkspaceDeletionCancellationToken?) async {
-        for provider in providers {
+        await cancelActiveSessions(for: deletionToken, excluding: nil)
+    }
+
+    private func cancelActiveSessions(
+        for deletionToken: WorkspaceDeletionCancellationToken?, excluding preservedProvider: (any WorkspaceSwitchSessionProvider)?
+    ) async {
+        for provider in providers where provider !== preservedProvider {
             guard deletionToken?.isActive ?? true else { return }
             await provider.cancelSwitchSessions(for: deletionToken)
         }

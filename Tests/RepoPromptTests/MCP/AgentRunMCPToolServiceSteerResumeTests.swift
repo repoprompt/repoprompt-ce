@@ -281,13 +281,21 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
         let tabID = try XCTUnwrap(workspace.activeComposeTabID)
         let sessionID = UUID()
-        let cold = vm.session(for: tabID)
+        let session = vm.session(for: tabID)
         _ = try XCTUnwrap(vm.test_installPersistentSessionBinding(
-            sessionID: sessionID, on: cold, compareAndSetInWorkspaceID: workspace.id
+            sessionID: sessionID, on: session, compareAndSetInWorkspaceID: workspace.id
         ))
-        cold.hasLoadedPersistedState = false
-        let session = await vm.ensureSessionReady(tabID: tabID)
-        XCTAssertTrue(session === cold)
+        session.hasLoadedPersistedState = false
+        let readinessStarted = ResidentSteerGate()
+        var readinessFinished = false
+        let readiness = Task { @MainActor in
+            readinessStarted.release()
+            _ = await vm.ensureSessionReady(tabID: tabID)
+            readinessFinished = true
+        }
+        defer { readiness.cancel() }
+        await readinessStarted.wait()
+        XCTAssertFalse(readinessFinished, "Readiness must join the queued adoption instead of returning the provisional session")
         XCTAssertFalse(session.hasLoadedPersistedState, "Readiness must not hydrate a payload the queued adoption will discard")
         // Even an already restored payload cannot override the scope's lifecycle fence. Retain the
         // proof, rather than clearing it or altering binding/run identity to manufacture a refusal.
@@ -348,9 +356,12 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         XCTAssertNil(session.mcpControlContext)
         XCTAssertEqual(vm.draftRuntime.text(for: tabID), "untouched local draft")
         XCTAssertFalse(session.stopState.isStopping(binding: session.persistentSessionBindingIdentity))
+        XCTAssertFalse(readinessFinished, "Refusing input must neither finish nor preempt adoption")
 
         adoption.release()
         await completed.wait()
+        try await AsyncTestWait.waitUntil("readiness joined the completed adoption") { readinessFinished }
+        await readiness.value
         XCTAssertFalse(vm.isAwaitingWorkspaceAdoption)
         let ready = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID, tabID: tabID)
         XCTAssertTrue(ready.permitsBoundOperationAndSave)

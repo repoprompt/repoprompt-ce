@@ -83,6 +83,7 @@ enum AgentComposerProjection {
         return AgentComposerProps(
             computerUse: session.flatMap { vm?.computerUseComposerProps(session: $0) } ?? .hidden,
             imageAttachmentNotice: vm?.imageAttachmentNotice.flatMap { notice in current || notice.tabID == tabID ? notice : nil },
+            submitDisabledReason: subject.isDraft ? nil : vm?.composerSubmitDisabledReason(tabID: tabID, session: session),
             currentTabID: tabID,
             submitTarget: current ? vm?.makeComposerSubmitTarget(tabID: tabID, session: session) : session.flatMap { vm?.makeComposerSubmitTarget(tabID: tabID, session: $0) },
             attachments: .init(

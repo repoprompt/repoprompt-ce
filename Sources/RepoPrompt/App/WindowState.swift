@@ -559,6 +559,11 @@ class WindowState: ObservableObject {
         isClosing || WindowStatesManager.shared.isTerminating
     }
 
+    private var detachedAgentExecutionAtClose: (
+        host: AgentSessionRuntimeHost, switchProvider: AgentModeWorkspaceSwitchSessionProvider?
+    )?
+    private var isRequestingWorkspaceDeletionClose = false
+
     func beginClose(preservingOversightIntent: Bool = true) {
         guard !isClosing else { return }
         let manager = windowStatesManager ?? WindowStatesManager.shared
@@ -566,7 +571,13 @@ class WindowState: ObservableObject {
             AgentSessionLinkRuntimeBridge.shared.noteOversightWindowClosing(windowID: windowID)
         }
         isClosing = true
-        agentModeViewModel.closeOracleBackgroundWindowAdmission()
+        if !manager.isTerminating, !isPreparedSessionOwner, preservingOversightIntent, !isRequestingWorkspaceDeletionClose,
+           let host = agentModeViewModel.detachExecutionForWindowClose()
+        {
+            detachedAgentExecutionAtClose = (host, workspaceManager.agentSwitchSessionProvider)
+        } else {
+            agentModeViewModel.closeOracleBackgroundWindowAdmission()
+        }
         failUnstartedCommandsForWindowClose()
 
         if !manager.isTerminating, !isPreparedSessionOwner {
@@ -674,6 +685,14 @@ class WindowState: ObservableObject {
             await domainWorkspacePresentationBridge?.stopAndJoinForTesting()
         }
 
+        convenience init(domainRuntime: MCPDomainRuntime, visibleAgentProviderResources: AgentRunProviderComposition, mcpTransport: MCPService) {
+            self.init(
+                contextBuilderProviderFactory: nil, loadStoredAPISettingsDataOnInit: false,
+                codexModelPollingService: .shared, automaticProviderModelDiscoveryEnabled: false,
+                domainRuntimeOverride: domainRuntime, visibleAgentProviderResources: visibleAgentProviderResources, mcpTransport: mcpTransport
+            )
+        }
+
         func restartDomainWorkspaceProjectionForTesting() {
             domainWorkspacePresentationBridge?.start()
         }
@@ -746,7 +765,9 @@ class WindowState: ObservableObject {
         automaticProviderModelDiscoveryEnabled: Bool = true,
         domainRuntimeOverride: MCPDomainRuntime?,
         keyManager injectedKeyManager: KeyManager? = nil,
-        agentModeViewModelFactory: WindowStateCompositionFactory.AgentModeViewModelFactory? = nil
+        agentModeViewModelFactory: WindowStateCompositionFactory.AgentModeViewModelFactory? = nil,
+        visibleAgentProviderResources: AgentRunProviderComposition? = nil,
+        mcpTransport: MCPService? = nil
     ) {
         // Assign a unique window ID
         windowID = WindowState.allocateWindowID()
@@ -764,7 +785,7 @@ class WindowState: ObservableObject {
         let composition = WindowStateCompositionFactory.make(
             windowID: windowID,
             deferredInitialAgentSystemWorkspaceRefresh: deferredInitialAgentSystemWorkspaceRefresh,
-            sharedMCPService: Self.sharedMCPService,
+            sharedMCPService: mcpTransport ?? Self.sharedMCPService,
             domainRuntime: domainRuntimeOverride,
             contextBuilderProviderFactory: contextBuilderProviderFactory,
             keyManager: injectedKeyManager,
@@ -773,7 +794,8 @@ class WindowState: ObservableObject {
             loadStoredAPISettingsDataOnInit: loadStoredAPISettingsDataOnInit,
             automaticProviderModelDiscoveryEnabled: automaticProviderModelDiscoveryEnabled,
             codexModelPollingService: codexModelPollingService,
-            agentModeViewModelFactory: agentModeViewModelFactory
+            agentModeViewModelFactory: agentModeViewModelFactory,
+            visibleAgentProviderResources: visibleAgentProviderResources
         )
         compositionSpan.end()
 
@@ -1344,6 +1366,10 @@ class WindowState: ObservableObject {
     }
 
     func requestClose(authorization: WindowCloseAuthorization? = nil) {
+        // A vetoed deletion close must not turn a subsequent ordinary close into retirement.
+        let wasRequestingDeletionClose = isRequestingWorkspaceDeletionClose
+        isRequestingWorkspaceDeletionClose = wasRequestingDeletionClose || authorization?.source == .workspaceDelete
+        defer { isRequestingWorkspaceDeletionClose = wasRequestingDeletionClose }
         if let authorization {
             closeCoordinator.enqueueAuthorization(authorization)
         }
@@ -2324,6 +2350,7 @@ class WindowState: ObservableObject {
                 sessionID: target,
                 workspace: activeWorkspace,
                 workspaceLink: workspaceLink,
+                restoringStashedCarrier: tabIsStashed && !tabIsActive,
                 visitIntent: visitIntent,
                 resumePreparedVisit: resume
             )
@@ -3135,7 +3162,10 @@ class WindowState: ObservableObject {
         beginClose()
         // The retained host drain joins its own Oracle producers. Waiting here would delay
         // starting that drain and skip its bounded observation when the window closes.
-        if !WindowStatesManager.shared.isTerminating, agentModeViewModel.runtimeHost.workspaceActivation == nil {
+        let detachedAgentHost = detachedAgentExecutionAtClose?.host
+        if detachedAgentHost == nil, !WindowStatesManager.shared.isTerminating,
+           agentModeViewModel.runtimeHost.workspaceActivation == nil
+        {
             await agentModeViewModel.joinOracleBackgroundWindowDrain()
         }
         // Join cancelled startup before saves/root drains so it cannot publish or hydrate late.
@@ -3166,8 +3196,9 @@ class WindowState: ObservableObject {
         domainWorkspacePresentationBridge?.stop()
         // A shared route belongs to the lease owner, not this teardown. In particular a
         // timed-out retirement waiter must not revoke routing needed by the retained host.
-        let routeDisposalIsLeased = mcpServer.routeResources.isLeaseManaged
-        if !routeDisposalIsLeased { await mcpServer.unregisterDomainRoutingWindow() }
+        let mayDisposePresentationRoute = !mcpServer.routeResources.isLeaseManaged
+            && detachedAgentHost?.route !== mcpServer.routeResources
+        if mayDisposePresentationRoute { await mcpServer.unregisterDomainRoutingWindow() }
         mcpServer.stopServiceObservation()
 
         // App-level termination already coordinates agent/session and MCP shutdown.
@@ -3178,12 +3209,17 @@ class WindowState: ObservableObject {
         }
 
         await contextBuilderAgentViewModel.cancelAllActiveRuns()
-        await workspaceManager.cancelActiveSessions()
-        await agentModeViewModel.prepareForWindowClose()
-        WorkspaceApprovalManager.shared.cancelPending(forWindowID: windowID)
+        await workspaceManager.cancelActiveSessions(excluding: detachedAgentExecutionAtClose?.switchProvider)
+        if detachedAgentHost == nil {
+            await agentModeViewModel.retireRuntimeForClosingOrQuit()
+        }
+        // Independent host approvals are keyed to their own route. If the route is shared,
+        // the host's exact interaction owner, not this closing window, settles those requests.
+        if detachedAgentHost?.routeID != windowID {
+            WorkspaceApprovalManager.shared.cancelPending(forWindowID: windowID)
+        }
 
-        // Shared-route terminal disposal belongs to its lease owner, after both users release.
-        if !routeDisposalIsLeased { await mcpServer.stopServer() }
+        if mayDisposePresentationRoute { await mcpServer.stopServer() }
 
         // Cancel any ongoing AI query
         aiQueriesService.cancelQuery()

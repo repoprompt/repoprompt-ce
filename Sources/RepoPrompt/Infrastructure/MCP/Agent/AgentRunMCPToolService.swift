@@ -1293,6 +1293,11 @@ struct AgentRunMCPToolService {
             object["overseer"] = overseer
             return .object(object)
         }
+        try await requireWorkspaceAdoptionNotFailedIfUnregistered(
+            sessionID: sessionID,
+            targetWindow: targetWindow,
+            agentModeVM: agentModeVM
+        )
         let capturedDefaultWaitSeconds = Self.capturedDefaultWaitTimeoutSeconds()
         let timeoutSeconds = try forcePoll
             ? 0
@@ -1343,6 +1348,14 @@ struct AgentRunMCPToolService {
             singleArgs.removeValue(forKey: "session_ids")
             singleArgs["session_id"] = .string(sessionIDs[0].uuidString)
             return try await executeWait(args: singleArgs)
+        }
+
+        for sessionID in sessionIDs {
+            try await requireWorkspaceAdoptionNotFailedIfUnregistered(
+                sessionID: sessionID,
+                targetWindow: targetWindow,
+                agentModeVM: agentModeVM
+            )
         }
 
         let capturedDefaultWaitSeconds = Self.capturedDefaultWaitTimeoutSeconds()
@@ -1444,7 +1457,7 @@ struct AgentRunMCPToolService {
             targetWindow: targetWindow, agentModeVM: agentModeVM, metadata: metadata
         )
         guard !targetWindow.isClosing, !WindowStatesManager.shared.isTerminating,
-              targetWindow.windowID == target.endpoint.windowID,
+              targetWindow === target.window,
               agentModeVM.mcpResidentTargetIsCurrent(target)
         else { throw MCPError.invalidParams(AgentModeViewModel.mcpResidentTargetError) }
         return try (
@@ -1478,6 +1491,11 @@ struct AgentRunMCPToolService {
                 snapshots.append(snapshot)
                 overseers[sessionID] = overseer
             } else {
+                try await requireWorkspaceAdoptionNotFailedIfUnregistered(
+                    sessionID: sessionID,
+                    targetWindow: targetWindow,
+                    agentModeVM: agentModeVM
+                )
                 await snapshots.append(currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM))
             }
         }
@@ -1596,7 +1614,7 @@ struct AgentRunMCPToolService {
             let delivery = try await agentModeVM.mcpSubmitResidentTask(
                 resident, text: text, workflow: workflow,
                 windowIsAvailable: {
-                    targetWindow.windowID == resident.endpoint.windowID
+                    targetWindow === resident.window
                         && !targetWindow.isClosing && !WindowStatesManager.shared.isTerminating
                 }
             )
@@ -3350,6 +3368,35 @@ struct AgentRunMCPToolService {
 
     private nonisolated func pendingSessionIDs(from snapshots: [AgentRunMCPSnapshot]) -> [UUID] {
         snapshots.filter { !isInterestingSnapshot($0) }.map(\.sessionID)
+    }
+
+    /// Only when no live or terminal `AgentRunSessionStore` registration exists and the active
+    /// workspace's canonical host activation was refused, reject `poll`/`wait` with the actionable
+    /// activation failure instead of returning a misleading `expired` handle advising `agent_run.steer`.
+    private func requireWorkspaceAdoptionNotFailedIfUnregistered(
+        sessionID: UUID,
+        targetWindow: WindowState,
+        agentModeVM: AgentModeViewModel
+    ) async throws {
+        guard currentSnapshotProvider == nil else { return }
+        let expectedWorkspaceID = targetWindow.workspaceManager.activeWorkspaceID
+        if agentModeVM === targetWindow.agentModeViewModel, expectedWorkspaceID == nil {
+            return
+        }
+        guard let refusalError = agentModeVM.workspaceActivationRefusalMCPError(
+            expectedWorkspaceID: expectedWorkspaceID
+        ) else { return }
+        if let registration = agentModeVM.mcpRuntime.registration(sessionID: sessionID) {
+            if await AgentRunSessionStore.snapshot(for: registration) != nil
+                || agentModeVM.mcpSnapshot(registration: registration) != nil
+            {
+                return
+            }
+        }
+        if case .unavailable = agentModeVM.mcpRuntime.controlRead(sessionID: sessionID) {
+            return
+        }
+        throw refusalError
     }
 
     private func currentSnapshot(

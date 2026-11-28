@@ -6,6 +6,7 @@ import SwiftUI
 struct RemoteSettingsView: View {
     @ObservedObject private var gateway: RemoteGatewayController
     @ObservedObject private var availability: RemoteAvailabilityController
+    @State private var showingStorageReset = false
 
     init(gateway: RemoteGatewayController) {
         _gateway = ObservedObject(wrappedValue: gateway)
@@ -23,6 +24,7 @@ struct RemoteSettingsView: View {
                 gatewaySection
                 pairingSection
                 authorizationSection
+                workspaceVoiceSection
                 availabilitySection
             }
             .frame(maxWidth: 720, alignment: .leading)
@@ -47,45 +49,35 @@ struct RemoteSettingsView: View {
     private var gatewaySection: some View {
         GroupBox("Remote access") {
             VStack(alignment: .leading, spacing: 14) {
-                Toggle("Enable pairing", isOn: Binding(
+                Toggle("Enable Remote", isOn: Binding(
                     get: { gateway.isEnabled },
                     set: { enabled in
                         Task { await gateway.setEnabled(enabled) }
                     }
                 ))
-                if gateway.isRunning, gateway.irohDiagnostics.path != .unknown {
+                if gateway.isEnabled {
+                    LabeledContent("Listener", value: listenerStatus)
+                }
+                if gateway.isPhoneConnected, gateway.irohDiagnostics.path != .unknown {
                     LabeledContent("Iroh path") {
                         Text(gateway.irohDiagnostics.path.rawValue.replacingOccurrences(of: "_", with: " ").capitalized)
                     }
                 }
 
-                if gateway.isPaired {
-                    LabeledContent("Status") {
-                        if gateway.isRunning {
-                            Label("Connected", systemImage: "checkmark.circle.fill")
-                                .foregroundStyle(.green)
-                        } else {
-                            Label(gateway.lastError ?? "Paired, but disabled", systemImage: "exclamationmark.triangle.fill")
-                                .foregroundStyle(.orange)
-                        }
+                LabeledContent("Status") {
+                    Text(gatewayStatus)
+                        .foregroundStyle(gateway.isPhoneConnected ? Color.green : Color.secondary)
+                }
+                if case let .paired(expiresAt) = gateway.pairingStatus {
+                    LabeledContent("Paired phone", value: gateway.pairedDeviceName ?? "Paired device")
+                    LabeledContent("Credential expires") {
+                        Text(expiresAt.formatted(date: .abbreviated, time: .shortened))
                     }
-                    LabeledContent("Paired phone") {
-                        Text(gateway.pairedDeviceName ?? "Paired device")
-                            .foregroundStyle(.primary)
+                }
+                if gateway.isEnabled, !gateway.isRunning {
+                    Button("Retry starting Remote") {
+                        Task { await gateway.setEnabled(true) }
                     }
-                } else if gateway.isRunning {
-                    LabeledContent("Status") {
-                        Label("Ready for pairing", systemImage: "checkmark.circle.fill")
-                            .foregroundStyle(.green)
-                    }
-                } else {
-                    LabeledContent("Status") {
-                        Text(gateway.lastError ?? "Disabled")
-                            .foregroundStyle(gateway.lastError == nil ? Color.secondary : Color.red)
-                    }
-                    Text("Allow RepoPrompt Remote to connect to this Mac. Pairing is required before anything can be viewed or controlled.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
                 }
 
                 if let error = gateway.lastError, !error.isEmpty {
@@ -99,11 +91,52 @@ struct RemoteSettingsView: View {
         }
     }
 
+    private var listenerStatus: String {
+        switch gateway.irohDiagnostics.state {
+        case "starting": "Starting…"
+        case "degraded": "Degraded · Retrying"
+        default: gateway.isRunning ? "Ready" : "Unavailable"
+        }
+    }
+
+    private var gatewayStatus: String {
+        switch gateway.pairingStatus {
+        case .storageUnavailable: "Pairing storage unavailable"
+        case .storageUnreadable: "Pairing storage unreadable"
+        case .attemptExpired: "Pairing attempt expired"
+        case .codeExpired: "Pairing code expired"
+        case .credentialExpired: "Paired credential expired"
+        case .pending: "Pairing pending"
+        case .paired:
+            switch gateway.phoneReadiness {
+            case .offline: "Paired · Offline"
+            case .syncing: "Paired · Syncing"
+            case .legacyActive: "Paired · Phone active"
+            case .connected: "Paired · Connected"
+            }
+        case .idle, .codeReady:
+            if gateway.isRunning {
+                "Ready for pairing"
+            } else if gateway.isEnabled {
+                "Waiting for listener"
+            } else {
+                "Disabled"
+            }
+        }
+    }
+
     @ViewBuilder
     private var pairingSection: some View {
         if gateway.isPaired {
             GroupBox("Paired phone") {
                 VStack(alignment: .leading, spacing: 14) {
+                    if gateway.isRunning, gateway.phoneReadiness == .offline {
+                        Text("Open RepoPrompt Remote on your phone to reconnect and finish syncing.")
+                            .foregroundStyle(.secondary)
+                    } else if gateway.phoneReadiness == .legacyActive {
+                        Text("This phone is active. Sync confirmation turns on automatically when both apps support it.")
+                            .foregroundStyle(.secondary)
+                    }
                     Button("Unpair phone", role: .destructive) {
                         gateway.revokePairedDevice()
                     }
@@ -113,7 +146,30 @@ struct RemoteSettingsView: View {
         } else {
             GroupBox("Pair your phone") {
                 VStack(alignment: .leading, spacing: 14) {
-                    if let pairingCode = gateway.pairingCode {
+                    if case .storageUnavailable = gateway.pairingStatus {
+                        Text("Unlock this Mac’s Keychain and retry loading pairing.")
+                            .foregroundStyle(.secondary)
+                        Button("Retry Keychain") { gateway.retryPairingStorage() }
+                    } else if case .storageUnreadable = gateway.pairingStatus {
+                        Text("This Mac can’t read its saved pairing. Reset it to generate a new code.")
+                            .foregroundStyle(.secondary)
+                        Button("Reset pairing storage", role: .destructive) { showingStorageReset = true }
+                            .confirmationDialog("Reset Remote pairing storage?", isPresented: $showingStorageReset) {
+                                Button("Reset pairing storage", role: .destructive) {
+                                    gateway.resetUnreadablePairingStorage()
+                                }
+                            } message: {
+                                Text("The saved phone pairing will be removed. Any previously paired phone will need a new code.")
+                            }
+                    } else if case let .pending(deviceName, expiresAt) = gateway.pairingStatus {
+                        Text("Waiting for \(deviceName) to save and confirm pairing. Reopen RepoPrompt Remote on that phone to resume.")
+                            .foregroundStyle(.secondary)
+                        LabeledContent("Attempt expires") { Text(expiresAt, style: .timer).monospacedDigit() }
+                        Button("Cancel attempt and generate new code") {
+                            gateway.refreshPairingAdvertisement()
+                        }
+                        .disabled(!gateway.isRunning)
+                    } else if let pairingCode = gateway.pairingCode {
                         HStack(alignment: .top, spacing: 20) {
                             PairingQRCodeView(payload: pairingCode)
                                 .frame(width: 220, height: 220)
@@ -124,10 +180,13 @@ struct RemoteSettingsView: View {
                             VStack(alignment: .leading, spacing: 10) {
                                 Text("Scan this code with RepoPrompt Remote")
                                     .font(.headline)
-                                Text("The code expires after five minutes, is single-use, and is invalidated when you generate a replacement.")
+                                Text("Use the current RepoPrompt Remote app to scan this single-use code.")
                                     .font(.callout)
                                     .foregroundStyle(.secondary)
                                     .fixedSize(horizontal: false, vertical: true)
+                                if case let .codeReady(expiresAt) = gateway.pairingStatus {
+                                    LabeledContent("Code expires") { Text(expiresAt, style: .timer).monospacedDigit() }
+                                }
                                 HStack {
                                     Button("Generate new code") {
                                         gateway.refreshPairingAdvertisement()
@@ -140,7 +199,7 @@ struct RemoteSettingsView: View {
                             }
                         }
                     } else {
-                        Text(gateway.isEnabled ? "Start pairing to generate a code." : "Enable pairing to generate a code.")
+                        Text(gateway.isEnabled ? "Start pairing to generate a code." : "Enable Remote to generate a code.")
                             .foregroundStyle(.secondary)
                         Button("Generate pairing code") {
                             gateway.refreshPairingAdvertisement()
@@ -170,6 +229,21 @@ struct RemoteSettingsView: View {
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(8)
+        }
+    }
+
+    private var workspaceVoiceSection: some View {
+        GroupBox("Workspace Voice") {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Workspace Voice sends microphone audio from your paired phone to OpenAI through Codex. It can also send workspace tool results to OpenAI, including file contents, chat transcripts, and settings.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Toggle("Allow OpenAI data sharing for Workspace Voice", isOn: $gateway.allowsWorkspaceVoiceDataSharing)
+                    .disabled(!gateway.isPaired)
             }
             .padding(8)
         }

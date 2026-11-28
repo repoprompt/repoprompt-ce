@@ -1430,13 +1430,18 @@ package actor CodexAppServerClient {
     }
 
     /// A normal return acknowledges a write to the originating transport, not provider action.
-    package func respondToServerRequest(receipt: CodexServerRequestReceipt, result: [String: Any]) throws {
+    package func respondToServerRequest(
+        receipt: CodexServerRequestReceipt,
+        result: [String: Any],
+        respectingCancellation: Bool = false
+    ) throws {
         try validateServerRequestOrigin(receipt)
         let payload: [String: Any] = [
             "id": receipt.requestID.jsonValue,
             "result": result
         ]
-        try sendJSONLine(payload, method: nil)
+        // Provider-request results may contain secure user input.
+        try sendJSONLine(payload, method: nil, logPayload: false, respectingCancellation: respectingCancellation)
     }
 
     package func respondToServerRequestError(
@@ -2198,13 +2203,15 @@ package actor CodexAppServerClient {
     ///
     /// Related:
     /// - ClaudeNativeProcessSessionController.sendLine (reference atomic write pattern)
-    private func sendJSONLine(_ payload: [String: Any], method: String?) throws {
+    private func sendJSONLine(
+        _ payload: [String: Any], method: String?, logPayload: Bool = true, respectingCancellation: Bool = false
+    ) throws {
         guard let activeTransport, !didTerminateTransport else {
             throw lastTransportFailure ?? ClientError.processNotRunning
         }
         let process = activeTransport.process
         let data = try JSONSerialization.data(withJSONObject: payload, options: [])
-        if config.enableDebugLogging {
+        if config.enableDebugLogging, logPayload {
             if let line = String(data: data, encoding: .utf8) {
                 print("[CodexAppServer] -> \(line)")
             }
@@ -2215,6 +2222,7 @@ package actor CodexAppServerClient {
         var frame = data
         frame.append(0x0A)
         let generation = activeTransport.generation
+        if respectingCancellation { try Task.checkCancellation() }
         do {
             try writeFrameHandler(stdinDescriptor, frame)
         } catch let error as FDWriteError {

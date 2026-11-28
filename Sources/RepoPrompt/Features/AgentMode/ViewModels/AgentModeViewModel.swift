@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import MCP
+import OSLog
 import RepoPromptACPProviders
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
@@ -505,7 +506,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         Int
     ) async -> AsyncThrowingStream<AgentSessionSidebarBuildBatch, Error>
 
-    let runtimeHost: AgentSessionRuntimeHost
+    private(set) var runtimeHost: AgentSessionRuntimeHost
+    /// Only installed by composition with a fully registered independent executable route.
+    typealias CanonicalWorkspaceHostPreparation = @MainActor (
+        WorkspaceModel, SessionIndexOwner, AgentWorkspaceSessionIndexStore
+    ) async throws -> AgentSessionRuntimeHost
+    var canonicalWorkspaceHostPreparation: CanonicalWorkspaceHostPreparation?
+
     var runtimeSessionStore: AgentSessionRuntimeStore.Scope {
         runtimeHost.scope
     }
@@ -912,6 +919,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     let applyEditsApprovalStore: ApplyEditsApprovalStore
     var runService: AgentModeRunService {
         if let execution = runtimeSessionStore.execution { return execution }
+        precondition(runtimeHost.workspaceActivation == nil, "Compose canonical execution before attaching presentation.")
         let execution = makeRunService()
         runtimeSessionStore.installExecution(execution)
         return execution
@@ -1169,6 +1177,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         var test_beforeWorkspaceSwitchAdoption: (@MainActor (SessionIndexOwner) async -> Void)?
         /// Passive: runs synchronously when that queued adoption task finishes, on every exit.
         var test_afterWorkspaceSwitchAdoptionCompleted: (@MainActor (SessionIndexOwner) -> Void)?
+        var test_afterPreparingWorkspaceHost: (@MainActor (SessionIndexOwner) async -> Void)?
         /// Passive: runs synchronously when `onTabChanged`'s spawned activation task finishes, on every exit.
         var test_afterTabActivationContinuation: (@MainActor (UUID, Int) -> Void)?
         var test_beforeMCPSelectionCommit: (@MainActor () async -> Void)?
@@ -1189,6 +1198,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     weak var preparedSessionRuntimes: (any PreparedAgentSessionRuntimeRegistry)?
     var providerSwitchExactOwnerProbe: (@MainActor (TabSession) -> Bool)?
     private var hasPreparedForWindowClose = false
+    private var hasDetachedClosingPresentation = false
     private var windowClosePreparationTask: Task<Void, Never>?
     private static let uiRefreshCoalesceDelayNanos: UInt64 = 75_000_000
     /// The restore service has already loaded and projected all metadata before
@@ -2157,10 +2167,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 runtimeSessionStore.presentation.detach(attachment)
             }
         }
-        guard !hasPreparedForWindowClose else { return }
-        runtimeSessionStore.installDetachedNotificationSink(routeID: windowID)
+        guard !hasPreparedForWindowClose, !hasDetachedClosingPresentation else { return }
+        let host = runtimeHost
+        host.scope.installDetachedNotificationSink(routeID: host.routeID)
         for (tabID, session) in sessions where previous[tabID] !== session {
-            runPresentationAttachments[ObjectIdentifier(session)] = runtimeSessionStore.presentation.attach(session, sink: .init(
+            let sink = AgentSessionPresentationRuntime.Sink(
                 activityChanged: { [weak self] session, isActive in
                     guard let self, sessions[session.tabID] === session else { return }
                     publishAgentRunActivity(tabID: session.tabID, session: session, isActive: isActive)
@@ -2264,9 +2275,49 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         applyLocalSessionIndexUpsert(entry)
                     }
                 },
+                saveCommitted: { [weak self, weak host] session, receipt, count in
+                    guard let self, let host, runtimeHost === host, sessions[session.tabID] === session,
+                          !hasDetachedClosingPresentation, !hasPreparedForWindowClose else { return }
+                    publishSessionSave(session, receipt: receipt, canonicalItemCount: count)
+                },
                 isAvailable: { [weak self] in self != nil }
-            ))
+            )
+            let identity = ObjectIdentifier(session)
+            if let activation = host.workspaceActivation, let sessionID = session.activeAgentSessionID {
+                guard let destination = sessionIndexOwner,
+                      destination.workspaceID == activation.key.owner.workspaceID,
+                      !host.scope.presentation.hasPresenter(for: session),
+                      case let .unique(writer) = host.scope.resolveWriter(sessionID: sessionID),
+                      writer.scope === host.scope, writer.session === session
+                else { continue }
+                let writerIdentity = writer.identity
+                runPresentationAttachments[identity] = host.scope.presentation.attachCurrent(
+                    session, sink: sink, isDestinationCurrent: { [weak self, weak host, weak session] in
+                        guard let self, let host, let session, runtimeHost === host,
+                              !hasPreparedForWindowClose, !hasDetachedClosingPresentation,
+                              sessions[tabID] === session, sessionIndexStore.isOwnerCurrent(destination),
+                              host.workspaceActivation?.owns(scope: host.scope, route: host.route) == true,
+                              host.scope.holdsPresentationIncarnation(of: writerIdentity, session: session)
+                        else { return false }
+                        return true
+                    }, seed: { [weak self] session in
+                        self?.seedAttachedRunPresentation(session)
+                    }
+                )
+            } else {
+                runPresentationAttachments[identity] = host.scope.presentation.attach(session, sink: sink)
+            }
         }
+    }
+
+    private func seedAttachedRunPresentation(_ session: TabSession) {
+        let tabID = session.tabID
+        if session.runState.isActive { tabsWithActiveAgentRun.insert(tabID) }
+        else { tabsWithActiveAgentRun.remove(tabID) }
+        if session.mcpControlContext != nil { mcpControlledTabIDs.insert(tabID) }
+        else { mcpControlledTabIDs.remove(tabID) }
+        publishActiveAgentRunStartedAt(for: tabID, session: session)
+        publishDerivedTranscriptState(for: session)
     }
 
     private func detachRunPresentation() {
@@ -3118,7 +3169,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     var interactionRuntime: AgentSessionInteractionRuntime {
-        let runtime = runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore)
+        let runtime = runtimeSessionStore.interactions(routeID: runtimeHost.routeID, approvalStore: applyEditsApprovalStore)
         runtime.observer = codexCoordinator
         runtime.installClaudeCancellationCommands(claudeCoordinator)
         _ = persistenceRuntime
@@ -3139,6 +3190,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     var mcpRuntime: AgentSessionMCPRuntime {
         let runtime = runtimeSessionStore.mcp
+        if runtimeHost.workspaceActivation != nil { return runtime }
         if let mcpServer { runtime.installRunRoute(id: windowID, bindings: mcpServer.runRouteBindings) }
         if runtime.workspaceHasProvisionalClaim == nil {
             runtime.workspaceHasProvisionalClaim = { [weak self] workspaceID, sessionID in
@@ -3517,7 +3569,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) -> AgentModeRunService {
         let publication = mcpRuntime
         let dependencies = AgentModeRunService.Dependencies(
-            windowID: windowID,
+            windowID: runtimeHost.routeID,
             connectionPolicyInstaller: connectionPolicyInstaller ?? self.connectionPolicyInstaller,
             expectedPIDPolicyArmer: expectedPIDPolicyArmer ?? { spec in
                 guard spec.requiresExpectedAgentPID, let clientName = spec.clientName else {
@@ -3818,9 +3870,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 Task { @MainActor in
                     #if DEBUG
                         defer { self.test_afterWorkspaceSwitchAdoptionCompleted?(owner) }
-                        await self.test_beforeWorkspaceSwitchAdoption?(owner)
                     #endif
-                    await self.handleWorkspaceSwitch(workspace, owner: owner)
+                    await Self.performingWorkspaceAdoptionFor.withValue(ObjectIdentifier(self)) {
+                        #if DEBUG
+                            await self.test_beforeWorkspaceSwitchAdoption?(owner)
+                        #endif
+                        await self.performWorkspaceAdoption(workspace, owner: owner)
+                    }
                 }
                 #if DEBUG
                     test_afterWorkspaceSwitchAdoptionQueued?(owner)
@@ -3918,10 +3974,30 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return workspaces.flatMap { workspace in
             workspace.composeTabs.compactMap { tab in
                 let sessionID = tab.activeAgentSessionID
-                let liveSession = sessionID.flatMap { expectedSessionID in
-                    sessions[tab.id]?.activeAgentSessionID == expectedSessionID
-                        ? sessions[tab.id]
-                        : nil
+                if let sessionID, workspaceManager?.hasActiveProvisionalAgentSession(workspaceID: workspace.id, sessionID: sessionID) == true {
+                    // A projection observed during first-save cannot repair an unpublished row
+                    // after the initiating admission rolls it back.
+                    return nil
+                }
+                let liveSession: AgentTabSession?
+                if let sessionID, runtimeHost.workspaceActivation == nil, let local = sessions[tab.id],
+                   local.activeAgentSessionID == sessionID, !local.qualifiedRestorationReadiness.isCreating
+                {
+                    liveSession = local
+                } else if let sessionID, !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: sessionID),
+                          !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: sessionID),
+                          case let .unique(writer) = runtimeSessionStore.resolveWriter(sessionID: sessionID, expectedWorkspaceID: workspace.id),
+                          writer.session.tabID == tab.id, !writer.scope.isRetiring,
+                          !writer.session.qualifiedRestorationReadiness.isCreating,
+                          let activation = writer.scope.executableHost?.workspaceActivation,
+                          activation.isCurrent, activation.savedCarrierSessionID == nil
+                {
+                    // Writer discovery is global; stale carrier repair is not. Even a pin in
+                    // this window's selected workspace cannot override the actual presenter.
+                    guard activation.lifecycleProjectionOwner === sessionIndexStore else { return nil }
+                    liveSession = writer.session
+                } else {
+                    liveSession = nil
                 }
                 let isLive = liveSession != nil
                 // Every window mirrors the catalog, but a cold pin in an inactive workspace
@@ -4581,8 +4657,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     "agentActivation.inactive windowID=\(windowID) workspaceID=\(restorePerfRecorder.shortID(workspaceIDForLog))"
                 )
             #endif
-            codexCoordinator.stop()
-            claudeCoordinator.stop()
+            if runtimeHost.workspaceActivation == nil {
+                codexCoordinator.stop()
+                claudeCoordinator.stop()
+            }
             stopOpenCodeModelsSubscription()
             stopCursorModelsSubscription()
             let cancelledOwner = activeSessionIndexRefreshToken?.owner
@@ -4637,7 +4715,45 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         cancellables.removeAll()
     }
 
+    /// Only an independent activation can keep its originating resources without a window.
+    func preservableExecutionHost() -> AgentSessionRuntimeHost? {
+        let host = runtimeHost
+        guard host.route.identity.kind == .independent, !host.scope.isRetiring,
+              host.workspaceActivation?.owns(scope: host.scope, route: host.route) == true
+        else { return nil }
+        return host
+    }
+
+    /// Withdraw this presenter before window teardown can suspend. The scope remains admitted.
+    func detachExecutionForWindowClose() -> AgentSessionRuntimeHost? {
+        guard !hasPreparedForWindowClose, !hasDetachedClosingPresentation,
+              let host = preservableExecutionHost()
+        else { return nil }
+        host.scope.retainExecutableHost()
+        hasDetachedClosingPresentation = true
+        withdrawUnpublishedComposerSubmissionsForPresentationLoss()
+        detachRunPresentation()
+        cleanUpClosingPresentation()
+        retireEmptyDetachedHost(host)
+        return host
+    }
+
+    private func retireEmptyDetachedHost(_ host: AgentSessionRuntimeHost) {
+        guard host.scope.sessions.isEmpty, !host.scope.isRetiring, !host.scope.hasPendingHostEffects else { return }
+        host.beginRetirement().startIfNeeded()
+    }
+
     func prepareForWindowClose() async {
+        if let task = windowClosePreparationTask {
+            await task.value
+            return
+        }
+        guard !hasPreparedForWindowClose, !hasDetachedClosingPresentation else { return }
+        if detachExecutionForWindowClose() == nil { await retireAndCancelRuntime() }
+    }
+
+    /// Quit and a non-preserving close explicitly retire the runtime. Do not reconsider detach.
+    func retireRuntimeForClosingOrQuit() async {
         await retireAndCancelRuntime()
     }
 
@@ -4662,10 +4778,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         guard !hasPreparedForWindowClose else { return }
         hasPreparedForWindowClose = true
-        // This legacy path retires its private runtime, not merely its presentation. Fence
-        // pending producers before the first await; final originating IO remains permitted.
-        // The independent-host cutover must detach presentation without invoking retirement.
-        let canonicalDrain = runtimeHost.workspaceActivation == nil ? nil : runtimeHost.beginWindowRetirement()
+        workspaceAdoption?.finish(.refused)
+        // Explicit retirement and the legacy owner fence producers before the first await.
+        // Final originating IO remains permitted.
+        let canonicalDrain = runtimeHost.workspaceActivation == nil ? nil : runtimeHost.beginAuthorizedRetirement()
         if canonicalDrain == nil { runtimeSessionStore.beginRetirement() }
         closeOracleBackgroundWindowAdmission()
         let task = Task<Void, Never> { @MainActor [weak self] in
@@ -4680,7 +4796,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         detachRunPresentation()
     }
 
-    private func performWindowClosePreparation(canonicalDrain: AgentSessionHostDrainRuntime?) async {
+    private func cleanUpClosingPresentation() {
+        workspaceAdoption?.finish(.refused)
         queuedWorkspaceSwitchOwner = nil
         unregisterObserverRegistrations()
         stopOpenCodeModelsSubscription()
@@ -4689,10 +4806,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         uiRefreshTask = nil
         pendingUIRefreshScopesByTabID.removeAll()
         pendingAssistantPresentationByTabID.removeAll()
-        workspaceSwitchProvider.cancelAllBackgroundCleanup()
         cancelSessionIndexRefresh()
         // Teardown drops the ephemeral restoration join/baseline; nothing publishes into a successor.
         sessionIndexStore.abandonSidebarRestore(owner: nil)
+    }
+
+    private func performWindowClosePreparation(canonicalDrain: AgentSessionHostDrainRuntime?) async {
+        cleanUpClosingPresentation()
+        workspaceSwitchProvider.cancelAllBackgroundCleanup()
         if let canonicalDrain {
             // The host retained the producer. A window wait is not a release receipt.
             _ = await canonicalDrain.wait(until: .now.advanced(by: .seconds(2)))
@@ -4749,7 +4870,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         await session.disposeProviderIfPresent()
                         await codexCoordinator.shutdownCodexSession(session)
                         let sessionID = boundSessionID(for: session.tabID)
-                        await cleanupMCPRunRoutingIfPresent(
+                        await cleanupLegacyMCPRunRoutingIfPresent(
                             boundSessionID: sessionID,
                             liveSession: session,
                             reason: "managed_codex_logout"
@@ -4774,7 +4895,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func prepareSessionForWindowClose(_ session: TabSession) async {
-        if let drain = runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).closeOracleBackground(for: session), !OracleBackgroundInvocationRegistry.shared.isShuttingDown {
+        if let drain = runtimeSessionStore.interactions(routeID: runtimeHost.routeID, approvalStore: applyEditsApprovalStore).closeOracleBackground(for: session), !OracleBackgroundInvocationRegistry.shared.isShuttingDown {
             await drain.value
         }
         removePendingUIRefresh(for: session.tabID)
@@ -4807,7 +4928,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         await codexCoordinator.shutdownCodexSession(session)
         await claudeCoordinator.shutdownClaudeSession(session)
         let sessionID = boundSessionID(for: session.tabID)
-        await cleanupMCPRunRoutingIfPresent(
+        await cleanupLegacyMCPRunRoutingIfPresent(
             boundSessionID: sessionID,
             liveSession: session,
             reason: "window_close"
@@ -4849,7 +4970,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return
         }
 
-        if shouldDeferForWorkspaceSwitch {
+        if refusedWorkspaceActivationOwner != nil {
+            pendingTabIDForLoad = tabID
+            activeSessionLoadInProgressTabID = nil
+            return
+        }
+        if shouldDeferForWorkspaceSwitch || (canonicalWorkspaceHostPreparation != nil && isAwaitingWorkspaceAdoption) {
             pendingTabIDForLoad = tabID
             activeSessionLoadInProgressTabID = tabID
             publishLoadingTranscriptPresentation(tabID: tabID)
@@ -5121,6 +5247,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             interactionRuntime.ensureApprovalSync(for: existing)
             return existing
         }
+        guard canonicalWorkspaceHostPreparation == nil || !isAwaitingWorkspaceAdoption else { return nil }
         let explicitSessionID = explicitActiveSessionID(for: tabID)
         guard createIfNeeded || explicitSessionID != nil else {
             return nil
@@ -5250,13 +5377,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func session(for tabID: UUID) -> TabSession {
-        if let existing = session(for: tabID, createIfNeeded: true) {
-            return existing
-        }
-        let fallback = makeSession(for: tabID)
-        sessions[tabID] = fallback
-        interactionRuntime.ensureApprovalSync(for: fallback)
-        return fallback
+        // The create-if-needed path only refuses while the canonical presenter lacks authority.
+        // Never bypass it by inserting a fallback into the old scope.
+        session(for: tabID, createIfNeeded: true) ?? unadmittedSession(tabID: tabID)
     }
 
     func applyEditsScope(for tabID: UUID) -> ApplyEditsApprovalScope {
@@ -5373,7 +5496,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
 
         if let owner = session.oracleBackgroundOwner {
-            runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).closeOracleBackground(for: session)
+            runtimeSessionStore.interactions(routeID: runtimeHost.routeID, approvalStore: applyEditsApprovalStore).closeOracleBackground(for: session)
             guard OracleBackgroundInvocationRegistry.shared.isDrained(owner) else { return nil }
             session.oracleBackgroundOwner = nil
             session.oracleBackgroundDrain = nil
@@ -5424,7 +5547,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let retiredRunID = session.runID
             claudeCoordinator.prepareForConversationResetSync(session)
             if let retiredRunID {
-                Task { await self.cleanupMCPRunRoutingIfPresent(boundSessionID: previousSessionID, liveSession: nil, explicitRunID: retiredRunID, reason: "claudeNative.rebind") }
+                Task { await self.cleanupLegacyMCPRunRoutingIfPresent(boundSessionID: previousSessionID, liveSession: nil, explicitRunID: retiredRunID, reason: "claudeNative.rebind") }
             }
         }
         if invalidateAsyncWork {
@@ -5878,7 +6001,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         {
             return binding
         }
-        guard await runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).awaitOracleBackgroundDrain(for: targetSession) else { throw PersistentBindingMutationError.blockedByOwnership }
+        guard await runtimeSessionStore.interactions(routeID: runtimeHost.routeID, approvalStore: applyEditsApprovalStore).awaitOracleBackgroundDrain(for: targetSession) else { throw PersistentBindingMutationError.blockedByOwnership }
         try checkPreparedOwner()
         guard targetMembership.permitsBindingPreparation else { throw PersistentBindingMutationError.staleTransition }
 
@@ -5895,7 +6018,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         guard preparationIsCurrent() else { throw PersistentBindingMutationError.staleTransition }
         if let sourceSession, sourceSession !== targetSession {
-            guard await runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).awaitOracleBackgroundDrain(for: sourceSession) else { throw PersistentBindingMutationError.blockedByOwnership }
+            guard await runtimeSessionStore.interactions(routeID: runtimeHost.routeID, approvalStore: applyEditsApprovalStore).awaitOracleBackgroundDrain(for: sourceSession) else { throw PersistentBindingMutationError.blockedByOwnership }
             try checkPreparedOwner()
         }
         guard preparationIsCurrent() else { throw PersistentBindingMutationError.staleTransition }
@@ -6507,8 +6630,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if case .owner = input.target.owner, input.target.tabID == nil {
             return .settled(.noSelection)
         }
-        if case .settledUnowned = input.target.owner {
+        switch input.target.owner {
+        case .settledUnowned, .activationFailed:
             return .settled(.workspaceUnavailable)
+        default:
+            break
         }
         if let record = input.record, record.scope == input.target.scope, record.origin == .fresh {
             return .settled(.fresh)
@@ -6623,20 +6749,160 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// Separate from presentation adoption: installation clears queuedWorkspaceSwitchOwner before
     /// teardown/discard. Readiness must stay withheld through that entire destructive slice.
     private var destructiveWorkspaceAdoptionOwner: SessionIndexOwner?
+    private var fencedLegacyAdoptionScope: AgentSessionRuntimeStore.Scope?
+
+    @MainActor
+    private final class WorkspaceAdoption {
+        enum Result {
+            case ready(ObjectIdentifier)
+            case refused
+        }
+
+        let owner: SessionIndexOwner
+        let canJoin: Bool
+        private(set) var result: Result?
+        private var waiters: [UUID: CheckedContinuation<Result, Never>] = [:]
+
+        init(owner: SessionIndexOwner, canJoin: Bool) {
+            self.owner = owner
+            self.canJoin = canJoin
+        }
+
+        func finish(_ result: Result) {
+            guard self.result == nil else { return }
+            self.result = result
+            let pending = waiters
+            waiters.removeAll()
+            for waiter in pending.values {
+                waiter.resume(returning: result)
+            }
+        }
+
+        func wait() async -> Result {
+            guard canJoin, !Task.isCancelled else { return .refused }
+            let id = UUID()
+            return await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    if Task.isCancelled {
+                        continuation.resume(returning: .refused)
+                    } else if let result {
+                        continuation.resume(returning: result)
+                    } else {
+                        waiters[id] = continuation
+                    }
+                }
+            } onCancel: {
+                Task { @MainActor in
+                    self.waiters.removeValue(forKey: id)?.resume(returning: .refused)
+                }
+            }
+        }
+    }
+
+    private static let performingWorkspaceAdoptionFor = BoxedTaskLocal<ObjectIdentifier?>(nil)
+    static let workspaceActivationLog = Logger(subsystem: "com.repoprompt.agents", category: "WorkspaceActivation")
+    static let workspaceActivationFailureMessage = "Agent Mode could not start for this workspace. Retry to load Agent Mode."
+    private var workspaceAdoption: WorkspaceAdoption?
+
+    var refusedWorkspaceActivationOwner: SessionIndexOwner? {
+        guard canonicalWorkspaceHostPreparation != nil || runtimeHost.workspaceActivation != nil,
+              let adoption = workspaceAdoption, case .refused? = adoption.result,
+              adoption.owner.workspaceID != nil, sessionIndexStore.isOwnerCurrent(adoption.owner)
+        else { return nil }
+        return adoption.owner
+    }
+
+    func retryWorkspaceActivation(_ owner: SessionIndexOwner) async {
+        guard refusedWorkspaceActivationOwner == owner,
+              !hasPreparedForWindowClose, !hasDetachedClosingPresentation,
+              let workspaceManager, !workspaceManager.isSwitchingWorkspace,
+              let workspace = workspaceManager.activeWorkspace, workspace.id == owner.workspaceID
+        else { return }
+        await handleWorkspaceSwitch(workspace)
+    }
+
+    private func workspaceAdoptionMCPError(expectedWorkspaceID: UUID?) -> MCPError {
+        if let owner = refusedWorkspaceActivationOwner,
+           expectedWorkspaceID == nil || expectedWorkspaceID == owner.workspaceID
+        {
+            return .invalidParams("Agent Mode could not start for this workspace. Use Retry in Agent Mode, then run this command again.")
+        }
+        return .invalidParams(TabSession.loadingAdmissionFailureMessage)
+    }
+
+    func workspaceActivationRefusalMCPError(expectedWorkspaceID: UUID?) -> MCPError? {
+        guard let refused = refusedWorkspaceActivationOwner,
+              sessionIndexStore.isOwnerCurrent(refused),
+              expectedWorkspaceID == nil || refused.workspaceID == expectedWorkspaceID
+        else { return nil }
+        return workspaceAdoptionMCPError(expectedWorkspaceID: expectedWorkspaceID)
+    }
 
     var isAwaitingWorkspaceAdoption: Bool {
-        runtimeSessionStore.isAwaitingWorkspaceAdoption
+        if destructiveWorkspaceAdoptionOwner != nil || runtimeSessionStore.isAwaitingWorkspaceAdoption { return true }
+        if canonicalWorkspaceHostPreparation != nil, let workspaceAdoption {
+            guard case let .ready(host) = workspaceAdoption.result, host == ObjectIdentifier(runtimeHost),
+                  sessionIndexStore.isOwnerCurrent(workspaceAdoption.owner) else { return true }
+        }
+        // A refused destination preparation leaves the last owner intact, not authorized to
+        // serve the newly selected workspace through the old presenter.
+        guard let activation = runtimeHost.workspaceActivation else {
+            return canonicalWorkspaceHostPreparation != nil && activeWorkspaceIDForSessionIndexOwnership != nil
+        }
+        return activation.key.owner.workspaceID != activeWorkspaceIDForSessionIndexOwnership
     }
 
     private func beginDestructiveWorkspaceAdoption(_ owner: SessionIndexOwner) {
+        if workspaceAdoption?.owner != owner {
+            workspaceAdoption?.finish(.refused)
+            // Legacy teardown can join a tool/provider that is itself asking for readiness.
+            // Independent hosts aren't drained by presentation adoption.
+            let needsLegacyDrain = runtimeHost.workspaceActivation == nil && sessions.values.contains { session in
+                session.runState.isActive || session.oracleBackgroundOwner != nil
+            }
+            workspaceAdoption = WorkspaceAdoption(owner: owner, canJoin: !needsLegacyDrain)
+        }
         destructiveWorkspaceAdoptionOwner = owner
-        runtimeSessionStore.setWorkspaceAdoptionPending(true)
+        // Activation changes fence the presenter, not the independent owner's commands.
+        if runtimeHost.workspaceActivation == nil {
+            fencedLegacyAdoptionScope = runtimeSessionStore
+            runtimeSessionStore.setWorkspaceAdoptionPending(true)
+        }
     }
 
     private func finishDestructiveWorkspaceAdoption(_ owner: SessionIndexOwner) {
         guard destructiveWorkspaceAdoptionOwner == owner else { return }
         destructiveWorkspaceAdoptionOwner = nil
-        runtimeSessionStore.setWorkspaceAdoptionPending(false)
+        let fencedScope = fencedLegacyAdoptionScope
+        fencedLegacyAdoptionScope = nil
+        fencedScope?.setWorkspaceAdoptionPending(false)
+    }
+
+    private func completeWorkspaceAdoption(_ owner: SessionIndexOwner) {
+        guard workspaceAdoption?.owner == owner, sessionIndexStore.isOwnerCurrent(owner) else { return }
+        workspaceAdoption?.finish(.ready(ObjectIdentifier(runtimeHost)))
+    }
+
+    /// Join one activation, never follow the window to a successor (even A → B → A).
+    /// Ready means an exact host was installed, not merely that its pending flag was cleared.
+    func awaitWorkspaceRuntimeAdoption(expectedWorkspaceID: UUID? = nil) async -> Bool {
+        let workspaceID = expectedWorkspaceID ?? activeWorkspaceIDForSessionIndexOwnership
+        guard !Task.isCancelled, !hasPreparedForWindowClose, !hasDetachedClosingPresentation,
+              workspaceID == activeWorkspaceIDForSessionIndexOwnership else { return false }
+        guard let adoption = workspaceAdoption else { return !isAwaitingWorkspaceAdoption }
+        guard adoption.owner.workspaceID == workspaceID else { return false }
+        let result: WorkspaceAdoption.Result
+        if let settled = adoption.result {
+            result = settled
+        } else {
+            guard Self.performingWorkspaceAdoptionFor.get() != ObjectIdentifier(self) else { return false }
+            result = await adoption.wait()
+        }
+        guard case let .ready(host) = result else { return false }
+        return !Task.isCancelled && !hasPreparedForWindowClose && !hasDetachedClosingPresentation
+            && workspaceAdoption === adoption && sessionIndexStore.isOwnerCurrent(adoption.owner)
+            && activeWorkspaceIDForSessionIndexOwnership == workspaceID
+            && ObjectIdentifier(runtimeHost) == host && !isAwaitingWorkspaceAdoption
     }
 
     private func clearQueuedWorkspaceSwitchOwner(_ owner: SessionIndexOwner) {
@@ -6665,8 +6931,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
-    /// Owner qualification shared by the pane target and the sidebar's owner-pending projection.
-    func transcriptPaneTargetOwner() -> AgentTranscriptPaneTarget.Owner {
+    private func sessionIndexPresentationOwner() -> AgentTranscriptPaneTarget.Owner {
         let emitted = emittedActiveWorkspace
         return if let owner = currentPaneOwner,
                   emitted == nil || emitted?.workspaceID == owner.workspaceID
@@ -6680,6 +6945,18 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         } else {
             .noWorkspace
         }
+    }
+
+    private func transcriptPaneTargetOwner() -> AgentTranscriptPaneTarget.Owner {
+        if let owner = refusedWorkspaceActivationOwner {
+            return .activationFailed(owner)
+        }
+        if canonicalWorkspaceHostPreparation != nil, isAwaitingWorkspaceAdoption,
+           let workspaceID = activeWorkspaceIDForSessionIndexOwnership
+        {
+            return .awaitingOwner(workspaceID: workspaceID)
+        }
+        return sessionIndexPresentationOwner()
     }
 
     func transcriptPaneInput(tabID: UUID?, session: TabSession?) -> AgentTranscriptPanePresentation.Input {
@@ -6696,6 +6973,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         let targetWorkspaceID: UUID? = switch paneOwner {
         case let .owner(owner): owner.workspaceID
+        case let .activationFailed(owner): owner.workspaceID
         case let .awaitingOwner(workspaceID): workspaceID
         case .noWorkspace: nil
         case let .settledUnowned(workspaceID, _): workspaceID
@@ -7049,12 +7327,37 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         publishMCPStateChange(for: session)
     }
 
+    private func unadmittedSession(tabID: UUID) -> TabSession {
+        let session = TabSession(tabID: tabID)
+        session.workspaceAdoptionPending = { true }
+        return session
+    }
+
     /// Ensures a session exists for the given tab ID and loads any persisted state.
     /// Used by MCP tool handlers to ensure session is ready before accessing it.
-    func ensureSessionReady(tabID: UUID, reconnectActiveProviders: Bool = false, visitIntent: UUID? = nil) async -> TabSession {
-        // Do not join adoption: its teardown can be draining work which called this method.
-        // Return an explicitly not-ready payload, without hydration, handoff or provider effects.
-        if isAwaitingWorkspaceAdoption { return session(for: tabID) }
+    func ensureSessionReady(
+        tabID: UUID, reconnectActiveProviders: Bool = false, visitIntent: UUID? = nil, expectedWorkspaceID: UUID? = nil
+    ) async -> TabSession {
+        let activation = sessionIndexStore.latestSessionIndexOwner
+        let requestedWorkspaceID = expectedWorkspaceID ?? activeWorkspaceIDForSessionIndexOwnership
+        func requestedTabIsCurrent() -> Bool {
+            guard requestedWorkspaceID == activeWorkspaceIDForSessionIndexOwnership,
+                  sessionIndexStore.latestSessionIndexOwner == activation else { return false }
+            guard canonicalWorkspaceHostPreparation != nil else { return true }
+            // A stale tab from the previous workspace must not be materialized by the new host.
+            return workspaceManager?.activeWorkspace?.composeTabs.contains { $0.id == tabID } == true
+        }
+        guard requestedTabIsCurrent() else { return unadmittedSession(tabID: tabID) }
+        // A failed join must not materialize a writer in the departing or successor host.
+        if isAwaitingWorkspaceAdoption, await !awaitWorkspaceRuntimeAdoption(expectedWorkspaceID: requestedWorkspaceID) {
+            return unadmittedSession(tabID: tabID)
+        }
+        let host = runtimeHost
+        func activationIsCurrent() -> Bool {
+            !Task.isCancelled && !isAwaitingWorkspaceAdoption && !hasPreparedForWindowClose && !hasDetachedClosingPresentation
+                && requestedTabIsCurrent() && runtimeHost === host
+        }
+        guard activationIsCurrent() else { return unadmittedSession(tabID: tabID) }
         let owners = preparedSessionRuntimes
         let visibleSessionID = workspaceManager?.activeAgentSessionID(forTabID: tabID)
         let visibleWorkspaceID = workspaceManager?.activeWorkspaceID
@@ -7091,21 +7394,22 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 guard let self, !self.hasPreparedForWindowClose,
                       workspaceManager?.activeWorkspaceID == visibleWorkspaceID,
                       workspaceManager?.activeAgentSessionID(forTabID: tabID) == id else { return }
-                _ = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: reconnectActiveProviders, visitIntent: intent)
+                _ = await ensureSessionReady(
+                    tabID: tabID, reconnectActiveProviders: reconnectActiveProviders, visitIntent: intent,
+                    expectedWorkspaceID: visibleWorkspaceID
+                )
             }
             return session(for: tabID)
         }
-        guard visitIsCurrent() else { return session(for: tabID) }
+        guard activationIsCurrent(), visitIsCurrent() else { return unadmittedSession(tabID: tabID) }
         let session = session(for: tabID)
-        if isAwaitingWorkspaceAdoption { return session }
 
         // Load persisted session if we haven't already.
         if !session.hasLoadedPersistedState {
             await loadSessionFromDisk(for: session)
         }
 
-        guard visitIsCurrent(), sessions[tabID] === session else { return self.session(for: tabID) }
-        if isAwaitingWorkspaceAdoption { return session }
+        guard activationIsCurrent(), visitIsCurrent(), sessions[tabID] === session else { return unadmittedSession(tabID: tabID) }
         // Apply to bindings if this is the active tab
         if tabID == currentTabID {
             applySessionToBindings(session)
@@ -7117,14 +7421,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         {
             await codexCoordinator.ensureCodexNativeSession(session: session)
         }
-        if reconnectActiveProviders, session.pendingHandoff.providerSwitchDelivery == nil,
+        if activationIsCurrent(), visitIsCurrent(), reconnectActiveProviders, session.pendingHandoff.providerSwitchDelivery == nil,
            session.operationAdmissionFailureMessage == nil,
            sessions[tabID] === session, session.selectedAgent.usesClaudeNativeRuntime, session.runState.isActive
         {
             await reconnectClaudeNativeSessionIfNeeded(session)
         }
 
-        return sessions[tabID] === session ? session : self.session(for: tabID)
+        return activationIsCurrent() && visitIsCurrent() && sessions[tabID] === session ? session : unadmittedSession(tabID: tabID)
     }
 
     func activateRoutedAgentSession(
@@ -7132,6 +7436,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         sessionID: UUID?,
         workspace: WorkspaceModel,
         workspaceLink: Bool = false,
+        restoringStashedCarrier: Bool = false,
         visitIntent: UUID? = nil,
         resumePreparedVisit: (@MainActor (UUID) async -> Void)? = nil
     ) async -> AgentRouteSessionActivationResult {
@@ -7142,6 +7447,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         func visitIsCurrent() -> Bool {
             guard qualifiesForVisit, let visitSessionID, let owners else { return true }
             return owners.isRuntimeVisitIntentCurrent(visitSessionID, intent: intent)
+        }
+        if let adoption = workspaceAdoption, adoption.result == nil,
+           await !awaitWorkspaceRuntimeAdoption(expectedWorkspaceID: workspace.id)
+        {
+            return .blockedByActiveDifferentSession
         }
         guard visitIsCurrent() else { return .blockedByActiveDifferentSession }
         if workspaceLink, let sessionID, owners?.hasPreparedRuntime(sessionID) == true {
@@ -7163,7 +7473,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let expectedVisibleID = workspaceManager?.activeAgentSessionID(forTabID: tabID)
             let expectedActivation = sessionIndexStore.latestSessionIndexOwner
             owners.queuePreparedRuntimeVisit(preparedVisitID, intent: intent) { [weak self] in
-                guard let self, !self.hasPreparedForWindowClose, let intent,
+                guard let self, !hasPreparedForWindowClose, !hasDetachedClosingPresentation, let intent,
                       sessionIndexStore.latestSessionIndexOwner == expectedActivation, workspaceManager?.activeWorkspaceID == workspace.id,
                       workspaceManager?.activeAgentSessionID(forTabID: tabID) == expectedVisibleID else { return }
                 if let resumePreparedVisit {
@@ -7175,9 +7485,58 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return .blockedByActiveDifferentSession
         }
         guard visitIsCurrent() else { return .blockedByActiveDifferentSession }
+        if qualifiesForVisit, canonicalWorkspaceHostPreparation != nil, isAwaitingWorkspaceAdoption,
+           destructiveWorkspaceAdoptionOwner == nil, queuedWorkspaceSwitchOwner == nil,
+           workspaceManager?.activeWorkspaceID == workspace.id,
+           !hasPreparedForWindowClose, !hasDetachedClosingPresentation
+        {
+            // The initial activation could not adopt while an exact drain owned the writer.
+            // The same explicit visit may now install the new host after durable release.
+            await handleWorkspaceSwitch(workspace)
+            guard visitIsCurrent(), !isAwaitingWorkspaceAdoption, !hasDetachedClosingPresentation,
+                  !hasPreparedForWindowClose, workspaceManager?.activeWorkspaceID == workspace.id
+            else { return .blockedByActiveDifferentSession }
+        }
+        let routeOwner = sessionIndexStore.latestSessionIndexOwner
+        let routeHost = runtimeHost
+        func routeActivationIsCurrent(requiresActiveCarrier: Bool = true) -> Bool {
+            !Task.isCancelled && !isAwaitingWorkspaceAdoption && !hasPreparedForWindowClose && !hasDetachedClosingPresentation
+                && workspaceManager?.activeWorkspaceID == workspace.id && workspaceManager?.isSwitchingWorkspace == false
+                && sessionIndexStore.latestSessionIndexOwner == routeOwner && runtimeHost === routeHost
+                && (
+                    !requiresActiveCarrier || canonicalWorkspaceHostPreparation == nil
+                        || workspaceManager?.activeWorkspace?.composeTabs.contains { $0.id == tabID } == true
+                )
+        }
+        if restoringStashedCarrier, canonicalWorkspaceHostPreparation != nil, let sessionID {
+            /// The router restores this carrier only after the old writer settles. This first
+            /// check reads the durable binding but does not install a session in the active host.
+            func stashedCarrierIsCurrent() -> Bool {
+                guard routeActivationIsCurrent(requiresActiveCarrier: false), visitIsCurrent(),
+                      owners?.hasPreparedRuntime(sessionID) != true,
+                      !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: sessionID),
+                      !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: sessionID),
+                      let current = workspaceManager?.activeWorkspace, current.customStoragePath == workspace.customStoragePath,
+                      !current.composeTabs.contains(where: { $0.id == tabID }),
+                      current.stashedTabs.filter({ $0.tab.id == tabID }).map(\.tab.activeAgentSessionID) == [sessionID],
+                      case .unavailable(.absent) = routeHost.scope.resolveWriter(sessionID: sessionID, expectedWorkspaceID: workspace.id)
+                else { return false }
+                return true
+            }
+            guard stashedCarrierIsCurrent() else { return .blockedByActiveDifferentSession }
+            guard let saved = try? await dataService.loadAgentSession(id: sessionID, for: workspace),
+                  saved.id == sessionID else { return .sessionNotFound }
+            guard stashedCarrierIsCurrent() else { return .blockedByActiveDifferentSession }
+            if let storedWorkspaceID = saved.workspaceID, storedWorkspaceID != workspace.id { return .sessionWorkspaceMismatch }
+            if let storedTabID = saved.composeTabID, storedTabID != tabID { return .sessionTabMismatch }
+            return .ready
+        }
+        guard routeActivationIsCurrent() else { return .blockedByActiveDifferentSession }
         guard let sessionID else {
             guard !workspaceLink else { return .sessionNotFound }
-            let session = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: true, visitIntent: intent)
+            let session = await ensureSessionReady(
+                tabID: tabID, reconnectActiveProviders: true, visitIntent: intent, expectedWorkspaceID: workspace.id
+            )
             guard visitIsCurrent() else { return .blockedByActiveDifferentSession }
             return sessions[tabID] === session && session.operationAdmissionFailureMessage == nil
                 ? .ready : .sessionNotFound
@@ -7196,7 +7555,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return finishWorkspaceLink(session)
         }
         if currentBinding == sessionID, !workspaceLink {
-            let session = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: true, visitIntent: intent)
+            let session = await ensureSessionReady(
+                tabID: tabID, reconnectActiveProviders: true, visitIntent: intent, expectedWorkspaceID: workspace.id
+            )
             guard visitIsCurrent() else { return .blockedByActiveDifferentSession }
             return sessions[tabID] === session && session.activeAgentSessionID == sessionID
                 && session.permitsBoundOperationAndSave ? .ready : .sessionNotFound
@@ -7286,7 +7647,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return .sessionNotFound
         }
 
-        guard payload.sessionID == sessionID,
+        guard routeActivationIsCurrent(), visitIsCurrent(), payload.sessionID == sessionID,
               persistentBindingTransitionIsCurrent(transitionToken)
         else {
             return .sessionNotFound
@@ -7327,7 +7688,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return .sessionNotFound
         }
 
-        guard visitIsCurrent() else { return .blockedByActiveDifferentSession }
+        guard routeActivationIsCurrent(), visitIsCurrent() else { return .blockedByActiveDifferentSession }
         if workspaceLink, preparedSessionRuntimes?.hasPreparedRuntime(sessionID) == true {
             return .blockedByActiveDifferentSession
         }
@@ -8524,6 +8885,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
+    enum MCPSessionTargetPurpose {
+        case controlActivation
+        case remoteCommand
+    }
+
     func mcpResolveOrCreateSessionTarget(
         tabID: UUID?,
         sessionID: UUID?,
@@ -8532,11 +8898,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         parentSessionID: UUID? = nil,
         inheritWorktreeBindings: Bool = false,
         expectedWorkspaceID: UUID? = nil,
-        creationKind: MCPSessionCreationKind = .mcpControlled
+        creationKind: MCPSessionCreationKind = .mcpControlled,
+        purpose: MCPSessionTargetPurpose = .controlActivation
     ) async throws -> MCPSessionTarget {
-        guard !isAwaitingWorkspaceAdoption else {
-            throw MCPError.invalidParams(TabSession.loadingAdmissionFailureMessage)
+        if isAwaitingWorkspaceAdoption, await !awaitWorkspaceRuntimeAdoption(expectedWorkspaceID: expectedWorkspaceID) {
+            try Task.checkCancellation()
+            throw workspaceAdoptionMCPError(expectedWorkspaceID: expectedWorkspaceID)
         }
+        let activation = sessionIndexStore.latestSessionIndexOwner
+        let host = runtimeHost
         let selector = try normalizeMCPSessionSelector(
             tabID: tabID,
             sessionID: sessionID,
@@ -8567,6 +8937,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 try requireLocalMCPRuntimeWriter(sessionID: intendedSessionID, expectedWorkspaceID: reservationWorkspaceID)
             }
             triggerPendingMCPSessionTargetDiscardRetries()
+            guard sessionIndexStore.latestSessionIndexOwner == activation, runtimeHost === host else {
+                throw workspaceAdoptionMCPError(expectedWorkspaceID: expectedWorkspaceID)
+            }
             try revalidateNormalizedMCPSessionSelector(
                 selector,
                 expectedWorkspaceID: expectedWorkspaceID
@@ -8579,7 +8952,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 parentSessionID: parentSessionID,
                 inheritWorktreeBindings: inheritWorktreeBindings,
                 expectedWorkspaceID: expectedWorkspaceID,
-                creationKind: creationKind
+                creationKind: creationKind,
+                purpose: purpose
             )
             if creationKind.retainsPublishedSession {
                 publishedLaneTarget = target
@@ -8779,10 +9153,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         parentSessionID: UUID?,
         inheritWorktreeBindings: Bool,
         expectedWorkspaceID: UUID?,
-        creationKind: MCPSessionCreationKind
+        creationKind: MCPSessionCreationKind,
+        purpose: MCPSessionTargetPurpose
     ) async throws -> MCPSessionTarget {
         guard !isAwaitingWorkspaceAdoption else {
-            throw MCPError.invalidParams(TabSession.loadingAdmissionFailureMessage)
+            throw workspaceAdoptionMCPError(expectedWorkspaceID: expectedWorkspaceID)
         }
         if let expectedWorkspaceID,
            workspaceManager?.activeWorkspaceID != expectedWorkspaceID
@@ -8799,7 +9174,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 parentSessionID: parentSessionID,
                 inheritWorktreeBindings: inheritWorktreeBindings,
                 expectedWorkspaceID: expectedWorkspaceID,
-                discardAuthorityID: discardAuthorityID
+                discardAuthorityID: discardAuthorityID,
+                purpose: purpose
             )
 
         case let .session(sessionID):
@@ -8820,7 +9196,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     parentSessionID: indexedParentSessionID ?? parentSessionID,
                     inheritWorktreeBindings: inheritWorktreeBindings,
                     expectedWorkspaceID: expectedWorkspaceID,
-                    discardAuthorityID: discardAuthorityID
+                    discardAuthorityID: discardAuthorityID,
+                    purpose: purpose
                 )
             }
             guard createIfNeeded else {
@@ -8880,11 +9257,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     parentWasLocallyRepresentedAtAdmissionStart: parentWasLocallyRepresentedAtAdmissionStart
                 )
                 try requireCurrentAgentSessionLifecycleAdmission(provisionalTarget)
-                applySpawnParentSessionID(
-                    effectiveParentSessionID,
-                    to: hydrated,
-                    inheritWorktreeBindings: inheritWorktreeBindings
-                )
+                if purpose == .controlActivation {
+                    applySpawnParentSessionID(
+                        effectiveParentSessionID,
+                        to: hydrated,
+                        inheritWorktreeBindings: inheritWorktreeBindings
+                    )
+                }
                 return provisionalTarget
             } catch {
                 _ = await mcpDiscardSessionTarget(provisionalTarget)
@@ -8908,7 +9287,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     parentSessionID: parentSessionID,
                     inheritWorktreeBindings: inheritWorktreeBindings,
                     expectedWorkspaceID: expectedWorkspaceID,
-                    discardAuthorityID: discardAuthorityID
+                    discardAuthorityID: discardAuthorityID,
+                    purpose: purpose
                 )
             }
             guard createsBinding, createIfNeeded, let intendedSessionID = resolvedSessionID else {
@@ -9015,26 +9395,33 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
             let createdTabID = creation.tabID
             defer { provisionalParentSessionIDBySessionID.removeValue(forKey: intendedSessionID) }
-            // The registry retains the durable recovery claim even if cancellation arrives while the
-            // newly published tab is being hydrated into this view model.
+            // Capture the published writer now, before a cancellable hydration wait. Recovery
+            // must remove this incarnation and its artifacts, never a replacement binding.
+            let publishedFreshSession = creation.freshSession
+            let publishedLifecycleIdentity: AgentSessionLifecycleAuthority.Identity? = publishedFreshSession.flatMap { handle in
+                guard freshSessionCreationIsCurrent(handle) else { return nil }
+                return agentSessionLifecycleIdentity(tabID: createdTabID, expectedSessionID: intendedSessionID)
+            }
             var provisionalTarget = MCPSessionTarget(
                 tabID: createdTabID,
                 sessionID: intendedSessionID,
                 origin: .createdNewTab,
+                lifecycleIdentity: publishedLifecycleIdentity,
                 recoveryClaim: creation.recoveryClaim,
                 discardAuthorityID: discardAuthorityID,
-                creationHandle: creation.freshSession
+                creationHandle: publishedFreshSession
             )
             registerOutstandingProvisionalMCPSessionTarget(provisionalTarget)
-            let publishedFreshSession = creation.freshSession
             do {
                 #if DEBUG
                     await test_afterDurableChildTabCreation?()
                 #endif
+                try Task.checkCancellation()
                 guard let publishedFreshSession, freshSessionCreationIsCurrent(publishedFreshSession) else {
                     throw MCPError.invalidParams("The fresh Agent session binding changed during creation.")
                 }
                 let hydrated = await ensureSessionReady(tabID: createdTabID)
+                try Task.checkCancellation()
                 guard hydrated === publishedFreshSession.session,
                       freshSessionCreationIsCurrent(publishedFreshSession)
                 else { throw MCPError.invalidParams("The fresh Agent session binding changed during hydration.") }
@@ -9095,7 +9482,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         parentSessionID: UUID?,
         inheritWorktreeBindings: Bool,
         expectedWorkspaceID: UUID?,
-        discardAuthorityID: UUID
+        discardAuthorityID: UUID,
+        purpose: MCPSessionTargetPurpose
     ) async throws -> MCPSessionTarget {
         try requireFrozenMCPSessionBinding(
             tabID: tabID,
@@ -9104,7 +9492,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             requiresHydratedRuntime: false
         )
         let admittedWindow = WindowStatesManager.shared.window(withID: windowID)
-        let residentActivationTarget = try await mcpPreflightResidentActivation(sessionID: sessionID, admittedWindow: admittedWindow)
+        // Remote commands use the existing session writer. Only an ownership transfer needs the link fence.
+        let residentActivationTarget: MCPResidentTarget? = if purpose == .controlActivation {
+            try await mcpPreflightResidentActivation(sessionID: sessionID, admittedWindow: admittedWindow)
+        } else {
+            nil
+        }
         try requireLocalMCPRuntimeWriter(sessionID: sessionID, expectedWorkspaceID: expectedWorkspaceID)
         let hydrated = await ensureSessionReady(tabID: tabID)
         #if DEBUG
@@ -9125,14 +9518,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 "The requested Agent session runtime changed while its target was prepared."
             )
         }
-        let hydratedActivationTarget: MCPResidentTarget? = if let residentActivationTarget {
-            residentActivationTarget
-        } else {
-            try await mcpPreflightResidentActivation(sessionID: sessionID, admittedWindow: admittedWindow)
+        if purpose == .controlActivation {
+            let hydratedActivationTarget: MCPResidentTarget? = if let residentActivationTarget {
+                residentActivationTarget
+            } else {
+                try await mcpPreflightResidentActivation(sessionID: sessionID, admittedWindow: admittedWindow)
+            }
+            try mcpRequireActivationOwnerFence(hydratedActivationTarget, session: hydrated)
         }
-        try mcpRequireActivationOwnerFence(hydratedActivationTarget, session: hydrated)
         let resolvedSessionID = sessionID
-        let indexedParentSessionID = ownerValidatedSessionIndex[resolvedSessionID]?.parentSessionID
         let target = MCPSessionTarget(
             tabID: hydrated.tabID,
             sessionID: resolvedSessionID,
@@ -9154,11 +9548,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             .init(tabID: target.tabID, identity: lifecycleIdentity),
             intent: .providerStart
         )
-        applySpawnParentSessionID(
-            hydrated.parentSessionID ?? indexedParentSessionID ?? parentSessionID,
-            to: hydrated,
-            inheritWorktreeBindings: inheritWorktreeBindings
-        )
+        if purpose == .controlActivation {
+            let indexedParentSessionID = ownerValidatedSessionIndex[resolvedSessionID]?.parentSessionID
+            applySpawnParentSessionID(
+                hydrated.parentSessionID ?? indexedParentSessionID ?? parentSessionID,
+                to: hydrated,
+                inheritWorktreeBindings: inheritWorktreeBindings
+            )
+        }
         return target
     }
 
@@ -10679,30 +11076,46 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                   expectedSessionID: sessionID
               ) == runtimeIdentity.lifecycleIdentity
         else { return }
-        mcpRuntime.mcpRemoveAgentRunOracleReviewContexts(sessionID: sessionID)
-        if session.activeAgentSessionID == sessionID {
-            if session.runState.isActive {
-                await runService.cancelRun(
-                    tabID: target.tabID,
-                    session: session,
-                    intent: .runtimeShutdown,
-                    completion: .terminalTeardownCompleted
-                )
-            }
-            cancelPersistedLoad(for: session)
-            session.cancelEphemeralRuntimeState()
-            session.derivedTranscriptRefreshGeneration &+= 1
-            session.derivedTranscriptRefreshTask?.cancel()
-            session.derivedTranscriptRefreshTask = nil
-            session.pendingDerivedTranscriptRefreshReason = nil
-            await mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
-            await cleanupMCPRunRoutingIfPresent(
-                boundSessionID: sessionID,
-                liveSession: session,
-                reason: "provisional_admission_recovery"
-            )
-            sessions.removeValue(forKey: target.tabID)
+        let originatingScope = runtimeSessionStore
+        let originatingMCP = mcpRuntime
+        let runAttempt = session.activeRunOwnership
+        func stillOwnsRuntime() -> Bool {
+            runtimeSessionStore === originatingScope && sessions[target.tabID] === session
+                && agentSessionLifecycleIdentity(tabID: target.tabID, expectedSessionID: sessionID) == runtimeIdentity.lifecycleIdentity
+                && (session.activeRunOwnership == nil || session.activeRunOwnership == runAttempt)
         }
+        originatingMCP.mcpRemoveAgentRunOracleReviewContexts(sessionID: sessionID)
+        if session.runState.isActive {
+            await runService.cancelRun(
+                tabID: target.tabID,
+                session: session,
+                intent: .runtimeShutdown,
+                completion: .terminalTeardownCompleted
+            )
+            guard stillOwnsRuntime() else { return }
+        }
+        cancelPersistedLoad(for: session)
+        session.cancelEphemeralRuntimeState()
+        session.derivedTranscriptRefreshGeneration &+= 1
+        session.derivedTranscriptRefreshTask?.cancel()
+        session.derivedTranscriptRefreshTask = nil
+        session.pendingDerivedTranscriptRefreshReason = nil
+        guard stillOwnsRuntime() else { return }
+        if let context = session.mcpControlContext, context.sessionID == sessionID {
+            _ = await originatingMCP.deactivateControlContext(
+                session: session, expectedContext: context,
+                approvalStore: applyEditsApprovalStore, cleanupRegistration: true
+            )
+            guard stillOwnsRuntime() else { return }
+        }
+        await cleanupLegacyMCPRunRoutingIfPresent(
+            boundSessionID: sessionID,
+            liveSession: session,
+            reason: "provisional_admission_recovery"
+        )
+        guard stillOwnsRuntime() else { return }
+        sessions.removeValue(forKey: target.tabID)
+        guard runtimeSessionStore === originatingScope, sessions[target.tabID] == nil else { return }
         if pendingTabIDForLoad == target.tabID {
             pendingTabIDForLoad = nil
         }
@@ -11169,7 +11582,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         workflow: AgentWorkflowDefinition? = nil,
         nativePreparedTurn: NativeSlashPreparedUserTurn? = nil,
         preserveRoutedInitialEffort: Bool = false,
+        preserveRequestedReasoningEffort: Bool = false,
         remoteAttachments: [AgentFileAttachment]? = nil,
+        remoteInterviewFirst: Bool? = nil,
         validateInitialStart: (@MainActor () throws -> Void)? = nil
     ) async throws -> MCPInstructionDispatch {
         guard let originalWriter = mcpRuntime.controlledWriter(sessionID: sessionID),
@@ -11210,7 +11625,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // Preserve Model Router's effort on a router-owned first start. Auto effort may
         // judge other first starts and settled follow-ups; active steering keeps its effort.
         let judgesUserTurn = AutoEffortModelPolicy.shouldJudgeMCPUserTurn(
-            isEnabled: modelRouterSettingsStore.autoEffortEnabled(),
+            isEnabled: !preserveRequestedReasoningEffort && modelRouterSettingsStore.autoEffortEnabled(),
             startsNewRun: allowStartingRun && !session.runState.isActive
                 && !(session.runState == .waitingForUser && session.instructionContinuation != nil),
             hasPriorUserTurn: session.hasSentFirstMessage,
@@ -11263,6 +11678,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if remoteAttachments?.isEmpty == false, delivery != .startedRun {
             throw MCPError.invalidParams("Wait for the current run to finish before sending attachments.")
         }
+        if remoteInterviewFirst == true, delivery != .startedRun {
+            throw MCPError.invalidParams("Interview first is only available when starting a new chat.")
+        }
         let submittedAutoEffortSelection = delivery == .startedRun ? autoEffortSelection : nil
         let submittedAutoEffortAudit = delivery == .startedRun
             ? autoEffortChoice?.audit
@@ -11300,6 +11718,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         codexAttemptID: codexAttemptID,
                         autoEffortAudit: submittedAutoEffortAudit,
                         isLocalComposerInput: false,
+                        remoteInterviewFirst: remoteInterviewFirst,
                         scheduledProviderSwitchSubmission: { pendingSwitchSubmission = $0 }
                     )
                 }
@@ -11311,6 +11730,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     autoEffortAudit: submittedAutoEffortAudit,
                     isLocalComposerInput: false,
                     remoteAttachments: remoteAttachments,
+                    remoteInterviewFirst: remoteInterviewFirst,
                     scheduledProviderSwitchSubmission: { pendingSwitchSubmission = $0 }
                 )
             }
@@ -12862,15 +13282,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         ))
     }
 
-    private func cleanupMCPRunRoutingIfPresent(
+    private func cleanupLegacyMCPRunRoutingIfPresent(
         boundSessionID: UUID?,
         liveSession: TabSession?,
         explicitRunID: UUID? = nil,
         reason: String
     ) async {
         _ = boundSessionID
-        guard let runID = explicitRunID ?? liveSession?.runID else { return }
-        await runtimeHost.cleanupRunRouting(.legacyWindow(runID: runID), reason: reason)
+        let host = runtimeHost
+        // Originating controllers or bootstrap rollback consume independent registrations. A late
+        // presenter discard carries only a run ID and cannot clean an independent host or successor.
+        guard host.route.identity.kind == .legacyWindow,
+              let runID = explicitRunID ?? liveSession?.runID else { return }
+        await host.cleanupRunRouting(.legacyWindow(runID: runID), reason: reason)
     }
 
     func removeSessionIndex(sessionID: UUID) {
@@ -12900,9 +13324,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         sessionIndexStore.ownerValidatedSidebarRestoreBaseline
     }
 
-    /// Active switch/queued adoption has not installed its owner: the pane's awaiting-owner target.
+    /// Sidebar rows need the current index owner. Execution host readiness gates the transcript.
     var isSidebarOwnerPending: Bool {
-        if case .awaitingOwner = transcriptPaneTargetOwner() {
+        if case .awaitingOwner = sessionIndexPresentationOwner() {
             true
         } else {
             false
@@ -13133,19 +13557,64 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
-    func handleWorkspaceSwitch(_ workspace: WorkspaceModel?) async {
-        let owner = sessionIndexStore.receiveWorkspaceSwitchNotification(workspace)
-        await handleWorkspaceSwitch(workspace, owner: owner)
+    private enum WorkspaceExecutionDestination {
+        case unowned
+        case blocked
+        case retained(AgentSessionRuntimeStore.Writer, AgentSessionRuntimeHost)
     }
 
-    private func handleWorkspaceSwitch(
+    /// The workspace document names the carrier, but only the store can resolve its writer.
+    /// Conflict or incomplete ownership never authorizes a second writer.
+    private func workspaceExecutionDestination(_ workspace: WorkspaceModel) -> WorkspaceExecutionDestination {
+        guard let tabID = workspace.activeComposeTabID,
+              let sessionID = workspace.composeTabs.first(where: { $0.id == tabID })?.activeAgentSessionID
+        else { return .unowned }
+        switch runtimeSessionStore.resolveWriter(sessionID: sessionID, expectedWorkspaceID: workspace.id) {
+        case .unavailable(.absent): return .unowned
+        case .unavailable, .conflicting: return .blocked
+        case let .unique(writer):
+            guard let host = writer.scope.executableHost, host.route.identity.kind == .independent else {
+                return writer.scope === runtimeSessionStore ? .unowned : .blocked
+            }
+            guard writer.binding.tabID == tabID, writer.isCurrent, writer.session.hasLoadedPersistedState,
+                  writer.session.permitsBoundOperationAndSave, !host.scope.isRetiring,
+                  host.workspaceActivation?.key.owner.workspaceID == workspace.id,
+                  host.workspaceActivation?.owns(scope: host.scope, route: host.route) == true,
+                  host.route.hasCurrentModelCatalogRoute,
+                  host === runtimeHost || !host.scope.sessions.values.contains(where: { host.scope.presentation.hasPresenter(for: $0) })
+            else { return .blocked }
+            return .retained(writer, host)
+        }
+    }
+
+    func handleWorkspaceSwitch(_ workspace: WorkspaceModel?) async {
+        let preservesDrafts = refusedWorkspaceActivationOwner?.workspaceID == workspace?.id && workspace != nil
+        let owner = sessionIndexStore.receiveWorkspaceSwitchNotification(workspace)
+        await handleWorkspaceSwitch(workspace, owner: owner, preservesDrafts: preservesDrafts)
+    }
+
+    private func handleWorkspaceSwitch(_ workspace: WorkspaceModel?, owner: SessionIndexOwner, preservesDrafts: Bool = false) async {
+        await Self.performingWorkspaceAdoptionFor.withValue(ObjectIdentifier(self)) {
+            await performWorkspaceAdoption(workspace, owner: owner, preservesDrafts: preservesDrafts)
+        }
+    }
+
+    private func performWorkspaceAdoption(
         _ workspace: WorkspaceModel?,
-        owner: SessionIndexOwner
+        owner: SessionIndexOwner,
+        preservesDrafts: Bool = false
     ) async {
-        // This queued adoption ends here (installed, superseded or bailed); never clears a successor's.
+        // A refused or superseded adoption must wake only its own waiters.
         defer {
-            clearQueuedWorkspaceSwitchOwner(owner)
             finishDestructiveWorkspaceAdoption(owner)
+            if let adoption = workspaceAdoption, adoption.owner == owner, adoption.result == nil {
+                adoption.finish(.refused)
+                if refusedWorkspaceActivationOwner == owner, !hasPreparedForWindowClose, !hasDetachedClosingPresentation {
+                    activeSessionLoadInProgressTabID = nil
+                    if !isActiveUISyncSuppressed { syncComposerUIState() }
+                }
+            }
+            clearQueuedWorkspaceSwitchOwner(owner)
         }
         logAgentSessionDiscoveryAdoption(owner: owner, workspace: workspace, stage: 1)
         guard sessionIndexStore.isWorkspaceActivationCurrent(owner, workspace: workspace) else { return }
@@ -13202,38 +13671,135 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let teardownStartMS = restorePerfRecorder.timestampMSIfEnabled()
             let teardownSessionCount = sessions.count
         #endif
-        let originatingCleanup = runtimeHost.workspaceSwitchCleanup
-        let oracleDrains = sessions.values.compactMap { runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).closeOracleBackground(for: $0) }
-        for drain in oracleDrains {
-            await drain.value
+        let outgoing = runtimeHost
+        let presenterWindowID = windowID
+        let activityCoordinator = workspaceManager?.workspaceActivityCoordinator ?? WindowStatesManager.shared.workspaceActivityCoordinator
+        let activationLease: WorkspaceActivityCoordinator.ActivationLease?
+        if canonicalWorkspaceHostPreparation != nil, let workspace {
+            guard let lease = activityCoordinator.beginActivation(workspaceID: workspace.id) else {
+                Self.workspaceActivationLog.error("Activation refused by workspace activity coordinator. window=\(presenterWindowID) epoch=\(owner.activationEpoch)")
+                workspaceSwitchInFlight = false
+                activeSessionLoadInProgressTabID = nil
+                completeAgentSessionLinkDiscoveryEpoch(discoveryEpoch)
+                return
+            }
+            activationLease = lease
+        } else {
+            activationLease = nil
         }
-        guard sessionIndexStore.isOwnerCurrent(owner) else { return }
-        let discardContexts = sessions.values.map {
-            prepareWorkspaceSwitchSessionDiscard(
-                $0,
-                reason: "Cancelled due to workspace switch"
+        defer { if let activationLease { activityCoordinator.endActivation(activationLease) } }
+        // Even if an explicit drain has already claimed it, never send an independent
+        // owner through the legacy presentation teardown.
+        let preservesOrigin = outgoing.workspaceActivation != nil
+        let originatingCleanup = outgoing.workspaceSwitchCleanup
+        var prepared: AgentSessionRuntimeHost?
+        var retainedWriter: AgentSessionRuntimeStore.Writer?
+        var destination: AgentSessionRuntimeHost?
+        func ownsCurrentPresentation() -> Bool {
+            !hasPreparedForWindowClose && !hasDetachedClosingPresentation && runtimeHost === outgoing
+                && sessionIndexStore.isOwnerCurrent(owner)
+                && sessionIndexStore.isWorkspaceActivationCurrent(owner, workspace: workspace)
+        }
+        func adoptionIsCurrent() -> Bool {
+            !Task.isCancelled && ownsCurrentPresentation()
+        }
+        func settleRefusedDestination(_ reason: String) {
+            guard ownsCurrentPresentation() else { return }
+            Self.workspaceActivationLog.error("Activation refused. window=\(presenterWindowID) epoch=\(owner.activationEpoch) reason=\(reason, privacy: .public)")
+            workspaceSwitchInFlight = false
+            activeSessionLoadInProgressTabID = nil
+            completeAgentSessionLinkDiscoveryEpoch(discoveryEpoch)
+        }
+        func abandonPreparedDestination() {
+            // There are no admitted writers in an unpublished candidate. Release its exact
+            // activation and execution lease through the normal drain, without blocking adoption.
+            if let prepared, runtimeHost !== prepared { prepared.beginRetirement().startIfNeeded() }
+        }
+        if let workspace, let prepare = canonicalWorkspaceHostPreparation {
+            switch workspaceExecutionDestination(workspace) {
+            case let .retained(writer, host):
+                retainedWriter = writer
+                destination = host
+            case .blocked:
+                settleRefusedDestination("saved carrier writer unavailable for presentation")
+                return
+            case .unowned:
+                do {
+                    prepared = try await prepare(workspace, owner, sessionIndexStore)
+                    destination = prepared
+                    #if DEBUG
+                        await test_afterPreparingWorkspaceHost?(owner)
+                    #endif
+                } catch {
+                    settleRefusedDestination("host preparation failed (\(type(of: error)))")
+                    return
+                }
+            }
+        } else if preservesOrigin, workspace != nil {
+            // A canonical host is never retargeted to cover for missing destination composition.
+            settleRefusedDestination("missing host preparation")
+            return
+        }
+        func destinationIsCurrent() -> Bool {
+            guard let destination, let workspace else { return true }
+            let visible = workspaceManager?.activeWorkspace ?? workspace
+            guard visible.id == workspace.id else { return false }
+            if let retainedWriter {
+                guard case let .retained(currentWriter, currentHost) = workspaceExecutionDestination(visible) else { return false }
+                return currentHost === destination && currentWriter.identity == retainedWriter.identity
+            }
+            guard case .unowned = workspaceExecutionDestination(visible) else { return false }
+            return destination.workspaceActivation?.key.owner == owner
+                && destination.workspaceActivation?.isPresenterCurrent == true
+                && destination.route.hasCurrentModelCatalogRoute && destination.scope.sessions.isEmpty && !destination.scope.isRetiring
+                && destination.scope.execution != nil && destination.scope.installedInteractions != nil
+                && destination.scope.persistence.composition != nil
+        }
+        guard adoptionIsCurrent(), destinationIsCurrent() else {
+            abandonPreparedDestination()
+            settleRefusedDestination("prepared host failed adoption checks")
+            return
+        }
+        let cleanupTargets: [WorkspaceSwitchSessionCleanupTarget]
+        if preservesOrigin {
+            cleanupTargets = []
+        } else {
+            let oracleDrains = sessions.values.compactMap {
+                outgoing.scope.interactions(routeID: outgoing.routeID, approvalStore: applyEditsApprovalStore).closeOracleBackground(for: $0)
+            }
+            for drain in oracleDrains {
+                await drain.value
+            }
+            guard adoptionIsCurrent() else {
+                abandonPreparedDestination()
+                settleRefusedDestination("adoption cancelled during legacy cleanup")
+                return
+            }
+            let discardContexts = sessions.values.map {
+                prepareWorkspaceSwitchSessionDiscard($0, reason: "Cancelled due to workspace switch")
+            }
+            for session in sessions.values where session.runState.isActive {
+                guard adoptionIsCurrent() else {
+                    abandonPreparedDestination()
+                    settleRefusedDestination("adoption cancelled during legacy cleanup")
+                    return
+                }
+                guard sessions[session.tabID] === session else { continue }
+                await cancelAgentRun(tabID: session.tabID, origin: .internalLifecycle)
+            }
+            guard adoptionIsCurrent() else {
+                abandonPreparedDestination()
+                settleRefusedDestination("adoption cancelled during legacy cleanup")
+                return
+            }
+            // Finalize and remove the legacy owner's sessions in the same actor turn.
+            cleanupTargets = assembleWorkspaceSwitchCleanupTargets(
+                preparedContexts: discardContexts, reason: "Cancelled due to workspace switch"
             )
+            claudeCoordinator.detachAllClaudeToolTrackingHandlersForWorkspaceSwitch()
+            codexCoordinator.stop()
+            claudeCoordinator.stop()
         }
-        // Safe to iterate across the awaits: `sessions.values` is a
-        // copy-on-write snapshot taken when the iterator is created, so map
-        // mutations during the suspensions cannot invalidate it, and
-        // cancelAgentRun(tabID:) re-resolves the live map by tab ID.
-        for session in sessions.values where session.runState.isActive {
-            await cancelAgentRun(tabID: session.tabID, origin: .internalLifecycle)
-        }
-        // Ownership-transfer slice: from finalize through scheduleBackgroundCleanup
-        // this must stay one uninterrupted main-actor region with no await, so a
-        // successor can never install or observe state on a discarded session
-        // between handle capture and discard. Targets are assembled from the
-        // prepared contexts plus the map's current contents, so sessions
-        // admitted or replaced during the cancellation awaits are finalized too.
-        let cleanupTargets = assembleWorkspaceSwitchCleanupTargets(
-            preparedContexts: discardContexts,
-            reason: "Cancelled due to workspace switch"
-        )
-        claudeCoordinator.detachAllClaudeToolTrackingHandlersForWorkspaceSwitch()
-        codexCoordinator.stop()
-        claudeCoordinator.stop()
         #if DEBUG
             restorePerfRecorder.event(
                 "agentMode.workspaceSwitch.discardPrepared",
@@ -13246,28 +13812,39 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
             let clearStateStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
-        sessions.removeAll()
-        // Owner discard drops the discarded sessions' ephemeral presentation state (§4.1).
+        func retryDrafts() -> [UUID: String] {
+            guard preservesDrafts, let workspace else { return [:] }
+            // Only move drafts for tabs still owned by this workspace. Capture after any
+            // suspension during preparation so edits made while Retry runs are included.
+            let current = workspaceManager?.activeWorkspace ?? workspace
+            return Dictionary(uniqueKeysWithValues: current.composeTabs.compactMap { tab in
+                let text = sessions[tab.id]?.draftText ?? tabDraftText[tab.id]
+                return text.map { (tab.id, $0) }
+            })
+        }
+        if !preservesOrigin {
+            tabDraftText = retryDrafts()
+            sessions.removeAll()
+        }
+        // Clear the departing presenter's projection, not the retained execution state.
         transcriptPresentationRecordsByTabID.removeAll()
         persistedLoadAttemptByTabID.removeAll()
         persistedLoadProducerByTabID.removeAll()
         activeTranscriptPresentationScope = nil
         if workspace == nil {
             workspaceSwitchInFlight = false
-            clearBindings()
+            if !preservesOrigin { clearBindings() }
         }
         tabsWithActiveAgentRun.removeAll()
         mcpControlledTabIDs.removeAll()
-        tabDraftText.removeAll()
-        draftRestorationLedger.removeAll()
         sidebarObservedRunStateByTabID.removeAll()
-        originatingCleanup.scheduleBackgroundCleanup(
-            targets: cleanupTargets,
-            reason: "workspace_switch"
-        )
+        if !preservesOrigin {
+            draftRestorationLedger.removeAll()
+            originatingCleanup.scheduleBackgroundCleanup(targets: cleanupTargets, reason: "workspace_switch")
+        }
         // No session created after this point belongs to this adoption's discard. Release only
         // our fence; an adoption queued during cancellation owns its own, newer fence.
-        finishDestructiveWorkspaceAdoption(owner)
+        if destination == nil { finishDestructiveWorkspaceAdoption(owner) }
         // End of the no-await ownership-transfer slice. The awaits below are
         // safe after discard: worktree release is keyed by session ID and does
         // not read `sessions`, and window-scope approval cleanup is
@@ -13275,15 +13852,45 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         for sessionID in Set(cleanupTargets.compactMap(\.boundSessionID)) {
             await releaseSessionWorktreeOwnership(sessionID: sessionID)
         }
-        await applyEditsApprovalStore.cleanupWindowScopes(
-            windowID: windowID,
-            reason: "Cancelled due to workspace switch"
-        )
+        if !preservesOrigin || outgoing.routeID != windowID {
+            await applyEditsApprovalStore.cleanupWindowScopes(
+                windowID: windowID,
+                reason: "Cancelled due to workspace switch"
+            )
+        }
         logAgentSessionDiscoveryAdoption(owner: owner, workspace: workspace, stage: 3)
-        guard sessionIndexStore.isWorkspaceActivationCurrent(owner, workspace: workspace),
-              sessionIndexStore.isOwnerCurrent(owner)
-        else {
+        guard adoptionIsCurrent(), destinationIsCurrent() else {
+            abandonPreparedDestination()
+            settleRefusedDestination("destination changed during workspace cleanup")
             return
+        }
+        if preservesOrigin {
+            withdrawUnpublishedComposerSubmissionsForPresentationLoss()
+            guard adoptionIsCurrent(), destinationIsCurrent() else {
+                abandonPreparedDestination()
+                settleRefusedDestination("destination changed while withdrawing unpublished input")
+                return
+            }
+            // Deletion or explicit retirement may have taken the exact origin while preparation
+            // or cleanup was suspended. Its drain owns release; never re-retain a retiring scope.
+            if preservableExecutionHost() === outgoing { outgoing.scope.retainExecutableHost() }
+            detachRunPresentation()
+        }
+        if let destination {
+            if destination !== outgoing {
+                for (tabID, text) in retryDrafts() {
+                    destination.scope.drafts.write(tabID: tabID, text: text)
+                }
+            }
+            destination.scope.retainExecutableHost()
+            runtimeHost = destination
+            if preservesOrigin, outgoing !== destination { retireEmptyDetachedHost(outgoing) }
+            finishDestructiveWorkspaceAdoption(owner)
+            synchronizeRunPresentationAttachments(previous: [:])
+            guard sessionIndexStore.isOwnerCurrent(owner), runtimeHost === destination,
+                  !hasDetachedClosingPresentation, !hasPreparedForWindowClose
+            else { return }
+            destination.workspaceActivation?.recordLifecycleProjectionOwner(sessionIndexStore, owner: owner)
         }
         #if DEBUG
             restorePerfRecorder.event(
@@ -13295,6 +13902,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 ]
             )
         #endif
+        completeWorkspaceAdoption(owner)
         scheduleSkillCatalogRefresh()
 
         guard let workspace else {
@@ -13328,7 +13936,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 ]
             )
         #endif
-        let resolvedActiveTabID = workspace.activeComposeTabID
+        let resolvedActiveTabID = workspaceManager?.activeWorkspace?.activeComposeTabID ?? workspace.activeComposeTabID
         if let resolvedActiveTabID {
             activeSessionLoadInProgressTabID = resolvedActiveTabID
             // The workspace's compose-tab bindings are installed by now, so this window can describe
@@ -14077,7 +14685,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 await claudeCoordinator.shutdownClaudeSession(session)
             }
             if sessions[tabID] == nil {
-                await cleanupMCPRunRoutingIfPresent(
+                await cleanupLegacyMCPRunRoutingIfPresent(
                     boundSessionID: boundID,
                     liveSession: capturedSession,
                     reason: "compose_tab_close"
@@ -14957,6 +15565,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         isLocalComposerInput: Bool = true,
         providerSwitchClaim: AgentComposerSubmitClaim? = nil,
         remoteAttachments: [AgentFileAttachment]? = nil,
+        remoteInterviewFirst: Bool? = nil,
         scheduledProviderSwitchSubmission: ((Task<UserTurnSubmissionResult, Never>) -> Void)? = nil
     ) -> UserTurnSubmissionResult {
         let session = session(for: tabID)
@@ -14970,7 +15579,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard !trimmedText.isEmpty || !attachmentsToSend.isEmpty || !taggedFilesToSend.isEmpty else {
             return .blocked(message: "")
         }
-        if let nativeSlashCommand = resolvedNativeSlashCommand(in: trimmedText, session: session),
+        let nativeSlashCommand = resolvedNativeSlashCommand(in: trimmedText, session: session)
+        if remoteInterviewFirst == true, nativeSlashCommand?.command.behavior == .controlPlane {
+            return .blocked(message: "Interview first requires a message that starts an agent turn.")
+        }
+        if let nativeSlashCommand,
            nativeSlashCommand.command == .computerUse,
            CodexComputerUseWorkflow.isOffCommand(argumentsText: nativeSlashCommand.argumentsText)
         {
@@ -15017,7 +15630,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let activeWorkflow = effectiveWorkflow(session: session, autoWorkflow: autoWorkflow)
         let restorationSelectedWorkflowMutationGeneration = session.userWorkflowSelectionMutationGeneration
         let nativePreparedTurn: NativeSlashPreparedUserTurn?
-        if let nativeSlashCommand = resolvedNativeSlashCommand(in: trimmedText, session: session) {
+        if let nativeSlashCommand {
             if let validationFailure = validateNativeSlashCommandUsage(
                 nativeSlashCommand,
                 session: session,
@@ -15141,6 +15754,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
                     stopFence: stopFence,
                     isLocalComposerInput: isLocalComposerInput,
+                    remoteInterviewFirst: remoteInterviewFirst,
                     providerSwitchClaim: providerSwitchClaim
                 )
             }
@@ -15167,6 +15781,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             restorationSelectedWorkflow: restorationSelectedWorkflow,
             restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
             isLocalComposerInput: isLocalComposerInput,
+            remoteInterviewFirst: remoteInterviewFirst,
             providerSwitchClaim: providerSwitchClaim,
             scheduledProviderSwitchSubmission: scheduledProviderSwitchSubmission
         )
@@ -15199,6 +15814,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         restorationSelectedWorkflowMutationGeneration: UInt64? = nil,
         stopFence: AgentRunStartStopFence,
         isLocalComposerInput: Bool = true,
+        remoteInterviewFirst: Bool? = nil,
         providerSwitchClaim: AgentComposerSubmitClaim? = nil
     ) async -> UserTurnSubmissionResult {
         let session = originalWriter.session
@@ -15262,6 +15878,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
             stopFence: stopFence,
             isLocalComposerInput: isLocalComposerInput,
+            remoteInterviewFirst: remoteInterviewFirst,
             providerSwitchClaim: providerSwitchClaim,
             scheduledProviderSwitchSubmission: { pending = $0 }
         )
@@ -15804,6 +16421,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         delegationDecisionBatch: AgentDelegationDecisionBatch? = nil,
         stopFence: AgentRunStartStopFence? = nil,
         isLocalComposerInput: Bool = true,
+        remoteInterviewFirst: Bool? = nil,
         providerSwitchPreparation: ProviderSwitchSendPreparation? = nil,
         providerSwitchClaim: AgentComposerSubmitClaim? = nil,
         preparedTaggedInput: String? = nil,
@@ -15870,7 +16488,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let unexpandedWrappedText = composeOrdinaryUserTurnText(
             managedTurn?.providerText ?? nativePreparedTurn?.providerText ?? trimmedText,
             computerUseArmed: nativePreparedTurn == nil && computerUseArmedAtComposition,
-            includesInterview: managedTurn == nil && interviewFirst
+            includesInterview: managedTurn == nil && (remoteInterviewFirst ?? interviewFirst)
                 && (session.items.isEmpty || !session.items.contains(where: { $0.kind == .assistant })),
             workflow: activeWorkflow,
             includeBuiltInCleanupGuidance: GlobalSettingsStore.shared.showBuiltInWorkflowCleanupGuidance()
@@ -15990,6 +16608,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         restorationSelectedWorkflow: restorationSelectedWorkflow,
                         restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
                         managedTurn: managedTurn, stopFence: capturedStop, isLocalComposerInput: isLocalComposerInput,
+                        remoteInterviewFirst: remoteInterviewFirst,
                         providerSwitchPreparation: preparation, providerSwitchClaim: claim,
                         preparedTaggedInput: preparedInput
                     )
@@ -16022,7 +16641,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 session.pendingTaggedFileAttachments.removeAll { fileIDs.contains($0.id) }
             }
         }
-        if managedTurn == nil, interviewFirst, nativePreparedTurn == nil,
+        if managedTurn == nil, remoteInterviewFirst == nil, interviewFirst, nativePreparedTurn == nil,
            isLocalComposerInput || providerSwitchPreparation != nil,
            session.items.isEmpty || !session.items.contains(where: { $0.kind == .assistant }) { interviewFirst = false }
         let codexCompactionInFlight = session.selectedAgent == .codexExec
@@ -16172,8 +16791,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if let observerEndpoint = linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: tabID) {
             linkExecutionRuntime.cancelAgentSessionLinkAutoWake(for: observerEndpoint, reason: .localUserWon)
         }
-        updateBindingsFromSession(session)
-        persistenceRuntime.scheduleSave(for: tabID)
+        // Refreshing the active transcript can compact source rows and advance the revision.
+        // Admit the canonical dispatch against its append receipt before doing that work.
+        defer {
+            if canonicalLocalDispatch, runtimeHost === canonicalHost, sessions[tabID] === session {
+                updateBindingsFromSession(session)
+            }
+        }
+        if !canonicalLocalDispatch { updateBindingsFromSession(session) }
+        persistenceRuntime.scheduleSave(for: session)
 
         let steeringMessage = trimmedText.isEmpty ? nil : (repromptedText == nil ? trimmedText : unexpandedWrappedText)
         if session.runState == .running,
@@ -17248,7 +17874,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     var providerInputRuntime: AgentSessionProviderInputRuntime {
-        runtimeSessionStore.providerInput(skillCatalog: skillCatalog, perfRecorder: perfRecorder)
+        if runtimeHost.workspaceActivation != nil {
+            guard let input = runtimeSessionStore.installedProviderInput else {
+                preconditionFailure("Compose canonical provider input before attaching presentation.")
+            }
+            return input
+        }
+        return runtimeSessionStore.providerInput(skillCatalog: skillCatalog, perfRecorder: perfRecorder)
     }
 
     var handoffRuntime: AgentSessionHandoffRuntime {
@@ -17287,6 +17919,24 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         startOutcome: AgentRunStartOutcomeRecorder? = nil,
         providerSwitchPreparation: ProviderSwitchSendPreparation? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
+        let host = runtimeHost
+        guard !isAwaitingWorkspaceAdoption else {
+            startOutcome?.recordStartFailure(message: Self.staleComposerSubmitTargetMessage)
+            return .preDispatchRejected(message: Self.staleComposerSubmitTargetMessage)
+        }
+        if let activation = host.workspaceActivation {
+            guard let session = host.scope.sessions[tabID],
+                  let command = try? host.scope.admit(session: session, expectedWorkspaceID: activation.key.owner.workspaceID)
+            else {
+                startOutcome?.recordStartFailure(message: Self.staleComposerSubmitTargetMessage)
+                return .preDispatchRejected(message: Self.staleComposerSubmitTargetMessage)
+            }
+            return await host.startCanonicalRequest(
+                command: command, message: initialMessage, attachments: attachments, taggedFileAttachments: taggedFileAttachments,
+                codexFallbackContext: codexFallbackContext, autoEffortSelection: autoEffortSelection,
+                options: directStartOptions, outcome: startOutcome, providerSwitchPreparation: providerSwitchPreparation
+            )
+        }
         let session: TabSession
         if directStartOptions.periodicWakeID != nil {
             guard let existing = sessions[tabID] else { return nil }
@@ -17416,13 +18066,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             prepareAgentRunCancellation(session: session, intent: .userStop, origin: origin)
             runService.withdrawQueuedWorkForManagedStop(tabID: tabID, session: session)
             if completion == .terminalTeardownCompleted { _ = await start.awaitFinalization() }
-            _ = await runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).awaitOracleBackgroundDrain(for: session)
+            _ = await runtimeSessionStore.interactions(routeID: runtimeHost.routeID, approvalStore: applyEditsApprovalStore).awaitOracleBackgroundDrain(for: session)
             return
         }
         if let operation = repromptOperations[tabID] {
             operation.invalidate(reason: "The run was stopped.")
             if !session.runState.isActive {
-                if origin == .explicitStop { _ = await runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).awaitOracleBackgroundDrain(for: session) }
+                if origin == .explicitStop { _ = await runtimeSessionStore.interactions(routeID: runtimeHost.routeID, approvalStore: applyEditsApprovalStore).awaitOracleBackgroundDrain(for: session) }
                 return
             }
         }
@@ -17481,7 +18131,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
            OracleBackgroundInvocationRegistry.shared.hasLiveOwner(owner)
         {
             prepareAgentRunCancellation(session: session, intent: .userStop, origin: .explicitStop)
-            _ = await runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).awaitOracleBackgroundDrain(for: session)
+            _ = await runtimeSessionStore.interactions(routeID: runtimeHost.routeID, approvalStore: applyEditsApprovalStore).awaitOracleBackgroundDrain(for: session)
             return true
         }
         if let rejectionReason = cancelTargetRejectionReason(target, session: session) {
@@ -17628,6 +18278,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session: TabSession?,
         validateSubmissionToken: Bool = true
     ) -> String? {
+        if hasDetachedClosingPresentation { return "presentation_closed" }
         let liveHasLinkedSession = hasLinkedAgentSession(for: target.tabID)
         let liveSourceAgentSessionID = composerSourceAgentSessionID(tabID: target.tabID, session: session)
         let liveRunState = session?.runState ?? .idle
@@ -18270,7 +18921,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// Clear the chat transcript for a specific tab
     func clearChat(tabID: UUID) {
         guard let session = sessions[tabID] else { return }
-        runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).closeOracleBackground(for: session)
+        runtimeSessionStore.interactions(routeID: runtimeHost.routeID, approvalStore: applyEditsApprovalStore).closeOracleBackground(for: session)
 
         ui.transcript.clearDisclosureChoices(for: tabID)
         session.setItemsSilently([], reason: .clearedChat)
@@ -18569,7 +19220,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
             guard let session = sessions[tabID], session.activeAgentSessionID == sessionID else { continue }
             await cleanUpDeletedSessionRuntime(session)
-            await cleanupMCPRunRoutingIfPresent(
+            await cleanupLegacyMCPRunRoutingIfPresent(
                 boundSessionID: sessionID,
                 liveSession: session,
                 reason: reason
@@ -18631,7 +19282,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let sessionID = boundSessionID(for: tabID)
         let liveSession = sessions[tabID]
         if let liveSession {
-            guard await runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).awaitOracleBackgroundDrain(for: liveSession) else { throw CancellationError() }
+            guard await runtimeSessionStore.interactions(routeID: runtimeHost.routeID, approvalStore: applyEditsApprovalStore).awaitOracleBackgroundDrain(for: liveSession) else { throw CancellationError() }
             guard sessions[tabID] === liveSession, liveSession.activeAgentSessionID == sessionID else { throw CancellationError() }
         }
         if let sessionID {
@@ -18655,7 +19306,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             removePendingUIRefresh(for: tabID)
             providerCleanupOutcome = await cleanUpDeletedSessionRuntime(session)
         }
-        await cleanupMCPRunRoutingIfPresent(
+        await cleanupLegacyMCPRunRoutingIfPresent(
             boundSessionID: sessionID,
             liveSession: liveSession,
             reason: "session_delete"
@@ -18785,7 +19436,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private func captureFreshSessionCreation(
         tab: ComposeTabState, claim: AgentSessionCreationClaim
     ) -> FreshSessionCreation? {
-        guard workspaceManager?.activeWorkspaceID == claim.workspaceID,
+        guard !isAwaitingWorkspaceAdoption, workspaceManager?.activeWorkspaceID == claim.workspaceID,
               tab.activeAgentSessionID == nil || tab.activeAgentSessionID == claim.sessionID,
               sessions[tab.id] == nil else { return nil }
         // Build the complete blocked runtime before either the runtime map or tab carrier exposes it.
@@ -19862,7 +20513,7 @@ extension AgentModeViewModel: WorkspaceSwitchSessionProviderDelegate {
         explicitRunID: UUID?,
         reason: String
     ) async {
-        await cleanupMCPRunRoutingIfPresent(
+        await cleanupLegacyMCPRunRoutingIfPresent(
             boundSessionID: boundSessionID,
             liveSession: liveSession,
             explicitRunID: explicitRunID,
@@ -19873,11 +20524,11 @@ extension AgentModeViewModel: WorkspaceSwitchSessionProviderDelegate {
 
 extension AgentModeViewModel {
     func closeOracleBackgroundWindowAdmission() {
-        runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).closeOracleBackgroundAdmission()
+        runtimeSessionStore.interactions(routeID: runtimeHost.routeID, approvalStore: applyEditsApprovalStore).closeOracleBackgroundAdmission()
     }
 
     func joinOracleBackgroundWindowDrain() async {
-        await runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).joinOracleBackgroundDrain()
+        await runtimeSessionStore.interactions(routeID: runtimeHost.routeID, approvalStore: applyEditsApprovalStore).joinOracleBackgroundDrain()
     }
 }
 

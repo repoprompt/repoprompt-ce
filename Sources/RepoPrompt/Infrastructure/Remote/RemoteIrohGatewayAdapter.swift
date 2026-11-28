@@ -1,15 +1,24 @@
 import Foundation
 import OSLog
-import RepoPromptIrohTransport
+import RepoPromptRemoteNetworking
 import RepoPromptRemoteProtocol
+
+enum RemoteIrohPhoneReadiness: Equatable {
+    case offline
+    case syncing
+    case legacyActive
+    case connected
+}
 
 struct RemoteIrohGatewayDiagnostics: Equatable {
     var state = "stopped"
     var endpointID: String?
     var path: RemoteIrohPathKind = .unknown
     var activePeerCount = 0
+    var phoneReadiness: RemoteIrohPhoneReadiness = .offline
     var lastTransitionAt: Date?
     var lastError: String?
+    var lastSyncedActivityAt: Date?
 }
 
 /// Production framed-QUIC adapter. Rust owns Iroh/QUIC and reports the
@@ -17,14 +26,64 @@ struct RemoteIrohGatewayDiagnostics: Equatable {
 /// performs pairing, credential/binding checks, routing, and Codable framing.
 @MainActor
 final class RemoteIrohGatewayAdapter {
+    private static let syncLogger = Logger(subsystem: "com.pvncher.repoprompt.ce", category: "RemoteSync")
     private static let unpairLogger = Logger(subsystem: "com.pvncher.repoprompt.ce", category: "RemoteUnpair")
 
     typealias StateChanged = (RemoteIrohGatewayDiagnostics) -> Void
     typealias RequestCallback = () -> Void
 
+    struct SyncState {
+        let sessionID: UUID?
+        private(set) var ticket: UUID?
+        private(set) var lastActivityAt: Date?
+        private(set) var hasConfirmedSync = false
+
+        init(sessionID: UUID?) {
+            self.sessionID = sessionID
+        }
+
+        mutating func issueTicket() -> UUID? {
+            guard sessionID != nil, !hasConfirmedSync else { return nil }
+            if let ticket {
+                return ticket
+            }
+            let ticket = UUID()
+            self.ticket = ticket
+            return ticket
+        }
+
+        mutating func confirm(_ ticket: UUID, at date: Date = Date()) -> Bool {
+            guard ticket == self.ticket else { return false }
+            hasConfirmedSync = true
+            recordActivity(at: date)
+            return true
+        }
+
+        mutating func recordActivity(at date: Date = Date()) {
+            lastActivityAt = date
+        }
+
+        func permits(_ request: RemoteGatewayRequest) -> Bool {
+            guard request.requiresConfirmedSync, !hasConfirmedSync else { return true }
+            if case .workspaceVoice = request { return false }
+            return sessionID == nil
+        }
+
+        func readiness(at date: Date = Date()) -> RemoteIrohPhoneReadiness {
+            guard let lastActivityAt, date.timeIntervalSince(lastActivityAt) < 25 else {
+                return .offline
+            }
+            if hasConfirmedSync {
+                return .connected
+            }
+            return sessionID == nil ? .legacyActive : .syncing
+        }
+    }
+
     private struct Session {
         let deviceID: String
         let authorizationHeader: String
+        var sync: SyncState
 
         func context(endpointID: String) -> RemoteGatewayRequestContext {
             .init(endpointID: endpointID, deviceID: deviceID, authorizationHeader: authorizationHeader)
@@ -32,12 +91,12 @@ final class RemoteIrohGatewayAdapter {
     }
 
     private let router: RemoteGatewayRequestRouter
+    private let authenticationUnavailable: () -> Bool
     private let stateChanged: StateChanged
     private let requestReceived: RequestCallback
     private let successfulResponseSent: RequestCallback
-    private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
-    private var endpoint: TransportEndpoint?
+    private var endpoint: RemoteNetworkEndpoint?
     private var acceptTask: Task<Void, Never>?
     private var sessions: [String: Session] = [:]
     private var diagnostics = RemoteIrohGatewayDiagnostics()
@@ -47,18 +106,24 @@ final class RemoteIrohGatewayAdapter {
 
     init(
         router: RemoteGatewayRequestRouter,
+        authenticationUnavailable: @escaping () -> Bool = { false },
         stateChanged: @escaping StateChanged = { _ in },
         requestReceived: @escaping RequestCallback = {},
         successfulResponseSent: @escaping RequestCallback = {}
     ) {
         self.router = router
+        self.authenticationUnavailable = authenticationUnavailable
         self.stateChanged = stateChanged
         self.requestReceived = requestReceived
         self.successfulResponseSent = successfulResponseSent
     }
 
     var currentAddress: RemoteIrohEndpointAddress? {
-        serverAddress
+        (try? endpoint?.currentAddress()) ?? serverAddress
+    }
+
+    func refreshLiveness() {
+        publishSessionCount()
     }
 
     func start(
@@ -73,39 +138,33 @@ final class RemoteIrohGatewayAdapter {
         }
         activeGeneration = generation
         update { $0.state = "starting" }
-        var candidate: TransportEndpoint?
+        var candidate: RemoteNetworkEndpoint?
         do {
-            let endpoint = try await RepoPromptIrohSpike.startApplication(
+            let endpoint = try await RemoteNetworkEndpoint.start(
                 secret: secret,
                 relayEnabled: relayEnabled,
                 generation: generation
             )
             candidate = endpoint
-            let snapshot: EndpointSnapshot = if let onlineSnapshot = try? await endpoint.waitUntilOnline(timeoutMillis: 5000) {
-                onlineSnapshot
-            } else {
-                try endpoint.snapshot()
-            }
+            let address = try await endpoint.address(waitForRelay: relayEnabled)
             guard activeGeneration == generation else { throw CancellationError() }
-            guard !snapshot.endpointId.isEmpty else {
+            guard !address.endpointID.isEmpty else {
                 throw RemoteIrohGatewayAdapterError.invalidEndpoint
             }
-            let address = RemoteIrohEndpointAddress(
-                endpointID: snapshot.endpointId,
-                transportAddressJSON: snapshot.addressJson
-            )
             self.endpoint = endpoint
             self.desktopInstanceID = desktopInstanceID
             serverAddress = address
             update {
                 $0.state = "running"
-                $0.endpointID = snapshot.endpointId
+                $0.endpointID = address.endpointID
                 $0.lastError = nil
             }
             startAcceptLoop(endpoint)
             return address
         } catch {
-            if let candidate { try? await candidate.shutdown() }
+            if let candidate {
+                try? await candidate.shutdown()
+            }
             if activeGeneration == generation {
                 activeGeneration = nil
                 update {
@@ -129,6 +188,8 @@ final class RemoteIrohGatewayAdapter {
         update {
             $0.state = "stopped"
             $0.activePeerCount = 0
+            $0.phoneReadiness = .offline
+            $0.lastSyncedActivityAt = nil
             $0.path = .unknown
         }
         if let stopping {
@@ -138,87 +199,127 @@ final class RemoteIrohGatewayAdapter {
 
     func revokePeerSessions() {
         sessions.removeAll()
-        update { $0.activePeerCount = 0 }
+        publishSessionCount()
     }
 
-    private func startAcceptLoop(_ endpoint: TransportEndpoint) {
+    private func startAcceptLoop(_ endpoint: RemoteNetworkEndpoint) {
         acceptTask?.cancel()
-        acceptTask = Task { [weak self] in
-            guard let self else { return }
-            while !Task.isCancelled {
-                do {
-                    let request = try await endpoint.acceptRequest()
-                    guard !Task.isCancelled else { return }
-                    Task { @MainActor [weak self] in
-                        await self?.handle(request)
-                    }
-                } catch {
-                    guard !Task.isCancelled else { return }
-                    update {
-                        $0.state = "degraded"
-                        $0.lastError = error.localizedDescription
-                    }
-                    try? await Task.sleep(for: .milliseconds(250))
+        acceptTask = endpoint.listen(
+            onAccept: { [weak self] in
+                guard let self, diagnostics.state == "degraded" else { return }
+                update {
+                    $0.state = "running"
+                    $0.lastError = nil
                 }
+            },
+            onFailure: { [weak self] error in
+                self?.update {
+                    $0.state = "degraded"
+                    $0.lastError = error.localizedDescription
+                }
+            },
+            handle: { [weak self] request in
+                guard let self else {
+                    request.close()
+                    return
+                }
+                await handle(request)
             }
-        }
+        )
     }
 
-    private func handle(_ request: IncomingRequest) async {
-        guard request.generation() == activeGeneration else {
+    private func handle(_ request: RemoteNetworkRequest) async {
+        guard request.generation == activeGeneration else {
             request.close()
             return
         }
-        let peerEndpointID = request.peerEndpointId()
+        let peerEndpointID = request.peerEndpointID
         requestReceived()
+        let path = request.path
         update {
-            $0.path = Self.pathKind(from: request.pathSummary())
+            $0.path = path
             $0.lastError = nil
         }
 
-        do {
-            let data = request.payload()
-            guard data.count <= RemoteWireProtocol.maximumClientFrameBytes else {
-                throw RemoteIrohGatewayAdapterError.frameTooLarge
+        var messageID: UUID?
+        var pairing: SentryTelemetryBootstrap.PairingContext?
+        var pairingTrace: SentryTelemetryBootstrap.TraceSpan?
+        var pairingResponseSent = false
+        defer {
+            if let pairingTrace {
+                SentryTelemetryBootstrap.finishRemotePairing(pairingTrace, attemptID: pairing?.attemptID, delivered: pairingResponseSent)
             }
-            let frame = try decoder.decode(RemoteWireFrame.self, from: data)
-            try frame.validateEncodedLimit(direction: .clientToServer)
+        }
+        do {
+            let frame = try request.frame()
+            messageID = frame.messageID
+            if let step = SentryTelemetryBootstrap.PairingContext.Step(frame.kind) {
+                let context = SentryTelemetryBootstrap.PairingContext(step: step, path: path)
+                pairing = context
+                pairingTrace = SentryTelemetryBootstrap.beginRemotePairing(context)
+            }
             let isUnpairRequest = isUnpairRPC(frame)
             let originalContext: RemoteGatewayRequestContext? = if !isUnpairRequest,
                                                                    frame.kind == .rpcRequest || frame.kind == .eventSubscribe
             {
-                try authenticatedSession(peerEndpointID).context(endpointID: peerEndpointID)
+                try authenticatedSession(peerEndpointID, sessionID: frame.sessionID).context(endpointID: peerEndpointID)
             } else {
                 nil
             }
             let response = try await response(
                 to: frame,
-                peerEndpointID: peerEndpointID
+                peerEndpointID: peerEndpointID,
+                pairing: &pairing
             )
-            let encoded = try encoder.encode(response)
-            try response.validateEncodedLimit(
-                direction: response.kind == .event ? .serverEvent : .serverResponse
-            )
-            guard request.generation() == activeGeneration else {
+            pairing?.failure = .encodeResponse
+            guard request.generation == activeGeneration else {
                 request.close()
                 return
             }
-            if let originalContext, !router.isAuthorized(originalContext) {
-                throw RemoteIrohGatewayAdapterError.unauthorizedPeer
+            if let originalContext {
+                guard router.isAuthorized(originalContext) else {
+                    throw RemoteIrohGatewayAdapterError.unauthorizedPeer
+                }
+                _ = try authenticatedSession(peerEndpointID, sessionID: frame.sessionID)
             }
             if isUnpairRequest {
                 Self.unpairLogger.info("Sending framed Iroh Unpair response after durable revocation")
             }
-            try await request.respond(payload: encoded)
+            pairing?.failure = .sendResponse
+            try await request.respond(response)
+            if let pairing {
+                pairingResponseSent = true
+                SentryTelemetryBootstrap.recordRemotePairingResponse(pairing)
+            }
             if isUnpairRequest {
                 Self.unpairLogger.info("Framed Iroh Unpair response delivery completed")
             }
-            successfulResponseSent()
+            if request.generation == activeGeneration, originalContext != nil,
+               response.kind != .streamError,
+               var session = try? authenticatedSession(peerEndpointID, sessionID: frame.sessionID)
+            {
+                session.sync.recordActivity()
+                sessions[peerEndpointID] = session
+                publishSessionCount()
+                successfulResponseSent()
+            }
         } catch {
-            let frame = makeStreamError(error)
-            if let encoded = try? encoder.encode(frame) {
-                try? await request.respond(payload: encoded)
-            } else {
+            guard request.generation == activeGeneration else {
+                request.close()
+                return
+            }
+            if let pairing, !(error is CancellationError) {
+                let failure: SentryTelemetryBootstrap.PairingFailure = if case let RemoteIrohGatewayAdapterError.remote(response) = error {
+                    .init(code: response.code)
+                } else {
+                    pairing.failure
+                }
+                SentryTelemetryBootstrap.recordRemotePairingFailure(failure, context: pairing)
+            }
+            let frame = makeStreamError(error, messageID: messageID)
+            do {
+                try await request.respond(frame)
+            } catch {
                 request.close()
             }
             update { $0.lastError = error.localizedDescription }
@@ -237,30 +338,59 @@ final class RemoteIrohGatewayAdapter {
 
     private func response(
         to frame: RemoteWireFrame,
-        peerEndpointID: String
+        peerEndpointID: String,
+        pairing: inout SentryTelemetryBootstrap.PairingContext?
     ) async throws -> RemoteWireFrame {
         guard frame.wireVersion == RemoteWireProtocol.currentVersion else {
+            pairing?.failure = .unsupportedWireVersion
             throw RemoteIrohGatewayAdapterError.unsupportedWireVersion
         }
 
         switch frame.kind {
-        case .pairingHello:
-            let hello = try frame.decodedPayload(as: RemotePairingHello.self, expectedKind: .pairingHello)
+        case .pairingHello, .pairingPrepare:
+            pairing?.failure = .decodeRequest
+            let hello = try frame.decodedPayload(as: RemotePairingHello.self, expectedKind: frame.kind)
+            guard (frame.kind == .pairingPrepare) == (hello.request.attemptID != nil) else {
+                throw RemoteIrohGatewayAdapterError.malformedPayload
+            }
+            pairing?.attemptID = hello.request.attemptID ?? frame.messageID
+            pairing?.failure = .rejected
             let routed = await router.route(
                 .pairIroh(hello.request, authenticatedPeerEndpointID: peerEndpointID),
                 context: .init(endpointID: peerEndpointID, deviceID: "", authorizationHeader: nil)
             )
             let payload = try successfulJSON(from: routed)
-            let pairing = try decoder.decode(RemoteIrohPairingResponse.self, from: payload)
-            sessions.removeAll()
-            sessions[peerEndpointID] = Session(
-                deviceID: pairing.pairingResponse.deviceID,
-                authorizationHeader: "Bearer \(pairing.pairingResponse.credential)"
-            )
-            publishSessionCount()
             return RemoteWireFrame(kind: .helloAccepted, messageID: frame.messageID, payload: payload)
 
+        case .pairingConfirm:
+            pairing?.failure = .decodeRequest
+            let confirmation = try frame.decodedPayload(
+                as: RemotePairingConfirmation.self,
+                expectedKind: .pairingConfirm
+            )
+            pairing?.attemptID = confirmation.attemptID
+            do {
+                try router.confirmIroh(confirmation, peerEndpointID: peerEndpointID)
+            } catch {
+                throw RemoteIrohGatewayAdapterError.remote(RemoteGatewayRequestRouter.pairingError(error))
+            }
+            pairing?.failure = .encodeResponse
+            return try RemoteWireFrame(
+                kind: .pairingConfirmed, messageID: frame.messageID, encoding: confirmation.attemptID
+            )
+
+        case .syncConfirm:
+            var session = try authenticatedSession(peerEndpointID, sessionID: frame.sessionID)
+            let ticket = try frame.decodedPayload(as: UUID.self, expectedKind: .syncConfirm)
+            guard session.sync.confirm(ticket) else {
+                throw RemoteIrohGatewayAdapterError.syncRequired
+            }
+            sessions[peerEndpointID] = session
+            publishSessionCount()
+            return try RemoteWireFrame(kind: .syncConfirmed, messageID: frame.messageID, encoding: ticket)
+
         case .authenticatedHello:
+            try checkCredentialStorage()
             let hello = try frame.decodedPayload(
                 as: RemoteAuthenticatedHello.self,
                 expectedKind: .authenticatedHello
@@ -281,30 +411,38 @@ final class RemoteIrohGatewayAdapter {
                 authorizationHeader: "Bearer \(hello.credential)"
             )
             guard router.isAuthorized(context) else {
-                sessions.removeValue(forKey: peerEndpointID)
-                publishSessionCount()
                 throw RemoteIrohGatewayAdapterError.unauthorizedPeer
             }
+            let sessionID = hello.supportsSyncConfirmation == true ? UUID() : nil
+            var sync = SyncState(sessionID: sessionID)
+            sync.recordActivity()
             sessions[peerEndpointID] = Session(
                 deviceID: hello.deviceID,
-                authorizationHeader: "Bearer \(hello.credential)"
+                authorizationHeader: "Bearer \(hello.credential)",
+                sync: sync
             )
             publishSessionCount()
             let accepted = RemoteHelloAccepted(
                 desktopInstanceID: desktopInstanceID ?? "",
                 serverEndpointID: serverAddress?.endpointID ?? "",
                 clientEndpointID: peerEndpointID,
-                deviceID: hello.deviceID
+                deviceID: hello.deviceID,
+                sessionID: sessionID,
+                serverAddress: currentAddress
             )
             return try RemoteWireFrame(kind: .helloAccepted, messageID: frame.messageID, encoding: accepted)
 
         case .rpcRequest:
-            let session = try authenticatedSession(peerEndpointID)
+            let session = try authenticatedSession(peerEndpointID, sessionID: frame.sessionID)
             let rpc = try frame.decodedPayload(as: RemoteRPCRequest.self, expectedKind: .rpcRequest)
             let request = try gatewayRequest(for: rpc)
+            if !session.sync.permits(request) {
+                throw RemoteIrohGatewayAdapterError.syncRequired
+            }
             if case .unpair = request {
                 Self.unpairLogger.info("Iroh Unpair RPC received over authenticated peer path")
             }
+            let routingStarted = ContinuousClock.now
             let routed = await router.route(
                 request,
                 context: .init(
@@ -319,15 +457,30 @@ final class RemoteIrohGatewayAdapter {
                     Self.unpairLogger.error("Iroh Unpair RPC failed with status \(routed.status, privacy: .public)")
                 }
             }
-            let rpcResponse = rpcResponse(from: routed)
-            return try RemoteWireFrame(
+            var ticket: UUID?
+            if rpc.operation == .snapshot, case .json = routed.content {
+                var current = try authenticatedSession(peerEndpointID, sessionID: frame.sessionID)
+                ticket = current.sync.issueTicket()
+                sessions[peerEndpointID] = current
+            }
+            let rpcResponse = rpcResponse(
+                from: routed,
+                syncTicket: ticket,
+                compressSnapshot: rpc.operation == .snapshot && rpc.acceptsCompressedSnapshot == true
+            )
+            let reply = try RemoteWireFrame(
                 kind: .rpcResponse,
                 messageID: frame.messageID,
                 encoding: rpcResponse
             )
+            if rpc.operation == .snapshot {
+                let elapsed = routingStarted.duration(to: .now)
+                Self.syncLogger.info("Snapshot ready after \(elapsed, privacy: .public), payload \(reply.payload.count, privacy: .public) bytes")
+            }
+            return reply
 
         case .eventSubscribe:
-            let session = try authenticatedSession(peerEndpointID)
+            let session = try authenticatedSession(peerEndpointID, sessionID: frame.sessionID)
             let subscription = try frame.decodedPayload(
                 as: RemoteEventSubscriptionRequest.self,
                 expectedKind: .eventSubscribe
@@ -358,7 +511,7 @@ final class RemoteIrohGatewayAdapter {
                 throw RemoteIrohGatewayAdapterError.invalidRouterResponse
             }
 
-        case .helloAccepted, .rpcResponse, .event, .heartbeat, .streamError:
+        case .helloAccepted, .pairingConfirmed, .syncConfirmed, .rpcResponse, .event, .heartbeat, .streamError:
             throw RemoteIrohGatewayAdapterError.unexpectedClientFrame
         }
     }
@@ -395,9 +548,20 @@ final class RemoteIrohGatewayAdapter {
         return try RemoteWireFrame(kind: .event, messageID: messageID, encoding: selected)
     }
 
-    private func authenticatedSession(_ peerEndpointID: String) throws -> Session {
-        guard let session = sessions[peerEndpointID] else {
-            throw RemoteIrohGatewayAdapterError.unauthorizedPeer
+    private func checkCredentialStorage() throws {
+        if authenticationUnavailable() {
+            throw RemoteIrohGatewayAdapterError.remote(.init(
+                code: "pairing_storage_unavailable",
+                message: "Open Remote settings on the Mac to recover its pairing storage.",
+                retryable: true
+            ))
+        }
+    }
+
+    private func authenticatedSession(_ peerEndpointID: String, sessionID: UUID?) throws -> Session {
+        try checkCredentialStorage()
+        guard let session = sessions[peerEndpointID], sessionID == session.sync.sessionID else {
+            throw RemoteIrohGatewayAdapterError.sessionRequired
         }
         let context = RemoteGatewayRequestContext(
             endpointID: peerEndpointID, deviceID: session.deviceID,
@@ -433,6 +597,10 @@ final class RemoteIrohGatewayAdapter {
             ))
         case .imageAttachment:
             return try .imageAttachment(decodePayload(RemoteImageAttachmentRequest.self, from: rpc.payload))
+        case .workspaceVoice:
+            return try .workspaceVoice(decodePayload(RemoteWorkspaceVoiceRequest.self, from: rpc.payload))
+        case .workspacePresentation:
+            return try .workspacePresentation(decodePayload(RemoteWorkspacePresentation.self, from: rpc.payload))
         case .command:
             return try .command(
                 decodePayload(RemoteCommandRequest.self, from: rpc.payload),
@@ -479,10 +647,14 @@ final class RemoteIrohGatewayAdapter {
         return data
     }
 
-    private func rpcResponse(from response: RemoteGatewayResponse) -> RemoteRPCResponse {
+    private func rpcResponse(
+        from response: RemoteGatewayResponse,
+        syncTicket: UUID?,
+        compressSnapshot: Bool
+    ) -> RemoteRPCResponse {
         switch response.content {
         case let .json(data):
-            RemoteRPCResponse(result: data)
+            RemoteRPCResponse(result: data, syncTicket: syncTicket, compressSnapshot: compressSnapshot)
         case let .error(error):
             RemoteRPCResponse(error: error)
         case .events:
@@ -490,9 +662,15 @@ final class RemoteIrohGatewayAdapter {
         }
     }
 
-    private func makeStreamError(_ error: Error) -> RemoteWireFrame {
+    private func makeStreamError(_ error: Error, messageID: UUID?) -> RemoteWireFrame {
         let response: RemoteErrorResponse = switch error {
         case let RemoteIrohGatewayAdapterError.remote(remote): remote
+        case RemoteNetworkError.responseTooLarge:
+            RemoteErrorResponse(code: "response_too_large", message: error.localizedDescription)
+        case RemoteIrohGatewayAdapterError.sessionRequired:
+            RemoteErrorResponse(code: "session_required", message: error.localizedDescription, retryable: true)
+        case RemoteIrohGatewayAdapterError.syncRequired:
+            RemoteErrorResponse(code: "sync_required", message: error.localizedDescription, retryable: true)
         case RemoteIrohGatewayAdapterError.unauthorizedPeer:
             RemoteErrorResponse(code: "unauthorized", message: error.localizedDescription)
         case RemoteIrohGatewayAdapterError.serverEndpointMismatch:
@@ -500,8 +678,8 @@ final class RemoteIrohGatewayAdapter {
         default:
             RemoteErrorResponse(code: "transport_error", message: error.localizedDescription)
         }
-        return (try? RemoteWireFrame(kind: .streamError, encoding: response))
-            ?? RemoteWireFrame(kind: .streamError)
+        return (try? RemoteWireFrame(kind: .streamError, messageID: messageID, encoding: response))
+            ?? RemoteWireFrame(kind: .streamError, messageID: messageID)
     }
 
     private func update(_ mutation: (inout RemoteIrohGatewayDiagnostics) -> Void) {
@@ -511,27 +689,37 @@ final class RemoteIrohGatewayAdapter {
     }
 
     private func publishSessionCount() {
-        update { $0.activePeerCount = sessions.count }
-    }
-
-    private static func pathKind(from summary: String) -> RemoteIrohPathKind {
-        let lower = summary.lowercased()
-        if lower.contains("relay") { return .relay }
-        if lower.contains("192.168.") || lower.contains("10.") || lower.contains("172.16.") {
-            return .localDirect
+        let now = Date()
+        let active = sessions.values.filter { $0.sync.readiness(at: now) != .offline }
+        let lastSyncedActivity = active.filter(\.sync.hasConfirmedSync).compactMap(\.sync.lastActivityAt).max()
+        let readiness = if lastSyncedActivity != nil {
+            RemoteIrohPhoneReadiness.connected
+        } else if active.contains(where: { $0.sync.sessionID != nil }) {
+            RemoteIrohPhoneReadiness.syncing
+        } else {
+            active.isEmpty ? RemoteIrohPhoneReadiness.offline : .legacyActive
         }
-        if lower.contains("direct") || lower.contains("udp") { return .internetDirect }
-        return .unknown
+        guard diagnostics.activePeerCount != active.count || diagnostics.phoneReadiness != readiness
+            || diagnostics.lastSyncedActivityAt != lastSyncedActivity
+        else {
+            return
+        }
+        update {
+            $0.activePeerCount = active.count
+            $0.phoneReadiness = readiness
+            $0.lastSyncedActivityAt = lastSyncedActivity
+        }
     }
 }
 
 enum RemoteIrohGatewayAdapterError: LocalizedError {
     case notRunning
     case invalidEndpoint
-    case frameTooLarge
     case unsupportedWireVersion
     case serverEndpointMismatch
     case unauthorizedPeer
+    case sessionRequired
+    case syncRequired
     case unexpectedClientFrame
     case invalidRouterResponse
     case malformedPayload
@@ -541,9 +729,10 @@ enum RemoteIrohGatewayAdapterError: LocalizedError {
         switch self {
         case .notRunning: "The Iroh endpoint is not running."
         case .invalidEndpoint: "The Iroh endpoint did not provide a valid identity."
-        case .frameTooLarge: "The Iroh request exceeded the one-megabyte limit."
         case .unsupportedWireVersion: "The Iroh wire version is unsupported."
         case .serverEndpointMismatch: "The authenticated server endpoint did not match the pairing record."
+        case .sessionRequired: "The Mac session ended. Reconnect and sync again."
+        case .syncRequired: "Confirm the first snapshot before using this session."
         case .unauthorizedPeer: "The authenticated Iroh peer is not paired."
         case .unexpectedClientFrame: "The client sent an unexpected Iroh frame."
         case .invalidRouterResponse: "The application router returned an invalid response."

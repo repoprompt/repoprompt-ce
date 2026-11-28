@@ -4,6 +4,7 @@ import RepoPromptInstrumentation
 import RepoPromptSettingsCore
 import RepoPromptShared
 import RepoPromptWorkspaceContext
+import RepoPromptWorkspaceCore
 
 /// App composition for a saved Agent carrier. Dependencies describe app authority, not an
 /// active presenter. Runtime publication still happens only through the canonical store.
@@ -178,8 +179,11 @@ enum AppSavedAgentSessionExecution {
         }
 
         let workspace = target.workspace
-        if !workspace.repoPaths.isEmpty {
-            let failure = try await WorkspaceRootDirectoryProbe().run(paths: workspace.repoPaths, attemptID: UUID(), checkpoint: rootProbeCheckpoint)
+        let loadablePaths = StandardizedPath.canonicalWorkspaceRootPaths(
+            WorkspaceManagerViewModel.loadableRepoPaths(for: workspace)
+        )
+        if !loadablePaths.isEmpty {
+            let failure = try await WorkspaceRootDirectoryProbe().run(paths: loadablePaths, attemptID: UUID(), checkpoint: rootProbeCheckpoint)
             try Task.checkCancellation()
             guard isStillAuthorized() else { throw AgentSavedSessionTargetLoader.Failure.changed }
             if let failure { throw AgentSavedSessionTargetLoader.Failure.rootsUnavailable(failure) }
@@ -237,12 +241,19 @@ enum AppSavedAgentSessionExecution {
                 settingsLease.release()
                 throw error
             }
+            let fileSystemSettings = settings.fileSystemSettingsSnapshot()
             var rootIDs: [UUID] = []
-            for path in workspace.repoPaths {
+            rootIDs.reserveCapacity(loadablePaths.count)
+            for path in loadablePaths {
                 try Task.checkCancellation()
                 guard isStillAuthorized() else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
                 do {
-                    let root = try await files.loadRoot(path: path, cancelUnderlyingLoadOnCallerCancellation: true)
+                    let root = try await files.loadRoot(
+                        path: path,
+                        kind: .primaryWorkspace,
+                        fileSystemSettings: fileSystemSettings,
+                        cancelUnderlyingLoadOnCallerCancellation: true
+                    )
                     rootIDs.append(root.id)
                 } catch {
                     guard isStillAuthorized(), !Task.isCancelled else { throw AgentSavedSessionTargetLoader.Failure.changed }

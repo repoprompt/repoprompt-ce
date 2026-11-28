@@ -254,7 +254,7 @@ actor MCPBootstrapLease {
             await policyInstaller(spec)
             return true
         }
-        let process = reusingProcess ? await processRegistrationProvider?() : nil
+        let process = reusingProcess ? await existingProcessRegistration(on: routingOwner) : nil
         guard let generation = routingWaitGeneration,
               let receipt = await Self.installPolicy(
                   spec, routingOwner: routingOwner, originatingContextSource: originatingContextSource,
@@ -265,12 +265,26 @@ actor MCPBootstrapLease {
         return true
     }
 
+    private func existingProcessRegistration(on routingOwner: MCPHostRouteResources) async -> MCPRunRoutingProcessRegistration? {
+        if let explicit = await processRegistrationProvider?() { return explicit }
+        #if DEBUG
+            if let fixture = await routingOwner.test_existingProcessForBootstrap { return await fixture(spec) }
+        #endif
+        return nil
+    }
+
     private func armExpectedPIDPolicy() async -> Bool {
-        guard routingOwner != nil else { return await expectedPIDPolicyArmer(spec) }
+        guard let routingOwner else { return await expectedPIDPolicyArmer(spec) }
         guard let receipt = cleanupReceipts.last, let client = spec.clientName else { return false }
-        return await ServerNetworkManager.shared.requireExpectedAgentPIDForPendingPolicy(
+        let armed = await ServerNetworkManager.shared.requireExpectedAgentPIDForPendingPolicy(
             for: client, runID: spec.runID, windowID: spec.windowID, registration: receipt
         )
+        #if DEBUG
+            if armed, let onArmed = await routingOwner.test_afterExpectedPIDPolicyArmed {
+                return await onArmed(spec, receipt)
+            }
+        #endif
+        return armed
     }
 
     private func resolveRouteAuthority() async -> MCPRunRouteAuthorityDecision {

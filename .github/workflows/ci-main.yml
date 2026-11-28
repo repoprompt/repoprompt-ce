@@ -24,25 +24,23 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Restore SwiftPM build cache
+      - name: Cache SwiftPM dependency sources
         uses: actions/cache@v6
         with:
           path: |
-            .build
-            Packages/RepoPromptAgentProviders/.build
-          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-sentry-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/RepoPromptAgentProviders/Package.swift', 'Packages/RepoPromptAgentProviders/Package.resolved') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-swiftpm-sentry-
+            .build/checkouts
+            .build/repositories
+          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-sentry-sources-v1-${{ hashFiles('Package.resolved') }}
 
-      - name: Cache checksum-verified SwiftPM binary artifacts
-        uses: actions/cache@v6
+      - name: Restore checksum-verified SwiftPM binary artifacts
+        uses: actions/cache/restore@v6
         with:
           path: |
             .build/artifacts
             .build/swiftbuild/artifacts
             Packages/RepoPromptAgentProviders/.build/artifacts
             ~/Library/Caches/org.swift.swiftpm/artifacts
-          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-binaries-v1-${{ hashFiles('Package.resolved', 'Packages/RepoPromptAgentProviders/Package.resolved') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-binaries-v2-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/RepoPromptAgentProviders/Package.swift', 'Packages/RepoPromptAgentProviders/Package.resolved') }}
 
       - name: Resolve Sentry dependency downloads with bounded retries
         env:

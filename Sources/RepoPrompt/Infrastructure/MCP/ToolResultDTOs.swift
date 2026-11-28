@@ -904,6 +904,10 @@ enum ToolResultDTOs {
         let results: [EditOutcome]? // Provided by diff generator utilities
         let unifiedDiff: String?
         let cardUnifiedDiff: String?
+        var displayUnifiedDiff: String? {
+            [cardUnifiedDiff, unifiedDiff].compactMap(\.self).first { !$0.isEmpty }
+        }
+
         // Extra context – used for friendlier UI and fallback reporting
         let note: String?
         let fileCreated: Bool?

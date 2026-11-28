@@ -48,7 +48,7 @@ extension MCPServerViewModel {
             true
         case .context, .appPresentationWindow:
             existing != target
-        case .runScoped, .savedRunScoped:
+        case .runScoped, .canonicalRunScoped, .savedRunScoped:
             false
         }
     }

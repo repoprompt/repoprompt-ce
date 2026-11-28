@@ -2002,15 +2002,18 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
                     let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: window.windowID)
                     let created = try await client.create(workspace, fileURL: window.workspaceManager.workspaceFileURL(for: workspace))
                     XCTAssertEqual(created.disposition, .applied)
+                    for tab in workspace.composeTabs {
+                        let session = try AgentSession(id: XCTUnwrap(tab.activeAgentSessionID), workspaceID: workspace.id, composeTabID: tab.id, name: tab.name)
+                        _ = try await AgentSessionDataService.shared.saveAgentSession(session, for: workspace)
+                    }
                     let bridge = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
                     let refreshed = await bridge.refreshForAgentAdmission()
                     XCTAssertTrue(refreshed)
                     let canonical = try XCTUnwrap(window.workspaceManager.workspace(withID: workspace.id))
-                    _ = await window.workspaceManager.switchWorkspace(to: canonical, saveState: false, reason: "groupOrderAuthorityFixture")
-                    // The switch starts a disk session-list refresh for this owner. Let it settle before the
-                    // synthetic index below is installed, or its empty on-disk result replaces those entries
-                    // and every carrier correctly fails closed as unproven placement.
-                    await window.agentModeViewModel.test_waitForSessionListCacheRefresh()
+                    let switched = await window.workspaceManager.switchWorkspace(to: canonical, saveState: false, reason: "groupOrderAuthorityFixture")
+                    XCTAssertTrue(switched.didSwitch)
+                    let adopted = await window.agentModeViewModel.awaitWorkspaceRuntimeAdoption(expectedWorkspaceID: workspace.id)
+                    XCTAssertTrue(adopted)
                     XCTAssertEqual(window.workspaceManager.activeWorkspaceID, workspace.id)
                     XCTAssertTrue(window.workspaceManager.canCommitComposeTabPresentation(workspaceID: workspace.id))
                 } else if isolated {
@@ -2043,24 +2046,33 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
                 window.promptManager.loadComposeTabsFromWorkspace(installed, syncPromptText: true)
                 XCTAssertEqual(window.promptManager.currentComposeTabs.map(\.id), [fixture.callerTab.id, fixture.targetTab.id])
                 XCTAssertEqual(window.promptManager.activeComposeTabID, fixture.callerTab.id)
-                let owner = AgentModeViewModel.SessionIndexOwner(workspaceID: workspace.id, activationEpoch: 1)
-                let entries = [fixture.callerTab, fixture.targetTab].map { tab in
-                    AgentSessionIndexEntry(
-                        id: tab.activeAgentSessionID!, tabID: tab.id, name: tab.name,
-                        savedAt: Date(timeIntervalSince1970: 0), itemCount: 0, autoEditEnabled: false,
-                        hasUnknownConversationContent: false, isMCPOriginated: false,
-                        worktreeBindingSummaries: [], activeWorktreeMergeSummaries: []
+                let agent = window.agentModeViewModel
+                if runtime != nil {
+                    let caller = await agent.ensureSessionReady(tabID: fixture.callerTab.id, reconnectActiveProviders: false, expectedWorkspaceID: workspace.id)
+                    XCTAssertTrue(caller.qualifiedRestorationReadiness.isAuthoritative)
+                    _ = try XCTUnwrap(caller.persistentSessionBindingIdentity)
+                    agent.test_refreshSessionListCache(for: installed)
+                    await agent.test_waitForSessionListCacheRefresh()
+                } else {
+                    let owner = AgentModeViewModel.SessionIndexOwner(workspaceID: workspace.id, activationEpoch: 1)
+                    let entries = [fixture.callerTab, fixture.targetTab].map { tab in
+                        AgentSessionIndexEntry(
+                            id: tab.activeAgentSessionID!, tabID: tab.id, name: tab.name,
+                            savedAt: Date(timeIntervalSince1970: 0), itemCount: 0, autoEditEnabled: false,
+                            hasUnknownConversationContent: false, isMCPOriginated: false,
+                            worktreeBindingSummaries: [], activeWorktreeMergeSummaries: []
+                        )
+                    }
+                    agent.test_installSessionIndexSnapshot(
+                        Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) }),
+                        owner: owner, latestOwner: owner, activeWorkspace: installed
                     )
+                    let caller = agent.session(for: fixture.callerTab.id)
+                    caller.hasLoadedPersistedState = true
+                    _ = try XCTUnwrap(agent.test_installPersistentSessionBinding(
+                        sessionID: fixture.callerTab.activeAgentSessionID, on: caller, updateWorkspaceMetadata: true
+                    ))
                 }
-                try window.agentModeViewModel.test_installSessionIndexSnapshot(
-                    Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) }),
-                    owner: owner, latestOwner: owner, activeWorkspace: fixture.workspace()
-                )
-                let caller = window.agentModeViewModel.session(for: fixture.callerTab.id)
-                caller.hasLoadedPersistedState = true
-                _ = try XCTUnwrap(window.agentModeViewModel.test_installPersistentSessionBinding(
-                    sessionID: fixture.callerTab.activeAgentSessionID, on: caller, updateWorkspaceMetadata: true
-                ))
                 _ = try AgentSessionLinkEndpointTestSupport.endpoint(window.agentModeViewModel, tabID: fixture.callerTab.id)
                 let ready = try fixture.workspace()
                 for expected in [fixture.callerTab, fixture.targetTab] {
@@ -2172,7 +2184,7 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
 
         func assertReadTarget(name: String, pinned: Bool, archived: Bool = false, loadedOnly: Bool = false) async throws {
             let get = try await call("get", [:])
-            XCTAssertEqual(get["result"], .string("ok"))
+            XCTAssertEqual(get["result"], .string("ok"), "Exact session read: \(get)")
             let exact = try XCTUnwrap(get["session"]?.objectValue)
             var fields: [String: Value] = ["limit": .int(500)]
             if loadedOnly { fields["filter"] = .object(["loaded": .bool(true)]) }
@@ -2222,6 +2234,7 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
         func cleanup() async {
             await ingress?.cleanup()
             ingress = nil
+            await window.agentModeViewModel.test_retireAndCancelFixture()
             WindowStatesManager.shared.unregisterWindowState(window)
             if runtime != nil {
                 window.beginClose()

@@ -31,8 +31,18 @@ enum RemoteGatewayRequest {
     case history(RemoteHistoryRPCRequest)
     case transcript(RemoteGatewayTranscriptRequest)
     case imageAttachment(RemoteImageAttachmentRequest)
+    case workspaceVoice(RemoteWorkspaceVoiceRequest)
+    case workspacePresentation(RemoteWorkspacePresentation)
     case events(after: UInt64?)
     case command(RemoteCommandRequest, endpoint: RemoteGatewayCommandEndpoint)
+
+    var requiresConfirmedSync: Bool {
+        switch self {
+        case .command, .workspacePresentation: true
+        case let .workspaceVoice(request): request.action == .start
+        default: false
+        }
+    }
 }
 
 enum RemoteGatewayResponseContent {
@@ -77,8 +87,10 @@ typealias RemoteDispatchAuthorization = @MainActor () throws -> Void
 struct RemoteGatewayRoutingServices {
     var authorize: (RemoteGatewayRequestContext) -> Bool
     var pairIroh: (RemoteIrohPairingRequest, String) -> Result<RemoteIrohPairingResponse, Error>
+    var confirmIroh: (RemotePairingConfirmation, String) throws -> Void
     var unpair: () -> RemoteGatewayRevocationResult
     var snapshot: () async -> RemoteSnapshot?
+    var bootstrapSnapshot: () async -> RemoteSnapshot?
     var diagnostics: () async -> RemoteDiagnostics?
     var history: (RemoteHistoryRPCRequest) async throws -> RemoteHistoryPage?
     var transcript: (RemoteGatewayTranscriptRequest) async -> RemoteGatewayTranscriptResult
@@ -88,6 +100,9 @@ struct RemoteGatewayRoutingServices {
     var commandGeneration: () -> UInt64
     var execute: (RemoteCommandRequest, @escaping RemoteDispatchAuthorization) async -> RemoteGatewayCommandResult
     var eventCursor: () async -> UInt64
+    var workspaceVoiceConsent: () -> Bool
+    var workspaceVoice: (RemoteWorkspaceVoiceRequest, RemoteGatewayRequestContext) throws -> RemoteWorkspaceVoiceStatus
+    var workspacePresentation: (RemoteWorkspacePresentation, @escaping RemoteDispatchAuthorization) async throws -> Void
 
     init(
         authorize: @escaping (RemoteGatewayRequestContext) -> Bool,
@@ -104,12 +119,25 @@ struct RemoteGatewayRoutingServices {
         imageAttachment: @escaping (RemoteImageAttachmentRequest) async throws -> RemoteImageAttachmentChunk? = { _ in nil },
         pairIroh: @escaping (RemoteIrohPairingRequest, String) -> Result<RemoteIrohPairingResponse, Error> = { _, _ in
             .failure(RemoteGatewayRouterError.irohUnavailable)
+        },
+        confirmIroh: @escaping (RemotePairingConfirmation, String) throws -> Void = { _, _ in
+            throw RemoteGatewayRouterError.irohUnavailable
+        },
+        bootstrapSnapshot: (() async -> RemoteSnapshot?)? = nil,
+        workspaceVoiceConsent: @escaping () -> Bool = { false },
+        workspaceVoice: @escaping (RemoteWorkspaceVoiceRequest, RemoteGatewayRequestContext) throws -> RemoteWorkspaceVoiceStatus = { _, _ in
+            throw RemoteWorkspaceVoiceError.unavailable
+        },
+        workspacePresentation: @escaping (RemoteWorkspacePresentation, @escaping RemoteDispatchAuthorization) async throws -> Void = { _, _ in
+            throw RemoteAgentControlServiceError.commandRejected("Workspace controls are unavailable.")
         }
     ) {
+        self.confirmIroh = confirmIroh
         self.authorize = authorize
         self.pairIroh = pairIroh
         self.unpair = unpair
         self.snapshot = snapshot
+        self.bootstrapSnapshot = bootstrapSnapshot ?? snapshot
         self.diagnostics = diagnostics
         self.history = history
         self.transcript = transcript
@@ -119,6 +147,9 @@ struct RemoteGatewayRoutingServices {
         self.commandGeneration = commandGeneration
         self.execute = execute
         self.eventCursor = eventCursor
+        self.workspaceVoiceConsent = workspaceVoiceConsent
+        self.workspaceVoice = workspaceVoice
+        self.workspacePresentation = workspacePresentation
     }
 }
 
@@ -147,6 +178,10 @@ final class RemoteGatewayRequestRouter {
 
     func isAuthorized(_ context: RemoteGatewayRequestContext) -> Bool {
         services.authorize(context)
+    }
+
+    func confirmIroh(_ confirmation: RemotePairingConfirmation, peerEndpointID: String) throws {
+        try services.confirmIroh(confirmation, peerEndpointID)
     }
 
     func route(
@@ -185,8 +220,8 @@ final class RemoteGatewayRequestRouter {
             return encode(RemoteUnpairResponse())
 
         case .snapshot:
-            guard let snapshot = await services.snapshot() else { return unavailableReadResponse() }
-            return encode(snapshot)
+            guard let snapshot = await services.bootstrapSnapshot() else { return unavailableReadResponse() }
+            return encodeSnapshot(snapshot)
 
         case .diagnostics:
             guard let diagnostics = await services.diagnostics() else { return unavailableReadResponse() }
@@ -264,6 +299,42 @@ final class RemoteGatewayRequestRouter {
                 )
             }
 
+        case let .workspaceVoice(request):
+            guard request.isValid else {
+                return .error(.init(code: "invalid_voice_request", message: "Invalid voice session request."), status: 400)
+            }
+            guard services.authorizationState().allows(.control) else {
+                return .error(.init(code: "forbidden", message: "Workspace Voice requires Control permission on the Mac."), status: 403)
+            }
+            guard request.action != .start || services.workspaceVoiceConsent() else {
+                return .error(.init(
+                    code: "workspace_voice_consent_required",
+                    message: "Allow OpenAI data sharing for Workspace Voice in Remote settings on the Mac."
+                ), status: 403)
+            }
+            do {
+                return try encode(services.workspaceVoice(request, context))
+            } catch let error as RemoteWorkspaceVoiceError {
+                return .error(.init(code: "workspace_voice", message: error.localizedDescription), status: 409)
+            } catch {
+                return .error(.init(code: "workspace_voice", message: "The Mac could not open Workspace Voice."), status: 503)
+            }
+
+        case let .workspacePresentation(request):
+            guard services.authorizationState().allows(.control) else {
+                return .error(.init(code: "forbidden", message: "Opening and closing workspaces requires Control permission on the Mac."), status: 403)
+            }
+            do {
+                try await services.workspacePresentation(request, authorizeDispatch(context, requiring: .control))
+                return encode(request)
+            } catch let error as RemoteAgentControlServiceError {
+                return .error(.init(code: "workspace_presentation", message: error.localizedDescription), status: 409)
+            } catch let error as RemoteWorkspaceVoiceError {
+                return .error(.init(code: "workspace_presentation", message: error.localizedDescription), status: 409)
+            } catch {
+                return .error(.init(code: "workspace_presentation", message: "The Mac could not change the workspace."), status: 503)
+            }
+
         case let .events(cursor):
             switch await services.replay(cursor) {
             case let .events(events):
@@ -292,8 +363,16 @@ final class RemoteGatewayRequestRouter {
         case let .success(response):
             encode(response)
         case let .failure(error):
-            .error(.init(code: "pairing_failed", message: error.localizedDescription), status: 403)
+            .error(Self.pairingError(error), status: 403)
         }
+    }
+
+    static func pairingError(_ error: Error) -> RemoteErrorResponse {
+        (error as? RemoteGatewaySecurityError)?.response ?? .init(
+            code: "pairing_storage_unavailable",
+            message: "The Mac could not access or save pairing in Keychain. Check Remote settings on your Mac and retry.",
+            retryable: true
+        )
     }
 
     private func routeCommand(
@@ -330,17 +409,7 @@ final class RemoteGatewayRequestRouter {
             )
         }
 
-        let generation = services.commandGeneration()
-        switch await services.execute(command, {
-            guard generation == self.services.commandGeneration(),
-                  self.services.authorize(context),
-                  self.services.authorizationState().allows(requiredAuthority)
-            else {
-                throw RemoteAgentControlServiceError.commandRejected(
-                    "Remote access changed before this command could be dispatched."
-                )
-            }
-        }) {
+        switch await services.execute(command, authorizeDispatch(context, requiring: requiredAuthority)) {
         case let .success(response):
             return await encode(Self.attachingEventCursor(
                 to: response,
@@ -358,6 +427,23 @@ final class RemoteGatewayRequestRouter {
                 .init(code: "unavailable", message: "Remote control services are not ready.", retryable: true),
                 status: 503
             )
+        }
+    }
+
+    private func authorizeDispatch(
+        _ context: RemoteGatewayRequestContext,
+        requiring authority: RemoteAuthorityLevel
+    ) -> RemoteDispatchAuthorization {
+        let generation = services.commandGeneration()
+        return {
+            guard generation == self.services.commandGeneration(),
+                  self.services.authorize(context),
+                  self.services.authorizationState().allows(authority)
+            else {
+                throw RemoteAgentControlServiceError.commandRejected(
+                    "Remote access changed before this command could be dispatched."
+                )
+            }
         }
     }
 
@@ -380,9 +466,17 @@ final class RemoteGatewayRequestRouter {
         )
     }
 
+    private func encodeSnapshot(_ snapshot: RemoteSnapshot) -> RemoteGatewayResponse {
+        encodeJSON { try RemoteSnapshotBootstrap.encode(snapshot, with: encoder) }
+    }
+
     private func encode(_ value: some Encodable, status: Int = 200) -> RemoteGatewayResponse {
+        encodeJSON(status: status) { try encoder.encode(value) }
+    }
+
+    private func encodeJSON(status: Int = 200, _ data: () throws -> Data) -> RemoteGatewayResponse {
         do {
-            return try RemoteGatewayResponse(status: status, content: .json(encoder.encode(value)))
+            return try RemoteGatewayResponse(status: status, content: .json(data()))
         } catch {
             return .error(
                 .init(code: "encoding_failed", message: "The response could not be encoded."),

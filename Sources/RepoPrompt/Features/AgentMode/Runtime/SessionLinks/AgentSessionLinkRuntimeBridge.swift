@@ -4605,6 +4605,7 @@ final class AgentSessionLinkRuntimeBridge {
             // Seen state is generation-qualified: a fresh re-add of the same pair baselines against
             // current activity instead of inheriting an acknowledgement made under removed authority.
             monitorSeenByReference.removeValue(forKey: reference)
+            AgentSessionLinkExecutionRuntime.cancelRunStartedByRevokedLink(notice)
             // The exact grant already ended. A saved relationship's history ends only when
             // its token-qualified retirement succeeds.
             let hasDurableIntent = capturedBookkeeping[reference]?.token != nil
@@ -8820,7 +8821,8 @@ final class AgentSessionLinkRuntimeBridge {
         // No suspension from the stable inventory/authorization fence through count and reserve.
         let ticket = UUID()
         let admittedCount = admittedLaneCount(creatorSessionID: creatorID, linkedIDs: linkedIDs)
-        guard delegationScopes.authorization.admitsAdditionalLane(admittedLaneCount: admittedCount)
+        let laneAdmission = delegationScopes.authorization.laneAdmissionDecision(admittedLaneCount: admittedCount)
+        guard laneAdmission.admitted
         else { return .refused(.laneLimitReached, laneCount: admittedCount) }
         laneCreationCapReservations[creatorID, default: [:]][ticket] = .pending
         laneCreationCapGeneration[creatorID, default: 0] &+= 1
@@ -8834,7 +8836,8 @@ final class AgentSessionLinkRuntimeBridge {
         return await performLaneCreation(
             observerEndpoint: observerEndpoint, callerBasis: callerBasis, request: request, selection: selection,
             destinationWindowID: destination.windowID, workspaceID: destination.workspaceID,
-            workspaceName: destination.workspaceName, reservationTicket: ticket
+            workspaceName: destination.workspaceName, reservationTicket: ticket,
+            laneQuotaWaived: laneAdmission.quotaWaived
         )
     }
 
@@ -8846,7 +8849,8 @@ final class AgentSessionLinkRuntimeBridge {
         destinationWindowID: Int,
         workspaceID: UUID,
         workspaceName: String,
-        reservationTicket: UUID
+        reservationTicket: UUID,
+        laneQuotaWaived: Bool
     ) async -> AgentSessionLaneCreateReceipt {
         guard !isFrozenForTermination, !Task.isCancelled, let host else {
             return .refused(.shuttingDown)
@@ -8892,6 +8896,7 @@ final class AgentSessionLinkRuntimeBridge {
                     sessionName: request.sessionName, linked: false, reason: reason, firstTask: .none,
                     laneCount: linkedCreatedLaneIDs(creatorSessionID: observerEndpoint.sessionID).ids.count
                 )
+                receipt.laneQuotaWaived = laneQuotaWaived
                 receipt.workspaceName = workspaceName
             } else {
                 receipt = .refused(reason)
@@ -8944,6 +8949,7 @@ final class AgentSessionLinkRuntimeBridge {
                 reason: reason, firstTask: firstTask, laneCount: count
             )
             value.firstTaskReason = firstTaskReason
+            value.laneQuotaWaived = laneQuotaWaived
             value.workspaceName = workspaceName
             return value
         }

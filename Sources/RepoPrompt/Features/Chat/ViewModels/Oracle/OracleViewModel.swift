@@ -459,7 +459,7 @@ class OracleViewModel: ObservableObject {
     let restorePerfRecorder: any WorkspaceRestorePerfRecording
     @Published var messages: [AIChatMessage] = []
     @Published private(set) var streamingSessions: Set<UUID> = []
-    @Published private(set) var messageStoreRevision: Int = 0
+    private let transcriptChanges = PassthroughSubject<UUID, Never>()
     @Published var oracleGroupPresentations: [OracleGroupPresentation.Key: OracleGroupPresentation] = [:]
     @Published private(set) var currentQueryId: UUID?
 
@@ -560,9 +560,6 @@ class OracleViewModel: ObservableObject {
     @Published private(set) var tokenDisplayText: String = ""
     // NEW: live estimate for the *next* user prompt
     @Published private(set) var upcomingInputTokenText: String = ""
-
-    /// Tick counter to force UI refresh when reasoning content updates during streaming
-    @Published var reasoningUpdateTick: Int = 0
 
     @MainActor
     private func syncMCPGlobalsForCurrentSession() {
@@ -836,6 +833,10 @@ class OracleViewModel: ObservableObject {
         return []
     }
 
+    func transcriptChanges(for sessionID: UUID?) -> AnyPublisher<UUID, Never> {
+        transcriptChanges.filter { $0 == sessionID }.eraseToAnyPublisher()
+    }
+
     @MainActor
     @discardableResult
     func ensureSessionMessagesLoaded(_ sessionID: UUID) async -> Bool {
@@ -898,13 +899,18 @@ class OracleViewModel: ObservableObject {
     private func withSessionMessages(_ sessionID: UUID, _ mutate: (inout [AIChatMessage]) -> Void) {
         ensureSessionStorage(sessionID)
         var arr = messageStore[sessionID] ?? []
+        let oldCount = arr.count
         mutate(&arr)
+        // Pill eligibility depends on whether a lane has messages. In-place reply
+        // updates only need to wake the transcript subscribed to this session.
+        if currentSessionID != sessionID, arr.count != oldCount {
+            objectWillChange.send()
+        }
         messageStore[sessionID] = arr
-        messageStoreRevision &+= 1
-
         if currentSessionID == sessionID {
             messages = arr
         }
+        transcriptChanges.send(sessionID)
     }
 
     @MainActor
@@ -1004,7 +1010,8 @@ class OracleViewModel: ObservableObject {
     func purgeSessionStorage(_ sessionID: UUID) {
         let messageIDs: [UUID]
         if let stored = messageStore.removeValue(forKey: sessionID) {
-            messageStoreRevision &+= 1
+            objectWillChange.send()
+            transcriptChanges.send(sessionID)
             messageIDs = stored.map(\.id)
         } else {
             messageIDs = sessionIDByMessageId.filter { $0.value == sessionID }.map(\.key)
@@ -1031,8 +1038,11 @@ class OracleViewModel: ObservableObject {
     @MainActor
     private func clearAllSessionStorage() {
         sessionSwitchGeneration += 1
+        let storedSessionIDs = Array(messageStore.keys)
         messageStore.removeAll(keepingCapacity: false)
-        messageStoreRevision &+= 1
+        for sessionID in storedSessionIDs {
+            transcriptChanges.send(sessionID)
+        }
         sessionIDByMessageId.removeAll(keepingCapacity: false)
         runStateBySession.removeAll(keepingCapacity: false)
         nextSequenceIndexBySession.removeAll(keepingCapacity: false)
@@ -2886,14 +2896,19 @@ class OracleViewModel: ObservableObject {
         }
 
         guard contextBuilderScope?.isLive != false else { return }
-        let newSortedMessages = newMessages.sorted { $0.sequenceIndex < $1.sequenceIndex }
+        var newSortedMessages = newMessages.sorted { $0.sequenceIndex < $1.sequenceIndex }
+        for index in newSortedMessages.indices where !newSortedMessages[index].isUser {
+            newSortedMessages[index].setIsFinalized(true)
+        }
         if let existing = messageStore[session.id] {
             for message in existing {
                 sessionIDByMessageId.removeValue(forKey: message.id)
             }
         }
+        // A reload can change the model label even when the message count is unchanged.
+        objectWillChange.send()
+        ensureSessionStorage(session.id)
         messageStore[session.id] = newSortedMessages
-        messageStoreRevision &+= 1
         for msg in newSortedMessages {
             registerMessage(msg.id, sessionID: session.id)
         }
@@ -2901,14 +2916,11 @@ class OracleViewModel: ObservableObject {
         if shouldAffectDisplayed {
             currentQueryId = nil
             setDisplayedSession(session.id)
+        } else if currentSessionID == session.id {
+            messages = newSortedMessages
         }
 
-        // Historical messages now display directly from raw stored text.
-        withSessionMessages(session.id) { msgs in
-            for index in msgs.indices where !msgs[index].isUser {
-                msgs[index].setIsFinalized(true)
-            }
-        }
+        transcriptChanges.send(session.id)
         // Batch finished – re-enable token updates and do a single refresh
         if shouldAffectDisplayed {
             isBatchLoadingMessages = false
@@ -3605,7 +3617,6 @@ class OracleViewModel: ObservableObject {
                     await MainActor.run {
                         guard self.canCommitContextBuilderLane(contextBuilderScope, backgroundQuery: backgroundQuery) else { return }
                         let sawText = !delta.isEmpty
-                        let sawReasoning = !(reasoningDelta?.isEmpty ?? true)
                         let now = self.streamWatchdogNow
                         if activityKind != nil {
                             guard self.recordObservedStreamActivity(for: aiResponseId, at: now) else { return }
@@ -3614,13 +3625,8 @@ class OracleViewModel: ObservableObject {
                             self.hasSeenNonReasoningText.insert(aiResponseId)
                             self.lastTextStreamActivityAt[aiResponseId] = now
                         }
-                        // Store reasoning content in ephemeral state instead of message
+                        // MCP reads the live reasoning from ephemeral state.
                         self.ephemeralState.setReasoningContent(reasoningBuffer, for: aiResponseId)
-
-                        // Increment tick to force popover UI refresh when reasoning updates
-                        if sawReasoning {
-                            self.reasoningUpdateTick += 1
-                        }
 
                         self.withSessionMessages(targetSessionID) { msgs in
                             if let idx = msgs.firstIndex(where: { $0.id == aiResponseId }) {
@@ -4522,32 +4528,6 @@ class OracleViewModel: ObservableObject {
         history += "</conversation_history>"
         print(history)
         return history
-    }
-
-    func bindingForReasoningContent(of messageId: UUID) -> Binding<String> {
-        Binding<String>(
-            get: {
-                // Only access ephemeral state if message still exists
-                if self.messages.contains(where: { $0.id == messageId }) {
-                    return self.ephemeralState.reasoningContent(for: messageId)
-                } else {
-                    #if DEBUG
-                        print("Warning: Binding accessed reasoning for non-existent message: \(messageId)")
-                    #endif
-                    return ""
-                }
-            },
-            set: { newValue in
-                // Only update if message still exists
-                if self.messages.contains(where: { $0.id == messageId }) {
-                    self.ephemeralState.setReasoningContent(newValue, for: messageId)
-                } else {
-                    #if DEBUG
-                        print("Warning: Binding attempted to update reasoning for non-existent message: \(messageId)")
-                    #endif
-                }
-            }
-        )
     }
 
     @MainActor

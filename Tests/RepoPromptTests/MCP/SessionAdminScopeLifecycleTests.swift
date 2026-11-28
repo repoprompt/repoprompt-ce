@@ -8704,7 +8704,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
         static func make(
             activeID: UUID, parentID: UUID?, stashedID: UUID? = nil,
             agentFactory: WindowStateCompositionFactory.AgentModeViewModelFactory? = nil,
-            processRuntime: MCPDomainRuntime? = nil
+            processRuntime: MCPDomainRuntime? = nil, commitCarriersBeforeActivation: Bool = false
         ) async throws -> LoadedWindowFixture {
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent("inventory-loaded-\(UUID())")
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -8755,8 +8755,37 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 workspace.composeTabs = [active]
                 workspace.stashedTabs = stashed.map { [StashedTab(tab: $0)] } ?? []
                 workspace.activeComposeTabID = active.id
+                if commitCarriersBeforeActivation {
+                    fixture.carriers = workspace
+                    let authority = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: window.windowID)
+                    let saved = try await authority.save(
+                        workspace, fileURL: window.workspaceManager.workspaceFileURL(for: workspace),
+                        expectedWorkspaceRevision: nil, expectedContentDigest: nil
+                    )
+                    guard saved.disposition == .applied else { throw DomainWorkspaceAuthorityOperationError(outcome: saved) }
+                    _ = try await AgentSessionDataService.shared.saveAgentSession(
+                        AgentSession(
+                            id: activeID, workspaceID: workspace.id, composeTabID: active.id, name: "Targeted child",
+                            agentKind: AgentProviderKind.claudeCode.rawValue, agentModel: "", parentSessionID: parentID,
+                            isMCPOriginated: parentID != nil
+                        ), for: workspace
+                    )
+                    let projection = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
+                    let refreshed = await projection.refreshForAgentAdmission()
+                    XCTAssertTrue(refreshed)
+                }
                 let switched = await window.workspaceManager.reactivateWorkspaceAfterReplacement(workspace, reason: "inventoryLoadedTreeTest")
                 XCTAssertEqual(switched, .switched)
+                if commitCarriersBeforeActivation {
+                    let vm = window.agentModeViewModel
+                    let adopted = await vm.awaitWorkspaceRuntimeAdoption(expectedWorkspaceID: workspace.id)
+                    XCTAssertTrue(adopted)
+                    let session = await vm.ensureSessionReady(tabID: active.id, expectedWorkspaceID: workspace.id)
+                    XCTAssertTrue(session.permitsBoundOperationAndSave)
+                    XCTAssertEqual(session.activeAgentSessionID, activeID)
+                    XCTAssertEqual(session.parentSessionID, parentID)
+                    return fixture
+                }
                 // Activation reloads the manager's canonical projection; it does not publish
                 // arbitrary fields from the caller's local workspace value. Install carriers
                 // after activation has settled, rather than assuming that value was accepted.
@@ -8794,6 +8823,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
 
         func cleanup() async {
             if !ownsRuntime, let carriers { _ = await window.workspaceManager.deleteWorkspaceAsync(carriers) }
+            await window.agentModeViewModel.test_retireAndCancelFixture()
             WindowStatesManager.shared.unregisterWindowState(window)
             await window.workspaceManager.debugDrainScheduledSaves()
             await window.tearDown()
@@ -9004,13 +9034,15 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             let parent = ownChild ? caller : UUID()
             var fullAccess = global
             let appRuntime = AppDomainRuntimeComposition.shared.runtime
-            let observerFixture = try await LoadedWindowFixture.make(activeID: caller, parentID: nil, processRuntime: appRuntime)
-            let targetFixture = try await LoadedWindowFixture.make(activeID: target, parentID: parent, processRuntime: appRuntime)
-            addTeardownBlock { @MainActor in await targetFixture.cleanup()
-                await observerFixture.cleanup()
-            }
-            try observerFixture.installCarriers()
-            try targetFixture.installCarriers()
+            let observerFixture = try await LoadedWindowFixture.make(
+                activeID: caller, parentID: nil, processRuntime: appRuntime, commitCarriersBeforeActivation: true
+            )
+            addTeardownBlock { @MainActor in await observerFixture.cleanup() }
+            let targetFixture = try await LoadedWindowFixture.make(
+                activeID: target, parentID: parent, processRuntime: appRuntime, commitCarriersBeforeActivation: true
+            )
+            addTeardownBlock { @MainActor in await targetFixture.cleanup() }
+            WindowStatesManager.shared.attachAgentSessionLinkBridge()
             let bridge = AgentSessionLinkRuntimeBridge.shared
             let previousGlobal = bridge.delegationScopes.isGlobalAutoApproveEnabled
             bridge.delegationScopes.isGlobalAutoApproveEnabled = { fullAccess }
@@ -9023,19 +9055,6 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                     bridge.delegationScopes.revoke(scopeID: scope.id)
                 }
                 bridge.delegationScopes.isGlobalAutoApproveEnabled = previousGlobal
-            }
-            for (fixture, id, parent) in [(observerFixture, caller, UUID?.none), (targetFixture, target, Optional(parent))] {
-                _ = try await fixture.persistActiveCarriers()
-                let vm = fixture.window.agentModeViewModel
-                let tab = try XCTUnwrap(fixture.carriers?.composeTabs.first)
-                let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
-                let payload = AgentSession(id: id, workspaceID: workspace.id, composeTabID: tab.id, name: "Targeted child", agentKind: "claudeCode", agentModel: "", parentSessionID: parent, isMCPOriginated: parent != nil)
-                _ = try await AgentSessionDataService.shared.saveAgentSession(payload, for: workspace)
-                let session = vm.session(for: tab.id)
-                _ = try XCTUnwrap(vm.test_installPersistentSessionBinding(sessionID: id, on: session, updateWorkspaceMetadata: true))
-                session.parentSessionID = parent
-                session.hasLoadedPersistedState = true
-                session.recordRestorationAuthoritative(.persistedPayloadApplied)
             }
             for (fixture, id, parent) in [(observerFixture, caller, UUID?.none), (targetFixture, target, Optional(parent))] {
                 let vm = fixture.window.agentModeViewModel
@@ -9106,30 +9125,22 @@ final class SessionAdminInventoryReadTests: XCTestCase {
     func testReducedTargetApprovalReportsTheMissingCapabilitiesWithoutDelivering() async throws {
         try await MCPSharedServerTestLease.shared.withLease { _ in
             let runtime = AppDomainRuntimeComposition.shared.runtime
-            let observerFixture = try await LoadedWindowFixture.make(activeID: UUID(), parentID: nil, processRuntime: runtime)
-            let targetFixture = try await LoadedWindowFixture.make(activeID: UUID(), parentID: nil, processRuntime: runtime)
-            addTeardownBlock { @MainActor in await targetFixture.cleanup()
-                await observerFixture.cleanup()
-            }
-            try observerFixture.installCarriers()
-            try targetFixture.installCarriers()
-            _ = try await targetFixture.persistActiveCarriers()
-            // This test exercises reduced consent for a saved target, not the earlier
-            // missing-target refusal. An in-memory inventory row is not saved authority.
-            let targetTab = try XCTUnwrap(targetFixture.carriers?.composeTabs.first)
-            let targetWorkspace = try XCTUnwrap(targetFixture.window.workspaceManager.activeWorkspace)
-            let targetID = try XCTUnwrap(targetTab.activeAgentSessionID)
-            _ = try await AgentSessionDataService.shared.saveAgentSession(
-                AgentSession(id: targetID, workspaceID: targetWorkspace.id, composeTabID: targetTab.id, name: targetTab.name),
-                for: targetWorkspace
+            // Both sides need canonical carriers: target preparation may refresh the shared
+            // catalog before reduced consent is evaluated. It must not erase the observer.
+            let observerFixture = try await LoadedWindowFixture.make(
+                activeID: UUID(), parentID: nil, processRuntime: runtime, commitCarriersBeforeActivation: true
             )
+            addTeardownBlock { @MainActor in await observerFixture.cleanup() }
+            let targetFixture = try await LoadedWindowFixture.make(
+                activeID: UUID(), parentID: nil, processRuntime: runtime, commitCarriersBeforeActivation: true
+            )
+            addTeardownBlock { @MainActor in await targetFixture.cleanup() }
             let vm = observerFixture.window.agentModeViewModel
             let tab = try XCTUnwrap(observerFixture.carriers?.composeTabs.first)
             let sessionID = try XCTUnwrap(tab.activeAgentSessionID)
-            let session = vm.session(for: tab.id)
-            _ = try XCTUnwrap(vm.test_installPersistentSessionBinding(sessionID: sessionID, on: session, updateWorkspaceMetadata: true))
-            session.hasLoadedPersistedState = true
-            session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            let session = try XCTUnwrap(vm.sessions[tab.id])
+            XCTAssertTrue(session.permitsBoundOperationAndSave)
+            XCTAssertEqual(session.persistentSessionBindingIdentity?.sessionID, sessionID)
             let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(vm, tabID: tab.id)
             let target = try XCTUnwrap(targetFixture.carriers?.composeTabs.first?.activeAgentSessionID)
             let bridge = AgentSessionLinkRuntimeBridge.shared
@@ -9571,26 +9582,36 @@ final class SessionAdminInventoryReadTests: XCTestCase {
     func testCanonicalSavedOwnerIsReleasedAfterLinkRetirement() async throws {
         try await MCPSharedServerTestLease.shared.withLease { _ in
             let observerID = UUID(), targetID = UUID()
-            let fixture = try await LoadedWindowFixture.make(activeID: observerID, parentID: nil)
-            do {
-                try fixture.installCarriers()
-                let original = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
-                let observerTab = try XCTUnwrap(original.composeTabs.first)
-                let observerVM = fixture.window.agentModeViewModel
-                let observer = observerVM.session(for: observerTab.id)
-                _ = try XCTUnwrap(observerVM.test_installPersistentSessionBinding(sessionID: observerID, on: observer))
-                observer.hasLoadedPersistedState = true
-                observer.recordRestorationAuthoritative(.persistedPayloadApplied)
-                observer.selectedAgent = .claudeCode
-                let historical = ComposeTabState(name: "Historical carrier", activeAgentSessionID: UUID())
-                var workspace = original
-                workspace.composeTabs.append(historical)
-                workspace.customStoragePath = fixture.directory.appendingPathComponent("canonical-sessions")
-                try await CanonicalSavedWorkspaceFixture.run(workspace) { canonical in
-                    _ = try await AgentSessionDataService.shared.saveAgentSession(
-                        AgentSession(id: targetID, workspaceID: canonical.id, composeTabID: historical.id, name: "Saved historical target"),
-                        for: canonical
-                    )
+            let observerTab = ComposeTabState(name: "Observer", activeAgentSessionID: observerID)
+            let historical = ComposeTabState(name: "Historical carrier", activeAgentSessionID: UUID())
+            var workspace = WorkspaceModel(name: "Saved host retirement", repoPaths: [])
+            workspace.composeTabs = [observerTab, historical]
+            workspace.activeComposeTabID = observerTab.id
+            // The observer and target must use the same runtime for the exact carrier proof.
+            try await CanonicalSavedWorkspaceFixture.run(workspace) { canonical in
+                let window = WindowState(domainRuntime: AppDomainRuntimeComposition.shared.runtime)
+                WindowStatesManager.shared.registerWindowState(window)
+                let observerVM = window.agentModeViewModel
+                let cleanup: @MainActor () async -> Void = {
+                    await observerVM.test_retireAndCancelFixture()
+                    await window.tearDown()
+                    WindowStatesManager.shared.unregisterWindowState(window)
+                }
+                do {
+                    for (id, tab) in [(observerID, observerTab), (targetID, historical)] {
+                        _ = try await AgentSessionDataService.shared.saveAgentSession(
+                            AgentSession(id: id, workspaceID: canonical.id, composeTabID: tab.id, name: tab.name, agentKind: AgentProviderKind.claudeCode.rawValue),
+                            for: canonical
+                        )
+                    }
+                    await window.workspaceManager.awaitInitialized()
+                    let projection = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
+                    let refreshed = await projection.refreshForAgentAdmission()
+                    XCTAssertTrue(refreshed)
+                    let switched = await window.workspaceManager.switchWorkspace(to: canonical, saveState: false)
+                    XCTAssertTrue(switched.didSwitch)
+                    let observer = await observerVM.ensureSessionReady(tabID: observerTab.id, expectedWorkspaceID: canonical.id)
+                    XCTAssertTrue(observer.permitsBoundOperationAndSave)
                     let manager = WindowStatesManager.shared
                     manager.attachAgentSessionLinkBridge()
                     let host = SessionAdminWindowsStructureHost()
@@ -9603,7 +9624,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                     XCTAssertEqual(command.writer.session.tabID, historical.id)
                     XCTAssertEqual(command.writer.session.activeAgentSessionID, targetID)
                     XCTAssertEqual(WindowState.windowCounter, windowCount)
-                    XCTAssertEqual(fixture.window.promptManager.activeComposeTabID, observerTab.id)
+                    XCTAssertEqual(window.promptManager.activeComposeTabID, observerTab.id)
                     XCTAssertNil(observerVM.sessions[historical.id])
                     manager.schedulePreparedOversightCleanup()
                     await manager.preparedOversightCleanupTask?.value
@@ -9616,12 +9637,12 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                     }
                     XCTAssertFalse(command.isCurrent)
                     XCTAssertNil(try SessionAdminWindows.command(for: targetID))
+                } catch {
+                    await cleanup()
+                    throw error
                 }
-            } catch {
-                await fixture.cleanup()
-                throw error
+                await cleanup()
             }
-            await fixture.cleanup()
         }
     }
 
@@ -10328,10 +10349,30 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 case "unstash":
                     _ = try await targetFixture.window.promptManager.unstashTab(XCTUnwrap(targetFixture.window.workspaceManager.activeWorkspace?.stashedTabs.first?.id))
                 case "close":
-                    targetFixture.window.beginClose()
-                    XCTAssertEqual(targetFixture.window.apiSettingsViewModel.managedRuntimeLeaseCount, 0, "No settings were borrowed from the visible window")
+                    let sourceWindow = targetFixture.window
+                    let visibleHost = sourceWindow.agentModeViewModel.runtimeHost
+                    let visibleSettings = sourceWindow.apiSettingsViewModel
+                    let savedActivation = try XCTUnwrap(targetHost.workspaceActivation)
+                    XCTAssertTrue(savedActivation.test_hasSettingsLease(from: targetSettings))
+                    XCTAssertFalse(savedActivation.test_hasSettingsLease(from: visibleSettings))
+                    let visibleActivation = visibleHost.workspaceActivation
+                    let visibleLeaseCount = visibleSettings.managedRuntimeLeaseCount
+                    let hadVisibleLease = visibleActivation?.test_hasSettingsLease(from: visibleSettings) == true
+                    sourceWindow.beginClose()
+                    XCTAssertEqual(visibleSettings.managedRuntimeLeaseCount, visibleLeaseCount)
                     XCTAssertEqual(targetSettings.managedRuntimeLeaseCount, 1)
-                    XCTAssertTrue(targetHost.workspaceActivation?.modelAvailability?.claudeCodeAvailable == true)
+                    XCTAssertTrue(savedActivation.modelAvailability?.claudeCodeAvailable == true)
+                    if hadVisibleLease {
+                        await sourceWindow.tearDown()
+                        if !visibleHost.scope.hasReleasedWriterClaims {
+                            XCTAssertFalse(visibleHost.scope.sessions.values.contains { $0.runState.isActive })
+                            let drain = visibleHost.beginAuthorizedRetirement()
+                            let outcome = await drain.wait(until: .now.advanced(by: .seconds(5)))
+                            XCTAssertEqual(outcome, .released)
+                        }
+                        XCTAssertFalse(visibleActivation?.test_hasSettingsLease(from: visibleSettings) == true)
+                        XCTAssertTrue(savedActivation.test_hasSettingsLease(from: targetSettings))
+                    }
                     let stillLinked = await SessionAdminWindowsStructureHost().addLink(
                         observer: requesterID, target: targetID, sourceScopeID: granted.id,
                         isStillAuthorized: { bridge.delegationScopes.linkConsent.permits(scopeID: granted.id, observer: requesterID, target: targetID, at: Date()) }

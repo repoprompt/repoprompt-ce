@@ -1,15 +1,257 @@
 import Foundation
 import MCP
 import RepoPromptAIContracts
-import RepoPromptDomainRuntime
-import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import RepoPromptRemoteProtocol
 import RepoPromptSecureStorage
+import RepoPromptSettingsCore
+import RepoPromptVCS
 import XCTest
 
 @MainActor
 final class RemoteGatewayRouterTests: XCTestCase {
+    func testVoiceStartRequiresConfirmedSyncWhileStatusEndAndUnpairRemainAvailable() throws {
+        let workspaceID = UUID()
+        let callID = UUID()
+        let start = RemoteGatewayRequest.workspaceVoice(.init(action: .start, callID: callID, workspaceID: workspaceID, offerSDP: "v=0"))
+        let status = RemoteGatewayRequest.workspaceVoice(.init(action: .status, callID: callID, workspaceID: workspaceID))
+        let end = RemoteGatewayRequest.workspaceVoice(.init(action: .end, callID: callID, workspaceID: workspaceID))
+        var sync = RemoteIrohGatewayAdapter.SyncState(sessionID: UUID())
+        XCTAssertFalse(sync.permits(start))
+        XCTAssertFalse(RemoteIrohGatewayAdapter.SyncState(sessionID: nil).permits(start))
+        XCTAssertTrue(sync.permits(status))
+        XCTAssertTrue(sync.permits(end))
+        XCTAssertTrue(sync.permits(.unpair))
+        let ticket = try XCTUnwrap(sync.issueTicket())
+        XCTAssertFalse(sync.permits(start))
+        XCTAssertTrue(sync.confirm(ticket))
+        XCTAssertTrue(sync.permits(start))
+    }
+
+    func testWorkspaceVoiceStartRequiresConsentWhileStatusAndEndStillRoute() async throws {
+        let workspaceID = UUID()
+        let callID = UUID()
+        var hasConsent = false
+        var routed: [RemoteWorkspaceVoiceRequest.Action] = []
+        let router = makeRouter(
+            workspaceVoiceConsent: { hasConsent },
+            workspaceVoice: { request, _ in
+                routed.append(request.action)
+                return .init(callID: callID, workspaceID: workspaceID, phase: .ended)
+            }
+        )
+        let peer = RemoteGatewayRequestContext.testPeer(authorizationHeader: "Bearer valid")
+        let start = RemoteGatewayRequest.workspaceVoice(.init(action: .start, callID: callID, workspaceID: workspaceID, offerSDP: "v=0"))
+        let denied = await router.route(start, context: peer)
+        XCTAssertEqual(denied.status, 403)
+        XCTAssertEqual(try error(from: denied).code, "workspace_voice_consent_required")
+        XCTAssertTrue(routed.isEmpty)
+
+        for action: RemoteWorkspaceVoiceRequest.Action in [.status, .end] {
+            let response = await router.route(.workspaceVoice(.init(action: action, callID: callID, workspaceID: workspaceID)), context: peer)
+            XCTAssertEqual(response.status, 200)
+        }
+        hasConsent = true
+        let accepted = await router.route(start, context: peer)
+        XCTAssertEqual(accepted.status, 200)
+        XCTAssertEqual(routed, [.status, .end, .start])
+    }
+
+    func testWorkspacePresentationRequiresPairedControlAndReturnsRequestedState() async throws {
+        var authority: RemoteAuthorityLevel = .observe
+        var changes: [RemoteWorkspacePresentation] = []
+        let router = makeRouter(
+            authorize: { $0.authorizationHeader == "Bearer valid" },
+            authorizationState: { .init(defaultLevel: authority) },
+            workspacePresentation: { request, authorize in
+                try authorize()
+                changes.append(request)
+            }
+        )
+        let paired = RemoteGatewayRequestContext.testPeer(authorizationHeader: "Bearer valid")
+        let open = RemoteWorkspacePresentation(workspaceID: UUID(), isOpen: true)
+        let unpairedReply = await router.route(.workspacePresentation(open), context: .testPeer(authorizationHeader: nil))
+        XCTAssertEqual(unpairedReply.status, 401)
+        let observeReply = await router.route(.workspacePresentation(open), context: paired)
+        XCTAssertEqual(observeReply.status, 403)
+        XCTAssertTrue(changes.isEmpty)
+
+        authority = .control
+        let close = RemoteWorkspacePresentation(workspaceID: open.workspaceID, isOpen: false)
+        for request in [open, close] {
+            let reply = await router.route(.workspacePresentation(request), context: paired)
+            XCTAssertEqual(reply.status, 200)
+            XCTAssertEqual(try JSONDecoder().decode(RemoteWorkspacePresentation.self, from: json(from: reply)), request)
+        }
+        XCTAssertEqual(changes, [open, close])
+    }
+
+    func testWorkspacePresentationRevalidatesAuthorityBeforeChangingWindows() async throws {
+        var generation: UInt64 = 1
+        let router = makeRouter(
+            commandGeneration: { generation },
+            workspacePresentation: { _, authorize in
+                generation += 1
+                try authorize()
+                XCTFail("A stale workspace change must be rejected")
+            }
+        )
+        let reply = await router.route(
+            .workspacePresentation(.init(workspaceID: UUID(), isOpen: true)),
+            context: .testPeer(authorizationHeader: "Bearer valid")
+        )
+        XCTAssertEqual(reply.status, 409)
+        XCTAssertEqual(try error(from: reply).code, "workspace_presentation")
+    }
+
+    func testFirstSyncDoesNotSendSavedSessionIndexForTwoWorkspaces() async throws {
+        let workspaceIDs = [UUID(), UUID()]
+        let liveID = UUID()
+        let workspaces = workspaceIDs.map {
+            RemoteWorkspaceRecord(
+                workspaceID: $0, name: "Open workspace", repositoryRootSummary: nil, isOpen: true,
+                activeSessionIDs: $0 == workspaceIDs[0] ? [liveID] : [], lastActivityAt: nil
+            )
+        }
+        let controls = RemoteSessionConfigurationControls(
+            agent: .init(isMutable: true, allowedValueIDs: ["codex"]),
+            model: .init(isMutable: true, allowedValueIDs: (0 ..< 100).map {
+                "provider/model-\($0)-" + String(repeating: "x", count: 180)
+            }),
+            reasoningEffort: .init(isMutable: true, allowedValueIDs: ["high"])
+        )
+        let saved = (0 ..< 256).map {
+            RemoteSessionRecord(
+                sessionID: UUID(), workspaceID: workspaceIDs[$0 % 2], composeTabID: nil, parentSessionID: nil,
+                sessionName: "Saved chat \($0)", workflow: nil, agent: "codex", model: nil, reasoningEffort: nil,
+                runState: .completed, lifecycleStage: nil, latestMeaningfulActivity: nil, pendingInteraction: nil,
+                worktreeSummary: nil, mergeAttention: nil, failureSummary: nil,
+                lastUpdatedAt: .distantPast, isLive: false, configurationControls: controls
+            )
+        }
+        let active = RemoteSessionRecord(
+            sessionID: liveID, workspaceID: workspaceIDs[0], composeTabID: UUID(), parentSessionID: nil,
+            sessionName: "Active chat", workflow: nil, agent: "codex", model: nil, reasoningEffort: nil,
+            runState: .working, lifecycleStage: nil, latestMeaningfulActivity: nil, pendingInteraction: nil,
+            worktreeSummary: nil, mergeAttention: nil, failureSummary: nil, lastUpdatedAt: Date(), isLive: true
+        )
+        let builder = RemoteSnapshotBuilder(
+            workspaceCatalog: FixtureWorkspaceCatalog(records: workspaces),
+            sessionQuery: FixtureSessionQuery(records: saved + [active]),
+            workflowCatalog: StaticRemoteCatalogService()
+        )
+        func snapshot(bootstrap: Bool) async -> RemoteSnapshot {
+            await builder.build(
+                desktop: .init(instanceID: "desktop", displayName: "Mac", appVersion: "test", isAvailable: true),
+                connection: .init(state: .connecting), authorization: .init(), eventCursor: 42,
+                bootstrap: bootstrap
+            )
+        }
+
+        let full = await snapshot(bootstrap: false)
+        let fullJSON = try JSONEncoder().encode(full)
+        let oldFrame = try RemoteWireFrame(
+            kind: .rpcResponse, messageID: UUID(), encoding: RemoteRPCResponse(result: fullJSON, syncTicket: UUID())
+        )
+        XCTAssertThrowsError(try oldFrame.validateEncodedLimit(direction: .serverResponse))
+        let router = makeRouter(snapshot: { full }, bootstrapSnapshot: { await snapshot(bootstrap: true) })
+        let context = RemoteGatewayRequestContext.testPeer(authorizationHeader: "Bearer valid")
+        let reply = await router.route(.snapshot, context: context)
+        XCTAssertEqual(reply.status, 200)
+        let data = try json(from: reply)
+        let syncFrame = try RemoteWireFrame(
+            kind: .rpcResponse, messageID: UUID(), encoding: RemoteRPCResponse(result: data, syncTicket: UUID())
+        )
+        try syncFrame.validateEncodedLimit(direction: .serverResponse)
+
+        let firstSync = try JSONDecoder().decode(RemoteSnapshot.self, from: data)
+        XCTAssertEqual(Set(firstSync.workspaces.map(\.workspaceID)), Set(workspaceIDs.map(\.uuidString)))
+        XCTAssertEqual(firstSync.sessions.map(\.sessionID), [liveID])
+        XCTAssertEqual(firstSync.eventCursor, 42)
+
+        let sessionsReply = await router.route(.sessions, context: context)
+        let sessionList = try JSONDecoder().decode([RemoteSessionSummary].self, from: json(from: sessionsReply))
+        XCTAssertEqual(sessionList.count, saved.count + 1)
+    }
+
+    func testFirstSyncPreservesSavedRelationshipsAroundLiveSession() async throws {
+        let workspaceID = UUID()
+        let liveID = UUID()
+        let parentID = UUID()
+        let childID = UUID()
+        let unrelatedID = UUID()
+        func record(_ id: UUID, parent: UUID? = nil, live: Bool = false) -> RemoteSessionRecord {
+            RemoteSessionRecord(
+                sessionID: id, workspaceID: workspaceID, composeTabID: nil, parentSessionID: parent,
+                sessionName: "Chat", workflow: nil, agent: "codex", model: nil, reasoningEffort: nil,
+                runState: live ? .working : .completed, lifecycleStage: nil, latestMeaningfulActivity: nil,
+                pendingInteraction: nil, worktreeSummary: nil, mergeAttention: nil, failureSummary: nil,
+                lastUpdatedAt: .distantPast, isLive: live
+            )
+        }
+        let workspaces = FixtureWorkspaceCatalog(records: [.init(
+            workspaceID: workspaceID, name: "Open workspace", repositoryRootSummary: nil, isOpen: true,
+            activeSessionIDs: [liveID], lastActivityAt: nil
+        )])
+        let sessions = FixtureSessionQuery(records: [
+            record(parentID), record(liveID, parent: parentID, live: true),
+            record(childID, parent: liveID), record(unrelatedID)
+        ])
+        let builder = RemoteSnapshotBuilder(
+            workspaceCatalog: workspaces, sessionQuery: sessions, workflowCatalog: StaticRemoteCatalogService()
+        )
+        let router = makeRouter(bootstrapSnapshot: {
+            await builder.build(
+                desktop: .init(instanceID: "desktop", displayName: "Mac", appVersion: "test", isAvailable: true),
+                connection: .init(state: .connecting), authorization: .init(), bootstrap: true
+            )
+        })
+
+        let reply = await router.route(.snapshot, context: .testPeer(authorizationHeader: "Bearer valid"))
+        let snapshot = try JSONDecoder().decode(RemoteSnapshot.self, from: json(from: reply))
+        let byID = Dictionary(uniqueKeysWithValues: snapshot.sessions.map { ($0.sessionID, $0) })
+        XCTAssertEqual(Set(byID.keys), [parentID, liveID, childID])
+        XCTAssertEqual(byID[parentID]?.childSessionIDs, [liveID])
+        XCTAssertEqual(byID[liveID]?.parentSessionID, parentID)
+        XCTAssertEqual(byID[liveID]?.childSessionIDs, [childID])
+        XCTAssertEqual(byID[childID]?.parentSessionID, liveID)
+        XCTAssertEqual(byID[liveID]?.isLive, true)
+        XCTAssertEqual(byID[childID]?.isLive, false)
+    }
+
+    func testFirstSyncCompactsOversizedLiveDataAndKeepsCoreState() async throws {
+        let workspaceID = UUID().uuidString
+        let sessionID = UUID()
+        let epoch = UUID()
+        let prompt = String(repeating: "x", count: RemoteSnapshotBootstrap.maximumJSONBytes + 1)
+        let snapshot = RemoteSnapshot(
+            desktop: .init(instanceID: "desktop", displayName: "Mac", appVersion: "test", isAvailable: true),
+            connection: .init(state: .connecting), authorization: .init(defaultLevel: .control),
+            workspaces: [.init(workspaceID: workspaceID, name: "Open workspace", isOpen: true)],
+            sessions: [.init(
+                sessionID: sessionID, workspaceID: workspaceID, runState: .waitingForInput,
+                pendingInteraction: .init(id: "request", kind: .approval, prompt: prompt), isLive: true
+            )],
+            eventCursor: 73, transcriptRevisionEpoch: epoch
+        )
+        let router = makeRouter(bootstrapSnapshot: { snapshot })
+        let reply = await router.route(.snapshot, context: .testPeer(authorizationHeader: "Bearer valid"))
+        XCTAssertEqual(reply.status, 200)
+        let data = try json(from: reply)
+        XCTAssertLessThanOrEqual(data.count, RemoteSnapshotBootstrap.maximumJSONBytes)
+
+        let core = try JSONDecoder().decode(RemoteSnapshot.self, from: data)
+        XCTAssertEqual(core.workspaces, snapshot.workspaces)
+        XCTAssertEqual(core.sessions.map(\.sessionID), [sessionID])
+        XCTAssertEqual(core.sessions.first?.runState, .waitingForInput)
+        XCTAssertNil(core.sessions.first?.pendingInteraction?.prompt)
+        XCTAssertNotNil(core.sessions.first?.pendingInteraction?.responseUnavailableReason)
+        XCTAssertEqual(core.authorization, snapshot.authorization)
+        XCTAssertEqual(core.eventCursor, 73)
+        XCTAssertEqual(core.transcriptRevisionEpoch, epoch)
+    }
+
     func testWorkspaceHistoryScopesBeforePagingAndKeepsEqualTimestamps() throws {
         let workspace = UUID()
         let busyWorkspace = UUID()
@@ -402,6 +644,14 @@ final class RemoteGatewayRouterTests: XCTestCase {
         imageAttachment: @escaping (RemoteImageAttachmentRequest) async throws -> RemoteImageAttachmentChunk? = { _ in nil },
         pairIroh: @escaping (RemoteIrohPairingRequest, String) -> Result<RemoteIrohPairingResponse, Error> = { _, _ in
             .failure(TestFailure.unexpectedResponse)
+        },
+        bootstrapSnapshot: (() async -> RemoteSnapshot?)? = nil,
+        workspaceVoiceConsent: @escaping () -> Bool = { false },
+        workspaceVoice: @escaping (RemoteWorkspaceVoiceRequest, RemoteGatewayRequestContext) throws -> RemoteWorkspaceVoiceStatus = { _, _ in
+            throw TestFailure.unexpectedResponse
+        },
+        workspacePresentation: @escaping (RemoteWorkspacePresentation, @escaping RemoteDispatchAuthorization) async throws -> Void = { _, _ in
+            throw TestFailure.unexpectedResponse
         }
     ) -> RemoteGatewayRequestRouter {
         RemoteGatewayRequestRouter(services: RemoteGatewayRoutingServices(
@@ -417,7 +667,11 @@ final class RemoteGatewayRouterTests: XCTestCase {
             execute: execute,
             eventCursor: eventCursor,
             imageAttachment: imageAttachment,
-            pairIroh: pairIroh
+            pairIroh: pairIroh,
+            bootstrapSnapshot: bootstrapSnapshot,
+            workspaceVoiceConsent: workspaceVoiceConsent,
+            workspaceVoice: workspaceVoice,
+            workspacePresentation: workspacePresentation
         ))
     }
 
@@ -448,6 +702,8 @@ final class RemoteGatewayRouterTests: XCTestCase {
         case .history: "history"
         case .transcript: "transcript"
         case .imageAttachment: "image_attachment"
+        case .workspaceVoice: "workspace_voice"
+        case .workspacePresentation: "workspace_presentation"
         case .events: "events"
         case .command: "command"
         }
@@ -488,164 +744,242 @@ final class RemoteIrohSecurityTests: XCTestCase {
         XCTAssertEqual(Data(base64URL: issued.oneTimeSecret)?.count, 32)
     }
 
-    func testPairingSecretExpiresAndIsSingleUse() throws {
+    func testIssuedCodeCanBeUsedAfterMacRestartsBeforePrepare() throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 1800))
+        var disk = RemoteStoredPairingState()
+        let firstMac = makeManager(clock: clock, persist: { disk = $0 })
+        let server = RemoteIrohEndpointAddress(endpointID: endpointID("a"))
+        let issued = try firstMac.issueAdvertisement(server: server)
+        let reopened = makeManager(clock: clock, storedState: disk)
+        XCTAssertEqual(reopened.restoreAdvertisement(server: server), issued)
+        _ = try prepare(pairingRequest(secret: issued.oneTimeSecret), on: reopened)
+        XCTAssertFalse(reopened.isPaired)
+    }
+
+    func testLostCredentialReplyCanResumeAfterMacRestart() throws {
         let clock = TestClock(Date(timeIntervalSince1970: 2000))
-        var persisted: [RemoteStoredDeviceCredential?] = []
-        let manager = makeManager(clock: clock) { persisted.append($0) }
-        let advertisement = try manager.issueAdvertisement(server: .init(endpointID: endpointID("a")))
-        clock.date = advertisement.expiresAt.addingTimeInterval(1)
+        var disk = RemoteStoredPairingState()
+        let firstMac = makeManager(clock: clock, persist: { disk = $0 })
+        let issued = try firstMac.issueAdvertisement(server: .init(endpointID: endpointID("a")))
+        XCTAssertEqual(issued.requiresPairingConfirmation, true)
+        let request = pairingRequest(secret: issued.oneTimeSecret)
+        let droppedResponse = try prepare(request, on: firstMac)
+        XCTAssertFalse(firstMac.isPaired)
+        XCTAssertFalse(isAuthorized(droppedResponse, on: firstMac))
+        XCTAssertNil(disk.active)
+        XCTAssertEqual(disk.pending?.attemptID, request.attemptID)
 
-        XCTAssertThrowsError(try manager.pairIroh(
-            request: pairingRequest(secret: advertisement.oneTimeSecret),
-            authenticatedPeerEndpointID: endpointID("b"),
-            serverEndpointID: endpointID("a"),
-            desktop: desktopSummary()
-        )) { error in
-            guard case RemoteGatewaySecurityError.pairingSecretExpired = error else {
-                return XCTFail("Expected pairingSecretExpired, got \(error)")
-            }
-        }
-        XCTAssertTrue(persisted.isEmpty)
-
-        XCTAssertThrowsError(try manager.pairIroh(
-            request: pairingRequest(secret: advertisement.oneTimeSecret),
-            authenticatedPeerEndpointID: endpointID("b"),
-            serverEndpointID: endpointID("a"),
-            desktop: desktopSummary()
-        )) { error in
-            guard case RemoteGatewaySecurityError.pairingSecretInvalid = error else {
-                return XCTFail("Expected pairingSecretInvalid, got \(error)")
-            }
-        }
-    }
-
-    func testPairingReplayFailsEvenWhenCredentialPersistenceFails() throws {
-        let clock = TestClock(Date(timeIntervalSince1970: 3000))
-        let manager = makeManager(clock: clock) { _ in throw PersistenceFailure.failed }
-        let advertisement = try manager.issueAdvertisement(server: .init(endpointID: endpointID("a")))
-        let request = pairingRequest(secret: advertisement.oneTimeSecret)
-
-        XCTAssertThrowsError(try manager.pairIroh(request: request, authenticatedPeerEndpointID: endpointID("b"), serverEndpointID: endpointID("a"), desktop: desktopSummary())) { error in
-            XCTAssertTrue(error is PersistenceFailure)
-        }
-        XCTAssertThrowsError(try manager.pairIroh(request: request, authenticatedPeerEndpointID: endpointID("b"), serverEndpointID: endpointID("a"), desktop: desktopSummary())) { error in
-            guard case RemoteGatewaySecurityError.pairingSecretInvalid = error else {
-                return XCTFail("Expected consumed secret rejection, got \(error)")
-            }
-        }
-    }
-
-    func testFreshValidIrohPairingReplacesStaleOneDeviceRecord() throws {
-        let clock = TestClock(Date(timeIntervalSince1970: 3500))
-        let stale = RemoteStoredDeviceCredential(
-            deviceID: "stale-device",
-            credential: "stale-credential",
-            expiresAt: clock.date.addingTimeInterval(3600),
-            deviceName: "Old phone",
-            irohPeerEndpointID: endpointID("b")
-        )
-        var persisted: RemoteStoredDeviceCredential? = nil
-        let manager = makeManager(clock: clock, storedDevice: stale) { persisted = $0 }
-        let serverID = endpointID("a")
-        let replacementClientID = endpointID("c")
-        let issued = try manager.issueAdvertisement(server: RemoteIrohEndpointAddress(endpointID: serverID))
-
-        let response = try manager.pairIroh(
-            request: RemoteIrohPairingRequest(
-                desktopInstanceID: "desktop",
-                expectedServerEndpointID: serverID,
-                clientEndpointID: replacementClientID,
-                oneTimeSecret: issued.oneTimeSecret,
-                deviceName: "Replacement phone"
-            ),
-            authenticatedPeerEndpointID: replacementClientID,
-            serverEndpointID: serverID,
-            desktop: desktopSummary()
-        )
-
-        XCTAssertNotEqual(response.pairingResponse.deviceID, stale.deviceID)
-        XCTAssertEqual(persisted?.deviceID, response.pairingResponse.deviceID)
-        XCTAssertEqual(persisted?.irohPeerEndpointID, replacementClientID)
-        XCTAssertFalse(manager.isAuthorizedIroh(
-            authorizationHeader: "Bearer \(stale.credential)",
-            deviceID: stale.deviceID,
-            authenticatedPeerEndpointID: stale.irohPeerEndpointID
-        ))
-        XCTAssertTrue(manager.isAuthorizedIroh(
-            authorizationHeader: "Bearer \(response.pairingResponse.credential)",
-            deviceID: response.pairingResponse.deviceID,
-            authenticatedPeerEndpointID: replacementClientID
-        ))
-    }
-
-    func testIrohPairingAuthenticatesBothEndpointBindingsBeforeConsumingSecret() throws {
-        let clock = TestClock(Date(timeIntervalSince1970: 4000))
-        var persisted: RemoteStoredDeviceCredential? = nil
-        let manager = makeManager(clock: clock) { persisted = $0 }
-        let serverID = endpointID("a")
-        let clientID = endpointID("b")
-        let issued = try manager.issueAdvertisement(server: RemoteIrohEndpointAddress(endpointID: serverID))
-        let request = RemoteIrohPairingRequest(
+        let restoredState = try RemoteStoredPairingState.decode(JSONEncoder().encode(disk))
+        let reopenedMac = makeManager(clock: clock, storedState: restoredState, persist: { disk = $0 })
+        XCTAssertThrowsError(try prepare(pairingRequest(secret: issued.oneTimeSecret), on: reopenedMac))
+        let competingPeer = RemoteIrohPairingRequest(
             desktopInstanceID: "desktop",
-            expectedServerEndpointID: serverID,
-            clientEndpointID: clientID,
+            expectedServerEndpointID: endpointID("a"),
+            clientEndpointID: endpointID("c"),
             oneTimeSecret: issued.oneTimeSecret,
-            deviceName: "Phone"
+            deviceName: "Other phone",
+            attemptID: request.attemptID
         )
+        XCTAssertThrowsError(try prepare(competingPeer, on: reopenedMac, peer: endpointID("c")))
+        XCTAssertEqual(try prepare(request, on: reopenedMac), droppedResponse)
+        XCTAssertFalse(reopenedMac.isPaired)
+        XCTAssertFalse(isAuthorized(droppedResponse, on: reopenedMac))
+    }
 
-        XCTAssertThrowsError(try manager.pairIroh(
-            request: request,
-            authenticatedPeerEndpointID: endpointID("c"),
-            serverEndpointID: serverID,
-            desktop: desktopSummary()
-        )) { error in
-            guard case RemoteGatewaySecurityError.endpointBindingInvalid = error else {
-                return XCTFail("Expected endpointBindingInvalid, got \(error)")
+    func testLostFinalAcknowledgementReturnsTheSameResultAfterMacRestart() throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 3000))
+        var disk = RemoteStoredPairingState()
+        let manager = makeManager(clock: clock, persist: { disk = $0 })
+        let advertised = try manager.issueAdvertisement(server: .init(endpointID: endpointID("a")))
+        let response = try prepare(pairingRequest(secret: advertised.oneTimeSecret), on: manager)
+        let confirmation = try confirmation(for: response)
+
+        XCTAssertThrowsError(try confirm(confirmation, on: manager, peer: endpointID("c")))
+        XCTAssertFalse(manager.isPaired)
+        XCTAssertTrue(try confirm(confirmation, on: manager))
+        XCTAssertTrue(manager.isPaired)
+        XCTAssertTrue(isAuthorized(response, on: manager))
+        let committed = disk
+        XCTAssertNil(committed.pending)
+
+        clock.date = clock.date.addingTimeInterval(2)
+        let reopenedMac = makeManager(clock: clock, storedState: committed, persist: { _ in
+            XCTFail("Confirm retry must not write or renew a credential")
+        })
+        XCTAssertThrowsError(try confirm(confirmation, on: reopenedMac, peer: endpointID("c")))
+        XCTAssertFalse(try confirm(confirmation, on: reopenedMac))
+        XCTAssertTrue(isAuthorized(response, on: reopenedMac))
+    }
+
+    func testFailedPhoneSaveLeavesOnlyAnExpiringAttemptAndAllowsNewCode() throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 3500))
+        let manager = makeManager(clock: clock)
+        let issued = try manager.issueAdvertisement(server: .init(endpointID: endpointID("a")))
+        let request = pairingRequest(secret: issued.oneTimeSecret)
+        let response = try prepare(request, on: manager)
+        // The phone Keychain save fails and the app stops before submitting a confirmation.
+        XCTAssertEqual(manager.status, .pending(deviceName: "Phone", expiresAt: clock.date.addingTimeInterval(300)))
+        XCTAssertFalse(manager.isPaired)
+        XCTAssertFalse(isAuthorized(response, on: manager))
+        clock.date = clock.date.addingTimeInterval(301)
+        XCTAssertEqual(manager.status, .attemptExpired)
+        XCTAssertThrowsError(try confirm(confirmation(for: response), on: manager))
+        let replacement = try manager.issueAdvertisement(server: .init(endpointID: endpointID("a")))
+        XCTAssertThrowsError(try confirm(confirmation(for: response), on: manager))
+        let next = try prepare(pairingRequest(secret: replacement.oneTimeSecret), on: manager)
+        XCTAssertNotEqual(next.pairingResponse.deviceID, response.pairingResponse.deviceID)
+        XCTAssertFalse(manager.isPaired)
+    }
+
+    func testPrepareAndConfirmationRemainRetryableAfterDesktopStorageFailure() throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 4000))
+        var shouldFail = false
+        var disk = RemoteStoredPairingState()
+        let manager = makeManager(clock: clock, persist: {
+            if shouldFail {
+                throw PersistenceFailure.failed
             }
-        }
+            disk = $0
+        })
+        let issued = try manager.issueAdvertisement(server: .init(endpointID: endpointID("a")))
+        let request = pairingRequest(secret: issued.oneTimeSecret)
+        let initial = disk
+        shouldFail = true
+        XCTAssertThrowsError(try prepare(request, on: manager))
+        XCTAssertEqual(disk, initial)
+        shouldFail = false
+        let receipt = try prepare(request, on: manager)
+        let confirmation = try confirmation(for: receipt)
+        shouldFail = true
+        XCTAssertThrowsError(try confirm(confirmation, on: manager))
+        XCTAssertNil(disk.active)
+        XCTAssertFalse(isAuthorized(receipt, on: manager))
+        shouldFail = false
+        XCTAssertTrue(try confirm(confirmation, on: manager))
+        XCTAssertTrue(manager.isPaired)
+    }
 
-        let response = try manager.pairIroh(
-            request: request,
-            authenticatedPeerEndpointID: clientID,
-            serverEndpointID: serverID,
-            desktop: desktopSummary()
+    func testLegacyHelloPairsOnceAndPreservesTheCredentialAcrossRestart() throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 4600))
+        var disk = RemoteStoredPairingState()
+        let manager = makeManager(clock: clock, persist: { disk = $0 })
+        let issued = try manager.issueAdvertisement(server: .init(endpointID: endpointID("a")))
+        let legacy = pairingRequest(secret: issued.oneTimeSecret, attemptID: nil)
+        XCTAssertThrowsError(try prepare(legacy, on: manager, peer: endpointID("c")))
+        let receipt = try prepare(legacy, on: manager)
+        XCTAssertNil(receipt.attemptID)
+        XCTAssertNil(disk.pending)
+        XCTAssertNil(disk.advertisement)
+        XCTAssertTrue(isAuthorized(receipt, on: manager))
+        XCTAssertThrowsError(try prepare(legacy, on: manager))
+        let restored = makeManager(clock: clock, storedState: disk)
+        XCTAssertTrue(isAuthorized(receipt, on: restored))
+    }
+
+    func testLegacyHelloCannotReplacePendingConfirmationOrUseExpiredCode() throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 4600))
+        let manager = makeManager(clock: clock)
+        let issued = try manager.issueAdvertisement(server: .init(endpointID: endpointID("a")))
+        let receipt = try prepare(pairingRequest(secret: issued.oneTimeSecret), on: manager)
+        XCTAssertThrowsError(try prepare(pairingRequest(secret: issued.oneTimeSecret, attemptID: nil), on: manager))
+        XCTAssertFalse(isAuthorized(receipt, on: manager))
+        XCTAssertTrue(try confirm(confirmation(for: receipt), on: manager))
+        try manager.revokeDevice()
+        let next = try manager.issueAdvertisement(server: .init(endpointID: endpointID("a")))
+        clock.date = next.expiresAt
+        XCTAssertEqual(manager.status, .codeExpired)
+        XCTAssertThrowsError(try prepare(pairingRequest(secret: next.oneTimeSecret, attemptID: nil), on: manager))
+        XCTAssertFalse(manager.isPaired)
+    }
+
+    func testExpiredActiveCredentialAllowsReplacementAndLegacyStorageLoads() throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 5000))
+        let legacy = RemoteStoredDeviceCredential(
+            deviceID: "old-phone", credential: "legacy-bearer", expiresAt: clock.date.addingTimeInterval(60),
+            deviceName: "Old phone", irohPeerEndpointID: endpointID("b")
         )
-        XCTAssertEqual(response.serverEndpointID, serverID)
-        XCTAssertEqual(response.clientEndpointID, clientID)
-        XCTAssertEqual(persisted?.irohPeerEndpointID, clientID)
-        XCTAssertTrue(manager.isAuthorizedIroh(
-            authorizationHeader: "Bearer \(response.pairingResponse.credential)",
-            deviceID: response.pairingResponse.deviceID,
-            authenticatedPeerEndpointID: clientID
-        ))
-
-        XCTAssertThrowsError(try manager.pairIroh(
-            request: request,
-            authenticatedPeerEndpointID: clientID,
-            serverEndpointID: serverID,
-            desktop: desktopSummary()
-        ))
+        let decoded = try RemoteStoredPairingState.decode(JSONEncoder().encode(legacy))
+        let manager = makeManager(clock: clock, storedState: decoded)
+        XCTAssertTrue(manager.isPaired)
+        XCTAssertThrowsError(try manager.issueAdvertisement(server: .init(endpointID: endpointID("a"))))
+        clock.date = legacy.expiresAt
+        XCTAssertEqual(manager.status, .credentialExpired)
+        let issued = try manager.issueAdvertisement(server: .init(endpointID: endpointID("a")))
+        let receipt = try prepare(pairingRequest(secret: issued.oneTimeSecret), on: manager)
+        XCTAssertFalse(manager.isPaired)
+        XCTAssertTrue(try confirm(confirmation(for: receipt), on: manager))
     }
 
     func testPersistedPairingFieldsAreBoundedAndEndpointIDsAreCanonical() throws {
         let clock = TestClock(Date(timeIntervalSince1970: 6500))
-        var persisted: RemoteStoredDeviceCredential?
-        let manager = makeManager(clock: clock) { persisted = $0 }
+        var disk = RemoteStoredPairingState()
+        let manager = makeManager(clock: clock, persist: { disk = $0 })
         let advertisement = try manager.issueAdvertisement(server: .init(endpointID: endpointID("a")))
         let request = pairingRequest(secret: advertisement.oneTimeSecret, deviceName: String(repeating: "📱", count: 512))
-        XCTAssertThrowsError(try manager.pairIroh(
-            request: request,
-            authenticatedPeerEndpointID: "invalid-endpoint",
-            serverEndpointID: endpointID("a"),
-            desktop: desktopSummary()
-        ))
-        _ = try manager.pairIroh(
-            request: request,
-            authenticatedPeerEndpointID: endpointID("b"),
-            serverEndpointID: endpointID("a"),
-            desktop: desktopSummary()
+        XCTAssertThrowsError(try prepare(request, on: manager, peer: "invalid-endpoint"))
+        _ = try prepare(request, on: manager)
+        XCTAssertEqual(disk.pending?.credential.deviceName.count, RemotePairingManager.maximumDeviceNameCharacters)
+    }
+
+    func testFailedFirstSyncDoesNotReportConnected() throws {
+        let now = Date(timeIntervalSince1970: 6750)
+        var firstConnection = RemoteIrohGatewayAdapter.SyncState(sessionID: UUID())
+        firstConnection.recordActivity(at: now)
+        XCTAssertEqual(firstConnection.readiness(at: now), .syncing)
+        let lostSnapshotTicket = try XCTUnwrap(firstConnection.issueTicket())
+        XCTAssertEqual(firstConnection.readiness(at: now), .syncing)
+
+        var reconnect = RemoteIrohGatewayAdapter.SyncState(sessionID: UUID())
+        let newTicket = try XCTUnwrap(reconnect.issueTicket())
+        XCTAssertFalse(reconnect.confirm(lostSnapshotTicket, at: now))
+        XCTAssertEqual(reconnect.readiness(at: now), .offline)
+        XCTAssertTrue(reconnect.confirm(newTicket, at: now))
+        XCTAssertTrue(reconnect.confirm(newTicket, at: now))
+        XCTAssertEqual(reconnect.readiness(at: now), .connected)
+        XCTAssertEqual(reconnect.readiness(at: now.addingTimeInterval(26)), .offline)
+    }
+
+    func testLegacyPhoneShowsActivityWithoutClaimingConfirmedSync() {
+        let now = Date(timeIntervalSince1970: 6800)
+        var legacy = RemoteIrohGatewayAdapter.SyncState(sessionID: nil)
+        legacy.recordActivity(at: now)
+        XCTAssertEqual(legacy.readiness(at: now), .legacyActive)
+        XCTAssertNil(legacy.issueTicket())
+        XCTAssertFalse(legacy.confirm(UUID(), at: now))
+        XCTAssertEqual(legacy.readiness(at: now.addingTimeInterval(26)), .offline)
+    }
+
+    func testCorruptStorageCanBeResetAfterDurableWrite() throws {
+        var disk: Data? = Data("damaged".utf8)
+        var failWrites = true
+        let manager = RemotePairingManager(
+            desktopInstanceID: "desktop", now: Date.init, randomBytes: { Data(repeating: 43, count: $0) },
+            reloadStoredState: { try disk.map(RemoteStoredPairingState.decode) ?? .init() },
+            persistState: { state in
+                if failWrites {
+                    throw PersistenceFailure.failed
+                }
+                disk = try JSONEncoder().encode(state)
+            }
         )
-        XCTAssertEqual(persisted?.deviceName.count, RemotePairingManager.maximumDeviceNameCharacters)
+        XCTAssertEqual(manager.status, .storageUnreadable)
+        XCTAssertThrowsError(try manager.resetUnreadableStorage())
+        XCTAssertEqual(manager.status, .storageUnreadable)
+        failWrites = false
+        try manager.resetUnreadableStorage()
+        manager.retryStorageRead()
+        XCTAssertEqual(manager.status, .idle)
+        XCTAssertNoThrow(try manager.issueAdvertisement(server: .init(endpointID: endpointID("a"))))
+    }
+
+    func testTemporaryKeychainFailureCannotResetPairing() {
+        let manager = RemotePairingManager(
+            desktopInstanceID: "desktop", now: Date.init, randomBytes: { Data(repeating: 43, count: $0) },
+            reloadStoredState: { throw PersistenceFailure.failed },
+            persistState: { _ in XCTFail("An inaccessible Keychain item must not be replaced") }
+        )
+        XCTAssertEqual(manager.status, .storageUnavailable)
+        XCTAssertThrowsError(try manager.resetUnreadableStorage())
     }
 
     func testRevokedCredentialStaysUnavailableAfterReopeningStorage() throws {
@@ -663,6 +997,43 @@ final class RemoteIrohSecurityTests: XCTestCase {
         XCTAssertEqual(try reopened.read(.remotePairedDevice), replacement)
     }
 
+    func testUnpairAllowsSamePhoneToConfirmFreshPairingAfterRestart() throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 6800))
+        let server = RemoteIrohEndpointAddress(endpointID: endpointID("a"))
+        var disk = RemoteStoredPairingState()
+        var nextByte: UInt8 = 0
+        let randomBytes: (Int) -> Data = { count in
+            nextByte += 1
+            return Data(repeating: nextByte, count: count)
+        }
+        let manager = makeManager(clock: clock, randomBytes: randomBytes, persist: { disk = $0 })
+        let oldCode = try manager.issueAdvertisement(server: server)
+        let oldRequest = pairingRequest(secret: oldCode.oneTimeSecret)
+        let oldResponse = try prepare(oldRequest, on: manager)
+        let oldConfirmation = try confirmation(for: oldResponse)
+        XCTAssertTrue(try confirm(oldConfirmation, on: manager))
+        XCTAssertTrue(isAuthorized(oldResponse, on: manager))
+
+        try manager.revokeDevice()
+        XCTAssertEqual(manager.status, .idle)
+        XCTAssertFalse(isAuthorized(oldResponse, on: manager))
+
+        let restoredState = try RemoteStoredPairingState.decode(JSONEncoder().encode(disk))
+        let reopened = makeManager(clock: clock, storedState: restoredState, randomBytes: randomBytes, persist: { disk = $0 })
+        XCTAssertEqual(reopened.status, .idle)
+        let newCode = try reopened.issueAdvertisement(server: server)
+        XCTAssertNotEqual(newCode.oneTimeSecret, oldCode.oneTimeSecret)
+        XCTAssertThrowsError(try prepare(oldRequest, on: reopened))
+
+        let replacement = try prepare(pairingRequest(secret: newCode.oneTimeSecret), on: reopened)
+        XCTAssertEqual(replacement.clientEndpointID, oldResponse.clientEndpointID)
+        XCTAssertThrowsError(try confirm(oldConfirmation, on: reopened))
+        XCTAssertFalse(isAuthorized(replacement, on: reopened))
+        XCTAssertTrue(try confirm(confirmation(for: replacement), on: reopened))
+        XCTAssertTrue(isAuthorized(replacement, on: reopened))
+        XCTAssertFalse(isAuthorized(oldResponse, on: reopened))
+    }
+
     func testFailedDurableRevocationRetainsPairedAuthorizationState() {
         let clock = TestClock(Date(timeIntervalSince1970: 7000))
         let stored = RemoteStoredDeviceCredential(
@@ -672,9 +1043,9 @@ final class RemoteIrohSecurityTests: XCTestCase {
             deviceName: "Phone",
             irohPeerEndpointID: endpointID("a")
         )
-        let manager = makeManager(clock: clock, storedDevice: stored) { _ in
+        let manager = makeManager(clock: clock, storedState: .init(active: stored), persist: { _ in
             throw PersistenceFailure.failed
-        }
+        })
 
         XCTAssertThrowsError(try manager.revokeDevice()) { error in
             XCTAssertTrue(error is PersistenceFailure)
@@ -728,25 +1099,66 @@ final class RemoteIrohSecurityTests: XCTestCase {
 
     private func makeManager(
         clock: TestClock,
-        storedDevice: RemoteStoredDeviceCredential? = nil,
-        persist: @escaping (RemoteStoredDeviceCredential?) throws -> Void = { _ in }
+        storedState: RemoteStoredPairingState = .init(),
+        randomBytes: @escaping (Int) -> Data = { count in Data(repeating: UInt8(count), count: count) },
+        persist: @escaping (RemoteStoredPairingState) throws -> Void = { _ in }
     ) -> RemotePairingManager {
         RemotePairingManager(
             desktopInstanceID: "desktop",
-            storedDevice: storedDevice,
+            storedState: storedState,
             now: { clock.date },
-            randomBytes: { count in Data(repeating: UInt8(count), count: count) },
-            persistStoredDevice: persist
+            randomBytes: randomBytes,
+            persistState: persist
         )
     }
 
-    private func pairingRequest(secret: String, deviceName: String = "Phone") -> RemoteIrohPairingRequest {
+    private func pairingRequest(
+        secret: String, deviceName: String = "Phone", attemptID: UUID? = UUID()
+    ) -> RemoteIrohPairingRequest {
         RemoteIrohPairingRequest(
             desktopInstanceID: "desktop",
             expectedServerEndpointID: endpointID("a"),
             clientEndpointID: endpointID("b"),
             oneTimeSecret: secret,
-            deviceName: deviceName
+            deviceName: deviceName,
+            attemptID: attemptID
+        )
+    }
+
+    private func prepare(
+        _ request: RemoteIrohPairingRequest, on manager: RemotePairingManager, peer: String? = nil
+    ) throws -> RemoteIrohPairingResponse {
+        try manager.pairIroh(
+            request: request, authenticatedPeerEndpointID: peer ?? endpointID("b"),
+            serverEndpointID: endpointID("a"), desktop: desktopSummary()
+        )
+    }
+
+    private func confirmation(for response: RemoteIrohPairingResponse) throws -> RemotePairingConfirmation {
+        try RemotePairingConfirmation(
+            attemptID: XCTUnwrap(response.attemptID),
+            authentication: .init(
+                desktopInstanceID: "desktop",
+                expectedServerEndpointID: response.serverEndpointID,
+                deviceID: response.pairingResponse.deviceID,
+                credential: response.pairingResponse.credential
+            )
+        )
+    }
+
+    private func confirm(
+        _ confirmation: RemotePairingConfirmation, on manager: RemotePairingManager, peer: String? = nil
+    ) throws -> Bool {
+        try manager.confirmIroh(
+            confirmation, authenticatedPeerEndpointID: peer ?? endpointID("b"), serverEndpointID: endpointID("a")
+        )
+    }
+
+    private func isAuthorized(_ response: RemoteIrohPairingResponse, on manager: RemotePairingManager) -> Bool {
+        manager.isAuthorizedIroh(
+            authorizationHeader: "Bearer \(response.pairingResponse.credential)",
+            deviceID: response.pairingResponse.deviceID,
+            authenticatedPeerEndpointID: response.clientEndpointID
         )
     }
 
@@ -927,6 +1339,22 @@ final class RemoteMutationBehaviorTests: XCTestCase {
         XCTAssertEqual(session.selectedModelRaw, originalModel)
     }
 
+    func testRemoteInterviewRejectsCodexControlCommandBeforeSubmission() async throws {
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let agentMode = window.agentModeViewModel
+        let tabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.composeTabs.first?.id)
+        let session = await agentMode.ensureSessionReady(tabID: tabID)
+        session.selectedAgent = .codexExec
+
+        let result = agentMode.submitUserTurn(
+            text: "/goal", tabID: tabID, isLocalComposerInput: false, remoteInterviewFirst: true
+        )
+
+        XCTAssertEqual(result, .blocked(message: "Interview first requires a message that starts an agent turn."))
+        XCTAssertTrue(session.items.isEmpty)
+    }
+
     func testStartCommandSavesConfiguredSessionAndDeliversUploadedFile() async throws {
         let window = try await makeWindow()
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
@@ -970,6 +1398,7 @@ final class RemoteMutationBehaviorTests: XCTestCase {
             workspaceID: workspace.id.uuidString,
             message: "Exercise the Remote launch path.",
             agentID: "claudeCode",
+            interviewFirst: true,
             attachmentIDs: [attachmentID]
         ), authorizeDispatch: {})
 
@@ -985,7 +1414,9 @@ final class RemoteMutationBehaviorTests: XCTestCase {
             return XCTFail("Expected the uploaded file in managed attachment storage.")
         }
         let escapedPath = AgentSessionProviderInputRuntime.escapePathForAtCommand(path)
-        XCTAssertTrue(try XCTUnwrap(inputAtDispatch).contains("@\(escapedPath)"))
+        let input = try XCTUnwrap(inputAtDispatch)
+        XCTAssertTrue(input.contains("@\(escapedPath)"))
+        XCTAssertTrue(input.contains("<interview_first>"))
         XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), bytes)
     }
 
@@ -1031,6 +1462,254 @@ final class RemoteMutationBehaviorTests: XCTestCase {
 
 @MainActor
 final class RemoteProducerParityTests: XCTestCase {
+    func testRecordedQuestionsProjectLiveAndSavedExchangesWithoutRawToolPayloads() throws {
+        struct LegacyTranscriptRow: Decodable {
+            struct Detail: Decodable {
+                let argumentsJSON: String?
+                let resultJSON: String?
+                let keyPaths: [String]
+            }
+
+            let text: String?
+            let detail: Detail?
+        }
+
+        let arguments = """
+        {"title":"Badge setup","provider_context":"internal test metadata","questions":[
+            {"id":"shape","header":"Shape","question":"What shape should the badge be?"},
+            {"id":"placement","header":"Placement","question":"Where should the badge appear?"},
+            {"id":"notes","header":"Notes","question":"Any other notes? Bearer fixture-only-value"}
+        ]}
+        """
+        let result = """
+        {"answers":{
+            "shape":{"answers":["Square"]},
+            "placement":{"answers":["Sidebar","Header"]},
+            "notes":{"skipped":true}
+        },"timed_out":false,"skipped":false}
+        """
+        let stored = try XCTUnwrap(
+            AgentAskUserTranscriptExchange.decode(argsJSON: arguments, resultJSON: result)?
+                .persistedResultJSON(statusWord: "success", summaryText: "ask_user • success", byteBudget: 4096)
+        )
+        let executions = [
+            toolExecution(name: "mcp__RepoPrompt__ask_user", status: .success, argsJSON: arguments, resultJSON: result),
+            toolExecution(name: "ask_user", status: .success, resultJSON: stored),
+            toolExecution(
+                name: "ask_user",
+                status: .success,
+                argsJSON: arguments,
+                resultJSON: #"{"answers":{},"timed_out":true}"#
+            ),
+            toolExecution(
+                name: "ask_user",
+                status: .success,
+                argsJSON: arguments,
+                resultJSON: #"{"status":"success"}"#
+            )
+        ]
+        let timestamp = Date(timeIntervalSinceReferenceDate: 100)
+        let activities = executions.enumerated().map { index, execution in
+            AgentTranscriptActivity(
+                id: fixedUUID(960 + index), timestamp: timestamp, sequenceIndex: index,
+                role: index == 1 ? .assistant : .toolExecution, itemKind: .toolResult,
+                text: index == 1 ? "Previously recorded answer" : "", toolExecution: execution,
+                isSubstantiveAssistant: index == 1, sealsAssistantBoundary: index == 0
+            )
+        }
+        let transcript = AgentTranscript(
+            turns: [.init(
+                id: fixedUUID(965), request: nil, responseSpans: [.init(startedAt: timestamp, activities: activities)],
+                startedAt: timestamp
+            )],
+            nextSequenceIndex: activities.count
+        )
+
+        let collapsed = WindowRemoteReadService.project(transcript: transcript, includeDetails: false)
+        let expanded = WindowRemoteReadService.project(transcript: transcript, includeDetails: true)
+        XCTAssertEqual(collapsed.map(\.semanticKind), [.question, .question, .question, .question])
+        XCTAssertTrue(collapsed.allSatisfy { $0.kind == .activity })
+        XCTAssertEqual(collapsed.map(\.text), [
+            "Shape: Square · Placement: Sidebar, Header · Notes: Skipped",
+            "Shape: Square · Placement: Sidebar, Header · Notes: Skipped",
+            "Timed out",
+            nil
+        ])
+        XCTAssertTrue(collapsed.allSatisfy { $0.detail == nil })
+        let exchange = try XCTUnwrap(expanded.first?.detail?.questionExchange)
+        XCTAssertEqual(exchange.title, "Badge setup")
+        XCTAssertEqual(exchange.questions[1].prompt, "Where should the badge appear?")
+        XCTAssertEqual(exchange.questions[1].answer, "Sidebar, Header")
+        XCTAssertTrue(exchange.questions[2].skipped)
+        XCTAssertEqual(expanded[1].detail?.questionExchange, exchange)
+        XCTAssertEqual(expanded[2].detail?.questionExchange?.outcome, .timedOut)
+        XCTAssertNil(expanded[3].detail?.questionExchange)
+        XCTAssertNil(expanded[0].detail?.argumentsJSON)
+        XCTAssertNil(expanded[0].detailText)
+
+        // Older iOS builds ignore questionExchange and display detail.resultJSON
+        // even when the collapsed row already has text.
+        let legacyRows = try JSONDecoder().decode([LegacyTranscriptRow].self, from: JSONEncoder().encode(expanded))
+        XCTAssertNotNil(legacyRows[0].text)
+        XCTAssertNil(legacyRows[0].detail?.argumentsJSON)
+        XCTAssertEqual(legacyRows[0].detail?.keyPaths, [])
+        let legacyResult = try XCTUnwrap(legacyRows[0].detail?.resultJSON)
+        XCTAssertTrue(legacyResult.contains("What shape should the badge be?\nAnswer\nSquare"))
+        XCTAssertTrue(legacyResult.contains("Where should the badge appear?\nAnswer\nSidebar, Header"))
+        XCTAssertTrue(legacyResult.contains("Bearer [REDACTED]\nAnswer\nSkipped"))
+        XCTAssertFalse(legacyResult.contains("fixture-only-value"))
+        XCTAssertFalse(legacyResult.contains("internal test metadata"))
+        XCTAssertEqual(legacyRows[1].detail?.resultJSON, legacyResult)
+        XCTAssertTrue(try XCTUnwrap(legacyRows[2].detail?.resultJSON).contains("Answer\nTimed out"))
+    }
+
+    func testLiveTranscriptRecoversGitPreviewAfterToolResultCompaction() async throws {
+        let diff = try await MCPGitToolProjection.makeDiffDTO(
+            compare: "uncommitted",
+            detail: "patches",
+            changedFiles: [VCSUncommittedFile(path: "README.md", status: "M", additions: 2, deletions: 1)],
+            perFilePatches: ["README.md": "--- a/README.md\n+++ b/README.md\n@@ -1 +1,2 @@\n-old\n+new\n+extra\n"],
+            maxLinesForPatches: 100
+        )
+        let resultJSON = try String(decoding: JSONEncoder().encode(
+            ToolResultDTOs.GitToolReplyDTO(op: "diff", diff: diff)
+        ), as: UTF8.self)
+        let result = AgentChatItem.toolResult(
+            name: "git", invocationID: UUID(),
+            argsJSON: #"{"op":"diff","detail":"patches","path":"README.md"}"#,
+            resultJSON: resultJSON, isError: false, sequenceIndex: 1
+        )
+        let agentMode = AgentModeViewModel(
+            testWindowID: -993, testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in preconditionFailure("No provider is needed") },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            mcpServerEnabler: { true }
+        )
+        let tabID = UUID()
+        let workspaceManager = AgentSessionLinkEndpointTestSupport.installWorkspace(
+            on: agentMode, tabID: tabID, name: "Remote live diff"
+        )
+        let session = AgentModeViewModel.TabSession(tabID: tabID)
+        let sessionID = UUID()
+        agentMode.test_installLiveSession(session)
+        _ = try XCTUnwrap(agentMode.test_installPersistentSessionBinding(sessionID: sessionID, on: session))
+        session.setItemsSilently([.user("Show the README diff", sequenceIndex: 0), result], reason: .testOverride)
+        session.compactSummaryOnlyToolResultsAndAlignEphemeralPayloadMap()
+        session.transcript = AgentTranscriptIO.buildTranscript(from: session.items, compact: false)
+        let compacted = try XCTUnwrap(session.transcript.allActivities.first { $0.id == result.id }?.toolExecution?.resultJSON)
+        XCTAssertTrue(AgentTranscriptToolNormalizer.isSummaryOnly(raw: compacted))
+        XCTAssertEqual(agentMode.rawToolResultPayloadForRendering(tabID: tabID, itemID: result.id), resultJSON)
+
+        let service = WindowRemoteReadService(contexts: [(agentMode, workspaceManager)])
+        let page = try await service.transcript(
+            sessionID: sessionID, paging: .recentBackward(before: nil), limit: 20, includeDetails: false
+        )
+        let collapsed = try XCTUnwrap(page.items.first { $0.id == result.id })
+        XCTAssertEqual(collapsed.diffSummary, .init(fileCount: 1, singleFilePath: "README.md", additions: 2, deletions: 1))
+        XCTAssertNil(collapsed.detail)
+
+        let expanded = try await service.transcript(
+            sessionID: sessionID, paging: .exactItem(result.id), limit: 1, includeDetails: true
+        )
+        let detail = try XCTUnwrap(expanded.items.first?.detail)
+        let preview = try XCTUnwrap(detail.diffPreview)
+        let patch = try XCTUnwrap(preview.files.first?.patch)
+        XCTAssertTrue(patch.contains("@@ -1 +1,2 @@\n-old\n+new\n+extra"))
+        XCTAssertFalse(preview.isTruncated)
+        XCTAssertEqual(detail.resultJSON, compacted)
+
+        let oversizedResult = resultJSON.replacingOccurrences(of: "+new", with: "+" + String(repeating: "界", count: 23000))
+        XCTAssertLessThan(oversizedResult.count, 65536)
+        XCTAssertGreaterThan(oversizedResult.utf8.count, 65536)
+        session.replaceEphemeralToolResultPayloadMap([result.id: oversizedResult], liveItemIDs: [result.id])
+
+        let boundedPage = try await service.transcript(
+            sessionID: sessionID, paging: .recentBackward(before: nil), limit: 20, includeDetails: false
+        )
+        let boundedRow = try XCTUnwrap(boundedPage.items.first { $0.id == result.id })
+        XCTAssertNil(boundedRow.diffSummary)
+        XCTAssertTrue(try XCTUnwrap(boundedRow.text).contains("1 files (+2 -1)"))
+        let boundedDetails = try await service.transcript(
+            sessionID: sessionID, paging: .exactItem(result.id), limit: 1, includeDetails: true
+        )
+        XCTAssertNil(boundedDetails.items.first?.detail?.diffPreview)
+        XCTAssertEqual(boundedDetails.items.first?.detail?.resultJSON, compacted)
+    }
+
+    func testRecordedDiffUsesDesktopCardPatchAndKeepsLargeGitSummaries() throws {
+        let edit = #"""
+        {"structuredContent":{"status":"success","edits_requested":1,"edits_applied":1,
+        "added_lines":1,"deleted_lines":1,"card_unified_diff":"--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-old\n+new"}}
+        """#
+        let gitPatch = "-old\n+first change\n+" + String(repeating: "x", count: 13000)
+        let gitPatchJSON = try String(decoding: JSONEncoder().encode(gitPatch), as: UTF8.self)
+        let git = #"""
+        {"op":"diff","diff":{"compare":"uncommitted","oneliner":"1 file","totals":{"files":1,"insertions":2,"deletions":1},
+        "files":[{"path":"Sources/A.swift","status":"modified","insertions":2,"deletions":1,
+        "hunks":[{"header":"@@ -1 +1,2 @@","old_start":1,"new_start":1,"patch":\#(gitPatchJSON)}]}]}}
+        """#
+        let executions = [
+            toolExecution(name: "apply_edits", status: .success, argsJSON: #"{"path":"/project/README.md"}"#, resultJSON: edit),
+            toolExecution(name: "git", status: .success, resultJSON: git),
+            toolExecution(name: "git", status: .success, resultJSON: #"{"op":"status"}"#)
+        ]
+        let timestamp = Date(timeIntervalSinceReferenceDate: 100)
+        let activities = executions.enumerated().map { index, execution in
+            AgentTranscriptActivity(
+                id: fixedUUID(980 + index), timestamp: timestamp, sequenceIndex: index,
+                role: .toolExecution, itemKind: .toolResult, text: "", toolExecution: execution,
+                sealsAssistantBoundary: index == 0
+            )
+        }
+        let transcript = AgentTranscript(
+            turns: [.init(
+                id: fixedUUID(985), request: nil, responseSpans: [.init(startedAt: timestamp, activities: activities)],
+                startedAt: timestamp
+            )],
+            nextSequenceIndex: activities.count
+        )
+
+        let collapsed = WindowRemoteReadService.project(transcript: transcript, includeDetails: false)
+        let expanded = WindowRemoteReadService.project(transcript: transcript, includeDetails: true)
+        XCTAssertEqual(collapsed[0].kind, .activity)
+        XCTAssertEqual(collapsed[0].semanticKind, .compactActivity)
+        XCTAssertEqual(collapsed[0].diffSummary, .init(fileCount: 1, singleFilePath: "README.md", additions: 1, deletions: 1))
+        XCTAssertEqual(collapsed[1].diffSummary, .init(fileCount: 1, singleFilePath: "Sources/A.swift", additions: 2, deletions: 1))
+        XCTAssertNil(collapsed[2].diffSummary)
+        XCTAssertTrue(collapsed.allSatisfy { $0.detail == nil })
+        XCTAssertEqual(expanded.map(\.diffSummary), collapsed.map(\.diffSummary))
+        XCTAssertEqual(expanded[0].detail?.diffPreview?.files.first?.patch, "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-old\n+new")
+        let preview = try XCTUnwrap(expanded[1].detail?.diffPreview)
+        XCTAssertTrue(preview.isTruncated)
+        XCTAssertEqual(preview.files.first?.patch, "@@ -1 +1,2 @@\n-old\n+first change")
+        XCTAssertNil(expanded[2].detail?.diffPreview)
+        XCTAssertEqual(try JSONDecoder().decode([RemoteTranscriptItem].self, from: JSONEncoder().encode(expanded)), expanded)
+    }
+
+    func testCompactToolSummariesIncludeResultMetadataWithoutFullOutput() {
+        let read = toolExecution(
+            name: "read_file", status: .success, argsJSON: #"{"path":"Sources/A.swift"}"#,
+            resultJSON: #"{"content":"omitted body","total_lines":100,"first_line":3,"last_line":6,"display_path":"Sources/A.swift"}"#
+        )
+        XCTAssertEqual(WindowRemoteReadService.compactToolSummary(read), "Sources/A.swift • Lines 3–6")
+        let search = toolExecution(
+            name: "file_search", status: .success, argsJSON: #"{"pattern":"needle"}"#,
+            resultJSON: #"{"total_matches":12,"content_match_groups":[]}"#
+        )
+        XCTAssertEqual(WindowRemoteReadService.compactToolSummary(search), "\"needle\" • 12 matches")
+        let command = toolExecution(
+            name: "functions.exec_command", status: .failed,
+            resultJSON: #"{"type":"commandExecution","command":"swift build","exitCode":1,"aggregatedOutput":"omitted output","status":"failed"}"#
+        )
+        XCTAssertEqual(WindowRemoteReadService.compactToolSummary(command), "Shell command • Exit 1")
+        let patch = toolExecution(
+            name: "apply_patch", status: .success,
+            resultJSON: #"{"status":"success","change_count":1,"changes":[{"path":"Sources/A.swift","kind":"update","diff":"@@ -1 +1 @@\n-old\n+new"}]}"#
+        )
+        XCTAssertEqual(WindowRemoteReadService.compactToolSummary(patch), "Sources/A.swift • +1 −1 lines")
+        XCTAssertNil(WindowRemoteReadService.compactToolSummary(toolExecution(name: "unrecognized", status: .success)))
+    }
+
     func testWorkflowDescriptorsUseAuthoritativeVisualsAndFeaturedRanks() throws {
         let customID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000901"))
         let custom = AgentWorkflowDefinition(
@@ -1489,7 +2168,7 @@ final class RemoteProducerParityTests: XCTestCase {
                 argsJSON: #"{"api_key":"raw-argument"}"#,
                 resultJSON: #"{"password":"raw-result"}"#,
                 isError: true,
-                summaryText: "Command failed"
+                summaryText: "TOKEN=shell-secret do-work"
             ),
             reasoning: "Bearer raw-reasoning"
         )
@@ -1575,7 +2254,7 @@ final class RemoteProducerParityTests: XCTestCase {
         XCTAssertEqual(sanitized.first { $0.id == answer.id }?.kind, .conclusion)
         XCTAssertEqual(sanitized.first { $0.id == substantiveAnswer.id }?.semanticKind, .assistantAnswer)
         XCTAssertEqual(sanitized.first { $0.id == failedTool.id }?.semanticKind, .error)
-        XCTAssertEqual(sanitized.first { $0.id == failedTool.id }?.text, "Command failed")
+        XCTAssertEqual(sanitized.first { $0.id == failedTool.id }?.text, "Shell command")
         XCTAssertNil(sanitized.first { $0.id == failedTool.id }?.detail)
         XCTAssertEqual(sanitized.first { $0.id == question.id }?.semanticKind, .question)
         XCTAssertNil(sanitized.first { $0.id == question.id }?.text)
@@ -1590,6 +2269,7 @@ final class RemoteProducerParityTests: XCTestCase {
         XCTAssertFalse(encodedDefault.contains("raw-result"))
         XCTAssertFalse(encodedDefault.contains("raw-reasoning"))
         XCTAssertFalse(encodedDefault.contains("request-secret"))
+        XCTAssertFalse(encodedDefault.contains("shell-secret"))
 
         let detailed = WindowRemoteReadService.project(transcript: transcript, includeDetails: true)
         let toolDetail = try XCTUnwrap(detailed.first { $0.id == failedTool.id }?.detail)
@@ -1965,23 +2645,100 @@ final class RemoteSnapshotProjectionTests: XCTestCase {
         }
     }
 
-    func testSecretAndMultipartInputRetainSecureEntryWithoutPretendingToSupportMultipart() throws {
+    func testMultipartInputProjectsChoicesAndMarksOnlySecretFields() throws {
         let secret = AgentRunMCPSnapshot.Interaction.Field(
-            id: "token", prompt: "Enter token", isSecret: true, allowsOther: true, options: []
+            id: "token", prompt: "Enter token", isSecret: true, allowsOther: false, options: []
         )
-        for fields in [[secret], [secret, secret]] {
-            let interaction = AgentRunMCPSnapshot.Interaction(
-                id: UUID(), kind: .userInput, responseType: .structured,
-                title: "Input", prompt: nil, context: nil, allowsMultiple: nil,
-                options: [], fields: fields, details: []
-            )
-            let result = try XCTUnwrap(AgentModeRemoteSessionQueryService.projectInteraction(
-                interaction, createdAt: .distantPast
-            ))
-            XCTAssertEqual(result.kind, .secretInput)
-            XCTAssertTrue(result.requiresSecureEntry)
-            XCTAssertEqual(result.responseUnavailableReason == nil, fields.count == 1)
+        let choice = AgentRunMCPSnapshot.Interaction.Field(
+            id: "mode", prompt: "Choose a mode", isSecret: false, allowsOther: true,
+            options: [.init(label: "Read", description: "Only read files")]
+        )
+        let interaction = AgentRunMCPSnapshot.Interaction(
+            id: UUID(), kind: .userInput, responseType: .structured,
+            title: "Input", prompt: nil, context: nil, allowsMultiple: nil,
+            options: [], fields: [choice, secret], details: []
+        )
+        let result = try XCTUnwrap(AgentModeRemoteSessionQueryService.projectInteraction(
+            interaction, createdAt: .distantPast
+        ))
+        XCTAssertEqual(result.kind, .secretInput)
+        XCTAssertTrue(result.requiresSecureEntry)
+        XCTAssertNil(result.responseUnavailableReason)
+        let questions = try XCTUnwrap(result.questionnaire?.questions)
+        XCTAssertEqual(questions.map(\.id), ["mode", "token"])
+        XCTAssertEqual(questions.map(\.isSecret), [false, true])
+        XCTAssertEqual(questions[0].options.map(\.label), ["Read", AgentRequestUserInputQuestion.otherOptionLabel])
+        XCTAssertEqual(questions[0].options.first?.description, "Only read files")
+        XCTAssertTrue(questions[0].allowsNote)
+        XCTAssertFalse(questions[1].allowsSkip)
+
+        struct LegacyInteraction: Decodable {
+            let responseUnavailableReason: String?
         }
+        let encoded = try JSONEncoder().encode(result)
+        XCTAssertNotNil(try JSONDecoder().decode(LegacyInteraction.self, from: encoded).responseUnavailableReason)
+        XCTAssertEqual(try JSONDecoder().decode(RemoteInteractionSummary.self, from: encoded), result)
+
+        let unavailable = AgentModeRemoteSessionQueryService.projectInteraction(
+            interaction, createdAt: .distantPast, requiresLocalUserInput: true
+        )
+        XCTAssertNil(unavailable?.questionnaire)
+        XCTAssertNotNil(unavailable?.responseUnavailableReason)
+    }
+
+    func testRemoteAskUserConvertsChoicesAndPerQuestionSkipAndRejectsIncompleteAnswers() throws {
+        let questionnaire = RemoteQuestionnaire(questions: [
+            .init(
+                id: "modes", prompt: "Choose modes", options: [.init(label: "Read"), .init(label: "Write")],
+                allowsMultiple: true, allowsCustom: true, allowsSkip: true
+            ),
+            .init(id: "notes", prompt: "Anything else?", allowsCustom: true, allowsSkip: true)
+        ])
+        let answers: [String: RemoteQuestionAnswer] = [
+            "modes": .init(selectedOptionIndices: [1, 0], text: "Read both"),
+            "notes": .init(skipped: true)
+        ]
+        let payload = try WindowRemoteAgentControlService.questionResponsePayload(
+            answers, questionnaire: questionnaire, userInput: nil
+        )
+        XCTAssertEqual(payload.askUserAnswersByQuestionID["modes"]?.selectedOptions, ["Write", "Read"])
+        XCTAssertEqual(payload.askUserAnswersByQuestionID["modes"]?.customResponse, "Read both")
+        XCTAssertEqual(payload.askUserAnswersByQuestionID["notes"]?.skipped, true)
+        XCTAssertFalse(payload.skip)
+        XCTAssertThrowsError(try WindowRemoteAgentControlService.questionResponsePayload(
+            ["modes": .init(selectedOptionIndices: [1])], questionnaire: questionnaire, userInput: nil
+        ))
+    }
+
+    func testRemoteUserInputUsesProviderDraftEncodingForOtherAndSecureNotes() throws {
+        let request = AgentRequestUserInputRequest(
+            receipt: .fixture(.int(9)), method: "item/tool/requestUserInput", threadID: "t", turnID: "t", itemID: "i",
+            questions: [
+                .init(
+                    id: "mode",
+                    header: "Mode",
+                    question: "Which mode?",
+                    isOther: true,
+                    isSecret: false,
+                    options: [.init(label: "Read", description: "Read files")]
+                ),
+                .init(id: "code", header: "Code", question: "Enter a code", isOther: false, isSecret: true, options: [])
+            ]
+        )
+        let questionnaire = RemoteQuestionnaire(questions: [
+            .init(
+                id: "mode", prompt: "Which mode?", options: [.init(label: "Read"), .init(label: "None of the above")],
+                allowsCustom: true, allowsNote: true
+            ),
+            .init(id: "code", prompt: "Enter a code", isSecret: true, allowsCustom: true)
+        ])
+        let payload = try WindowRemoteAgentControlService.questionResponsePayload(
+            ["mode": .init(selectedOptionIndices: [1], text: "Another mode"), "code": .init(text: " test-code ")],
+            questionnaire: questionnaire, userInput: request
+        )
+        XCTAssertEqual(payload.answersByQuestionID["mode"], ["None of the above", "user_note: Another mode"])
+        XCTAssertEqual(payload.answersByQuestionID["code"], ["user_note: test-code"])
+        XCTAssertNil(payload.text)
     }
 
     func testAvailabilityPolicyCoversActiveWaitingAndTerminalStates() {

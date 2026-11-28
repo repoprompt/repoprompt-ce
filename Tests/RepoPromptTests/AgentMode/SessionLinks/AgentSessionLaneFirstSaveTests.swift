@@ -64,6 +64,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
         WindowStatesManager.shared.registerWindowState(window)
         GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
         let cleanup: @MainActor () async -> Void = {
+            await window.agentModeViewModel.test_retireAndCancelFixture()
             window.beginClose()
             await window.domainWorkspacePresentationBridgeForTesting?.stopAndJoinForTesting()
             await window.tearDown()
@@ -154,11 +155,13 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             await window.workspaceManager.awaitInitialized()
             try await body(window)
         } catch {
+            await window.agentModeViewModel.test_retireAndCancelFixture()
             window.beginClose()
             await window.tearDown()
             WindowStatesManager.shared.unregisterWindowState(window)
             throw error
         }
+        await window.agentModeViewModel.test_retireAndCancelFixture()
         window.beginClose()
         await window.tearDown()
         WindowStatesManager.shared.unregisterWindowState(window)
@@ -487,6 +490,14 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                         requireCatalogApplication: true
                     )
                     XCTAssertNotNil(applied, "The stale save must resume after the real peer projection wins")
+                    let peerRecord = published.workspaces.first { $0.document.workspaceID == workspaceID }
+                    let peerDocument = peerRecord.flatMap { try? JSONDecoder().decode(WorkspaceModel.self, from: $0.document.documentBytes) }
+                    XCTAssertNotNil(peerDocument)
+                    XCTAssertEqual(
+                        peerDocument?.composeTabs.contains { $0.id == fresh.id || $0.activeAgentSessionID == sessionID },
+                        false,
+                        "The peer must not publish the initiating transaction's provisional carrier"
+                    )
                 }
                 manager.setWorkspaceSaveAfterAuthoritySnapshotHandlerForTesting(interpose)
                 defer { manager.setWorkspaceSaveAfterAuthoritySnapshotHandlerForTesting(nil) }
@@ -2613,7 +2624,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             }
         )
         guard receipt.result == .created, receipt.linked, let sessionID = receipt.sessionID else {
-            XCTFail("linked lane creation refused: \(String(describing: receipt.reason))")
+            XCTFail("linked lane creation refused: \(String(describing: receipt.reason)) detail=\(String(describing: receipt.refusalDetail)) destination=\(String(describing: receipt.destinationFailure))")
             throw CancellationError()
         }
         let tabID = try XCTUnwrap(fixture.window.agentModeViewModel.sessions.first {

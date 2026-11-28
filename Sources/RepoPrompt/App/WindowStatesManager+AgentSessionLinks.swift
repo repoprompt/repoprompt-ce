@@ -82,7 +82,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         let prefix = Self.agentHostRecoveryWarningPrefix
         guard !isTerminating, warningID.hasPrefix(prefix),
               let recoveryID = UUID(uuidString: String(warningID.dropFirst(prefix.count))),
-              let drain = agentRuntimeStore.retainedDrains.first(where: { $0.recoveryID == recoveryID }),
+              let drain = (agentRuntimeStore.retainedDrains + agentRuntimeStore.retainedSessionDeletionDrains).first(where: { $0.recoveryID == recoveryID }),
               case .retained? = drain.outcome else { return }
         observeAgentHostDrainRecovery(drain)
         drain.attemptRecovery()
@@ -413,7 +413,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         }
     }
 
-    private func independentLinkRuntime(
+    func independentLinkRuntime(
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> AgentSessionLinkExecutionRuntime? {
         guard !isTerminating,
@@ -470,6 +470,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
             guard modelRoutingWindow(withID: window.windowID) === window else { continue }
             candidates.append(
                 contentsOf: window.agentModeViewModel.agentSessionLinkCandidates(isWindowClosing: false, includeLocation: includeLocation)
+                    .filter { !isCanonicalPresentationAlias($0, in: window) }
             )
         }
         return candidates
@@ -519,15 +520,28 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
                 forSessionIDs: sessionIDs, includeLocation: includeLocation
             )
             for sessionID in sessionIDs {
-                result[sessionID, default: []] += local[sessionID] ?? []
+                result[sessionID, default: []] += (local[sessionID] ?? []).filter { !isCanonicalPresentationAlias($0, in: window) }
             }
         }
         return result
     }
 
+    /// A presenter of an independent writer is not another endpoint. Do not deduplicate by
+    /// session UUID: genuinely distinct writer claims must still fail closed as ambiguous.
+    private func isCanonicalPresentationAlias(_ candidate: AgentSessionLinkEndpointCandidate, in window: WindowState) -> Bool {
+        let host = window.agentModeViewModel.runtimeHost
+        guard let session = host.scope.sessions[candidate.tabID], session.activeAgentSessionID == candidate.sessionID,
+              let runtime = host.scope.linkExecution, let endpoint = runtime.agentSessionLinkObserverEndpoint(tabID: candidate.tabID),
+              endpoint.workspaceID == candidate.workspaceID, independentLinkRuntime(for: endpoint) === runtime else { return false }
+        return true
+    }
+
     func agentSessionLinkRunFacts(
         for candidate: AgentSessionLinkEndpointCandidate, capturedStatus: DomainAgentSessionLinkStatus
     ) -> AgentRunQuietFacts? {
+        if let runtime = independentLinkRuntime(for: candidate.domainEndpoint) {
+            return runtime.agentSessionLinkRunFacts(for: candidate, capturedStatus: capturedStatus)
+        }
         guard !isTerminating, let window = modelRoutingWindow(withID: candidate.windowID), !window.isClosing else { return nil }
         return window.agentModeViewModel.agentSessionLinkRunFacts(for: candidate, capturedStatus: capturedStatus)
     }
@@ -779,8 +793,15 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         _ props: AgentMonitorPillProps,
         to endpoint: DomainAgentSessionLinkEndpointIdentity
     ) {
-        if let runtime = independentLinkRuntime(for: endpoint), props.endpoint == endpoint {
+        if let runtime = independentLinkRuntime(for: endpoint), let scope = runtime.scope {
+            guard props.endpoint == endpoint else { return }
             runtime.residentMonitorPropsBySessionID[endpoint.sessionID] = props.outbound.isEmpty ? nil : props
+            // The independent route owns execution. Its attached window still owns presentation.
+            for window in sessionRuntimeWindows where !window.isClosing {
+                let presenter = window.agentModeViewModel
+                guard presenter.runtimeSessionStore === scope else { continue }
+                presenter.agentSessionLinkPublishProjection(props, to: endpoint)
+            }
         } else if let viewModel = agentSessionLinkOwningViewModel(for: endpoint) {
             viewModel.agentSessionLinkPublishProjection(props, to: endpoint)
         } else {
@@ -971,6 +992,9 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
     }
 
     func agentSessionLinkLocalInputSnapshot(for endpoint: DomainAgentSessionLinkEndpointIdentity, includeRecords: Bool) -> AgentSessionLinkRetainedLocalInputIndex.Snapshot? {
+        if let runtime = independentLinkRuntime(for: endpoint) {
+            return runtime.agentSessionLinkLocalInputSnapshot(for: endpoint, includeRecords: includeRecords)
+        }
         guard !isTerminating, let window = modelRoutingWindow(withID: endpoint.windowID), !window.isClosing else { return nil }
         return window.agentModeViewModel.agentSessionLinkLocalInputSnapshot(for: endpoint, includeRecords: includeRecords)
     }
@@ -988,7 +1012,9 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
     func agentSessionLinkBootstrapState(
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> AgentSessionOverseerBootstrapState? {
-        guard !isTerminating, let window = modelRoutingWindow(withID: endpoint.windowID), !window.isClosing else { return nil }
+        guard !isTerminating else { return nil }
+        if let runtime = independentLinkRuntime(for: endpoint) { return runtime.agentSessionLinkBootstrapState(for: endpoint) }
+        guard let window = modelRoutingWindow(withID: endpoint.windowID), !window.isClosing else { return nil }
         return window.agentModeViewModel.agentSessionLinkBootstrapState(for: endpoint)
     }
 
@@ -996,6 +1022,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> AgentSessionOverseerBootstrapRefusal? {
         guard !isTerminating else { return .terminating }
+        if let runtime = independentLinkRuntime(for: endpoint) { return runtime.agentSessionLinkBootstrapRefusal(for: endpoint) }
         guard let window = modelRoutingWindow(withID: endpoint.windowID), !window.isClosing else { return .notLoaded }
         return window.agentModeViewModel.agentSessionLinkBootstrapRefusal(for: endpoint)
     }
@@ -1003,7 +1030,17 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
     func agentSessionLinkActivateOverseer(
         for endpoint: DomainAgentSessionLinkEndpointIdentity, expected: AgentSessionOverseerBootstrapState
     ) -> Bool {
-        guard !isTerminating, let window = modelRoutingWindow(withID: endpoint.windowID), !window.isClosing else { return false }
+        guard !isTerminating else { return false }
+        if let runtime = independentLinkRuntime(for: endpoint) {
+            guard runtime.agentSessionLinkActivateOverseer(for: endpoint, expected: expected) else { return false }
+            if let session = runtime.sessions[endpoint.tabID] {
+                for window in allWindows where !window.isClosing && window.agentModeViewModel.runtimeSessionStore === runtime.scope {
+                    window.agentModeViewModel.agentSessionLinkRepaintCurrentPillIfOwned(session)
+                }
+            }
+            return true
+        }
+        guard let window = modelRoutingWindow(withID: endpoint.windowID), !window.isClosing else { return false }
         return window.agentModeViewModel.agentSessionLinkActivateOverseer(for: endpoint, expected: expected)
     }
 

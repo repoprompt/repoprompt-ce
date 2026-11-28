@@ -39,15 +39,13 @@ struct ChatMessagesView: View {
     /// Supplied only by the multi-Oracle result popover; exact reply identity gates its footer.
     let oracleResult: OracleMemberPresentation?
 
-    private let contentAnimationDuration: Double = 0.2
-
     /// Tracks if we're near the bottom of the scrollable area.
     @State private var isNearBottom = false
 
     @State private var didChatChange = false
 
-    @State private var scrollDebounceWorkItem: DispatchWorkItem? = nil
     @State private var scrollWorkGate = WorkItemGate()
+    @State private var transcriptRevision = 0
 
     @State private var loadingSessionID: UUID?
     @State private var pinnedOverrideSessionID: UUID?
@@ -89,7 +87,7 @@ struct ChatMessagesView: View {
 
     private var renderedMessages: [AIChatMessage] {
         guard let sessionIDOverride else { return viewModel.messages }
-        _ = viewModel.messageStoreRevision
+        _ = transcriptRevision
         return viewModel.messagesSnapshot(for: sessionIDOverride)
     }
 
@@ -137,6 +135,9 @@ struct ChatMessagesView: View {
                     scrollToBottom(proxy, true, false)
                 }
             }
+            .onReceive(viewModel.transcriptChanges(for: sessionIDOverride)) { _ in
+                transcriptRevision &+= 1
+            }
             .task(id: sessionIDOverride) {
                 guard let sessionIDOverride else {
                     loadingSessionID = nil
@@ -144,13 +145,15 @@ struct ChatMessagesView: View {
                     return
                 }
                 pinOverrideSession(sessionIDOverride)
+                didChatChange = autoScrollOnAppear && renderedMessages.isEmpty
                 loadingSessionID = sessionIDOverride
                 _ = await viewModel.ensureSessionMessagesLoaded(sessionIDOverride)
-                if loadingSessionID == sessionIDOverride {
+                if !Task.isCancelled, loadingSessionID == sessionIDOverride {
                     loadingSessionID = nil
                 }
             }
             .onDisappear {
+                scrollWorkGate.cancel()
                 loadingSessionID = nil
                 releasePinnedOverrideSession()
             }
@@ -180,6 +183,8 @@ struct ChatMessagesView: View {
 
             // If the session changes, we reset layout, re-enable auto-scroll (if allowed), and scroll down.
             .onChange(of: renderedSessionID) { _, _ in
+                guard sessionIDOverride == nil else { return }
+                scrollWorkGate.cancel()
                 didChatChange = true
                 refreshToken = UUID() // force view refresh
                 if isRenderedSessionStreaming {
@@ -204,7 +209,9 @@ struct ChatMessagesView: View {
             }
             .onScrollPhaseChange { _, newPhase in
                 if newPhase == .interacting {
-                    // User manually scrolled => disable auto-scroll
+                    // Manual scrolling takes precedence over a queued follow request.
+                    scrollWorkGate.cancel()
+                    didChatChange = false
                     setAutoScrollEnabled(false)
                 }
             }
@@ -334,21 +341,17 @@ struct ChatMessagesView: View {
 
     /// Scrolls to the "bottomTarget" with an animation.
     private func scrollToBottom(_ proxy: ScrollViewProxy, _ didChange: Bool, _ animate: Bool = true) {
-        // Cancel any pending scroll work.
-        scrollDebounceWorkItem?.cancel()
-        scrollWorkGate.cancel()
-
         let delay = didChange ? 0 : 0.2
 
         // Schedule the scroll call with a short delay.
         if animate {
-            scrollDebounceWorkItem = scrollWorkGate.schedule(after: delay) {
+            scrollWorkGate.schedule(after: delay) {
                 withAnimation(.easeOut(duration: 0.2)) {
                     proxy.scrollTo("bottomSentinel", anchor: .bottom)
                 }
             }
         } else {
-            scrollDebounceWorkItem = scrollWorkGate.schedule(after: delay) {
+            scrollWorkGate.schedule(after: delay) {
                 proxy.scrollTo("bottomSentinel", anchor: .bottom)
             }
         }

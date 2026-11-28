@@ -15,6 +15,7 @@ struct RemoteWorkspaceRecord: Equatable {
     let isOpen: Bool
     let activeSessionIDs: [UUID]
     let lastActivityAt: Date?
+    var supportsPresentationControl = false
 }
 
 struct RemoteSessionRecord: Equatable {
@@ -134,6 +135,19 @@ enum RemoteWorkspaceActivationError: Error, Equatable {
 @MainActor
 protocol SessionQueryService: AnyObject {
     func remoteSessions() async -> [RemoteSessionRecord]
+    func bootstrapRemoteSessions() async -> [RemoteSessionRecord]
+}
+
+extension SessionQueryService {
+    func bootstrapRemoteSessions() async -> [RemoteSessionRecord] {
+        let sessions = await remoteSessions()
+        let parents = sessions.reduce(into: [UUID: UUID]()) { result, session in
+            result[session.sessionID] = session.parentSessionID
+        }
+        let roots = Set(sessions.filter(\.isLive).map(\.sessionID))
+        let related = RemoteBootstrapSessionGraph.relatedIDs(liveIDs: roots, parentByChild: parents)
+        return sessions.filter { related.contains($0.sessionID) }
+    }
 }
 
 @MainActor
@@ -170,7 +184,8 @@ final class RemoteSnapshotBuilder {
         connection: RemoteConnectionSummary,
         authorization: RemoteAuthorizationState,
         eventCursor: UInt64 = 0,
-        transcriptRevisionEpoch: UUID? = nil
+        transcriptRevisionEpoch: UUID? = nil,
+        bootstrap: Bool = false
     ) async -> RemoteSnapshot {
         let workspaces = await workspaceCatalog.allSavedWorkspaces()
             .map {
@@ -180,12 +195,18 @@ final class RemoteSnapshotBuilder {
                     repositoryRootSummary: $0.repositoryRootSummary,
                     isOpen: $0.isOpen,
                     activeSessionIDs: $0.activeSessionIDs,
-                    lastActivityAt: $0.lastActivityAt
+                    lastActivityAt: $0.lastActivityAt,
+                    supportsPresentationControl: $0.supportsPresentationControl
                 )
             }
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
 
-        let records = await sessionQuery.remoteSessions()
+        let records = if bootstrap {
+            await sessionQuery.bootstrapRemoteSessions()
+        } else {
+            await sessionQuery.remoteSessions()
+        }
+        let projectedIDs = Set(records.map(\.sessionID))
         let childIDsByParent = records.reduce(into: [UUID: [UUID]]()) { result, record in
             guard let parent = record.parentSessionID else { return }
             result[parent, default: []].append(record.sessionID)
@@ -195,7 +216,9 @@ final class RemoteSnapshotBuilder {
                 sessionID: $0.sessionID,
                 workspaceID: $0.workspaceID.uuidString,
                 composeTabID: $0.composeTabID,
-                parentSessionID: $0.parentSessionID,
+                parentSessionID: $0.parentSessionID.flatMap { parentID in
+                    !bootstrap || projectedIDs.contains(parentID) ? parentID : nil
+                },
                 sessionName: $0.sessionName,
                 workflow: $0.workflow,
                 workflowID: $0.workflowID,
@@ -261,28 +284,26 @@ final class RemoteSnapshotBuilder {
 
 @MainActor
 final class WorkspaceManagerRemoteCatalogService: WorkspaceCatalogService {
-    private let managers: [WorkspaceManagerViewModel]
+    private let windows: [WindowState]
 
-    init(manager: WorkspaceManagerViewModel) {
-        managers = [manager]
-    }
-
-    init(managers: [WorkspaceManagerViewModel]) {
-        self.managers = managers
+    init(windows: [WindowState]) {
+        self.windows = windows
     }
 
     func allSavedWorkspaces() async -> [RemoteWorkspaceRecord] {
+        let openWorkspaceIDs = Set(windows.filter { !$0.isClosing }.compactMap(\.workspaceManager.activeWorkspaceID))
         var records: [UUID: RemoteWorkspaceRecord] = [:]
-        for manager in managers {
+        for manager in windows.map(\.workspaceManager) {
             for workspace in manager.workspaces where !workspace.isEphemeral {
                 let current = RemoteWorkspaceRecord(
                     workspaceID: workspace.id,
                     name: workspace.name,
                     repositoryRootSummary: workspace.repoPaths.first
                         .map { URL(fileURLWithPath: $0).lastPathComponent },
-                    isOpen: WindowStatesManager.shared.countWindowsShowing(workspaceId: workspace.id) > 0,
+                    isOpen: openWorkspaceIDs.contains(workspace.id),
                     activeSessionIDs: workspace.composeTabs.compactMap(\.activeAgentSessionID),
-                    lastActivityAt: workspace.lastUsed
+                    lastActivityAt: workspace.lastUsed,
+                    supportsPresentationControl: RemoteWorkspacePresentationController.supportsControl(for: workspace)
                 )
                 if let existing = records[workspace.id] {
                     records[workspace.id] = RemoteWorkspaceRecord(
@@ -292,7 +313,8 @@ final class WorkspaceManagerRemoteCatalogService: WorkspaceCatalogService {
                         isOpen: existing.isOpen || current.isOpen,
                         activeSessionIDs: Array(Set(existing.activeSessionIDs + current.activeSessionIDs))
                             .sorted { $0.uuidString < $1.uuidString },
-                        lastActivityAt: max(existing.lastActivityAt ?? .distantPast, current.lastActivityAt ?? .distantPast)
+                        lastActivityAt: max(existing.lastActivityAt ?? .distantPast, current.lastActivityAt ?? .distantPast),
+                        supportsPresentationControl: existing.supportsPresentationControl && current.supportsPresentationControl
                     )
                 } else {
                     records[workspace.id] = current
@@ -312,8 +334,7 @@ final class WorkspaceManagerRemoteActivationService: WorkspaceActivationService 
     }
 
     func activate(workspaceID: UUID) async -> Result<RemoteWorkspaceActivationResult, RemoteWorkspaceActivationError> {
-        guard let manager else { return .failure(.workspaceNotFound) }
-        guard let workspace = manager.workspace(withID: workspaceID) else {
+        guard let manager, let workspace = manager.workspace(withID: workspaceID) else {
             return .failure(.workspaceNotFound)
         }
 
@@ -357,14 +378,41 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
     }
 
     func remoteSessions() async -> [RemoteSessionRecord] {
+        await remoteSessions(bootstrapIDs: nil)
+    }
+
+    func bootstrapRemoteSessions() async -> [RemoteSessionRecord] {
+        let liveIDs = Set(contexts.flatMap {
+            $0.agentMode.sessions.values.compactMap(\.activeAgentSessionID)
+        })
+        guard !liveIDs.isEmpty else { return [] }
+        let parents = contexts.reduce(into: [UUID: UUID]()) { result, context in
+            for entry in context.agentMode.sessionIndex.values {
+                if let parentID = entry.parentSessionID {
+                    result[entry.id] = parentID
+                }
+            }
+        }
+        let related = RemoteBootstrapSessionGraph.relatedIDs(liveIDs: liveIDs, parentByChild: parents)
+        return await remoteSessions(bootstrapIDs: related)
+    }
+
+    private func remoteSessions(bootstrapIDs: Set<UUID>?) async -> [RemoteSessionRecord] {
         var records: [UUID: RemoteSessionRecord] = [:]
         for context in contexts {
             let workspaceID = context.agentMode.sessionIndexOwner?.workspaceID
                 ?? context.workspaceManager.activeWorkspaceID
             guard let workspaceID else { continue }
             let liveByTabID = context.agentMode.sessions
+            let index = context.agentMode.sessionIndex
+            let entries = if let bootstrapIDs {
+                index.values.filter { bootstrapIDs.contains($0.id) }
+            } else {
+                Array(index.values)
+            }
+            guard !entries.isEmpty else { continue }
             let discoveryAgents = context.agentMode.remoteDiscoveryAgents()
-            for entry in context.agentMode.sessionIndex.values {
+            for entry in entries {
                 let live = Self.matchingLiveSession(
                     entryID: entry.id,
                     tabID: entry.tabID,
@@ -381,7 +429,7 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
                     )
                 } else if let cached = revisionTracker?.cachedPersistedRevision(sessionID: entry.id, savedAt: entry.savedAt) {
                     cached
-                } else if revisionTracker?.revision(for: entry.id) != nil,
+                } else if bootstrapIDs == nil, revisionTracker?.revision(for: entry.id) != nil,
                           let workspace = context.workspaceManager.workspace(withID: workspaceID),
                           let persisted = try? await AgentSessionDataService.shared.loadAgentSession(id: entry.id, for: workspace)
                 {
@@ -399,7 +447,7 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
                         sessionID: entry.id,
                         discoveryAgents: discoveryAgents
                     )
-                } else {
+                } else if bootstrapIDs == nil {
                     context.agentMode.mcpPersistedSessionSelectionCapabilities(
                         agentRaw: entry.agentKindRaw,
                         modelRaw: entry.agentModelRaw,
@@ -407,6 +455,8 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
                         isMutable: Self.isConfigurationMutable(runState: runState),
                         discoveryAgents: discoveryAgents
                     )
+                } else {
+                    nil
                 }
                 let activity: String? = switch runState {
                 case .opening, .working: live?.runningStatusText
@@ -512,7 +562,8 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
             agentMode.mcpRuntime.mcpPendingInteraction(for: session),
             createdAt: session.lastActivityAt,
             supportsPlainApproval: session.pendingApproval?.supportsPlainApprove ?? true,
-            macOnlyApprovalID: session.pendingWorktreeMergeReview?.id ?? session.pendingPermissionsRequest?.id
+            macOnlyApprovalID: session.pendingWorktreeMergeReview?.id ?? session.pendingPermissionsRequest?.id,
+            requiresLocalUserInput: session.pendingUserInputRequest?.questions.contains(where: \.isLegacyMCPToolApproval) == true
         )
     }
 
@@ -520,11 +571,14 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
         _ interaction: AgentRunMCPSnapshot.Interaction?,
         createdAt: Date,
         supportsPlainApproval: Bool = true,
-        macOnlyApprovalID: UUID? = nil
+        macOnlyApprovalID: UUID? = nil,
+        requiresLocalUserInput: Bool = false
     ) -> RemoteInteractionSummary? {
         guard let interaction, interaction.kind != .instruction else { return nil }
         let isApproval = interaction.kind == .approval || interaction.kind == .hookApproval
         let isSecret = interaction.fields.contains { $0.isSecret == true }
+        let isAskUser = interaction.kind == .question
+        let isUserInput = interaction.kind == .userInput
         let unavailableReason: String? = if interaction.id == macOnlyApprovalID {
             "Review this decision on your Mac."
         } else if interaction.kind == .hookApproval {
@@ -533,8 +587,8 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
             "Review the MCP request on your Mac."
         } else if isApproval, !supportsPlainApproval {
             "This request needs a specific approval option. Review it on your Mac."
-        } else if interaction.fields.count > 1 {
-            "Answer this multi-part request on your Mac."
+        } else if isUserInput, requiresLocalUserInput {
+            "Review this tool approval on your Mac."
         } else {
             nil
         }
@@ -542,6 +596,28 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
         let prompt = unavailableReason == nil
             ? ([interaction.prompt ?? interaction.fields.first?.prompt].compactMap(\.self) + details).joined(separator: "\n\n")
             : nil
+        let questionnaire: RemoteQuestionnaire? = if unavailableReason == nil,
+                                                     isAskUser || isUserInput,
+                                                     !interaction.fields.isEmpty
+        {
+            RemoteQuestionnaire(context: interaction.context, questions: interaction.fields.map { field in
+                var options = field.options.map {
+                    RemoteQuestionField.Option(label: $0.label, description: $0.description)
+                }
+                if isUserInput, field.allowsOther == true, !options.isEmpty {
+                    options.append(.init(label: AgentRequestUserInputQuestion.otherOptionLabel))
+                }
+                return RemoteQuestionField(
+                    id: field.id, header: field.header, prompt: field.prompt, context: field.context,
+                    options: options, isSecret: field.isSecret == true,
+                    allowsMultiple: field.allowsMultiple == true,
+                    allowsCustom: isUserInput || field.allowsCustom == true,
+                    allowsNote: isUserInput && !options.isEmpty, allowsSkip: isAskUser
+                )
+            })
+        } else {
+            nil
+        }
         return RemoteInteractionSummary(
             id: interaction.id.uuidString,
             kind: isApproval ? .approval : (isSecret ? .secretInput : .question),
@@ -549,7 +625,8 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
             prompt: prompt?.isEmpty == false ? prompt : nil,
             requiresSecureEntry: isSecret,
             responseUnavailableReason: unavailableReason,
-            createdAt: createdAt
+            createdAt: createdAt,
+            questionnaire: questionnaire
         )
     }
 }
@@ -659,7 +736,8 @@ final class DesktopRemoteCatalogService: WorkflowCatalogService {
             toolCatalog: toolCatalog,
             supportsStartSelection: true,
             supportsSessionConfiguration: true,
-            supportsAttachments: true
+            supportsAttachments: true,
+            supportsWorkspaceVoice: true
         )
 
         return RemoteCatalogRecord(workflows: workflows, agents: agents, metadata: metadata)

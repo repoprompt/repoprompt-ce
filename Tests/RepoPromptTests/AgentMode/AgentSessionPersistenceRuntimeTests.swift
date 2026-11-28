@@ -669,6 +669,8 @@ final class AgentSessionPersistenceRuntimeTests: XCTestCase {
         XCTAssertTrue(f.scope.sessions[f.session.tabID] === f.session)
         XCTAssertFalse(f.scope.hasReleasedWriterClaims)
         XCTAssertEqual(f.store.retainedDrains.count, 1)
+        XCTAssertFalse(f.session.runState.isActive)
+        XCTAssertTrue(AppDelegate.hasUnsettledAgentExecution(store: f.store), "A failed final save still owns process lifetime")
         let windowManager = WindowStatesManager.makeForTesting(
             windowSessionFileURL: f.root.appendingPathComponent("windows.json"), agentRuntimeStore: f.store
         )
@@ -717,6 +719,7 @@ final class AgentSessionPersistenceRuntimeTests: XCTestCase {
         XCTAssertFalse(f.session.isDirty)
         XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
         XCTAssertTrue(f.store.retainedDrains.isEmpty)
+        XCTAssertFalse(AppDelegate.hasUnsettledAgentExecution(store: f.store))
         XCTAssertEqual(drain.sessionOutcomes[cleanSibling.tabID]?.outcome, .released, "Recovery preserves the original exact sibling acknowledgement")
     }
 

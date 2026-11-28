@@ -4807,6 +4807,24 @@ final class MonitorFakeCodexController: CodexSessionControllerPassiveStubDefault
     private var threadStarted = false
     private var startOrResumeHook: (@Sendable () async -> Void)?
     private var sendGate: TestReleaseFence?
+    private var routingExpectation: (runID: UUID, routeID: Int, owner: MCPHostRouteResources)?
+    private var routingReceipts: [MCPRunRoutingCleanupReceipt] = []
+    private var didShutDown = false
+
+    func expectRouting(runID: UUID, routeID: Int, owner: MCPHostRouteResources) {
+        lock.withLock { routingExpectation = (runID, routeID, owner) }
+    }
+
+    func retainRoutingCleanup(_ receipt: MCPRunRoutingCleanupReceipt) -> Bool {
+        lock.withLock {
+            guard let routingExpectation, !didShutDown, !receipt.isConsumed,
+                  receipt.managerIdentity == ObjectIdentifier(ServerNetworkManager.shared),
+                  receipt.runID == routingExpectation.runID, receipt.routeID == routingExpectation.routeID,
+                  receipt.routeOwner === routingExpectation.owner else { return false }
+            if !routingReceipts.contains(receipt) { routingReceipts.append(receipt) }
+            return true
+        }
+    }
 
     func setSendGate(_ gate: TestReleaseFence?) {
         lock.withLock { sendGate = gate }
@@ -5001,7 +5019,17 @@ final class MonitorFakeCodexController: CodexSessionControllerPassiveStubDefault
     ) async {}
 
     func shutdown() async {
+        let receipts = lock.withLock {
+            didShutDown = true
+            routingExpectation = nil
+            let receipts = routingReceipts
+            routingReceipts.removeAll()
+            return receipts
+        }
         continuation.finish()
+        for receipt in receipts {
+            await ServerNetworkManager.shared.cleanupRunRoutingState(ownedBy: receipt)
+        }
     }
 }
 

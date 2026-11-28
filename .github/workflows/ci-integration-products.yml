@@ -49,7 +49,7 @@ jobs:
             .build/swiftbuild/artifacts
             Packages/RepoPromptAgentProviders/.build/artifacts
             ~/Library/Caches/org.swift.swiftpm/artifacts
-          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-binaries-v1-${{ hashFiles('Package.resolved', 'Packages/RepoPromptAgentProviders/Package.resolved') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-binaries-v2-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/RepoPromptAgentProviders/Package.swift', 'Packages/RepoPromptAgentProviders/Package.resolved') }}
 
       - name: Resolve Sentry dependencies
         id: resolve-sentry-dependencies

@@ -290,7 +290,9 @@ final class MCPHostRouteResources {
             if let runID = context.runID, let sessionID = context.savedCarrierSessionID {
                 .savedRunScoped(runID: runID, context: .init(workspaceID: workspaceID, contextID: context.tabID), sessionID: sessionID)
             } else if let runID = context.runID {
-                .runScoped(runID: runID, context: .init(workspaceID: workspaceID, contextID: context.tabID))
+                identity.kind == .independent && isLeaseManaged
+                    ? .canonicalRunScoped(runID: runID, context: .init(workspaceID: workspaceID, contextID: context.tabID))
+                    : .runScoped(runID: runID, context: .init(workspaceID: workspaceID, contextID: context.tabID))
             } else {
                 .context(DomainContextIdentity(workspaceID: workspaceID, contextID: context.tabID), explicit: context.explicitlyBound)
             }
@@ -359,6 +361,12 @@ final class MCPHostRouteResources {
     #if DEBUG
         /// Suspend the actual transfer after tentative publication to exercise actor reentrancy.
         var test_afterProcessConnectionTransfer: (@MainActor @Sendable (MCPRunRoutingCleanupReceipt) async -> Void)?
+        /// An in-process provider fixture can supply its real socket after the exact policy is armed.
+        /// The fixture may stop its own startup, but a successful hook never substitutes for route proof.
+        // Process identity is supplied only by socket fixtures whose peer PID was admitted via
+        // the real network manager. The bootstrap still verifies the original policy and route.
+        var test_existingProcessForBootstrap: (@MainActor @Sendable (MCPBootstrapLeaseSpec) async -> MCPRunRoutingProcessRegistration?)?
+        var test_afterExpectedPIDPolicyArmed: (@MainActor @Sendable (MCPBootstrapLeaseSpec, MCPRunRoutingCleanupReceipt) async -> Bool)?
     #endif
 
     /// Join original publications before transferring the existing domain receipt and context.

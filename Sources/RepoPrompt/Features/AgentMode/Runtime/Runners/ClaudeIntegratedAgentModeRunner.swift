@@ -240,6 +240,7 @@ final class ClaudeIntegratedAgentModeRunner {
         }
         let qualifiesQuietProvider = session.selectedAgent == .claudeCode
         let ownership = session.beginRunAttempt(source: "claudeNative")
+        startOutcome?.recordNewAttempt(ownership)
         session.installRunAttemptTerminalResources(ownership: ownership) { [weak session] terminalState in
             {
                 switch terminalState {

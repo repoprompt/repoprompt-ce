@@ -235,6 +235,10 @@ final class AgentSessionRuntimeStore {
         Array(drainingHosts.values)
     }
 
+    var retainedSessionDeletionDrains: [AgentSessionHostDrainRuntime] {
+        retainedExecutionHosts.flatMap(\.scope.sessionDeletionDrains.values)
+    }
+
     func makeScope() -> Scope {
         scopes = scopes.filter { $0.value.value != nil }
         let scope = Scope(store: self)
@@ -478,6 +482,9 @@ final class AgentSessionRuntimeStore {
         }
 
         private var providerInputRuntime: AgentSessionProviderInputRuntime?
+        var installedProviderInput: AgentSessionProviderInputRuntime? {
+            providerInputRuntime
+        }
 
         /// Install once from host composition. The legacy VM has an immutable private scope,
         /// catalog and recorder; presentation attachment must reuse this service, not reconfigure it.
@@ -515,6 +522,18 @@ final class AgentSessionRuntimeStore {
             persistence.queue
         }
 
+        /// Scope-owned producers can still owe acknowledgements after their last session leaves
+        /// the runtime map. Do not infer that the host is idle from an empty map alone.
+        var hasPendingHostEffects: Bool {
+            !saveQueue.inFlightSessionIDs.isEmpty || attachments.hasPendingRetention
+                || worktrees.pendingTransitions != 0 || continuation.hasPendingStarts
+                || installedInteractions?.hasPendingEffects == true || !sessionDeletionDrains.isEmpty
+                || linkExecution?.pendingManagedInputEffects.isEmpty == false
+                || linkExecution?.pendingSendEffects.isEmpty == false
+                || linkExecution?.pendingStopEffects.isEmpty == false
+                || linkExecution?.pendingSelfCompactEffects.isEmpty == false
+        }
+
         /// The host fences readiness synchronously when destructive owner adoption is queued,
         /// and releases it only after that adoption's discard slice (or its own abandoned exit).
         private(set) var isAwaitingWorkspaceAdoption = false
@@ -546,6 +565,15 @@ final class AgentSessionRuntimeStore {
             return true
         }
 
+        /// A never-published candidate rejected before it had a link runtime owns no link
+        /// effects. Verify that there is nothing admitted before releasing any of its resources.
+        func releaseUnpublishedWriterClaims() -> Bool {
+            guard sessions.isEmpty, linkExecution == nil, execution == nil,
+                  retainedDrain == nil, installedInteractions?.hasPendingEffects != true
+            else { return false }
+            return releaseWriterClaimsAfterDrain()
+        }
+
         /// Host-only full policy, after exact producer/provider/domain joins and final saves.
         /// Legacy prepared teardown continues to call the compatibility entry point above.
         @discardableResult
@@ -555,20 +583,23 @@ final class AgentSessionRuntimeStore {
             return releaseWriterClaimsAfterDrain()
         }
 
-        /// Per-session release under the existing scope retirement fence. The host must first
-        /// join provider/domain teardown and acknowledge the final save; timeout is not a receipt.
-        /// A sibling's effects never release or block this exact object's claim. This primitive
-        /// has no VM caller until host cutover; presentation removal/publication belongs to that host.
+        /// A release requires positive teardown and settlement on the originating object. A
+        /// deletion can acknowledge one participant without closing sibling admission.
         @discardableResult
-        func releaseWriterClaim(for session: AgentTabSession) -> Bool {
-            guard isRetiring, worktrees.pendingTransitions == 0, settlement(for: session).isSettled else { return false }
+        func releaseWriterClaim(for session: AgentTabSession, afterCommittedDeletion: Bool = false) -> Bool {
+            if afterCommittedDeletion {
+                guard let id = session.activeAgentSessionID, AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: id),
+                      sessionDeletionDrains[ObjectIdentifier(session)] != nil else { return false }
+            } else if !isRetiring { return false }
+            guard worktrees.pendingTransitions == 0, settlement(for: session).isSettled else { return false }
             var remaining = sessions
             remaining.removeValue(forKey: session.tabID)
-            releasedSessionTabIDs.insert(session.tabID)
-            replaceSessions(remaining)
+            if isRetiring { releasedSessionTabIDs.insert(session.tabID) }
+            replaceSessions(remaining, acknowledgingDeletion: afterCommittedDeletion ? ObjectIdentifier(session) : nil)
             return true
         }
 
+        var sessionDeletionDrains: [ObjectIdentifier: AgentSessionHostDrainRuntime] = [:]
         private(set) var sessions: [UUID: AgentTabSession] = [:]
         private var releasedSessionTabIDs: Set<UUID> = []
         fileprivate struct LiveClaim {
@@ -584,9 +615,21 @@ final class AgentSessionRuntimeStore {
         }
 
         func replaceSessions(_ replacement: [UUID: AgentTabSession]) {
+            replaceSessions(replacement, acknowledgingDeletion: nil)
+        }
+
+        private func replaceSessions(_ replacement: [UUID: AgentTabSession], acknowledgingDeletion: ObjectIdentifier?) {
             guard !hasReleasedWriterClaims || replacement.isEmpty else { return }
             let previous = sessions
             sessions = replacement.filter { !releasedSessionTabIDs.contains($0.key) }
+            if !sessionDeletionDrains.isEmpty {
+                for (tabID, session) in previous {
+                    let identity = ObjectIdentifier(session)
+                    if identity != acknowledgingDeletion, sessionDeletionDrains[identity] != nil {
+                        sessions[tabID] = session
+                    }
+                }
+            }
             for (tabID, session) in previous where sessions[tabID] !== session {
                 store.refreshBindingObservation(for: session)
                 updateLiveSessionBindingIndex(tabID: tabID)
@@ -607,6 +650,13 @@ final class AgentSessionRuntimeStore {
 
         func holds(_ identity: MembershipIdentity, for session: AgentTabSession) -> Bool {
             identity.scopeID == id && holdsSlot(session: session, incarnationID: identity.incarnationID, binding: identity.binding)
+        }
+
+        /// Presentation follows this installed object through an authorized same-object rebind.
+        /// This is not command admission and never follows a removed/reinstalled incarnation.
+        func holdsPresentationIncarnation(of writer: WriterIdentity, session: AgentTabSession) -> Bool {
+            writer.scopeID == id && sessions[session.tabID] === session
+                && liveClaimByTabID[session.tabID]?.incarnationID == writer.incarnationID
         }
 
         func membership(of session: AgentTabSession) -> Membership? {
