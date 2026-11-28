@@ -8,6 +8,7 @@ package protocol GlobalSettingsFileStoring {
     var blockReason: GlobalSettingsPersistenceBlockReason? { get }
 
     func load() throws -> GlobalSettingsDocument
+    /// Reads a complete snapshot without sharing mutable transaction state with an in-flight save.
     func readSnapshot() throws -> GlobalSettingsDocument?
     func loadOrCreateDefault() -> GlobalSettingsDocument
     func save(_ document: GlobalSettingsDocument) throws
@@ -154,7 +155,7 @@ package final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
 
     /// Projecting one setting must not adopt a new write generation or migration baseline.
     package func readSnapshot() throws -> GlobalSettingsDocument? {
-        guard let data = try readCurrentData() else { return nil }
+        guard let data = try Self.readData(at: fileURL) else { return nil }
         let header = try Self.decoder.decode(GlobalSettingsDocumentHeader.self, from: data)
         guard Self.preservationBlockReason(for: header) == nil else { return nil }
         return try Self.decoder.decode(GlobalSettingsDocument.self, from: data)
@@ -424,7 +425,12 @@ package final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
     }
 
     package func save(_ document: GlobalSettingsDocument) throws {
-        try withTransaction { try saveLocked(document) }
+        do {
+            try withTransaction { try saveLocked(document) }
+        } catch {
+            if blockReason == nil { blockReason = .saveFailed }
+            throw error
+        }
     }
 
     private func saveLocked(
@@ -905,13 +911,19 @@ package final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
 
     private func readCurrentData() throws -> Data? {
         do {
-            return try Data(contentsOf: fileURL)
-        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
-            return nil
+            return try Self.readData(at: fileURL)
         } catch {
             requiresReload = true
             blockReason = .loadFailed
             throw error
+        }
+    }
+
+    private static func readData(at url: URL) throws -> Data? {
+        do {
+            return try Data(contentsOf: url)
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            return nil
         }
     }
 
