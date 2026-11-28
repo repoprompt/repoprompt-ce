@@ -103,14 +103,31 @@ final class AgentSessionHandoffRuntime {
         let writer: AgentSessionRuntimeStore.WriterIdentity
         let sourceAgent: AgentProviderKind
         var sourceModel: String
+        let sourceReasoningEffort: String?
+        let sourceClaudeEffort: String?
+        let sourceParameters: [ACPModelParameterSelection]
+        let sourceInstructions: [String]
+        let context: ProviderSwitchSummaryContext?
         let handoffRevision: UInt64
         let rowID: UUID
         let destination: AgentProviderKind
         let model: String
         var outcome: ProviderSwitchSummary.Outcome?
+
+        var projection: ProviderSwitchSummary {
+            .init(requestRowID: rowID, destination: destination, model: model, outcome: outcome)
+        }
     }
 
     private var summaryBySessionID: [UUID: SummaryGeneration] = [:]
+
+    struct ProviderSwitchSummaryContext: Equatable {
+        let interviewPreference: Bool
+        let includeCleanupGuidance: Bool
+        let computerUseArmed: Bool
+        let images: [AgentFileAttachment]
+        let taggedFiles: [AgentTaggedFileAttachment]
+    }
 
     struct ProviderSwitchSummaryRequest {
         let rowID: UUID
@@ -118,6 +135,7 @@ final class AgentSessionHandoffRuntime {
         let model: String
         let wordLimit: Int
         let stopFence: AgentRunStartStopFence
+        var context: ProviderSwitchSummaryContext?
     }
 
     enum ProviderSwitchSummaryStart {
@@ -155,7 +173,7 @@ final class AgentSessionHandoffRuntime {
         defer { if existingClaim == nil { owner.submissions.release(claim) } }
         guard request.stopFence.permitsStart(of: session), !session.items.contains(where: { $0.id == request.rowID }),
               registerProviderSwitchSummary(
-                  command: command, rowID: request.rowID, destination: request.destination, model: request.model
+                  command: command, request: request, links: links
               )
         else { return .refused }
         let row = AgentChatItem(id: request.rowID, kind: .user, text: text, sequenceIndex: session.nextSequenceIndex)
@@ -197,7 +215,8 @@ final class AgentSessionHandoffRuntime {
     }
 
     private func registerProviderSwitchSummary(
-        command: AgentSessionRuntimeStore.Command, rowID: UUID, destination: AgentProviderKind, model: String
+        command: AgentSessionRuntimeStore.Command, request: ProviderSwitchSummaryRequest,
+        links: AgentSessionLinkExecutionRuntime
     ) -> Bool {
         guard command.writer.scope === scope, command.isCurrent,
               providerSwitchTransitionAdmission(command.writer.session, ownsComposerClaim: true).isAdmissible(forcing: false)
@@ -206,17 +225,34 @@ final class AgentSessionHandoffRuntime {
         if let current = currentSummaryGeneration(for: session), current.outcome == nil { return false }
         summaryBySessionID[command.identity.sessionID] = .init(
             writer: command.identity, sourceAgent: session.selectedAgent, sourceModel: session.selectedModelRaw,
-            handoffRevision: session.pendingHandoffRevision, rowID: rowID, destination: destination, model: model
+            sourceReasoningEffort: session.selectedReasoningEffortRaw, sourceClaudeEffort: session.selectedClaudeEffortRaw,
+            sourceParameters: session.acpModelParameterSelections,
+            sourceInstructions: links.providerSwitchInstructionStrings(session, destination: request.destination, includeOwedContent: false),
+            context: request.context, handoffRevision: session.pendingHandoffRevision,
+            rowID: request.rowID, destination: request.destination, model: request.model
         )
         return true
     }
 
     func providerSwitchSummary(for session: AgentTabSession) -> ProviderSwitchSummary? {
-        guard let generation = currentSummaryGeneration(for: session) else { return nil }
-        return .init(
-            requestRowID: generation.rowID, destination: generation.destination,
-            model: generation.model, outcome: generation.outcome
-        )
+        currentSummaryGeneration(for: session)?.projection
+    }
+
+    /// A later presenter can render a completed result when the source configuration and
+    /// request context still match. Draft and workflow edits are measured when the carrier fits.
+    func reusableProviderSwitchSummary(
+        for session: AgentTabSession, context: ProviderSwitchSummaryContext
+    ) -> ProviderSwitchSummary? {
+        guard let generation = currentSummaryGeneration(for: session),
+              generation.context == context,
+              generation.sourceReasoningEffort == session.selectedReasoningEffortRaw,
+              generation.sourceClaudeEffort == session.selectedClaudeEffortRaw,
+              generation.sourceParameters == session.acpModelParameterSelections,
+              let links = scope?.linkExecution,
+              generation.sourceInstructions == links.providerSwitchInstructionStrings(
+                  session, destination: generation.destination, includeOwedContent: false
+              ) else { return nil }
+        return generation.projection
     }
 
     /// ACP can resolve the default model while starting the Summary's original provider

@@ -213,6 +213,13 @@ extension AgentModeViewModel {
         let includeCleanupGuidance: Bool
         let images: [AgentFileAttachment]
         let taggedFiles: [AgentTaggedFileAttachment]
+
+        var summaryContext: AgentSessionHandoffRuntime.ProviderSwitchSummaryContext {
+            .init(
+                interviewPreference: interviewPreference, includeCleanupGuidance: includeCleanupGuidance,
+                computerUseArmed: computerUseArmed, images: images, taggedFiles: taggedFiles
+            )
+        }
     }
 
     private func providerSwitchComposition(_ session: TabSession, destination: AgentProviderKind) -> ProviderSwitchComposition {
@@ -597,7 +604,8 @@ extension AgentModeViewModel {
             }
             if let summary = preview.generatedSummary {
                 fitProviderSwitchSummary(summary, into: &preview)
-            } else if !preview.isReview, let summary = handoffRuntime.providerSwitchSummary(for: session),
+            } else if !preview.isReview,
+                      let summary = handoffRuntime.reusableProviderSwitchSummary(for: session, context: preview.composition.summaryContext),
                       summary.destination == preview.destination, summary.model == preview.model,
                       case let .generated(text, revision)? = summary.outcome, revision == preview.sourceRevision
             {
@@ -840,7 +848,10 @@ extension AgentModeViewModel {
         providerSwitchPreview?.generationItemID = rowID
         providerSwitchPreview?.selected = .summary
         let result = await claim.scope.handoff.generateProviderSwitchSummary(
-            .init(rowID: rowID, destination: preview.destination, model: preview.model, wordLimit: words, stopFence: preview.stopFence),
+            .init(
+                rowID: rowID, destination: preview.destination, model: preview.model, wordLimit: words,
+                stopFence: preview.stopFence, context: preview.composition.summaryContext
+            ),
             command: command, existingClaim: claim, testGenerate: testGenerate, testStart: testStart
         )
         guard providerSwitchPreview?.id == id, providerSwitchPreview?.generationItemID == rowID else { return }

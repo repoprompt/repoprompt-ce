@@ -665,10 +665,14 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         let rowID = UUID()
         let sourceModel = session.selectedModelRaw
         let handoffRevision = session.pendingHandoffRevision
+        let context = AgentSessionHandoffRuntime.ProviderSwitchSummaryContext(
+            interviewPreference: false, includeCleanupGuidance: false,
+            computerUseArmed: false, images: [], taggedFiles: []
+        )
         let result = await host.scope.handoff.generateProviderSwitchSummary(
             .init(
                 rowID: rowID, destination: .codexExec, model: "destination-model",
-                wordLimit: 100, stopFence: AgentRunStartStopFence(session: session)
+                wordLimit: 100, stopFence: AgentRunStartStopFence(session: session), context: context
             ), command: command
         )
         guard case .started = result else { return XCTFail("The original host must start the summary") }
@@ -683,6 +687,11 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             return
         }
         XCTAssertEqual(text, reply)
+        let reusable = host.scope.handoff.reusableProviderSwitchSummary(for: session, context: context)
+        guard case let .generated(reusableText, _)? = reusable?.outcome else {
+            return XCTFail("A later presenter must be able to read the completed Summary")
+        }
+        XCTAssertEqual(reusableText, reply)
         XCTAssertEqual(revision, session.sourceItemsRevision)
         XCTAssertNotEqual(session.selectedModelRaw, sourceModel, "The scripted ACP handshake must resolve the selected default model")
         XCTAssertEqual(provider.promptedMessages.count, 1)
