@@ -17,6 +17,7 @@ import RepoPromptInstrumentation
 enum StartupPhaseLog {
     /// Static phase identifiers; new phases are added here, never interpolated at call sites.
     enum Phase: String, CaseIterable {
+        case debugProfilePreparation
         case bootstrap
         case appInit
         case windowComposition

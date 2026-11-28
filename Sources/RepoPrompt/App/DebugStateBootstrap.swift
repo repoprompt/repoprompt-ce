@@ -1,13 +1,45 @@
 import AppKit
+import Darwin
 import Foundation
 import RepoPromptC
 import RepoPromptDomainRuntime
 import RepoPromptShared
 
-/// Opens the independent debug profile before app stores acquire it. Production
-/// is imported only into an empty profile; clean mode explicitly resets it.
+/// Runs once per *process launch*, before settings, windows, catalogs or agents
+/// acquire their stores. Ordinary launches preserve the isolated debug profile;
+/// production import and empty reset are explicit, non-sticky launch arguments.
 enum DebugStateBootstrap {
     static let cleanSlateArgument = "--debug-clean-slate"
+    static let freshProfileArgument = "--fresh-profile"
+
+    enum Mode: Int {
+        case reuse, fresh, clean
+    }
+
+    static func requestedMode(arguments: [String]) -> Mode {
+        if arguments.contains(cleanSlateArgument) { return .clean }
+        return arguments.contains(freshProfileArgument) ? .fresh : .reuse
+    }
+
+    struct PendingPreferencesFailure: LocalizedError {
+        var underlyingDescription: String?
+
+        var errorDescription: String? {
+            "The debug profile has pending snapshot preferences that could not be installed. "
+                + "No application stores were opened. Retry attempts only the pending installation, without another import. "
+                + "If the staged preferences are missing or damaged, explicitly launch with --fresh-profile "
+                + "(Finder launcher f) or --debug-clean-slate to replace the profile. Any displaced profile "
+                + "remains in RepoPrompt CE Debug Recovery."
+                + (underlyingDescription.map { "\n\($0)" } ?? "")
+        }
+    }
+
+    /// A publication already committed before preference finalization failed. Retrying
+    /// capture would archive that new profile repeatedly and could prune the real prior state.
+    static func retryMode(after error: Error, current: Mode) -> Mode {
+        error is PendingPreferencesFailure ? .reuse : current
+    }
+
     /// A live release app keeps writing. Only the first attempt captures the whole
     /// profile; later attempts reuse unchanged captured bytes and derived records, so
     /// each retry costs roughly one stat/listing pass instead of a full re-capture.
@@ -49,10 +81,13 @@ enum DebugStateBootstrap {
         }
     }
 
-    @MainActor static func runIfNeeded(forceCleanSlate: Bool = false) throws {
+    @MainActor static func runIfNeeded(mode: Mode) throws {
         guard MCPFilesystemIdentity.current.buildFlavor == .debug,
               !AppLaunchConfiguration.isUnitTestProcess,
               !AppLaunchConfiguration.current.suppressesNonessentialLaunchSideEffects else { return }
+        let span = StartupPhaseLog.begin(.debugProfilePreparation)
+        var succeeded = false
+        defer { span.end(extraFields: ["mode": mode.rawValue, "succeeded": succeeded ? 1 : 0]) }
         // If the handler cannot be installed, SIGTERM keeps its default (immediate) behavior.
         let termination = TerminationRequest.install()
         defer { termination?.finish() }
@@ -62,19 +97,19 @@ enum DebugStateBootstrap {
             throw DebugStateSnapshot.Failure.unsafeDestination
         }
         let start = Date()
-        let clean = forceCleanSlate || ProcessInfo.processInfo.arguments.contains(cleanSlateArgument)
         let preparation = try prepareProfile(
+            mode: mode,
             locations: .current,
             defaults: .standard,
             preferencesDomain: AppProfileLocations.current.preferencesDomain,
-            cleanSlate: clean,
             cancellation: termination.map { request in .init { request.isRequested } }
         )
         appProfileLease = preparation.lease
+        succeeded = true
         if let receipt = preparation.receipt {
             print("[DebugStateSeed] action=\(preparation.action.rawValue) schema=\(receipt.version) clean=\(receipt.cleanSlate) files=\(receipt.copiedFiles) bytes=\(receipt.copiedBytes) captureSeconds=\(receipt.seconds) totalSeconds=\(Date().timeIntervalSince(start))")
         } else {
-            print("[DebugStateSeed] action=reused totalSeconds=\(Date().timeIntervalSince(start))")
+            print("[DebugStateSeed] action=\(preparation.action.rawValue) totalSeconds=\(Date().timeIntervalSince(start))")
         }
     }
 
