@@ -710,6 +710,15 @@ An overseer role is derived from one exact live endpoint's stored `AgentMonitorP
 a session UUID, a durable intent, or an authority-wide query. `isOverseer` means exactly that the
 projection has at least one outbound row. An inbound-only session is not an overseer.
 
+The bridge publishes those rows to the endpoint's runtime host. The host's presentation store
+keeps both directions while the window is detached. An attached window reads that same store and
+repaints after publication. The observer's route ID comes from its host and can differ from the
+window ID. Auto-wake settings, snooze, and `Wake now` address the same exact executor.
+
+Target status publication and projection refresh have separate completion boundaries. Poll and
+wait join the status publication they requested. The projection coalescer continues to converge
+sidebar rows, prompt inventory, and passive notices from the accepted authority state.
+
 `agentSessionLinkIsOverseer(tabID:expectedSessionID:)` therefore fails closed unless all of these
 still agree:
 
@@ -865,7 +874,7 @@ operations and a retry replays the stored receipt.
 | Fully idle and send-ready | The attributed send transaction (durable row, then run start) | `run_started` / `run_start_failed` |
 | Running Codex turn | Native steer, or the durable fallback queue, reported by the steer acknowledgement tracker; the deferred dispatch re-proves the exact endpoint and the exact active run, and withdraws the row (`steer_not_accepted`) if either moved | `steered` / `queued_follow_up` |
 | Running Claude-native turn | The provider's interrupt-steering queue | `queued_interrupt` |
-| Running ACP turn | The target's serialized ACP steering queue; an interrupt refusal becomes a follow-up with the original provider envelope | `steered` / `queued_follow_up` |
+| Running ACP turn | The target's serialized ACP steering queue; an interrupt refusal becomes a follow-up with the original provider envelope | `provider_prompt_written` / `queued_follow_up` |
 | Waiting for its next instruction | That instruction | `delivered_to_waiting_instruction` |
 | Any pending prompt | Refused before the fence | `target_awaiting_interaction` |
 | Between states, idle but not yet send-ready, or settled during the fence | Refused; nothing staged and the key is released | `target_busy` |
@@ -888,10 +897,10 @@ attempt returns `target_busy`. Stop or caller cancellation before the row is sta
 provider input. Once the runtime accepts input, its originating provider producer settles the receipt.
 A provider path that withdraws the row reports `steer_not_accepted` (key released); one whose
 outcome cannot be observed reports `steer_unconfirmed` with `delivered_unknown: true` (key spent).
-ACP records the `session/prompt` pipe write independently of its end-of-turn response. If that
-response fails after the write (including Stop shutting down the transport), the batch is not
-restored or requeued, its transcript rows remain, and managed sinks settle as unconfirmed. A write
-alone is not proof of provider acceptance or successful completion.
+ACP reports `submitted` with `delivery_state: provider_prompt_written` once the transport writes
+`session/prompt`. The write receipt spends the idempotency key and preserves the transcript row
+even if a later provider error or Stop prevents a terminal response. Read or wait on the target
+for evidence of provider acceptance and the turn outcome.
 
 The provider sees a RepoPrompt-authored envelope with `delegation="user_delegated_management"`:
 direction from the user's delegated overseer, to be followed within the session's workspace and

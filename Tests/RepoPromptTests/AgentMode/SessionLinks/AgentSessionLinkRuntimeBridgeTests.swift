@@ -125,7 +125,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         _ = try installRestoredFixtureBinding(session, in: vm)
         let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(vm, tabID: session.tabID)
         fixture.host.beforeActivation = { activating in
-            if activating == fixture.target.domainEndpoint { await vm.agentSessionLinkWillActivate(endpoint) }
+            if activating == fixture.target.domainEndpoint { await vm.linkExecutionRuntime.prepareForLinkActivation(endpoint) }
         }
         guard case .added = await addLink(fixture) else { return XCTFail("Link must activate") }
         let armed = await vm.armComputerUseForLocalUser(session: session)
@@ -4664,6 +4664,29 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             XCTAssertEqual(fixture.host.observationSnapshotCalls[successor.sessionID, default: 0], successorSnapshots + 1, "The successor must retain its own observation")
             XCTAssertEqual(fixture.bridge.test_sourcePublicationSequence(for: successor.sessionID), (sequence ?? 0) + 1)
         }
+    }
+
+    func testCensusReadCompletesWhileTheProjectionIsSuspended() async throws {
+        let fixture = makeFixture()
+        guard case .added = await addLink(fixture) else { return XCTFail("Could not establish a link") }
+        await fixture.bridge.test_settleTargetPublications()
+        let target = try await authorizedTarget(fixture.bridge, operation: .monitorWait, observer: fixture.observer, target: fixture.target)
+        fixture.host.runFacts[fixture.target.sessionID] = .init(settledThrough: 9, ordinaryThrough: 8)
+        let gate = TestReleaseFence(name: "downstream presentation")
+        fixture.bridge.test_afterPresentationSnapshot = { await gate.enterAndWait() }
+        defer {
+            fixture.bridge.test_afterPresentationSnapshot = nil
+            gate.release()
+        }
+        let completed = expectation(description: "target publication releases the wait preflight")
+        let census = Task {
+            await fixture.bridge.refreshLaneBoardCensus(for: [target])
+            completed.fulfill()
+        }
+        guard await gate.waitUntilEntered() else { return }
+        await fulfillment(of: [completed], timeout: 3)
+        gate.release()
+        await census.value
     }
 
     func testCensusKnownAbsenceDoesNotRediscoverOrSample() async throws {

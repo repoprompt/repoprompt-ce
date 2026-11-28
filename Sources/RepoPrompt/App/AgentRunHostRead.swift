@@ -491,7 +491,7 @@ extension AgentRunHostAdmission {
         guard AgentModeViewModel.isMCPResidentAppOwned(session), executor.agentSessionLinkObserverEndpoint(tabID: session.tabID) == endpoint
         else { throw MCPError.invalidParams(AgentModeViewModel.mcpResidentTargetError) }
         let counts = try executor.mcpResidentLaneStateCounts(
-            for: endpoint, hasOutboundLinks: hasLinks, props: executor.residentMonitorPropsBySessionID[target.sessionID]
+            for: endpoint, hasOutboundLinks: hasLinks, props: target.command.writer.scope.presentation.monitorPropsByEndpoint[endpoint]
         )
         return (residentStatusSnapshot(target), AgentModeViewModel.mcpResidentOverseerValue(session: session, endpoint: endpoint, counts: counts))
     }
