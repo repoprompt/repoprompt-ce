@@ -1,6 +1,6 @@
 import Foundation
 import OSLog
-import RepoPromptIrohTransport
+import RepoPromptRemoteNetworking
 import RepoPromptRemoteProtocol
 
 enum RemoteIrohPhoneReadiness: Equatable {
@@ -26,6 +26,7 @@ struct RemoteIrohGatewayDiagnostics: Equatable {
 /// performs pairing, credential/binding checks, routing, and Codable framing.
 @MainActor
 final class RemoteIrohGatewayAdapter {
+    private static let syncLogger = Logger(subsystem: "com.pvncher.repoprompt.ce", category: "RemoteSync")
     private static let unpairLogger = Logger(subsystem: "com.pvncher.repoprompt.ce", category: "RemoteUnpair")
 
     typealias StateChanged = (RemoteIrohGatewayDiagnostics) -> Void
@@ -88,9 +89,8 @@ final class RemoteIrohGatewayAdapter {
     private let stateChanged: StateChanged
     private let requestReceived: RequestCallback
     private let successfulResponseSent: RequestCallback
-    private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
-    private var endpoint: TransportEndpoint?
+    private var endpoint: RemoteNetworkEndpoint?
     private var acceptTask: Task<Void, Never>?
     private var sessions: [String: Session] = [:]
     private var diagnostics = RemoteIrohGatewayDiagnostics()
@@ -113,10 +113,7 @@ final class RemoteIrohGatewayAdapter {
     }
 
     var currentAddress: RemoteIrohEndpointAddress? {
-        if let endpoint, let snapshot = try? endpoint.snapshot() {
-            return .init(endpointID: snapshot.endpointId, transportAddressJSON: snapshot.addressJson)
-        }
-        return serverAddress
+        (try? endpoint?.currentAddress()) ?? serverAddress
     }
 
     func refreshLiveness() {
@@ -135,33 +132,25 @@ final class RemoteIrohGatewayAdapter {
         }
         activeGeneration = generation
         update { $0.state = "starting" }
-        var candidate: TransportEndpoint?
+        var candidate: RemoteNetworkEndpoint?
         do {
-            let endpoint = try await RepoPromptIrohSpike.startApplication(
+            let endpoint = try await RemoteNetworkEndpoint.start(
                 secret: secret,
                 relayEnabled: relayEnabled,
                 generation: generation
             )
             candidate = endpoint
-            let snapshot: EndpointSnapshot = if let onlineSnapshot = try? await endpoint.waitUntilOnline(timeoutMillis: 5000) {
-                onlineSnapshot
-            } else {
-                try endpoint.snapshot()
-            }
+            let address = try await endpoint.address(waitForRelay: relayEnabled)
             guard activeGeneration == generation else { throw CancellationError() }
-            guard !snapshot.endpointId.isEmpty else {
+            guard !address.endpointID.isEmpty else {
                 throw RemoteIrohGatewayAdapterError.invalidEndpoint
             }
-            let address = RemoteIrohEndpointAddress(
-                endpointID: snapshot.endpointId,
-                transportAddressJSON: snapshot.addressJson
-            )
             self.endpoint = endpoint
             self.desktopInstanceID = desktopInstanceID
             serverAddress = address
             update {
                 $0.state = "running"
-                $0.endpointID = snapshot.endpointId
+                $0.endpointID = address.endpointID
                 $0.lastError = nil
             }
             startAcceptLoop(endpoint)
@@ -207,46 +196,40 @@ final class RemoteIrohGatewayAdapter {
         publishSessionCount()
     }
 
-    private func startAcceptLoop(_ endpoint: TransportEndpoint) {
+    private func startAcceptLoop(_ endpoint: RemoteNetworkEndpoint) {
         acceptTask?.cancel()
-        acceptTask = Task { [weak self] in
-            guard let self else { return }
-            while !Task.isCancelled {
-                do {
-                    let request = try await endpoint.acceptRequest()
-                    guard !Task.isCancelled else {
-                        request.close()
-                        return
-                    }
-                    if diagnostics.state == "degraded" {
-                        update {
-                            $0.state = "running"
-                            $0.lastError = nil
-                        }
-                    }
-                    Task { @MainActor [weak self] in
-                        await self?.handle(request)
-                    }
-                } catch {
-                    guard !Task.isCancelled else { return }
-                    update {
-                        $0.state = "degraded"
-                        $0.lastError = error.localizedDescription
-                    }
-                    try? await Task.sleep(for: .milliseconds(250))
+        acceptTask = endpoint.listen(
+            onAccept: { [weak self] in
+                guard let self, diagnostics.state == "degraded" else { return }
+                update {
+                    $0.state = "running"
+                    $0.lastError = nil
                 }
+            },
+            onFailure: { [weak self] error in
+                self?.update {
+                    $0.state = "degraded"
+                    $0.lastError = error.localizedDescription
+                }
+            },
+            handle: { [weak self] request in
+                guard let self else {
+                    request.close()
+                    return
+                }
+                await handle(request)
             }
-        }
+        )
     }
 
-    private func handle(_ request: IncomingRequest) async {
-        guard request.generation() == activeGeneration else {
+    private func handle(_ request: RemoteNetworkRequest) async {
+        guard request.generation == activeGeneration else {
             request.close()
             return
         }
-        let peerEndpointID = request.peerEndpointId()
+        let peerEndpointID = request.peerEndpointID
         requestReceived()
-        let path = Self.pathKind(from: request.pathSummary())
+        let path = request.path
         update {
             $0.path = path
             $0.lastError = nil
@@ -262,11 +245,7 @@ final class RemoteIrohGatewayAdapter {
             }
         }
         do {
-            let data = request.payload()
-            guard data.count <= RemoteWireProtocol.maximumClientFrameBytes else {
-                throw RemoteIrohGatewayAdapterError.frameTooLarge
-            }
-            let frame = try decoder.decode(RemoteWireFrame.self, from: data)
+            let frame = try request.frame()
             messageID = frame.messageID
             if let step = SentryTelemetryBootstrap.PairingContext.Step(frame.kind) {
                 let context = SentryTelemetryBootstrap.PairingContext(step: step, path: path)
@@ -287,12 +266,7 @@ final class RemoteIrohGatewayAdapter {
                 pairing: &pairing
             )
             pairing?.failure = .encodeResponse
-            let encoded = try encoder.encode(response)
-            let direction: RemoteWireDirection = response.kind == .event ? .serverEvent : .serverResponse
-            guard encoded.count <= direction.maximumEncodedFrameBytes else {
-                throw RemoteIrohGatewayAdapterError.responseTooLarge
-            }
-            guard request.generation() == activeGeneration else {
+            guard request.generation == activeGeneration else {
                 request.close()
                 return
             }
@@ -306,7 +280,7 @@ final class RemoteIrohGatewayAdapter {
                 Self.unpairLogger.info("Sending framed Iroh Unpair response after durable revocation")
             }
             pairing?.failure = .sendResponse
-            try await request.respond(payload: encoded)
+            try await request.respond(response)
             if let pairing {
                 pairingResponseSent = true
                 SentryTelemetryBootstrap.recordRemotePairingResponse(pairing)
@@ -314,7 +288,7 @@ final class RemoteIrohGatewayAdapter {
             if isUnpairRequest {
                 Self.unpairLogger.info("Framed Iroh Unpair response delivery completed")
             }
-            if request.generation() == activeGeneration, originalContext != nil,
+            if request.generation == activeGeneration, originalContext != nil,
                response.kind != .streamError,
                var session = try? authenticatedSession(peerEndpointID, sessionID: frame.sessionID)
             {
@@ -324,7 +298,7 @@ final class RemoteIrohGatewayAdapter {
                 successfulResponseSent()
             }
         } catch {
-            guard request.generation() == activeGeneration else {
+            guard request.generation == activeGeneration else {
                 request.close()
                 return
             }
@@ -337,9 +311,9 @@ final class RemoteIrohGatewayAdapter {
                 SentryTelemetryBootstrap.recordRemotePairingFailure(failure, context: pairing)
             }
             let frame = makeStreamError(error, messageID: messageID)
-            if let encoded = try? encoder.encode(frame) {
-                try? await request.respond(payload: encoded)
-            } else {
+            do {
+                try await request.respond(frame)
+            } catch {
                 request.close()
             }
             update { $0.lastError = error.localizedDescription }
@@ -462,6 +436,7 @@ final class RemoteIrohGatewayAdapter {
             if case .unpair = request {
                 Self.unpairLogger.info("Iroh Unpair RPC received over authenticated peer path")
             }
+            let routingStarted = ContinuousClock.now
             let routed = await router.route(
                 request,
                 context: .init(
@@ -487,11 +462,16 @@ final class RemoteIrohGatewayAdapter {
                 syncTicket: ticket,
                 compressSnapshot: rpc.operation == .snapshot && rpc.acceptsCompressedSnapshot == true
             )
-            return try RemoteWireFrame(
+            let reply = try RemoteWireFrame(
                 kind: .rpcResponse,
                 messageID: frame.messageID,
                 encoding: rpcResponse
             )
+            if rpc.operation == .snapshot {
+                let elapsed = routingStarted.duration(to: .now)
+                Self.syncLogger.info("Snapshot ready after \(elapsed, privacy: .public), payload \(reply.payload.count, privacy: .public) bytes")
+            }
+            return reply
 
         case .eventSubscribe:
             let session = try authenticatedSession(peerEndpointID, sessionID: frame.sessionID)
@@ -675,7 +655,7 @@ final class RemoteIrohGatewayAdapter {
     private func makeStreamError(_ error: Error, messageID: UUID?) -> RemoteWireFrame {
         let response: RemoteErrorResponse = switch error {
         case let RemoteIrohGatewayAdapterError.remote(remote): remote
-        case RemoteIrohGatewayAdapterError.responseTooLarge:
+        case RemoteNetworkError.responseTooLarge:
             RemoteErrorResponse(code: "response_too_large", message: error.localizedDescription)
         case RemoteIrohGatewayAdapterError.sessionRequired:
             RemoteErrorResponse(code: "session_required", message: error.localizedDescription, retryable: true)
@@ -720,27 +700,11 @@ final class RemoteIrohGatewayAdapter {
             $0.lastSyncedActivityAt = lastSyncedActivity
         }
     }
-
-    private static func pathKind(from summary: String) -> RemoteIrohPathKind {
-        let lower = summary.lowercased()
-        if lower.contains("relay") {
-            return .relay
-        }
-        if lower.contains("192.168.") || lower.contains("10.") || lower.contains("172.16.") {
-            return .localDirect
-        }
-        if lower.contains("direct") || lower.contains("udp") {
-            return .internetDirect
-        }
-        return .unknown
-    }
 }
 
 enum RemoteIrohGatewayAdapterError: LocalizedError {
     case notRunning
     case invalidEndpoint
-    case frameTooLarge
-    case responseTooLarge
     case unsupportedWireVersion
     case serverEndpointMismatch
     case unauthorizedPeer
@@ -755,8 +719,6 @@ enum RemoteIrohGatewayAdapterError: LocalizedError {
         switch self {
         case .notRunning: "The Iroh endpoint is not running."
         case .invalidEndpoint: "The Iroh endpoint did not provide a valid identity."
-        case .responseTooLarge: "The Mac could not send this response within the Remote transfer limit."
-        case .frameTooLarge: "The Iroh request exceeded the one-megabyte limit."
         case .unsupportedWireVersion: "The Iroh wire version is unsupported."
         case .serverEndpointMismatch: "The authenticated server endpoint did not match the pairing record."
         case .sessionRequired: "The Mac session ended. Reconnect and sync again."

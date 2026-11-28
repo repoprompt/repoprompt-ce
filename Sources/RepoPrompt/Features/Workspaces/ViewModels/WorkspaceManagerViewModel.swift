@@ -15198,15 +15198,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         let previousName = workspaces[index].name
         workspaces[index].name = finalName
         workspaces[index].dateModified = Date()
-        // Fired from the canonical in-memory assignment, not from the save below: presentation
-        // follows live memory, and a later save failure or model revert emits its own refresh.
-        // Compared through the same `(main)` fallback the row renders, so a rename that cannot
-        // change any label repaints nothing.
-        if AgentMonitorLocationLabelFormatter.label(worktreeLabel: nil, workspaceName: previousName)
-            != AgentMonitorLocationLabelFormatter.label(worktreeLabel: nil, workspaceName: finalName)
-        {
-            AgentSessionLinkLocationInvalidationSink.locationLabelsChanged(inWorkspace: workspace.id)
-        }
+        invalidateWorkspaceLocationLabels(workspaceID: workspace.id, previousName: previousName, name: finalName)
 
         // Schedule async save of the specific workspace and index update, with flushes before notify.
         // The intent token lets an authority projection replace the array element without
@@ -15232,7 +15224,9 @@ class WorkspaceManagerViewModel: ObservableObject {
                 workspaces[currentIndex].dateModified = workspaceToSave.dateModified
             }
             do {
-                let finalURL = try await saveWorkspaceToFileAsync(workspaceToSave, source: .renameWorkspace)
+                let finalURL = try await saveWorkspaceToFileAsync(
+                    workspaceToSave, source: .renameWorkspace, metadataIntentID: intentID
+                )
                 await workspaceDiskWriter.flush(url: finalURL)
 
                 await rebuildAndSaveIndexAsync()
@@ -15301,7 +15295,9 @@ class WorkspaceManagerViewModel: ObservableObject {
                 workspaces[currentIndex].dateModified = workspaceToSave.dateModified
             }
             do {
-                let finalURL = try await saveWorkspaceToFileAsync(workspaceToSave, source: .setWorkspaceHidden)
+                let finalURL = try await saveWorkspaceToFileAsync(
+                    workspaceToSave, source: .setWorkspaceHidden, metadataIntentID: intentID
+                )
                 await workspaceDiskWriter.flush(url: finalURL)
 
                 await rebuildAndSaveIndexAsync()
@@ -15442,9 +15438,15 @@ class WorkspaceManagerViewModel: ObservableObject {
                 workspaces.append(updated)
             }
 
+            let intentID = UUID()
+            workspaceHiddenIntentByID[updated.id] = intentID
+            defer {
+                if workspaceHiddenIntentByID[updated.id] == intentID {
+                    workspaceHiddenIntentByID.removeValue(forKey: updated.id)
+                }
+            }
             let finalURL = try await saveWorkspaceToFileAsync(
-                updated,
-                source: .setWorkspaceHiddenFromSnapshot
+                updated, source: .setWorkspaceHiddenFromSnapshot, metadataIntentID: intentID
             )
             await workspaceDiskWriter.flush(url: finalURL)
 
@@ -15456,7 +15458,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 object: nil,
                 userInfo: ["managerID": instanceID]
             )
-            return updated
+            return self.workspace(withID: updated.id) ?? updated
         }
 
         guard !activeConsolidatedRestoreIDs.contains(workspace.id) else {
@@ -16719,6 +16721,22 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
     #endif
 
+    private func invalidateWorkspaceLocationLabels(workspaceID: UUID, previousName: String, name: String) {
+        if AgentMonitorLocationLabelFormatter.label(worktreeLabel: nil, workspaceName: previousName)
+            != AgentMonitorLocationLabelFormatter.label(worktreeLabel: nil, workspaceName: name)
+        {
+            AgentSessionLinkLocationInvalidationSink.locationLabelsChanged(inWorkspace: workspaceID)
+        }
+    }
+
+    private func validateWorkspaceMetadataIntent(_ intentID: UUID?, workspaceID: UUID, source: WorkspaceSaveSource) throws {
+        guard let intentID else { return }
+        let currentIntentID = source == .renameWorkspace
+            ? workspaceRenameIntentByID[workspaceID]
+            : workspaceHiddenIntentByID[workspaceID]
+        guard currentIntentID == intentID else { throw WorkspacePersistenceFailure(category: .cancelled) }
+    }
+
     private func retryStaleDomainAuthoritySave(
         proposal: WorkspaceModel,
         capture: DomainAuthoritySaveCapture,
@@ -16730,7 +16748,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         issueClearance: DomainAuthorityIssueClearance,
         ownedPublicationGeneration: UInt64?,
         ownSaveFence: OwnSaveFence?,
-        recaptureActivationGeneration: UInt64?
+        recaptureActivationGeneration: UInt64?,
+        metadataIntentID: UUID?
     ) async throws -> DomainAuthoritySaveResult {
         try Task.checkCancellation()
         #if DEBUG
@@ -16831,6 +16850,17 @@ class WorkspaceManagerViewModel: ObservableObject {
             current = recaptured
             retryPublicationGeneration = generation
         }
+        // Reapply the requested field to the qualified retry model after peer projection.
+        try validateWorkspaceMetadataIntent(metadataIntentID, workspaceID: proposal.id, source: source)
+        if metadataIntentID != nil {
+            try validateConsolidationLifecycle(proposal)
+            if source == .renameWorkspace {
+                current.name = proposal.name
+            } else {
+                current.isHiddenInMenus = proposal.isHiddenInMenus
+            }
+            current.dateModified = max(current.dateModified, proposal.dateModified)
+        }
         return try await persistWorkspaceThroughDomainAuthority(
             current,
             targetURL: targetURL,
@@ -16841,7 +16871,8 @@ class WorkspaceManagerViewModel: ObservableObject {
             issueClearance: issueClearance,
             ownedPublicationGeneration: retryPublicationGeneration,
             ownSaveFence: ownSaveFence,
-            recaptureActivationGeneration: recaptureActivationGeneration
+            recaptureActivationGeneration: recaptureActivationGeneration,
+            metadataIntentID: metadataIntentID
         )
     }
 
@@ -16855,7 +16886,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         issueClearance: DomainAuthorityIssueClearance? = nil,
         ownedPublicationGeneration: UInt64? = nil,
         ownSaveFence: OwnSaveFence? = nil,
-        recaptureActivationGeneration: UInt64? = nil
+        recaptureActivationGeneration: UInt64? = nil,
+        metadataIntentID: UUID? = nil
     ) async throws -> DomainAuthoritySaveResult {
         let issueClearance = issueClearance ?? DomainAuthorityIssueClearance(issueID: domainWorkspaceAuthorityIssue?.id)
         guard !workspace.isEphemeral else {
@@ -16906,7 +16938,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                 source: source, remainingRetryCount: remainingRetryCount,
                 creationOperationID: creationOperationID, issueClearance: issueClearance,
                 ownedPublicationGeneration: ownedPublicationGeneration, ownSaveFence: ownSaveFence,
-                recaptureActivationGeneration: recaptureActivationGeneration
+                recaptureActivationGeneration: recaptureActivationGeneration,
+                metadataIntentID: metadataIntentID
             )
         }
 
@@ -17013,7 +17046,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                 source: source, remainingRetryCount: remainingRetryCount,
                 creationOperationID: creationOperationID, issueClearance: issueClearance,
                 ownedPublicationGeneration: ownedPublicationGeneration, ownSaveFence: ownSaveFence,
-                recaptureActivationGeneration: recaptureActivationGeneration
+                recaptureActivationGeneration: recaptureActivationGeneration,
+                metadataIntentID: metadataIntentID
             )
         }
         guard isOwnSaveFenceCurrent(ownSaveFence, workspaceID: workspace.id) else {
@@ -17085,7 +17119,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                     source: source, remainingRetryCount: remainingRetryCount,
                     creationOperationID: creationOperationID, issueClearance: issueClearance,
                     ownedPublicationGeneration: ownedPublicationGeneration, ownSaveFence: ownSaveFence,
-                    recaptureActivationGeneration: recaptureActivationGeneration
+                    recaptureActivationGeneration: recaptureActivationGeneration,
+                    metadataIntentID: metadataIntentID
                 )
             }
             // Last point before this save writes to the authority. A superseded own save bails
@@ -17093,6 +17128,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             guard isOwnSaveFenceCurrent(ownSaveFence, workspaceID: workspaceToSave.id) else {
                 throw WorkspacePersistenceFailure(category: .cancelled)
             }
+            try validateWorkspaceMetadataIntent(metadataIntentID, workspaceID: workspaceToSave.id, source: source)
             if let existing {
                 // A manager without an accepted authority baseline may save only when its
                 // observed local model is exactly the canonical model it just read. Otherwise
@@ -17205,13 +17241,20 @@ class WorkspaceManagerViewModel: ObservableObject {
             published.customStoragePath = workspaceToSave.customStoragePath
             published.isSystemWorkspace = workspaceToSave.isSystemWorkspace
             published.isHiddenInMenus = workspaceToSave.isHiddenInMenus
+            if metadataIntentID != nil {
+                published.dateModified = workspaceToSave.dateModified
+            }
             if mergeResult.preservedDiskRepoPaths,
                rootEditGenerationByWorkspaceID[workspace.id, default: 0] == capturedRootEditGeneration
             {
                 published.repoPaths = workspaceToSave.repoPaths
             }
             if published != workspaces[index] {
+                let previousName = workspaces[index].name
                 workspaces[index] = published
+                if source == .renameWorkspace {
+                    invalidateWorkspaceLocationLabels(workspaceID: workspaceToSave.id, previousName: previousName, name: published.name)
+                }
             }
         }
         acknowledgePendingFullDocumentWrite(outcome, workspaceID: workspaceToSave.id)
@@ -17335,7 +17378,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         _ workspace: WorkspaceModel,
         preserveDiskRepoPathsIfUnchangedSinceBaseline: Bool = true,
         source: WorkspaceSaveSource = .directUnknown,
-        rootEditContext: RootEditSaveContext? = nil
+        rootEditContext: RootEditSaveContext? = nil,
+        metadataIntentID: UUID? = nil
     ) async throws -> URL {
         let targetURL = workspaceFileURL(for: workspace)
         guard !isSessionRuntimeProjection else { throw WorkspaceDirectWriteError.domainAuthorityRequired }
@@ -17356,7 +17400,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                 targetURL: targetURL,
                 preserveDiskRepoPathsIfUnchangedSinceBaseline: preserveDiskRepoPathsIfUnchangedSinceBaseline,
                 source: source,
-                remainingRetryCount: 1
+                remainingRetryCount: 1,
+                metadataIntentID: metadataIntentID
             )
             lastSavedVersionByWorkspaceID[workspace.id] = result.savedStateVersion
             return result.fileURL

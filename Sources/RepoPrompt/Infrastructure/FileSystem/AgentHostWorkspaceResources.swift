@@ -42,10 +42,13 @@ struct AgentHostWorkspaceResources {
         let retention = try await files.retainRoots(ids: rootIDs)
         do {
             try Task.checkCancellation()
-            guard await contexts.workspaceSnapshot(workspaceID) == snapshot else { throw Failure.contextChanged }
+            guard let latest = await contexts.workspaceSnapshot(workspaceID),
+                  latest.isInSameExecutionLineage(as: snapshot),
+                  admits(latest)
+            else { throw Failure.contextChanged }
             guard await files.isRootRetentionCurrent(retention) else { throw Failure.rootsChanged }
             try Task.checkCancellation()
-            return Lease(resources: self, snapshot: snapshot, roots: requestedRoots, retention: retention)
+            return Lease(resources: self, snapshot: latest, roots: requestedRoots, retention: retention)
         } catch {
             await files.releaseRootRetention(retention)
             throw error
@@ -60,6 +63,7 @@ struct AgentHostWorkspaceResources {
         private let retention: WorkspaceFileContextStore.RootRetention
         private let rootOwner: Lease?
         private(set) var isReleased = false
+        private var isInvalidated = false
 
         fileprivate init(resources: AgentHostWorkspaceResources, snapshot: DomainWorkspaceSnapshot, roots: [WorkspaceRootRef], retention: WorkspaceFileContextStore.RootRetention, rootOwner: Lease? = nil) {
             self.resources = resources
@@ -83,9 +87,18 @@ struct AgentHostWorkspaceResources {
         }
 
         func isCurrent() async -> Bool {
-            guard rootsAreCurrent,
-                  await resources.contexts?.workspaceSnapshot(snapshot.document.workspaceID) == snapshot else { return false }
-            return await retainedRootsAreCurrent()
+            guard !isInvalidated, rootsAreCurrent,
+                  let current = await resources.contexts?.workspaceSnapshot(snapshot.document.workspaceID),
+                  current.isInSameExecutionLineage(as: snapshot)
+            else {
+                isInvalidated = true
+                return false
+            }
+            let rootsValid = await retainedRootsAreCurrent()
+            if !rootsValid {
+                isInvalidated = true
+            }
+            return rootsValid
         }
 
         /// A request captures fresh canonical bytes while borrowing this activation's existing
@@ -106,10 +119,13 @@ struct AgentHostWorkspaceResources {
             guard Set(current.document.metadata.repoPaths.map { ($0 as NSString).standardizingPath }) == originalPaths,
                   await resources.files.isRootRetentionCurrent(retention), rootsAreCurrent
             else { throw Failure.rootsChanged }
-            guard await resources.contexts?.workspaceSnapshot(workspaceID) == current else { throw Failure.contextChanged }
+            guard let latest = await resources.contexts?.workspaceSnapshot(workspaceID),
+                  latest.isInSameExecutionLineage(as: current),
+                  admits(latest)
+            else { throw Failure.contextChanged }
             try Task.checkCancellation()
             guard rootsAreCurrent else { throw Failure.rootsChanged }
-            return Lease(resources: resources, snapshot: current, roots: roots, retention: retention, rootOwner: rootOwner ?? self)
+            return Lease(resources: resources, snapshot: latest, roots: roots, retention: retention, rootOwner: rootOwner ?? self)
         }
 
         func release() async {
@@ -117,5 +133,32 @@ struct AgentHostWorkspaceResources {
             isReleased = true
             if rootOwner == nil { await resources.files.releaseRootRetention(retention) }
         }
+    }
+}
+
+extension DomainWorkspaceSnapshot {
+    /// Returns true when `self` belongs to the same unbroken presentation-only lineage as `baseline`:
+    /// same workspace identity/file/roots/health/contexts, monotonic working revision, and identical
+    /// store-maintained `executionRevision` and `executionContentDigest`. Any intermediate
+    /// execution-relevant edit—even one later reverted to matching bytes—advances `executionRevision`
+    /// permanently and fails closed here.
+    func isInSameExecutionLineage(as baseline: DomainWorkspaceSnapshot) -> Bool {
+        if self == baseline { return true }
+        guard health != .removed, baseline.health != .removed, health == baseline.health,
+              document.workspaceID == baseline.document.workspaceID,
+              document.fileURL == baseline.document.fileURL,
+              document.metadata.repoPaths == baseline.document.metadata.repoPaths,
+              revisions.workingRevision >= baseline.revisions.workingRevision,
+              executionRevision == baseline.executionRevision,
+              document.executionContentDigest == baseline.document.executionContentDigest,
+              contexts.count == baseline.contexts.count
+        else { return false }
+        for (lhs, rhs) in zip(contexts, baseline.contexts) {
+            guard lhs.metadata.identity == rhs.metadata.identity,
+                  lhs.health != .removed, rhs.health != .removed,
+                  lhs.health == rhs.health
+            else { return false }
+        }
+        return true
     }
 }
