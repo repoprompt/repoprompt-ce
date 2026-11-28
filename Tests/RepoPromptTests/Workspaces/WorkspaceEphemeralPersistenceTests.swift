@@ -2520,6 +2520,484 @@ import XCTest
             }
         }
 
+        func testSnapshotHideSurvivesPeerSaveThatWinsRevisionCheck() async throws {
+            let entered = expectation(description: "snapshot hide submitted against the initial revision")
+            let gate = WorkspaceDeleteSuspensionGate()
+            let counter = WorkspaceSavePreparationCounter()
+            try await withProjectionSaveFixture(configureClient: { client in
+                client.commandWillExecuteForTesting = { envelope in
+                    guard case .replaceWorkingDocument = envelope.command, await counter.increment() == 1 else { return }
+                    entered.fulfill()
+                    await gate.wait()
+                }
+            }) { fixture in
+                let manager = fixture.manager
+                self.installCatalogRefresh(for: manager, bridge: fixture.bridge)
+                let initial = try XCTUnwrap(manager.workspace(withID: fixture.workspace.id))
+                let initialSnapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(initial.id)
+                let before = try XCTUnwrap(initialSnapshot)
+                let hide = Task { try await manager.setWorkspaceHiddenFromSnapshot(initial, hidden: true) }
+                let peer: DomainWorkspaceSnapshot
+                do {
+                    try await self.awaitSaveCheckpoint(entered)
+                    peer = try await self.restoreArchivedTabRemotely(in: fixture)
+                    XCTAssertGreaterThan(peer.revisions.workingRevision, before.revisions.workingRevision)
+                    let catalog = await fixture.runtime.workspaceStore.snapshot()
+                    let checkpoint = await fixture.observer.waitForProjection(
+                        afterGeneration: 0, through: catalog.publicationSequence, requireCatalogApplication: true
+                    )
+                    _ = try XCTUnwrap(checkpoint)
+                    XCTAssertTrue(try XCTUnwrap(manager.workspace(withID: initial.id)).composeTabs.contains { $0.id == fixture.restoredTab.id })
+                    XCTAssertFalse(try XCTUnwrap(manager.workspace(withID: initial.id)).isHiddenInMenus)
+                } catch {
+                    hide.cancel()
+                    await gate.open()
+                    _ = await hide.result
+                    throw error
+                }
+                await gate.open()
+                let returned = try await hide.value
+                XCTAssertTrue(returned.isHiddenInMenus)
+                XCTAssertTrue(returned.composeTabs.contains { $0.id == fixture.restoredTab.id })
+                let snapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(initial.id)
+                let final = try XCTUnwrap(snapshot)
+                XCTAssertNil(final.revisions.dirtyRevision)
+                var expected = try JSONDecoder().decode(WorkspaceModel.self, from: peer.document.documentBytes)
+                expected.isHiddenInMenus = true
+                let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: final.document.documentBytes)
+                expected.dateModified = canonical.dateModified
+                XCTAssertEqual(canonical, expected)
+                try await self.assertCanonicalAndDiskRemain(final, in: fixture)
+            }
+        }
+
+        func testFieldSurvivesSameDigestReinstallWhileParked() async throws {
+            try await withProjectionSaveFixture { fixture in
+                await fixture.bridge.stopAndJoinForTesting()
+                let manager = fixture.manager
+                let initial = try XCTUnwrap(manager.workspace(withID: fixture.workspace.id))
+                let initialSnapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(initial.id)
+                let before = try XCTUnwrap(initialSnapshot)
+                let digest = before.document.contentDigest
+                let generation = manager.adoptedFullDocumentGeneration(workspaceID: initial.id, contentDigest: digest)
+                _ = try XCTUnwrap(generation)
+                let prepared = self.expectation(description: "snapshot hide prepared")
+                let gate = WorkspaceDeleteSuspensionGate()
+                let counter = WorkspaceSavePreparationCounter()
+                manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { id, _, _ in
+                    guard id == initial.id, await counter.increment() == 1 else { return }
+                    prepared.fulfill()
+                    await gate.wait()
+                }
+                defer { manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil) }
+                let hide = Task { try await manager.setWorkspaceHiddenFromSnapshot(initial, hidden: true) }
+                do {
+                    try await self.awaitSaveCheckpoint(prepared)
+                    XCTAssertTrue(try XCTUnwrap(manager.workspace(withID: initial.id)).isHiddenInMenus)
+                    let catalog = await fixture.runtime.workspaceStore.snapshot()
+                    let decoded = try catalog.workspaces.map {
+                        try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
+                            documentBytes: $0.document.documentBytes, fileURL: $0.document.fileURL
+                        )
+                    }
+                    let result = manager.applyDomainWorkspaceCatalog(
+                        catalog, projection: .full(decoded), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata
+                    )
+                    XCTAssertEqual(try XCTUnwrap(result.receipt).kind, .full)
+                    XCTAssertEqual(manager.workspace(withID: initial.id), initial)
+                    let reinstalled = manager.adoptedFullDocumentGeneration(workspaceID: initial.id, contentDigest: digest)
+                    XCTAssertGreaterThan(try XCTUnwrap(reinstalled), try XCTUnwrap(generation))
+                    try await self.assertCanonicalAndDiskRemain(before, in: fixture)
+                } catch {
+                    hide.cancel()
+                    await gate.open()
+                    _ = await hide.result
+                    throw error
+                }
+                await gate.open()
+                let returned = try await hide.value
+                XCTAssertTrue(returned.isHiddenInMenus)
+                let snapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(initial.id)
+                let final = try XCTUnwrap(snapshot)
+                XCTAssertNil(final.revisions.dirtyRevision)
+                let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: final.document.documentBytes)
+                var expected = initial
+                expected.isHiddenInMenus = true
+                expected.dateModified = canonical.dateModified
+                XCTAssertEqual(canonical, expected)
+                try await self.assertCanonicalAndDiskRemain(final, in: fixture)
+            }
+        }
+
+        func testQuitFenceRejectsParkedWorkingPublication() async throws {
+            try await withProjectionSaveFixture { fixture in
+                let manager = fixture.manager
+                let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == fixture.workspace.id })
+                let snapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspace.id)
+                let before = try XCTUnwrap(snapshot)
+                manager.workspaces[index].composeTabs[0].promptText = "Unpublished quit draft"
+                let proposal = manager.workspaces[index]
+                let captured = self.expectation(description: "working publication captured")
+                let gate = WorkspaceDeleteSuspensionGate()
+                manager.workingPublicationDidCaptureForTesting = { id in
+                    guard id == proposal.id else { return }
+                    captured.fulfill()
+                    await gate.wait()
+                }
+                defer { manager.workingPublicationDidCaptureForTesting = nil }
+                let publish = Task { await manager.debugPublishWorkingDocumentToDomainAuthority(proposal) }
+                do {
+                    try await self.awaitSaveCheckpoint(captured)
+                } catch {
+                    await gate.open()
+                    await publish.value
+                    throw error
+                }
+                manager.beginWorkspaceSaveShutdown(deadline: .now)
+                await gate.open()
+                await publish.value
+                try await self.assertCanonicalAndDiskRemain(before, in: fixture)
+            }
+        }
+
+        func testMetadataCloseDeadlineReleasesStalledSaveAndFencesItsWrite() async throws {
+            try await assertMetadataDrainFencesParkedSave(cancelClose: false)
+        }
+
+        func testCancellingMetadataCloseDrainFencesParkedSave() async throws {
+            try await assertMetadataDrainFencesParkedSave(cancelClose: true)
+        }
+
+        private func assertMetadataDrainFencesParkedSave(cancelClose: Bool) async throws {
+            try await withProjectionSaveFixture { fixture in
+                let manager = fixture.manager
+                let initial = try XCTUnwrap(manager.workspace(withID: fixture.workspace.id))
+                let snapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(initial.id)
+                let before = try XCTUnwrap(snapshot)
+                let prepared = self.expectation(description: "metadata preparation parked")
+                let done = self.expectation(description: "close stopped waiting")
+                let gate = WorkspaceDeleteSuspensionGate()
+                manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { id, _, _ in
+                    guard id == initial.id else { return }
+                    prepared.fulfill()
+                    await gate.wait()
+                }
+                defer { manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil) }
+                let hide = Task { try await manager.setWorkspaceHiddenFromSnapshot(initial, hidden: true) }
+                do {
+                    try await self.awaitSaveCheckpoint(prepared)
+                } catch {
+                    await gate.open()
+                    _ = await hide.result
+                    throw error
+                }
+                if !cancelClose {
+                    manager.beginWorkspaceSaveShutdown(deadline: .now.advanced(by: .milliseconds(100)))
+                }
+                manager.prepareForWindowClose()
+                let close = Task {
+                    await manager.awaitOwnSavesForWindowClose()
+                    done.fulfill()
+                }
+                if cancelClose { close.cancel() }
+                let reached = await XCTWaiter.fulfillment(of: [done], timeout: 2)
+                XCTAssertEqual(reached, .completed)
+                await gate.open()
+                await close.value
+                if case .success = await hide.result { XCTFail("An expired save submitted new bytes") }
+                try await self.assertCanonicalAndDiskRemain(before, in: fixture)
+            }
+        }
+
+        func testClosingSnapshotHideReplaysAfterPeerWinsRevisionCheck() async throws {
+            let entered = expectation(description: "visibility command parked at authority ingress")
+            let gate = WorkspaceDeleteSuspensionGate()
+            let counter = WorkspaceSavePreparationCounter()
+            try await withProjectionSaveFixture(configureClient: { client in
+                client.commandWillExecuteForTesting = { envelope in
+                    guard case .replaceWorkingDocument = envelope.command, await counter.increment() == 1 else { return }
+                    entered.fulfill()
+                    await gate.wait()
+                }
+            }) { fixture in
+                let manager = fixture.manager
+                let initial = try XCTUnwrap(manager.workspace(withID: fixture.workspace.id))
+                let hide = Task { try await manager.setWorkspaceHiddenFromSnapshot(initial, hidden: true) }
+                let peer: DomainWorkspaceSnapshot
+                do {
+                    try await self.awaitSaveCheckpoint(entered)
+                    manager.prepareForWindowClose()
+                    peer = try await self.restoreArchivedTabRemotely(in: fixture)
+                    XCTAssertFalse(try XCTUnwrap(manager.workspace(withID: initial.id)).composeTabs.contains { $0.id == fixture.restoredTab.id })
+                } catch {
+                    await gate.open()
+                    _ = await hide.result
+                    throw error
+                }
+                await gate.open()
+                await manager.awaitOwnSavesForWindowClose()
+                let returned = try await hide.value
+                XCTAssertTrue(returned.isHiddenInMenus)
+                let snapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(initial.id)
+                let final = try XCTUnwrap(snapshot)
+                XCTAssertNil(final.revisions.dirtyRevision)
+                var expected = try JSONDecoder().decode(WorkspaceModel.self, from: peer.document.documentBytes)
+                let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: final.document.documentBytes)
+                expected.isHiddenInMenus = true
+                expected.dateModified = canonical.dateModified
+                XCTAssertEqual(canonical, expected)
+                let commands = await counter.value
+                XCTAssertEqual(commands, 2)
+                try await self.assertCanonicalAndDiskRemain(final, in: fixture)
+            }
+        }
+
+        func testWindowCloseDrainsInactiveWorkspaceMetadataSave() async throws {
+            for rename in [true, false] {
+                let tab = ComposeTabState(name: "Active tab")
+                let other = WorkspaceModel(name: "Active workspace", repoPaths: [], composeTabs: [tab], activeComposeTabID: tab.id)
+                try await withProjectionSaveFixture(additionalWorkspaces: [other]) { fixture in
+                    let manager = fixture.manager
+                    let initial = try XCTUnwrap(manager.workspace(withID: fixture.workspace.id))
+                    manager.activeWorkspace = try XCTUnwrap(manager.workspace(withID: other.id))
+                    XCTAssertEqual(manager.activeWorkspaceID, other.id)
+                    let prepared = self.expectation(description: "inactive metadata save prepared")
+                    let gate = WorkspaceDeleteSuspensionGate()
+                    let counter = WorkspaceSavePreparationCounter()
+                    manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { id, _, _ in
+                        guard id == initial.id, await counter.increment() == 1 else { return }
+                        prepared.fulfill()
+                        await gate.wait()
+                    }
+                    defer { manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil) }
+                    if rename {
+                        manager.renameWorkspace(initial, newName: "Renamed before close")
+                    } else {
+                        manager.setWorkspaceHidden(initial, hidden: true)
+                    }
+                    do {
+                        try await self.awaitSaveCheckpoint(prepared)
+                        let catalog = await fixture.runtime.workspaceStore.snapshot()
+                        let decoded = try catalog.workspaces.map {
+                            try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
+                                documentBytes: $0.document.documentBytes, fileURL: $0.document.fileURL
+                            )
+                        }
+                        let receipt = manager.applyDomainWorkspaceCatalog(
+                            catalog, projection: .full(decoded), preferredActiveWorkspaceID: other.id, rootMapPolicy: .snapshotMetadata
+                        ).receipt
+                        XCTAssertEqual(try XCTUnwrap(receipt).kind, .full)
+                        XCTAssertEqual(manager.workspace(withID: initial.id), initial)
+                        XCTAssertEqual(manager.activeWorkspaceID, other.id)
+                    } catch {
+                        await gate.open()
+                        await manager.awaitOwnSavesForWindowClose()
+                        throw error
+                    }
+                    manager.prepareForWindowClose()
+                    manager.pollAndSaveState()
+                    await gate.open()
+                    await manager.awaitOwnSavesForWindowClose()
+                    let snapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(initial.id)
+                    let saved = try XCTUnwrap(snapshot)
+                    XCTAssertNil(saved.revisions.dirtyRevision)
+                    let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: saved.document.documentBytes)
+                    XCTAssertEqual(canonical.name, rename ? "Renamed before close" : initial.name)
+                    XCTAssertEqual(canonical.isHiddenInMenus, !rename)
+                    try await self.assertCanonicalAndDiskRemain(saved, in: fixture)
+                }
+            }
+        }
+
+        func testParkedRenameDoesNotReplacePeerRename() async throws {
+            try await withProjectionSaveFixture { fixture in
+                let manager = fixture.manager
+                let initial = try XCTUnwrap(manager.workspace(withID: fixture.workspace.id))
+                let prepared = self.expectation(description: "older rename prepared")
+                let gate = WorkspaceDeleteSuspensionGate()
+                let counter = WorkspaceSavePreparationCounter()
+                manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { id, _, _ in
+                    guard id == initial.id, await counter.increment() == 1 else { return }
+                    prepared.fulfill()
+                    await gate.wait()
+                }
+                defer { manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil) }
+                manager.renameWorkspace(initial, newName: "Older rename")
+
+                let peer: DomainWorkspaceSnapshot
+                do {
+                    try await self.awaitSaveCheckpoint(prepared)
+                    let beforeSnapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(initial.id)
+                    let before = try XCTUnwrap(beforeSnapshot)
+                    var proposal = try JSONDecoder().decode(WorkspaceModel.self, from: before.document.documentBytes)
+                    proposal.name = "Peer rename"
+                    let author = DomainWorkspaceAuthorityClient(store: fixture.runtime.workspaceStore, windowID: -758)
+                    let saved = try await author.saveFailClosed(
+                        proposal, fileURL: before.document.fileURL,
+                        expectedWorkspaceRevision: before.revisions.workingRevision,
+                        expectedContentDigest: before.document.contentDigest
+                    )
+                    XCTAssertEqual(saved.saved?.disposition, .applied)
+                    let catalog = await fixture.runtime.workspaceStore.snapshot()
+                    peer = try XCTUnwrap(catalog.workspaces.first { $0.document.workspaceID == initial.id })
+                    let checkpoint = await fixture.observer.waitForProjection(
+                        afterGeneration: 0, through: catalog.publicationSequence, requireCatalogApplication: true
+                    )
+                    _ = try XCTUnwrap(checkpoint)
+                    XCTAssertEqual(manager.workspace(withID: initial.id)?.name, proposal.name)
+                } catch {
+                    await gate.open()
+                    try await self.waitForRenameToFinish(in: manager, workspaceID: initial.id)
+                    throw error
+                }
+                await gate.open()
+                try await self.waitForRenameToFinish(in: manager, workspaceID: initial.id)
+                XCTAssertEqual(manager.workspace(withID: initial.id)?.name, "Peer rename")
+                try await self.assertCanonicalAndDiskRemain(peer, in: fixture)
+            }
+        }
+
+        private func waitForRenameToFinish(in manager: WorkspaceManagerViewModel, workspaceID: UUID) async throws {
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: .seconds(5))
+            while manager.hasPendingWorkspaceRenameIntentForTesting(workspaceID: workspaceID) {
+                guard clock.now < deadline else {
+                    XCTFail("The rename did not finish")
+                    throw SaveInterleavingFailure.checkpointTimedOut
+                }
+                try await clock.sleep(for: .milliseconds(10))
+            }
+        }
+
+        func testThirtyFiveWindowsConvergeOnConcurrentMetadataChanges() async throws {
+            let clock = ContinuousClock()
+            let start = clock.now
+            let windowsPerWorkspace = 7
+            let workspaces = try (0 ..< 5).map { index in
+                let tab = ComposeTabState(name: "Current tab", promptText: "Initial prompt \(index)")
+                let workspace = WorkspaceModel(
+                    name: "Scale \(index)", repoPaths: [], composeTabs: [tab], activeComposeTabID: tab.id
+                )
+                try writeWorkspace(workspace)
+                return workspace
+            }
+            try writeLegacyIndex(workspaces)
+            let runtime = try await makeRuntime(profileIdentifier: "workspace-metadata-scale")
+            var windows: [(
+                manager: WorkspaceManagerViewModel,
+                bridge: DomainWorkspacePresentationBridge,
+                observer: DomainWorkspaceProjectionObserver
+            )] = []
+            do {
+                let deadline = start.advanced(by: .seconds(10))
+                for index in 0 ..< workspaces.count * windowsPerWorkspace {
+                    let windowID = -2000 - index
+                    let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: windowID)
+                    let manager = makeManager(windowID: windowID, domainWorkspaceAuthorityClient: client)
+                    let bridge = DomainWorkspacePresentationBridge(workspaceManager: manager, client: client)
+                    let observer = DomainWorkspaceProjectionObserver(bridge: bridge)
+                    installCatalogRefresh(for: manager, bridge: bridge)
+                    windows.append((manager, bridge, observer))
+                }
+                while windows.contains(where: { !$0.manager.isInitialized || $0.manager.isSwitchingWorkspace }) {
+                    guard clock.now < deadline else {
+                        XCTFail("Windows did not initialize before the 10-second deadline")
+                        throw SaveInterleavingFailure.checkpointTimedOut
+                    }
+                    try await clock.sleep(for: .milliseconds(10))
+                }
+                for window in windows {
+                    window.bridge.start()
+                }
+                let initial = await runtime.workspaceStore.snapshot().publicationSequence
+                for (index, window) in windows.enumerated() {
+                    let checkpoint = await window.observer.waitForProjection(
+                        afterGeneration: 0, through: initial, requireCatalogApplication: true,
+                        timeout: max(.zero, clock.now.duration(to: deadline))
+                    )
+                    _ = try XCTUnwrap(checkpoint, "Window \(index) did not adopt the initial catalog")
+                }
+                let setup = clock.now - start
+                for (offset, workspace) in workspaces.enumerated() {
+                    let base = offset * windowsPerWorkspace
+                    let renamer = windows[base].manager
+                    let hider = windows[base + 1].manager
+                    try renamer.renameWorkspace(XCTUnwrap(renamer.workspace(withID: workspace.id)), newName: "Renamed \(offset)")
+                    try hider.setWorkspaceHidden(XCTUnwrap(hider.workspace(withID: workspace.id)), hidden: true)
+                }
+                while workspaces.enumerated().contains(where: { offset, workspace in
+                    let base = offset * windowsPerWorkspace
+                    return windows[base].manager.hasPendingWorkspaceRenameIntentForTesting(workspaceID: workspace.id)
+                        || windows[base + 1].manager.hasPendingWorkspaceHiddenIntentForTesting(workspaceID: workspace.id)
+                }) {
+                    guard clock.now < deadline else {
+                        XCTFail("Metadata saves did not finish before the 10-second deadline")
+                        throw SaveInterleavingFailure.checkpointTimedOut
+                    }
+                    try await clock.sleep(for: .milliseconds(10))
+                }
+                let final = await runtime.workspaceStore.snapshot().publicationSequence
+                for (index, window) in windows.enumerated() {
+                    let checkpoint = await window.observer.waitForProjection(
+                        afterGeneration: 0, through: final, timeout: max(.zero, clock.now.duration(to: deadline))
+                    )
+                    _ = try XCTUnwrap(checkpoint, "Window \(index) did not observe the final publication")
+                }
+                for (offset, workspace) in workspaces.enumerated() {
+                    let snapshot = await runtime.workspaceStore.canonicalWorkspaceSnapshot(workspace.id)
+                    let saved = try XCTUnwrap(snapshot)
+                    XCTAssertNil(saved.revisions.dirtyRevision)
+                    XCTAssertEqual(try DomainContentDigest.sha256(Data(contentsOf: saved.document.fileURL)), saved.document.contentDigest)
+                    let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: saved.document.documentBytes)
+                    XCTAssertEqual(canonical.name, "Renamed \(offset)")
+                    XCTAssertTrue(canonical.isHiddenInMenus)
+                    XCTAssertEqual(canonical.composeTabs.first?.promptText, "Initial prompt \(offset)")
+                    for (index, window) in windows.enumerated() {
+                        let local = try XCTUnwrap(window.manager.workspace(withID: workspace.id))
+                        XCTAssertEqual(local.name, canonical.name, "Window \(index) name diverged")
+                        XCTAssertEqual(local.isHiddenInMenus, canonical.isHiddenInMenus, "Window \(index) visibility diverged")
+                        XCTAssertEqual(local.composeTabs, canonical.composeTabs, "Window \(index) tabs diverged")
+                    }
+                }
+                let elapsed = clock.now - start
+                print("35-window metadata saves: \(elapsed) (setup \(setup), saves and convergence \(elapsed - setup))")
+                XCTAssertLessThan(elapsed, .seconds(10))
+            } catch {
+                await stopScaleFixture(windows.map(\.bridge), runtime: runtime)
+                throw error
+            }
+            await stopScaleFixture(windows.map(\.bridge), runtime: runtime)
+        }
+
+        private func installCatalogRefresh(
+            for manager: WorkspaceManagerViewModel,
+            bridge: DomainWorkspacePresentationBridge
+        ) {
+            manager.installDomainCatalogRefresh(
+                request: { [weak bridge] in bridge?.requestCatalogRefresh(isRetry: $0) },
+                cancel: { [weak bridge] in bridge?.cancelCatalogRefresh() },
+                awaitRefresh: { [weak bridge] in await bridge?.refreshForAgentAdmission() ?? false }
+            )
+        }
+
+        private func stopScaleFixture(_ bridges: [DomainWorkspacePresentationBridge], runtime: MCPDomainRuntime) async {
+            for manager in managers {
+                manager.prepareForWindowClose()
+            }
+            // Retire refresh work before joining saves; storage stays alive until both drain.
+            for bridge in bridges {
+                bridge.stop()
+            }
+            for manager in managers {
+                try? await manager.debugDrainMetadataSaves()
+                await manager.debugDrainScheduledSaves()
+            }
+            for bridge in bridges {
+                await bridge.stopAndJoinForTesting()
+            }
+            _ = await runtime.shutdown()
+        }
+
         func testWorkspaceMetadataSaveRebasesAfterPeerProjection() async throws {
             enum Edit: CaseIterable { case rename, hide, color }
             for edit in Edit.allCases {
@@ -2883,6 +3361,7 @@ import XCTest
         }
 
         private func withProjectionSaveFixture(
+            additionalWorkspaces: [WorkspaceModel] = [],
             configureClient: (@MainActor (inout DomainWorkspaceAuthorityClient) -> Void)? = nil,
             _ body: @MainActor (ProjectionSaveFixture) async throws -> Void
         ) async throws {
@@ -2894,7 +3373,10 @@ import XCTest
             )
             workspace.stashedTabs = [StashedTab(tab: restoredTab)]
             try writeWorkspace(workspace)
-            try writeLegacyIndex([workspace])
+            for additional in additionalWorkspaces {
+                try writeWorkspace(additional)
+            }
+            try writeLegacyIndex([workspace] + additionalWorkspaces)
             let runtime = try await makeRuntime(profileIdentifier: "workspace-projection-save")
             var client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -759)
             configureClient?(&client)
