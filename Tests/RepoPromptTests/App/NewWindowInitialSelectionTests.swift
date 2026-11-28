@@ -1619,8 +1619,13 @@ import XCTest
                     XCTAssertTrue(window.displayedWindowTitle.contains(target.name))
                 }
                 let (writer, _, edited) = try XCTUnwrap(restores.first)
+                let saved = Signal("workspace color saved")
+                let changes = NotificationCenter.default.publisher(for: .workspaceListDidChange)
+                    .filter { $0.userInfo?["managerID"] is UUID }
+                    .first().sink { _ in saved.fire() }
+                defer { changes.cancel() }
                 writer.workspaceManager.setWorkspaceColor(edited, color: .blue)
-                await writer.workspaceManager.awaitOwnSavesForWindowClose()
+                try await f.wait(saved)
                 for (window, _, target) in restores {
                     try await f.awaitCaughtUpWithCatalogBaseline(window)
                     let expected = target.id == edited.id ? WorkspaceColor.blue : target.workspaceColor

@@ -1980,17 +1980,22 @@ class WorkspaceManagerViewModel: ObservableObject {
     private var pendingFullDocumentWrites: [UUID: PendingFullDocumentWrite] = [:]
     private var workspaceRenameIntentByID: [UUID: UUID] = [:]
     private var workspaceHiddenIntentByID: [UUID: UUID] = [:]
-    private struct WorkspaceColorSaveIntent {
-        let id: UUID
+    /// For each field with a pending choice in this window: the values observed before each of
+    /// those choices, plus every choice's requested value. A newer choice re-applies only over one
+    /// of these values, so an earlier choice of this window, even one already sent to the authority
+    /// that commits later, does not stop it. These are values, not authorship: another window that
+    /// saves one of them is treated the same way.
+    private var workspaceRenamePriorNamesByID: [UUID: Set<String>] = [:]
+    private struct WorkspaceColorRetryWitness {
         let colorID: String?
         let compatibleColorIDs: Set<String?>
-        let dateModified: Date
         let fileURL: URL
         let workspaceFence: UInt64
     }
 
-    private var workspaceColorIntentByID: [UUID: WorkspaceColorSaveIntent] = [:]
-    private var failedWorkspaceColorByID: [UUID: WorkspaceColorSaveIntent] = [:]
+    private var failedWorkspaceColorByID: [UUID: WorkspaceColorRetryWitness] = [:]
+    private var workspaceColorIntentByID: [UUID: UUID] = [:]
+    private var workspaceColorPriorIDsByID: [UUID: Set<String?>] = [:]
     private var workspaceCreationTasksByID: [UUID: Task<Void, Never>] = [:]
     private var domainWorkspaceCatalogRevision: UInt64 = 0
     #if DEBUG
@@ -2492,6 +2497,14 @@ class WorkspaceManagerViewModel: ObservableObject {
             workspaceSaveAttemptCountByWorkspaceIDForTesting.removeAll()
             workspaceSaveCapturePublicationCountByWorkspaceIDForTesting.removeAll()
             savePathComposeTabReloadCountForTesting = 0
+        }
+
+        func hasPendingWorkspaceRenameIntentForTesting(workspaceID: UUID) -> Bool {
+            workspaceRenameIntentByID[workspaceID] != nil
+        }
+
+        func hasPendingWorkspaceHiddenIntentForTesting(workspaceID: UUID) -> Bool {
+            workspaceHiddenIntentByID[workspaceID] != nil
         }
 
         func hasPendingWorkspaceColorIntentForTesting(workspaceID: UUID) -> Bool {
@@ -14714,6 +14727,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         if merged.activePresetID == nil {
             merged.activePresetID = duplicates.lazy.compactMap(\.activePresetID).first
         }
+
         if merged.color == nil {
             merged.color = duplicates.lazy.compactMap(\.color).first
         }
@@ -15178,9 +15192,11 @@ class WorkspaceManagerViewModel: ObservableObject {
         domainWorkspaceFileURLsByID.removeValue(forKey: workspace.id)
         forgetWorkingPublicationTracking(workspaceID: workspace.id)
         workspaceRenameIntentByID.removeValue(forKey: workspace.id)
+        workspaceRenamePriorNamesByID.removeValue(forKey: workspace.id)
         workspaceHiddenIntentByID.removeValue(forKey: workspace.id)
         workspaceColorIntentByID.removeValue(forKey: workspace.id)
         failedWorkspaceColorByID.removeValue(forKey: workspace.id)
+        workspaceColorPriorIDsByID.removeValue(forKey: workspace.id)
         removeConsolidatedRestoreTracking(workspaceID: workspace.id)
         if activeWorkspaceID == workspace.id {
             activeWorkspaceID = nil
@@ -15222,7 +15238,18 @@ class WorkspaceManagerViewModel: ObservableObject {
         let workspaceID = workspace.id
         let intentID = UUID()
         let intentDateModified = workspaces[index].dateModified
+        let priorNames = (workspaceRenameIntentByID[workspaceID] == nil ? [] : workspaceRenamePriorNamesByID[workspaceID] ?? [])
+            .union([previousName])
         workspaceRenameIntentByID[workspaceID] = intentID
+        workspaceRenamePriorNamesByID[workspaceID] = priorNames.union([finalName])
+        let intent = WorkspaceSaveFieldIntent { [weak self] workspace in
+            guard self?.workspaceRenameIntentByID[workspaceID] == intentID,
+                  priorNames.contains(workspace.name) || workspace.name == finalName
+            else { return false }
+            workspace.name = finalName
+            workspace.dateModified = max(workspace.dateModified, intentDateModified)
+            return true
+        }
         Task { @MainActor [weak self] in
             guard let self,
                   workspaceRenameIntentByID[workspaceID] == intentID,
@@ -15231,17 +15258,17 @@ class WorkspaceManagerViewModel: ObservableObject {
             defer {
                 if workspaceRenameIntentByID[workspaceID] == intentID {
                     workspaceRenameIntentByID.removeValue(forKey: workspaceID)
+                    workspaceRenamePriorNamesByID.removeValue(forKey: workspaceID)
                 }
             }
-            workspaceToSave.name = finalName
-            workspaceToSave.dateModified = max(workspaceToSave.dateModified, intentDateModified)
+            guard intent.apply(&workspaceToSave) else { return }
             if let currentIndex = workspaces.firstIndex(where: { $0.id == workspaceID }) {
                 workspaces[currentIndex].name = workspaceToSave.name
                 workspaces[currentIndex].dateModified = workspaceToSave.dateModified
             }
             do {
                 let finalURL = try await saveWorkspaceToFileAsync(
-                    workspaceToSave, source: .renameWorkspace, metadataIntentID: intentID
+                    workspaceToSave, source: .renameWorkspace, fieldIntent: intent
                 )
                 await workspaceDiskWriter.flush(url: finalURL)
 
@@ -15287,6 +15314,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     /// Preserves the predecessor optimistic hidden-state flow for ordinary UI mutations.
     private func setOrdinaryWorkspaceHidden(_ workspace: WorkspaceModel, hidden: Bool) {
         guard let index = workspaces.firstIndex(where: { $0.id == workspace.id }) else { return }
+        let lifecycle = workspaces[index].consolidatedIntoWorkspaceID
         workspaces[index].isHiddenInMenus = hidden
         workspaces[index].dateModified = Date()
 
@@ -15294,6 +15322,10 @@ class WorkspaceManagerViewModel: ObservableObject {
         let intentID = UUID()
         let intentDateModified = workspaces[index].dateModified
         workspaceHiddenIntentByID[workspaceID] = intentID
+        let intent = hiddenFieldIntent(
+            workspaceID: workspaceID, intentID: intentID, hidden: hidden,
+            lifecycle: lifecycle, intentDateModified: intentDateModified
+        )
         Task { @MainActor [weak self] in
             guard let self,
                   workspaceHiddenIntentByID[workspaceID] == intentID,
@@ -15304,15 +15336,14 @@ class WorkspaceManagerViewModel: ObservableObject {
                     workspaceHiddenIntentByID.removeValue(forKey: workspaceID)
                 }
             }
-            workspaceToSave.isHiddenInMenus = hidden
-            workspaceToSave.dateModified = max(workspaceToSave.dateModified, intentDateModified)
+            guard intent.apply(&workspaceToSave) else { return }
             if let currentIndex = workspaces.firstIndex(where: { $0.id == workspaceID }) {
                 workspaces[currentIndex].isHiddenInMenus = workspaceToSave.isHiddenInMenus
                 workspaces[currentIndex].dateModified = workspaceToSave.dateModified
             }
             do {
                 let finalURL = try await saveWorkspaceToFileAsync(
-                    workspaceToSave, source: .setWorkspaceHidden, metadataIntentID: intentID
+                    workspaceToSave, source: .setWorkspaceHidden, fieldIntent: intent
                 )
                 await workspaceDiskWriter.flush(url: finalURL)
 
@@ -15339,172 +15370,93 @@ class WorkspaceManagerViewModel: ObservableObject {
     /// judged from the current record, not the caller's copy, so a retained row action cannot colour
     /// a workspace that has since become a recovery copy.
     func setWorkspaceColor(_ workspace: WorkspaceModel, color: WorkspaceColor?) {
-        let workspaceID = workspace.id
-        guard !isPreparingForWindowClose, !isSessionRuntimeProjection,
-              !pendingConsolidatedRestoreIDs.contains(workspaceID),
-              let index = workspaceIndex(for: workspaceID), Self.acceptsWorkspaceColor(workspaces[index])
+        guard let index = workspaces.firstIndex(where: { $0.id == workspace.id }),
+              Self.acceptsWorkspaceColor(workspaces[index])
         else { return }
         let colorID = color?.rawValue
-        var current = workspaces[index]
-        let previous = workspaceColorIntentByID[workspaceID]
-        let fileURL = workspaceFileURL(for: current)
+        let workspaceID = workspace.id
+        let previousColorID = workspaces[index].color
+        let hasPendingChoice = workspaceColorIntentByID[workspaceID] != nil
+        // Choosing the shown colour again still replaces a pending save of a different choice.
+        let fileURL = workspaceFileURL(for: workspaces[index])
         let fence = ownSaveFenceByWorkspaceID[workspaceID, default: 0]
         let failed = failedWorkspaceColorByID.removeValue(forKey: workspaceID).flatMap { failed in
-            failed.fileURL == fileURL && failed.workspaceFence == fence && failed.colorID == current.color ? failed : nil
+            failed.fileURL == fileURL && failed.workspaceFence == fence && failed.colorID == previousColorID ? failed : nil
         }
-        guard current.color != colorID || previous != nil || failed != nil else { return }
-        var compatible: Set<String?> = [current.color, colorID]
-        if let prior = previous ?? failed, prior.compatibleColorIDs.contains(current.color) {
-            compatible.formUnion(prior.compatibleColorIDs)
-        }
-        current.color = colorID
-        current.dateModified = Date()
-        workspaces[index] = current
-        guard !current.isEphemeral else {
-            failedWorkspaceColorByID.removeValue(forKey: workspaceID)
+        guard previousColorID != colorID || hasPendingChoice || failed != nil else { return }
+        workspaces[index].color = colorID
+        workspaces[index].dateModified = Date()
+        guard !workspaces[index].isEphemeral else {
+            // A memory-only choice also replaces a pending save of an earlier choice.
             workspaceColorIntentByID.removeValue(forKey: workspaceID)
+            workspaceColorPriorIDsByID.removeValue(forKey: workspaceID)
             return
         }
 
-        let intent = WorkspaceColorSaveIntent(
-            id: UUID(), colorID: colorID, compatibleColorIDs: compatible,
-            dateModified: current.dateModified, fileURL: fileURL, workspaceFence: fence
-        )
-        workspaceColorIntentByID[workspaceID] = intent
-        let predecessors = ownTrackedSaveTasks(workspaceID: workspaceID)
-        let legacyCreation = workspaceCreationTasksByID[workspaceID]
+        // The intent token lets an authority projection replace the array element without losing
+        // this request, while a newer colour choice supersedes the older task.
+        let intentID = UUID()
+        let intentDateModified = workspaces[index].dateModified
+        let priorColorIDs = (workspaceColorPriorIDsByID[workspaceID] ?? failed?.compatibleColorIDs ?? [])
+            .union([previousColorID])
+        let compatibleColorIDs = priorColorIDs.union([colorID])
+        workspaceColorIntentByID[workspaceID] = intentID
+        workspaceColorPriorIDsByID[workspaceID] = compatibleColorIDs
         let authorityCreation = pendingPersistentWorkspaceCreationsByWorkspaceID[workspaceID]
-        let task = Task { @MainActor [weak self] in
+        let legacyCreation = workspaceCreationTasksByID[workspaceID]
+        let intent = WorkspaceSaveFieldIntent { [weak self] workspace in
+            guard self?.workspaceColorIntentByID[workspaceID] == intentID,
+                  Self.acceptsWorkspaceColor(workspace),
+                  priorColorIDs.contains(workspace.color) || workspace.color == colorID
+            else { return false }
+            workspace.color = colorID
+            workspace.dateModified = max(workspace.dateModified, intentDateModified)
+            return true
+        }
+        Task { @MainActor [weak self] in
+            guard let self, workspaceColorIntentByID[workspaceID] == intentID else { return }
             defer {
-                self?.scheduledWorkspaceSaveTasks[workspaceID]?.removeValue(forKey: intent.id)
-                if self?.scheduledWorkspaceSaveTasks[workspaceID]?.isEmpty == true {
-                    self?.scheduledWorkspaceSaveTasks.removeValue(forKey: workspaceID)
+                if workspaceColorIntentByID[workspaceID] == intentID {
+                    workspaceColorIntentByID.removeValue(forKey: workspaceID)
+                    workspaceColorPriorIDsByID.removeValue(forKey: workspaceID)
                 }
             }
-            for predecessor in predecessors {
-                await predecessor.value
-            }
-            await legacyCreation?.value
-            await self?.persistWorkspaceColor(workspaceID: workspaceID, intent: intent, creation: authorityCreation)
-        }
-        scheduledWorkspaceSaveTasks[workspaceID, default: [:]][intent.id] = task
-    }
-
-    private func persistWorkspaceColor(
-        workspaceID: UUID, intent: WorkspaceColorSaveIntent, creation: PendingPersistentWorkspaceCreation?
-    ) async {
-        defer {
-            if workspaceColorIntentByID[workspaceID]?.id == intent.id {
-                workspaceColorIntentByID.removeValue(forKey: workspaceID)
-            }
-        }
-        do {
-            // The optimistic row can be edited before its first authority document exists.
-            _ = try await creation?.publishedWorkspace()
-            let finalURL = try await persistAdmittedWorkspaceColor(workspaceID: workspaceID, intent: intent)
-            await workspaceDiskWriter.flush(url: finalURL)
-            if domainWorkspaceAuthorityClient == nil {
-                try await verifyLegacyWorkspaceColor(workspaceID: workspaceID, colorID: intent.colorID, fileURL: finalURL)
-            }
-            if workspaceColorIntentByID[workspaceID]?.id == intent.id {
-                failedWorkspaceColorByID.removeValue(forKey: workspaceID)
-            }
-            NotificationCenter.default.post(
-                name: .workspaceListDidChange, object: nil, userInfo: ["managerID": instanceID]
-            )
-        } catch let failure as WorkspacePersistenceFailure where failure.category == .cancelled {
-            // A newer request, a peer colour, or a lifecycle change took precedence.
-        } catch {
-            if workspaceColorIntentByID[workspaceID]?.id == intent.id {
-                failedWorkspaceColorByID[workspaceID] = intent
-            }
-            print("Error saving color for workspace: \(error)")
-        }
-    }
-
-    private func persistAdmittedWorkspaceColor(workspaceID: UUID, intent: WorkspaceColorSaveIntent) async throws -> URL {
-        if domainWorkspaceAuthorityClient != nil, fullDocumentWriteBaseline(workspaceID: workspaceID) == nil {
-            // Creation can finish (and drop its receipt) before the catalog adopts its bytes.
-            if !isPreparingForWindowClose, let refresh = domainCatalogRefreshAwaiter { _ = await refresh() }
-            if fullDocumentWriteBaseline(workspaceID: workspaceID) == nil {
-                let error = WorkspacePersistenceFailure(category: .workspaceChanged)
-                guard isPreparingForWindowClose else { throw error }
-                return try await saveClosingWorkspaceColor(
-                    workspaceID: workspaceID, fileURL: intent.fileURL, originalError: error
-                ) { workspace in
-                    try self.reapplyWorkspaceColorIntent(intent.id, to: &workspace)
+            do {
+                await legacyCreation?.value
+                _ = try await authorityCreation?.publishedWorkspace()
+                // The creation receipt can arrive before its saved document is adopted.
+                if domainWorkspaceAuthorityClient != nil, fullDocumentWriteBaseline(workspaceID: workspaceID) == nil,
+                   let refresh = domainCatalogRefreshAwaiter
+                {
+                    _ = await refresh()
                 }
+                guard let index = workspaceIndex(for: workspaceID) else { return }
+                var workspaceToSave = workspaces[index]
+                guard intent.apply(&workspaceToSave) else { return }
+                if workspaces[index] != workspaceToSave { workspaces[index] = workspaceToSave }
+                let finalURL = try await saveWorkspaceToFileAsync(
+                    workspaceToSave, source: .setWorkspaceColor, fieldIntent: intent
+                )
+                await workspaceDiskWriter.flush(url: finalURL)
+                if domainWorkspaceAuthorityClient == nil {
+                    try await verifyLegacyWorkspaceColor(workspaceID: workspaceID, colorID: colorID, fileURL: finalURL)
+                }
+                NotificationCenter.default.post(
+                    name: .workspaceListDidChange,
+                    object: nil,
+                    userInfo: ["managerID": instanceID]
+                )
+            } catch let failure as WorkspacePersistenceFailure where failure.category == .cancelled {
+                // The intent was superseded or no longer applies.
+            } catch {
+                if workspaceColorIntentByID[workspaceID] == intentID {
+                    failedWorkspaceColorByID[workspaceID] = WorkspaceColorRetryWitness(
+                        colorID: colorID, compatibleColorIDs: compatibleColorIDs, fileURL: fileURL, workspaceFence: fence
+                    )
+                }
+                print("Error saving color for workspace: \(error)")
             }
         }
-        do {
-            return try await saveWorkspaceColorOnce(workspaceID: workspaceID, intent: intent)
-        } catch let error as DomainWorkspaceAuthorityOperationError
-            where !error.workingCommitted && error.outcome.errorCode == .stateConflict
-            && error.outcome.diagnostic == "workspace_revision_mismatch"
-        {
-            return try await replayWorkspaceColorAfterConflict(workspaceID: workspaceID, intent: intent, error: error)
-        }
-    }
-
-    private func replayWorkspaceColorAfterConflict(
-        workspaceID: UUID, intent: WorkspaceColorSaveIntent, error: DomainWorkspaceAuthorityOperationError
-    ) async throws -> URL {
-        try validateWorkspaceMetadataIntent(intent.id, workspaceID: workspaceID, source: .setWorkspaceColor)
-        if !isPreparingForWindowClose, let refresh = domainCatalogRefreshAwaiter {
-            let refreshed = await refresh()
-            let canonical = refreshed && !isPreparingForWindowClose
-                ? await domainWorkspaceAuthorityClient?.canonicalWorkspaceSnapshot(workspaceID) : nil
-            if !isPreparingForWindowClose {
-                guard let canonical,
-                      let baseline = fullDocumentWriteBaseline(workspaceID: workspaceID),
-                      baseline.workingRevision == canonical.revisions.workingRevision,
-                      baseline.contentDigest == canonical.document.contentDigest,
-                      baseline.fileURL == intent.fileURL, canonical.document.fileURL == intent.fileURL
-                else { throw error }
-                return try await saveWorkspaceColorOnce(workspaceID: workspaceID, intent: intent)
-            }
-        }
-        guard isPreparingForWindowClose else { throw error }
-        return try await saveClosingWorkspaceColor(
-            workspaceID: workspaceID, fileURL: intent.fileURL, originalError: error
-        ) { workspace in
-            try self.reapplyWorkspaceColorIntent(intent.id, to: &workspace)
-        }
-    }
-
-    private func saveClosingWorkspaceColor(
-        workspaceID: UUID, fileURL: URL, originalError: any Error,
-        apply: (inout WorkspaceModel) throws -> Void
-    ) async throws -> URL {
-        // The closing bridge cannot adopt a catalog. Rebuild only the explicit color field from
-        // exact saved bytes; a local whole-document proposal cannot borrow this revision.
-        guard let client = domainWorkspaceAuthorityClient,
-              let canonical = await client.canonicalWorkspaceSnapshot(workspaceID),
-              canonical.document.fileURL == fileURL, canonical.health.acceptsMutations,
-              canonical.revisions.dirtyRevision == nil
-        else { throw originalError }
-        var workspace = try Self.decodeDomainWorkspaceProjection(
-            documentBytes: canonical.document.documentBytes, fileURL: fileURL, preserveUnreadableDocument: false
-        )
-        guard workspace.id == workspaceID, Self.acceptsWorkspaceColor(workspace), !workspace.isEphemeral else {
-            throw originalError
-        }
-        try apply(&workspace)
-        let document = try await WorkspaceFileDecodeCache.shared.documentPreparation.documentBySettingColor(
-            workspace.color, dateModified: workspace.dateModified, in: canonical.document
-        )
-        guard !agentAdmissionRecoveryOwnsWorkspace(workspaceID) else { throw originalError }
-        try apply(&workspace)
-        let result = try await client.saveFailClosed(
-            document, expectedWorkspaceRevision: canonical.revisions.workingRevision,
-            expectedContentDigest: canonical.document.contentDigest
-        )
-        guard let outcome = result.finalOutcome else { throw originalError }
-        guard Self.isSuccessfulDomainOutcome(outcome) else {
-            throw DomainWorkspaceAuthorityOperationError(outcome: outcome, workingCommitted: result.workingCommitted)
-        }
-        WorkspaceFileDecodeCache.shared.invalidate(url: fileURL)
-        return fileURL
     }
 
     private func verifyLegacyWorkspaceColor(workspaceID: UUID, colorID: String?, fileURL: URL) async throws {
@@ -15514,25 +15466,6 @@ class WorkspaceManagerViewModel: ObservableObject {
             return model.id == workspaceID && model.color == colorID
         }.value
         guard persisted else { throw WorkspacePersistenceFailure(category: .workspaceChanged) }
-    }
-
-    private func saveWorkspaceColorOnce(workspaceID: UUID, intent: WorkspaceColorSaveIntent) async throws -> URL {
-        guard let index = workspaceIndex(for: workspaceID) else {
-            throw WorkspaceDirectWriteError.workspaceUnavailable
-        }
-        var proposal = workspaces[index]
-        try reapplyWorkspaceColorIntent(intent.id, to: &proposal)
-        if workspaces[index] != proposal { workspaces[index] = proposal }
-        return try await saveWorkspaceToFileAsync(proposal, source: .setWorkspaceColor, metadataIntentID: intent.id)
-    }
-
-    private func reapplyWorkspaceColorIntent(_ intentID: UUID, to workspace: inout WorkspaceModel) throws {
-        try validateWorkspaceMetadataIntent(intentID, workspaceID: workspace.id, source: .setWorkspaceColor)
-        guard let intent = workspaceColorIntentByID[workspace.id],
-              intent.compatibleColorIDs.contains(workspace.color)
-        else { throw WorkspacePersistenceFailure(category: .cancelled) }
-        workspace.color = intent.colorID
-        workspace.dateModified = max(workspace.dateModified, intent.dateModified)
     }
 
     private static func acceptsWorkspaceColor(_ workspace: WorkspaceModel) -> Bool {
@@ -15568,6 +15501,28 @@ class WorkspaceManagerViewModel: ObservableObject {
         return !pendingConsolidatedRestoreIDs.contains(workspaceID)
     }
 
+    /// The hidden-state change of one request. Showing a recovery copy is a restore, which
+    /// `setWorkspaceHidden` routes elsewhere; a consolidation or restore since the request ends it.
+    private func hiddenFieldIntent(
+        workspaceID: UUID,
+        intentID: UUID,
+        hidden: Bool,
+        lifecycle: UUID?,
+        intentDateModified: Date
+    ) -> WorkspaceSaveFieldIntent {
+        WorkspaceSaveFieldIntent { [weak self] workspace in
+            guard self?.workspaceHiddenIntentByID[workspaceID] == intentID,
+                  workspace.consolidatedIntoWorkspaceID == lifecycle,
+                  hidden || workspace.consolidatedIntoWorkspaceID == nil
+            else { return false }
+            workspace.isHiddenInMenus = hidden
+            workspace.dateModified = max(workspace.dateModified, intentDateModified)
+            return true
+        }
+    }
+
+    /// On success, returns the latest in-memory workspace. Concurrent changes may be newer than the
+    /// document this call saved.
     func setWorkspaceHiddenFromSnapshot(_ workspace: WorkspaceModel, hidden: Bool) async throws -> WorkspaceModel {
         var current = self.workspace(withID: workspace.id)
         var isAuthorityIncompleteRestore = authorityIncompleteConsolidatedRestoreIDs.contains(workspace.id)
@@ -15661,6 +15616,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 workspaces.append(updated)
             }
 
+            // Same intent as the UI setter, so another window's save during this one keeps it.
             let intentID = UUID()
             workspaceHiddenIntentByID[updated.id] = intentID
             defer {
@@ -15669,7 +15625,12 @@ class WorkspaceManagerViewModel: ObservableObject {
                 }
             }
             let finalURL = try await saveWorkspaceToFileAsync(
-                updated, source: .setWorkspaceHiddenFromSnapshot, metadataIntentID: intentID
+                updated,
+                source: .setWorkspaceHiddenFromSnapshot,
+                fieldIntent: hiddenFieldIntent(
+                    workspaceID: updated.id, intentID: intentID, hidden: hidden,
+                    lifecycle: current.consolidatedIntoWorkspaceID, intentDateModified: updated.dateModified
+                )
             )
             await workspaceDiskWriter.flush(url: finalURL)
 
@@ -16894,6 +16855,22 @@ class WorkspaceManagerViewModel: ObservableObject {
         let ownedPublicationGeneration: UInt64?
     }
 
+    /// The name or visibility change an optimistic setter is saving. Another window's
+    /// save can replace this window's copy while the save is suspended, or win the authority's
+    /// revision check first; the save then applies the change again to that window's adopted save
+    /// instead of saving the replacement as if it carried the change, or dropping it.
+    struct WorkspaceSaveFieldIntent {
+        /// Applies the change and returns true while the requesting setter still owns it and the
+        /// workspace still accepts it. A rename requires a name observed or requested by this
+        /// window's pending choices, so it cannot replace an unrelated peer rename.
+        let apply: @MainActor (inout WorkspaceModel) -> Bool
+    }
+
+    /// Extra attempts a field save may spend applying its change again to another window's save,
+    /// whether that save won the revision check or was reinstalled over the change in memory,
+    /// before the failure is returned to the setter. Other saves get none.
+    private static let fieldIntentRebaseLimit = 7
+
     /// The proposal may differ from the local model for an explicit direct save. Both it and
     /// the observed model must keep the revision under which the save began across suspensions.
     private struct DomainAuthoritySaveCapture {
@@ -16952,30 +16929,11 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
     }
 
-    private func validateWorkspaceMetadataIntent(_ intentID: UUID?, workspaceID: UUID, source: WorkspaceSaveSource) throws {
-        guard let intentID else { return }
-        let currentIntentID: UUID?
-        switch source {
-        case .renameWorkspace:
-            currentIntentID = workspaceRenameIntentByID[workspaceID]
-        case .setWorkspaceHidden, .setWorkspaceHiddenFromSnapshot:
-            currentIntentID = workspaceHiddenIntentByID[workspaceID]
-        case .setWorkspaceColor:
-            // Close drains accepted colour choices, including inactive workspaces that the final
-            // active-workspace capture cannot save. Workspace recovery still fences those choices.
-            try Task.checkCancellation()
-            guard let intent = workspaceColorIntentByID[workspaceID],
-                  intent.workspaceFence == ownSaveFenceByWorkspaceID[workspaceID, default: 0],
-                  !pendingConsolidatedRestoreIDs.contains(workspaceID),
-                  let current = workspace(withID: workspaceID), !current.isEphemeral,
-                  Self.acceptsWorkspaceColor(current), intent.compatibleColorIDs.contains(current.color),
-                  workspaceFileURL(for: current) == intent.fileURL
-            else { throw WorkspacePersistenceFailure(category: .cancelled) }
-            currentIntentID = intent.id
-        default:
-            currentIntentID = nil
-        }
-        guard currentIntentID == intentID else { throw WorkspacePersistenceFailure(category: .cancelled) }
+    private func publishRebasedWorkspace(_ workspace: WorkspaceModel) {
+        guard let index = workspaceIndex(for: workspace.id), workspaces[index] != workspace else { return }
+        let previousName = workspaces[index].name
+        workspaces[index] = workspace
+        invalidateWorkspaceLocationLabels(workspaceID: workspace.id, previousName: previousName, name: workspace.name)
     }
 
     private func retryStaleDomainAuthoritySave(
@@ -16990,7 +16948,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         ownedPublicationGeneration: UInt64?,
         ownSaveFence: OwnSaveFence?,
         recaptureActivationGeneration: UInt64?,
-        metadataIntentID: UUID?
+        fieldIntent: WorkspaceSaveFieldIntent?,
+        remainingFieldIntentRebases: Int
     ) async throws -> DomainAuthoritySaveResult {
         try Task.checkCancellation()
         #if DEBUG
@@ -17042,15 +17001,13 @@ class WorkspaceManagerViewModel: ObservableObject {
             // report success without ever writing that tab.
             throw WorkspacePersistenceFailure(category: .workspaceChanged)
         }
-        // Colour carries one explicit field across adoption. A qualified baseline proves the
-        // current model descends from adopted bytes even if they were reinstalled unchanged.
-        let canReapplyColor = source == .setWorkspaceColor && metadataIntentID != nil
-            && fullDocumentWriteBaseline(workspaceID: proposal.id)?.fileURL == capture.fileURL
-        if !canReapplyColor, currentGeneration != capture.adoptionGeneration,
-           domainWorkspaceDigestsByID[proposal.id] == capture.digest
+        if currentGeneration != capture.adoptionGeneration,
+           domainWorkspaceDigestsByID[proposal.id] == capture.digest,
+           fieldIntent == nil || fullDocumentWriteBaseline(workspaceID: proposal.id) == nil
         {
             // Reinstalling the same canonical bytes can still discard a local proposal. It is
             // not the committed predecessor handoff for which this retry preserves descendants.
+            // A field save applies its change to the reinstalled bytes below, so it continues.
             throw WorkspacePersistenceFailure(category: .workspaceChanged)
         }
         // A joined own publisher may have committed while the newer local model was captured.
@@ -17059,19 +17016,34 @@ class WorkspaceManagerViewModel: ObservableObject {
         let retainedWriteLineage = capture.writeBaseline != nil
             && currentGeneration == capture.adoptionGeneration
             && fullDocumentWriteBaseline(workspaceID: proposal.id)?.adoptionGeneration == capture.adoptionGeneration
-        if !canReapplyColor, !retainedWriteLineage,
+        if !retainedWriteLineage,
            domainWorkspaceRevisionsByID[proposal.id]?.workingRevision != capture.revisions?.workingRevision
            || domainWorkspaceDigestsByID[proposal.id] != capture.digest
         {
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = .sortedKeys
-            let digest = try DomainContentDigest.sha256(encoder.encode(current))
-            guard digest == domainWorkspaceDigestsByID[proposal.id] else {
-                throw WorkspacePersistenceFailure(category: .workspaceChanged)
+            // A field save writes only its own field onto `current`, which may already carry this
+            // window's other field replays made since adoption. It needs proof that `current`
+            // descends from the adopted document, not that it equals it.
+            let descendsFromAdoptedDocument = fieldIntent != nil
+                && fullDocumentWriteBaseline(workspaceID: proposal.id) != nil
+            if !descendsFromAdoptedDocument {
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = .sortedKeys
+                let digest = try DomainContentDigest.sha256(encoder.encode(current))
+                guard digest == domainWorkspaceDigestsByID[proposal.id] else {
+                    throw WorkspacePersistenceFailure(category: .workspaceChanged)
+                }
             }
         }
-        guard remainingRetryCount > 0 else {
-            throw WorkspacePersistenceFailure(category: .localSavePreparationRetryExhausted)
+        // A field save re-applies its change below, so once its ordinary retry is spent it may
+        // keep rebasing on its own bounded allowance.
+        var nextRetryCount = remainingRetryCount - 1
+        var nextFieldIntentRebases = remainingFieldIntentRebases
+        if remainingRetryCount <= 0 {
+            guard fieldIntent != nil, remainingFieldIntentRebases > 0 else {
+                throw WorkspacePersistenceFailure(category: .localSavePreparationRetryExhausted)
+            }
+            nextRetryCount = 0
+            nextFieldIntentRebases -= 1
         }
         recordAgentAdmissionLocalRetry(
             workspaceID: proposal.id,
@@ -17095,35 +17067,63 @@ class WorkspaceManagerViewModel: ObservableObject {
             current = recaptured
             retryPublicationGeneration = generation
         }
-        // Reapply the requested field to the qualified retry model after peer projection.
-        try validateWorkspaceMetadataIntent(metadataIntentID, workspaceID: proposal.id, source: source)
-        if metadataIntentID != nil {
+        if let fieldIntent {
+            // `current` may be another window's adopted save, which lacks this change. Apply it
+            // on top so that window's edits survive too, and show it here: this window's own
+            // committed save is not echoed back to it.
             try validateConsolidationLifecycle(proposal)
-            if source == .setWorkspaceColor, let metadataIntentID {
-                try reapplyWorkspaceColorIntent(metadataIntentID, to: &current)
-                if let index = workspaceIndex(for: current.id), workspaces[index] != current {
-                    workspaces[index] = current
-                }
-            } else if source == .renameWorkspace {
-                current.name = proposal.name
-            } else {
-                current.isHiddenInMenus = proposal.isHiddenInMenus
+            guard fieldIntent.apply(&current) else {
+                throw WorkspacePersistenceFailure(category: .cancelled)
             }
-            current.dateModified = max(current.dateModified, proposal.dateModified)
+            publishRebasedWorkspace(current)
         }
         return try await persistWorkspaceThroughDomainAuthority(
             current,
             targetURL: targetURL,
             preserveDiskRepoPathsIfUnchangedSinceBaseline: preserveDiskRepoPathsIfUnchangedSinceBaseline,
             source: source,
-            remainingRetryCount: remainingRetryCount - 1,
+            remainingRetryCount: nextRetryCount,
             creationOperationID: creationOperationID,
             issueClearance: issueClearance,
             ownedPublicationGeneration: retryPublicationGeneration,
             ownSaveFence: ownSaveFence,
             recaptureActivationGeneration: recaptureActivationGeneration,
-            metadataIntentID: metadataIntentID
+            fieldIntent: fieldIntent,
+            remainingFieldIntentRebases: nextFieldIntentRebases
         )
+    }
+
+    /// Waits, through the bridge's existing catalog refresh, until this window has adopted the save
+    /// that won the revision check, then applies `fieldIntent` to that adopted copy and shows it.
+    /// Returns nil when the change no longer applies or no adopted copy is writable after two
+    /// refreshes; the caller then returns the conflict.
+    private func workspaceRebasingFieldIntentAfterConflict(
+        proposal: WorkspaceModel,
+        fileURL: URL,
+        fieldIntent: WorkspaceSaveFieldIntent,
+        ownSaveFence: OwnSaveFence?
+    ) async throws -> WorkspaceModel? {
+        let workspaceID = proposal.id
+        guard let refresh = domainCatalogRefreshAwaiter else { return nil }
+        for _ in 0 ..< 2 {
+            // Stop if the refresh did not complete for the current bridge run; adoption itself is
+            // proven separately by the write baseline below.
+            guard await refresh() else { return nil }
+            try Task.checkCancellation()
+            guard !isPreparingForWindowClose,
+                  isOwnSaveFenceCurrent(ownSaveFence, workspaceID: workspaceID),
+                  var current = workspace(withID: workspaceID), !current.isEphemeral,
+                  workspaceFileURL(for: current) == fileURL
+            else { return nil }
+            guard fullDocumentWriteBaseline(workspaceID: workspaceID) != nil else { continue }
+            guard !pendingConsolidatedRestoreIDs.contains(workspaceID),
+                  current.consolidatedIntoWorkspaceID == proposal.consolidatedIntoWorkspaceID,
+                  fieldIntent.apply(&current)
+            else { return nil }
+            publishRebasedWorkspace(current)
+            return current
+        }
+        return nil
     }
 
     private func persistWorkspaceThroughDomainAuthority(
@@ -17137,7 +17137,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         ownedPublicationGeneration: UInt64? = nil,
         ownSaveFence: OwnSaveFence? = nil,
         recaptureActivationGeneration: UInt64? = nil,
-        metadataIntentID: UUID? = nil
+        fieldIntent: WorkspaceSaveFieldIntent? = nil,
+        remainingFieldIntentRebases: Int = 0
     ) async throws -> DomainAuthoritySaveResult {
         let issueClearance = issueClearance ?? DomainAuthorityIssueClearance(issueID: domainWorkspaceAuthorityIssue?.id)
         guard !workspace.isEphemeral else {
@@ -17188,8 +17189,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                 source: source, remainingRetryCount: remainingRetryCount,
                 creationOperationID: creationOperationID, issueClearance: issueClearance,
                 ownedPublicationGeneration: ownedPublicationGeneration, ownSaveFence: ownSaveFence,
-                recaptureActivationGeneration: recaptureActivationGeneration,
-                metadataIntentID: metadataIntentID
+                recaptureActivationGeneration: recaptureActivationGeneration, fieldIntent: fieldIntent,
+                remainingFieldIntentRebases: remainingFieldIntentRebases
             )
         }
 
@@ -17296,8 +17297,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                 source: source, remainingRetryCount: remainingRetryCount,
                 creationOperationID: creationOperationID, issueClearance: issueClearance,
                 ownedPublicationGeneration: ownedPublicationGeneration, ownSaveFence: ownSaveFence,
-                recaptureActivationGeneration: recaptureActivationGeneration,
-                metadataIntentID: metadataIntentID
+                recaptureActivationGeneration: recaptureActivationGeneration, fieldIntent: fieldIntent,
+                remainingFieldIntentRebases: remainingFieldIntentRebases
             )
         }
         guard isOwnSaveFenceCurrent(ownSaveFence, workspaceID: workspace.id) else {
@@ -17369,8 +17370,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                     source: source, remainingRetryCount: remainingRetryCount,
                     creationOperationID: creationOperationID, issueClearance: issueClearance,
                     ownedPublicationGeneration: ownedPublicationGeneration, ownSaveFence: ownSaveFence,
-                    recaptureActivationGeneration: recaptureActivationGeneration,
-                    metadataIntentID: metadataIntentID
+                    recaptureActivationGeneration: recaptureActivationGeneration, fieldIntent: fieldIntent,
+                    remainingFieldIntentRebases: remainingFieldIntentRebases
                 )
             }
             // Last point before this save writes to the authority. A superseded own save bails
@@ -17378,7 +17379,12 @@ class WorkspaceManagerViewModel: ObservableObject {
             guard isOwnSaveFenceCurrent(ownSaveFence, workspaceID: workspaceToSave.id) else {
                 throw WorkspacePersistenceFailure(category: .cancelled)
             }
-            try validateWorkspaceMetadataIntent(metadataIntentID, workspaceID: workspaceToSave.id, source: source)
+            if let fieldIntent {
+                var validated = workspaceToSave
+                guard fieldIntent.apply(&validated), validated == workspaceToSave else {
+                    throw WorkspacePersistenceFailure(category: .cancelled)
+                }
+            }
             if let existing {
                 // A manager without an accepted authority baseline may save only when its
                 // observed local model is exactly the canonical model it just read. Otherwise
@@ -17476,10 +17482,41 @@ class WorkspaceManagerViewModel: ObservableObject {
         )
         guard Self.isSuccessfulDomainOutcome(outcome) else {
             await refreshCanonicalRootState(workspaceID: workspaceToSave.id)
-            throw DomainWorkspaceAuthorityOperationError(
+            let failure = DomainWorkspaceAuthorityOperationError(
                 outcome: outcome,
                 workingCommitted: workingCommitted
             )
+            // Another window's save won the revision check. A field save rebases onto that save,
+            // once this window has adopted it, instead of dropping the change.
+            guard let fieldIntent, remainingFieldIntentRebases > 0, !requiresExactSnapshotAttempt,
+                  outcome.errorCode == .stateConflict, outcome.diagnostic == "workspace_revision_mismatch"
+            else { throw failure }
+            pendingOperationIDs.forEach { pendingFullDocumentWrites.removeValue(forKey: $0) }
+            pendingOperationIDs = []
+            do {
+                guard let rebased = try await workspaceRebasingFieldIntentAfterConflict(
+                    proposal: workspaceToSave, fileURL: targetURL,
+                    fieldIntent: fieldIntent, ownSaveFence: ownSaveFence
+                ) else { throw failure }
+                return try await persistWorkspaceThroughDomainAuthority(
+                    rebased,
+                    targetURL: targetURL,
+                    preserveDiskRepoPathsIfUnchangedSinceBaseline: preserveDiskRepoPathsIfUnchangedSinceBaseline,
+                    source: source,
+                    remainingRetryCount: 1,
+                    issueClearance: issueClearance,
+                    ownedPublicationGeneration: ownedPublicationGeneration,
+                    ownSaveFence: ownSaveFence,
+                    recaptureActivationGeneration: recaptureActivationGeneration,
+                    fieldIntent: fieldIntent,
+                    remainingFieldIntentRebases: remainingFieldIntentRebases - 1
+                )
+            } catch let later as DomainWorkspaceAuthorityOperationError where workingCommitted {
+                throw DomainWorkspaceAuthorityOperationError(outcome: later.outcome, workingCommitted: true)
+            } catch where workingCommitted {
+                // A local refusal after the working phase must not hide that it committed.
+                throw failure
+            }
         }
 
         if let index = workspaceIndex(for: workspaceToSave.id),
@@ -17491,12 +17528,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             published.customStoragePath = workspaceToSave.customStoragePath
             published.isSystemWorkspace = workspaceToSave.isSystemWorkspace
             published.isHiddenInMenus = workspaceToSave.isHiddenInMenus
-            if source == .setWorkspaceColor {
-                if workspaceColorIntentByID[workspaceToSave.id]?.id == metadataIntentID {
-                    published.color = workspaceToSave.color
-                    published.dateModified = workspaceToSave.dateModified
-                }
-            } else if metadataIntentID != nil {
+            if fieldIntent != nil {
                 published.dateModified = workspaceToSave.dateModified
             }
             if mergeResult.preservedDiskRepoPaths,
@@ -17634,7 +17666,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         preserveDiskRepoPathsIfUnchangedSinceBaseline: Bool = true,
         source: WorkspaceSaveSource = .directUnknown,
         rootEditContext: RootEditSaveContext? = nil,
-        metadataIntentID: UUID? = nil
+        fieldIntent: WorkspaceSaveFieldIntent? = nil
     ) async throws -> URL {
         let targetURL = workspaceFileURL(for: workspace)
         guard !isSessionRuntimeProjection else { throw WorkspaceDirectWriteError.domainAuthorityRequired }
@@ -17656,7 +17688,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                 preserveDiskRepoPathsIfUnchangedSinceBaseline: preserveDiskRepoPathsIfUnchangedSinceBaseline,
                 source: source,
                 remainingRetryCount: 1,
-                metadataIntentID: metadataIntentID
+                fieldIntent: fieldIntent,
+                remainingFieldIntentRebases: fieldIntent == nil ? 0 : Self.fieldIntentRebaseLimit
             )
             lastSavedVersionByWorkspaceID[workspace.id] = result.savedStateVersion
             return result.fileURL
@@ -17669,22 +17702,15 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
 
         var workspaceToSave = workspace
-        if source == .setWorkspaceColor, let metadataIntentID {
-            guard let current = self.workspace(withID: workspace.id) else {
-                throw WorkspaceDirectWriteError.workspaceUnavailable
-            }
-            workspaceToSave = current
-            try reapplyWorkspaceColorIntent(metadataIntentID, to: &workspaceToSave)
-        }
         if preserveDiskRepoPathsIfUnchangedSinceBaseline,
            FileManager.default.fileExists(atPath: targetURL.path)
         {
             let diskWorkspace = try? Self.loadWorkspaceFromFile(at: targetURL, scheduleNormalizationWriteback: false)
             let mergeResult = Self.workspaceForSavePreservingDiskRepoPaths(
-                current: workspaceToSave,
+                current: workspace,
                 diskWorkspace: diskWorkspace,
                 lastSyncedRepoPaths: lastSyncedRepoPathsByWorkspaceID[workspace.id],
-                modificationDate: workspaceToSave.dateModified
+                modificationDate: workspace.dateModified
             )
             workspaceToSave = mergeResult.workspace
             if mergeResult.preservedDiskRepoPaths,
@@ -17709,10 +17735,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                     ]
                 )
             #endif
-            return try await saveWorkspaceToFileAsync(
-                workspaces[index], preserveDiskRepoPathsIfUnchangedSinceBaseline: preserveDiskRepoPathsIfUnchangedSinceBaseline,
-                source: source, rootEditContext: rootEditContext, metadataIntentID: source == .setWorkspaceColor ? metadataIntentID : nil
-            )
+            return try await saveWorkspaceToFileAsync(workspaces[index], preserveDiskRepoPathsIfUnchangedSinceBaseline: preserveDiskRepoPathsIfUnchangedSinceBaseline, source: source, rootEditContext: rootEditContext)
         }
 
         let changesConsolidationLifecycle = source == .duplicateCleanupCanonicalMerge
