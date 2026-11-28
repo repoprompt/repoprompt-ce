@@ -92,13 +92,16 @@ protocol RemoteHistoryReadService: AnyObject {
 final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryReadService {
     private let contexts: [(agentMode: AgentModeViewModel, workspaceManager: WorkspaceManagerViewModel)]
     private let revisionTracker: RemoteTranscriptRevisionTracker?
+    private let workspaceScope: UUID?
 
     init(
         contexts: [(agentMode: AgentModeViewModel, workspaceManager: WorkspaceManagerViewModel)],
-        revisionTracker: RemoteTranscriptRevisionTracker? = nil
+        revisionTracker: RemoteTranscriptRevisionTracker? = nil,
+        workspaceScope: UUID? = nil
     ) {
         self.contexts = contexts
         self.revisionTracker = revisionTracker
+        self.workspaceScope = workspaceScope
     }
 
     func transcript(
@@ -119,7 +122,7 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
         default: false
         }
 
-        for context in contexts {
+        for context in contexts where workspaceScope == nil || context.workspaceManager.activeWorkspaceID == workspaceScope {
             if let liveSession = context.agentMode.sessions.values.first(where: { $0.activeAgentSessionID == sessionID }) {
                 transcript = liveSession.transcript
                 liveMutationRevision = liveSession.remoteTranscriptMutationRevision
@@ -143,7 +146,9 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
 
         if transcript == nil {
             persistedSearch: for context in contexts {
-                for workspace in context.workspaceManager.workspaces where !workspace.isEphemeral {
+                for workspace in context.workspaceManager.workspaces
+                    where !workspace.isEphemeral && (workspaceScope == nil || workspace.id == workspaceScope)
+                {
                     guard let persisted = try? await AgentSessionDataService.shared.loadAgentSession(id: sessionID, for: workspace)
                     else { continue }
                     transcript = persisted.transcript ?? .empty
@@ -351,6 +356,13 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
     }
 
     func history(_ request: RemoteHistoryRPCRequest) async throws -> RemoteHistoryPage {
+        try await history(request, including: [])
+    }
+
+    func history(_ request: RemoteHistoryRPCRequest, including liveEntries: [RemoteHistoryEntry]) async throws -> RemoteHistoryPage {
+        if let workspaceScope, request.workspaceID != workspaceScope {
+            throw RemoteReadServiceError.workspaceNotFound
+        }
         let workspaceID = request.workspaceID
         let candidates = contexts.flatMap(\.workspaceManager.workspaces)
         var visited: Set<UUID> = []
@@ -380,7 +392,7 @@ final class WindowRemoteReadService: RemoteTranscriptReadService, RemoteHistoryR
         if let workspaceID, !visited.contains(workspaceID) {
             throw RemoteReadServiceError.workspaceNotFound
         }
-        return Self.historyPage(entries: entries, request: request)
+        return Self.historyPage(entries: entries + liveEntries, request: request)
     }
 
     static func historyPage(entries: [RemoteHistoryEntry], request: RemoteHistoryRPCRequest) -> RemoteHistoryPage {

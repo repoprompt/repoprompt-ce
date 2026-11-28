@@ -42,7 +42,9 @@ final class RemoteGatewayController: NSObject, ObservableObject {
     private static let defaultAuthorityKey = "RepoPrompt.remote.defaultAuthority"
 
     private weak var windowStatesManager: WindowStatesManager?
-    private var controlService: (any RemoteAgentControlService)?
+    private var controlService: WindowRemoteAgentControlService?
+    private let workspaceVoice = RemoteWorkspaceVoiceService()
+    private let workspacePresentation = RemoteWorkspacePresentationController()
     private let pairingManager = RemotePairingManager()
     private let irohIdentityStore = RemoteIrohIdentityStore()
     let availabilityController = RemoteAvailabilityController()
@@ -127,6 +129,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
             }
             if !RemoteAuthorizationState(defaultLevel: newValue).allows(.control) {
                 controlService?.clearAttachmentUploads()
+                workspaceVoice.invalidate()
             }
             UserDefaults.standard.set(newValue.rawValue, forKey: Self.defaultAuthorityKey)
         }
@@ -180,6 +183,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
 
     func stop() {
         commandGeneration &+= 1
+        workspaceVoice.invalidate()
         controlService?.clearAttachmentUploads()
         eventPollTask?.cancel()
         eventPollTask = nil
@@ -242,6 +246,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
 
     private func publishPairingRevocation() {
         commandGeneration &+= 1
+        workspaceVoice.invalidate()
         controlService?.clearAttachmentUploads()
         irohAdapter.revokePeerSessions()
         refreshPairingStatus()
@@ -428,12 +433,129 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                 let result = await snapshot(bootstrap: true)
                 lastSnapshotAt = Date()
                 return result
+            },
+            workspaceVoice: { [unowned self] request, context in
+                let generation = commandGeneration
+                let isAuthorized: @MainActor () -> Bool = { [weak self] in
+                    guard let self else { return false }
+                    return commandGeneration == generation && authorizationState.allows(.control)
+                        && requestRouter.isAuthorized(context)
+                }
+                return try workspaceVoice.handle(request, peerEndpointID: context.endpointID, isAuthorized: isAuthorized) { [weak self] in
+                    guard let self else { throw RemoteWorkspaceVoiceError.unavailable }
+                    if voiceWindows(request.workspaceID).isEmpty {
+                        try await setWorkspacePresentation(.init(workspaceID: request.workspaceID, isOpen: true), source: .voice) {
+                            guard isAuthorized() else { throw RemoteWorkspaceVoiceError.unavailable }
+                        }
+                    }
+                    return try makeWorkspaceVoiceAccess(workspaceID: request.workspaceID, isCallAuthorized: isAuthorized)
+                }
+            },
+            workspacePresentation: { [unowned self] request, authorizeDispatch in
+                try await setWorkspacePresentation(request, authorizeDispatch: authorizeDispatch)
+            }
+        )
+    }
+
+    private func voiceWindows(_ workspaceID: UUID) -> [WindowState] {
+        guard let manager = windowStatesManager else { return [] }
+        return RemoteWorkspacePresentationController.windows(showing: workspaceID, in: manager).filter {
+            $0.workspaceManager.activeWorkspace?.isEphemeral == false
+        }
+    }
+
+    private func setWorkspacePresentation(
+        _ request: RemoteWorkspacePresentation,
+        source: RemoteWorkspacePresentationController.OpenSource = .picker,
+        authorizeDispatch: RemoteDispatchAuthorization
+    ) async throws {
+        guard let manager = windowStatesManager else { throw RemoteWorkspaceVoiceError.unavailable }
+        try await workspacePresentation.set(
+            request,
+            source: source,
+            in: manager,
+            isVoiceActive: workspaceVoice.isUsingWorkspace,
+            authorizeDispatch: authorizeDispatch
+        )
+    }
+
+    private func makeWorkspaceVoiceAccess(
+        workspaceID: UUID,
+        isCallAuthorized: @escaping @MainActor () -> Bool
+    ) throws -> RemoteWorkspaceVoiceAccess {
+        guard let workspace = voiceWindows(workspaceID).first?.workspaceManager.activeWorkspace else {
+            throw RemoteWorkspaceVoiceError.workspaceClosed
+        }
+        let isAuthorized = { [weak self] in
+            isCallAuthorized() && self?.voiceWindows(workspaceID).isEmpty == false
+        }
+        let readService = { [weak self] () throws -> WindowRemoteReadService in
+            guard let self, isAuthorized() else { throw RemoteWorkspaceVoiceError.unavailable }
+            return WindowRemoteReadService(
+                contexts: voiceWindows(workspaceID).map { ($0.agentModeViewModel, $0.workspaceManager) },
+                revisionTracker: transcriptRevisionTracker,
+                workspaceScope: workspaceID
+            )
+        }
+        let liveSessions = { [weak self] in
+            self?.lastPublishedSnapshot?.sessions.filter {
+                $0.isLive && UUID(uuidString: $0.workspaceID) == workspaceID
+            } ?? []
+        }
+        return RemoteWorkspaceVoiceAccess(
+            workspaceID: workspaceID,
+            name: workspace.name,
+            isAuthorized: isAuthorized,
+            liveSessions: liveSessions,
+            history: { request in
+                try await readService().history(
+                    request,
+                    including: liveSessions().map(RemoteWorkspaceVoiceChatTools.historyEntry(for:))
+                )
+            },
+            transcript: { sessionID, before in
+                try await readService().transcript(
+                    sessionID: sessionID, paging: .recentBackward(before: before),
+                    limit: 12, includeDetails: false
+                )
+            },
+            dispatch: { [weak self] request, leaseIsValid in
+                guard let self, let controlService, isAuthorized(), leaseIsValid() else {
+                    throw RemoteWorkspaceVoiceError.unavailable
+                }
+                let required = RemoteGatewayRequestRouter.requiredAuthority(for: request.operation)
+                return try await controlService.dispatchWorkspaceVoiceCommand(request, workspaceID: workspaceID) {
+                    try Task.checkCancellation()
+                    guard isAuthorized(), leaseIsValid() else { throw RemoteWorkspaceVoiceError.unavailable }
+                    guard self.authorizationState.allows(required) else {
+                        throw RemoteAgentControlServiceError.commandRejected("Changing Mac-wide tools requires Danger permission on the Mac.")
+                    }
+                }
+            },
+            catalog: { [weak self] in
+                guard let self, isAuthorized(), let primary = voiceWindows(workspaceID).first else {
+                    throw RemoteWorkspaceVoiceError.unavailable
+                }
+                let windows = windowStatesManager?.allWindows.filter { !$0.isClosing && $0 !== primary } ?? []
+                return await DesktopRemoteCatalogService(
+                    agentModes: ([primary] + windows).map(\.agentModeViewModel)
+                ).remoteCatalog()
+            },
+            browse: { [weak self] operation, path in
+                guard let self, isAuthorized(), let window = voiceWindows(workspaceID).first else {
+                    throw RemoteWorkspaceVoiceError.unavailable
+                }
+                return try await RemoteWorkspaceVoiceFiles(window: window, workspaceID: workspaceID).execute(operation, path: path)
+            },
+            canConfigureTools: { [weak self] in
+                self?.authorizationState.allows(.danger) == true
             }
         )
     }
 
     private func invalidatePreviousPairingSessions() {
         commandGeneration &+= 1
+        workspaceVoice.invalidate()
         controlService?.clearAttachmentUploads()
         irohAdapter.revokePeerSessions()
     }
@@ -692,9 +814,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
             (agentMode: $0.agentModeViewModel, workspaceManager: $0.workspaceManager)
         }
         let builder = RemoteSnapshotBuilder(
-            workspaceCatalog: WorkspaceManagerRemoteCatalogService(
-                managers: windows.map(\.workspaceManager)
-            ),
+            workspaceCatalog: WorkspaceManagerRemoteCatalogService(windows: windows),
             sessionQuery: AgentModeRemoteSessionQueryService(
                 contexts: contexts,
                 revisionTracker: transcriptRevisionTracker

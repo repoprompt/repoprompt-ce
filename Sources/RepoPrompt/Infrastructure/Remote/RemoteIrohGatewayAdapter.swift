@@ -430,7 +430,7 @@ final class RemoteIrohGatewayAdapter {
             let session = try authenticatedSession(peerEndpointID, sessionID: frame.sessionID)
             let rpc = try frame.decodedPayload(as: RemoteRPCRequest.self, expectedKind: .rpcRequest)
             let request = try gatewayRequest(for: rpc)
-            if case .command = request, session.sync.sessionID != nil, !session.sync.hasConfirmedSync {
+            if request.requiresConfirmedSync, session.sync.sessionID != nil, !session.sync.hasConfirmedSync {
                 throw RemoteIrohGatewayAdapterError.syncRequired
             }
             if case .unpair = request {
@@ -591,6 +591,10 @@ final class RemoteIrohGatewayAdapter {
             ))
         case .imageAttachment:
             return try .imageAttachment(decodePayload(RemoteImageAttachmentRequest.self, from: rpc.payload))
+        case .workspaceVoice:
+            return try .workspaceVoice(decodePayload(RemoteWorkspaceVoiceRequest.self, from: rpc.payload))
+        case .workspacePresentation:
+            return try .workspacePresentation(decodePayload(RemoteWorkspacePresentation.self, from: rpc.payload))
         case .command:
             return try .command(
                 decodePayload(RemoteCommandRequest.self, from: rpc.payload),
