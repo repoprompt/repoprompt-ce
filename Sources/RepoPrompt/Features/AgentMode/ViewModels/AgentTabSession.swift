@@ -1240,6 +1240,7 @@ final class AgentTabSession: ObservableObject {
     }
 
     var providerCleanupHandle: ProviderConversationCleanupHandle?
+    var subscriptionAccountBinding: AgentSessionSubscriptionBinding = .legacy
     var providerTokenUsageByTurn: [AgentTokenUsagePersist] = []
     var automationTurnAudit: [AgentAutomationTurnAudit] = []
 
@@ -1756,7 +1757,7 @@ final class AgentTabSession: ObservableObject {
     /// Session-owned self-compaction state. No restored attempt is executable.
     var selfCompactState = AgentSelfCompactState() {
         didSet {
-            if oldValue != selfCompactState { isDirty = true }
+            if oldValue != selfCompactState, !subscriptionAccountBinding.blocksProviderOperations { isDirty = true }
             // Only correlated native/ACP completion enters the verified note boundary.
             if let active = selfCompactState.active, active.phase == .awaitingNoteBoundary,
                active.compactTurnSucceeded == true, active.acpCompletionUnverified != true
@@ -2138,6 +2139,7 @@ final class AgentTabSession: ObservableObject {
     /// Persisted handoff recovery remains its own blocker after payload restoration succeeds.
     var operationAdmissionFailureMessage: String? {
         if isAwaitingWorkspaceAdoption { return Self.loadingAdmissionFailureMessage }
+        if subscriptionAccountBinding.blocksProviderOperations { return AgentSessionSubscriptionBinding.notRunnableMessage }
         return restorationAdmissionFailureMessage ?? pendingHandoff.executionLocationFailure
     }
 

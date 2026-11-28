@@ -693,10 +693,12 @@ extension AgentSessionDataService {
                     ? canonicalLiveItems.count
                     : builtPresentation.projectionCounts.canonicalVisibleRowCount
             )
-            let needsReloadMigrationSave = agentSession.transcript != compactedTranscript
-                || agentSession.itemCount == nil
-                || agentSession.lastUserMessageAt == nil
-                || frozenTailLimitNormalizationNeeded
+            let needsReloadMigrationSave = !agentSession.subscriptionAccountBinding.blocksProviderOperations && (
+                agentSession.transcript != compactedTranscript
+                    || agentSession.itemCount == nil
+                    || agentSession.lastUserMessageAt == nil
+                    || frozenTailLimitNormalizationNeeded
+            )
 
             #if DEBUG
                 logPrepare(

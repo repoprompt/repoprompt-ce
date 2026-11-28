@@ -11707,6 +11707,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         session: AgentTabSession,
         force: Bool = false
     ) {
+        guard !session.subscriptionAccountBinding.blocksProviderOperations else { return }
         if !force {
             guard !session.hasReconciledPersistedCodexCommandStatus else { return }
         }
