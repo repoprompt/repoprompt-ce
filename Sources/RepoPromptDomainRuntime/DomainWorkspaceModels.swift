@@ -401,13 +401,15 @@ private enum DomainWorkspaceDocumentDecoder {
         "isPinned",
         "pinnedOrder",
         "sidebarGroup",
-        "sidebarGroupOrder"
+        "sidebarGroupOrder",
+        "activeChatSessionID", // Selection in the separate Chat mode.
+        "expandedFolders"
     ]
 
-    /// Computes a deterministic SHA-256 digest of the workspace JSON with only compose-tab
-    /// presentation fields and top-level save/focus metadata keys (`dateModified`, `lastUsed`,
-    /// `activeComposeTabID`) stripped. Any unreadable or non-object payload falls back to
-    /// `fallbackDigest` so lineage checks fail closed.
+    /// Hashes workspace JSON without save timestamps or presentation-only fields. Changing the
+    /// active tab can update its view state and the workspace's prompt mirror. The captured
+    /// tab's own prompt, file selection, and Agent session identity still contribute to the
+    /// digest. Unreadable or non-object payloads fall back to `fallbackDigest`.
     static func executionContentDigest(from data: Data, fallbackDigest: String) -> String {
         guard var object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
             return fallbackDigest
@@ -415,7 +417,9 @@ private enum DomainWorkspaceDocumentDecoder {
         for key in workspacePresentationOnlyKeys {
             object.removeValue(forKey: key)
         }
-        if let rawTabs = object["composeTabs"] as? [Any] {
+        if let rawTabs = object["composeTabs"] as? [Any], !rawTabs.isEmpty {
+            // Workspaces without compose tabs still seed the first tab from this legacy prompt.
+            object.removeValue(forKey: "currentPromptText")
             var normalizedTabs: [Any] = []
             normalizedTabs.reserveCapacity(rawTabs.count)
             for rawTab in rawTabs {
