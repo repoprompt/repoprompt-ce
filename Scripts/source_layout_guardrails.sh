@@ -865,6 +865,7 @@ allowed_tracked_docs=(
   "docs/architecture/settings-persistence.md"
   "docs/architecture/self-compact-native-note-delivery.md"
   "docs/architecture/source-layout.md"
+  "docs/architecture/workspace-colors.md"
   "docs/architecture/xcode-workspace.md"
   "docs/designs/cross-restart-durability-root-search-cas-2026-06-25.md"
   "docs/mcp-progress.md"

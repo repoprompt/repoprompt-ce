@@ -27,6 +27,7 @@ struct WorkspaceSaveSource: Equatable, Hashable, ExpressibleByStringLiteral, Cus
     static let renameWorkspace = WorkspaceSaveSource("renameWorkspace")
     static let setWorkspaceHidden = WorkspaceSaveSource("setWorkspaceHidden")
     static let setWorkspaceHiddenFromSnapshot = WorkspaceSaveSource("setWorkspaceHiddenFromSnapshot")
+    static let setWorkspaceColor = WorkspaceSaveSource("setWorkspaceColor")
     static let consolidatedWorkspaceRestore = WorkspaceSaveSource("consolidatedWorkspaceRestore")
     static let rootReorder = WorkspaceSaveSource("rootReorder")
     static let rootRemove = WorkspaceSaveSource("rootRemove")

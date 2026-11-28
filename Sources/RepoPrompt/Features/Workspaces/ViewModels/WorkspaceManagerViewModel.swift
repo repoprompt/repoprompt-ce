@@ -1980,6 +1980,16 @@ class WorkspaceManagerViewModel: ObservableObject {
     private var pendingFullDocumentWrites: [UUID: PendingFullDocumentWrite] = [:]
     private var workspaceRenameIntentByID: [UUID: UUID] = [:]
     private var workspaceHiddenIntentByID: [UUID: UUID] = [:]
+    private struct WorkspaceColorSaveIntent {
+        let id: UUID
+        let colorID: String?
+        let compatibleColorIDs: Set<String?>
+        let dateModified: Date
+        let fileURL: URL
+        let workspaceFence: UInt64
+    }
+
+    private var workspaceColorIntentByID: [UUID: WorkspaceColorSaveIntent] = [:]
     private var workspaceCreationTasksByID: [UUID: Task<Void, Never>] = [:]
     private var domainWorkspaceCatalogRevision: UInt64 = 0
     #if DEBUG
@@ -2481,6 +2491,10 @@ class WorkspaceManagerViewModel: ObservableObject {
             workspaceSaveAttemptCountByWorkspaceIDForTesting.removeAll()
             workspaceSaveCapturePublicationCountByWorkspaceIDForTesting.removeAll()
             savePathComposeTabReloadCountForTesting = 0
+        }
+
+        func hasPendingWorkspaceColorIntentForTesting(workspaceID: UUID) -> Bool {
+            workspaceColorIntentByID[workspaceID] != nil
         }
 
         func workspaceSaveDiagnosticsForTesting(workspaceID: UUID) -> (
@@ -14699,6 +14713,9 @@ class WorkspaceManagerViewModel: ObservableObject {
         if merged.activePresetID == nil {
             merged.activePresetID = duplicates.lazy.compactMap(\.activePresetID).first
         }
+        if merged.color == nil {
+            merged.color = duplicates.lazy.compactMap(\.color).first
+        }
 
         var composeTabIDs = Set(merged.composeTabs.map(\.id))
         for duplicate in duplicates {
@@ -15161,6 +15178,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         forgetWorkingPublicationTracking(workspaceID: workspace.id)
         workspaceRenameIntentByID.removeValue(forKey: workspace.id)
         workspaceHiddenIntentByID.removeValue(forKey: workspace.id)
+        workspaceColorIntentByID.removeValue(forKey: workspace.id)
         removeConsolidatedRestoreTracking(workspaceID: workspace.id)
         if activeWorkspaceID == workspace.id {
             activeWorkspaceID = nil
@@ -15310,6 +15328,132 @@ class WorkspaceManagerViewModel: ObservableObject {
                 print("Error saving hidden state for workspace: \(error)")
             }
         }
+    }
+
+    /// Sets or clears (`nil`) a workspace's colour. Mirrors the optimistic hidden-state flow: memory
+    /// first, then one `workspace.json` save and a cross-window reload notice. The colour is not an
+    /// index field, so the workspace index is not rebuilt. Ephemeral workspaces keep the colour in
+    /// memory only; System workspaces and consolidated recovery copies are never coloured. Both are
+    /// judged from the current record, not the caller's copy, so a retained row action cannot colour
+    /// a workspace that has since become a recovery copy.
+    func setWorkspaceColor(_ workspace: WorkspaceModel, color: WorkspaceColor?) {
+        let workspaceID = workspace.id
+        guard !isPreparingForWindowClose, !isSessionRuntimeProjection,
+              !pendingConsolidatedRestoreIDs.contains(workspaceID),
+              let index = workspaceIndex(for: workspaceID), Self.acceptsWorkspaceColor(workspaces[index])
+        else { return }
+        let colorID = color?.rawValue
+        var current = workspaces[index]
+        let previous = workspaceColorIntentByID[workspaceID]
+        guard current.color != colorID || previous != nil else { return }
+        var compatible: Set<String?> = [current.color, colorID]
+        if let previous, previous.compatibleColorIDs.contains(current.color) {
+            compatible.formUnion(previous.compatibleColorIDs)
+        }
+        current.color = colorID
+        current.dateModified = Date()
+        workspaces[index] = current
+        guard !current.isEphemeral else {
+            workspaceColorIntentByID.removeValue(forKey: workspaceID)
+            return
+        }
+
+        let intent = WorkspaceColorSaveIntent(
+            id: UUID(), colorID: colorID, compatibleColorIDs: compatible,
+            dateModified: current.dateModified, fileURL: workspaceFileURL(for: current),
+            workspaceFence: ownSaveFenceByWorkspaceID[workspaceID, default: 0]
+        )
+        workspaceColorIntentByID[workspaceID] = intent
+        let predecessors = ownTrackedSaveTasks(workspaceID: workspaceID)
+        let legacyCreation = workspaceCreationTasksByID[workspaceID]
+        let authorityCreation = pendingPersistentWorkspaceCreationsByWorkspaceID[workspaceID]
+        let task = Task { @MainActor [weak self] in
+            defer {
+                self?.scheduledWorkspaceSaveTasks[workspaceID]?.removeValue(forKey: intent.id)
+                if self?.scheduledWorkspaceSaveTasks[workspaceID]?.isEmpty == true {
+                    self?.scheduledWorkspaceSaveTasks.removeValue(forKey: workspaceID)
+                }
+            }
+            for predecessor in predecessors {
+                await predecessor.value
+            }
+            await legacyCreation?.value
+            await self?.persistWorkspaceColor(workspaceID: workspaceID, intent: intent, creation: authorityCreation)
+        }
+        scheduledWorkspaceSaveTasks[workspaceID, default: [:]][intent.id] = task
+    }
+
+    private func persistWorkspaceColor(
+        workspaceID: UUID, intent: WorkspaceColorSaveIntent, creation: PendingPersistentWorkspaceCreation?
+    ) async {
+        defer {
+            if workspaceColorIntentByID[workspaceID]?.id == intent.id {
+                workspaceColorIntentByID.removeValue(forKey: workspaceID)
+            }
+        }
+        do {
+            // The optimistic row can be edited before its first authority document exists.
+            _ = try await creation?.publishedWorkspace()
+            let finalURL: URL
+            do {
+                finalURL = try await saveWorkspaceColorOnce(workspaceID: workspaceID, intent: intent)
+            } catch let error as DomainWorkspaceAuthorityOperationError
+                where !error.workingCommitted && error.outcome.errorCode == .stateConflict
+                && error.outcome.diagnostic == "workspace_revision_mismatch"
+            {
+                try validateWorkspaceMetadataIntent(intent.id, workspaceID: workspaceID, source: .setWorkspaceColor)
+                guard let refresh = domainCatalogRefreshAwaiter, await refresh(),
+                      let canonical = await domainWorkspaceAuthorityClient?.canonicalWorkspaceSnapshot(workspaceID),
+                      let baseline = fullDocumentWriteBaseline(workspaceID: workspaceID),
+                      baseline.workingRevision == canonical.revisions.workingRevision,
+                      baseline.contentDigest == canonical.document.contentDigest,
+                      baseline.fileURL == intent.fileURL, canonical.document.fileURL == intent.fileURL
+                else { throw error }
+                finalURL = try await saveWorkspaceColorOnce(workspaceID: workspaceID, intent: intent)
+            }
+            await workspaceDiskWriter.flush(url: finalURL)
+            if domainWorkspaceAuthorityClient == nil {
+                // A coalesced legacy write can be replaced by a later payload before the flush.
+                let expected = intent.colorID
+                let persisted = try await Task.detached {
+                    let model = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: finalURL))
+                    return model.id == workspaceID && model.color == expected
+                }.value
+                guard persisted else {
+                    throw WorkspacePersistenceFailure(category: .workspaceChanged)
+                }
+            }
+            NotificationCenter.default.post(
+                name: .workspaceListDidChange, object: nil, userInfo: ["managerID": instanceID]
+            )
+        } catch let failure as WorkspacePersistenceFailure where failure.category == .cancelled {
+            // A newer request, a peer colour, or a lifecycle change took precedence.
+        } catch {
+            print("Error saving color for workspace: \(error)")
+        }
+    }
+
+    private func saveWorkspaceColorOnce(workspaceID: UUID, intent: WorkspaceColorSaveIntent) async throws -> URL {
+        guard let index = workspaceIndex(for: workspaceID) else {
+            throw WorkspaceDirectWriteError.workspaceUnavailable
+        }
+        var proposal = workspaces[index]
+        try reapplyWorkspaceColorIntent(intent.id, to: &proposal)
+        if workspaces[index] != proposal { workspaces[index] = proposal }
+        return try await saveWorkspaceToFileAsync(proposal, source: .setWorkspaceColor, metadataIntentID: intent.id)
+    }
+
+    private func reapplyWorkspaceColorIntent(_ intentID: UUID, to workspace: inout WorkspaceModel) throws {
+        try validateWorkspaceMetadataIntent(intentID, workspaceID: workspace.id, source: .setWorkspaceColor)
+        guard let intent = workspaceColorIntentByID[workspace.id],
+              intent.compatibleColorIDs.contains(workspace.color)
+        else { throw WorkspacePersistenceFailure(category: .cancelled) }
+        workspace.color = intent.colorID
+        workspace.dateModified = max(workspace.dateModified, intent.dateModified)
+    }
+
+    private static func acceptsWorkspaceColor(_ workspace: WorkspaceModel) -> Bool {
+        !workspace.isSystemWorkspace && workspace.consolidatedIntoWorkspaceID == nil
     }
 
     private func validateConsolidationLifecycle(_ workspace: WorkspaceModel) throws {
@@ -16727,9 +16871,27 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     private func validateWorkspaceMetadataIntent(_ intentID: UUID?, workspaceID: UUID, source: WorkspaceSaveSource) throws {
         guard let intentID else { return }
-        let currentIntentID = source == .renameWorkspace
-            ? workspaceRenameIntentByID[workspaceID]
-            : workspaceHiddenIntentByID[workspaceID]
+        let currentIntentID: UUID?
+        switch source {
+        case .renameWorkspace:
+            currentIntentID = workspaceRenameIntentByID[workspaceID]
+        case .setWorkspaceHidden, .setWorkspaceHiddenFromSnapshot:
+            currentIntentID = workspaceHiddenIntentByID[workspaceID]
+        case .setWorkspaceColor:
+            // Close drains accepted colour choices, including inactive workspaces that the final
+            // active-workspace capture cannot save. Workspace recovery still fences those choices.
+            try Task.checkCancellation()
+            guard let intent = workspaceColorIntentByID[workspaceID],
+                  intent.workspaceFence == ownSaveFenceByWorkspaceID[workspaceID, default: 0],
+                  !pendingConsolidatedRestoreIDs.contains(workspaceID),
+                  let current = workspace(withID: workspaceID), !current.isEphemeral,
+                  Self.acceptsWorkspaceColor(current), intent.compatibleColorIDs.contains(current.color),
+                  workspaceFileURL(for: current) == intent.fileURL
+            else { throw WorkspacePersistenceFailure(category: .cancelled) }
+            currentIntentID = intent.id
+        default:
+            currentIntentID = nil
+        }
         guard currentIntentID == intentID else { throw WorkspacePersistenceFailure(category: .cancelled) }
     }
 
@@ -16797,7 +16959,11 @@ class WorkspaceManagerViewModel: ObservableObject {
             // report success without ever writing that tab.
             throw WorkspacePersistenceFailure(category: .workspaceChanged)
         }
-        if currentGeneration != capture.adoptionGeneration,
+        // Colour carries one explicit field across adoption. A qualified baseline proves the
+        // current model descends from adopted bytes even if they were reinstalled unchanged.
+        let canReapplyColor = source == .setWorkspaceColor && metadataIntentID != nil
+            && fullDocumentWriteBaseline(workspaceID: proposal.id)?.fileURL == capture.fileURL
+        if !canReapplyColor, currentGeneration != capture.adoptionGeneration,
            domainWorkspaceDigestsByID[proposal.id] == capture.digest
         {
             // Reinstalling the same canonical bytes can still discard a local proposal. It is
@@ -16810,7 +16976,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         let retainedWriteLineage = capture.writeBaseline != nil
             && currentGeneration == capture.adoptionGeneration
             && fullDocumentWriteBaseline(workspaceID: proposal.id)?.adoptionGeneration == capture.adoptionGeneration
-        if !retainedWriteLineage,
+        if !canReapplyColor, !retainedWriteLineage,
            domainWorkspaceRevisionsByID[proposal.id]?.workingRevision != capture.revisions?.workingRevision
            || domainWorkspaceDigestsByID[proposal.id] != capture.digest
         {
@@ -16850,7 +17016,12 @@ class WorkspaceManagerViewModel: ObservableObject {
         try validateWorkspaceMetadataIntent(metadataIntentID, workspaceID: proposal.id, source: source)
         if metadataIntentID != nil {
             try validateConsolidationLifecycle(proposal)
-            if source == .renameWorkspace {
+            if source == .setWorkspaceColor, let metadataIntentID {
+                try reapplyWorkspaceColorIntent(metadataIntentID, to: &current)
+                if let index = workspaceIndex(for: current.id), workspaces[index] != current {
+                    workspaces[index] = current
+                }
+            } else if source == .renameWorkspace {
                 current.name = proposal.name
             } else {
                 current.isHiddenInMenus = proposal.isHiddenInMenus
@@ -17237,7 +17408,12 @@ class WorkspaceManagerViewModel: ObservableObject {
             published.customStoragePath = workspaceToSave.customStoragePath
             published.isSystemWorkspace = workspaceToSave.isSystemWorkspace
             published.isHiddenInMenus = workspaceToSave.isHiddenInMenus
-            if metadataIntentID != nil {
+            if source == .setWorkspaceColor {
+                if workspaceColorIntentByID[workspaceToSave.id]?.id == metadataIntentID {
+                    published.color = workspaceToSave.color
+                    published.dateModified = workspaceToSave.dateModified
+                }
+            } else if metadataIntentID != nil {
                 published.dateModified = workspaceToSave.dateModified
             }
             if mergeResult.preservedDiskRepoPaths,
@@ -17410,15 +17586,22 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
 
         var workspaceToSave = workspace
+        if source == .setWorkspaceColor, let metadataIntentID {
+            guard let current = self.workspace(withID: workspace.id) else {
+                throw WorkspaceDirectWriteError.workspaceUnavailable
+            }
+            workspaceToSave = current
+            try reapplyWorkspaceColorIntent(metadataIntentID, to: &workspaceToSave)
+        }
         if preserveDiskRepoPathsIfUnchangedSinceBaseline,
            FileManager.default.fileExists(atPath: targetURL.path)
         {
             let diskWorkspace = try? Self.loadWorkspaceFromFile(at: targetURL, scheduleNormalizationWriteback: false)
             let mergeResult = Self.workspaceForSavePreservingDiskRepoPaths(
-                current: workspace,
+                current: workspaceToSave,
                 diskWorkspace: diskWorkspace,
                 lastSyncedRepoPaths: lastSyncedRepoPathsByWorkspaceID[workspace.id],
-                modificationDate: workspace.dateModified
+                modificationDate: workspaceToSave.dateModified
             )
             workspaceToSave = mergeResult.workspace
             if mergeResult.preservedDiskRepoPaths,
@@ -17443,7 +17626,10 @@ class WorkspaceManagerViewModel: ObservableObject {
                     ]
                 )
             #endif
-            return try await saveWorkspaceToFileAsync(workspaces[index], preserveDiskRepoPathsIfUnchangedSinceBaseline: preserveDiskRepoPathsIfUnchangedSinceBaseline, source: source, rootEditContext: rootEditContext)
+            return try await saveWorkspaceToFileAsync(
+                workspaces[index], preserveDiskRepoPathsIfUnchangedSinceBaseline: preserveDiskRepoPathsIfUnchangedSinceBaseline,
+                source: source, rootEditContext: rootEditContext, metadataIntentID: source == .setWorkspaceColor ? metadataIntentID : nil
+            )
         }
 
         let changesConsolidationLifecycle = source == .duplicateCleanupCanonicalMerge

@@ -1581,6 +1581,67 @@ import XCTest
 
         // MARK: 6. Queued restore after startup
 
+        func testWorkspaceColorsRestoreAcrossThirtyFiveWindows() async throws {
+            let colors = WorkspaceColor.allCases.map { Optional($0.rawValue) } + [nil, "future-color"]
+            let coloredSeeds = colors.enumerated().map { index, color in
+                let suffix = String(format: "%012d", index + 100)
+                let id = UUID(uuidString: "C0100000-0000-0000-0000-" + suffix)!
+                var model = Fixture.model(id: id, name: "Color fixture \(index)")
+                model.color = color
+                return model
+            }
+            let seeds = Fixture.standardSeeds.filter(\.isSystemWorkspace) + coloredSeeds
+            let targets = coloredSeeds + coloredSeeds + [coloredSeeds[0], coloredSeeds[6], coloredSeeds[13]]
+            XCTAssertEqual(targets.count, 35)
+            try await Fixture.run(seeds: seeds) { f in
+                let restores = targets.map { target in
+                    let window = f.makeWindow()
+                    let completion = Signal("workspace color restore for window \(window.windowID)")
+                    window.applyWindowRestoreEntry(f.restoreEntry(for: target.id, window: window)) {
+                        completion.fire()
+                    }
+                    return (window, completion, target)
+                }
+                for (window, completion, target) in restores {
+                    try await f.wait(completion)
+                    try await f.acknowledgeWindowObservers(window)
+                    let resolved = Signal("coherent workspace color for window \(window.windowID)")
+                    if window.workspaceSticker.state.workspaceID != target.id {
+                        window.setWindowTitleResolutionDidCompleteHandlerForTesting {
+                            if window.workspaceSticker.state.workspaceID == target.id { resolved.fire() }
+                        }
+                        defer { window.setWindowTitleResolutionDidCompleteHandlerForTesting(nil) }
+                        try await f.wait(resolved)
+                    }
+                    XCTAssertEqual(window.workspaceManager.activeWorkspaceID, target.id)
+                    XCTAssertEqual(window.workspaceManager.activeWorkspace?.color, target.color)
+                    XCTAssertEqual(window.workspaceSticker.state, .init(workspaceID: target.id, color: target.workspaceColor))
+                    XCTAssertTrue(window.displayedWindowTitle.contains(target.name))
+                }
+                let (writer, _, edited) = try XCTUnwrap(restores.first)
+                writer.workspaceManager.setWorkspaceColor(edited, color: .blue)
+                await writer.workspaceManager.awaitOwnSavesForWindowClose()
+                for (window, _, target) in restores {
+                    try await f.awaitCaughtUpWithCatalogBaseline(window)
+                    let expected = target.id == edited.id ? WorkspaceColor.blue : target.workspaceColor
+                    let resolved = Signal("workspace color after peer save for window \(window.windowID)")
+                    if window.workspaceSticker.state.color != expected {
+                        window.setWindowTitleResolutionDidCompleteHandlerForTesting {
+                            if window.workspaceSticker.state.color == expected { resolved.fire() }
+                        }
+                        defer { window.setWindowTitleResolutionDidCompleteHandlerForTesting(nil) }
+                        try await f.wait(resolved)
+                    }
+                    XCTAssertEqual(window.workspaceSticker.state, .init(workspaceID: target.id, color: expected))
+                }
+                for target in coloredSeeds {
+                    let document = try Data(contentsOf: f.workspaceURL(for: target))
+                    let persisted = try JSONDecoder().decode(WorkspaceModel.self, from: document)
+                    XCTAssertEqual(persisted.color, target.id == edited.id ? "blue" : target.color)
+                }
+            }
+        }
+
         func testQueuedRestoreWaitsForAcceptedCatalogAfterInitializationWithRecoveryTwinInStaleIndex() async throws {
             var recovery = Fixture.model(id: Fixture.namesakeID, name: "Z requested")
             recovery.consolidatedIntoWorkspaceID = Fixture.requestedID

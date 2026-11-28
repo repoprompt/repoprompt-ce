@@ -689,6 +689,22 @@ import XCTest
             XCTAssertEqual(stillRetiredOnDisk.consolidatedIntoWorkspaceID, canonical.id)
         }
 
+        func testMergedCanonicalWorkspaceKeepsCanonicalColorElseFirstColoredDuplicate() {
+            let uncolored = WorkspaceModel(name: "Duplicate uncolored", repoPaths: [])
+            let red = WorkspaceModel(name: "Duplicate red", repoPaths: [], color: "red")
+            let green = WorkspaceModel(name: "Duplicate green", repoPaths: [], color: "green")
+            let coloredCanonical = WorkspaceModel(name: "Canonical", repoPaths: [], color: "blue")
+            var plainCanonical = coloredCanonical
+            plainCanonical.color = nil
+
+            func merged(_ canonical: WorkspaceModel, _ duplicates: [WorkspaceModel]) -> String? {
+                WorkspaceManagerViewModel.mergedCanonicalWorkspace(canonical: canonical, duplicates: duplicates).color
+            }
+            XCTAssertEqual(merged(coloredCanonical, [uncolored, red, green]), "blue")
+            XCTAssertEqual(merged(plainCanonical, [uncolored, red, green]), "red")
+            XCTAssertNil(merged(plainCanonical, [uncolored]))
+        }
+
         func testWorkspaceRetirementMarkerRoundTripsAndDefaultsToNil() throws {
             let canonicalID = UUID()
             let retired = WorkspaceModel(

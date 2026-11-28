@@ -374,6 +374,14 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
     var name: String
     var repoPaths: [String]
 
+    /// User-chosen colour id (`workspace.json` key `color`); nil means None. Stored raw, so an id
+    /// unknown to this build is preserved on re-save. Render through `workspaceColor`.
+    var color: String?
+
+    var workspaceColor: WorkspaceColor? {
+        WorkspaceColor.resolve(color)
+    }
+
     var presets: [WorkspacePreset]
     var activePresetID: UUID?
     var lastUsed: Date
@@ -477,6 +485,7 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
         dateModified: Date = Date(),
         name: String,
         repoPaths: [String],
+        color: String? = nil,
         presets: [WorkspacePreset] = [],
         activePresetID: UUID? = nil,
         lastUsed: Date = Date(),
@@ -502,6 +511,7 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
         self.dateModified = dateModified
         self.name = name
         self.repoPaths = repoPaths
+        self.color = WorkspaceColor.normalizedID(color)
         self.presets = presets
         self.activePresetID = activePresetID
         self.lastUsed = lastUsed
@@ -543,6 +553,7 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
         ephemeralFlag = (try? c.decode(Bool?.self, forKey: .ephemeralFlag)) ?? nil
         name = (try? c.decode(String.self, forKey: .name)) ?? "Untitled Workspace"
         repoPaths = (try? c.decode([String].self, forKey: .repoPaths)) ?? []
+        color = WorkspaceColor.normalizedID(try? c.decodeIfPresent(String.self, forKey: .color))
         presets = (try? c.decode([WorkspacePreset].self, forKey: .presets)) ?? []
         activePresetID = (try? c.decode(UUID.self, forKey: .activePresetID))
         lastUsed = (try? c.decode(Date.self, forKey: .lastUsed))
@@ -585,6 +596,7 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
         try c.encodeIfPresent(consolidatedIntoWorkspaceID, forKey: .consolidatedIntoWorkspaceID)
         try c.encode(name, forKey: .name)
         try c.encode(repoPaths, forKey: .repoPaths)
+        try c.encodeIfPresent(color, forKey: .color)
         try c.encode(presets, forKey: .presets)
         try c.encodeIfPresent(activePresetID, forKey: .activePresetID)
         try c.encode(lastUsed, forKey: .lastUsed)
@@ -607,6 +619,7 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
             lhs.dateModified == rhs.dateModified &&
             lhs.name == rhs.name &&
             lhs.repoPaths == rhs.repoPaths &&
+            lhs.color == rhs.color &&
             lhs.presets == rhs.presets &&
             lhs.activePresetID == rhs.activePresetID &&
             lhs.lastUsed == rhs.lastUsed &&
@@ -639,6 +652,7 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
         case consolidatedIntoWorkspaceID
         case name
         case repoPaths
+        case color
         case presets
         case activePresetID
         case lastUsed
