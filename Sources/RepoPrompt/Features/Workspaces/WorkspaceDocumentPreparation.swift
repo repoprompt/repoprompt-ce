@@ -1,6 +1,10 @@
 import Foundation
 import RepoPromptDomainRuntime
 
+enum WorkspaceMetadataField {
+    case name, hidden
+}
+
 private enum DomainWorkspaceModelEncoder {
     static func encode(_ workspace: WorkspaceModel) throws -> Data {
         let encoder = JSONEncoder()
@@ -62,6 +66,28 @@ actor WorkspaceDocumentPreparation {
             ])
         #endif
         return Catalog(models: models, failedIDs: failedIDs, wasOnMainThread: Thread.isMainThread)
+    }
+
+    func metadataModel(for canonical: DomainWorkspaceDocument) throws -> WorkspaceModel {
+        try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
+            documentBytes: canonical.documentBytes, fileURL: canonical.fileURL, preserveUnreadableDocument: false
+        )
+    }
+
+    /// Patch only the owned field and modification date; preserve unknown canonical JSON values.
+    func documentByApplyingMetadata(
+        _ field: WorkspaceMetadataField, model: WorkspaceModel, in canonical: DomainWorkspaceDocument
+    ) throws -> DomainWorkspaceDocument {
+        guard var json = try JSONSerialization.jsonObject(with: canonical.documentBytes) as? [String: Any] else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        switch field {
+        case .name: json["name"] = model.name
+        case .hidden: json["isHiddenInMenus"] = model.isHiddenInMenus
+        }
+        json["dateModified"] = model.dateModified.timeIntervalSinceReferenceDate
+        let bytes = try JSONSerialization.data(withJSONObject: json, options: [.sortedKeys])
+        return try DomainWorkspaceDocument.decode(documentBytes: bytes, fileURL: canonical.fileURL)
     }
 
     func document(for workspace: WorkspaceModel, fileURL: URL) throws -> DomainWorkspaceDocument {

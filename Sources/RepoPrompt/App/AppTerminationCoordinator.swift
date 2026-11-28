@@ -4,6 +4,8 @@ import AppKit
 /// Never cancel an updater's termination request: Sparkle owns installation and relaunch.
 @MainActor
 final class AppTerminationCoordinator {
+    nonisolated static let defaultCleanupTimeout: TimeInterval = 15
+
     private(set) var isReady = false
     private var started = false
     private var cleanupTask: Task<Void, Never>?
@@ -11,13 +13,13 @@ final class AppTerminationCoordinator {
     private var pendingReply: (() -> Void)?
     private var installationContinuation: (() -> Void)?
     private let timeout: TimeInterval
-    private let freeze: () -> Void
+    private let freeze: (ContinuousClock.Instant) -> Void
     private let cleanup: () async -> Void
     private let requestTermination: () -> Void
 
     init(
-        timeout: TimeInterval = 15,
-        freeze: @escaping () -> Void,
+        timeout: TimeInterval = AppTerminationCoordinator.defaultCleanupTimeout,
+        freeze: @escaping (ContinuousClock.Instant) -> Void,
         cleanup: @escaping () async -> Void,
         requestTermination: @escaping () -> Void
     ) {
@@ -51,10 +53,17 @@ final class AppTerminationCoordinator {
     private func start() {
         guard !started else { return }
         started = true
-        freeze()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(timeout))
+        freeze(deadline)
+        let remaining = ContinuousClock.now.duration(to: deadline).components
+        let seconds = Double(remaining.seconds) + Double(remaining.attoseconds) / 1e18
+        guard seconds > 0 else {
+            deadlineExceeded()
+            return
+        }
         // A main-queue timer/task cannot rescue termination entered from a main-queue
         // callback: AppKit's nested termination loop holds that queue. A run-loop timer can.
-        let timer = Timer(timeInterval: timeout, repeats: false) { [weak self] _ in
+        let timer = Timer(timeInterval: seconds, repeats: false) { [weak self] _ in
             MainActor.assumeIsolated { self?.deadlineExceeded() }
         }
         deadlineTimer = timer

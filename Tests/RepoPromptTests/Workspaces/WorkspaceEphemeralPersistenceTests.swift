@@ -2533,6 +2533,129 @@ import XCTest
             }
         }
 
+        func testQuitFenceRejectsParkedWorkingPublication() async throws {
+            try await withProjectionSaveFixture { fixture in
+                let manager = fixture.manager
+                let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == fixture.workspace.id })
+                let snapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspace.id)
+                let before = try XCTUnwrap(snapshot)
+                manager.workspaces[index].composeTabs[0].promptText = "Unpublished quit draft"
+                let proposal = manager.workspaces[index]
+                let captured = self.expectation(description: "working publication captured")
+                let gate = WorkspaceDeleteSuspensionGate()
+                manager.workingPublicationDidCaptureForTesting = { id in
+                    guard id == proposal.id else { return }
+                    captured.fulfill()
+                    await gate.wait()
+                }
+                defer { manager.workingPublicationDidCaptureForTesting = nil }
+                let publish = Task { await manager.debugPublishWorkingDocumentToDomainAuthority(proposal) }
+                do {
+                    try await self.awaitSaveCheckpoint(captured)
+                } catch {
+                    await gate.open()
+                    await publish.value
+                    throw error
+                }
+                manager.beginWorkspaceSaveShutdown(deadline: .now)
+                await gate.open()
+                await publish.value
+                try await self.assertCanonicalAndDiskRemain(before, in: fixture)
+            }
+        }
+
+        func testMetadataCloseDeadlineReleasesStalledSaveAndFencesItsWrite() async throws {
+            try await assertMetadataDrainFencesParkedSave(cancelClose: false)
+        }
+
+        func testCancellingMetadataCloseDrainFencesParkedSave() async throws {
+            try await assertMetadataDrainFencesParkedSave(cancelClose: true)
+        }
+
+        private func assertMetadataDrainFencesParkedSave(cancelClose: Bool) async throws {
+            try await withProjectionSaveFixture { fixture in
+                let manager = fixture.manager
+                let initial = try XCTUnwrap(manager.workspace(withID: fixture.workspace.id))
+                let snapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(initial.id)
+                let before = try XCTUnwrap(snapshot)
+                let prepared = self.expectation(description: "metadata preparation parked")
+                let done = self.expectation(description: "close stopped waiting")
+                let gate = WorkspaceDeleteSuspensionGate()
+                manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { id, _, _ in
+                    guard id == initial.id else { return }
+                    prepared.fulfill()
+                    await gate.wait()
+                }
+                defer { manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil) }
+                let hide = Task { try await manager.setWorkspaceHiddenFromSnapshot(initial, hidden: true) }
+                do {
+                    try await self.awaitSaveCheckpoint(prepared)
+                } catch {
+                    await gate.open()
+                    _ = await hide.result
+                    throw error
+                }
+                if !cancelClose {
+                    manager.beginWorkspaceSaveShutdown(deadline: .now.advanced(by: .milliseconds(100)))
+                }
+                manager.prepareForWindowClose()
+                let close = Task {
+                    await manager.awaitOwnSavesForWindowClose()
+                    done.fulfill()
+                }
+                if cancelClose { close.cancel() }
+                let reached = await XCTWaiter.fulfillment(of: [done], timeout: 2)
+                XCTAssertEqual(reached, .completed)
+                await gate.open()
+                await close.value
+                if case .success = await hide.result { XCTFail("An expired save submitted new bytes") }
+                try await self.assertCanonicalAndDiskRemain(before, in: fixture)
+            }
+        }
+
+        func testClosingSnapshotHideReplaysAfterPeerWinsRevisionCheck() async throws {
+            let entered = expectation(description: "visibility command parked at authority ingress")
+            let gate = WorkspaceDeleteSuspensionGate()
+            let counter = WorkspaceSavePreparationCounter()
+            try await withProjectionSaveFixture(configureClient: { client in
+                client.commandWillExecuteForTesting = { envelope in
+                    guard case .replaceWorkingDocument = envelope.command, await counter.increment() == 1 else { return }
+                    entered.fulfill()
+                    await gate.wait()
+                }
+            }) { fixture in
+                let manager = fixture.manager
+                let initial = try XCTUnwrap(manager.workspace(withID: fixture.workspace.id))
+                let hide = Task { try await manager.setWorkspaceHiddenFromSnapshot(initial, hidden: true) }
+                let peer: DomainWorkspaceSnapshot
+                do {
+                    try await self.awaitSaveCheckpoint(entered)
+                    manager.prepareForWindowClose()
+                    peer = try await self.restoreArchivedTabRemotely(in: fixture)
+                    XCTAssertFalse(try XCTUnwrap(manager.workspace(withID: initial.id)).composeTabs.contains { $0.id == fixture.restoredTab.id })
+                } catch {
+                    await gate.open()
+                    _ = await hide.result
+                    throw error
+                }
+                await gate.open()
+                await manager.awaitOwnSavesForWindowClose()
+                let returned = try await hide.value
+                XCTAssertTrue(returned.isHiddenInMenus)
+                let snapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(initial.id)
+                let final = try XCTUnwrap(snapshot)
+                XCTAssertNil(final.revisions.dirtyRevision)
+                var expected = try JSONDecoder().decode(WorkspaceModel.self, from: peer.document.documentBytes)
+                let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: final.document.documentBytes)
+                expected.isHiddenInMenus = true
+                expected.dateModified = canonical.dateModified
+                XCTAssertEqual(canonical, expected)
+                let commands = await counter.value
+                XCTAssertEqual(commands, 2)
+                try await self.assertCanonicalAndDiskRemain(final, in: fixture)
+            }
+        }
+
         func testWindowCloseDrainsInactiveWorkspaceMetadataSave() async throws {
             for rename in [true, false] {
                 let tab = ComposeTabState(name: "Active tab")
@@ -2770,7 +2893,8 @@ import XCTest
                 bridge.stop()
             }
             for manager in managers {
-                await manager.awaitOwnSavesForWindowClose()
+                try? await manager.debugDrainMetadataSaves()
+                await manager.debugDrainScheduledSaves()
             }
             for bridge in bridges {
                 await bridge.stopAndJoinForTesting()
