@@ -652,6 +652,52 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         tools.endAgentRunWaitScope(unrelatedWait.token, completion: completion)
     }
 
+    func testCanonicalProviderSwitchSummarySettlesWithoutPresenter() async throws {
+        let (host, fixture, _, provider, _, _, _) = try await hostStartupFixture(
+            canonicalWorkspace: true, boundCanonicalCarrier: true, canonicalInput: true
+        )
+        let session = fixture.session
+        let reply = "Summary of the originating session."
+        provider.environment["ACP_ASSISTANT_TEXT_ON_PROMPT"] = reply
+        provider.usesDefaultNormalizer = true
+        let command = try host.scope.admit(session: session)
+        XCTAssertFalse(host.scope.presentation.hasPresenter(for: session))
+        let rowID = UUID()
+        let sourceModel = session.selectedModelRaw
+        let handoffRevision = session.pendingHandoffRevision
+        let context = AgentSessionHandoffRuntime.ProviderSwitchSummaryContext(
+            interviewPreference: false, includeCleanupGuidance: false,
+            computerUseArmed: false, images: [], taggedFiles: []
+        )
+        let result = await host.scope.handoff.generateProviderSwitchSummary(
+            .init(
+                rowID: rowID, destination: .codexExec, model: "destination-model",
+                wordLimit: 100, stopFence: AgentRunStartStopFence(session: session), context: context
+            ), command: command
+        )
+        guard case .started = result else { return XCTFail("The original host must start the summary") }
+        let producer = try XCTUnwrap(session.agentTask)
+        try await routeScriptedHostProvider(session)
+        await producer.value
+        guard case let .generated(text, revision)? = host.scope.handoff.providerSwitchSummary(for: session)?.outcome else {
+            let receipt = host.scope.handoff.providerSwitchSummary(for: session)
+            let turn = session.transcript.turns.first { $0.request?.id == rowID }
+            let terminal = session.lastTerminalCommitRevision?.terminalState.rawValue ?? "missing"
+            XCTFail("Expected terminal Summary. Receipt: \(receipt != nil). Provider model current: \(session.selectedModelRaw == sourceModel). Handover revision current: \(session.pendingHandoffRevision == handoffRevision). Terminal: \(terminal). Row found: \(turn != nil). Row completed: \(turn?.completedAt != nil).")
+            return
+        }
+        XCTAssertEqual(text, reply)
+        let reusable = host.scope.handoff.reusableProviderSwitchSummary(for: session, context: context)
+        guard case let .generated(reusableText, _)? = reusable?.outcome else {
+            return XCTFail("A later presenter must be able to read the completed Summary")
+        }
+        XCTAssertEqual(reusableText, reply)
+        XCTAssertEqual(revision, session.sourceItemsRevision)
+        XCTAssertNotEqual(session.selectedModelRaw, sourceModel, "The scripted ACP handshake must resolve the selected default model")
+        XCTAssertEqual(provider.promptedMessages.count, 1)
+        XCTAssertNil(session.pendingHandoff.payload)
+    }
+
     func testCanonicalComposerPublicationRefusalUsesPrepublicationCleanupOnly() async throws {
         for change in ["claim", "claim-existing-draft", "membership", "draft", "workflow", "reused-row"] {
             let (host, f, _, provider, _, _, _) = try await hostStartupFixture(
@@ -669,7 +715,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             }
             let stop = try XCTUnwrap(claim.cancellation.pendingStartFence(for: f.session))
             let item = AgentChatItem.user("Original row", sequenceIndex: f.session.nextSequenceIndex)
-            let receipt = try XCTUnwrap(submissions.captureCanonicalPublication(claim: claim, host: host, item: item))
+            let receipt = try XCTUnwrap(submissions.test_captureCanonicalPublication(claim: claim, host: host, session: f.session, item: item))
             let rollback = host.scope.turnTiming.recordAgentTurnUserAnchor(for: f.session, userItem: item)
             let previousObserver = f.session.onSourceItemsChanged
             f.session.onSourceItemsChanged = { session, mutation in
@@ -699,7 +745,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                 anchorRollback: rollback, autoEffortSelection: nil, options: .init(stopFence: stop),
                 providerSwitchPreparation: nil
             )
-            let submission = submissions.submitCanonicalTurn(turn, claim: claim, host: host)
+            let submission = submissions.test_submitCanonicalTurn(turn, claim: claim, host: host)
             guard case let .refused(recovered) = submission else {
                 if case let .queued(task) = submission { task.cancel()
                     _ = await task.value
@@ -716,11 +762,64 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             if change == "draft" { XCTAssertEqual(f.session.draftText, "Newer draft") }
             if change == "workflow" { XCTAssertEqual(f.session.selectedWorkflow, .init(builtIn: .review)) }
             let retainedDraft = f.session.draftText
-            XCTAssertFalse(submissions.rollbackCanonicalPublication(turn, claim: claim, message: "Repeated cleanup"), change)
+            XCTAssertFalse(submissions.test_rollbackCanonicalPublication(turn, claim: claim, message: "Repeated cleanup"), change)
             XCTAssertEqual(f.session.draftText, retainedDraft, change)
             submissions.release(claim)
             XCTAssertTrue(claim.cancellation.isFinalized, change)
         }
+    }
+
+    func testCanonicalActiveCodexInputOutlivesItsComposerClaim() async throws {
+        let controller = MonitorFakeCodexController(dispatches: MonitorCodexDispatchRecorder())
+        let (host, fixture, _, _, _, _, _) = try await hostStartupFixture(
+            canonicalWorkspace: true, boundCanonicalCarrier: true, canonicalInput: true,
+            codexController: controller
+        )
+        let session = fixture.session
+        session.selectedAgent = .codexExec
+        let command = try host.scope.admit(session: session)
+        let started = await host.startCanonicalRequest(
+            command: command, message: "First test message", options: .default, outcome: nil
+        )
+        XCTAssertEqual(started, .sent)
+        guard started == .sent else { return }
+        controller.markActiveTurn(id: "turn-1")
+        await host.codexCoordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "turn-1"), session: session, sourceController: controller)
+        XCTAssertTrue(session.runState.isActive)
+        XCTAssertEqual(session.codexAuthoritativeActiveTurn?.turnID, "turn-1")
+        let ticket = session.codexDispatchSerialGate.issueTicket()
+        let entered = await session.codexDispatchSerialGate.awaitTurn(ticket)
+        XCTAssertTrue(entered)
+
+        let submissions = host.scope.submissions
+        let target = try XCTUnwrap(submissions.programmaticTarget(command))
+        let message = "Second test message"
+        let attempt = AgentComposerSubmitAttempt(
+            id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: message
+        )
+        guard case let .claimed(claim) = submissions.claim(attempt, command: command) else {
+            session.codexDispatchSerialGate.finish(ticket)
+            return XCTFail("Expected the local input claim")
+        }
+        let row = AgentChatItem.user(message, sequenceIndex: session.nextSequenceIndex)
+        let admission = submissions.acceptCanonicalInput(.init(
+            row: row, message: message, providerTaggedFiles: [],
+            restorationDraftText: message, followUpDraftText: message, steeringDraftText: message,
+            workflow: nil, workflowMutationGeneration: nil, autoEffortSelection: nil,
+            routerAudit: nil, autoEffortAudit: nil, repromptAudit: nil, steeringMessage: message,
+            skipsSlashExpansion: false, registersLocalComposerOrigin: true, consumesPreparedAttachments: false,
+            stopFence: nil, providerSwitchPreparation: nil
+        ), claim: claim, host: host)
+        submissions.release(claim)
+        XCTAssertNil(session.composerStartCancellation, "Another input must be admissible while the provider queue is held")
+        session.codexDispatchSerialGate.finish(ticket)
+        guard case .queued = admission else { return XCTFail("Expected the admitted input producer") }
+        await fixture.runtime.drainPendingInputEffects(for: session)
+
+        XCTAssertEqual(controller.startedTurns.count, 1)
+        XCTAssertEqual(controller.steeredTurns.count, 1)
+        XCTAssertTrue(controller.steeredTurns.first?.contains(message) == true)
+        XCTAssertEqual(session.items.count(where: { $0.id == row.id }), 1)
     }
 
     func testCanonicalComposerProducerRetainsOriginalHostAndWriterAcrossScheduling() async throws {
@@ -741,7 +840,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                 return XCTFail("Expected the original composer claim: \(change)")
             }
             let item = AgentChatItem.user("Canonical local input", sequenceIndex: f.session.nextSequenceIndex)
-            let publication = try XCTUnwrap(submissions.captureCanonicalPublication(claim: claim, host: host, item: item))
+            let publication = try XCTUnwrap(submissions.test_captureCanonicalPublication(claim: claim, host: host, session: f.session, item: item))
             let rollback = host.scope.turnTiming.recordAgentTurnUserAnchor(for: f.session, userItem: item)
             f.session.appendItem(item)
             claim.cancellation.recordOptimisticInput(item.id, on: f.session)
@@ -751,7 +850,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                 let admitted = await f.session.codexDispatchSerialGate.awaitTurn(predecessor)
                 XCTAssertTrue(admitted)
             }
-            let submission = submissions.submitCanonicalTurn(
+            let submission = submissions.test_submitCanonicalTurn(
                 .init(
                     publication: publication, message: "Canonical local input",
                     attachments: [],
@@ -808,6 +907,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                 } else if change == "codex-new-draft" {
                     XCTAssertEqual(f.session.draftText, "Newer draft after owned clear")
                     XCTAssertTrue(f.session.items.contains { $0.id == item.id })
+                    XCTAssertTrue(f.session.items.contains { $0.recoveryDiagnostic?.outcome == "notDispatched" })
                 } else if codex {
                     XCTAssertEqual(f.session.draftText, "Original local draft")
                     XCTAssertFalse(f.session.items.contains { $0.id == item.id })
@@ -1443,16 +1543,53 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         try await runVisibleLifetimeWitness(switchWorkspace: false, failFinalSave: true)
     }
 
-    func testClosingVisibleWindowDuringFirstSaveWithdrawsUnpublishedComposer() async throws {
-        try await runVisibleLifetimeWitness(switchWorkspace: false, holdFirstSave: true)
+    func testVisibleComposerFirstSendReachesTheNewSessionWriter() async throws {
+        try await runVisibleLifetimeWitness(switchWorkspace: false, submission: .firstMessage(.send))
+    }
+
+    func testPinningDuringFirstSaveKeepsTheFirstMessageAndWriter() async throws {
+        try await runVisibleLifetimeWitness(switchWorkspace: false, submission: .firstMessage(.pin))
+    }
+
+    func testSwitchingTabsDuringFirstSaveStillSendsTheFirstMessage() async throws {
+        try await runVisibleLifetimeWitness(switchWorkspace: false, submission: .firstMessage(.switchTabs))
+    }
+
+    func testExplicitStopDuringFirstSaveRestoresTheDraftWithoutProviderDispatch() async throws {
+        try await runVisibleLifetimeWitness(switchWorkspace: false, submission: .firstMessage(.stop))
+    }
+
+    func testSwitchingTabsDuringVisibleStartupSendsAndFinishesInBackground() async throws {
+        try await runVisibleLifetimeWitness(switchWorkspace: false, submission: .composerWhileSwitchingTabs)
+    }
+
+    func testCanonicalOversightPublishesRolesAndPolicyToTheAttachedWindow() async throws {
+        try await runVisibleLifetimeWitness(switchWorkspace: false, submission: .oversightProjection)
+    }
+
+    func testWakePolicyRequiresTheRestoredWriterAfterRebind() throws {
+        let f = try fixture()
+        let transition = f.session.beginPersistentBindingTransition()
+        f.session.finishPersistentBindingTransition(generation: transition)
+        let current = try XCTUnwrap(f.runtime.agentSessionLinkObserverEndpoint(tabID: f.session.tabID))
+        XCTAssertNotEqual(f.endpoint, current)
+        XCTAssertFalse(f.runtime.setWakePolicy(.automaticUpdates(true), for: f.endpoint))
+        XCTAssertFalse(f.runtime.setWakePolicy(.automaticUpdates(true), for: current))
+        XCTAssertFalse(f.session.oversight.autoWakeOnUpdates)
+
+        f.session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        f.session.hasLoadedPersistedState = true
+        XCTAssertFalse(f.runtime.setWakePolicy(.automaticUpdates(true), for: f.endpoint))
+        XCTAssertTrue(f.runtime.setWakePolicy(.automaticUpdates(true), for: current))
+        XCTAssertTrue(f.session.oversight.autoWakeOnUpdates)
+    }
+
+    func testCanonicalOversightSendSurvivesSwitchAndDeliversOnce() async throws {
+        try await runVisibleLifetimeWitness(switchWorkspace: false, submission: .oversightWhileSwitchingTabs)
     }
 
     func testExplicitStopStillCancelsTheVisibleHostAttempt() async throws {
         try await runVisibleLifetimeWitness(switchWorkspace: false, explicitStop: true)
-    }
-
-    func testSwitchDuringFirstSaveWithdrawsOnlyTheUnpublishedComposer() async throws {
-        try await runVisibleLifetimeWitness(switchWorkspace: true, holdFirstSave: true)
     }
 
     func testConfirmedWorkspaceDeletionDrainsDetachedVisibleAttempt() async throws {
@@ -1487,11 +1624,11 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         try await runVisibleLifetimeWitness(switchWorkspace: true, heldTool: .question)
     }
 
-    func testLastWindowCloseKeepsOriginatingProtectedFileEditAndGit() async throws {
+    func testLastWindowCloseKeepsOriginatingProtectedFileEditGitAndWorktrees() async throws {
         try await runVisibleLifetimeWitness(switchWorkspace: false, heldTool: .fileEdit)
     }
 
-    func testWorkspaceSwitchKeepsOriginatingProtectedFileEditAndGit() async throws {
+    func testWorkspaceSwitchKeepsOriginatingProtectedFileEditGitAndWorktrees() async throws {
         try await runVisibleLifetimeWitness(switchWorkspace: true, heldTool: .fileEdit)
     }
 
@@ -1506,13 +1643,28 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         case workspaceDeletion, workspaceDeletionDuringSwitch, quit, sessionDeletion
     }
 
-    private enum VisibleSubmission {
-        case composer, composerWithHiddenRow, remoteFollowUp
+    private enum FirstSaveAction: Equatable {
+        case send, pin, switchTabs, stop
+    }
+
+    private enum VisibleSubmission: Equatable {
+        case composer, composerWithHiddenRow, remoteFollowUp, composerWhileSwitchingTabs
+        case oversightProjection, oversightWhileSwitchingTabs
+        case firstMessage(FirstSaveAction)
+
+        var createsSession: Bool {
+            if case .firstMessage = self { return true }
+            return false
+        }
+
+        var switchesDuringStartup: Bool {
+            self == .composerWhileSwitchingTabs || self == .oversightWhileSwitchingTabs
+        }
     }
 
     private func runVisibleLifetimeWitness(
         switchWorkspace: Bool, failFinalSave: Bool = false, leaveOtherWindowOpen: Bool = false,
-        holdFirstSave: Bool = false, explicitStop: Bool = false, detachedShutdown: DetachedShutdown? = nil,
+        explicitStop: Bool = false, detachedShutdown: DetachedShutdown? = nil,
         revokeLinkStartedRun: Bool = false, revokeDuringLinkSave: Bool = false, heldTool: VisibleHeldTool? = nil,
         submission: VisibleSubmission = .composer, withOutboundLink: Bool = false
     ) async throws {
@@ -1523,9 +1675,9 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         let otherRoot: URL?
         if let gitFixture {
             root = try gitFixture.makeRepository(named: "original-root", files: ["Witness.swift": VisibleHeldTool.uneditedSource])
-            let decoy = directory.appendingPathComponent("other-root", isDirectory: true)
-            try gitFixture.write(VisibleHeldTool.uneditedSource, to: "Witness.swift", at: decoy)
-            otherRoot = decoy
+            let originalWorktree = directory.appendingPathComponent("original-worktree", isDirectory: true)
+            _ = try gitFixture.runGit(["worktree", "add", "-b", "original-host-only", originalWorktree.path], at: root)
+            otherRoot = try gitFixture.makeRepository(named: "other-root", files: ["Witness.swift": VisibleHeldTool.uneditedSource])
         } else {
             root = directory.appendingPathComponent("original-root")
             otherRoot = nil
@@ -1547,6 +1699,11 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         let provider = AgentSessionLinkCapturingACPProvider(providerID: .openCode, commandPath: script.path, environment: [
             "ACP_HOLD_METHOD": "session/prompt", "ACP_RESPONSE_GATE": gate.path
         ])
+        let backgroundReply = "Completed while another chat is selected."
+        if submission.switchesDuringStartup {
+            provider.environment["ACP_ASSISTANT_TEXT_ON_PROMPT"] = backgroundReply
+            provider.usesDefaultNormalizer = true
+        }
         defer { gate.release() }
         let providerResources = AgentRunProviderComposition(
             headless: { _, _ in preconditionFailure("The fixture only launches ACP") }, acp: { _, _ in provider },
@@ -1563,11 +1720,12 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
 
         let sessionID = UUID()
         var tab = ComposeTabState()
-        tab.activeAgentSessionID = holdFirstSave ? nil : sessionID
+        tab.activeAgentSessionID = submission.createsSession ? nil : sessionID
         var workspace = WorkspaceModel(name: "Original", repoPaths: [root.path], customStoragePath: directory.appendingPathComponent("first"))
         var siblingTab = ComposeTabState()
-        if revokeLinkStartedRun || withOutboundLink { siblingTab.activeAgentSessionID = UUID() }
-        workspace.composeTabs = detachedShutdown == .sessionDeletion || revokeLinkStartedRun || withOutboundLink
+        let needsObserver = revokeLinkStartedRun || withOutboundLink || submission == .oversightProjection || submission == .oversightWhileSwitchingTabs
+        if needsObserver { siblingTab.activeAgentSessionID = UUID() }
+        workspace.composeTabs = detachedShutdown == .sessionDeletion || needsObserver || submission.switchesDuringStartup || submission == .firstMessage(.switchTabs)
             ? [tab, siblingTab] : [tab]
         workspace.activeComposeTabID = tab.id
         let second = WorkspaceModel(name: "Other", repoPaths: otherRoot.map { [$0.path] } ?? [], customStoragePath: directory.appendingPathComponent("second"))
@@ -1591,11 +1749,11 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         XCTAssertTrue(host.route.hasCurrentModelCatalogRoute)
         let registered = await transport.dashboardSnapshot()
         XCTAssertFalse(registered.isRunning, "Registering a canonical host must not start the transport")
-        if holdFirstSave {
-            try await assertFirstSaveWithdrawal(
-                window: window, workspace: workspace, tabID: tab.id, host: host, switchTarget: switchWorkspace ? second : nil
+        if case let .firstMessage(action) = submission {
+            try await assertFirstMessageDelivery(
+                window: window, workspace: workspace, sourceTabID: tab.id, siblingTabID: siblingTab.id,
+                host: host, provider: provider, responseGate: gate, action: action
             )
-            XCTAssertTrue(provider.promptedMessages.isEmpty)
             return
         }
 
@@ -1671,6 +1829,33 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         }
         let target = try XCTUnwrap(presentedTarget)
         XCTAssertEqual(target.expectedWriterIdentity, command.identity)
+        if submission == .oversightProjection {
+            let observerID = try XCTUnwrap(siblingTab.activeAgentSessionID)
+            let (bridge, observer) = try await addVisibleLink(
+                agent: agent, observerTab: siblingTab, workspace: workspace, targetSessionID: sessionID
+            )
+            await bridge.test_settleProjections()
+            let observed = agent.currentMonitorPillProps(tabID: tab.id)
+            let overseer = agent.currentMonitorPillProps(tabID: siblingTab.id)
+            XCTAssertEqual(overseer.outbound.map(\.targetSessionID), [sessionID])
+            XCTAssertEqual(observed.inbound.map(\.observerSessionID), [observerID])
+            XCTAssertTrue(agent.agentSessionLinkIsOverseer(tabID: siblingTab.id))
+            let roles = agent.agentSessionLinkOversightRoles(expectedSessionIDs: [tab.id: sessionID, siblingTab.id: observerID])
+            XCTAssertEqual(roles[tab.id]?.isOverseen, true)
+            XCTAssertEqual(roles[siblingTab.id]?.overseeingCount, 1)
+            XCTAssertTrue(agent.sidebarLiveOverseerRelations().contains(.init(overseerSessionID: observerID, overseenSessionID: sessionID)))
+            XCTAssertTrue(WindowStatesManager.shared.agentSessionLinkSetRoutineWakeInterval(enabled: true, seconds: 300, for: observer))
+            XCTAssertTrue(agent.currentMonitorPillProps(tabID: siblingTab.id).routineWakeIntervalEnabled)
+            let poll = try await bridge.authorizeTarget(
+                operation: .monitorPoll, observerEndpoint: observer, targetSessionID: sessionID
+            ).get()
+            let snooze = await bridge.autoWakeSnoozeProjection(
+                observerEndpoint: observer, targetSessionID: sessionID,
+                expectedReference: .init(linkID: poll.lease.linkID, generation: poll.lease.linkGeneration)
+            )
+            XCTAssertNil(try snooze.get())
+            return
+        }
         let prompt = "Retain the originating provider"
         let linkSaveGate = AutoWakeCatalogAuthorityGate()
         let originalSaver = host.scope.persistence.saver
@@ -1688,10 +1873,10 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                 host.scope.persistence.saver = originalSaver
             }
         }
-        let revocation = revokeLinkStartedRun ? try await startThroughVisibleLink(
-            host: host, observerTab: siblingTab, workspace: workspace, targetSessionID: sessionID, message: prompt
+        let linkedSend = revokeLinkStartedRun || submission == .oversightWhileSwitchingTabs ? try await startThroughVisibleLink(
+            agent: agent, observerTab: siblingTab, workspace: workspace, targetSessionID: sessionID, message: prompt
         ) : nil
-        if revokeDuringLinkSave, let revocation {
+        if revokeDuringLinkSave, let revocation = linkedSend {
             try await AsyncTestWait.waitUntil("hold the accepted link row at its first save") { linkSaveEntered }
             await revocation.bridge.revokeLink(linkID: revocation.reference.linkID, generation: revocation.reference.generation)
             await linkSaveGate.open()
@@ -1706,9 +1891,9 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         }
         var remoteSubmission: Task<RemoteCommandResponse, Error>?
         defer { remoteSubmission?.cancel() }
-        if revocation == nil {
+        if linkedSend == nil {
             switch submission {
-            case .composer:
+            case .composer, .composerWhileSwitchingTabs:
                 let submitted = await agent.submitUserTurnCreatingSessionIfNeeded(text: prompt, target: target)
                 guard submitted == .submitted else { return XCTFail("Composer did not accept the run: \(submitted)") }
             case .composerWithHiddenRow:
@@ -1734,6 +1919,8 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                         sessionID: sessionID, message: prompt
                     ), authorizeDispatch: {})
                 }
+            case .firstMessage, .oversightProjection, .oversightWhileSwitchingTabs:
+                return XCTFail("First messages must enter through the unlinked composer")
             }
         }
         try await AsyncTestWait.waitUntil("launch the originating ACP attempt") {
@@ -1742,6 +1929,14 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         let task = try XCTUnwrap(session.agentTask)
         let runID = try XCTUnwrap(session.runID)
         let controller = try XCTUnwrap(session.acpController)
+        if submission.switchesDuringStartup {
+            await window.promptManager.switchComposeTab(siblingTab.id)
+            let save = await window.workspaceManager.pollAndSaveStateWithOutcomeAsync()
+            XCTAssertTrue(save.acceptedForLifecycleAdmission)
+            let canonical = await authority.canonicalWorkspaceSnapshot(workspace.id)
+            XCTAssertEqual(canonical?.document.metadata.activeContextID, siblingTab.id)
+            XCTAssertEqual(agent.currentTabID, siblingTab.id)
+        }
         let routingReceipt = try await routeScriptedHostProvider(session)
         try await gate.waitUntilEntered()
         if submission != .composer {
@@ -1762,6 +1957,20 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             XCTAssertEqual(session.items.count(where: { $0.kind == .user && $0.text.contains(prompt) }), 1)
             gate.release()
             await task.value
+            if submission.switchesDuringStartup {
+                XCTAssertEqual(agent.currentTabID, siblingTab.id)
+                XCTAssertEqual(session.runState, .completed)
+                XCTAssertEqual(try host.scope.admit(session: session).identity, command.identity)
+                try await host.scope.persistence.flushSaveRequired(writer: command.writer).get()
+                let persisted = try await AgentSessionDataService.shared.loadAgentSession(id: sessionID, for: workspace)
+                XCTAssertTrue(persisted?.toLiveItems().contains { $0.kind == .assistant && $0.text == backgroundReply } == true)
+                if let linkedSend {
+                    let delivery = await linkedSend.delivery.value
+                    guard case let .receipt(receipt) = delivery else { return XCTFail("Oversight send did not produce a receipt") }
+                    XCTAssertEqual(receipt.targetSessionID, sessionID)
+                    XCTAssertEqual(receipt.deliveryState, .runStarted)
+                }
+            }
             return
         }
         let started = await transport.dashboardSnapshot()
@@ -1829,6 +2038,10 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             addTeardownBlock { _ = await switching.result }
             guard await suspension.waitUntilEntered() else { return XCTFail("Switch did not prepare B") }
             XCTAssertTrue(agent.runtimeHost === host)
+            XCTAssertEqual(window.workspaceManager.activeWorkspaceID, second.id)
+            let provenance = OpenWindowsDelegationProvenanceSource(windows: { [window] })
+            XCTAssertEqual(provenance.resolutionState(for: sessionID), .unique)
+            XCTAssertEqual(provenance.placement(for: sessionID)?.workspaceID, workspace.id)
             try assertOriginalAttempt()
             try await assertExplicitDetachedShutdown(
                 .workspaceDeletion, host: host, session: session, attemptID: attemptID, workspaceID: workspace.id,
@@ -1886,14 +2099,14 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             XCTAssertFalse(AppDelegate.shouldTerminateAfterLastWindowClosed(isBackgrounded: false))
             try assertOriginalAttempt()
             try await completeHeldTool?()
-            if let revocation {
+            if let revocation = linkedSend {
                 let fence = AgentRunStartStopFence(session: session)
                 let revoke = Task { await revocation.bridge.revokeLink(linkID: revocation.reference.linkID, generation: revocation.reference.generation) }
                 try await AsyncTestWait.waitUntil("revocation fences the exact link-started attempt") { !fence.permitsStart(of: session) }
                 gate.release()
                 await revoke.value
                 await task.value
-                await host.scope.linkExecution?.drainPendingManagedInputEffects(for: session)
+                await host.scope.linkExecution?.drainPendingInputEffects(for: session)
                 XCTAssertEqual(session.runState, .cancelled)
                 XCTAssertEqual(session.lastTerminalCommitRevision?.ownership.attemptID, attemptID)
                 XCTAssertTrue(command.writer.ownsPersistentClaim)
@@ -2151,6 +2364,10 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             do {
                 let diff = try await invoke("git", ["op": .string("diff"), "detail": .string("patches")])
                 XCTAssertTrue(String(describing: diff).contains("+func visibleHostWitness() -> Int { 43 }"), "\(diff)")
+                let worktrees = try await invoke("manage_worktree", ["op": .string("list")])
+                let branches = worktrees.objectValue?["worktrees"]?.arrayValue?.compactMap { $0.objectValue?["branch"]?.stringValue }
+                XCTAssertEqual(Set(branches ?? []), ["main", "original-host-only"])
+                XCTAssertFalse(String(describing: worktrees).contains(otherFile.deletingLastPathComponent().path), "\(worktrees)")
             } catch {
                 XCTFail("Git failed on the retained originating root: \(error)")
                 throw error
@@ -2159,20 +2376,32 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
     }
 
     private func startThroughVisibleLink(
-        host: AgentSessionRuntimeHost, observerTab: ComposeTabState, workspace: WorkspaceModel, targetSessionID: UUID, message: String
+        agent: AgentModeViewModel, observerTab: ComposeTabState, workspace: WorkspaceModel, targetSessionID: UUID, message: String
     ) async throws -> (
         bridge: AgentSessionLinkRuntimeBridge, reference: DomainAgentSessionLinkReference,
         delivery: Task<AgentSessionLinkRuntimeBridge.SendOutcome, Never>
     ) {
+        let (bridge, endpoint) = try await addVisibleLink(
+            agent: agent, observerTab: observerTab, workspace: workspace, targetSessionID: targetSessionID
+        )
+        let authorization = await bridge.authorizeTarget(operation: .monitorSend, observerEndpoint: endpoint, targetSessionID: targetSessionID)
+        let target = try authorization.get()
+        let delivery = Task { await bridge.send(target: target, message: message, idempotencyKey: UUID().uuidString, workflowReference: nil) }
+        addTeardownBlock { _ = await delivery.value }
+        return (bridge, .init(linkID: target.lease.linkID, generation: target.lease.linkGeneration), delivery)
+    }
+
+    private func addVisibleLink(
+        agent: AgentModeViewModel, observerTab: ComposeTabState, workspace: WorkspaceModel, targetSessionID: UUID
+    ) async throws -> (AgentSessionLinkRuntimeBridge, DomainAgentSessionLinkEndpointIdentity) {
+        let host = agent.runtimeHost
         let observer = host.scope.makeSession(tabID: observerTab.id)
         let observerID = try XCTUnwrap(observerTab.activeAgentSessionID)
         observer.installPersistentSessionBinding(.init(tabID: observerTab.id, sessionID: observerID, workspaceID: workspace.id))
         observer.recordRestorationAuthoritative(.persistedPayloadApplied)
         observer.hasLoadedPersistedState = true
         observer.oversight.autoWakeOnUpdates = false
-        var installed = host.scope.sessions
-        installed[observer.tabID] = observer
-        host.scope.replaceSessions(installed)
+        agent.test_installLiveSession(observer)
         let executor = try XCTUnwrap(host.scope.linkExecution)
         let endpoint = try XCTUnwrap(executor.agentSessionLinkObserverEndpoint(tabID: observer.tabID))
         let authority = DomainAgentSessionLinkAuthority(identity: .init(
@@ -2187,11 +2416,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             XCTFail("Expected a live visible-host grant, got \(added)")
             throw CancellationError()
         }
-        let authorization = await bridge.authorizeTarget(operation: .monitorSend, observerEndpoint: endpoint, targetSessionID: targetSessionID)
-        let target = try authorization.get()
-        let delivery = Task { await bridge.send(target: target, message: message, idempotencyKey: UUID().uuidString, workflowReference: nil) }
-        addTeardownBlock { _ = await delivery.value }
-        return (bridge, .init(linkID: target.lease.linkID, generation: target.lease.linkGeneration), delivery)
+        return (bridge, endpoint)
     }
 
     private func assertExplicitDetachedShutdown(
@@ -2282,60 +2507,90 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         XCTAssertEqual(window.agentModeViewModel.runtimeHost.workspaceActivation?.key.owner.workspaceID, workspace.id)
     }
 
-    private func assertFirstSaveWithdrawal(
-        window: WindowState, workspace: WorkspaceModel, tabID: UUID, host: AgentSessionRuntimeHost, switchTarget: WorkspaceModel?
+    private func assertFirstMessageDelivery(
+        window: WindowState, workspace: WorkspaceModel, sourceTabID: UUID, siblingTabID: UUID, host: AgentSessionRuntimeHost,
+        provider: AgentSessionLinkCapturingACPProvider, responseGate: AgentSessionLinkACPResponseGate,
+        action: FirstSaveAction
     ) async throws {
         let agent = window.agentModeViewModel
         let navigation = AgentModeNavigationController(isSystemWorkspaceMode: workspace.isSystemWorkspace)
         navigation.onAppear(isSystem: workspace.isSystemWorkspace, windowState: window, agentModeVM: agent)
-        let session = await agent.ensureSessionReady(tabID: tabID)
-        session.selectedAgent = .openCode
+        let source = await agent.ensureSessionReady(tabID: sourceTabID)
+        source.selectedAgent = .openCode
         var presentedTarget: AgentComposerSubmitTarget?
-        try await AsyncTestWait.waitUntil("present the blank composer") {
-            guard agent.currentTabID == tabID else { return false }
+        try await AsyncTestWait.waitUntil("present the unlinked composer") {
+            guard agent.currentTabID == sourceTabID else { return false }
             presentedTarget = AgentComposerProjection.props(vm: agent, subject: .currentTab).submitTarget
             return presentedTarget != nil
         }
         let target = try XCTUnwrap(presentedTarget)
-        let prompt = "Restore this undispatched input"
-        let attempt = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: prompt)
-        guard case let .claimed(claim) = agent.claimComposerSubmitForImmediatePresentation(attempt) else {
-            return XCTFail("The visible composer did not own the local input")
-        }
-        let gate = AutoWakeCatalogAuthorityGate()
+        XCTAssertEqual(target.route, .createAgentSessionFromSourceTab)
+        let prompt = "Run this first message once"
+        let saveGate = AutoWakeCatalogAuthorityGate()
         let originalSaver = host.scope.persistence.saver
-        var entered = false
+        var saving = false
         host.scope.persistence.saver = { payload, workspace, count in
-            entered = true
-            _ = await gate.requirement()
+            saving = true
+            _ = await saveGate.requirement()
             return try await originalSaver(payload, workspace, count)
         }
         defer {
-            Task { await gate.open() }
+            Task { await saveGate.open() }
             host.scope.persistence.saver = originalSaver
         }
-        let send = Task { await agent.executeComposerSubmitAttempt(text: prompt, claim: claim) }
-        try await AsyncTestWait.waitUntil("hold the real configured first save") { entered }
-        XCTAssertFalse(host.scope.saveQueue.inFlightSessionIDs.isEmpty)
-        XCTAssertTrue(host.scope.sessions.values.allSatisfy { !$0.runState.isActive })
-        let close: Task<Void, Never>?
-        if let switchTarget {
-            try await activateVisibleLifetimeWorkspace(switchTarget, in: window)
-            XCTAssertFalse(window.agentModeViewModel.runtimeHost === host)
-            close = nil
-        } else {
-            WindowStatesManager.shared.unregisterWindowState(window)
-            close = Task { await window.tearDown() }
+        let attempt = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: prompt)
+        guard case let .claimed(claim) = agent.claimComposerSubmitForImmediatePresentation(attempt) else {
+            return XCTFail("The visible composer did not claim its input")
         }
-        XCTAssertTrue(claim.cancellation.isWithdrawn)
-        XCTAssertEqual(host.scope.drafts.text(for: tabID), prompt)
-        XCTAssertFalse(host.scope.isRetiring)
-        XCTAssertFalse(host.route.isClosing)
-        await gate.open()
-        let result = await send.value
-        guard case .blocked = result else { return XCTFail("A withdrawn composer dispatched after its save: \(result)") }
-        await close?.value
-        XCTAssertTrue(host.scope.sessions.values.allSatisfy { $0.activeRunAttemptID == nil && $0.acpController == nil })
+        let send = Task { await agent.executePresentedComposerSubmitAttempt(text: prompt, claim: claim) }
+        try await AsyncTestWait.waitUntil("hold the destination's first save") { saving }
+        let destinationTabID = try XCTUnwrap(agent.currentTabID)
+        XCTAssertNotEqual(destinationTabID, sourceTabID)
+        let destination = try XCTUnwrap(host.scope.sessions[destinationTabID])
+        let sessionID = try XCTUnwrap(destination.activeAgentSessionID)
+        guard case let .unique(writer) = host.scope.resolveWriter(sessionID: sessionID) else {
+            return XCTFail("The prepared session did not acquire a writer")
+        }
+        switch action {
+        case .send:
+            break
+        case .pin:
+            window.promptManager.setComposeTabPinned(true, for: destinationTabID)
+            XCTAssertEqual(window.workspaceManager.composeTab(with: destinationTabID)?.isPinned, true)
+        case .switchTabs:
+            await window.promptManager.switchComposeTab(siblingTabID)
+            let save = await window.workspaceManager.pollAndSaveStateWithOutcomeAsync()
+            XCTAssertTrue(save.acceptedForLifecycleAdmission)
+            XCTAssertEqual(agent.currentTabID, siblingTabID)
+        case .stop:
+            let target = try XCTUnwrap(agent.makeRunCancelTarget(tabID: destinationTabID, session: destination))
+            let stop = Task { await agent.cancelAgentRun(target: target) }
+            try await AsyncTestWait.waitUntil("an explicit Stop withdraws the pending writer") { claim.cancellation.isWithdrawn }
+            await saveGate.open()
+            let result = await send.value
+            let didStop = await stop.value
+            XCTAssertTrue(didStop)
+            guard case .blocked = result else { return XCTFail("The withdrawn message was accepted") }
+            XCTAssertEqual(host.scope.drafts.text(for: sourceTabID), prompt)
+            XCTAssertTrue(provider.promptedMessages.isEmpty)
+            XCTAssertNil(destination.activeRunAttemptID)
+            return
+        }
+        XCTAssertTrue(writer.isCurrent)
+        await saveGate.open()
+        let submission = await send.value
+        guard submission == .submitted else { return XCTFail("The new session did not accept the input: \(submission)") }
+        try await AsyncTestWait.waitUntil("start the newly saved session") { destination.acpController != nil }
+        _ = try await routeScriptedHostProvider(destination)
+        try await responseGate.waitUntilEntered()
+        XCTAssertEqual(provider.promptedMessages.count, 1)
+        XCTAssertTrue(provider.promptedMessages[0].userMessage.contains(prompt))
+        XCTAssertEqual(destination.items.count(where: { $0.kind == .user }), 1)
+        responseGate.release()
+        await destination.agentTask?.value
+        try await host.scope.persistence.flushSaveRequired(writer: writer).get()
+        let saved = try await AgentSessionDataService.shared.loadAgentSession(id: sessionID, for: workspace)
+        XCTAssertEqual(saved?.transcript?.turns.compactMap { $0.request?.text }, [prompt])
     }
 
     private func assertSupersededVisibleAdoption(
@@ -2898,7 +3153,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                 if change == "saveStop" { _ = await gate.requirement() }
                 return saved
             }
-            let pending = Task { try await host.prepareFreshCreation(submission: submission, rootIDs: []) }
+            let pending = Task { try await host.prepareFreshCreation(submission: submission) }
             await gate.waitUntilEntered()
             let createdID = try XCTUnwrap(session.activeAgentSessionID)
             switch change {
@@ -2972,7 +3227,6 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         let captured = MCPWorktreeToolProvider.ExecutionAdmission(command)
         let admission = try await captured.resolve()
         XCTAssertEqual(admission.command.identity, command.identity)
-        XCTAssertNotNil(admission.resources.store)
         try admission.requireCurrent()
 
         let current = await authority.canonicalWorkspaceSnapshot(command.identity.workspaceID)
@@ -3088,7 +3342,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
     /// the external provider is scripted; startup is never intercepted or delegated to a VM.
     private func hostStartupFixture(
         canonicalWorkspace: Bool = false, boundCanonicalCarrier: Bool = false, canonicalInput: Bool = false,
-        registersProviderRoute: Bool = false,
+        registersProviderRoute: Bool = false, codexController: MonitorFakeCodexController? = nil,
         makeResponseGate: ((URL) throws -> AgentSessionLinkACPResponseGate)? = nil,
         commandWillExecute: (@Sendable (DomainWorkspaceCommandEnvelope) async -> Void)? = nil
     ) async throws -> (
@@ -3124,7 +3378,10 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         }
         let codex = CodexAgentModeCoordinator(
             windowID: route.identity.routeID, runtimeWorkspacePathsProvider: { _ in .uniform(nil) },
-            codexControllerFactory: { _, _, _, _, _, _, _, _, _ in preconditionFailure("ACP must not construct Codex") },
+            codexControllerFactory: { _, _, _, _, _, _, _, _, _ in
+                guard let codexController else { preconditionFailure("ACP must not construct Codex") }
+                return codexController
+            },
             connectionPolicyInstaller: policy, shouldManageCodexTooling: false, codexHookApprovalSettings: GlobalSettingsStore.shared
         )
         let host = AgentSessionRuntimeHost(
@@ -3157,6 +3414,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         let keys = KeyManager()
         let settings = APISettingsViewModel(aiQueriesService: AIQueriesService(keyManager: keys), keyManager: keys, loadStoredDataOnInit: false)
         settings.isOpenCodeConnected = true
+        if codexController != nil { settings.isCodexConnected = true }
         let settingsLease = try XCTUnwrap(APISettingsRuntimeLease.acquire(from: settings))
         addTeardownBlock { await lease.release()
             await MainActor.run { settingsLease.release() }
@@ -3165,10 +3423,14 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         activations.receiveWorkspaceSwitchNotification(workspace)
         if canonicalWorkspace {
             authority.commandWillExecuteForTesting = commandWillExecute
-            try await host.installWorkspaceActivation(.init(
+            let activation = try AgentSessionHostWorkspaceActivation(
                 windowID: host.routeID, authority: authority, activations: activations,
                 resources: .init(files: files, contexts: domain.contextStore), settings: settingsLease
-            ), attachmentWorkspaceDirectory: directory, suppressesAttachmentPersistence: false)
+            )
+            try await host.installWorkspaceActivation(
+                activation, attachmentWorkspaceDirectory: directory, suppressesAttachmentPersistence: false
+            )
+            try await activation.retainHostFileResources(rootIDs: [])
         }
         if canonicalInput {
             XCTAssertTrue(host.scope.sessions.isEmpty)
@@ -3183,7 +3445,8 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             workspaceID: workspace.id, workspaceWithID: { $0 == workspace.id ? workspace : nil },
             displayName: { _ in "Host startup" }, isSuppressed: { false }, attachmentWorkspaceDirectory: { directory }
         ).persistenceComposition(scope: host.scope, canonicalStorage: .init(workspaceID: workspace.id, contexts: domain.contextStore))
-        _ = host.scope.interactions(routeID: host.routeID, approvalStore: ApplyEditsApprovalStore())
+        let approvalStore = ApplyEditsApprovalStore()
+        _ = host.scope.interactions(routeID: host.routeID, approvalStore: approvalStore)
         let execution = host.makeExecution(
             dependencies: .init(
                 windowID: host.routeID, connectionPolicyInstaller: policy, expectedPIDPolicyArmer: { _ in true }, mcpServerEnabler: { true },
@@ -3200,7 +3463,14 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             prepareLaunch: { nil }, perfRecorder: NoopAgentModePerfRecorder()
         )
         host.scope.installExecution(execution)
+        if codexController != nil {
+            host.installCodexRuntime(
+                codex, routeID: route.identity.routeID, approvalStore: approvalStore,
+                links: f.runtime, mcpServerEnabler: { true }, modelRouterSettingsStore: .shared
+            )
+        }
         addTeardownBlock { @MainActor in
+            await f.session.codexController?.shutdown()
             await f.session.agentTask?.value
             await f.session.acpController?.shutdown()
             await host.scope.persistence.flushSave(for: f.session.tabID)

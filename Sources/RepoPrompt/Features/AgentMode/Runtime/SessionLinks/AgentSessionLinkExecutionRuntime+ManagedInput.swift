@@ -1,20 +1,88 @@
 import Foundation
+import RepoPromptAgentRuntime
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 
 extension AgentSessionLinkExecutionRuntime {
+    func inputRouting(for session: AgentTabSession, hasImages: Bool) -> AgentSessionInputRouting {
+        .init(
+            provider: session.selectedAgent, state: session.runState,
+            hasContinuation: session.instructionContinuation != nil, hasImages: hasImages,
+            hasApproval: session.pendingApproval != nil,
+            acpPromptAvailable: session.pendingAskUser == nil
+                && session.pendingUserInputRequest == nil && session.pendingPermissionsRequest == nil
+                && session.runID != nil && session.activeRunAttemptID != nil && session.acpController != nil
+        )
+    }
+
     /// Managed input deliberately has no draft, attachment, interview or local workflow access.
-    func agentSessionLinkManagedSteerRoute(for session: TabSession) -> AgentSessionLinkManagedSteerRoute? {
-        if session.runState == .waitingForUser, session.instructionContinuation != nil { return .waitingInstruction }
-        guard session.runState.isActive else { return nil }
-        if session.selectedAgent == .codexExec { return .codex }
-        guard session.runState == .running, session.pendingApproval == nil else { return nil }
-        if session.selectedAgent.acpProviderID != nil,
-           session.pendingAskUser == nil, session.pendingUserInputRequest == nil,
-           session.pendingPermissionsRequest == nil, session.runID != nil,
-           session.activeRunAttemptID != nil, session.acpController != nil { return .acpQueued }
-        return session.selectedAgent.usesClaudeNativeRuntime ? .claudeInterrupt : nil
+    func agentSessionLinkManagedSteerRoute(for session: AgentTabSession) -> AgentSessionLinkManagedSteerRoute? {
+        inputRouting(for: session, hasImages: false).managedSteering
+    }
+
+    func submitActiveProviderSteering(
+        _ route: AgentSessionInputRouting.ActiveSteeringRoute,
+        session: TabSession,
+        wrappedText: String,
+        attachmentsToSend: [AgentFileAttachment],
+        taggedFilesToSend: [AgentTaggedFileAttachment],
+        trimmedText: String,
+        userItem: AgentChatItem,
+        managedTurn: AgentNoncomposerTurn? = nil,
+        localComposerCandidate: UUID? = nil,
+        skipsSlashExpansion: Bool = false,
+        providerTaggedFiles: [AgentTaggedFileAttachment]? = nil
+    ) -> Bool {
+        guard let owner = scope, owner.sessions[session.tabID] === session,
+              let service = owner.execution else { return false }
+        // Steering recovery restores a queued instruction's draft into the composer. A managed
+        // steer carries none, so a withdrawn one can never reappear as the target user's draft.
+        let restorableDraftText = managedTurn == nil ? trimmedText : ""
+        switch route {
+        case .acpPrompt:
+            // ACP live steering uses the same serialized queued-flush shape as
+            // Claude native steering. The run service waits for MCP tools to go idle,
+            // sends session/cancel, waits for the active ACP prompt to settle, then
+            // submits the steering session/prompt. Do not prompt directly here.
+            let interruptedPromptProviderText = Self.interruptedACPProviderText(for: session, before: userItem)
+            let steering = TabSession.ACPSteeringInstruction(
+                id: UUID(),
+                targetRunID: session.runID,
+                targetRunAttemptID: session.activeRunAttemptID,
+                providerText: wrappedText,
+                interruptedPromptProviderText: interruptedPromptProviderText,
+                attachments: attachmentsToSend,
+                taggedFileAttachments: taggedFilesToSend,
+                draftText: restorableDraftText,
+                optimisticUserItemID: userItem.id,
+                createdAt: Date(),
+                managed: managedTurn.map {
+                    TabSession.ACPSteeringManagedContext(
+                        sink: $0.sink,
+                        attributedItemID: userItem.id,
+                        endpoint: $0.endpoint,
+                        attribution: $0.attribution
+                    )
+                },
+                skipsSlashExpansion: skipsSlashExpansion,
+                providerTaggedFileAttachments: providerTaggedFiles
+            )
+            let command = instructionCommand(for: session)
+            return enqueueACPSteering(
+                steering, session: session, owner: owner, service: service, localComposerCandidate: localComposerCandidate,
+                admitted: { command?.isCurrent ?? (owner.executableHost?.workspaceActivation == nil) }
+            )
+        case .claudeNativeInterrupt:
+            return owner.startup.queueClaudeSteering(
+                session: session, service: service, wrappedText: wrappedText,
+                attachments: attachmentsToSend, taggedFiles: taggedFilesToSend,
+                draftText: restorableDraftText, userItem: userItem,
+                localComposerCandidate: localComposerCandidate, skipsSlashExpansion: skipsSlashExpansion,
+                providerTaggedFiles: providerTaggedFiles,
+                accepted: { managedTurn?.sink.resolve(.delivered(.queuedInterrupt)) }
+            )
+        }
     }
 
     @discardableResult
@@ -72,7 +140,7 @@ extension AgentSessionLinkExecutionRuntime {
         cancelAgentSessionLinkAutoWake(for: turn.endpoint, reason: .localUserWon)
         owner.presentation.bindingChanged(session)
         owner.persistence.scheduleSave(for: session)
-        wakeManagedInputWaiters(session: session, message: displayText, environment: environment)
+        wakeInputWaiters(session: session, message: displayText, environment: environment, isManaged: true)
 
         if session.selectedAgent != .codexExec {
             let preview = AgentSessionProviderInputRuntime.renderProviderMessage(text: wrapped, attachments: [], agent: session.selectedAgent)
@@ -123,19 +191,37 @@ extension AgentSessionLinkExecutionRuntime {
                 ),
                 runtimeInputAdmission: inputAdmission
             )
-            session.pendingACPSteeringInstructions.append(steering)
-            if !session.isMCPInstructionDispatchInProgress {
-                let stopFence = AgentRunStartStopFence(session: session)
-                retainManagedInputEffect(session: session, owner: owner) {
-                    guard command.isCurrent, environment.resourcesAreCurrent(), stopFence.permitsStart(of: session) else {
-                        service.withdrawQueuedManagedACPSteering(id: steering.id, session: session, stopFence: stopFence)
-                        return
-                    }
-                    let accepted = await service.submitQueuedACPSteeringIfSupported(session: session)
-                    guard stopFence.permitsStart(of: session), !accepted else { return }
-                    service.settleRejectedACPSteeringSubmission(id: steering.id, session: session, stopFence: stopFence)
-                }
+            if !enqueueACPSteering(
+                steering, session: session, owner: owner, service: service,
+                admitted: { command.isCurrent && environment.resourcesAreCurrent() }
+            ) {
+                withdrawManagedInput(command: command, session: session, row: row, rollback: rollback, turn: turn)
             }
+        }
+        return true
+    }
+
+    @discardableResult
+    func enqueueACPSteering(
+        _ instruction: TabSession.ACPSteeringInstruction, session: TabSession, owner: AgentSessionRuntimeStore.Scope,
+        service: AgentModeRunService, localComposerCandidate: UUID? = nil,
+        admitted: @escaping @MainActor () -> Bool
+    ) -> Bool {
+        guard scope === owner, owner.execution === service,
+              let membership = owner.membership(of: session), admitted() else { return false }
+        session.pendingACPSteeringInstructions.append(instruction)
+        session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained)
+        guard !session.isMCPInstructionDispatchInProgress else { return true }
+        let stopFence = AgentRunStartStopFence(session: session)
+        retainInputEffect(session: session, owner: owner) {
+            guard membership.isCurrent, stopFence.permitsStart(of: session) else { return }
+            guard admitted() else {
+                service.withdrawQueuedManagedACPSteering(id: instruction.id, session: session, stopFence: stopFence)
+                return
+            }
+            let accepted = await service.submitQueuedACPSteeringIfSupported(session: session)
+            guard membership.isCurrent, stopFence.permitsStart(of: session), !accepted else { return }
+            service.settleRejectedACPSteeringSubmission(id: instruction.id, session: session, stopFence: stopFence)
         }
         return true
     }
@@ -160,26 +246,28 @@ extension AgentSessionLinkExecutionRuntime {
         return text.isEmpty ? nil : text
     }
 
-    func retainManagedInputEffect(
-        session: TabSession, owner: AgentSessionRuntimeStore.Scope, operation: @escaping @MainActor () async -> Void
-    ) {
+    @discardableResult
+    func retainInputEffect<Outcome: Sendable>(
+        session: TabSession, owner: AgentSessionRuntimeStore.Scope, operation: @escaping @MainActor () async -> Outcome
+    ) -> Task<Outcome, Never> {
         let id = UUID()
         let task = Task { @MainActor [self, owner, session] in
-            defer { pendingManagedInputEffects.removeValue(forKey: id)
+            defer {
+                pendingInputEffects.removeValue(forKey: id)
                 owner.noteSettlementChanged()
-                // ObjectIdentifier filters are valid only while the exact originating object lives.
-                withExtendedLifetime((owner, session)) {}
+                withExtendedLifetime(session) {}
             }
-            await operation()
+            return await operation()
         }
-        pendingManagedInputEffects[id] = PendingSendEffect(sessionIdentity: ObjectIdentifier(session), task: task)
+        pendingInputEffects[id] = PendingInputEffect(sessionIdentity: ObjectIdentifier(session), join: { _ = await task.value })
+        return task
     }
 
-    /// Separate from terminal-save effects: provider submission can itself await terminal work.
-    func drainPendingManagedInputEffects(for session: TabSession? = nil) async {
+    /// Provider submission may itself await terminal work.
+    func drainPendingInputEffects(for session: TabSession? = nil) async {
         let identity = session.map(ObjectIdentifier.init)
-        while let effect = pendingManagedInputEffects.values.first(where: { identity == nil || $0.sessionIdentity == identity }) {
-            await effect.task.value
+        while let effect = pendingInputEffects.values.first(where: { identity == nil || $0.sessionIdentity == identity }) {
+            await effect.join()
         }
     }
 
@@ -212,7 +300,7 @@ extension AgentSessionLinkExecutionRuntime {
         let controllerID = session.codexController.map(ObjectIdentifier.init)
         let receipt = AgentSessionRuntimeStore.WriterReceipt(command)
         session.codexSteerAckTracker.authorizeDispatch(attemptID: attemptID)
-        retainManagedInputEffect(session: session, owner: owner) { [self] in
+        retainInputEffect(session: session, owner: owner) { [self] in
             guard await session.codexSteerAckTracker.awaitDispatchAuthorization(attemptID: attemptID) else {
                 session.codexDispatchSerialGate.cancel(ticket)
                 withdrawManagedInput(command: command, session: session, row: row, rollback: rollback, turn: turn)
@@ -315,28 +403,84 @@ extension AgentSessionLinkExecutionRuntime {
         }
     }
 
+    func dispatchLocalWaitingInstruction(
+        session: TabSession, text: String, row: AgentChatItem, providerTaggedFiles: [AgentTaggedFileAttachment],
+        rollback: AgentTurnUserAnchorRollbackState, draftText: String, workflow: AgentWorkflowDefinition?, workflowGeneration: UInt64?,
+        localComposerCandidate: UUID?, skipsSlashExpansion: Bool, managedTurn: AgentNoncomposerTurn? = nil,
+        rejectedPresentation: ((String) -> Void)? = nil
+    ) {
+        guard let owner = scope, let membership = owner.membership(of: session) else { return }
+        let command = instructionCommand(for: session)
+        let reject: (String) -> Void = { message in
+            guard membership.isCurrent, command?.writer.ownsPersistentClaim ?? true else {
+                managedTurn?.sink.resolve(.unconfirmed(message: message))
+                return
+            }
+            if let index = session.items.firstIndex(where: { $0.id == row.id }) { _ = session.removeItem(at: index) }
+            owner.turnTiming.rollbackAgentTurnUserAnchor(rollback, session: session)
+            owner.presentation.requestUIRefresh(for: session, urgent: true)
+            owner.persistence.scheduleSave(for: session)
+            if let managedTurn {
+                managedTurn.sink.resolve(.notAccepted(message: message))
+                return
+            }
+            _ = owner.drafts.restoreRejectedSubmission(
+                session: session, draftText: draftText, attachments: row.attachments,
+                taggedFiles: row.taggedFileAttachments, workflow: workflow,
+                workflowMutationGeneration: workflowGeneration, message: message
+            )
+            rejectedPresentation?(message)
+        }
+        guard let command else {
+            reject("The originating session could not admit this reply.")
+            return
+        }
+        dispatchWaitingInstruction(
+            command: command, text: text, attachments: row.attachments, taggedFiles: providerTaggedFiles,
+            skipsSlashExpansion: skipsSlashExpansion, localComposerCandidate: localComposerCandidate,
+            environment: commands.managedInputEnvironment(session), rejectInput: reject,
+            acceptInput: { managedTurn?.sink.resolve(.delivered(.deliveredToWaitingInstruction)) }
+        )
+    }
+
     private func dispatchManagedWaitingInstruction(
         command: AgentSessionRuntimeStore.Command, session: TabSession, text: String, row: AgentChatItem,
         rollback: AgentTurnUserAnchorRollbackState, turn: AgentNoncomposerTurn, environment: ManagedInputEnvironment
     ) {
+        dispatchWaitingInstruction(
+            command: command, text: text, environment: environment,
+            rejectInput: { [self] _ in
+                withdrawManagedInput(command: command, session: session, row: row, rollback: rollback, turn: turn)
+            },
+            acceptInput: { turn.sink.resolve(.delivered(.deliveredToWaitingInstruction)) }
+        )
+    }
+
+    private func dispatchWaitingInstruction(
+        command: AgentSessionRuntimeStore.Command, text: String, attachments: [AgentFileAttachment] = [],
+        taggedFiles: [AgentTaggedFileAttachment] = [], skipsSlashExpansion: Bool = false,
+        localComposerCandidate: UUID? = nil, environment: ManagedInputEnvironment?,
+        rejectInput: @escaping (String) -> Void, acceptInput: @escaping () -> Void
+    ) {
         let owner = command.writer.scope
+        let session = command.writer.session
         let ownership = session.activeRunOwnership
         let waitID = session.instructionWaitID
-        let instruction = instructionCommand(for: session)
         let controllerID = session.codexController.map(ObjectIdentifier.init)
         let dispatchID = AgentSessionLinkPromptDispatchID.waitingContinuation(waitID: waitID ?? session.tabID)
         let ticket = session.codexDispatchSerialGate.issueTicket()
-        retainManagedInputEffect(session: session, owner: owner) { [self] in
+        retainInputEffect(session: session, owner: owner) { [self] in
+            defer { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) }
             guard await session.codexDispatchSerialGate.awaitTurn(ticket) else {
-                turn.sink.resolve(.unconfirmed(message: "The waiting instruction stopped dispatching."))
+                rejectInput("The input queue closed before delivering this reply.")
                 return
             }
             defer { session.codexDispatchSerialGate.finish(ticket) }
             var capturedWorkspace: AgentSessionProviderInputRuntime.WorkspaceSource?
             @MainActor func isCurrent() -> Bool {
-                guard let instruction, let waitID else { return false }
-                return command.isCurrent && environment.resourcesAreCurrent() && (capturedWorkspace?.isCurrent() ?? true)
-                    && ownsInstructionWait(command: instruction, waitID: waitID)
+                guard let waitID else { return false }
+                return command.isCurrent && (environment?.resourcesAreCurrent() ?? true) && (capturedWorkspace?.isCurrent() ?? true)
+                    && ownsInstructionWait(command: command, waitID: waitID)
                     && (
                         ownership.map { session.isCurrentRunAttemptForCurrentBinding($0) && session.quietLedger.isOpen(owner: $0) }
                             ?? (session.activeRunOwnership == nil)
@@ -347,7 +491,7 @@ extension AgentSessionLinkExecutionRuntime {
             var ownsDispatchClaim = false
             @MainActor func reject() {
                 if ownsDispatchClaim { agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID) }
-                withdrawManagedInput(command: command, session: session, row: row, rollback: rollback, turn: turn)
+                rejectInput("The waiting request changed before the provider received this reply.")
             }
             guard isCurrent() else { reject()
                 return
@@ -356,7 +500,7 @@ extension AgentSessionLinkExecutionRuntime {
             let augmented: String
             do {
                 augmented = try await commands.input.augmentUserMessage(
-                    text, attachments: [], taggedFileAttachments: [], agent: session.selectedAgent,
+                    text, attachments: attachments, taggedFileAttachments: taggedFiles, agent: session.selectedAgent,
                     workspacePaths: commands.workspacePaths(), workspace: {
                         let source = try await self.commands.inputWorkspace(session, command)
                         capturedWorkspace = source
@@ -364,13 +508,13 @@ extension AgentSessionLinkExecutionRuntime {
                     },
                     workspaceCaptureOrder: commands.workspaceCaptureOrder,
                     session: session, handoff: owner.handoff, ignoresPendingHandoff: false,
-                    skipsSlashExpansion: false, isCurrent: isCurrent, onTaggedFileFailures: { failures = $0 }
+                    skipsSlashExpansion: skipsSlashExpansion, isCurrent: isCurrent, onTaggedFileFailures: { failures = $0 }
                 )
             } catch {
                 reject()
                 return
             }
-            guard isCurrent(), await environment.validateResources(command), isCurrent(),
+            guard isCurrent(), await (environment?.validateResources(command) ?? true), isCurrent(),
                   await capturedWorkspace?.validate() ?? true, isCurrent()
             else { reject()
                 return
@@ -392,9 +536,9 @@ extension AgentSessionLinkExecutionRuntime {
             let proof = await agentSessionLinkProveProviderInput(for: session, claim: monitoring.claim)
             guard isCurrent(), !Task.isCancelled,
                   agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: readiness),
-                  let instruction, let waitID,
+                  let waitID,
                   resumeWaitingInstructionContinuation(
-                      command: instruction,
+                      command: command,
                       waitID: waitID,
                       providerText: monitoring.text,
                       claim: monitoring.claim,
@@ -407,11 +551,13 @@ extension AgentSessionLinkExecutionRuntime {
             }
             AgentSessionProviderInputRuntime.recordTaggedFileFailures(failures, session: session, scope: owner)
             session.deferredActiveAgentRunTimerRollback = nil
-            turn.sink.resolve(.delivered(.deliveredToWaitingInstruction))
+            acceptInput()
         }
     }
 
-    private func wakeManagedInputWaiters(session: TabSession, message: String, environment: ManagedInputEnvironment) {
+    func wakeInputWaiters(
+        session: TabSession, message: String?, environment: ManagedInputEnvironment, isManaged: Bool
+    ) {
         guard session.runState == .running, !session.isMCPInstructionDispatchInProgress, let owner = scope else { return }
         let runID = session.runID
         let attemptID = session.activeRunAttemptID
@@ -423,21 +569,16 @@ extension AgentSessionLinkExecutionRuntime {
         if let runID,
            session.selectedAgent != .codexExec || codexCoordinator?.isCodexCompactionInFlight(session: session) == true
         {
-            retainManagedInputEffect(session: session, owner: owner) {
+            retainInputEffect(session: session, owner: owner) {
                 await environment.tools.wakeAgentRunWaitersOwnedByActiveRun(
-                    runID: runID, source: "managed-active-submit-parent-run", steeringMessage: message,
+                    runID: runID, source: isManaged ? "managed-active-submit-parent-run" : "manual-active-submit-parent-run", steeringMessage: message,
                     steeringOriginRunID: currentOrigin,
-                    publicationForSessionID: { id in
-                        guard let cursor = owner.mcp.waitCursor(sessionID: id),
-                              let target = owner.mcp.controlRead(sessionID: id).session,
-                              let snapshot = owner.mcp.mcpReadSnapshot(for: target) else { return nil }
-                        return (snapshot, cursor)
-                    }
+                    publicationForSessionID: { id in owner.mcp.waitPublication(sessionID: id) }
                 )
             }
         }
-        if let (snapshot, context) = owner.mcp.currentSteeringSnapshot(for: session, operation: "managed steer") {
-            retainManagedInputEffect(session: session, owner: owner) {
+        if let (snapshot, context) = owner.mcp.currentSteeringSnapshot(for: session, operation: isManaged ? "managed steer" : "active composer input") {
+            retainInputEffect(session: session, owner: owner) {
                 guard owner.mcp.mcpControlContextMatches(
                     tabID: session.tabID,
                     sessionID: snapshot.sessionID,

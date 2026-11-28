@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 /// In-memory projection scope; no persisted or reflected type identity is changed.
 enum AgentSessionPresentationRefreshScope: String, Equatable, Hashable {
@@ -32,7 +33,10 @@ final class AgentSessionPresentationRuntime {
         var elapsedTime: ((AgentTabSession) -> Void)?
         var runState: ((AgentTabSession) -> Void)?
         var oversightBinding: ((AgentTabSession) -> Void)?
+        var oversightProjection: ((AgentTabSession) -> Void)?
+        var oversightPolicy: ((AgentTabSession) -> Void)?
         var permissions: ((AgentTabSession) -> Void)?
+        var providerSwitchSummary: ((UUID) -> Void)?
         var worktreeOperations: ((AgentTabSession) -> Void)?
         var draftChanged: ((AgentTabSession, String) -> Void)?
         var draftRestored: ((AgentTabSession, AgentComposerDraftRestorationEvent) -> Void)?
@@ -74,6 +78,30 @@ final class AgentSessionPresentationRuntime {
 
     private var entries: [ObjectIdentifier: Entry] = [:]
     private var activeUISyncSuppressionDepth = 0
+    /// The bridge's display state for this host. A presenter can attach at any time
+    /// and read the same generation-qualified rows.
+    var monitorPropsByEndpoint: [DomainAgentSessionLinkEndpointIdentity: AgentMonitorPillProps] = [:]
+
+    @discardableResult
+    func storeMonitorProjection(
+        _ props: AgentMonitorPillProps, for endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> Bool {
+        let superseded = monitorPropsByEndpoint.keys.filter { $0.tabID == endpoint.tabID && $0 != endpoint }
+        guard !superseded.isEmpty || monitorPropsByEndpoint[endpoint] != props else { return false }
+        for stale in superseded {
+            monitorPropsByEndpoint.removeValue(forKey: stale)
+        }
+        monitorPropsByEndpoint[endpoint] = props
+        return true
+    }
+
+    func oversightProjectionChanged(_ session: AgentTabSession) {
+        sink(for: session)?.oversightProjection?(session)
+    }
+
+    func oversightPolicyChanged(_ session: AgentTabSession) {
+        sink(for: session)?.oversightPolicy?(session)
+    }
 
     var isActiveUISyncSuppressed: Bool {
         activeUISyncSuppressionDepth > 0
@@ -206,6 +234,10 @@ final class AgentSessionPresentationRuntime {
 
     func elapsedTimeChanged(_ session: AgentTabSession) {
         sink(for: session)?.elapsedTime?(session)
+    }
+
+    func providerSwitchSummaryChanged(_ session: AgentTabSession) {
+        sink(for: session)?.providerSwitchSummary?(session.tabID)
     }
 
     func bindingChanged(_ session: AgentTabSession) {

@@ -508,7 +508,7 @@ final class AgentTabSession: ObservableObject {
 
     /// Runtime-only: an execution-worktree change this session requested for itself from its own
     /// live turn, applied at that turn's completed terminal boundary and then continued
-    /// automatically. Owned by `AgentModeViewModel+SelfWorktreeRelocation`.
+    /// automatically. Owned by `AgentSessionWorktreeRuntime`.
     var pendingSelfWorktreeRelocation: AgentSelfWorktreeRelocation? {
         didSet {
             if oldValue != pendingSelfWorktreeRelocation {
@@ -1677,7 +1677,7 @@ final class AgentTabSession: ObservableObject {
     // In-memory authority for this chat, never written to AgentSession persistence. Runtime
     // reconnects and ownership transitions may reuse it; session shutdown and explicit off revoke it.
     var codexComputerUseArmingRequestID: UUID?
-    var pendingCodexComputerUseActivation: AgentModeViewModel.CodexComputerUseActivation?
+    var pendingCodexComputerUseActivation: CodexComputerUseActivation?
     var codexControllerFeatureState: CodexControllerFeatureState?
     var isCodexComputerUseArmed: Bool {
         pendingCodexComputerUseActivation != nil
@@ -1731,9 +1731,11 @@ final class AgentTabSession: ObservableObject {
         runLifecycle.lastTerminalPublicationResult
     }
 
-    var runAttemptTerminalResources: AgentRunAttemptTerminalResources? {
-        runLifecycle.terminalResources
-    }
+    #if DEBUG
+        var runAttemptTerminalResources: AgentRunAttemptTerminalResources? {
+            runLifecycle.test_terminalResources
+        }
+    #endif
 
     /// Handoff payload (injected into provider-facing text on first user send).
     /// Cleared only after the provider accepts the turn.
@@ -2143,6 +2145,13 @@ final class AgentTabSession: ObservableObject {
 
     var creationState: AgentSessionRestorationReadiness.CreationState? {
         qualifiedRestorationReadiness.creationState
+    }
+
+    @Published var activeCreationSaveOwnerID: UUID?
+
+    var isSavingInitialConfiguration: Bool {
+        guard let activeCreationSaveOwnerID else { return false }
+        return creationState?.ownerID == activeCreationSaveOwnerID
     }
 
     var creationConfigurationStamp: Data? {

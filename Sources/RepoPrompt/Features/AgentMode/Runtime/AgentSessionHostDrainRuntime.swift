@@ -32,13 +32,13 @@ final class AgentSessionHostDrainRuntime {
         /// Reuses the link owner's receipts, including objects removed from the live census.
         static func managedInput(_ links: AgentSessionLinkExecutionRuntime) -> Self {
             .init(hasPending: { session in
-                links.pendingManagedInputEffects.values.contains { $0.sessionIdentity == ObjectIdentifier(session) }
+                links.pendingInputEffects.values.contains { $0.sessionIdentity == ObjectIdentifier(session) }
             }, drain: { session in
-                await links.drainPendingManagedInputEffects(for: session)
+                await links.drainPendingInputEffects(for: session)
             }, hasPendingInScope: {
-                !links.pendingManagedInputEffects.isEmpty
+                !links.pendingInputEffects.isEmpty
             }, drainScope: {
-                await links.drainPendingManagedInputEffects(for: nil)
+                await links.drainPendingInputEffects(for: nil)
             })
         }
     }

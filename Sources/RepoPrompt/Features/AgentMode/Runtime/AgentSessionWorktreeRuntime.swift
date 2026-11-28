@@ -4,13 +4,22 @@ import RepoPromptCodexProvider
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 import RepoPromptWorkspaceContext
+import RepoPromptWorkspaceCore
 
 /// Execution-location transactions belong to the exact writer, not its presenting tab. The host
 /// supplies resource/protocol adapters; this owner sequences preparation, effects and persistence.
 @MainActor
 final class AgentSessionWorktreeRuntime {
-    typealias Intent = AgentModeViewModel.WorktreeBindingTransitionIntent
-    typealias Confirmation = AgentModeViewModel.ExecutionLocationChangeConfirmation
+    enum Confirmation: Equatable {
+        case startedThreadRestart
+        case activeRunStop
+    }
+
+    enum Intent {
+        case initialSend
+        case userExecutionLocationChange(confirmation: Confirmation?)
+        case externalManagement
+    }
 
     enum TransitionError: LocalizedError {
         case unavailable(String)
@@ -46,10 +55,11 @@ final class AgentSessionWorktreeRuntime {
     }
 
     struct Resources {
-        let store: WorkspaceFileContextStore?
+        private let store: WorkspaceFileContextStore?
         let fallbackWorkspacePath: String?
         let declaredRepoPaths: [String]
         let storageDirectory: URL?
+        private let retainedRoots: AgentHostWorkspaceResources.Lease?
         /// Hydrating a saved session does not imply its workspace roots have finished loading.
         let awaitRootReadiness: @MainActor () async throws -> Void
         let validatePlacement: (@MainActor () async throws -> Void)?
@@ -58,6 +68,7 @@ final class AgentSessionWorktreeRuntime {
         init(
             store: WorkspaceFileContextStore?, fallbackWorkspacePath: String?,
             declaredRepoPaths: [String], storageDirectory: URL? = nil,
+            retainedRoots: AgentHostWorkspaceResources.Lease? = nil,
             awaitRootReadiness: @escaping @MainActor () async throws -> Void,
             validatePlacement: (@MainActor () async throws -> Void)? = nil,
             isCurrent: @escaping @MainActor () -> Bool
@@ -66,10 +77,51 @@ final class AgentSessionWorktreeRuntime {
             self.fallbackWorkspacePath = fallbackWorkspacePath
             self.declaredRepoPaths = declaredRepoPaths
             self.storageDirectory = storageDirectory
+            self.retainedRoots = retainedRoots
             self.awaitRootReadiness = awaitRootReadiness
             self.validatePlacement = validatePlacement
             self.isCurrent = isCurrent
         }
+
+        @MainActor
+        func logicalRoots() async throws -> [WorkspaceRootRef] {
+            try await awaitRootReadiness()
+            if let retainedRoots { return retainedRoots.roots }
+            guard let store else { throw TransitionError.stale }
+            return await store.rootRefs(scope: .visibleWorkspace)
+        }
+
+        @MainActor
+        func lookup(
+            for source: AgentWorkspaceLookupContextSource
+        ) async throws -> (context: WorkspaceLookupContext, roots: [WorkspaceRootRef], mappings: [DomainMutationPhysicalRootMapping]) {
+            try await awaitRootReadiness()
+            guard let store else { throw TransitionError.stale }
+            let lookup: WorkspaceLookupContext = if let retainedRoots {
+                try await retainedRoots.lookupContext(for: source)
+            } else {
+                try await AgentWorkspaceLookupContextResolver.requiredLookupContext(source: source, store: store)
+            }
+            let roots = await store.rootRefs(scope: lookup.rootScope)
+            let mappings = await lookup.domainMutationPhysicalRootMappings(store: store)
+            guard isCurrent() else { throw TransitionError.stale }
+            return (lookup, roots, mappings)
+        }
+
+        @MainActor
+        func makeBindingMaterializer() -> WorkspaceRootBindingProjectionMaterializer? {
+            store.map(WorkspaceRootBindingProjectionMaterializer.init(store:))
+        }
+
+        func refreshMergedWorktree(at path: String) async {
+            _ = await store?.awaitAppliedIngressForExplicitRequest(userPath: path, fallbackScope: .allLoaded)
+        }
+
+        #if DEBUG
+            var test_store: WorkspaceFileContextStore? {
+                store
+            }
+        #endif
     }
 
     /// Call-scoped provenance captured before repository discovery, authorization or creation awaits.
@@ -111,9 +163,7 @@ final class AgentSessionWorktreeRuntime {
             return try admit(command)
         }
         let bindings = command.writer.session.worktreeBindings
-        let rootIDs = try await activation.loadedRootIDs(for: command, route: host.route)
-        guard command.isCurrent, command.writer.session.worktreeBindings == bindings else { throw TransitionError.stale }
-        let admission = try await activation.captureWorktreeAdmission(command: command, rootIDs: rootIDs, route: host.route)
+        let admission = try await activation.captureWorktreeAdmission(command: command, route: host.route)
         try admission.requireCurrent()
         guard admission.bindings == bindings else { throw TransitionError.stale }
         return admission
@@ -288,7 +338,7 @@ final class AgentSessionWorktreeRuntime {
             try requireCurrent()
             try Self.requireIdle(session, ownsExecutionLocationGate: true)
         }
-        let materializer = resources.store.map(WorkspaceRootBindingProjectionMaterializer.init(store:))
+        let materializer = resources.makeBindingMaterializer()
         let preparation: WorkspaceRootBindingProjectionPreparation?
         if let materializer {
             do {

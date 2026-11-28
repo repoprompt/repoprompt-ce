@@ -21,7 +21,7 @@ import RepoPromptDomainRuntime
 ///   ordering (revision staged before publication resolves; the in-progress
 ///   flag cleared only after publication and teardown registration) stays
 ///   representable across its suspension points.
-/// - Live tab/session binding remains owned by `AgentTabSession`; binding currency
+/// - The host supplies live session binding evidence; binding currency
 ///   validation composes this facade's attempt check with the session's own
 ///   binding comparison.
 ///
@@ -29,17 +29,17 @@ import RepoPromptDomainRuntime
 /// transcript, UI, persistence, provider, or MCP state, must not launch tasks,
 /// and must not retain the barrier or hooks.
 @MainActor
-final class AgentRunAttemptLifecycle {
+package final class AgentRunAttemptLifecycle {
     /// Atomic snapshot of the host-owned values captured when an attempt
     /// begins. Carries no live session or provider references.
-    struct AttemptContext {
+    package struct AttemptContext {
         let tabID: UUID
         let persistentSessionID: UUID?
         let persistentBindingGeneration: UUID?
         let bindingTransitionGeneration: UInt64
         let turnEpoch: AgentRunTurnEpoch?
 
-        init(
+        package init(
             tabID: UUID,
             persistentSessionID: UUID?,
             persistentBindingGeneration: UUID? = nil,
@@ -59,9 +59,9 @@ final class AgentRunAttemptLifecycle {
     private var tracker = AgentRunLifecycleTracker()
 
     /// Provider process run identity for the active or most recent run.
-    private(set) var currentRunID: UUID?
-    private(set) var providerTerminalDrainGeneration: UInt64 = 0
-    private(set) var terminalCommitInProgress = false {
+    package private(set) var currentRunID: UUID?
+    package private(set) var providerTerminalDrainGeneration: UInt64 = 0
+    package private(set) var terminalCommitInProgress = false {
         didSet {
             guard oldValue != terminalCommitInProgress else { return }
             onTerminalCommitPhaseChange?()
@@ -72,20 +72,22 @@ final class AgentRunAttemptLifecycle {
     /// otherwise: this state is owned here and is not `@Published`, so a settling run would look
     /// idle to a cross-window observer without an explicit notification.
     ///
-    /// Installed by the owning `TabSession`. It fires only on real transitions, so the phase reset
+    /// Installed by the host. It fires only on real transitions, so the phase reset
     /// inside `beginAttempt` is silent when no commit was in progress.
-    var onTerminalCommitPhaseChange: (() -> Void)?
-    private(set) var lastTerminalCommitRevision: AgentRunTerminalCommitRevision?
-    private(set) var lastTerminalPublicationResult: AgentRunTerminalPublicationResult?
-    private(set) var terminalResources: AgentRunAttemptTerminalResources?
+    package var onTerminalCommitPhaseChange: (() -> Void)?
+    package private(set) var lastTerminalCommitRevision: AgentRunTerminalCommitRevision?
+    package private(set) var lastTerminalPublicationResult: AgentRunTerminalPublicationResult?
+    private var terminalResources: AgentRunAttemptTerminalResources?
 
-    var activeOwnership: AgentRunOwnership? {
+    package var activeOwnership: AgentRunOwnership? {
         tracker.activeOwnership
     }
 
-    var liveness: AgentRunLivenessSnapshot? {
+    package var liveness: AgentRunLivenessSnapshot? {
         tracker.liveness
     }
+
+    package init() {}
 
     // MARK: Attempt lifecycle
 
@@ -95,7 +97,7 @@ final class AgentRunAttemptLifecycle {
     /// Intentionally preserves `currentRunID`: the app host installs the fresh
     /// process run identity before beginning the attempt.
     @discardableResult
-    func beginAttempt(context: AttemptContext, attemptID: UUID = UUID()) -> AgentRunOwnership {
+    package func beginAttempt(context: AttemptContext, attemptID: UUID = UUID()) -> AgentRunOwnership {
         assert(
             terminalResources == nil || terminalResources?.isClaimed == true,
             "Beginning a run attempt with unclaimed terminal resources leaks the prior attempt's teardown"
@@ -118,11 +120,11 @@ final class AgentRunAttemptLifecycle {
     /// Ends tracker ownership only. Never clears the run ID, terminal revision,
     /// publication result, or terminal resources implicitly.
     @discardableResult
-    func endAttempt(ifCurrent ownership: AgentRunOwnership) -> Bool {
+    package func endAttempt(ifCurrent ownership: AgentRunOwnership) -> Bool {
         tracker.end(ifCurrent: ownership)
     }
 
-    func isCurrentAttempt(_ ownership: AgentRunOwnership, expectedRunID: UUID? = nil) -> Bool {
+    package func isCurrentAttempt(_ ownership: AgentRunOwnership, expectedRunID: UUID? = nil) -> Bool {
         guard activeOwnership == ownership else { return false }
         if let expectedRunID {
             return currentRunID == expectedRunID
@@ -131,7 +133,7 @@ final class AgentRunAttemptLifecycle {
     }
 
     @discardableResult
-    func recordProgress(
+    package func recordProgress(
         ownership: AgentRunOwnership,
         kind: AgentRunLivenessSignalKind,
         stage: AgentRunLifecycleStage,
@@ -148,20 +150,20 @@ final class AgentRunAttemptLifecycle {
     }
 
     @discardableResult
-    func acceptProgress(_ signal: AgentRunProgressSignal) -> AgentRunProgressAcceptance {
+    package func acceptProgress(_ signal: AgentRunProgressSignal) -> AgentRunProgressAcceptance {
         tracker.accept(signal)
     }
 
     // MARK: Run identity
 
-    func installRunID(_ runID: UUID) {
+    package func installRunID(_ runID: UUID) {
         currentRunID = runID
     }
 
     /// Clears the run ID only when it still matches the caller's run, so stale
     /// provider cleanup cannot clear a successor run's identity.
     @discardableResult
-    func clearRunID(ifCurrent runID: UUID) -> Bool {
+    package func clearRunID(ifCurrent runID: UUID) -> Bool {
         guard currentRunID == runID else { return false }
         currentRunID = nil
         return true
@@ -173,19 +175,19 @@ final class AgentRunAttemptLifecycle {
     /// provider identity change, workspace switch, execution-location change).
     /// Run-scoped cleanup must use `clearRunID(ifCurrent:)` instead. Callers
     /// reach this through `AgentModeProcessRunIdentity.clearProcessRunID(for:)`.
-    func forceClearRunID() {
+    package func forceClearRunID() {
         currentRunID = nil
     }
 
     // MARK: Provider terminal drain generation
 
-    func bumpProviderTerminalDrainGeneration() {
+    package func bumpProviderTerminalDrainGeneration() {
         providerTerminalDrainGeneration &+= 1
     }
 
     // MARK: Terminal resources (exactly-once teardown)
 
-    func installTerminalResources(
+    package func installTerminalResources(
         ownership: AgentRunOwnership,
         prepare: @escaping AgentRunAttemptTerminalResources.Prepare
     ) {
@@ -196,10 +198,20 @@ final class AgentRunAttemptLifecycle {
         )
     }
 
+    package func hasTerminalResources(for ownership: AgentRunOwnership) -> Bool {
+        terminalResources?.ownership == ownership
+    }
+
+    #if DEBUG
+        package var test_terminalResources: AgentRunAttemptTerminalResources? {
+            terminalResources
+        }
+    #endif
+
     /// Claims the installed terminal teardown exactly once for the matching
     /// ownership. A stale-ownership claim attempt leaves the resources
     /// installed for the owning attempt.
-    func claimTerminalTeardown(
+    package func claimTerminalTeardown(
         ownership: AgentRunOwnership,
         terminalState: AgentSessionRunState
     ) -> AgentRunAttemptTerminalResources.Teardown? {
@@ -222,7 +234,7 @@ final class AgentRunAttemptLifecycle {
     /// Acquires the terminal-commit phase. Returns `false` when a commit is
     /// already in progress.
     @discardableResult
-    func beginTerminalCommit() -> Bool {
+    package func beginTerminalCommit() -> Bool {
         guard !terminalCommitInProgress else { return false }
         terminalCommitInProgress = true
         return true
@@ -230,13 +242,13 @@ final class AgentRunAttemptLifecycle {
 
     /// Releases the phase after a post-acquisition validation failure without
     /// touching the staged revision or publication result.
-    func abortTerminalCommit() {
+    package func abortTerminalCommit() {
         terminalCommitInProgress = false
     }
 
     /// Stores the settled revision and clears the prior publication result.
     /// Does not end the terminal-commit phase.
-    func stageTerminalRevision(_ revision: AgentRunTerminalCommitRevision) {
+    package func stageTerminalRevision(_ revision: AgentRunTerminalCommitRevision) {
         lastTerminalCommitRevision = revision
         lastTerminalPublicationResult = nil
     }
@@ -245,12 +257,12 @@ final class AgentRunAttemptLifecycle {
     /// duplicate-commit retry records a result while no terminal commit is in
     /// progress, and a binding transition may clear the revision while
     /// publication is suspended.
-    func recordTerminalPublicationResult(_ result: AgentRunTerminalPublicationResult) {
+    package func recordTerminalPublicationResult(_ result: AgentRunTerminalPublicationResult) {
         lastTerminalPublicationResult = result
     }
 
     /// Ends the terminal-commit phase, preserving revision and result.
-    func completeTerminalCommit() {
+    package func completeTerminalCommit() {
         terminalCommitInProgress = false
     }
 
@@ -258,7 +270,7 @@ final class AgentRunAttemptLifecycle {
     /// publication result into another session. Clears only the revision and
     /// result; ownership, run ID, drain generation, and any active
     /// terminal-commit phase are preserved.
-    func invalidateTerminalRevisionForBindingTransition() {
+    package func invalidateTerminalRevisionForBindingTransition() {
         lastTerminalCommitRevision = nil
         lastTerminalPublicationResult = nil
     }

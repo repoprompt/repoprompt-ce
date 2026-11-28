@@ -81,7 +81,7 @@ final class AgentSessionPersistenceRuntime {
         let isSuppressed: () -> Bool
         let bypassesSuppression: () -> Bool
         let isPreparedSavedHost: () -> Bool
-        let saveAdmission: (AgentTabSession) -> String?
+        var saveAdmission: (AgentTabSession) -> String? = { _ in nil }
         let creationIsCurrent: (AgentSessionCreationHandle) -> Bool
         let admitBinding: (AgentTabSession) -> Admission?
         var isRestoringConfiguration: () -> Bool = { false }
@@ -385,6 +385,9 @@ final class AgentSessionPersistenceRuntime {
             {
                 return .deferred("The saved target is being deleted or has been deleted; its retired runtime cannot write it back.")
             }
+            if scope?.handoff.providerSwitchBlocksSave(for: session) == true {
+                return .deferred(AgentSessionLinkSendFailure.targetBusy.rawValue)
+            }
             if let refusal = composition?.saveAdmission(session) { return .deferred(refusal) }
             if let handle = effectiveCreationSave?.handle {
                 guard handle.session === session, composition?.creationIsCurrent(handle) == true,
@@ -419,7 +422,12 @@ final class AgentSessionPersistenceRuntime {
         guard saveQueue.begin(sessionID: sessionID) else {
             return .deferred("A save for this session is already in flight.")
         }
+        let creationOwnerID = effectiveCreationSave?.handle.ownerID
+        if let creationOwnerID { session.activeCreationSaveOwnerID = creationOwnerID }
         defer {
+            if let creationOwnerID, session.activeCreationSaveOwnerID == creationOwnerID {
+                session.activeCreationSaveOwnerID = nil
+            }
             defer { scope?.noteSettlementChanged() }
             if saveQueue.finish(sessionID: sessionID) {
                 if let currentOwner = currentOwner(for: sessionID) {
@@ -777,8 +785,14 @@ final class AgentSessionPersistenceRuntime {
         while queue.inFlightSessionIDs.contains(writer.identity.sessionID) {
             await waitForInFlightSave(sessionID: writer.identity.sessionID)
             guard !Task.isCancelled, permits(.exact(writer), tabID: session.tabID),
-                  composition?.creationIsCurrent(handle) == true, session.creationHandleIsCurrent(handle)
+                  composition?.creationIsCurrent(handle) == true
             else { return .deferred("Initial session creation changed while an earlier save completed.") }
+            if session.qualifiedRestorationReadiness == durableReadiness {
+                return .durablySaved(handle.bindingToken)
+            }
+            guard session.creationHandleIsCurrent(handle) else {
+                return .deferred("Initial session creation changed while an earlier save completed.")
+            }
         }
         guard permits(.exact(writer), tabID: session.tabID),
               session.currentRestorationBindingToken == handle.bindingToken,

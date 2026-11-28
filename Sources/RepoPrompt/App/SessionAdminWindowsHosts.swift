@@ -534,7 +534,6 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
     ) async throws -> TargetCapture {
         let admission = try await admitWorktreeCommand(command, isStillAuthorized: isStillAuthorized)
         let resources = admission.resources
-        guard let store = resources.store else { throw SessionAdminHostError.sessionUnavailable }
         let bindingSource = TargetCapture.bindingSource(command)
         func requireCurrent() throws {
             try Task.checkCancellation()
@@ -544,8 +543,9 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         }
         // A prepared writer can finish payload hydration before its private workspace loads roots.
         // Join the existing reconciliation rather than treating an incomplete projection as no Git repo.
+        let roots: [WorkspaceRootRef]
         do {
-            try await resources.awaitRootReadiness()
+            roots = try await resources.logicalRoots()
         } catch let failure as WorkspaceRootReadinessFailure {
             try requireCurrent()
             if failure.reason == .emptyConfiguration {
@@ -568,8 +568,6 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
             try requireCurrent()
             throw error
         }
-        try requireCurrent()
-        let roots = await store.rootRefs(scope: .visibleWorkspace)
         try requireCurrent()
         var repos: [GitRepoDescriptor] = []
         var repoByRootPath: [String: GitRepoDescriptor] = [:]
@@ -617,19 +615,13 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
             throw SessionAdminHostError.invalid("The target session's workspace has no Git repository.")
         }
         let bindings = capture.session.worktreeBindings
-        guard let store = capture.resources.store else {
-            throw SessionAdminHostError.sessionUnavailable
-        }
-        let lookupContext: WorkspaceLookupContext
+        let lookup: (context: WorkspaceLookupContext, roots: [WorkspaceRootRef], mappings: [DomainMutationPhysicalRootMapping])
         do {
-            lookupContext = try await AgentWorkspaceLookupContextResolver.requiredLookupContext(
-                source: capture.bindingSource, visibleRoots: capture.roots, store: store
-            )
+            lookup = try await capture.resources.lookup(for: capture.bindingSource)
         } catch let error as WorkspaceLookupContextResolutionError {
             guard capture.isPlacementCurrent, capture.isBindingCurrent else { throw SessionAdminHostError.authorityEnded }
             throw SessionAdminHostError.invalid(error.localizedDescription)
         }
-        let lookupRoots = await store.rootRefs(scope: lookupContext.rootScope)
         try Task.checkCancellation()
         guard capture.isPlacementCurrent, capture.isBindingCurrent else { throw SessionAdminHostError.authorityEnded }
         return TargetAuthority(
@@ -639,8 +631,8 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
                 workspaceID: capture.workspaceID,
                 declaredRepoPaths: capture.repoPaths,
                 bindingSource: capture.bindingSource,
-                lookupContext: lookupContext,
-                lookupRoots: lookupRoots
+                lookupContext: lookup.context,
+                lookupRoots: lookup.roots
             )
         )
     }

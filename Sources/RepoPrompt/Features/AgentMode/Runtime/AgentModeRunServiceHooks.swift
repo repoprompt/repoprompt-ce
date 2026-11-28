@@ -62,6 +62,7 @@ extension AgentModeRunService {
     /// authoritative for run lifecycle decisions.
     struct RunBindingObservationHooks {
         let updateBindings: (AgentTabSession) -> Void
+        let providerResolvedDefaultModel: (_ session: AgentTabSession, _ sourceRowID: UUID, _ previousModel: String, _ ownership: AgentRunOwnership) -> Void
     }
 
     /// Recovery of queued, undelivered user work when a run settles before

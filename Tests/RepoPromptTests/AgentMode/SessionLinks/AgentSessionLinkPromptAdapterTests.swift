@@ -1084,7 +1084,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         let pendingKind = session.codexPendingTurnKind
         gate.release()
         let outcome = await send.value
-        await links.drainPendingManagedInputEffects(for: session)
+        await links.drainPendingInputEffects(for: session)
         if reacquire {
             XCTAssertEqual(outcome, .blocked(.steerUnconfirmed))
             XCTAssertTrue(fixture.startedTurns.isEmpty, "A stale producer must not start/fallback into its successor")

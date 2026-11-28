@@ -427,7 +427,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
 
             var body: some View {
                 Color.clear.sheet(isPresented: Binding(
-                    get: { viewModel.providerSwitchPreview?.session === session },
+                    get: { viewModel.providerSwitchPreview?.matches(session) == true },
                     set: { if !$0 { viewModel.cancelProviderSwitchPreview() } }
                 )) { AgentProviderSwitchPreview(viewModel: viewModel) }
             }
@@ -1605,7 +1605,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             }
         }
 
-        func testSwitchExactStagedPhysicalSendClearsOnceAndClearSaveFailureRestoresUncertainty() async throws {
+        func testSwitchExactStagedPhysicalSendClearsOnceAcrossSaveFailure() async throws {
             enum Fault: Error { case clear }
             for clearFails in [false, true] {
                 try await withFixture { fixture in
@@ -1637,13 +1637,14 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     let context = AgentSessionLinkDispatchContext(session: session, dispatchID: dispatch)
                     fixture.viewModel.linkExecutionRuntime.providerSwitchRecordPhysicalAcceptance(session: session, context: context)
                     fixture.viewModel.linkExecutionRuntime.providerSwitchRecordPhysicalAcceptance(session: session, context: context)
-                    try await AsyncTestWait.waitUntil("clear save settles") {
-                        saves.count >= 2 && (clearFails ? session.pendingHandoff.providerSwitchDelivery == .sending : session.pendingHandoff.providerSwitchDelivery == nil)
-                    }
+                    await fixture.viewModel.linkExecutionRuntime.drainPendingSendEffects(for: session)
+                    XCTAssertGreaterThanOrEqual(saves.count, 2)
+                    XCTAssertNil(session.pendingHandoff.providerSwitchDelivery)
+                    XCTAssertEqual(session.isDirty, clearFails)
                     session.saveDebounceTask?.cancel()
                     session.saveDebounceTask = nil
                     XCTAssertEqual(session.items.filter { $0.recoveryDiagnostic?.reason == "providerSwitch" }.map(\.text), ["Handover sent to \(session.selectedAgent.displayName) / \(fixture.viewModel.inputBarModelDisplayName(rawModel: session.selectedModelRaw, agentKind: session.selectedAgent))."])
-                    XCTAssertEqual(session.pendingHandoff.payload, clearFails ? payload : nil)
+                    XCTAssertNil(session.pendingHandoff.payload)
                     XCTAssertFalse(session.pendingHandoff.isStagedForSend)
                     XCTAssertNil(session.agentTask)
                 }
@@ -1664,7 +1665,6 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     }
                     try installSwitch(fixture)
                     let preparation = try await switchPreparation(fixture)
-                    let payload = try XCTUnwrap(session.pendingHandoff.payload)
                     let file = fixture.rootURL.appendingPathComponent("accepted-clear.json")
                     let release = AgentSessionLinkStopSignal<Void>()
                     defer { release.finish(()) }
@@ -1704,10 +1704,10 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     release.finish(())
                     try await AsyncTestWait.waitUntil("existing fresh-save owner persists the settled carrier") { writes.count >= 3 && !session.isDirty }
                     let latest = try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: file))
-                    XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, drift == "throwAfterWrite" ? .sending : nil, drift)
-                    XCTAssertEqual(latest.pendingHandoffProviderSwitchDelivery, drift == "throwAfterWrite" ? .sending : nil, drift)
-                    XCTAssertEqual(session.pendingHandoff.payload, drift == "throwAfterWrite" ? payload : nil, drift)
-                    XCTAssertEqual(latest.pendingHandoffPayload, drift == "throwAfterWrite" ? payload : nil, drift)
+                    XCTAssertNil(session.pendingHandoff.providerSwitchDelivery, drift)
+                    XCTAssertNil(latest.pendingHandoffProviderSwitchDelivery, drift)
+                    XCTAssertNil(session.pendingHandoff.payload, drift)
+                    XCTAssertNil(latest.pendingHandoffPayload, drift)
                     XCTAssertFalse(session.pendingHandoff.isStagedForSend)
                     XCTAssertNil(session.pendingHandoff.providerSwitchDispatch)
                     XCTAssertEqual(latest.toLiveItems().count(where: { $0.recoveryDiagnostic?.outcome == "sent" }), 1)
@@ -3203,7 +3203,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                                 XCTAssertEqual(session.items.count(where: { $0.recoveryDiagnostic?.outcome == "discarded" }), 1)
                             } else {
                                 XCTAssertEqual(saves, 0)
-                                XCTAssertTrue(vm.providerSwitchPreview?.session === session)
+                                XCTAssertTrue(vm.providerSwitchPreview?.matches(session) == true)
                                 XCTAssertEqual(vm.providerSwitchPreview?.originalHandoff, clickedSlot)
                                 vm.cancelProviderSwitchPreview()
                                 XCTAssertEqual(session.pendingHandoff, clickedSlot)

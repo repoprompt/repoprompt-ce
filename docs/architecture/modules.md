@@ -9,6 +9,7 @@ The app target (`RepoPromptApp`) is the composition and product-flow owner, not 
 | `RepoPrompt`, `RepoPromptMCP` | Thin executable entries | App or MCP core respectively |
 | `RepoPromptApp` | Product flow, UI, composition | May depend on lower app-free targets |
 | `RepoPromptMCPCore`, `RepoPromptDomainRuntime` | Headless CLI and domain runtime | Never depend on app |
+| `RepoPromptAgentRuntime` | Session incarnations, input routing, attempt identity, liveness and terminal settlement | AIContracts, DomainRuntime and Instrumentation |
 | `RepoPromptMCPServer` | Unix/bootstrap transport, captured invocation dispatch, execution supervision and publication gates | DomainRuntime, Shared and Instrumentation; no app/UI/settings owner |
 | `RepoPromptCodeMapCore`, `RepoPromptRegexCore`, `RepoPromptWorkspaceCore`, `RepoPromptShared` | Narrow reusable cores | Never depend on app |
 | `RepoPromptFoundation`, `RepoPromptInstrumentation` | Reusable substrate and diagnostic sink contracts | Never depend on app |
@@ -25,6 +26,23 @@ The app target (`RepoPromptApp`) is the composition and product-flow owner, not 
 | `<Module>Tests` | Tests of their corresponding module | Production target plus explicitly cataloged test support |
 
 Each extraction adds its production and test rows to the catalog, records its former app path(s) under `moved_families`, and lowers the matching ratchet baseline. This PR adds `RepoPromptFoundation`, `RepoPromptInstrumentation`, `RepoPromptProcess`, and `RepoPromptSecureStorage`, and extends `RepoPromptRegexCore`; the app remains the implementation owner of instrumentation diagnostics. The placement rule checks newly added paths against the PR merge base, so already-existing app adapters are not mistaken for new module code.
+
+Agent session stabilization is tracked in [#1877](https://github.com/repoprompt/repoprompt-ce/issues/1877).
+The terminal settlement implementation imported by `RepoPromptApp` runs independently with
+`make dev-test MODULE=RepoPromptAgentRuntimeTests`.
+
+| Responsibility | Owning path |
+| --- | --- |
+| Session incarnations, input route selection, run-attempt identity, liveness, terminal commit and teardown | `RepoPromptAgentRuntime` |
+| Canonical desktop input publication and queue ownership, waiting replies, and ACP steering | The originating session host and its input-effect drain |
+| File and worktree discovery | The originating host's retained workspace root lease |
+| Worktree relocation admission and terminal application | The originating host's worktree runtime |
+| Handover delivery acknowledgment and its durable clear | The exact link executor and the existing session persistence owner |
+| Provider-switch Summary, commit, rollback and save admission | The originating host's handoff runtime |
+
+The rest of the command boundary includes desktop input preparation, provider-switch preview and orchestration,
+the host registry and mutable session access. Their extraction is part of #1877's production
+cutover criteria.
 
 `RepoPromptAIContracts` owns neutral model selection/parameter values and the shared Codex model interpretation kernel, with app-free compatibility tests. SettingsCore depends on those values; configured Cursor identity, selection normalization and persistence policy remain in SettingsCore. `ModelCatalogAppAdapters` remains app-owned for lazy persisted lookup and remote conversion; no catalog lifecycle or provider authority moves with this kernel. The target retains the root Swift 5 language mode, matching the former app owner.
 

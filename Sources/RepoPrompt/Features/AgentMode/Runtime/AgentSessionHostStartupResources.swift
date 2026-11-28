@@ -109,8 +109,12 @@ final class AgentSessionHostStartupResources {
         #if DEBUG
             await test_beforeValidation?()
         #endif
-        guard await lease.isCurrent() else { return false }
-        return isCurrent
+        let resourcesAreCurrent: Bool = if let hostActivation {
+            await hostActivation.validateExecutionInput(lease: lease, command: origin)
+        } else {
+            await lease.isCurrent()
+        }
+        return resourcesAreCurrent && isCurrent
     }
 
     func inputWorkspace(for session: AgentTabSession) async throws -> AgentSessionProviderInputRuntime.WorkspaceSource? {
@@ -119,7 +123,7 @@ final class AgentSessionHostStartupResources {
         }
         return .init(store: lease.resources.files, lookupSource: .init(
             activeAgentSessionID: origin.writer.identity.sessionID, worktreeBindings: worktreeBindings
-        ), workspacePaths: workspacePaths, isCurrent: { self.isCurrent }, validate: { await self.validate() })
+        ), workspacePaths: workspacePaths, retainedRoots: lease, isCurrent: { self.isCurrent }, validate: { await self.validate() })
     }
 
     func initialThreadInput(for session: AgentTabSession) async throws -> AgentSessionProviderInputRuntime.InitialThreadInput? {

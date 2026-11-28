@@ -1051,8 +1051,8 @@ final class AgentSessionManagedInputRuntimeTests: XCTestCase {
         let row = try XCTUnwrap(f.session.items.first { $0.id == delivery.targetItemID })
         XCTAssertEqual(row.text, request.message)
         XCTAssertEqual(row.crossSessionAttribution, request.attribution)
-        await f.links.drainPendingManagedInputEffects(for: f.session)
-        XCTAssertTrue(f.links.pendingManagedInputEffects.isEmpty)
+        await f.links.drainPendingInputEffects(for: f.session)
+        XCTAssertTrue(f.links.pendingInputEffects.isEmpty)
     }
 
     func testResourceRevocationAtLastSecurityAwaitLeavesNoRowOrProviderEffect() async throws {
@@ -1067,7 +1067,7 @@ final class AgentSessionManagedInputRuntimeTests: XCTestCase {
         )
         XCTAssertEqual(outcome, .blocked(.endpointReadiness))
         XCTAssertTrue(f.session.items.isEmpty)
-        XCTAssertTrue(f.links.pendingManagedInputEffects.isEmpty)
+        XCTAssertTrue(f.links.pendingInputEffects.isEmpty)
         XCTAssertNotNil(f.session.instructionContinuation)
         f.session.instructionContinuation?.resume(throwing: CancellationError())
         f.session.instructionWait = nil
@@ -1099,8 +1099,8 @@ final class AgentSessionManagedInputRuntimeTests: XCTestCase {
         let join = AgentSessionHostDrainRuntime.EffectJoin.managedInput(f.links)
         let firstGate = AgentSessionLinkStopSignal<Void>()
         let siblingGate = AgentSessionLinkStopSignal<Void>()
-        f.links.retainManagedInputEffect(session: f.session, owner: f.scope) { await firstGate.value() }
-        try f.links.retainManagedInputEffect(session: XCTUnwrap(sibling), owner: f.scope) { await siblingGate.value() }
+        f.links.retainInputEffect(session: f.session, owner: f.scope) { await firstGate.value() }
+        try f.links.retainInputEffect(session: XCTUnwrap(sibling), owner: f.scope) { await siblingGate.value() }
         XCTAssertTrue(join.hasPending(f.session))
         XCTAssertTrue(try join.hasPending(XCTUnwrap(sibling)))
         XCTAssertTrue(join.hasPendingInScope())
@@ -1186,7 +1186,7 @@ final class AgentSessionManagedInputRuntimeTests: XCTestCase {
         f.session.codexDispatchSerialGate.finish(ticket)
         let outcome = await observer.value
         XCTAssertEqual(outcome, .blocked(.steerNotAccepted))
-        await f.links.drainPendingManagedInputEffects(for: f.session)
+        await f.links.drainPendingInputEffects(for: f.session)
         XCTAssertTrue(f.session.items.isEmpty)
         XCTAssertNotNil(f.session.instructionContinuation, "Stale prepared input must not consume the provider wait")
         f.session.instructionContinuation?.resume(throwing: CancellationError())
@@ -1233,7 +1233,7 @@ final class AgentSessionManagedInputRuntimeTests: XCTestCase {
         gate.finish(())
         let outcome = await observer.value
         XCTAssertEqual(outcome, .blocked(.steerNotAccepted))
-        await f.links.drainPendingManagedInputEffects(for: f.session)
+        await f.links.drainPendingInputEffects(for: f.session)
         XCTAssertTrue(f.session.items.isEmpty)
         XCTAssertNotNil(f.session.instructionContinuation, "An async resource receipt must not consume a revoked instruction wait")
     }

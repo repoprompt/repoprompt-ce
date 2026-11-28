@@ -62,6 +62,7 @@ enum AgentSessionCarrierResolver {
     struct Snapshot {
         var rows: [Observation] = []
         var ambiguousSessionIDs: Set<UUID> = []
+        var contradictoryCarrierSessionIDs: Set<UUID> = []
         var placementConflictSessionIDs: Set<UUID> = []
         var metadata: [UUID: [MetadataObservation]] = [:]
         var uniqueLocations: [UUID: Observation] = [:]
@@ -240,12 +241,13 @@ enum AgentSessionCarrierResolver {
                 tabIDs.formUnion(liveTabIDs)
                 for tabID in liveTabIDs {
                     // Re-read the live object after the maintained reverse lookup.
-                    guard vm.sessions[tabID]?.activeAgentSessionID == id else { continue }
+                    guard let session = vm.runtimeSessionStore.sessions[tabID], session.activeAgentSessionID == id else { continue }
+                    let executionWorkspaceID = session.persistentSessionBindingIdentity?.workspaceID
                     identitiesByTabID[tabID, default: []].insert(id)
                     snapshot.sessionIDs.insert(id)
-                    liveAddresses[id, default: []].insert(LiveAddress(workspaceID: workspace?.id, tabID: tabID))
+                    liveAddresses[id, default: []].insert(LiveAddress(workspaceID: executionWorkspaceID, tabID: tabID))
                     snapshot.bindingClaimDescriptions[id, default: []].insert(
-                        "live window \(window.windowID), workspace \(workspace?.id.uuidString ?? "unavailable"), tab \(tabID)"
+                        "live window \(window.windowID), workspace \(executionWorkspaceID?.uuidString ?? "unavailable"), tab \(tabID)"
                     )
                 }
             }
@@ -261,10 +263,13 @@ enum AgentSessionCarrierResolver {
         // carrier there belongs to an inactive workspace or another requested identity.
         for capture in captures {
             for tabID in tabIDs {
-                if let id = capture.window.agentModeViewModel.sessions[tabID]?.activeAgentSessionID {
+                if let session = capture.window.agentModeViewModel.runtimeSessionStore.sessions[tabID],
+                   let id = session.activeAgentSessionID
+                {
+                    let executionWorkspaceID = session.persistentSessionBindingIdentity?.workspaceID
                     identitiesByTabID[tabID, default: []].insert(id)
                     claimDescriptionsByTabID[tabID, default: []].insert(
-                        "live window \(capture.window.windowID), workspace \(capture.workspace?.id.uuidString ?? "unavailable"), tab \(tabID)"
+                        "live window \(capture.window.windowID), workspace \(executionWorkspaceID?.uuidString ?? "unavailable"), tab \(tabID)"
                     )
                 }
             }
@@ -298,11 +303,13 @@ enum AgentSessionCarrierResolver {
                 let effectiveID: UUID?
                 if isActiveWorkspace {
                     if carrier.stashedTabID == nil {
-                        effectiveID = vm.authoritativeSessionID(for: tab)
-                            ?? (capture.hasCurrentOwner ? vm.preferredActiveSidebarEntry(
-                                for: tab.id, tabName: tab.name, workspaceID: carrier.workspaceID
-                            )?.id : nil)
-                        if let liveID = vm.sessions[tab.id]?.activeAgentSessionID { claims.insert(liveID) }
+                        let session = vm.runtimeSessionStore.sessions[tab.id]
+                        let liveID = session?.persistentSessionBindingIdentity?.workspaceID == carrier.workspaceID
+                            ? session?.activeAgentSessionID : nil
+                        effectiveID = liveID ?? tab.activeAgentSessionID ?? (capture.hasCurrentOwner ? vm.preferredActiveSidebarEntry(
+                            for: tab.id, tabName: tab.name, workspaceID: carrier.workspaceID
+                        )?.id : nil)
+                        if let liveID { claims.insert(liveID) }
                     } else {
                         effectiveID = tab.activeAgentSessionID
                             ?? (capture.hasCurrentOwner ? AgentModeSidebarSessionBuilder.preferredSidebarEntry(for: tab.id, tabName: tab.name, entries: vm.sessionIndexStore.ownerValidatedEntries(forTabID: tab.id))?.id : nil)
@@ -336,7 +343,11 @@ enum AgentSessionCarrierResolver {
                     }
                     let sourceWindow = ObjectIdentifier(window)
                     if var existing = physical[id] {
-                        if existing.key != key || existing.presentation != presentation || !existing.sourceWindows.insert(sourceWindow).inserted {
+                        let duplicateInSource = !existing.sourceWindows.insert(sourceWindow).inserted
+                        if existing.key != key || duplicateInSource {
+                            snapshot.contradictoryCarrierSessionIDs.insert(id)
+                            snapshot.ambiguousSessionIDs.insert(id)
+                        } else if existing.presentation != presentation {
                             snapshot.ambiguousSessionIDs.insert(id)
                         }
                         physical[id] = existing
@@ -355,6 +366,7 @@ enum AgentSessionCarrierResolver {
         }
         for (tabID, claims) in identitiesByTabID where claims.count > 1 {
             let affected = claims.intersection(ids)
+            snapshot.contradictoryCarrierSessionIDs.formUnion(affected)
             snapshot.ambiguousSessionIDs.formUnion(affected)
             for id in affected {
                 snapshot.bindingClaimDescriptions[id, default: []].formUnion(claimDescriptionsByTabID[tabID] ?? [])
@@ -369,7 +381,10 @@ enum AgentSessionCarrierResolver {
                     key.workspaceID == address.workspaceID && key.tabID == address.tabID && key.stashedTabID == nil
                 }
             }
-            if addresses.count > 1 || hasUnmatchedAddress { snapshot.ambiguousSessionIDs.insert(id) }
+            if addresses.count > 1 || hasUnmatchedAddress {
+                snapshot.contradictoryCarrierSessionIDs.insert(id)
+                snapshot.ambiguousSessionIDs.insert(id)
+            }
         }
         for (id, observations) in snapshot.metadata {
             guard let first = observations.first else { continue }

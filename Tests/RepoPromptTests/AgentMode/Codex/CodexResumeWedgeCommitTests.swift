@@ -312,7 +312,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         try await AsyncTestWait.waitUntil("Arming request reaches fake preflight", timeout: 3) { release != nil }
         XCTAssertNotNil(fixture.session.codexComputerUseArmingRequestID)
         fixture.session.selectedAgent = .claudeCode
-        let rollback = AgentModeViewModel.ProviderSwitchRollback(fixture.session)
+        let rollback = AgentSessionHandoffRuntime.ProviderSwitchRollback(fixture.session)
         release?.resume(returning: CodexComputerUseWorkflow.runtimeRequirementMessage)
         _ = await arming.value
         XCTAssertNil(fixture.session.codexComputerUseArmingRequestID)
@@ -328,7 +328,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         session.selectedAgent = .claudeCode
         let captured = UUID()
         session.codexComputerUseArmingRequestID = captured
-        let rollback = AgentModeViewModel.ProviderSwitchRollback(session)
+        let rollback = AgentSessionHandoffRuntime.ProviderSwitchRollback(session)
         let successor = UUID()
         session.codexComputerUseArmingRequestID = successor
         rollback.restore(session)
@@ -1817,7 +1817,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
                 WedgeFakeCodexController(runID: runID, responses: [.suspendedMissingRollout(gate), .success("stale-retry")])
             }
             let session = fixture.session
-            let activation = AgentModeViewModel.CodexComputerUseActivation(id: UUID(), createdAt: Date())
+            let activation = CodexComputerUseActivation(id: UUID(), createdAt: Date())
             session.pendingCodexComputerUseActivation = activation
             let startup = Task { await coordinator.ensureCodexNativeSession(session: session) }
             let entered = await gate.waitUntilEntered(timeout: 4)

@@ -93,19 +93,15 @@ struct AgentRunStopState {
     #endif
 }
 
-/// Captured before a deferred producer creates a task; never refreshed by that producer.
-struct AgentRunStartStopFence: Equatable {
-    let binding: AgentPersistentSessionBindingIdentity?
-    let cancellationGeneration: UUID
-    let cancellationCount: UInt64
-    let explicitStopGeneration: UUID
-
+extension AgentRunStartStopFence {
     @MainActor
     init(session: AgentTabSession) {
-        binding = session.persistentSessionBindingIdentity
-        cancellationGeneration = session.stopState.cancellationGeneration
-        cancellationCount = session.stopState.cancellationCount
-        explicitStopGeneration = session.stopState.explicitStopGeneration
+        self.init(
+            binding: session.persistentSessionBindingIdentity,
+            cancellationGeneration: session.stopState.cancellationGeneration,
+            cancellationCount: session.stopState.cancellationCount,
+            explicitStopGeneration: session.stopState.explicitStopGeneration
+        )
     }
 
     @MainActor

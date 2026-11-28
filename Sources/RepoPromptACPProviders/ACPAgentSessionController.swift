@@ -12,7 +12,11 @@ package actor ACPAgentSessionController {
     /// that retrying after a lost response could duplicate input. Independent of controller
     /// teardown so the caller can classify an interrupted, dequeued steering batch.
     package final class PromptWriteReceipt: Sendable {
-        package init() {}
+        private let onWritten: (@Sendable () -> Void)?
+
+        package init(onWritten: (@Sendable () -> Void)? = nil) {
+            self.onWritten = onWritten
+        }
 
         private let written = OSAllocatedUnfairLock(initialState: false)
 
@@ -21,7 +25,12 @@ package actor ACPAgentSessionController {
         }
 
         fileprivate func noteWritten() {
-            written.withLock { $0 = true }
+            let firstWrite = written.withLock { written in
+                guard !written else { return false }
+                written = true
+                return true
+            }
+            if firstWrite { onWritten?() }
         }
     }
 

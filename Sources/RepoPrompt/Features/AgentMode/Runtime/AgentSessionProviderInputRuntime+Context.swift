@@ -12,24 +12,31 @@ extension AgentSessionProviderInputRuntime {
         let lookupSource: AgentWorkspaceLookupContextSource?
         /// Present only for an exact canonical capture; legacy callers retain their projection.
         let workspacePaths: [String]?
+        private let retainedRoots: AgentHostWorkspaceResources.Lease?
         let isCurrent: @MainActor () -> Bool
         let validate: @MainActor () async -> Bool
 
         init(
             store: WorkspaceFileContextStore, lookupSource: AgentWorkspaceLookupContextSource?,
             workspacePaths: [String]? = nil,
+            retainedRoots: AgentHostWorkspaceResources.Lease? = nil,
             isCurrent: @escaping @MainActor () -> Bool = { true },
             validate: @escaping @MainActor () async -> Bool = { true }
         ) {
             self.store = store
             self.lookupSource = lookupSource
             self.workspacePaths = workspacePaths
+            self.retainedRoots = retainedRoots
             self.isCurrent = isCurrent
             self.validate = validate
         }
 
         func lookupContext() async -> WorkspaceLookupContext {
             guard let lookupSource else { return .visibleWorkspace }
+            if let retainedRoots {
+                return await (try? retainedRoots.lookupContext(for: lookupSource))
+                    ?? AgentWorkspaceLookupContextResolver.failClosedLookupContext
+            }
             return await AgentWorkspaceLookupContextResolver.lookupContext(source: lookupSource, store: store)
         }
     }

@@ -41,9 +41,7 @@ extension AgentSessionRuntimeHost {
             throw MCPFileToolAuthorityFailure.superseded
         }
         let store = lease.resources.files
-        let lookup = try await AgentWorkspaceLookupContextResolver.requiredLookupContext(
-            source: connection.lookupSource, visibleRoots: lease.roots, store: store, usesRetainedRoots: true
-        )
+        let lookup = try await lease.lookupContext(for: connection.lookupSource)
         let lifetime: WorkspaceSessionRootLifetimeSnapshot?
         if let projection = lookup.bindingProjection {
             lifetime = await store.sessionBoundRootScopeValidationSnapshot(lookup.rootScope, expectedPhysicalRoots: projection.physicalRootRefs)

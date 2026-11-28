@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentRuntime
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 
@@ -270,7 +271,7 @@ final class AgentSessionRuntimeStore {
         guard !session.bindingTransitionInProgress, let restoration = session.currentRestorationBindingToken else {
             return .unavailable(.bindingTransition)
         }
-        guard let incarnationID = scope.liveClaimByTabID[session.tabID]?.incarnationID else { return .unavailable(.absent) }
+        guard let incarnationID = scope.incarnations.claim(for: session.tabID)?.incarnationID else { return .unavailable(.absent) }
         return .unique(Writer(
             scope: scope, session: session, binding: binding, restoration: restoration,
             identity: WriterIdentity(scopeID: scope.id, incarnationID: incarnationID, workspaceID: boundWorkspaceID, restoration: restoration)
@@ -404,7 +405,7 @@ final class AgentSessionRuntimeStore {
                           let installed = candidate.mcpControlContext,
                           installed.writerIdentity.scopeID == owner.id,
                           installed.writerIdentity.restoration.bindingIdentity.tabID == candidate.tabID,
-                          owner.liveClaimByTabID[candidate.tabID]?.incarnationID == installed.writerIdentity.incarnationID
+                          owner.incarnations.claim(for: candidate.tabID)?.incarnationID == installed.writerIdentity.incarnationID
                     else { return false }
                     return installed.registration == context.registration
                         || (context.autoEditOverride != nil && installed.autoEditOverride == context.autoEditOverride)
@@ -420,8 +421,8 @@ final class AgentSessionRuntimeStore {
                 && sessions[session.tabID] === session
                 && session.persistentSessionBindingIdentity == identity.restoration.bindingIdentity
                 && session.persistentSessionBindingIdentity?.workspaceID == identity.workspaceID
-                && liveClaimByTabID[session.tabID]?.sessionID == identity.sessionID
-                && liveClaimByTabID[session.tabID]?.incarnationID == identity.incarnationID
+                && incarnations.claim(for: session.tabID)?.sessionID == identity.sessionID
+                && incarnations.claim(for: session.tabID)?.incarnationID == identity.incarnationID
         }
 
         var settlementObservers: [UUID: AsyncStream<Void>.Continuation] = [:]
@@ -528,7 +529,7 @@ final class AgentSessionRuntimeStore {
             !saveQueue.inFlightSessionIDs.isEmpty || attachments.hasPendingRetention
                 || worktrees.pendingTransitions != 0 || continuation.hasPendingStarts
                 || installedInteractions?.hasPendingEffects == true || !sessionDeletionDrains.isEmpty
-                || linkExecution?.pendingManagedInputEffects.isEmpty == false
+                || linkExecution?.pendingInputEffects.isEmpty == false
                 || linkExecution?.pendingSendEffects.isEmpty == false
                 || linkExecution?.pendingStopEffects.isEmpty == false
                 || linkExecution?.pendingSelfCompactEffects.isEmpty == false
@@ -602,13 +603,7 @@ final class AgentSessionRuntimeStore {
         var sessionDeletionDrains: [ObjectIdentifier: AgentSessionHostDrainRuntime] = [:]
         private(set) var sessions: [UUID: AgentTabSession] = [:]
         private var releasedSessionTabIDs: Set<UUID> = []
-        fileprivate struct LiveClaim {
-            let sessionID: UUID?
-            let incarnationID = UUID()
-        }
-
-        fileprivate var liveClaimByTabID: [UUID: LiveClaim] = [:]
-        private var liveTabIDsBySessionID: [UUID: Set<UUID>] = [:]
+        fileprivate var incarnations = AgentSessionIncarnationIndex()
 
         fileprivate init(store: AgentSessionRuntimeStore) {
             self.store = store
@@ -644,7 +639,7 @@ final class AgentSessionRuntimeStore {
 
         fileprivate func holdsSlot(session: AgentTabSession, incarnationID: UUID, binding: AgentPersistentSessionBindingIdentity?) -> Bool {
             !hasReleasedWriterClaims && sessions[session.tabID] === session
-                && liveClaimByTabID[session.tabID]?.incarnationID == incarnationID
+                && incarnations.claim(for: session.tabID)?.incarnationID == incarnationID
                 && session.persistentSessionBindingIdentity == binding
         }
 
@@ -656,12 +651,12 @@ final class AgentSessionRuntimeStore {
         /// This is not command admission and never follows a removed/reinstalled incarnation.
         func holdsPresentationIncarnation(of writer: WriterIdentity, session: AgentTabSession) -> Bool {
             writer.scopeID == id && sessions[session.tabID] === session
-                && liveClaimByTabID[session.tabID]?.incarnationID == writer.incarnationID
+                && incarnations.claim(for: session.tabID)?.incarnationID == writer.incarnationID
         }
 
         func membership(of session: AgentTabSession) -> Membership? {
             guard !hasReleasedWriterClaims, sessions[session.tabID] === session,
-                  let claim = liveClaimByTabID[session.tabID] else { return nil }
+                  let claim = incarnations.claim(for: session.tabID) else { return nil }
             return Membership(scope: self, session: session, incarnationID: claim.incarnationID, binding: session.persistentSessionBindingIdentity)
         }
 
@@ -682,24 +677,16 @@ final class AgentSessionRuntimeStore {
         }
 
         func liveSessionTabIDs(for sessionID: UUID) -> Set<UUID> {
-            liveTabIDsBySessionID[sessionID] ?? []
+            incarnations.tabIDs(for: sessionID)
         }
 
         fileprivate func updateLiveSessionBindingIndex(tabID: UUID) {
-            if let previous = liveClaimByTabID.removeValue(forKey: tabID)?.sessionID {
-                liveTabIDsBySessionID[previous]?.remove(tabID)
-                if liveTabIDsBySessionID[previous]?.isEmpty == true {
-                    liveTabIDsBySessionID.removeValue(forKey: previous)
-                }
+            guard let session = sessions[tabID] else {
+                incarnations.remove(tabID: tabID)
+                return
             }
-            if let session = sessions[tabID] {
-                // Unbound members need the same ABA fence as persistent writers. They never
-                // enter the reverse session-ID index or resolve as a persistent Writer.
-                let current = session.activeAgentSessionID
-                liveClaimByTabID[tabID] = LiveClaim(sessionID: current)
-                noteSettlementChanged()
-                if let current { liveTabIDsBySessionID[current, default: []].insert(tabID) }
-            }
+            incarnations.install(tabID: tabID, sessionID: session.activeAgentSessionID)
+            noteSettlementChanged()
         }
     }
 }

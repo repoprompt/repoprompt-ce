@@ -10,10 +10,10 @@ import RepoPromptDomainRuntime
 /// is expressed in provider-neutral domain command vocabulary; the bound app
 /// hook remains the attachment persistence authority that applies it.
 @MainActor
-struct AgentRunTerminalSessionBinding {
-    struct Hooks {
-        var flushQuietToolObservations: (@MainActor () async -> Bool)?
-        var quietToolObservationsAreComplete: @MainActor () -> Bool = { true }
+package struct AgentRunTerminalSessionBinding {
+    package struct Hooks {
+        package var flushQuietToolObservations: (@MainActor () async -> Bool)?
+        package var quietToolObservationsAreComplete: @MainActor () -> Bool = { true }
         var sealQuietCheckIn: @MainActor (AgentRunOwnership, AgentSessionRunState, Bool, Bool) -> Void = { _, _, _, _ in }
         let flushPendingAssistantDelta: @MainActor () -> Void
         let finalizeStreamingItems: @MainActor () -> Void
@@ -48,11 +48,67 @@ struct AgentRunTerminalSessionBinding {
             AgentRunTerminalPublicationResult,
             @escaping @MainActor () -> Bool
         ) -> Void = { _, _, _ in }
+
+        package init(
+            flushQuietToolObservations: (@MainActor () async -> Bool)? = nil,
+            quietToolObservationsAreComplete: @escaping @MainActor () -> Bool = { true },
+            sealQuietCheckIn: @escaping @MainActor (AgentRunOwnership, AgentSessionRunState, Bool, Bool) -> Void = { _, _, _, _ in },
+            flushPendingAssistantDelta: @escaping @MainActor () -> Void,
+            finalizeStreamingItems: @escaping @MainActor () -> Void,
+            finalizePendingToolCalls: @escaping @MainActor (AgentSessionRunState) -> Void,
+            finalizeNonCodexTurnUsage: @escaping @MainActor () -> Void,
+            cancelPendingInteractions: @escaping @MainActor (_ reviewReason: String) -> Void,
+            finalizeAttachments: @escaping @MainActor (UUID?, DomainAgentRunAttachmentTurnDisposition) -> Void,
+            setAgentRunInactive: @escaping @MainActor () -> Void,
+            prepareTerminalPublication: @escaping @MainActor () -> Void,
+            makeTerminalPublicationEnvelope: @escaping @MainActor (
+                AgentRunOwnership,
+                AgentSessionRunState,
+                UUID?,
+                DomainAgentRunSnapshot.FailureReason?
+            ) -> AgentRunTerminalPublicationEnvelope?,
+            updateBindings: @escaping @MainActor () -> Void,
+            notifyAgentTurnComplete: @escaping @MainActor () -> Void,
+            notifyAgentTurnFailed: @escaping @MainActor (_ errorText: String?) -> Void = { _ in },
+            scheduleSave: @escaping @MainActor () -> Void,
+            publishTerminalCommit: @escaping @MainActor (
+                AgentRunTerminalCommitRevision,
+                AgentRunEpochTransitionKind?
+            ) async -> AgentRunTerminalPublicationResult,
+            permitsTerminalSuccessor: @escaping @MainActor (AgentRunTerminalCommitRevision, AgentRunTerminalPublicationResult) -> Bool = { _, _ in true },
+            startFollowUpRun: @escaping @MainActor (AgentRunPendingInstruction) -> Void,
+            onSelfCompactTerminalSettled: @escaping @MainActor (
+                AgentRunTerminalCommitRevision,
+                AgentRunTerminalPublicationResult,
+                @escaping @MainActor () -> Bool
+            ) -> Void = { _, _, _ in }
+        ) {
+            self.flushQuietToolObservations = flushQuietToolObservations
+            self.quietToolObservationsAreComplete = quietToolObservationsAreComplete
+            self.sealQuietCheckIn = sealQuietCheckIn
+            self.flushPendingAssistantDelta = flushPendingAssistantDelta
+            self.finalizeStreamingItems = finalizeStreamingItems
+            self.finalizePendingToolCalls = finalizePendingToolCalls
+            self.finalizeNonCodexTurnUsage = finalizeNonCodexTurnUsage
+            self.cancelPendingInteractions = cancelPendingInteractions
+            self.finalizeAttachments = finalizeAttachments
+            self.setAgentRunInactive = setAgentRunInactive
+            self.prepareTerminalPublication = prepareTerminalPublication
+            self.makeTerminalPublicationEnvelope = makeTerminalPublicationEnvelope
+            self.updateBindings = updateBindings
+            self.notifyAgentTurnComplete = notifyAgentTurnComplete
+            self.notifyAgentTurnFailed = notifyAgentTurnFailed
+            self.scheduleSave = scheduleSave
+            self.publishTerminalCommit = publishTerminalCommit
+            self.permitsTerminalSuccessor = permitsTerminalSuccessor
+            self.startFollowUpRun = startFollowUpRun
+            self.onSelfCompactTerminalSettled = onSelfCompactTerminalSettled
+        }
     }
 
     let tabID: UUID
     let lifecycle: AgentRunAttemptLifecycle
-    var hooks: Hooks
+    package var hooks: Hooks
 
     private let ownershipValidator: @MainActor (AgentRunOwnership, UUID?) -> Bool
     private let providerDrainGenerationProvider: @MainActor () -> UInt64
@@ -67,7 +123,7 @@ struct AgentRunTerminalSessionBinding {
     private let assistantDeltaFlushGenerationProvider: @MainActor () -> UInt64
     private let latestFailureTextProvider: @MainActor () -> String?
 
-    init(
+    package init(
         tabID: UUID,
         lifecycle: AgentRunAttemptLifecycle,
         hooks: Hooks,

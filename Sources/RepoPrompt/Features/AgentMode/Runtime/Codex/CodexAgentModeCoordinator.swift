@@ -1885,7 +1885,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
     @discardableResult
     private func stageCodexComputerUseActivationIfNeeded(session: AgentTabSession) -> UUID? {
         guard session.pendingCodexComputerUseActivation == nil else { return nil }
-        let activation = AgentModeViewModel.CodexComputerUseActivation(id: UUID(), createdAt: Date())
+        let activation = CodexComputerUseActivation(id: UUID(), createdAt: Date())
         session.pendingCodexComputerUseActivation = activation
         return activation.id
     }

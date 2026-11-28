@@ -326,10 +326,7 @@ extension AgentSessionLinkExecutionRuntime {
               let writer = providerSwitchWriter(for: session, proof: staged) else { return }
         // Physical acceptance acknowledges an already-dispatched effect. Retirement blocks a new
         // dispatch, not this originating acknowledgement or its final durable clear.
-        let sending = session.pendingHandoff
-        let binding = session.currentRestorationBindingToken
         session.pendingHandoff.clearAfterSend()
-        let cleared = session.pendingHandoff
         let model = commands.modelDisplayName(session)
         let text = "Handover sent to \(session.selectedAgent.displayName) / \(model)."
         session.appendItem(.system(text, sequenceIndex: session.nextSequenceIndex, recoveryDiagnostic: .init(
@@ -345,21 +342,11 @@ extension AgentSessionLinkExecutionRuntime {
             // Admission and the scheduled write are separate actor turns. Do not let a replaced
             // claim persist this acknowledgement through the successor's tab slot.
             guard writer.isCurrent else { return }
-            // A returned frozen clear must survive later save-token drift. The ordinary fresh-save
-            // owner carries it forward; only an unacknowledged write restores uncertainty.
-            var saverReturned = false
-            let result = await flushSaveRequired(writer: writer, observingSavePhase: {
-                if case .writeReturned = $0 { saverReturned = true }
-            })
-            if case .failure = result, !saverReturned, writer.isCurrent,
-               sessions[session.tabID] === session, session.currentRestorationBindingToken == binding,
-               session.pendingHandoff == cleared
-            {
-                session.pendingHandoff = sending
-                session.pendingHandoff.isStagedForSend = false
-                session.pendingHandoff.providerSwitchDispatch = nil
-                session.isDirty = true
-                scheduleSave(for: session.tabID)
+            // The provider acknowledgement is final. The cleared handover and notice are already
+            // part of this writer's dirty payload. A failed write transfers only persistence to
+            // the existing owner; neither a prewrite rejection nor a possible write licenses replay.
+            if case .failure = await flushSaveRequired(writer: writer), writer.isCurrent, session.isDirty {
+                writer.scope.persistence.scheduleSave(for: session)
             }
         }
         pendingSendEffects[effectID] = PendingSendEffect(sessionIdentity: ObjectIdentifier(session), task: task)
@@ -831,7 +818,7 @@ extension AgentSessionLinkExecutionRuntime {
         receipt.isRevoked = true
         session.linkStartedAttempt = nil
         guard let ownership = receipt.ownership, session.activeRunOwnership == ownership else { return }
-        executor.retainManagedInputEffect(session: session, owner: writer.scope) {
+        executor.retainInputEffect(session: session, owner: writer.scope) {
             guard writer.ownsPersistentClaim, session.activeRunOwnership == ownership else { return }
             await execution.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted)
         }

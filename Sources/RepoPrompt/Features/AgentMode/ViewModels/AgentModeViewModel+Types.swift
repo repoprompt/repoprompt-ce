@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentRuntime
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptFoundation
@@ -390,10 +391,7 @@ extension AgentModeViewModel {
         case afterProviderSend
     }
 
-    enum ActiveProviderSteeringRoute: Equatable {
-        case acpPrompt
-        case claudeNativeInterrupt
-    }
+    typealias ActiveProviderSteeringRoute = AgentSessionInputRouting.ActiveSteeringRoute
 
     typealias MCPInstructionDispatch = AgentMCPInstructionDispatch
     typealias MCPActiveInstructionDispatchPlan = AgentMCPActiveInstructionDispatchPlan
@@ -498,11 +496,6 @@ extension AgentModeViewModel {
         case idle
         case reserved(reservationID: UUID, attachments: [AgentFileAttachment])
         case consumed(reservationID: UUID, attachments: [AgentFileAttachment])
-    }
-
-    struct CodexComputerUseActivation: Equatable {
-        let id: UUID
-        let createdAt: Date
     }
 
     struct NativeSlashPreparedUserTurn: Equatable {
@@ -831,10 +824,7 @@ extension AgentModeViewModel {
         }
     }
 
-    enum ExecutionLocationChangeConfirmation: Equatable {
-        case startedThreadRestart
-        case activeRunStop
-    }
+    typealias ExecutionLocationChangeConfirmation = AgentSessionWorktreeRuntime.Confirmation
 
     enum ExecutionLocationChangeResult: Equatable {
         case applied
@@ -852,11 +842,7 @@ extension AgentModeViewModel {
         let provider: AgentProviderKind
     }
 
-    enum WorktreeBindingTransitionIntent {
-        case initialSend
-        case userExecutionLocationChange(confirmation: ExecutionLocationChangeConfirmation?)
-        case externalManagement
-    }
+    typealias WorktreeBindingTransitionIntent = AgentSessionWorktreeRuntime.Intent
 
     /// Internal for cross-file AgentModeViewModel extension access after the mechanical file split.
     struct PendingUserTurnState: Equatable {
