@@ -804,7 +804,14 @@ final class AgentModeRunService {
                     )
                     return
                 }
-                let writeReceipt = ACPAgentSessionController.PromptWriteReceipt()
+                let managedSinks = steeringBatch.compactMap { $0.managed?.sink }
+                let writeReceipt = ACPAgentSessionController.PromptWriteReceipt {
+                    Task { @MainActor in
+                        for sink in managedSinks {
+                            sink.resolve(.delivered(.providerPromptWritten))
+                        }
+                    }
+                }
                 let sent = await submitActiveACPPromptIfSupported(
                     session: session,
                     messageForRun: augmentedSteeringText.text,
@@ -832,15 +839,15 @@ final class AgentModeRunService {
                     // after the provider has received the prompt: never restore or requeue that
                     // text, remove its row, or release a managed idempotency key for retry.
                     releaseSupersedingProtectionIfUnused()
-                    for item in steeringBatch {
-                        item.managed?.sink.resolve(.unconfirmed(
-                            message: "The ACP prompt was written, but RepoPrompt could not confirm its completion. Read the session before retrying."
-                        ))
+                    for sink in managedSinks {
+                        sink.resolve(.delivered(.providerPromptWritten))
                     }
                     return
                 }
                 if sent {
-                    steeringBatch.forEach { $0.managed?.sink.resolve(.delivered(.steered)) }
+                    for sink in managedSinks {
+                        sink.resolve(.delivered(.providerPromptWritten))
+                    }
                     await hooks.continuation.signalMCPInstructionDelivered(session)
                 }
                 if !sent {

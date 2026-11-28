@@ -2145,6 +2145,13 @@ final class AgentTabSession: ObservableObject {
         qualifiedRestorationReadiness.creationState
     }
 
+    @Published var activeCreationSaveOwnerID: UUID?
+
+    var isSavingInitialConfiguration: Bool {
+        guard let activeCreationSaveOwnerID else { return false }
+        return creationState?.ownerID == activeCreationSaveOwnerID
+    }
+
     var creationConfigurationStamp: Data? {
         guard let state = creationState,
               case let .readyToPersist(configurationStamp) = state.phase else { return nil }

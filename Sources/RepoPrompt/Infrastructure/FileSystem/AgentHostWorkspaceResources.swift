@@ -61,6 +61,7 @@ struct AgentHostWorkspaceResources {
         workspaceID: UUID,
         rootIDs: [UUID],
         authority: SnapshotAuthority = .canonical,
+        matchesSnapshot: ((DomainWorkspaceSnapshot, DomainWorkspaceSnapshot) -> Bool)? = nil,
         admits: (DomainWorkspaceSnapshot) -> Bool
     ) async throws -> Lease {
         try Task.checkCancellation()
@@ -85,7 +86,8 @@ struct AgentHostWorkspaceResources {
             try Task.checkCancellation()
             guard let after = await workspaceSnapshot(for: workspaceID, authority: authority),
                   after.health != .removed,
-                  after.isInSameExecutionLineage(as: snapshot), admits(after)
+                  after.isInSameExecutionLineage(as: snapshot), admits(after),
+                  matchesSnapshot?(snapshot, after) ?? true
             else { throw Failure.contextChanged }
             guard after.document.metadata.canonicalLoadableRepoPathSet == retainedRootPathSet,
                   await files.isRootRetentionCurrent(retention)
@@ -170,6 +172,7 @@ struct AgentHostWorkspaceResources {
         func capture(
             workspaceID: UUID,
             authority: SnapshotAuthority? = nil,
+            matchesSnapshot: ((DomainWorkspaceSnapshot, DomainWorkspaceSnapshot) -> Bool)? = nil,
             admits: (DomainWorkspaceSnapshot) -> Bool
         ) async throws -> Lease {
             let effectiveAuthority = authority ?? snapshotAuthority
@@ -184,7 +187,8 @@ struct AgentHostWorkspaceResources {
             else { throw Failure.rootsChanged }
             guard let after = await resources.workspaceSnapshot(for: workspaceID, authority: effectiveAuthority),
                   after.health != .removed,
-                  after.isInSameExecutionLineage(as: current), admits(after)
+                  after.isInSameExecutionLineage(as: current), admits(after),
+                  matchesSnapshot?(current, after) ?? true
             else { throw Failure.contextChanged }
             guard after.document.metadata.canonicalLoadableRepoPathSet == retainedRootPathSet else {
                 throw Failure.rootsChanged
