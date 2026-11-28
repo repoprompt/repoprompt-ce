@@ -64,6 +64,25 @@ actor WorkspaceDocumentPreparation {
         return Catalog(models: models, failedIDs: failedIDs, wasOnMainThread: Thread.isMainThread)
     }
 
+    /// Closing metadata replay must preserve every field it did not edit, including fields
+    /// the app's typed decoder does not understand.
+    func documentBySettingColor(
+        _ colorID: String?, dateModified: Date, in canonical: DomainWorkspaceDocument
+    ) throws -> DomainWorkspaceDocument {
+        try Task.checkCancellation()
+        guard var fields = try JSONSerialization.jsonObject(with: canonical.documentBytes) as? [String: Any] else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        if let colorID {
+            fields["color"] = colorID
+        } else {
+            fields.removeValue(forKey: "color")
+        }
+        fields["dateModified"] = dateModified.timeIntervalSinceReferenceDate
+        let bytes = try JSONSerialization.data(withJSONObject: fields, options: .sortedKeys)
+        return try DomainWorkspaceDocument.decode(documentBytes: bytes, fileURL: canonical.fileURL)
+    }
+
     func document(for workspace: WorkspaceModel, fileURL: URL) throws -> DomainWorkspaceDocument {
         try Task.checkCancellation()
         #if DEBUG
