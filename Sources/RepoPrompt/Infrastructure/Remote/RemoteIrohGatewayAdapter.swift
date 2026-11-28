@@ -63,6 +63,12 @@ final class RemoteIrohGatewayAdapter {
             lastActivityAt = date
         }
 
+        func permits(_ request: RemoteGatewayRequest) -> Bool {
+            guard request.requiresConfirmedSync, !hasConfirmedSync else { return true }
+            if case .workspaceVoice = request { return false }
+            return sessionID == nil
+        }
+
         func readiness(at date: Date = Date()) -> RemoteIrohPhoneReadiness {
             guard let lastActivityAt, date.timeIntervalSince(lastActivityAt) < 25 else {
                 return .offline
@@ -430,7 +436,7 @@ final class RemoteIrohGatewayAdapter {
             let session = try authenticatedSession(peerEndpointID, sessionID: frame.sessionID)
             let rpc = try frame.decodedPayload(as: RemoteRPCRequest.self, expectedKind: .rpcRequest)
             let request = try gatewayRequest(for: rpc)
-            if request.requiresConfirmedSync, session.sync.sessionID != nil, !session.sync.hasConfirmedSync {
+            if !session.sync.permits(request) {
                 throw RemoteIrohGatewayAdapterError.syncRequired
             }
             if case .unpair = request {

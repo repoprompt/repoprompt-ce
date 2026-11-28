@@ -578,23 +578,39 @@ final class WindowRemoteAgentControlService: RemoteAgentControlService {
                 if request.operation == .configureSession {
                     return try await configureSession(request, authorizeDispatch: authorizeDispatch, voiceContext: context)
                 }
-                let selection: RemoteAgentSelection?
                 if request.agentID != nil || request.modelID != nil || request.reasoningEffort != nil {
-                    let configured = try await configureSession(request, authorizeDispatch: authorizeDispatch, voiceContext: context)
-                    guard let resolved = configured.resolvedSelection else { throw RemoteWorkspaceVoiceError.unavailable }
-                    selection = resolved
-                } else {
-                    selection = nil
+                    return try await Self.configureThenSendVoiceInstruction {
+                        try await configureSession(request, authorizeDispatch: authorizeDispatch, voiceContext: context)
+                    } send: { selection in
+                        try await continueRun(
+                            request, files: [], authorizeDispatch: authorizeDispatch,
+                            voiceTarget: (context, workspaceID), voiceSelection: selection
+                        )
+                    }
                 }
                 return try await continueRun(
-                    request, files: [], authorizeDispatch: authorizeDispatch,
-                    voiceTarget: (context, workspaceID), voiceSelection: selection
+                    request, files: [], authorizeDispatch: authorizeDispatch, voiceTarget: (context, workspaceID)
                 )
             default:
                 throw RemoteWorkspaceVoiceError.invalidToolArguments
             }
         } catch let error as MCPError {
             throw RemoteAgentControlServiceError.commandRejected(Self.remoteRejectionMessage(for: error))
+        }
+    }
+
+    static func configureThenSendVoiceInstruction(
+        configure: () async throws -> RemoteCommandResponse,
+        send: (RemoteAgentSelection) async throws -> RemoteCommandResponse
+    ) async throws -> RemoteCommandResponse {
+        let configuration = try await configure()
+        do {
+            guard let selection = configuration.resolvedSelection else { throw RemoteWorkspaceVoiceError.unavailable }
+            return try await send(selection)
+        } catch {
+            throw RemoteAgentControlServiceError.partialSuccess(
+                "The chat configuration was applied, but the instruction could not be sent. Check the chat before retrying."
+            )
         }
     }
 

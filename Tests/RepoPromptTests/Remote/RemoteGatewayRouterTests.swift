@@ -11,6 +11,53 @@ import XCTest
 
 @MainActor
 final class RemoteGatewayRouterTests: XCTestCase {
+    func testVoiceStartRequiresConfirmedSyncWhileStatusEndAndUnpairRemainAvailable() throws {
+        let workspaceID = UUID()
+        let callID = UUID()
+        let start = RemoteGatewayRequest.workspaceVoice(.init(action: .start, callID: callID, workspaceID: workspaceID, offerSDP: "v=0"))
+        let status = RemoteGatewayRequest.workspaceVoice(.init(action: .status, callID: callID, workspaceID: workspaceID))
+        let end = RemoteGatewayRequest.workspaceVoice(.init(action: .end, callID: callID, workspaceID: workspaceID))
+        var sync = RemoteIrohGatewayAdapter.SyncState(sessionID: UUID())
+        XCTAssertFalse(sync.permits(start))
+        XCTAssertFalse(RemoteIrohGatewayAdapter.SyncState(sessionID: nil).permits(start))
+        XCTAssertTrue(sync.permits(status))
+        XCTAssertTrue(sync.permits(end))
+        XCTAssertTrue(sync.permits(.unpair))
+        let ticket = try XCTUnwrap(sync.issueTicket())
+        XCTAssertFalse(sync.permits(start))
+        XCTAssertTrue(sync.confirm(ticket))
+        XCTAssertTrue(sync.permits(start))
+    }
+
+    func testWorkspaceVoiceStartRequiresConsentWhileStatusAndEndStillRoute() async throws {
+        let workspaceID = UUID()
+        let callID = UUID()
+        var hasConsent = false
+        var routed: [RemoteWorkspaceVoiceRequest.Action] = []
+        let router = makeRouter(
+            workspaceVoiceConsent: { hasConsent },
+            workspaceVoice: { request, _ in
+                routed.append(request.action)
+                return .init(callID: callID, workspaceID: workspaceID, phase: .ended)
+            }
+        )
+        let peer = RemoteGatewayRequestContext.testPeer(authorizationHeader: "Bearer valid")
+        let start = RemoteGatewayRequest.workspaceVoice(.init(action: .start, callID: callID, workspaceID: workspaceID, offerSDP: "v=0"))
+        let denied = await router.route(start, context: peer)
+        XCTAssertEqual(denied.status, 403)
+        XCTAssertEqual(try error(from: denied).code, "workspace_voice_consent_required")
+        XCTAssertTrue(routed.isEmpty)
+
+        for action: RemoteWorkspaceVoiceRequest.Action in [.status, .end] {
+            let response = await router.route(.workspaceVoice(.init(action: action, callID: callID, workspaceID: workspaceID)), context: peer)
+            XCTAssertEqual(response.status, 200)
+        }
+        hasConsent = true
+        let accepted = await router.route(start, context: peer)
+        XCTAssertEqual(accepted.status, 200)
+        XCTAssertEqual(routed, [.status, .end, .start])
+    }
+
     func testWorkspacePresentationRequiresPairedControlAndReturnsRequestedState() async throws {
         var authority: RemoteAuthorityLevel = .observe
         var changes: [RemoteWorkspacePresentation] = []
@@ -599,6 +646,10 @@ final class RemoteGatewayRouterTests: XCTestCase {
             .failure(TestFailure.unexpectedResponse)
         },
         bootstrapSnapshot: (() async -> RemoteSnapshot?)? = nil,
+        workspaceVoiceConsent: @escaping () -> Bool = { false },
+        workspaceVoice: @escaping (RemoteWorkspaceVoiceRequest, RemoteGatewayRequestContext) throws -> RemoteWorkspaceVoiceStatus = { _, _ in
+            throw TestFailure.unexpectedResponse
+        },
         workspacePresentation: @escaping (RemoteWorkspacePresentation, @escaping RemoteDispatchAuthorization) async throws -> Void = { _, _ in
             throw TestFailure.unexpectedResponse
         }
@@ -618,6 +669,8 @@ final class RemoteGatewayRouterTests: XCTestCase {
             imageAttachment: imageAttachment,
             pairIroh: pairIroh,
             bootstrapSnapshot: bootstrapSnapshot,
+            workspaceVoiceConsent: workspaceVoiceConsent,
+            workspaceVoice: workspaceVoice,
             workspacePresentation: workspacePresentation
         ))
     }

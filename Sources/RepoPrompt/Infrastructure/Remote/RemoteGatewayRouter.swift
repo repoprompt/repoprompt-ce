@@ -39,6 +39,7 @@ enum RemoteGatewayRequest {
     var requiresConfirmedSync: Bool {
         switch self {
         case .command, .workspacePresentation: true
+        case let .workspaceVoice(request): request.action == .start
         default: false
         }
     }
@@ -99,6 +100,7 @@ struct RemoteGatewayRoutingServices {
     var commandGeneration: () -> UInt64
     var execute: (RemoteCommandRequest, @escaping RemoteDispatchAuthorization) async -> RemoteGatewayCommandResult
     var eventCursor: () async -> UInt64
+    var workspaceVoiceConsent: () -> Bool
     var workspaceVoice: (RemoteWorkspaceVoiceRequest, RemoteGatewayRequestContext) throws -> RemoteWorkspaceVoiceStatus
     var workspacePresentation: (RemoteWorkspacePresentation, @escaping RemoteDispatchAuthorization) async throws -> Void
 
@@ -122,6 +124,7 @@ struct RemoteGatewayRoutingServices {
             throw RemoteGatewayRouterError.irohUnavailable
         },
         bootstrapSnapshot: (() async -> RemoteSnapshot?)? = nil,
+        workspaceVoiceConsent: @escaping () -> Bool = { false },
         workspaceVoice: @escaping (RemoteWorkspaceVoiceRequest, RemoteGatewayRequestContext) throws -> RemoteWorkspaceVoiceStatus = { _, _ in
             throw RemoteWorkspaceVoiceError.unavailable
         },
@@ -144,6 +147,7 @@ struct RemoteGatewayRoutingServices {
         self.commandGeneration = commandGeneration
         self.execute = execute
         self.eventCursor = eventCursor
+        self.workspaceVoiceConsent = workspaceVoiceConsent
         self.workspaceVoice = workspaceVoice
         self.workspacePresentation = workspacePresentation
     }
@@ -301,6 +305,12 @@ final class RemoteGatewayRequestRouter {
             }
             guard services.authorizationState().allows(.control) else {
                 return .error(.init(code: "forbidden", message: "Workspace Voice requires Control permission on the Mac."), status: 403)
+            }
+            guard request.action != .start || services.workspaceVoiceConsent() else {
+                return .error(.init(
+                    code: "workspace_voice_consent_required",
+                    message: "Allow OpenAI data sharing for Workspace Voice in Remote settings on the Mac."
+                ), status: 403)
             }
             do {
                 return try encode(services.workspaceVoice(request, context))

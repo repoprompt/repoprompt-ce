@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import Foundation
 import OSLog
 import RepoPromptRemoteProtocol
@@ -38,6 +39,27 @@ final class RemoteGatewayController: NSObject, ObservableObject {
         didSet { UserDefaults.standard.set(isEnabled, forKey: Self.enabledKey) }
     }
 
+    @Published private var workspaceVoiceConsentID: Data?
+
+    var allowsWorkspaceVoiceDataSharing: Bool {
+        get {
+            guard let activePairingConsentID else { return false }
+            return workspaceVoiceConsentID == activePairingConsentID
+        }
+        set {
+            let consentID = newValue ? activePairingConsentID : nil
+            if consentID == nil { workspaceVoice.invalidate() }
+            workspaceVoiceConsentID = consentID
+            UserDefaults.standard.set(consentID, forKey: Self.workspaceVoiceConsentKey)
+        }
+    }
+
+    private var activePairingConsentID: Data? {
+        // A replacement credential needs its own consent, even across a restart.
+        pairingManager.pairedCredential.map { Data(SHA256.hash(data: Data($0.utf8))) }
+    }
+
+    private static let workspaceVoiceConsentKey = "RepoPrompt.remote.workspaceVoiceOpenAIDataSharing"
     private static let enabledKey = "RepoPrompt.remote.gatewayEnabled"
     private static let defaultAuthorityKey = "RepoPrompt.remote.defaultAuthority"
 
@@ -76,6 +98,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
     )
     override init() {
         isEnabled = UserDefaults.standard.bool(forKey: Self.enabledKey)
+        workspaceVoiceConsentID = UserDefaults.standard.data(forKey: Self.workspaceVoiceConsentKey)
         super.init()
         refreshPairingStatus()
     }
@@ -155,6 +178,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
             let identity = try irohIdentityStore.loadOrCreate()
             if identity.origin != .loaded, pairingManager.hasStoredPairing {
                 try pairingManager.revokeDevice()
+                allowsWorkspaceVoiceDataSharing = false
                 refreshPairingStatus()
             }
             let server = try await irohAdapter.start(
@@ -246,7 +270,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
 
     private func publishPairingRevocation() {
         commandGeneration &+= 1
-        workspaceVoice.invalidate()
+        allowsWorkspaceVoiceDataSharing = false
         controlService?.clearAttachmentUploads()
         irohAdapter.revokePeerSessions()
         refreshPairingStatus()
@@ -434,6 +458,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                 lastSnapshotAt = Date()
                 return result
             },
+            workspaceVoiceConsent: { [unowned self] in allowsWorkspaceVoiceDataSharing },
             workspaceVoice: { [unowned self] request, context in
                 let generation = commandGeneration
                 let isAuthorized: @MainActor () -> Bool = { [weak self] in
@@ -555,7 +580,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
 
     private func invalidatePreviousPairingSessions() {
         commandGeneration &+= 1
-        workspaceVoice.invalidate()
+        allowsWorkspaceVoiceDataSharing = false
         controlService?.clearAttachmentUploads()
         irohAdapter.revokePeerSessions()
     }

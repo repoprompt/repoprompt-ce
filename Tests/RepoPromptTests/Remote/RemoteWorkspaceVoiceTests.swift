@@ -6,6 +6,43 @@ import XCTest
 
 @MainActor
 final class RemoteWorkspaceVoiceTests: XCTestCase {
+    func testVoiceReportsSavedConfigurationWhenSendingFails() async {
+        let selection = RemoteAgentSelection(agentID: "codexExec", modelID: "gpt-6-astra")
+        var sendAttempts = 0
+        do {
+            _ = try await WindowRemoteAgentControlService.configureThenSendVoiceInstruction {
+                .init(commandID: UUID(), accepted: true, resolvedSelection: selection)
+            } send: { configured in
+                XCTAssertEqual(configured.agentID, selection.agentID)
+                XCTAssertEqual(configured.modelID, selection.modelID)
+                sendAttempts += 1
+                throw RemoteAgentControlServiceError.commandRejected("Chat became busy")
+            }
+            XCTFail("The instruction failed to send")
+        } catch let RemoteAgentControlServiceError.partialSuccess(message) {
+            XCTAssertEqual(message, "The chat configuration was applied, but the instruction could not be sent. Check the chat before retrying.")
+        } catch {
+            XCTFail("Expected partial success, got \(error)")
+        }
+        XCTAssertEqual(sendAttempts, 1)
+    }
+
+    func testVoiceDoesNotSendOrReportSavedConfigurationWhenConfigurationFails() async {
+        do {
+            _ = try await WindowRemoteAgentControlService.configureThenSendVoiceInstruction {
+                throw RemoteAgentControlServiceError.commandRejected("Model unavailable")
+            } send: { _ in
+                XCTFail("Sending requires a successful configuration")
+                throw RemoteWorkspaceVoiceError.unavailable
+            }
+            XCTFail("Configuration failed")
+        } catch let RemoteAgentControlServiceError.commandRejected(message) {
+            XCTAssertEqual(message, "Model unavailable")
+        } catch {
+            XCTFail("Expected the configuration error, got \(error)")
+        }
+    }
+
     func testPickerKeepsOpenWorkspacesAndUsesANewWindowIfWelcomeIsOccupied() {
         let picker = RemoteWorkspacePresentationController.OpenSource.picker
         XCTAssertEqual(picker.destination(welcomeWindowID: nil, voiceWindowID: nil), .newWindow)

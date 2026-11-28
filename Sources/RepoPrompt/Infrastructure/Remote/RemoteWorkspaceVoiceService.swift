@@ -424,10 +424,14 @@ extension RemoteWorkspaceVoiceService {
             }
             guard hasAccess() else { return }
             if RemoteWorkspaceVoiceChatTools.isMutation(tool) { toolResults[callID] = result }
-            try? await client.respondToServerRequest(receipt: request.receipt, result: [
-                "success": result.success,
-                "contentItems": [["type": "inputText", "text": result.text]]
-            ])
+            try? await client.respondToServerRequest(
+                receipt: request.receipt,
+                result: [
+                    "success": result.success,
+                    "contentItems": [["type": "inputText", "text": result.text]]
+                ],
+                respectingCancellation: true
+            )
         }
 
         private static var endCallTool: [String: Any] {
