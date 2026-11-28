@@ -23,6 +23,7 @@ struct WorkspaceFileEditHost: FileEditHost {
     let selectionCoordinator: WorkspaceSelectionCoordinator?
     let lookupRootScope: WorkspaceLookupRootScope
     let createPathResolutionPolicy: WorkspaceFileCreatePathResolutionPolicy
+    let capturedSelectedPaths: Set<String>?
     let selectCreatedFiles: Bool
     let mutationRootMappings: [DomainMutationPhysicalRootMapping]
     let writeReceipt: WriteReceipt?
@@ -32,6 +33,7 @@ struct WorkspaceFileEditHost: FileEditHost {
         target: Target,
         selectionCoordinator: WorkspaceSelectionCoordinator? = nil,
         lookupRootScope: WorkspaceLookupRootScope = .visibleWorkspace,
+        capturedSelectedPaths: Set<String>? = nil,
         createPathResolutionPolicy: WorkspaceFileCreatePathResolutionPolicy = .literalPreferredIfStronger,
         selectCreatedFiles: Bool = true,
         mutationRootMappings: [DomainMutationPhysicalRootMapping] = [],
@@ -41,6 +43,7 @@ struct WorkspaceFileEditHost: FileEditHost {
         self.target = target
         self.selectionCoordinator = selectionCoordinator
         self.lookupRootScope = lookupRootScope
+        self.capturedSelectedPaths = capturedSelectedPaths
         self.createPathResolutionPolicy = createPathResolutionPolicy
         self.selectCreatedFiles = selectCreatedFiles
         self.mutationRootMappings = mutationRootMappings
@@ -115,6 +118,7 @@ struct WorkspaceFileEditHost: FileEditHost {
 
     @MainActor
     private func selectedFileFullPaths() -> Set<String> {
+        if let capturedSelectedPaths { return capturedSelectedPaths }
         guard let selectionCoordinator else { return [] }
         let snapshot = selectionCoordinator.activeSelectionSnapshot(flushPendingUI: true)
         return Set(StoredSelectionPathNormalization.standardizedPaths(snapshot.selection.selectedPaths))

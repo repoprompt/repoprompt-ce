@@ -1,15 +1,25 @@
 import Foundation
+import RepoPromptWorkspaceContext
 
 /// Exact saved-carrier lookup, independent of window/prompt/workspace view models.
 /// The result is evidence, not a writer or permission. The host revalidates it at
 /// mutation admission and supplies live metadata without retaining a census across IO.
 @MainActor
 enum AgentSavedSessionTargetLoader {
-    enum Failure: String, Error {
-        case missing = "target_missing"
-        case ambiguous = "target_ambiguous"
-        case changed = "target_binding_changed"
-        case unreadable = "target_saved_state_unreadable"
+    enum Failure: Error, Equatable {
+        case missing, ambiguous, changed, unreadable, providerSettingsUnavailable
+        case rootsUnavailable(WorkspaceRootReadinessFailure.Availability)
+
+        var rawValue: String {
+            switch self {
+            case .missing: "target_missing"
+            case .ambiguous: "target_ambiguous"
+            case .changed: "target_binding_changed"
+            case .unreadable: "target_saved_state_unreadable"
+            case .providerSettingsUnavailable: "provider_settings_unavailable"
+            case .rootsUnavailable: "workspace_not_ready"
+            }
+        }
     }
 
     struct Target {
@@ -17,6 +27,19 @@ enum AgentSavedSessionTargetLoader {
         let tab: ComposeTabState
         let stashedTabID: UUID?
         let entry: AgentSessionIndexEntry
+
+        /// Resolves only the saved carrier. A different transcript displayed in this same tab
+        /// is not a placement change, but a second carrier for the target is ambiguous.
+        func carrier(in current: WorkspaceModel) -> ComposeTabState? {
+            guard current.id == workspace.id, current.customStoragePath == workspace.customStoragePath,
+                  entry.tabID == tab.id else { return nil }
+            let composed = current.composeTabs.filter { $0.id == tab.id }
+            let stashed = current.stashedTabs.filter { $0.tab.id == tab.id }
+            guard composed.count + stashed.count == 1, stashed.first?.id == stashedTabID else { return nil }
+            let tabs = current.composeTabs + current.stashedTabs.map(\.tab)
+            guard !tabs.contains(where: { $0.id != tab.id && $0.activeAgentSessionID == entry.id }) else { return nil }
+            return composed.first ?? stashed.first?.tab
+        }
     }
 
     struct LiveMetadata {
@@ -82,9 +105,7 @@ enum AgentSavedSessionTargetLoader {
         guard !Task.isCancelled, isAvailable(), isCurrent(found),
               let current = currentWorkspace(found.workspace.id), current.id == found.workspace.id
         else { return .failure(.changed) }
-        let tabs = current.composeTabs.filter { $0.id == found.tab.id }
-        let stashes = current.stashedTabs.filter { $0.tab.id == found.tab.id }
-        guard tabs.count + stashes.count == 1, stashes.first?.id == found.stashedTabID else { return .failure(.changed) }
+        guard found.carrier(in: current) != nil else { return .failure(.changed) }
         return .success(found)
     }
 }

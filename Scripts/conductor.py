@@ -169,6 +169,9 @@ BUILD_CACHE_ENV_KEYS = (
     "ONLY_ACTIVE_ARCH",
     "OTHER_SWIFT_FLAGS",
     "REPOPROMPT_ENABLE_SENTRY",
+    "REPOPROMPT_REMOTE_NETWORKING_PATH",
+    "REPOPROMPT_IROH_LOCAL_ARTIFACT",
+    "REPOPROMPT_IROH_USE_LOCAL_ARTIFACT",
     "SDKROOT",
     "SWIFT_EXEC",
     "SWIFTFLAGS",
@@ -1445,6 +1448,7 @@ class BuildCacheManager:
         if (
             not self.eligible(operation, args)
             or self.env.get("REPOPROMPT_DEV_BUILD_CACHE_DISABLE") == "1"
+            or any(job_env.get(key) for key in OperationRegistry.REMOTE_NETWORKING_ENV_KEYS)
             or not (self.repo_root / "Package.swift").is_file()
         ):
             return None
@@ -3982,6 +3986,11 @@ class OperationRegistry:
         "REPOPROMPT_SENTRY_UPLOAD_WAIT",
         "SENTRY_URL",
     ]
+    REMOTE_NETWORKING_ENV_KEYS = [
+        "REPOPROMPT_REMOTE_NETWORKING_PATH",
+        "REPOPROMPT_IROH_LOCAL_ARTIFACT",
+        "REPOPROMPT_IROH_USE_LOCAL_ARTIFACT",
+    ]
     PASSTHROUGH_ENV_KEYS = sorted(
         set(
             SIGNING_ENV_KEYS
@@ -3991,6 +4000,7 @@ class OperationRegistry:
             + TEST_ENV_KEYS
             + CONDUCTOR_ENV_KEYS
             + TELEMETRY_ENV_KEYS
+            + REMOTE_NETWORKING_ENV_KEYS
         )
     )
 

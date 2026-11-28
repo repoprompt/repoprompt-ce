@@ -19,6 +19,16 @@ extension AgentSelfMCPCallOrigin {
 
 /// Owns self-only compaction admission and its required save, not the later native completion.
 extension AgentSessionLinkExecutionRuntime {
+    func agentSelfContextSnapshot(
+        endpoint: DomainAgentSessionLinkEndpointIdentity, origin: AgentSelfMCPCallOrigin
+    ) -> AgentSelfContextSnapshot? {
+        guard let session = origin.matchingSession(
+            endpoint: endpoint, lookup: { sessions[$0] },
+            observerEndpoint: { agentSessionLinkObserverEndpoint(tabID: $0) }
+        ) else { return nil }
+        return .init(context: AgentModeViewModel.observationContextLoad(for: session), selfCompact: session.selfCompactState.status)
+    }
+
     /// Synchronous admission captures the authoritative run attempt before a future MCP await.
     func agentSelfCompactSchedule(
         command: AgentSessionRuntimeStore.Command,

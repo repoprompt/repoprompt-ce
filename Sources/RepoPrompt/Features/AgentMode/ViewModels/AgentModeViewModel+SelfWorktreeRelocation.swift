@@ -58,7 +58,18 @@ extension AgentModeViewModel {
         else {
             throw MCPError.invalidParams("The requested agent session is not currently available.")
         }
+        return try await Self.scheduleSelfWorktreeRelocation(
+            desiredBindings, admission: admission, originRunID: originRunID,
+            originRunAttemptID: originRunAttemptID, beforeRecord: beforeRecord
+        )
+    }
+
+    static func scheduleSelfWorktreeRelocation(
+        _ desiredBindings: [AgentSessionWorktreeBinding], admission: AgentSessionWorktreeRuntime.Admission,
+        originRunID: UUID, originRunAttemptID: UUID, beforeRecord: @MainActor () async throws -> Void
+    ) async throws -> AgentSelfWorktreeRelocation? {
         try admission.requireCurrent()
+        let sessionID = admission.command.identity.sessionID
         let session = admission.session
         func originTurnIsLive() -> Bool {
             session.runState.isActive
@@ -67,7 +78,7 @@ extension AgentModeViewModel {
                 && !session.terminalCommitInProgress
         }
         guard originTurnIsLive() else { return nil }
-        try requireNoPendingSelfWorktreeRelocation(in: session, originRunAttemptID: originRunAttemptID)
+        try requireNoPendingSelfWorktreeRelocationForSession(in: session, originRunAttemptID: originRunAttemptID)
         let previousBindings = admission.bindings
         guard AgentSessionWorktreeRuntime.changesExecutionRoots(
             from: previousBindings, to: desiredBindings, fallbackWorkspacePath: admission.resources.fallbackWorkspacePath
@@ -86,7 +97,7 @@ extension AgentModeViewModel {
             )
         }
         // A concurrent request from the same turn may have recorded first while the fence awaited.
-        try requireNoPendingSelfWorktreeRelocation(in: session, originRunAttemptID: originRunAttemptID)
+        try requireNoPendingSelfWorktreeRelocationForSession(in: session, originRunAttemptID: originRunAttemptID)
         let relocation = AgentSelfWorktreeRelocation(
             id: UUID(),
             writer: admission.command.identity,
@@ -112,6 +123,10 @@ extension AgentModeViewModel {
     }
 
     func requireNoPendingSelfWorktreeRelocation(in session: TabSession, originRunAttemptID: UUID) throws {
+        try Self.requireNoPendingSelfWorktreeRelocationForSession(in: session, originRunAttemptID: originRunAttemptID)
+    }
+
+    static func requireNoPendingSelfWorktreeRelocationForSession(in session: TabSession, originRunAttemptID: UUID) throws {
         guard let pending = session.pendingSelfWorktreeRelocation,
               pending.originRunAttemptID == originRunAttemptID
         else { return }

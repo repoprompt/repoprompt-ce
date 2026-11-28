@@ -8,6 +8,16 @@ import PackageDescription
 // Sentry testing.
 let environment = ProcessInfo.processInfo.environment
 let sentryEnabled = environment["REPOPROMPT_ENABLE_SENTRY"] == "1"
+let remoteNetworkingLocalPath = environment["REPOPROMPT_REMOTE_NETWORKING_PATH"]
+let remoteNetworkingPackage = remoteNetworkingLocalPath == nil ? "repoprompt-remote" : "RepoPromptRemoteNetworking"
+let remoteNetworking: Package.Dependency = if let remoteNetworkingLocalPath {
+    .package(name: remoteNetworkingPackage, path: remoteNetworkingLocalPath)
+} else {
+    .package(
+        url: "https://github.com/repoprompt/repoprompt-remote.git",
+        revision: "d34e2f500890ede9e5447675aac176f402f50f8d"
+    )
+}
 
 var packageDependencies: [Package.Dependency] = [
     .package(url: "https://github.com/apple/swift-log.git", exact: "1.6.3"),
@@ -41,7 +51,7 @@ var packageDependencies: [Package.Dependency] = [
     .package(url: "https://github.com/loopwork-ai/ontology.git", exact: "0.6.0"),
     .package(url: "https://github.com/getsentry/sentry-cocoa", exact: "9.17.1"),
     .package(path: "Packages/RepoPromptAgentProviders"),
-    .package(path: "Packages/RepoPromptIrohTransport")
+    remoteNetworking
 ]
 
 var repoPromptAppDependencies: [Target.Dependency] = [
@@ -67,7 +77,7 @@ var repoPromptAppDependencies: [Target.Dependency] = [
     "RepoPromptRegexCore",
     "RepoPromptWorkspaceCore",
     "RepoPromptShared",
-    "RepoPromptRemoteProtocol",
+    .product(name: "RepoPromptRemoteProtocol", package: remoteNetworkingPackage),
     "RepoPromptC", "CSwiftPCRE2", "CCodexZstdDecoder",
     "Sparkle",
     .product(name: "Logging", package: "swift-log"),
@@ -82,7 +92,7 @@ var repoPromptAppDependencies: [Target.Dependency] = [
     .product(name: "JSONSchema", package: "JSONSchema"),
     .product(name: "Ontology", package: "ontology"),
     .product(name: "RepoPromptClaudeCompatibleProvider", package: "RepoPromptAgentProviders"),
-    .product(name: "RepoPromptIrohTransport", package: "RepoPromptIrohTransport")
+    .product(name: "RepoPromptRemoteNetworking", package: remoteNetworkingPackage)
 ]
 
 var repoPromptAppSwiftSettings: [SwiftSetting] = [
@@ -103,7 +113,7 @@ var repoPromptTestDependencies: [Target.Dependency] = [
     "RepoPromptCodexProvider",
     "RepoPromptAIContracts",
     "RepoPromptApp",
-    "RepoPromptRemoteProtocol",
+    .product(name: "RepoPromptRemoteProtocol", package: remoteNetworkingPackage),
     "RepoPromptWorkspaceContext",
     "RepoPromptWorkspaceContextTestSupport",
     "RepoPromptFoundation",
@@ -448,13 +458,9 @@ let package = Package(
         .executableTarget(
             name: "RepoPromptIrohSpikeMac",
             dependencies: [
-                .product(name: "RepoPromptIrohTransport", package: "RepoPromptIrohTransport")
+                .product(name: "RepoPromptRemoteNetworking", package: remoteNetworkingPackage)
             ],
             path: "Spikes/IrohTransportSpikeMac"
-        ),
-        .target(
-            name: "RepoPromptRemoteProtocol",
-            path: "Sources/RepoPromptRemoteProtocol"
         ),
         .target(
             name: "RepoPromptMCPCore",
@@ -464,7 +470,7 @@ let package = Package(
         ),
         .target(
             name: "RepoPromptShared",
-            dependencies: ["RepoPromptRemoteProtocol"],
+            dependencies: [.product(name: "RepoPromptRemoteProtocol", package: remoteNetworkingPackage)],
             path: "Sources/RepoPromptShared",
             swiftSettings: swift6LanguageMode + [
                 .define("DEBUG", .when(configuration: .debug))
@@ -542,7 +548,7 @@ let package = Package(
         ),
         .testTarget(
             name: "RepoPromptRemoteProtocolTests",
-            dependencies: ["RepoPromptRemoteProtocol"],
+            dependencies: [.product(name: "RepoPromptRemoteProtocol", package: remoteNetworkingPackage)],
             path: "Tests/RepoPromptRemoteProtocolTests",
             resources: [.process("Fixtures")]
         ),

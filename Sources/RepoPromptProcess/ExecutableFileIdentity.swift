@@ -67,14 +67,15 @@ package struct ExecutableFileIdentity: Equatable {
     }
 
     /// Revalidates identity and rejects launch paths that an untrusted local user can replace.
-    /// Root and the current user are trusted globally; admin-group writes are trusted only for ACL-free
-    /// canonical Homebrew Cellar and Caskroom paths.
+    /// Root and the current user are trusted globally. Admin-group writes are permitted for ACL-free
+    /// `/Applications` when the executable is inside an app bundle, and for eligible canonical
+    /// Homebrew Cellar and Caskroom ancestors.
     package func validateForTrustedPathLaunch(atPath path: String) throws {
         try validate(atPath: path)
         try Self.validateTrustedOwnershipAndPermissions(atCanonicalPath: canonicalPath)
     }
 
-    package static func permitsHomebrewAdminGroupWritableDirectory(
+    package static func permitsAdminGroupWritableDirectory(
         canonicalPath: String,
         directoryPath: String,
         mode: mode_t,
@@ -89,6 +90,13 @@ package struct ExecutableFileIdentity: Equatable {
               canonicalPath.hasPrefix(directoryPath + "/")
         else {
             return false
+        }
+
+        if directoryPath == "/Applications" {
+            let components = canonicalPath.split(separator: "/")
+            return ownerUID == 0 && components.dropFirst().dropLast().contains {
+                $0.count > 4 && $0.hasSuffix(".app")
+            }
         }
 
         return ["/opt/homebrew", "/usr/local"].contains { prefix in
@@ -154,8 +162,8 @@ package struct ExecutableFileIdentity: Equatable {
             let isGroupOrWorldWritable = directoryInfo.st_mode & mode_t(S_IWGRP | S_IWOTH) != 0
             let isRootOwnedStickyDirectory = directoryInfo.st_uid == 0
                 && directoryInfo.st_mode & mode_t(S_ISVTX) != 0
-            let isPermittedHomebrewDirectory =
-                permitsHomebrewAdminGroupWritableDirectory(
+            let isPermittedAdminGroupDirectory =
+                permitsAdminGroupWritableDirectory(
                     canonicalPath: canonicalPath,
                     directoryPath: directoryPath,
                     mode: directoryInfo.st_mode,
@@ -164,7 +172,7 @@ package struct ExecutableFileIdentity: Equatable {
                     effectiveUID: effectiveUID
                 )
                 && directoryHasNoExtendedACL(atPath: directoryPath)
-            guard !isGroupOrWorldWritable || isRootOwnedStickyDirectory || isPermittedHomebrewDirectory else {
+            guard !isGroupOrWorldWritable || isRootOwnedStickyDirectory || isPermittedAdminGroupDirectory else {
                 throw ExecutableFileIdentityError.untrustedWritableDirectory(directoryPath, directoryInfo.st_mode)
             }
 

@@ -378,7 +378,7 @@ class CatalogTests(unittest.TestCase):
                 restore, = (step for step in workflow.split('\n      - name: ')
                             if 'swiftpm-binaries-' in step)
                 paths, key = restore.split('          path: |\n', 1)[1].split('          key: ', 1)
-                self.assertIn("'Packages/RepoPromptIrohTransport/Package.swift'", key)
+                self.assertIn("'Package.resolved'", key)
                 binary_paths.append(paths)
                 binary_keys.append(key.splitlines()[0])
                 if filename == 'ci.yml':

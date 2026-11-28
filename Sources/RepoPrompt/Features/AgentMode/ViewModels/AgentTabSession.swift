@@ -997,6 +997,7 @@ final class AgentTabSession: ObservableObject {
     /// below (`installRunID`, `clearRunID(ifCurrent:)`) or the
     /// host-authoritative `AgentModeProcessRunIdentity.clearProcessRunID(for:)`.
     let runLifecycle = AgentRunAttemptLifecycle()
+    var linkStartedAttempt: AgentSessionLinkExecutionRuntime.LinkStartedAttempt?
 
     var runID: UUID? {
         runLifecycle.currentRunID

@@ -102,6 +102,8 @@ class CodexAppServerSchemaGateTests(unittest.TestCase):
             ("ClientRequest.json", "thread/goal/get"),
             ("ClientRequest.json", "thread/goal/set"),
             ("ClientRequest.json", "thread/goal/clear"),
+            ("ClientRequest.json", "thread/realtime/start"),
+            ("ClientRequest.json", "thread/realtime/stop"),
             ("ClientRequest.json", "turn/start"),
             ("ClientRequest.json", "turn/steer"),
             ("ClientRequest.json", "turn/interrupt"),
@@ -123,6 +125,11 @@ class CodexAppServerSchemaGateTests(unittest.TestCase):
             ("ServerNotification.json", "item/fileChange/outputDelta"),
             ("ServerNotification.json", "item/mcpToolCall/progress"),
             ("ServerNotification.json", "thread/status/changed"),
+            ("ServerNotification.json", "thread/realtime/sdp"),
+            ("ServerNotification.json", "thread/realtime/transcript/delta"),
+            ("ServerNotification.json", "thread/realtime/transcript/done"),
+            ("ServerNotification.json", "thread/realtime/error"),
+            ("ServerNotification.json", "thread/realtime/closed"),
             ("ServerNotification.json", "turn/plan/updated"),
             ("ServerNotification.json", "turn/diff/updated"),
             ("ServerNotification.json", "item/plan/delta"),
@@ -135,7 +142,7 @@ class CodexAppServerSchemaGateTests(unittest.TestCase):
             ("ServerRequest.json", "item/fileChange/requestApproval"),
         }
 
-        self.assertEqual(len(checks), 49)
+        self.assertEqual(len(checks), len(expected))
         self.assertEqual({(check["union"], check["method"]) for check in checks}, expected)
 
     def test_bundle_validation_accepts_declared_fields_nested_paths_and_enum(self) -> None:

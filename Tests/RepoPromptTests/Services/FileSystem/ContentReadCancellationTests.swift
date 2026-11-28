@@ -2553,7 +2553,7 @@ final class ContentReadCancellationTests: XCTestCase {
             XCTAssertEqual(error as? ContentReadSchedulerError, expected)
         }
         do {
-            _ = try await MCPServerViewModel.prepareAlwaysReadableExternalFileThroughEnvelopeForTesting(
+            _ = try await MCPWorkspaceFileRead.prepareAlwaysReadableExternalFileThroughEnvelopeForTesting(
                 externalFile,
                 readableService: readableService
             )

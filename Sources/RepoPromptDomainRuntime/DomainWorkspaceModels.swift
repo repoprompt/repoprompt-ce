@@ -1,6 +1,7 @@
 import CoreFoundation
 import CryptoKit
 import Foundation
+import RepoPromptWorkspaceCore
 
 package enum DomainWorkspaceStoragePath {
     package static func directoryName(name: String, id: UUID) -> String {
@@ -167,6 +168,21 @@ package struct DomainWorkspaceMetadata: Codable, Equatable {
         self.contexts = contexts
         self.agentIdentityClaims = agentIdentityClaims
     }
+
+    /// Raw configured root paths that are loadable for this workspace (`[]` for system workspaces).
+    package var loadableRepoPaths: [String] {
+        isSystemWorkspace ? [] : repoPaths
+    }
+
+    /// Canonical, deduplicated loadable root paths in declaration order.
+    package var canonicalLoadableRepoPaths: [String] {
+        StandardizedPath.canonicalWorkspaceRootPaths(loadableRepoPaths)
+    }
+
+    /// Canonical set of loadable root paths for equality checks across snapshots and retained roots.
+    package var canonicalLoadableRepoPathSet: Set<String> {
+        Set(canonicalLoadableRepoPaths)
+    }
 }
 
 package struct DomainWorkspaceDocument: Codable, Equatable {
@@ -174,14 +190,35 @@ package struct DomainWorkspaceDocument: Codable, Equatable {
     package let fileURL: URL
     package let documentBytes: Data
     package let contentDigest: String
+    package let executionContentDigest: String
     package let metadata: DomainWorkspaceMetadata
 
     package init(workspaceID: UUID, fileURL: URL, documentBytes: Data, metadata: DomainWorkspaceMetadata) {
         self.workspaceID = workspaceID
         self.fileURL = fileURL
         self.documentBytes = documentBytes
-        contentDigest = DomainContentDigest.sha256(documentBytes)
+        let rawDigest = DomainContentDigest.sha256(documentBytes)
+        contentDigest = rawDigest
+        executionContentDigest = DomainWorkspaceDocumentDecoder.executionContentDigest(
+            from: documentBytes,
+            fallbackDigest: rawDigest
+        )
         self.metadata = metadata
+    }
+
+    package init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        workspaceID = try container.decode(UUID.self, forKey: .workspaceID)
+        fileURL = try container.decode(URL.self, forKey: .fileURL)
+        documentBytes = try container.decode(Data.self, forKey: .documentBytes)
+        let decodedDigest = try container.decode(String.self, forKey: .contentDigest)
+        contentDigest = decodedDigest
+        executionContentDigest = try container.decodeIfPresent(String.self, forKey: .executionContentDigest)
+            ?? DomainWorkspaceDocumentDecoder.executionContentDigest(
+                from: documentBytes,
+                fallbackDigest: decodedDigest
+            )
+        metadata = try container.decode(DomainWorkspaceMetadata.self, forKey: .metadata)
     }
 
     package static func decode(documentBytes: Data, fileURL: URL) throws -> DomainWorkspaceDocument {
@@ -204,8 +241,33 @@ package struct DomainContextSnapshot: Codable, Equatable {
 package struct DomainWorkspaceSnapshot: Codable, Equatable {
     package let document: DomainWorkspaceDocument
     package let revisions: DomainRevisionState
+    package let executionRevision: UInt64
     package let health: DomainAuthorityHealth
     package let contexts: [DomainContextSnapshot]
+
+    package init(
+        document: DomainWorkspaceDocument,
+        revisions: DomainRevisionState,
+        executionRevision: UInt64? = nil,
+        health: DomainAuthorityHealth,
+        contexts: [DomainContextSnapshot]
+    ) {
+        self.document = document
+        self.revisions = revisions
+        self.executionRevision = executionRevision ?? revisions.workingRevision
+        self.health = health
+        self.contexts = contexts
+    }
+
+    package init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        document = try container.decode(DomainWorkspaceDocument.self, forKey: .document)
+        revisions = try container.decode(DomainRevisionState.self, forKey: .revisions)
+        executionRevision = try container.decodeIfPresent(UInt64.self, forKey: .executionRevision)
+            ?? revisions.workingRevision
+        health = try container.decode(DomainAuthorityHealth.self, forKey: .health)
+        contexts = try container.decode([DomainContextSnapshot].self, forKey: .contexts)
+    }
 }
 
 /// A target-only activation read. It never claims that the full catalog is ready.
@@ -326,6 +388,55 @@ package enum DomainContentDigest {
 
 private enum DomainWorkspaceDocumentDecoder {
     static let maximumSupportedSchemaVersion = 1
+
+    private static let workspacePresentationOnlyKeys: Set<String> = [
+        "dateModified",
+        "lastUsed",
+        "activeComposeTabID"
+    ]
+
+    private static let composeTabPresentationOnlyKeys: Set<String> = [
+        "name",
+        "lastModified",
+        "isPinned",
+        "pinnedOrder",
+        "sidebarGroup",
+        "sidebarGroupOrder"
+    ]
+
+    /// Computes a deterministic SHA-256 digest of the workspace JSON with only compose-tab
+    /// presentation fields and top-level save/focus metadata keys (`dateModified`, `lastUsed`,
+    /// `activeComposeTabID`) stripped. Any unreadable or non-object payload falls back to
+    /// `fallbackDigest` so lineage checks fail closed.
+    static func executionContentDigest(from data: Data, fallbackDigest: String) -> String {
+        guard var object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return fallbackDigest
+        }
+        for key in workspacePresentationOnlyKeys {
+            object.removeValue(forKey: key)
+        }
+        if let rawTabs = object["composeTabs"] as? [Any] {
+            var normalizedTabs: [Any] = []
+            normalizedTabs.reserveCapacity(rawTabs.count)
+            for rawTab in rawTabs {
+                guard var tab = rawTab as? [String: Any] else {
+                    return fallbackDigest
+                }
+                for key in composeTabPresentationOnlyKeys {
+                    tab.removeValue(forKey: key)
+                }
+                normalizedTabs.append(tab)
+            }
+            object["composeTabs"] = normalizedTabs
+        }
+        guard let normalizedBytes = try? JSONSerialization.data(
+            withJSONObject: object,
+            options: [.sortedKeys]
+        ) else {
+            return fallbackDigest
+        }
+        return DomainContentDigest.sha256(normalizedBytes)
+    }
 
     private static func persistedDate(forKey key: String, in object: [String: Any]) -> Date? {
         guard let value = object[key] as? NSNumber,
