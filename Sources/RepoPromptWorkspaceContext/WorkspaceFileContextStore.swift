@@ -19602,7 +19602,7 @@ package actor WorkspaceFileContextStore {
         return .matched(match)
     }
 
-    func resolveExactExistingWorkspaceFile(
+    package func resolveExactExistingWorkspaceFile(
         _ input: WorkspaceExactFileInput,
         namespace: WorkspaceExactFileNamespace
     ) async throws -> WorkspaceExactExistingFileResolution {

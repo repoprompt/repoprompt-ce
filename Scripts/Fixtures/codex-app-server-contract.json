@@ -215,9 +215,7 @@
       "alwaysSent": [
         "limit"
       ],
-      "maySend": [
-        "cursor"
-      ],
+      "maySend": ["cursor"],
       "responseSchema": "v2/ModelListResponse.json",
       "consumedResponse": [
         {
@@ -458,8 +456,13 @@
         "config",
         "cwd",
         "developerInstructions",
+        "dynamicTools",
+        "environments",
+        "ephemeral",
         "experimentalRawEvents",
         "model",
+        "modelProvider",
+        "runtimeWorkspaceRoots",
         "serviceTier"
       ],
       "responseSchema": "v2/ThreadStartResponse.json",
@@ -1973,6 +1976,11 @@
           "presence": "required",
           "nullable": true
         }
+      ],
+      "responseSchema": "DynamicToolCallResponse.json",
+      "alwaysSentResponse": [
+        "success",
+        "contentItems"
       ]
     },
     {
@@ -2040,6 +2048,110 @@
           "cancel"
         ]
       }
+    },
+    {
+      "union": "ClientRequest.json",
+      "method": "thread/realtime/start",
+      "alwaysSent": [
+        "threadId",
+        "voiceSessionId",
+        "version",
+        "outputModality",
+        "transport",
+        "transport.type",
+        "transport.sdp",
+        "includeStartupContext",
+        "codexResponseHandoffMode",
+        "prompt"
+      ],
+      "maySend": ["voice"]
+    },
+    {
+      "union": "ClientRequest.json",
+      "method": "thread/realtime/stop",
+      "alwaysSent": [
+        "threadId"
+      ]
+    },
+    {
+      "union": "ServerNotification.json",
+      "method": "thread/realtime/sdp",
+      "consumedParams": [
+        {
+          "path": "threadId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "sdp",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "union": "ServerNotification.json",
+      "method": "thread/realtime/transcript/delta",
+      "consumedParams": [
+        {
+          "path": "threadId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "role",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "union": "ServerNotification.json",
+      "method": "thread/realtime/transcript/done",
+      "consumedParams": [
+        {
+          "path": "threadId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "role",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "text",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "union": "ServerNotification.json",
+      "method": "thread/realtime/error",
+      "consumedParams": [
+        {
+          "path": "threadId",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "message",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "union": "ServerNotification.json",
+      "method": "thread/realtime/closed",
+      "consumedParams": [
+        {
+          "path": "threadId",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
     }
   ]
 }
