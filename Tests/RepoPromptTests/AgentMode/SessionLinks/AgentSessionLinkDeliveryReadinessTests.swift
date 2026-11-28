@@ -27,8 +27,17 @@ final class AgentSessionLinkDeliveryReadinessTests: XCTestCase {
         XCTAssertTrue(Readiness.evaluate(snapshot: .ready).isReady)
         XCTAssertEqual(
             Set(Readiness.BlockReason.allCases),
-            [.endpointInvalidated, .targetLoading, .targetRestoreUnavailable, .targetCreationIncomplete, .targetNotIdle, .providerSwitchUnconfirmed, .providerHandoverNeedsReview],
-            "Only target lifecycle, creation, restoration, and busy state may refuse a send."
+            [
+                .endpointInvalidated,
+                .targetLoading,
+                .targetRestoreUnavailable,
+                .targetCreationIncomplete,
+                .targetSubscriptionReadOnly,
+                .targetNotIdle,
+                .providerSwitchUnconfirmed,
+                .providerHandoverNeedsReview
+            ],
+            "Only target lifecycle, creation, restoration, subscription, and busy state may refuse a send."
         )
     }
 
@@ -169,6 +178,15 @@ final class AgentSessionLinkDeliveryReadinessTests: XCTestCase {
         XCTAssertTrue(Readiness.evaluate(snapshot: snapshot).isReady)
     }
 
+    func testReadOnlySubscriptionRefusesInputAndPermitsStoppingAnActiveRun() {
+        var snapshot = Snapshot.ready
+        snapshot.subscriptionAccountReadOnly = true
+        XCTAssertEqual(Readiness.evaluate(snapshot: snapshot), .blocked(.targetSubscriptionReadOnly))
+        snapshot.runStateIsActive = true
+        XCTAssertEqual(Readiness.evaluate(snapshot: snapshot), .blocked(.targetSubscriptionReadOnly))
+        XCTAssertEqual(AgentSessionLinkStopAdmission.classify(snapshot), .activeRun)
+    }
+
     func testBlockReasonsMapOntoStableWireFailures() {
         for reason in Readiness.BlockReason.allCases {
             let failure = AgentSessionLinkSendFailure(reason)
@@ -182,6 +200,8 @@ final class AgentSessionLinkDeliveryReadinessTests: XCTestCase {
         XCTAssertFalse(AgentSessionLinkSendFailure.endpointInvalidated.isRetryable)
         XCTAssertFalse(AgentSessionLinkSendFailure.targetRestoreUnavailable.isRetryable)
         XCTAssertFalse(AgentSessionLinkSendFailure.targetCreationIncomplete.isRetryable)
+        XCTAssertFalse(AgentSessionLinkSendFailure.targetSubscriptionReadOnly.isRetryable)
+        XCTAssertFalse(AgentSessionLinkSendFailure.targetSubscriptionReadOnly.isDeliveryIndeterminate)
     }
 
     /// The retired transport refusal must not survive anywhere on the wire. A caller that still

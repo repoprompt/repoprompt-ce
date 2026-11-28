@@ -86,7 +86,7 @@ extension AgentModeViewModel {
                 break
             case .providerSwitchUnconfirmed, .providerHandoverNeedsReview,
                  .endpointInvalidated, .targetLoading, .targetRestoreUnavailable,
-                 .targetCreationIncomplete:
+                 .targetCreationIncomplete, .targetSubscriptionReadOnly:
                 return .hard(AgentSessionLinkSendFailure(reason).message)
             }
         }
