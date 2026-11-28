@@ -540,6 +540,140 @@ extension GrokBuildDevinProviderTests {
         XCTAssertTrue(arguments.contains(directory + "/prompt.md"))
     }
 
+    func testDevinTextExecutionReportsLivenessWhileSilentChildRunsThenCompletes() async throws {
+        let root = try makeOneShotFixtureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let go = root.appendingPathComponent("go")
+        let executable = root.appendingPathComponent("devin")
+        try installFixtureScript(Self.waitingDevinScript(root: root, go: go, finish: "printf 'final answer'"), at: executable)
+        let host = FixtureDevinCLIHost()
+        let provider = makeLivenessProvider(executable: executable, root: root, host: host)
+        let collector = StreamCollector()
+
+        let consumer = Task {
+            try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
+                let stream = try await provider.streamMessage(AIMessage(systemPrompt: "", userMessage: "prompt"), model: .devinCustom(name: "raw-model"))
+                for try await result in stream {
+                    collector.append(result.type)
+                }
+            }
+        }
+        try await waitUntil { collector.types.count(where: { $0 == AIStreamResult.transportActivityType }) >= 2 }
+        XCTAssertEqual(collector.types.filter { $0 != AIStreamResult.transportActivityType }, [], "A silent child must produce liveness only")
+        try "go".write(to: go, atomically: true, encoding: .utf8)
+        try await consumer.value
+        await provider.dispose()
+
+        let types = collector.types
+        XCTAssertEqual(Array(types.suffix(2)), ["content", "message_stop"])
+        XCTAssertTrue(types.dropLast(2).allSatisfy { $0 == AIStreamResult.transportActivityType })
+        let pid = try XCTUnwrap(pid_t(String(contentsOf: root.appendingPathComponent("pid"), encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)))
+        XCTAssertNotEqual(kill(pid, 0), 0, "Child must be reaped before the stream finishes")
+        try XCTAssertFalse(FileManager.default.fileExists(atPath: XCTUnwrap(host.directory)))
+    }
+
+    func testDevinTextFailureKeepsProviderMessageAfterLiveness() async throws {
+        let root = try makeOneShotFixtureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let go = root.appendingPathComponent("go")
+        let executable = root.appendingPathComponent("devin")
+        try installFixtureScript(Self.waitingDevinScript(root: root, go: go, finish: "printf 'devin exploded: model refused' >&2; exit 7"), at: executable)
+        let provider = makeLivenessProvider(executable: executable, root: root, host: FixtureDevinCLIHost())
+        let collector = StreamCollector()
+
+        let consumer = Task {
+            try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
+                let stream = try await provider.streamMessage(AIMessage(systemPrompt: "", userMessage: "prompt"), model: .devinCustom(name: "raw-model"))
+                for try await result in stream {
+                    collector.append(result.type)
+                }
+            }
+        }
+        try await waitUntil { collector.types.count >= 1 }
+        try "go".write(to: go, atomically: true, encoding: .utf8)
+        do {
+            try await consumer.value
+            XCTFail("Expected the failing child to throw")
+        } catch let AIProviderError.apiError(source) {
+            let error = try XCTUnwrap(source as NSError?)
+            XCTAssertEqual(error.domain, "DevinCLI")
+            XCTAssertEqual(error.code, 7)
+            XCTAssertEqual(error.localizedDescription, "devin exploded: model refused")
+        }
+        await provider.dispose()
+        XCTAssertEqual(Set(collector.types), [AIStreamResult.transportActivityType])
+    }
+
+    func testDevinTextCancellationStopsLivenessAndReapsChild() async throws {
+        let root = try makeOneShotFixtureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let go = root.appendingPathComponent("go")
+        let executable = root.appendingPathComponent("devin")
+        try installFixtureScript(Self.waitingDevinScript(root: root, go: go, finish: "printf 'never'"), at: executable)
+        let host = FixtureDevinCLIHost()
+        let provider = makeLivenessProvider(executable: executable, root: root, host: host)
+        let collector = StreamCollector()
+
+        let consumer = Task {
+            try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
+                let stream = try await provider.streamMessage(AIMessage(systemPrompt: "", userMessage: "prompt"), model: .devinCustom(name: "raw-model"))
+                for try await result in stream {
+                    collector.append(result.type)
+                }
+            }
+        }
+        try await waitUntil { collector.types.count >= 1 }
+        consumer.cancel()
+        _ = await consumer.result
+        await provider.dispose()
+
+        let countAfterCancel = collector.types.count
+        try await Task.sleep(for: .milliseconds(250))
+        XCTAssertEqual(collector.types.count, countAfterCancel, "No liveness may be reported after cancellation")
+        let pid = try XCTUnwrap(pid_t(String(contentsOf: root.appendingPathComponent("pid"), encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)))
+        try await waitUntil { kill(pid, 0) != 0 }
+        try XCTAssertFalse(FileManager.default.fileExists(atPath: XCTUnwrap(host.directory)))
+    }
+
+    private func makeLivenessProvider(executable: URL, root: URL, host: FixtureDevinCLIHost) -> DevinCLIProvider {
+        DevinCLIProvider(
+            host: host,
+            config: DevinAgentConfig(commandName: executable.path, additionalPathHints: [], includeRepoPromptMCPServer: false),
+            launchResolver: makeDevinResolver(environment: ["PATH": "/usr/bin:/bin", "HOME": root.path]),
+            livenessHeartbeatInterval: 0.05,
+            headlessProviderFactory: { _, _ in preconditionFailure("Text requests must not construct ACP") }
+        )
+    }
+
+    /// A `devin` stand-in that is silent until `go` exists, then runs `finish`. Self-exits after ~30s.
+    private static func waitingDevinScript(root: URL, go: URL, finish: String) -> String {
+        """
+        #!/bin/sh
+        if [ "$1" = acp ] && [ "$2" = --help ]; then
+            printf 'Run as an ACP server over stdio\\n'
+            exit 0
+        fi
+        printf '%s' "$$" > '\(root.appendingPathComponent("pid").path)'
+        i=0
+        while [ ! -f '\(go.path)' ] && [ $i -lt 600 ]; do
+            sleep 0.05
+            i=$((i + 1))
+        done
+        \(finish)
+        """
+    }
+
+    private func waitUntil(timeout: TimeInterval = 10, _ condition: @escaping () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() {
+            if Date() >= deadline {
+                XCTFail("Timed out waiting for condition")
+                return
+            }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+    }
+
     func testDevinImageFailureUsesACPAndRemovesPrivateDirectoryWithoutTextIntegration() async throws {
         let host = FixtureDevinCLIHost()
         let factoryEvents = FixtureEvents()
@@ -581,6 +715,17 @@ extension GrokBuildDevinProviderTests {
 
 private enum FixtureProviderError: Error, Equatable {
     case selection, image, unexpectedController
+}
+
+private final class StreamCollector: Sendable {
+    private let state = OSAllocatedUnfairLock(initialState: [String]())
+    func append(_ value: String) {
+        state.withLock { $0.append(value) }
+    }
+
+    var types: [String] {
+        state.withLock { $0 }
+    }
 }
 
 private final class FixtureEvents: Sendable {

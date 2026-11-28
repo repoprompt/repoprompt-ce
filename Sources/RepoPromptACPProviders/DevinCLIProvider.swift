@@ -16,6 +16,7 @@ package final class DevinCLIProvider: AIProvider {
     private let config: DevinAgentConfig
     private let launchResolver: DevinACPLaunchResolver
     private let requestTimeout: TimeInterval
+    private let livenessHeartbeatInterval: TimeInterval
     private let headlessProviderFactory: HeadlessProviderFactory
     private let activeRuns = ActiveDevinOneShotRunStore()
 
@@ -24,12 +25,14 @@ package final class DevinCLIProvider: AIProvider {
         config: DevinAgentConfig,
         launchResolver: DevinACPLaunchResolver,
         requestTimeout: TimeInterval = 6000,
+        livenessHeartbeatInterval: TimeInterval = ProviderTransportActivity.pendingCompletionHeartbeatInterval,
         headlessProviderFactory: @escaping HeadlessProviderFactory
     ) {
         self.host = host
         self.config = config
         self.launchResolver = launchResolver
         self.requestTimeout = requestTimeout
+        self.livenessHeartbeatInterval = livenessHeartbeatInterval
         self.headlessProviderFactory = headlessProviderFactory
     }
 
@@ -63,7 +66,12 @@ package final class DevinCLIProvider: AIProvider {
                 do {
                     let modelName = host.modelName(for: model)
                     if aiMessage.attachments.isEmpty {
-                        let text = try await runOneShot(aiMessage, modelName: modelName)
+                        let text = try await runOneShot(aiMessage, modelName: modelName) {
+                            if case .terminated = continuation.yield(ProviderTransportActivity.result()) {
+                                return false
+                            }
+                            return true
+                        }
                         continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: "content", text: text))
                         continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: "message_stop", text: nil))
                     } else {
@@ -197,7 +205,11 @@ package final class DevinCLIProvider: AIProvider {
         )
     }
 
-    private func runOneShot(_ message: RepoPromptDomainRuntime.AIMessage, modelName: String?) async throws -> String {
+    private func runOneShot(
+        _ message: RepoPromptDomainRuntime.AIMessage,
+        modelName: String?,
+        reportTransportActivity: @escaping ProviderTransportHeartbeat.Report
+    ) async throws -> String {
         try Task.checkCancellation()
         let support = try await launchResolver.probeSupport(for: config)
         guard case .supported = support else {
@@ -247,6 +259,13 @@ package final class DevinCLIProvider: AIProvider {
             shellLookupMode: .disabled
         )
         let runner = CLIProcessRunner(config: processConfig)
+        // Liveness is attested only while the runner reports a spawned, unreaped child.
+        // Pre-launch work above and any stall before spawn stay silent so the Context
+        // Builder inactivity budget still bounds them.
+        let heartbeat = ProviderTransportHeartbeat(
+            interval: livenessHeartbeatInterval,
+            report: reportTransportActivity
+        )
         let result: CLIProcessRunner.Result
         do {
             try launch.executableIdentity.validateForTrustedPathLaunch(atPath: launch.command)
@@ -258,11 +277,16 @@ package final class DevinCLIProvider: AIProvider {
                 stdin: nil,
                 outputMode: .none,
                 timeout: requestTimeout,
-                cancelChildOnTaskCancellation: true
+                cancelChildOnTaskCancellation: true,
+                onProcessStarted: { _ in heartbeat.start() },
+                onProcessExited: { _ in await heartbeat.stop() }
             )
+            await heartbeat.stop()
         } catch is CancellationError {
+            await heartbeat.stop()
             throw CancellationError()
         } catch {
+            await heartbeat.stop()
             throw mapProcessError(error)
         }
 
