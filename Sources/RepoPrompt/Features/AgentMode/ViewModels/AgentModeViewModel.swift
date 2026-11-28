@@ -6830,6 +6830,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return .invalidParams(TabSession.loadingAdmissionFailureMessage)
     }
 
+    func workspaceActivationRefusalMCPError(expectedWorkspaceID: UUID?) -> MCPError? {
+        guard let refused = refusedWorkspaceActivationOwner,
+              sessionIndexStore.isOwnerCurrent(refused),
+              expectedWorkspaceID == nil || refused.workspaceID == expectedWorkspaceID
+        else { return nil }
+        return workspaceAdoptionMCPError(expectedWorkspaceID: expectedWorkspaceID)
+    }
+
     var isAwaitingWorkspaceAdoption: Bool {
         if destructiveWorkspaceAdoptionOwner != nil || runtimeSessionStore.isAwaitingWorkspaceAdoption { return true }
         if canonicalWorkspaceHostPreparation != nil, let workspaceAdoption {
@@ -13764,6 +13772,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             guard adoptionIsCurrent() else {
                 abandonPreparedDestination()
+                settleRefusedDestination("adoption cancelled during legacy cleanup")
                 return
             }
             let discardContexts = sessions.values.map {
@@ -13772,6 +13781,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             for session in sessions.values where session.runState.isActive {
                 guard adoptionIsCurrent() else {
                     abandonPreparedDestination()
+                    settleRefusedDestination("adoption cancelled during legacy cleanup")
                     return
                 }
                 guard sessions[session.tabID] === session else { continue }
@@ -13779,6 +13789,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             guard adoptionIsCurrent() else {
                 abandonPreparedDestination()
+                settleRefusedDestination("adoption cancelled during legacy cleanup")
                 return
             }
             // Finalize and remove the legacy owner's sessions in the same actor turn.

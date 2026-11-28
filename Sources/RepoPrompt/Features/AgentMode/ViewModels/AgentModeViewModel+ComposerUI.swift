@@ -122,7 +122,10 @@ extension AgentModeViewModel {
     }
 
     func makeComposerSubmitTarget(tabID: UUID?, session: TabSession?) -> AgentComposerSubmitTarget? {
-        guard let tabID, refusedWorkspaceActivationOwner == nil else { return nil }
+        guard let tabID,
+              refusedWorkspaceActivationOwner == nil,
+              canonicalWorkspaceHostPreparation == nil || !isAwaitingWorkspaceAdoption
+        else { return nil }
         let resolvedSession: TabSession
         if let heldSession = session ?? sessions[tabID] {
             resolvedSession = heldSession
@@ -136,7 +139,7 @@ extension AgentModeViewModel {
         if workspaceSwitchInFlight, (expectedInitialStartLocation ?? .local) == .local {
             return nil
         }
-        guard resolvedSession.restorationAdmissionFailureMessage == nil,
+        guard resolvedSession.operationAdmissionFailureMessage == nil,
               !resolvedSession.isComposerSubmissionInFlight,
               !resolvedSession.isPreparingInitialWorktree,
               !resolvedSession.isChangingExecutionLocation
@@ -179,6 +182,36 @@ extension AgentModeViewModel {
             expectedInitialStartLocation: expectedInitialStartLocation,
             expectedWriterIdentity: writerIdentity
         )
+    }
+
+    /// Single-authority explanation for why Send is currently unavailable for this tab.
+    /// Read-only: never allocates or mutates a `TabSession`.
+    func composerSubmitDisabledReason(tabID: UUID?, session: TabSession?) -> String? {
+        if let refused = refusedWorkspaceActivationOwner, sessionIndexStore.isOwnerCurrent(refused) {
+            return Self.workspaceActivationFailureMessage
+        }
+        if canonicalWorkspaceHostPreparation != nil, isAwaitingWorkspaceAdoption {
+            return "Wait for this workspace to finish loading."
+        }
+        guard let tabID else { return nil }
+        let expectedInitialStartLocation = initialStartLocationProps(tabID: tabID)?.selection
+        if workspaceSwitchInFlight, (expectedInitialStartLocation ?? .local) == .local {
+            return "Wait for this workspace to finish loading."
+        }
+        let resolvedSession = session ?? sessions[tabID]
+        if let message = resolvedSession?.operationAdmissionFailureMessage {
+            return message
+        }
+        if resolvedSession == nil, explicitActiveSessionID(for: tabID) != nil {
+            return TabSession.loadingAdmissionFailureMessage
+        }
+        if resolvedSession?.isPreparingInitialWorktree == true {
+            return "Wait for worktree preparation to finish."
+        }
+        if resolvedSession?.isChangingExecutionLocation == true {
+            return "Wait for execution location changes to finish."
+        }
+        return nil
     }
 
     func syncComposerUIState(tabID: UUID? = nil) {

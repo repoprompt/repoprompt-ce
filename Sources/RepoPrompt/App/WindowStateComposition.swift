@@ -126,10 +126,18 @@ enum WindowStateCompositionFactory {
             guard activations.latestSessionIndexOwner == owner else {
                 throw AgentHostWorkspaceResources.Failure.authorityUnavailable
             }
+            if !workspace.isEphemeral, await authority.canonicalWorkspaceSnapshot(workspace.id) == nil {
+                stage = "bootstrap canonical workspace store"
+                _ = await runtime.workspaceStore.snapshot()
+                try Task.checkCancellation()
+                guard activations.latestSessionIndexOwner == owner else {
+                    throw AgentHostWorkspaceResources.Failure.authorityUnavailable
+                }
+            }
             stage = "compose workspace activation"
             let activation = try AgentSessionHostWorkspaceActivation(
                 windowID: host.routeID, authority: authority, activations: activations,
-                resources: AgentHostWorkspaceResources(files: resources.files, contexts: runtime.contextStore), settings: settings
+                resources: resources.withContexts(runtime.contextStore), settings: settings
             )
             stage = "install workspace activation"
             try await host.installWorkspaceActivation(
@@ -140,7 +148,9 @@ enum WindowStateCompositionFactory {
             stage = "check installed presenter currency"
             guard activation.isPresenterCurrent else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
             stage = "retain visible file resources"
-            let originalRoots = try await activation.retainVisibleFileResources()
+            let originalRoots = try await activation.retainVisibleFileResources(
+                fileSystemSettings: settingsStore.fileSystemSettingsSnapshot()
+            )
             stage = "install execution and model catalog"
             try await installExecutionAndCatalog(host, originalRoots)
             stage = "validate composed host"
@@ -148,7 +158,7 @@ enum WindowStateCompositionFactory {
             try Task.checkCancellation()
             let checks = [
                 ("workspace present", current.map { $0.health != .removed } == true),
-                ("workspace paths match", current?.document.metadata.repoPaths == originalRoots.snapshot.document.metadata.repoPaths),
+                ("workspace paths match", current?.document.metadata.canonicalLoadableRepoPaths == originalRoots.snapshot.document.metadata.canonicalLoadableRepoPaths),
                 ("presenter current", activation.isPresenterCurrent),
                 ("roots current", originalRoots.rootsAreCurrent),
                 ("no sessions admitted", host.scope.sessions.isEmpty),
@@ -253,6 +263,7 @@ enum WindowStateCompositionFactory {
         let workspaceSearchService = injectedWorkspaceSearchService ?? WorkspaceSearchService()
         let workspaceFilesViewModel = WorkspaceFilesViewModel(
             workspaceFileContextStore: workspaceFileContextStore,
+            settingsStore: settingsStore,
             restorePerfRecorder: AppWorkspaceRestorePerfRecorder()
         )
         if injectedWorkspaceFileContextStore == nil {

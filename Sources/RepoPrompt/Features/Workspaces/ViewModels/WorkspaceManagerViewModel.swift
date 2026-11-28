@@ -6960,8 +6960,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         let configuredRootPaths = uniqueWorkspaceRootLoadRequests(
             for: Self.loadableRepoPaths(for: workspace)
         ).map(\.canonicalPath)
-        let primaryRootRecords = await fileManager.workspaceFileContextStore.roots()
-            .filter { $0.kind == .primaryWorkspace }
+        let primaryRootRefs = await fileManager.workspaceFileContextStore.rootRefs(scope: .visibleWorkspace)
         try Task.checkCancellation()
         #if DEBUG
             await workspaceRootCatalogDidCaptureRootsHandlerForTesting?()
@@ -6982,8 +6981,8 @@ class WorkspaceManagerViewModel: ObservableObject {
             throw WorkspaceRootCatalogSnapshotError.inconsistentRootProjection
         }
 
-        var rootsByPath: [String: WorkspaceRootRecord] = [:]
-        for root in primaryRootRecords {
+        var rootsByPath: [String: WorkspaceRootRef] = [:]
+        for root in primaryRootRefs {
             guard rootsByPath.updateValue(root, forKey: root.standardizedFullPath) == nil else {
                 throw WorkspaceRootCatalogSnapshotError.inconsistentRootProjection
             }
@@ -6994,10 +6993,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             throw WorkspaceRootCatalogSnapshotError.inconsistentRootProjection
         }
 
-        let orderedRoots = configuredRootPaths.compactMap { path -> WorkspaceRootRef? in
-            guard let root = rootsByPath[path] else { return nil }
-            return WorkspaceRootRef(id: root.id, name: root.name, fullPath: root.standardizedFullPath)
-        }
+        let orderedRoots = configuredRootPaths.compactMap { rootsByPath[$0] }
         guard orderedRoots.count == configuredRootPaths.count else {
             throw WorkspaceRootCatalogSnapshotError.inconsistentRootProjection
         }

@@ -2510,6 +2510,7 @@ private extension AgentModeViewModel {
         return AgentComposerProps(
             computerUse: computerUseComposerProps(session: session),
             imageAttachmentNotice: imageAttachmentNotice,
+            submitDisabledReason: composerSubmitDisabledReason(tabID: tabID, session: session),
             currentTabID: tabID,
             submitTarget: submitTarget,
             attachments: AgentAttachmentStripSnapshot(
@@ -2681,10 +2682,98 @@ final class AgentComposerProjectionEquivalenceTests: XCTestCase {
         XCTAssertEqual(props.selectedModelRaw, draft.model)
         XCTAssertEqual(props.selectedReasoningEffortRaw, "low")
         XCTAssertNil(props.submitTarget, "Typing must never allocate a session/writer")
+        XCTAssertNil(props.submitDisabledReason)
         XCTAssertFalse(props.areModelControlsDisabled)
         XCTAssertNotNil(props.providerControls)
         XCTAssertFalse(props.availableAgents.isEmpty)
         XCTAssertEqual(props.autoEditEnabled, draft.autoEdit)
+    }
+
+    func testWorkspaceActivationAdoptingAndRefusedGateSubmitTargetWithoutThrowawaySessions() async {
+        struct StubPreparationFailure: Error {}
+
+        let freshTab = ComposeTabState(id: UUID(), name: "Fresh")
+        let workspace = WorkspaceModel(
+            id: UUID(),
+            dateModified: Date(),
+            name: "Activation Composer Gate Fixture",
+            repoPaths: [],
+            lastUsed: Date(),
+            composeTabs: [freshTab],
+            activeComposeTabID: freshTab.id
+        )
+        let vm = AgentModeViewModel(
+            testWorkspacePath: nil,
+            codexControllerFactory: { _, _, _, _, _, _ in fatalError("Composer gate test must not launch a provider") },
+            headlessProviderFactory: { _, _ in UnsupportedHeadlessAgentProvider(reason: "composer gate test") }
+        )
+        vm.test_setSuppressesAgentSessionPersistence(true)
+        vm.test_setCurrentTabIDOverride(freshTab.id)
+
+        let enteredPreparation = expectation(description: "entered canonicalWorkspaceHostPreparation")
+        var releasePreparation: CheckedContinuation<Void, Never>?
+        vm.canonicalWorkspaceHostPreparation = { _, _, _ in
+            await withCheckedContinuation { continuation in
+                releasePreparation = continuation
+                enteredPreparation.fulfill()
+            }
+            throw StubPreparationFailure()
+        }
+        defer { releasePreparation?.resume() }
+
+        let owner = vm.test_receiveWorkspaceSwitchNotification(workspace)
+        let adoptionTask = Task { @MainActor in
+            await vm.test_handleWorkspaceSwitch(workspace, owner: owner)
+        }
+        await fulfillment(of: [enteredPreparation], timeout: 2)
+
+        // 1. Transient adopting: nil submitTarget, zero throwaway session churn, loading reason.
+        XCTAssertTrue(vm.isAwaitingWorkspaceAdoption)
+        XCTAssertNil(vm.refusedWorkspaceActivationOwner)
+        XCTAssertNil(vm.makeComposerSubmitTarget(tabID: freshTab.id, session: nil))
+        XCTAssertTrue(vm.sessions.isEmpty)
+
+        let adoptingPropsFirst = vm.makeComposerProps(tabID: freshTab.id)
+        let adoptingPropsSecond = vm.makeComposerProps(tabID: freshTab.id)
+        XCTAssertEqual(
+            adoptingPropsFirst,
+            adoptingPropsSecond,
+            "Repeated composer syncs during adoption must not churn throwaway session identities"
+        )
+        XCTAssertNil(adoptingPropsFirst.submitTarget)
+        XCTAssertEqual(adoptingPropsFirst.submitDisabledReason, "Wait for this workspace to finish loading.")
+
+        // Command Center unbound drafts borrowing this VM as a catalog donor must not inherit its adoption gate.
+        let donorDraft = AgentComposerDraftState(text: "draft")
+        XCTAssertNil(
+            AgentComposerProjection.props(vm: vm, subject: .draft(donorDraft.id), draft: donorDraft).submitDisabledReason
+        )
+
+        // 2. Refused activation (#1866): nil submitTarget, distinct failure reason published to UI store.
+        releasePreparation?.resume()
+        releasePreparation = nil
+        await adoptionTask.value
+
+        XCTAssertEqual(vm.refusedWorkspaceActivationOwner, owner)
+        XCTAssertTrue(vm.isAwaitingWorkspaceAdoption)
+        XCTAssertNil(vm.makeComposerSubmitTarget(tabID: freshTab.id, session: nil))
+        XCTAssertTrue(vm.sessions.isEmpty)
+
+        let refusedPropsFirst = vm.makeComposerProps(tabID: freshTab.id)
+        let refusedPropsSecond = vm.makeComposerProps(tabID: freshTab.id)
+        XCTAssertEqual(refusedPropsFirst, refusedPropsSecond)
+        XCTAssertNil(refusedPropsFirst.submitTarget)
+        XCTAssertEqual(
+            refusedPropsFirst.submitDisabledReason,
+            AgentModeViewModel.workspaceActivationFailureMessage
+        )
+        XCTAssertEqual(
+            vm.ui.composer.props.submitDisabledReason,
+            AgentModeViewModel.workspaceActivationFailureMessage
+        )
+        XCTAssertNotEqual(refusedPropsFirst.submitDisabledReason, adoptingPropsFirst.submitDisabledReason)
+
+        await vm.test_retireAndCancelFixture()
     }
 }
 

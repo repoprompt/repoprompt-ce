@@ -368,6 +368,7 @@ struct AgentComposerProps: Equatable {
 
     var computerUse: AgentComputerUseComposerProps = .hidden
     var imageAttachmentNotice: AgentImageAttachmentNoticeProps?
+    var submitDisabledReason: String?
     let currentTabID: UUID?
     let submitTarget: AgentComposerSubmitTarget?
     let attachments: AgentAttachmentStripSnapshot
