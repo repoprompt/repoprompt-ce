@@ -750,6 +750,7 @@ jobs:
 
       - name: Sign application
         env:
+          TIP_ROLLOUT_OBSERVATION_TOKEN: ${{ github.token }}
           TIP_COMMIT: ${{ needs.setup.outputs.commit }}
           TIP_SHORT_SHA: ${{ needs.setup.outputs.short-sha }}
           TIP_BUILD_NUMBER: ${{ needs.setup.outputs.build-number }}

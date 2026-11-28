@@ -167,6 +167,21 @@ class CapabilityTests(unittest.TestCase):
         with self.assertRaises(rollout.RolloutError): self.progression(s,adopted)
         with self.assertRaises(rollout.RolloutError): self.progression(adopted,t)
 
+    def test_stable_transition_is_published_exactly_once(self):
+        adopted = self.adoption()
+        t = self.native('stable','transition','44','v1.10.0',(self.p,))
+        self.progression(t, adopted)
+        repeated = self.native('stable','transition','45','v1.10.1',(self.p,))
+        with self.assertRaisesRegex(rollout.RolloutError, 'one-time identity crossing'):
+            self.progression(repeated, t)
+        s = self.native('stable','successor','45','v1.10.2',(t,self.p))
+        self.progression(s, t)
+        later = self.native('stable','successor','46','v1.10.3',(t,self.p))
+        self.progression(later, s)
+        late_t = self.native('stable','transition','47','v1.10.4',(self.p,))
+        with self.assertRaisesRegex(rollout.RolloutError, 'regress or skip'):
+            self.progression(late_t, later)
+
     def test_native_stable_ladder_cannot_reintroduce_tip_delivery(self):
         transition = self.native('stable','transition','44','v1.9.2',(self.p,))
         m = json.loads(transition.read_text())
