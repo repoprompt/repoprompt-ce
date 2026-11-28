@@ -4,6 +4,11 @@ import RepoPromptProcess
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
 
+struct CodexComputerUseActivation: Equatable {
+    let id: UUID
+    let createdAt: Date
+}
+
 extension Notification.Name {
     static let codexGoalSupportDidChange = Notification.Name("RepoPrompt.codexGoalSupportDidChange")
     static let codexComputerUseDidChange = Notification.Name("RepoPrompt.codexComputerUseDidChange")

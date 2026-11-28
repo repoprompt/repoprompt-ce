@@ -8637,14 +8637,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         admission: AgentSessionWorktreeRuntime.Admission? = nil
     ) async throws -> ExecutionLocationContext {
         let primaryRoot: String
-        let store: WorkspaceFileContextStore
+        let visibleRoots: [WorkspaceRootRef]
         if let admission {
             try admission.requireCurrent()
-            guard let root = admission.resources.declaredRepoPaths.first, let capturedStore = admission.resources.store else {
+            guard let root = admission.resources.declaredRepoPaths.first else {
                 throw ExecutionLocationTransitionError.unavailable("Execution location requires an active project workspace.")
             }
             primaryRoot = root
-            store = capturedStore
+            visibleRoots = try await admission.resources.logicalRoots()
         } else {
             guard let workspace = workspaceManager?.activeWorkspace, !workspace.isSystemWorkspace,
                   let root = workspace.repoPaths.first, let promptManager
@@ -8652,10 +8652,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 throw ExecutionLocationTransitionError.unavailable("Execution location requires an active project workspace.")
             }
             primaryRoot = root
-            store = promptManager.workspaceFileContextStore
+            visibleRoots = await promptManager.workspaceFileContextStore.rootRefs(scope: .visibleWorkspace)
         }
         let primaryPath = AgentWorktreeRuntimeWorkspaceResolver.standardizedWorkspacePath((primaryRoot as NSString).expandingTildeInPath) ?? primaryRoot
-        let visibleRoots = await store.rootRefs(scope: .visibleWorkspace)
         try admission?.requireCurrent()
         guard let logicalRoot = visibleRoots.first(where: {
             (AgentWorktreeRuntimeWorkspaceResolver.standardizedWorkspacePath($0.standardizedFullPath) ?? $0.standardizedFullPath) == primaryPath
@@ -8743,55 +8742,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             throw error
         }
-    }
-
-    /// Transfers runtime ownership without suspension. The returned cleanup touches only captured
-    /// instances, so a deadline may stop waiting without retiring a same-tab successor.
-    func detachProviderContextForProviderSwitch(_ session: TabSession) -> (@MainActor () async -> Void) {
-        let provider = session.provider
-        session.provider = nil
-        let acp = session.acpController
-        session.acpController = nil
-        let codex = codexCoordinator.detachForWorkspaceSwitchFinalizeSync(session, runIDs: [])
-        let claude = claudeCoordinator.detachForWorkspaceSwitchFinalizeSync(session)
-        let codexCoordinator = codexCoordinator
-        let claudeCoordinator = claudeCoordinator
-        #if DEBUG
-            let hook = test_providerSwitchRetirement
-        #endif
-        return {
-            #if DEBUG
-                if let hook {
-                    await hook(session)
-                    return
-                }
-            #endif
-            if let provider {
-                await provider.dispose()
-            }
-            if let acp {
-                await acp.cancelPrompt()
-                await acp.shutdown()
-            }
-            if let codex {
-                await codexCoordinator.retireDetachedControllerForWorkspaceSwitch(codex)
-            }
-            if let claude {
-                await claudeCoordinator.retireDetachedControllerForWorkspaceSwitch(claude, discardedSession: session)
-            }
-        }
-    }
-
-    func clearProviderContextForProviderSwitch(_ session: TabSession) {
-        codexCoordinator.clearCodexSessionState(session)
-        claudeCoordinator.rotateClaudeRuntimeEpoch(for: session)
-        session.providerSessionID = nil
-        session.providerCleanupHandle = nil
-        session.contextUsageSnapshot = nil
-        session.contextCompactedAt = nil
-        session.pendingNonCodexUserInputTokenQueue.removeAll()
-        session.activeNonCodexTurnTokenAccumulator = nil
-        AgentModeProcessRunIdentity.clearProcessRunID(for: session)
     }
 
     func updateWorktreeBindingSummariesInIndex(for session: TabSession) {
@@ -16619,16 +16569,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         }
 
-        if session.selectedAgent == .codexExec,
-           session.runState == .waitingForUser,
-           session.instructionContinuation != nil
-        {
+        let route = linkExecutionRuntime.inputRouting(for: session, hasImages: !attachmentsToSend.isEmpty).composer
+        if route == .waitingInstruction, session.selectedAgent == .codexExec {
             dispatchWaitingInstruction()
-            return UserTurnSubmissionResult.submitted
+            return .submitted
         }
 
-        if canonicalLocalDispatch, session.selectedAgent == .codexExec { return dispatchCanonicalPreparedTurn() }
-        if session.selectedAgent == .codexExec {
+        if route == .codex, canonicalLocalDispatch { return dispatchCanonicalPreparedTurn() }
+        if route == .codex {
             let dispatchTicket = session.codexDispatchSerialGate.issueTicket()
             let producerStopFence = stopFence ?? session.composerStartCancellation?.pendingStartFence(for: session)
                 ?? AgentRunStartStopFence(session: session)
@@ -16796,95 +16744,83 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             .enqueueUserTurnEstimate(messageForProvider: providerPreviewText, session: session)
             ?? AgentSessionUsageRuntime.estimateRuntimeTokens(for: providerPreviewText)
 
-        // If agent is waiting for instruction, resume it.
-        // Claude image attachments must go through a resumed turn (not wait-tool continuation),
-        // otherwise attachment references are not forwarded reliably.
-        if session.runState == .waitingForUser {
-            if session.selectedAgent.usesClaudeNativeRuntime, !attachmentsToSend.isEmpty {
-                let producerStopFence = stopFence ?? session.composerStartCancellation?.pendingStartFence(for: session)
-                    ?? AgentRunStartStopFence(session: session)
-                Task { [weak self, weak session] in
-                    guard let self, let session else { return }
-                    defer { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) }
-                    #if DEBUG
-                        defer { test_claudeAttachmentRestartFinished?() }
-                    #endif
-                    @MainActor func restoreIfStopped() {
-                        guard sessions[tabID] === session,
-                              session.persistentSessionBindingIdentity == producerStopFence.binding
-                        else { return }
-                        if let index = session.items.firstIndex(where: { $0.id == userItem.id }) {
-                            _ = session.removeItem(at: index)
-                        }
-                        restoreRejectedManualSubmissionComposerState(
-                            repromptedText: repromptedText,
-                            tabID: tabID,
-                            session: session,
-                            draftText: restorationDraftText,
-                            attachments: attachmentsToSend,
-                            taggedFiles: taggedFilesToSend,
-                            selectedWorkflow: restorationSelectedWorkflow,
-                            selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
-                            message: "This scheduled run was cancelled by Stop."
-                        )
-                    }
-                    guard sessions[tabID] === session, producerStopFence.permitsStart(of: session) else {
-                        restoreIfStopped()
-                        return
-                    }
-                    await cancelAgentRun(tabID: tabID, origin: .internalLifecycle)
-                    #if DEBUG
-                        await test_afterClaudeAttachmentSelfCancel?()
-                    #endif
-                    // This submission itself issued one Stop; any additional Stop invalidates it.
+        if route == .restartClaudeForImages {
+            let producerStopFence = stopFence ?? session.composerStartCancellation?.pendingStartFence(for: session)
+                ?? AgentRunStartStopFence(session: session)
+            Task { [weak self, weak session] in
+                guard let self, let session else { return }
+                defer { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) }
+                #if DEBUG
+                    defer { test_claudeAttachmentRestartFinished?() }
+                #endif
+                @MainActor func restoreIfStopped() {
                     guard sessions[tabID] === session,
-                          session.persistentSessionBindingIdentity == producerStopFence.binding,
-                          session.stopState.cancellationCount == producerStopFence.cancellationCount + 1
-                    else {
-                        restoreIfStopped()
-                        return
+                          session.persistentSessionBindingIdentity == producerStopFence.binding
+                    else { return }
+                    if let index = session.items.firstIndex(where: { $0.id == userItem.id }) {
+                        _ = session.removeItem(at: index)
                     }
-                    let resumedFence = AgentRunStartStopFence(session: session)
-                    await startAgentRun(
+                    restoreRejectedManualSubmissionComposerState(
+                        repromptedText: repromptedText,
                         tabID: tabID,
-                        initialMessage: wrappedText,
+                        session: session,
+                        draftText: restorationDraftText,
                         attachments: attachmentsToSend,
-                        taggedFileAttachments: providerTaggedFiles,
-                        appliedWorkflow: activeWorkflow,
-                        autoEffortSelection: autoEffortSelection,
-                        directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: providerSkipsSlashExpansion, stopFence: resumedFence, localComposerCandidate: localComposerCandidate, initialUserItemID: userItem.id, restorationDraftText: restorationDraftText),
-                        providerSwitchPreparation: acceptedSwitchPreparation
+                        taggedFiles: taggedFilesToSend,
+                        selectedWorkflow: restorationSelectedWorkflow,
+                        selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
+                        message: "This scheduled run was cancelled by Stop."
                     )
                 }
-                return UserTurnSubmissionResult.submitted
-            }
-            if session.instructionContinuation != nil {
-                _ = usageRuntime.dequeuePendingNonCodexUserTokens(for: session) ?? userInputTokenEstimate
-                dispatchWaitingInstruction()
-                return UserTurnSubmissionResult.submitted
-            }
-        }
-
-        // Managed steers use only the classified live route; a drift to idle or to the
-        // unqualified follow-up path withdraws the attributed row instead.
-        if let managedTurn {
-            let steeringRoute = session.runState.isActive
-                ? activeProviderSteeringRoute(for: session, attachments: attachmentsToSend)
-                : nil
-            guard steeringRoute == .claudeNativeInterrupt || steeringRoute == .acpPrompt else {
-                withdrawAgentSessionLinkManagedTurn(
-                    managedTurn,
-                    userItemID: userItem.id,
-                    session: session,
+                guard sessions[tabID] === session, producerStopFence.permitsStart(of: session) else {
+                    restoreIfStopped()
+                    return
+                }
+                await cancelAgentRun(tabID: tabID, origin: .internalLifecycle)
+                #if DEBUG
+                    await test_afterClaudeAttachmentSelfCancel?()
+                #endif
+                // This submission itself issued one Stop; any additional Stop invalidates it.
+                guard sessions[tabID] === session,
+                      session.persistentSessionBindingIdentity == producerStopFence.binding,
+                      session.stopState.cancellationCount == producerStopFence.cancellationCount + 1
+                else {
+                    restoreIfStopped()
+                    return
+                }
+                let resumedFence = AgentRunStartStopFence(session: session)
+                await startAgentRun(
                     tabID: tabID,
-                    anchorRollback: turnRuntimeAnchorRollback
+                    initialMessage: wrappedText,
+                    attachments: attachmentsToSend,
+                    taggedFileAttachments: providerTaggedFiles,
+                    appliedWorkflow: activeWorkflow,
+                    autoEffortSelection: autoEffortSelection,
+                    directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: providerSkipsSlashExpansion, stopFence: resumedFence, localComposerCandidate: localComposerCandidate, initialUserItemID: userItem.id, restorationDraftText: restorationDraftText),
+                    providerSwitchPreparation: acceptedSwitchPreparation
                 )
-                return UserTurnSubmissionResult.submitted
             }
+            return UserTurnSubmissionResult.submitted
+        }
+        if route == .waitingInstruction {
+            _ = usageRuntime.dequeuePendingNonCodexUserTokens(for: session) ?? userInputTokenEstimate
+            dispatchWaitingInstruction()
+            return .submitted
         }
 
-        // If agent is not running, start it
-        if !session.runState.isActive {
+        // Managed steering must remain tied to its original live provider path.
+        if let managedTurn, route != .steer(.claudeNativeInterrupt), route != .steer(.acpPrompt) {
+            withdrawAgentSessionLinkManagedTurn(
+                managedTurn,
+                userItemID: userItem.id,
+                session: session,
+                tabID: tabID,
+                anchorRollback: turnRuntimeAnchorRollback
+            )
+            return .submitted
+        }
+
+        if route == .start {
             if canonicalLocalDispatch { return dispatchCanonicalPreparedTurn() }
             let producerStopFence = stopFence ?? session.composerStartCancellation?.pendingStartFence(for: session)
                 ?? AgentRunStartStopFence(session: session)
@@ -16904,9 +16840,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     providerSwitchPreparation: acceptedSwitchPreparation
                 )
             }
-        } else if let route = activeProviderSteeringRoute(for: session, attachments: attachmentsToSend) {
+        } else if case let .steer(steering) = route {
             let accepted = submitActiveProviderSteering(
-                route,
+                steering,
                 session: session,
                 wrappedText: wrappedText,
                 attachmentsToSend: attachmentsToSend,
@@ -16946,40 +16882,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         for session: TabSession,
         attachments: [AgentFileAttachment] = []
     ) -> ActiveProviderSteeringRoute? {
-        guard session.runState == .running,
-              session.pendingApproval == nil else { return nil }
-        if activeACPPromptIsAvailable(for: session, attachments: attachments) {
-            return .acpPrompt
-        }
-        if session.selectedAgent.usesClaudeNativeRuntime {
-            return .claudeNativeInterrupt
-        }
-        return nil
-    }
-
-    private func activeACPPromptIsAvailable(
-        for session: TabSession,
-        attachments: [AgentFileAttachment]
-    ) -> Bool {
-        guard session.selectedAgent.acpProviderID != nil,
-              session.runState == .running,
-              session.pendingApproval == nil,
-              session.pendingAskUser == nil,
-              session.pendingUserInputRequest == nil,
-              session.pendingPermissionsRequest == nil,
-              attachments.isEmpty,
-              session.runID != nil,
-              session.activeRunAttemptID != nil,
-              session.acpController != nil
-        else {
-            return false
-        }
-        // ACP live steering is safe only through the serialized queue. The queue
-        // waits for RepoPrompt MCP tools to go idle, then the runner sends
-        // session/cancel and waits for the cancelled prompt to settle before the
-        // steering session/prompt. Never send prompt-only steering while a turn is
-        // already running.
-        return true
+        linkExecutionRuntime.inputRouting(for: session, hasImages: !attachments.isEmpty).activeSteering
     }
 
     private func submitActiveProviderSteering(

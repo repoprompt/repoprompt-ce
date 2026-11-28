@@ -237,11 +237,10 @@ extension MCPWorktreeToolProvider {
     ) async throws {
         try admission.requireCurrent()
         let paths = [operation.source.path, operation.target.path]
-        guard let store = admission.resources.store else { throw MCPError.invalidParams("The merge workspace is unavailable.") }
-        let lookupContext = await AgentSessionProviderInputRuntime.WorkspaceSource(
-            store: store, lookupSource: .init(activeAgentSessionID: admission.command.identity.sessionID, worktreeBindings: admission.bindings)
-        ).lookupContext()
-        var mappings = await lookupContext.domainMutationPhysicalRootMappings(store: store)
+        let lookup = try await admission.resources.lookup(
+            for: .init(activeAgentSessionID: admission.command.identity.sessionID, worktreeBindings: admission.bindings)
+        )
+        var mappings = lookup.mappings
         try admission.requireCurrent()
         let bindings = admission.bindings
         mappings.append(contentsOf: bindings.map {

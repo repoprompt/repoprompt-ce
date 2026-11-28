@@ -142,13 +142,13 @@
     },
     "RepoPromptAgentRuntime": {
       "source_root": "Sources/RepoPromptAgentRuntime",
-      "allowed_dependencies": ["RepoPromptDomainRuntime", "RepoPromptInstrumentation"],
+      "allowed_dependencies": ["RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptInstrumentation"],
       "test_target": "RepoPromptAgentRuntimeTests",
       "app_free_tests": true
     },
     "RepoPromptAgentRuntimeTests": {
       "source_root": "Tests/RepoPromptAgentRuntimeTests",
-      "allowed_dependencies": ["RepoPromptAgentRuntime"]
+      "allowed_dependencies": ["RepoPromptAgentRuntime", "RepoPromptAIContracts", "RepoPromptDomainRuntime"]
     },
     "RepoPromptDomainRuntime": {
       "source_root": "Sources/RepoPromptDomainRuntime",

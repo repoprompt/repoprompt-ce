@@ -272,6 +272,7 @@ extension AgentModeViewModel {
         var failure: String?
         var generationItemID: UUID?
         var generationFinished = false
+        @MainActor
         func matches(_ session: TabSession) -> Bool {
             session.tabID == tabID && ObjectIdentifier(session) == sessionObjectID
                 && session.currentRestorationBindingToken == binding
@@ -291,6 +292,7 @@ extension AgentModeViewModel {
         let sessionObjectID: ObjectIdentifier
         let binding: AgentSessionRestorationBindingToken?
 
+        @MainActor
         func matches(_ session: TabSession) -> Bool {
             session.tabID == tabID && ObjectIdentifier(session) == sessionObjectID
                 && session.currentRestorationBindingToken == binding
@@ -302,63 +304,6 @@ extension AgentModeViewModel {
               mutation.phase != .preparing,
               session.currentRestorationBindingToken == mutation.writer.restoration else { return false }
         return providerSwitchPreview?.id != mutation.previewID
-    }
-
-    @MainActor
-    struct ProviderSwitchRollback {
-        let agent: AgentProviderKind
-        let model: String
-        let effort: String?
-        let claudeEffort: String?
-        let parameters: [ACPModelParameterSelection]
-        let providerID: String?
-        let cleanup: ProviderConversationCleanupHandle?
-        let codexID: String?
-        let rollout: String?
-        let codexInstructionMode: CodexThreadInstructionMode?
-        let codexModel: String?
-        let codexEffort: String?
-        let computerUseActivation: CodexComputerUseActivation?
-        // In-flight arming IDs belong to the async arming call, not rollback.
-        let context: TabSession.ProviderSwitchContextSnapshot
-        let handoff: PendingHandoffState
-
-        init(_ session: TabSession) {
-            agent = session.selectedAgent
-            model = session.selectedModelRaw
-            effort = session.selectedReasoningEffortRaw
-            claudeEffort = session.selectedClaudeEffortRaw
-            parameters = session.acpModelParameterSelections
-            providerID = session.providerSessionID
-            cleanup = session.providerCleanupHandle
-            codexID = session.codexConversationID
-            rollout = session.codexRolloutPath
-            codexInstructionMode = session.codexInstructionMode
-            codexModel = session.codexModel
-            codexEffort = session.codexReasoningEffort
-            computerUseActivation = session.pendingCodexComputerUseActivation
-            context = session.captureProviderSwitchContext()
-            handoff = session.pendingHandoff
-        }
-
-        func restore(_ session: TabSession) {
-            session.selectedAgent = agent
-            session.selectedModelRaw = model
-            session.selectedReasoningEffortRaw = effort
-            session.selectedClaudeEffortRaw = claudeEffort
-            session.acpModelParameterSelections = parameters
-            session.providerSessionID = providerID
-            session.providerCleanupHandle = cleanup
-            session.codexConversationID = codexID
-            session.codexRolloutPath = rollout
-            session.codexInstructionMode = codexInstructionMode
-            session.codexModel = codexModel
-            session.codexReasoningEffort = codexEffort
-            session.pendingCodexComputerUseActivation = computerUseActivation
-            session.restoreProviderSwitchContext(context)
-            session.pendingHandoff = handoff
-            session.isDirty = true
-        }
     }
 
     /// UI-only interception. The shared picker/MCP selection predicate deliberately stays locked.
@@ -1031,7 +976,7 @@ extension AgentModeViewModel {
               let claim = providerSwitchClaim(preview, discard: discard, allowsPendingStartWithdrawal: false), let command = claim.command else { return false }
         defer { releaseComposerSubmitClaim(claim) }
         let session = command.writer.session
-        var rollback = ProviderSwitchRollback(session)
+        var rollback = AgentSessionHandoffRuntime.ProviderSwitchRollback(session)
         let handoff = claim.scope.handoff
         guard let mutation = handoff.beginProviderSwitchMutation(command: command, previewID: preview.id) else { return false }
         providerSwitchBackgroundOutcome = nil
@@ -1069,24 +1014,16 @@ extension AgentModeViewModel {
                 && providerSwitchHasExactOwner(session)
                 && providerSwitchTransitionAdmission(session, ownsComposerClaim: true, resolvingHandoff: preview.originalHandoff).isAdmissible(forcing: forcing)
         }
-        var noticeID: UUID?
-        var phase: RequiredSavePhase = .beforeWrite
-        func presentFailure(_ message: String, matching handoff: PendingHandoffState) {
-            if requiresPresentedPreview {
-                if providerSwitchPreview?.id == id {
-                    providerSwitchPreview?.failure = message
-                } else if providerSwitchMutation?.id == mutation.id, providerSwitchPreviewIdentityIsCurrent(preview) {
-                    providerSwitchBackgroundOutcome = .init(tabID: session.tabID, sessionObjectID: ObjectIdentifier(session), binding: preview.binding)
-                }
-            } else if providerSwitchPreviewIdentityIsCurrent(preview),
-                      composerSubmitRuntime.isCurrent(claim), providerSwitchMutation?.id == mutation.id,
-                      session.pendingHandoff == handoff
-            {
-                session.appendItem(.error(message, sequenceIndex: session.nextSequenceIndex))
+        func presentFailure(_ message: String) {
+            guard requiresPresentedPreview else { return }
+            if providerSwitchPreview?.id == id {
+                providerSwitchPreview?.failure = message
+            } else if providerSwitchMutation?.id == mutation.id, providerSwitchPreviewIdentityIsCurrent(preview) {
+                providerSwitchBackgroundOutcome = .init(tabID: session.tabID, sessionObjectID: ObjectIdentifier(session), binding: preview.binding)
             }
         }
         func surfaceReviewFailure() {
-            presentFailure(AgentSessionLinkSendFailure.providerHandoverNeedsReview.message, matching: session.pendingHandoff)
+            presentFailure(AgentSessionLinkSendFailure.providerHandoverNeedsReview.message)
         }
         do {
             guard current() else { return false }
@@ -1096,6 +1033,8 @@ extension AgentModeViewModel {
             var payload = (discard || forcing) ? nil : await providerSwitchPayload(id, mode: preview.selected ?? .history)
             guard discard || payload != nil || forcing, current() else { return false }
             var cutoff = preview.cutoff
+            let change: AgentSessionHandoffRuntime.ProviderSwitchCommit
+            let message: String
             if !discard {
                 var stagedRevision: Int?
                 if forcing {
@@ -1119,7 +1058,7 @@ extension AgentModeViewModel {
                     stagedRevision = refreshed.revision
                 } else {
                     if let failure = await providerSwitchRequireIdle(session) {
-                        presentFailure(failure, matching: preview.originalHandoff)
+                        presentFailure(failure)
                         return false
                     }
                     guard current() else { return false }
@@ -1127,13 +1066,20 @@ extension AgentModeViewModel {
                 if forcing {
                     // The transcript now reflects the stop; any later refusal restores this
                     // stopped source, never the pre-stop snapshot.
-                    rollback = ProviderSwitchRollback(session)
+                    rollback = AgentSessionHandoffRuntime.ProviderSwitchRollback(session)
                 }
                 // Detached shutdown can hang on a wedged provider; bound the wait on the shared
                 // managed-stop deadline, never the mutation. The work itself is never cancelled —
                 // a slow provider still finishes retiring detached.
-                let retire = detachProviderContextForProviderSwitch(session)
-                _ = handoff.updateProviderSwitchMutation(mutation.id, phase: .detached)
+                let retirementOverride: (@MainActor (TabSession) async -> Void)?
+                #if DEBUG
+                    retirementOverride = test_providerSwitchRetirement
+                #else
+                    retirementOverride = nil
+                #endif
+                guard let retire = handoff.detachProviderForSwitch(
+                    claim: claim, mutationID: mutation.id, retirementOverride: retirementOverride
+                ) else { return false }
                 objectWillChange.send()
                 _ = await providerSwitchAwaitDeadline(.retirementTail) { await retire()
                     return true
@@ -1156,81 +1102,49 @@ extension AgentModeViewModel {
                     payload = refreshed.payload
                     cutoff = refreshed.cutoff
                 }
-                // No suspension is permitted between clearing any native family and staging context.
-                clearProviderContextForProviderSwitch(session)
-                session.selectedAgent = preview.destination
-                session.selectedModelRaw = preview.model
-                if preview.destination.usesClaudeTooling, let effort = ClaudeModelSpecifier(raw: preview.model).explicitEffortLevel {
-                    session.selectedClaudeEffortRaw = effort.rawValue
-                }
-                if preview.destination != rollback.agent || preview.model != rollback.model { session.selectedReasoningEffortRaw = nil }
+                guard let payload, let source = preview.source else { return false }
+                let parameters: AgentSessionHandoffRuntime.ProviderSwitchDestination.ParameterChange?
                 if let intent = preview.cursorParameterIntent,
                    let selections = intent.applying(to: preview.sourceParameters, model: preview.model)
                 {
-                    // The model-menu variant is intent until this synchronous Switch staging.
-                    // Use existing parameter persistence; never mutate on open or Cancel.
                     let writes: [ACPModelParameterSelection] = switch intent {
                     case let .select(selection): [selection]
                     case let .clear(identity): preview.sourceParameters.filter { $0.identity == identity }
                     }
-                    session.recordAcceptedACPModelParameterWrite(writes)
-                    session.acpModelParameterSelections = selections
+                    parameters = .init(writes: writes, selections: selections)
+                } else {
+                    parameters = nil
                 }
-                session.pendingHandoff = .init(
-                    payload: payload,
-                    createdAt: Date(),
-                    sourceItemID: cutoff,
-                    providerSwitchDelivery: .ready
-                )
-                linkExecutionRuntime.agentSessionLinkReoweSupplementForRebuiltProviderContext(for: session)
-            } else { session.pendingHandoff.clearAfterSend() }
-            let text: String
-            if discard { text = "Pending handover discarded; chat history unchanged." }
-            else {
-                guard let source = preview.source else { return false }
-                text = "Provider changed from \(source.provider) / \(source.model) to \(preview.destination.displayName) / \(inputBarModelDisplayName(rawModel: preview.model, agentKind: preview.destination)); handover: \(preview.chosen?.label ?? "Full history")."
+                change = .replace(.init(
+                    agent: preview.destination, model: preview.model,
+                    payload: payload, cutoff: cutoff, parameters: parameters
+                ))
+                let destination = inputBarModelDisplayName(rawModel: preview.model, agentKind: preview.destination)
+                message = "Provider changed from \(source.provider) / \(source.model) to \(preview.destination.displayName) / \(destination); handover: \(preview.chosen?.label ?? "Full history")."
+            } else {
+                change = .discard
+                message = "Pending handover discarded; chat history unchanged."
             }
-            let notice = AgentChatItem.system(
-                text,
-                sequenceIndex: session.nextSequenceIndex,
-                recoveryDiagnostic: .init(reason: "providerSwitch", outcome: discard ? "discarded" : "applied", text: text)
-            )
-            noticeID = notice.id
-            session.appendItem(notice)
-            session.isDirty = true
-            _ = handoff.updateProviderSwitchMutation(mutation.id, phase: .staged)
-            updateBindingsFromSession(session)
-            let staged = session.pendingHandoff
+            let beforeSave: (@MainActor (TabSession) -> Void)?
             #if DEBUG
-                test_providerSwitchBeforeSave?(session)
+                beforeSave = test_providerSwitchBeforeSave
+            #else
+                beforeSave = nil
             #endif
-            let result = await claim.scope.persistence.flushSaveRequired(writer: command.writer, observingSavePhase: { phase = $0 })
-            guard case .success = result else {
-                if phase == .beforeWrite, sessions[session.tabID] === session,
-                   session.currentRestorationBindingToken == preview.binding, composerSubmitRuntime.isCurrent(claim),
-                   session.pendingHandoff == staged
-                {
-                    rollback.restore(session)
-                    if let index = session.items.firstIndex(where: { $0.id == noticeID }) { _ = session.removeItem(at: index) }
-                    for t in session.transcript.turns.indices {
-                        for s in session.transcript.turns[t].responseSpans.indices {
-                            session.transcript.turns[t].responseSpans[s].activities.removeAll { $0.id == noticeID }
-                        }
-                        session.transcript.turns[t].summary?.recoveryDiagnostics?.removeAll { $0.id == noticeID }
-                    }
-                    refreshDerivedTranscriptState(for: session)
-                }
-                if case let .failure(failure) = result {
-                    presentFailure(failure.message, matching: phase == .beforeWrite ? rollback.handoff : staged)
-                }
-                updateBindingsFromSession(session)
+            let result = await handoff.commitProviderSwitch(
+                change, claim: claim, mutationID: mutation.id,
+                rollback: rollback, message: message, reportFailureInTranscript: !requiresPresentedPreview, beforeSave: beforeSave
+            )
+            switch result {
+            case .applied:
+                if providerSwitchPreview?.matches(session) == true, providerSwitchPreview?.binding == preview.binding { providerSwitchPreview = nil }
+                return true
+            case .refused:
+                return false
+            case let .failed(message):
+                presentFailure(message)
                 return false
             }
-            guard sessions[session.tabID] === session, session.currentRestorationBindingToken == preview.binding,
-                  composerSubmitRuntime.isCurrent(claim), session.pendingHandoff == staged else { return false }
-            if providerSwitchPreview?.matches(session) == true, providerSwitchPreview?.binding == preview.binding { providerSwitchPreview = nil }
-            updateBindingsFromSession(session)
-            return true
         }
     }
 }

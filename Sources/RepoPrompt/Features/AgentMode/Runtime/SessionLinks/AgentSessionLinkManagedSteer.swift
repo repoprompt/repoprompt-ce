@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentRuntime
 import RepoPromptDomainRuntime
 
 // Value model for one managed cross-session `steer`: the provider route it was classified onto
@@ -16,17 +17,7 @@ import RepoPromptDomainRuntime
 /// Deliberately short. An idle target is not a route: it goes through the durable send transaction.
 /// The ACP route is a managed-aware serialized queue; only local draft text is recoverable into
 /// the target user's composer.
-enum AgentSessionLinkManagedSteerRoute: Equatable {
-    /// Codex native steer, or its durable fallback queue. The outcome comes from the steer
-    /// acknowledgement tracker.
-    case codex
-    /// The target is waiting for its next instruction; the steer is that instruction.
-    case waitingInstruction
-    /// The Claude-native interrupt-steering queue.
-    case claudeInterrupt
-    /// The serialized ACP interrupt, settle, and prompt queue.
-    case acpQueued
-}
+typealias AgentSessionLinkManagedSteerRoute = AgentSessionInputRouting.ManagedSteerRoute
 
 /// Provider-level outcome of one managed steer after its attributed row was appended.
 enum AgentSessionLinkManagedSteerOutcome: Equatable {

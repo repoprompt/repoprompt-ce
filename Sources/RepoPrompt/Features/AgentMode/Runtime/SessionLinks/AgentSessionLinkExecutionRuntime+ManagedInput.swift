@@ -1,20 +1,24 @@
 import Foundation
+import RepoPromptAgentRuntime
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 
 extension AgentSessionLinkExecutionRuntime {
+    func inputRouting(for session: AgentTabSession, hasImages: Bool) -> AgentSessionInputRouting {
+        .init(
+            provider: session.selectedAgent, state: session.runState,
+            hasContinuation: session.instructionContinuation != nil, hasImages: hasImages,
+            hasApproval: session.pendingApproval != nil,
+            acpPromptAvailable: session.pendingAskUser == nil
+                && session.pendingUserInputRequest == nil && session.pendingPermissionsRequest == nil
+                && session.runID != nil && session.activeRunAttemptID != nil && session.acpController != nil
+        )
+    }
+
     /// Managed input deliberately has no draft, attachment, interview or local workflow access.
-    func agentSessionLinkManagedSteerRoute(for session: TabSession) -> AgentSessionLinkManagedSteerRoute? {
-        if session.runState == .waitingForUser, session.instructionContinuation != nil { return .waitingInstruction }
-        guard session.runState.isActive else { return nil }
-        if session.selectedAgent == .codexExec { return .codex }
-        guard session.runState == .running, session.pendingApproval == nil else { return nil }
-        if session.selectedAgent.acpProviderID != nil,
-           session.pendingAskUser == nil, session.pendingUserInputRequest == nil,
-           session.pendingPermissionsRequest == nil, session.runID != nil,
-           session.activeRunAttemptID != nil, session.acpController != nil { return .acpQueued }
-        return session.selectedAgent.usesClaudeNativeRuntime ? .claudeInterrupt : nil
+    func agentSessionLinkManagedSteerRoute(for session: AgentTabSession) -> AgentSessionLinkManagedSteerRoute? {
+        inputRouting(for: session, hasImages: false).managedSteering
     }
 
     @discardableResult

@@ -263,13 +263,13 @@ let package = Package(
         ),
         .target(
             name: "RepoPromptAgentRuntime",
-            dependencies: ["RepoPromptDomainRuntime", "RepoPromptInstrumentation"],
+            dependencies: ["RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptInstrumentation"],
             path: "Sources/RepoPromptAgentRuntime",
             swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
         ),
         .testTarget(
             name: "RepoPromptAgentRuntimeTests",
-            dependencies: ["RepoPromptAgentRuntime"],
+            dependencies: ["RepoPromptAgentRuntime", "RepoPromptAIContracts", "RepoPromptDomainRuntime"],
             path: "Tests/RepoPromptAgentRuntimeTests"
         ),
         .target(
