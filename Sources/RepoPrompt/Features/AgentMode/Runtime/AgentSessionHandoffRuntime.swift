@@ -112,7 +112,91 @@ final class AgentSessionHandoffRuntime {
 
     private var summaryBySessionID: [UUID: SummaryGeneration] = [:]
 
-    func registerProviderSwitchSummary(
+    struct ProviderSwitchSummaryRequest {
+        let rowID: UUID
+        let destination: AgentProviderKind
+        let model: String
+        let wordLimit: Int
+        let stopFence: AgentRunStartStopFence
+    }
+
+    enum ProviderSwitchSummaryStart {
+        case started
+        case refused
+        case failed(String)
+    }
+
+    /// Generate through the exact source writer. The request row, startup save and provider
+    /// launch belong to this runtime even if the originating sheet is dismissed.
+    func generateProviderSwitchSummary(
+        _ request: ProviderSwitchSummaryRequest, command: AgentSessionRuntimeStore.Command,
+        existingClaim: AgentSessionComposerSubmitClaim? = nil,
+        testGenerate: (@MainActor (AgentTabSession, UUID, String) async -> Void)? = nil,
+        testStart: (@MainActor (AgentTabSession, String, AgentRunStartOutcomeRecorder) async -> Void)? = nil
+    ) async -> ProviderSwitchSummaryStart {
+        guard let owner = scope, command.writer.scope === owner, command.isCurrent,
+              let links = owner.linkExecution,
+              let text = AgentProviderHandover.summaryRequest(wordLimit: request.wordLimit)
+        else { return .refused }
+        let session = command.writer.session
+        let claim: AgentSessionComposerSubmitClaim
+        if let existingClaim {
+            guard owner.submissions.isCurrent(existingClaim), existingClaim.command?.identity == command.identity
+            else { return .refused }
+            claim = existingClaim
+        } else {
+            guard let target = owner.submissions.programmaticTarget(command),
+                  case let .claimed(admitted) = owner.submissions.claim(
+                      .init(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: ""),
+                      command: command, allowsPendingStartWithdrawal: false
+                  ) else { return .refused }
+            claim = admitted
+        }
+        defer { if existingClaim == nil { owner.submissions.release(claim) } }
+        guard request.stopFence.permitsStart(of: session), !session.items.contains(where: { $0.id == request.rowID }),
+              registerProviderSwitchSummary(
+                  command: command, rowID: request.rowID, destination: request.destination, model: request.model
+              )
+        else { return .refused }
+        let row = AgentChatItem(id: request.rowID, kind: .user, text: text, sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(row)
+        session.isDirty = true
+        let work = links.retainInputEffect(session: session, owner: owner) { [self] () -> ProviderSwitchSummaryStart in
+            guard case .success = await owner.persistence.flushSaveRequired(writer: command.writer),
+                  command.isCurrent, request.stopFence.permitsStart(of: session),
+                  providerSwitchSummary(for: session)?.requestRowID == request.rowID
+            else {
+                let message = AgentSessionLinkSendFailure.persistenceIndeterminate.message
+                failProviderSwitchSummary(session, rowID: request.rowID, message: message)
+                return .failed(message)
+            }
+            if let testGenerate {
+                await testGenerate(session, request.rowID, text)
+                settleProviderSwitchSummary(session)
+                return .started
+            }
+            let recorder = AgentRunStartOutcomeRecorder()
+            if let testStart {
+                await testStart(session, text, recorder)
+            } else {
+                _ = await links.startAgentRun(
+                    command: command, initialMessage: text,
+                    directStartOptions: .init(ignoresPendingHandoff: true, stopFence: request.stopFence, initialUserItemID: request.rowID),
+                    startOutcome: recorder, providerSwitchPreparation: nil
+                )
+            }
+            guard recorder.outcome.didStart else {
+                let message = AgentSessionLinkSendFailure.targetNotIdle.message
+                failProviderSwitchSummary(session, rowID: request.rowID, message: message)
+                return .failed(message)
+            }
+            session.clearAgentSessionLinkWaitingOnAfterAcceptedTurn()
+            return .started
+        }
+        return await work.value
+    }
+
+    private func registerProviderSwitchSummary(
         command: AgentSessionRuntimeStore.Command, rowID: UUID, destination: AgentProviderKind, model: String
     ) -> Bool {
         guard command.writer.scope === scope, command.isCurrent,
@@ -135,7 +219,7 @@ final class AgentSessionHandoffRuntime {
         )
     }
 
-    func failProviderSwitchSummary(_ session: AgentTabSession, rowID: UUID, message: String) {
+    private func failProviderSwitchSummary(_ session: AgentTabSession, rowID: UUID, message: String) {
         guard let generation = currentSummaryGeneration(for: session), generation.rowID == rowID,
               generation.outcome == nil else { return }
         recordProviderSwitchSummary(.unavailable(message), generation: generation, session: session)

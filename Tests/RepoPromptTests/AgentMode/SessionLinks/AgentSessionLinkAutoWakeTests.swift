@@ -661,26 +661,20 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         provider.environment["ACP_ASSISTANT_TEXT_ON_PROMPT"] = reply
         provider.usesDefaultNormalizer = true
         let command = try host.scope.admit(session: session)
-        let request = try XCTUnwrap(AgentProviderHandover.summaryRequest(wordLimit: 100))
-        let row = AgentChatItem.user(request, sequenceIndex: session.nextSequenceIndex)
         XCTAssertFalse(host.scope.presentation.hasPresenter(for: session))
-        XCTAssertTrue(host.scope.handoff.registerProviderSwitchSummary(
-            command: command, rowID: row.id, destination: .codexExec, model: "destination-model"
-        ))
-        session.appendItem(row)
-        session.isDirty = true
-        try await host.scope.persistence.flushSaveRequired(writer: command.writer).get()
-        let outcome = AgentRunStartOutcomeRecorder()
-        _ = await fixture.runtime.startAgentRun(
-            command: command, initialMessage: request,
-            directStartOptions: .init(ignoresPendingHandoff: true, initialUserItemID: row.id),
-            startOutcome: outcome, providerSwitchPreparation: nil
+        let result = await host.scope.handoff.generateProviderSwitchSummary(
+            .init(
+                rowID: UUID(), destination: .codexExec, model: "destination-model",
+                wordLimit: 100, stopFence: AgentRunStartStopFence(session: session)
+            ), command: command
         )
-        guard outcome.outcome.didStart else { return XCTFail("The original host must start the summary") }
+        guard case .started = result else { return XCTFail("The original host must start the summary") }
+        let producer = try XCTUnwrap(session.agentTask)
         try await routeScriptedHostProvider(session)
-        await session.agentTask?.value
+        await producer.value
         guard case let .generated(text, revision)? = host.scope.handoff.providerSwitchSummary(for: session)?.outcome else {
-            return XCTFail("The canonical terminal event must settle Summary without a sheet")
+            let summary = host.scope.handoff.providerSwitchSummary(for: session)
+            return XCTFail("Expected terminal Summary without a sheet. Outcome: \(String(describing: summary?.outcome)). Run: \(session.runState). Turns: \(session.transcript.turns.count).")
         }
         XCTAssertEqual(text, reply)
         XCTAssertEqual(revision, session.sourceItemsRevision)

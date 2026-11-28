@@ -814,7 +814,7 @@ extension AgentModeViewModel {
     /// attachments, never claims local authorship, and never applies or queues a provider switch.
     func generateProviderSwitchHandover(_ id: UUID) async {
         guard let preview = providerSwitchPreview, preview.id == id, !preview.isReview,
-              let words = preview.wordLimit, let request = AgentProviderHandover.summaryRequest(wordLimit: words),
+              let words = preview.wordLimit,
               providerSwitchPreviewBlocker(preview) == nil, let claim = providerSwitchClaim(preview) else { return }
         defer { releaseComposerSubmitClaim(claim) }
         guard let session = providerSwitchSession(for: preview) else { return }
@@ -826,55 +826,36 @@ extension AgentModeViewModel {
         }
         guard providerSwitchPreview?.id == id, providerSwitchPreviewIsCurrent(preview), composerSubmitRuntime.isCurrent(claim),
               providerSwitchTransitionBlocker(session, ownsComposerClaim: true) == nil,
-              let command = claim.command, let links = claim.scope.linkExecution else { return }
-        let handoff = claim.scope.handoff
-        // Register on the exact writer before appending the provider-facing request.
-        let row = AgentChatItem.user(request, sequenceIndex: session.nextSequenceIndex)
-        guard handoff.registerProviderSwitchSummary(command: command, rowID: row.id, destination: preview.destination, model: preview.model)
-        else { return }
-        providerSwitchPreview?.generationItemID = row.id
-        providerSwitchPreview?.selected = .summary
-        session.appendItem(row)
-        session.isDirty = true
-        guard case .success = await claim.scope.persistence.flushSaveRequired(writer: command.writer),
-              command.isCurrent, preview.stopFence.permitsStart(of: session),
-              handoff.providerSwitchSummary(for: session)?.requestRowID == row.id
-        else {
-            let message = AgentSessionLinkSendFailure.persistenceIndeterminate.message
-            handoff.failProviderSwitchSummary(session, rowID: row.id, message: message)
-            if providerSwitchPreview?.id == id {
-                providerSwitchPreview?.generationItemID = nil
-                if let index = providerSwitchPreview?.choices.firstIndex(where: { $0.mode == .summary }) {
-                    providerSwitchPreview?.choices[index].unavailable = message
-                }
-            }
-            return
-        }
+              let command = claim.command else { return }
+        let rowID = UUID()
+        let testGenerate: (@MainActor (TabSession, UUID, String) async -> Void)?
+        let testStart: (@MainActor (TabSession, String, AgentRunStartOutcomeRecorder) async -> Void)?
         #if DEBUG
-            if let test_providerSwitchGeneration {
-                await test_providerSwitchGeneration(session, row.id, request)
-                handoff.settleProviderSwitchSummary(session)
-                return
-            }
-        #endif
-        let outcome = AgentRunStartOutcomeRecorder()
-        #if DEBUG
-            if let test_providerSwitchGenerationStart {
-                await test_providerSwitchGenerationStart(session, request, outcome)
-            } else {
-                _ = await links.startAgentRun(command: command, initialMessage: request, directStartOptions: .init(ignoresPendingHandoff: true, stopFence: preview.stopFence, initialUserItemID: row.id), startOutcome: outcome, providerSwitchPreparation: nil)
-            }
+            testGenerate = test_providerSwitchGeneration
+            testStart = test_providerSwitchGenerationStart
         #else
-            _ = await links.startAgentRun(command: command, initialMessage: request, directStartOptions: .init(ignoresPendingHandoff: true, stopFence: preview.stopFence, initialUserItemID: row.id), startOutcome: outcome, providerSwitchPreparation: nil)
+            testGenerate = nil
+            testStart = nil
         #endif
-        if !outcome.outcome.didStart {
-            handoff.failProviderSwitchSummary(session, rowID: row.id, message: AgentSessionLinkSendFailure.targetNotIdle.message)
-            guard providerSwitchPreview?.id == id, providerSwitchPreview?.generationItemID == row.id else { return }
+        providerSwitchPreview?.generationItemID = rowID
+        providerSwitchPreview?.selected = .summary
+        let result = await claim.scope.handoff.generateProviderSwitchSummary(
+            .init(rowID: rowID, destination: preview.destination, model: preview.model, wordLimit: words, stopFence: preview.stopFence),
+            command: command, existingClaim: claim, testGenerate: testGenerate, testStart: testStart
+        )
+        guard providerSwitchPreview?.id == id, providerSwitchPreview?.generationItemID == rowID else { return }
+        switch result {
+        case .started:
+            return
+        case .refused:
+            providerSwitchPreview?.generationItemID = nil
+            providerSwitchPreview?.selected = preview.selected
+        case let .failed(message):
             providerSwitchPreview?.generationItemID = nil
             if let index = providerSwitchPreview?.choices.firstIndex(where: { $0.mode == .summary }) {
-                providerSwitchPreview?.choices[index].unavailable = AgentSessionLinkSendFailure.targetNotIdle.message
+                providerSwitchPreview?.choices[index].unavailable = message
             }
-        } else { session.clearAgentSessionLinkWaitingOnAfterAcceptedTurn() }
+        }
     }
 
     func providerSwitchGenerationSettled(_ session: TabSession) {
