@@ -11,7 +11,6 @@ enum RemoteGatewaySecurityError: LocalizedError {
     case endpointBindingInvalid
     case unsupportedProtocol(Int)
     case deviceCredentialUnavailable
-    case confirmationRequired
     case attemptUnavailable
     case confirmationRejected
     case pairingInProgress
@@ -25,7 +24,6 @@ enum RemoteGatewaySecurityError: LocalizedError {
         case .pairingSecretInvalid, .attemptUnavailable: "pairing_unavailable"
         case .endpointBindingInvalid: "endpoint_mismatch"
         case .unsupportedProtocol: "unsupported_protocol_version"
-        case .confirmationRequired: "pairing_upgrade_required"
         case .confirmationRejected: "pairing_confirmation_rejected"
         case .pairingInProgress: "pairing_in_progress"
         case .alreadyPaired: "already_paired"
@@ -50,8 +48,6 @@ enum RemoteGatewaySecurityError: LocalizedError {
             "The pairing request uses unsupported protocol version \(version)."
         case .deviceCredentialUnavailable:
             "No paired device credential is available."
-        case .confirmationRequired:
-            "Update RepoPrompt Remote on your phone to use confirmed pairing."
         case .attemptUnavailable:
             "This pairing attempt is no longer available. Generate a new code on your Mac."
         case .confirmationRejected:
@@ -418,16 +414,13 @@ final class RemotePairingManager {
         if let storageError {
             throw storageError
         }
-        guard let attemptID = request.attemptID else {
-            throw RemoteGatewaySecurityError.confirmationRequired
-        }
         guard !isPaired else { throw RemoteGatewaySecurityError.alreadyPaired }
         guard request.oneTimeSecret.utf8.count <= 256 else {
             throw RemoteGatewaySecurityError.pairingSecretInvalid
         }
         let digest = Data(SHA256.hash(data: Data(request.oneTimeSecret.utf8)))
         if let pending = storedState.pending {
-            guard pending.attemptID == attemptID,
+            guard pending.attemptID == request.attemptID,
                   pending.serverEndpointID == serverEndpointID,
                   pending.credential.irohPeerEndpointID == authenticatedPeerEndpointID,
                   RemoteConstantTimeComparison.equals(digest, pending.secretDigest)
@@ -440,8 +433,17 @@ final class RemotePairingManager {
         let credential = try createCredential(
             deviceName: request.deviceName,
             irohPeerEndpointID: authenticatedPeerEndpointID,
-            attemptID: attemptID
+            attemptID: request.attemptID
         )
+        guard let attemptID = request.attemptID else {
+            // A legacy phone can redeem only a fresh QR; it cannot replace a staged or active pairing.
+            try activate(credential)
+            return RemoteIrohPairingResponse(
+                pairingResponse: pairingResponse(for: credential, desktop: desktop),
+                serverEndpointID: serverEndpointID,
+                clientEndpointID: authenticatedPeerEndpointID
+            )
+        }
         let pending = RemotePendingPairing(
             attemptID: attemptID,
             secretDigest: digest,
@@ -488,10 +490,14 @@ final class RemotePairingManager {
             throw RemoteGatewaySecurityError.confirmationRejected
         }
         guard now() < pending.expiresAt else { throw RemoteGatewaySecurityError.pairingSecretExpired }
-        try save(.init(active: pending.credential))
+        try activate(pending.credential)
+        return true
+    }
+
+    private func activate(_ credential: RemoteStoredDeviceCredential) throws {
+        try save(.init(active: credential))
         notificationRegistration = nil
         try? RemoteGatewayKeychain.shared.remove(.remoteNotificationRegistration)
-        return true
     }
 
     func isAuthorizedIroh(
@@ -590,7 +596,7 @@ final class RemotePairingManager {
     private func createCredential(
         deviceName: String,
         irohPeerEndpointID: String,
-        attemptID: UUID
+        attemptID: UUID?
     ) throws -> RemoteStoredDeviceCredential {
         let trimmedName = deviceName.trimmingCharacters(in: .whitespacesAndNewlines)
         let boundedName = String(trimmedName.prefix(Self.maximumDeviceNameCharacters))

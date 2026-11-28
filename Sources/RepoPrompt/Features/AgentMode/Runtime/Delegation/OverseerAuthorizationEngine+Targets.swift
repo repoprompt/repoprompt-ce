@@ -82,10 +82,24 @@ extension OverseerAuthorizationEngine {
         }
     }
 
+    /// The lane admission decision, including whether full access waived the creator quota.
+    struct LaneAdmissionDecision: Equatable {
+        let admitted: Bool
+        let quotaWaived: Bool
+    }
+
     /// One more lane for a creator that already has `admittedLaneCount` (`creatorLaneQuota`, waived by
     /// full access). The in-flight lane-task bound in the bridge is operational capacity and stays.
+    func laneAdmissionDecision(admittedLaneCount: Int) -> LaneAdmissionDecision {
+        let quotaWaived = waives(.creatorLaneQuota)
+        return LaneAdmissionDecision(
+            admitted: quotaWaived || admittedLaneCount < AgentSessionLanePolicy.agentSessionLaneMaximumCount,
+            quotaWaived: quotaWaived
+        )
+    }
+
     func admitsAdditionalLane(admittedLaneCount: Int) -> Bool {
-        waives(.creatorLaneQuota) || admittedLaneCount < AgentSessionLanePolicy.agentSessionLaneMaximumCount
+        laneAdmissionDecision(admittedLaneCount: admittedLaneCount).admitted
     }
 
     /// A linked-basis lane creator must still hold an active link, unless full access waives it.

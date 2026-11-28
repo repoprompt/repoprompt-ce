@@ -19,6 +19,9 @@ extension AgentSessionRuntimeStore.Scope {
         for observer in settlementObservers.values {
             observer.yield(())
         }
+        if let activation = executableHost?.workspaceActivation, activation.savedCarrierSessionID == nil {
+            persistence.retainDetachedFinalSaveFailureIfReady()
+        }
     }
 
     /// Synchronous MainActor half of settlement. Provider actor/domain-registration probes stay

@@ -832,15 +832,31 @@ import XCTest
             }
             defer { manager.setAgentAdmissionCanonicalSnapshotHandlerForTesting(nil) }
             let recorder = AdmissionProviderRecorder(expectedCount: 1, blockProviders: false)
+            var admissionFinished = false
             let task = Task { @MainActor in
-                try await self.makeAgentRunStartService(window: fixture.window, recorder: recorder).execute(args: [
+                defer { admissionFinished = true }
+                return try await self.makeAgentRunStartService(window: fixture.window, recorder: recorder).execute(args: [
                     "op": .string("start"),
                     "message": .string("cancelled while reading authority"),
                     "detach": .bool(true),
                     "timeout": .int(0)
                 ])
             }
-            await gate.waitUntilEntered()
+            do {
+                try await waitUntil("canonical read hook or early admission exit") {
+                    if admissionFinished { return true }
+                    return await gate.hasEntered()
+                }
+            } catch {
+                task.cancel()
+                await gate.open()
+                throw error
+            }
+            guard await gate.hasEntered() else {
+                _ = try await task.value
+                XCTFail("Admission returned before the canonical read hook.")
+                return
+            }
             task.cancel()
             await gate.open()
             do {
@@ -1368,6 +1384,7 @@ import XCTest
             let initialWorkspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
             let initialTabs = initialWorkspace.composeTabs
             let initialTabIDs = Set(initialTabs.map(\.id))
+            let foregroundDraft = "Keep this foreground draft while the provisional child is rejected"
             let provisionalIdentity = ProvisionalAdmissionIdentityRecorder()
             let beforeSaveToken = fixture.window.workspaceManager.addBeforeSaveListener { workspace in
                 guard workspace.id == workspaceID,
@@ -1375,6 +1392,9 @@ import XCTest
                           !initialTabIDs.contains($0.id) && $0.activeAgentSessionID != nil
                       }), let sessionID = tab.activeAgentSessionID
                 else { return }
+                if provisionalIdentity.value() == nil {
+                    fixture.window.promptManager.promptText = foregroundDraft
+                }
                 provisionalIdentity.record(.init(tabID: tab.id, sessionID: sessionID))
             }
             let providerRecorder = AdmissionProviderRecorder(
@@ -1451,6 +1471,8 @@ import XCTest
                 )
             )
 
+            XCTAssertEqual(projectedWorkspace.composeTabs.first?.promptText, foregroundDraft)
+            await fixture.window.workspaceManager.debugAwaitWorkingDocumentCommitToDomainAuthority(workspaceID: workspaceID)
             let canonicalSnapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(workspaceID)
             let canonical = try XCTUnwrap(canonicalSnapshot)
             let canonicalWorkspace = try JSONDecoder().decode(
@@ -2442,6 +2464,11 @@ import XCTest
         // Admission begins only once that setup and its badge publication have finished.
         await window.workspaceManager.waitUntilPostSwitchGitDataLoadComplete()
         let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        let vm = window.agentModeViewModel
+        let adopted = await vm.awaitWorkspaceRuntimeAdoption(expectedWorkspaceID: workspace.id)
+        guard adopted else {
+            throw AdmissionTestError.fixtureSetup("durable workspace did not adopt its Agent host: current=\(String(describing: vm.runtimeHost.workspaceActivation?.key.owner.workspaceID)) expected=\(workspace.id) awaiting=\(vm.isAwaitingWorkspaceAdoption) inFlight=\(vm.workspaceSwitchInFlight) sessions=\(vm.sessions.count)")
+        }
         window.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: true)
         // The reload schedules or coalesces the dirty-badge callback synchronously.
         // FIFO ordering joins that specific callback before the fixture is returned.
@@ -2643,6 +2670,7 @@ import XCTest
         }
 
         private static func close(_ window: WindowState) async {
+            await window.agentModeViewModel.test_retireAndCancelFixture()
             window.beginClose()
             await window.tearDown()
             WindowStatesManager.shared.unregisterWindowState(window)
@@ -2755,6 +2783,7 @@ import XCTest
                     workspaceFileURL: workspaceFileURL
                 )
             } catch {
+                await window.agentModeViewModel.test_retireAndCancelFixture()
                 window.beginClose()
                 await window.tearDown()
                 WindowStatesManager.shared.unregisterWindowState(window)
@@ -2834,11 +2863,13 @@ import XCTest
             guard !isClosed else { return }
             isClosed = true
             for peer in peerWindows.reversed() {
+                await peer.agentModeViewModel.test_retireAndCancelFixture()
                 peer.beginClose()
                 await peer.tearDown()
                 WindowStatesManager.shared.unregisterWindowState(peer)
             }
             peerWindows.removeAll()
+            await window.agentModeViewModel.test_retireAndCancelFixture()
             window.beginClose()
             await window.tearDown()
             WindowStatesManager.shared.unregisterWindowState(window)
@@ -3057,6 +3088,10 @@ import XCTest
             await withCheckedContinuation { continuation in
                 releaseWaiters.append(continuation)
             }
+        }
+
+        func hasEntered() -> Bool {
+            entered
         }
 
         func waitUntilEntered() async {

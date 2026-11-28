@@ -59,9 +59,15 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
         for window in windows {
             let result = await window.workspaceManager.switchWorkspace(to: workspace, saveState: false)
             XCTAssertTrue(result.didSwitch)
+            let adopted = await window.agentModeViewModel.awaitWorkspaceRuntimeAdoption(expectedWorkspaceID: workspace.id)
+            _ = try XCTUnwrap(adopted ? window.agentModeViewModel.runtimeHost.workspaceActivation : nil)
         }
         let registry = OracleBackgroundInvocationRegistry.shared
-        let owners = windows.map { _ in OracleBackgroundInvocationRegistry.Owner(workspaceID: workspace.id, binding: .init(tabID: UUID(), sessionID: UUID())) }
+        let owners = windows.map { _ in
+            OracleBackgroundInvocationRegistry.Owner(
+                workspaceID: workspace.id, binding: .init(tabID: UUID(), sessionID: UUID(), workspaceID: workspace.id)
+            )
+        }
         let cleanupStarted = expectation(description: "both workers begin cleanup before workspace deletion")
         cleanupStarted.expectedFulfillmentCount = 2
         let cleanupGate = OracleFoundationGate()
@@ -72,8 +78,10 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
         for (window, owner) in zip(windows, owners) {
             let session = AgentTabSession(tabID: owner.binding.tabID)
             session.installPersistentSessionBinding(owner.binding)
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
             session.oracleBackgroundOwner = owner
             window.agentModeViewModel.test_installLiveSession(session)
+            _ = try window.agentModeViewModel.runtimeHost.scope.admit(session: session)
             await AgentModeWorkspaceSwitchSessionProvider(agentModeViewModel: window.agentModeViewModel)
                 .cancelSwitchSessions(for: WorkspaceDeletionCancellationToken(workspaceID: UUID()))
             XCTAssertFalse(registry.admissionIsClosed(for: owner), "A deletion token for another workspace must not close this window's owner")

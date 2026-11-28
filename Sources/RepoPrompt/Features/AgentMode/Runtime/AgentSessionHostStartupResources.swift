@@ -57,14 +57,20 @@ final class AgentSessionHostStartupResources {
             capturedActivation = activations.latestSessionIndexOwner
         }
         guard !lease.isReleased, !settings.isReleased,
-              let activation = capturedActivation, activation.workspaceID == workspaceID,
-              lease.snapshot.contexts.contains(where: { $0.metadata.identity == context && $0.health != .removed })
+              let activation = capturedActivation, activation.workspaceID == workspaceID
         else { throw AgentHostWorkspaceResources.Failure.contextUnavailable }
         // Decode the exact canonical bytes, not the currently selected tab or a later projection.
-        let document = try JSONDecoder().decode(WorkspaceModel.self, from: lease.snapshot.document.documentBytes)
-        let tabs = document.composeTabs.filter { $0.id == session.tabID }
-        guard document.id == workspaceID, tabs.count == 1, let tab = tabs.first else {
-            throw AgentHostWorkspaceResources.Failure.contextUnavailable
+        let tab: ComposeTabState
+        if let hostActivation {
+            guard let carrier = hostActivation.executionTab(in: lease.snapshot, command: origin) else {
+                throw AgentHostWorkspaceResources.Failure.contextUnavailable
+            }
+            tab = carrier
+        } else {
+            guard let carrier = lease.snapshot.contexts.first(where: { $0.metadata.identity == context && $0.health != .removed }) else {
+                throw AgentHostWorkspaceResources.Failure.contextUnavailable
+            }
+            tab = try JSONDecoder().decode(ComposeTabState.self, from: carrier.metadata.documentBytes)
         }
         carrierSessionID = tab.activeAgentSessionID
         self.lease = lease

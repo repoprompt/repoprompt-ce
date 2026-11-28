@@ -169,7 +169,7 @@ extension AgentComposerActions {
                 isCurrent() && agentModeVM.canMutateCursorComposerModel(expectedSession: cursorSession, expectedTabID: tabID)
             },
             setAutoEditEnabled: { enabled in guard isCurrent() else { return }
-                if active { agentModeVM.setAutoEditEnabled(enabled) } else if let session = exactSession { _ = agentModeVM.runtimeSessionStore.interactions(routeID: windowID, approvalStore: agentModeVM.applyEditsApprovalStore).setAutoEditEnabled(enabled, for: session) }
+                if active { agentModeVM.setAutoEditEnabled(enabled) } else if let session = exactSession { _ = agentModeVM.interactionRuntime.setAutoEditEnabled(enabled, for: session) }
             },
             setProviderPermissionLevel: { id in guard isCurrent() else { return }
                 agentModeVM.setProviderPermissionLevel(id)

@@ -8243,7 +8243,9 @@ package actor WorkspaceFileContextStore {
     }
 
     package func primaryRootReadinessObservation(orderedPaths: [String]) -> WorkspacePrimaryRootReadinessObservation {
-        let primaryRoots = rootStatesByID.values.filter { $0.root.kind == .primaryWorkspace }.map {
+        let primaryRoots = rootStatesByID.values.filter {
+            $0.root.kind == .primaryWorkspace && !isDetachedRetainedRoot($0.root.id)
+        }.map {
             WorkspaceRootRef(id: $0.root.id, name: $0.root.name, fullPath: $0.root.fullPath)
         }
         var requested: [WorkspaceRootRef] = []
@@ -8260,7 +8262,9 @@ package actor WorkspaceFileContextStore {
                 continue
             }
             let ref = WorkspaceRootRef(id: id, name: root.name, fullPath: root.fullPath)
-            guard case .valid = WorkspaceLookupRootSelectorValidator.validate(canonicalRoots: [ref], physicalRoots: []) else {
+            guard !isDetachedRetainedRoot(id),
+                  case .valid = WorkspaceLookupRootSelectorValidator.validate(canonicalRoots: [ref], physicalRoots: [])
+            else {
                 missing.append(path)
                 continue
             }
@@ -12039,6 +12043,81 @@ package actor WorkspaceFileContextStore {
         }
     }
 
+    /// Non-presentation primary-root join/load for independent Agent host retention.
+    /// Enforces `.primaryWorkspace` kind isolation fail-closed, joins already-loaded or in-flight
+    /// primary roots without reattaching detached presentations (`deferredRootUnloads` stays intact),
+    /// and loads absent roots using the caller's authoritative file-system settings.
+    @discardableResult
+    package func loadOrJoinPrimaryRoot(
+        path: String,
+        fileSystemSettings: FileSystemSettingsSnapshot,
+        cancelUnderlyingLoadOnCallerCancellation: Bool = false
+    ) async throws -> WorkspaceRootRecord {
+        guard let canonicalPath = StandardizedPath.canonicalWorkspaceRootPath(path) else {
+            throw WorkspaceFileContextStoreError.catalogMaterializationFailed("Invalid configured workspace root path.")
+        }
+        let standardizedPath = (canonicalPath as NSString).standardizingPath
+        try Task.checkCancellation()
+        try await waitForRootUnloadIfNeeded(standardizedPath: standardizedPath)
+        try Task.checkCancellation()
+        try await waitForPendingSeededRootVisibilityIfNeeded(
+            standardizedPath: standardizedPath,
+            bypassToken: nil
+        )
+        try Task.checkCancellation()
+        if let existingID = rootIDsByStandardizedPath[standardizedPath],
+           let existing = rootStatesByID[existingID]?.root
+        {
+            guard let existingConfiguration = rootLoadConfigurationsByPath[standardizedPath],
+                  existingConfiguration.kind == .primaryWorkspace
+            else {
+                throw WorkspaceFileContextStoreError.rootAlreadyLoadedWithDifferentConfiguration(standardizedPath)
+            }
+            return existing
+        }
+        if let inFlight = rootLoadFlightsByPath[standardizedPath] {
+            guard let inFlightConfiguration = rootLoadConfigurationsByPath[standardizedPath],
+                  inFlightConfiguration.kind == .primaryWorkspace
+            else {
+                throw WorkspaceFileContextStoreError.rootLoadInFlightWithDifferentConfiguration(standardizedPath)
+            }
+            return try await awaitRootLoadTask(
+                inFlight.task,
+                standardizedPath: standardizedPath,
+                cancelUnderlyingLoadOnCallerCancellation: cancelUnderlyingLoadOnCallerCancellation
+            )
+        }
+        return try await loadRoot(
+            path: standardizedPath,
+            isSystemRoot: false,
+            kind: .primaryWorkspace,
+            fileSystemSettings: fileSystemSettings,
+            cancelUnderlyingLoadOnCallerCancellation: cancelUnderlyingLoadOnCallerCancellation
+        )
+    }
+
+    @discardableResult
+    package func loadRoot(
+        path: String,
+        isSystemRoot: Bool = false,
+        kind: WorkspaceRootKind? = nil,
+        fileSystemSettings: FileSystemSettingsSnapshot,
+        cancelUnderlyingLoadOnCallerCancellation: Bool = false,
+        sessionWorktreeReservationToken: WorkspaceSessionWorktreeOwnershipToken? = nil
+    ) async throws -> WorkspaceRootRecord {
+        try await loadRoot(
+            path: path,
+            isSystemRoot: isSystemRoot,
+            kind: kind,
+            respectRepoIgnore: fileSystemSettings.respectRepoIgnore,
+            respectCursorignore: fileSystemSettings.respectCursorignore,
+            skipSymlinks: fileSystemSettings.skipSymlinks,
+            enableHierarchicalIgnores: fileSystemSettings.enableHierarchicalIgnores,
+            cancelUnderlyingLoadOnCallerCancellation: cancelUnderlyingLoadOnCallerCancellation,
+            sessionWorktreeReservationToken: sessionWorktreeReservationToken
+        )
+    }
+
     /// An owning caller cancels and joins its underlying load. If publication already won,
     /// return the root even on cancellation so the caller can clean up that exact receipt.
     /// Shared callers retain prompt cancellation without cancelling the shared load.
@@ -12681,17 +12760,34 @@ package actor WorkspaceFileContextStore {
         await unloadRoots(ids: ready)
     }
 
+    /// An unloaded presentation no longer projects this root, even though an admitted
+    /// consumer can still query its exact retained lifetime. A new load can reattach it.
+    private func isDetachedRetainedRoot(_ rootID: UUID) -> Bool {
+        guard let state = rootStatesByID[rootID] else { return false }
+        return deferredRootUnloads.contains(.init(rootID: rootID, lifetimeID: state.lifetimeID))
+    }
+
     package func unloadRoot(id rootID: UUID) async {
         await unloadRoots(ids: [rootID])
     }
 
+    /// Authoritative removal invalidates the lifetime even if an execution still holds a receipt.
     package func unloadRoots(ids rootIDs: [UUID]) async {
+        await unloadRoots(ids: rootIDs, preservingRetainedLifetimes: false)
+    }
+
+    /// Ordinary presentation loss leaves only exact retained lifetimes loaded.
+    package func detachRootPresentations(ids rootIDs: [UUID]) async {
+        await unloadRoots(ids: rootIDs, preservingRetainedLifetimes: true)
+    }
+
+    private func unloadRoots(ids rootIDs: [UUID], preservingRetainedLifetimes: Bool) async {
         var seenRootIDs = Set<UUID>()
         let orderedRootIDs = rootIDs.filter { rootID in
             guard seenRootIDs.insert(rootID).inserted else { return false }
             guard let state = rootStatesByID[rootID] else { return true }
             let lifetime = RetainedRootLifetime(rootID: rootID, lifetimeID: state.lifetimeID)
-            if rootRetentionCounts[lifetime, default: 0] > 0 {
+            if preservingRetainedLifetimes, rootRetentionCounts[lifetime, default: 0] > 0 {
                 deferredRootUnloads.insert(lifetime)
                 return false
             }
@@ -19506,7 +19602,7 @@ package actor WorkspaceFileContextStore {
         return .matched(match)
     }
 
-    func resolveExactExistingWorkspaceFile(
+    package func resolveExactExistingWorkspaceFile(
         _ input: WorkspaceExactFileInput,
         namespace: WorkspaceExactFileNamespace
     ) async throws -> WorkspaceExactExistingFileResolution {
@@ -23140,9 +23236,12 @@ package actor WorkspaceFileContextStore {
         case .visibleWorkspace, .visibleWorkspacePlusGitData, .allLoaded, .allLoadedExcludingGitData:
             var hasher = Hasher()
             hasher.combine((catalogGenerationsByScope[scope] ?? 0) &* 3 &+ scopeDiscriminator(scope))
+            let followsPresentation = scope == .visibleWorkspace || scope == .visibleWorkspacePlusGitData
             for root in rootsForPathLookupIgnoringPublishedAuthority(scope: scope) {
+                // Detach and reattach change membership without replacing a physical root.
+                if followsPresentation { hasher.combine(root.id) }
                 guard publishedSeededAuthorityFencesByRootID[root.id] != nil else { continue }
-                hasher.combine(root.id)
+                if !followsPresentation { hasher.combine(root.id) }
                 hasher.combine(publishedSeededAuthorityStatesByRootID[root.id]?.epoch ?? 0)
                 hasher.combine(publishedSeededAuthorityIsQueryable(rootID: root.id))
             }
@@ -23354,9 +23453,9 @@ package actor WorkspaceFileContextStore {
         let allRoots = roots()
         switch scope {
         case .visibleWorkspace:
-            return allRoots.filter { $0.kind == .primaryWorkspace }
+            return allRoots.filter { $0.kind == .primaryWorkspace && !isDetachedRetainedRoot($0.id) }
         case .visibleWorkspacePlusGitData:
-            return allRoots.filter { $0.kind == .primaryWorkspace || $0.kind == .workspaceGitData }
+            return allRoots.filter { ($0.kind == .primaryWorkspace || $0.kind == .workspaceGitData) && !isDetachedRetainedRoot($0.id) }
         case .allLoaded:
             return allRoots
         case .allLoadedExcludingGitData:

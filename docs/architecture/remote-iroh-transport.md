@@ -8,7 +8,8 @@ gateway lifecycle, session state, permissions, and command execution.
 - `RemoteGatewayController` owns enablement, startup/shutdown, QR state, event production, and diagnostics.
 - `RemoteGatewayRequestRouter` is the only application router. The adapter uses the snapshot/read/control services, authority mapping, transcript paging, replay buffer, and `RemoteErrorResponse` vocabulary.
 - `RemoteIrohGatewayAdapter` owns the Swift side of the Rust endpoint, authenticated hello/pairing preflight, framed RPC/event serialization, and connection/path diagnostics.
-- `RepoPromptIrohTransport` owns Iroh, QUIC streams, four-byte bounded framing, staged connection policy, deadlines, and cryptographically authenticated peer endpoint IDs. It does not persist identity or application data.
+- `RepoPromptRemoteNetworking` owns the shared Iroh endpoint lifecycle, pinned-peer dialing, stream admission, framing, path observation, deadlines and read retries. The Rust bridge isolates a stream failure from the rest of the authenticated connection.
+- The desktop adapter supplies product authorization, routing and snapshot projection. The phone supplies Keychain storage, lifecycle and presentation.
 
 ## Identity and pairing
 
@@ -28,9 +29,13 @@ device ID, and the authenticated peer. A repeated confirmation returns the same
 `pairing_confirmed` acknowledgment after either app restarts, without extending
 the lifetime. Pending credentials authorize confirmation only.
 
-An expired or abandoned attempt can be replaced from Mac Settings. Existing
-saved credentials and their usual authorization rules remain supported. New
-pairings require updated builds on both sides.
+An expired or abandoned attempt can be replaced from Mac Settings. Earlier
+builds pair with the single-use `pairing_hello` exchange. A phone selects that
+exchange only when the Mac's QR lacks the confirmation capability. The Mac
+checks both endpoint identities and the QR's expiry before activating the
+credential. This exchange needs a fresh code after an ambiguous result because
+it has no recoverable confirmation. Existing credentials work across both
+upgrade orders.
 
 ## Framing and recovery
 
@@ -45,14 +50,26 @@ supports first-sync confirmation. The first successful snapshot includes a
 server-generated sync ticket. The phone decodes the snapshot and echoes the
 ticket in `sync_confirm`. The Mac shows Connected once it validates that
 ticket for the current session. The status expires after 25 seconds without
-authenticated application activity. An earlier client can use its existing
-credential. Settings shows Phone active for this connection and prompts the
-user to update the phone to confirm sync.
+authenticated application activity. An earlier client continues to use its
+existing credential, and Settings shows Phone active for that connection. The
+next authenticated connection negotiates first-sync confirmation as soon as both
+apps support it. A snapshot is compressed only when the phone requests that
+capability.
 
 The phone supervises its connection and event poll with one retry task.
 Foregrounding or returning online restarts recovery promptly, and a failed
 dial backs off with jitter before retrying. Cached data remains visible
 while offline. Mutating commands are never automatically replayed.
+
+## Release validation
+
+For changes to pairing or the wire, test both upgrade orders with the previous
+supported desktop and iPhone builds. Check fresh pairing, reconnect with saved
+credentials, and capability negotiation after the second app updates. Use a
+physical iPhone to exercise cellular-only reconnect and Wi-Fi-to-cellular
+handoff. Exercise slow or lossy links, a brief loss of network, dropped replies
+and both app restarts during pairing. Verify that a saved credential still
+works when the network returns.
 
 ## Lifecycle and rollback
 

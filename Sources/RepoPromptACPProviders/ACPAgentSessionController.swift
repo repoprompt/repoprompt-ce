@@ -349,6 +349,9 @@ package actor ACPAgentSessionController {
     private var nextRequestID = 1
     private var inboundMessageSequence: UInt64 = 0
     private var pendingRequests: [String: PendingRequest] = [:]
+    private var openCodeLimitGrace: Duration?
+    private var lastOpenCodePromptProgress: Date?
+    private var retiredOpenCodePromptKey: String?
     // Wire identity is typed; approval identity is a fresh incarnation owned by this controller.
     private var pendingPermissionRequests: [String: PendingPermissionRequest] = [:]
     private var permissionStorageKeyByApprovalID: [String: String] = [:]
@@ -637,6 +640,11 @@ package actor ACPAgentSessionController {
         return true
     }
 
+    func enableOpenCodeHeadlessPromptLimitHandling(grace: Duration) {
+        guard provider.providerID == .openCode, state == .idle else { return }
+        openCodeLimitGrace = grace
+    }
+
     package func bootstrap() async throws -> BootstrapResult {
         guard state == .idle else {
             throw ControllerError.invalidState(expected: "idle", actual: state)
@@ -646,7 +654,12 @@ package actor ACPAgentSessionController {
         state = .launching
         log("Launching ACP transport")
         diagnose(.phaseStarted("launch"))
-        let environment = await resolvedEnvironment()
+        var environment = await resolvedEnvironment()
+        if openCodeLimitGrace != nil {
+            // OpenCode v1 only writes its structured halt diagnostic to stderr with this opt-in.
+            environment["OPENCODE_PRINT_LOGS"] = "1"
+            environment["OPENCODE_LOG_LEVEL"] = "ERROR"
+        }
         try host.preflightInjectedMCPServers(in: sessionConfiguration, environment: environment)
         let workingDirectory = CommandPathResolver.expandPath(
             launchConfiguration.workingDirectory ?? FileManager.default.temporaryDirectory.path,
@@ -890,6 +903,7 @@ package actor ACPAgentSessionController {
         recentDevinToolCallIDs.removeAll()
         let promptTurnID = UUID()
         activePromptTurnID = promptTurnID
+        lastOpenCodePromptProgress = nil
         lastPromptFailurePreservedSession = false
         resetActivePromptTrace()
         state = .promptRunning
@@ -1012,6 +1026,11 @@ package actor ACPAgentSessionController {
         // actor drain pending stderr so openCodeEmptyPromptDiagnosticMessage
         // sees the error line.
         await Task.yield()
+        if openCodeLimitGrace != nil, Task.isCancelled {
+            let error = CancellationError()
+            settlePromptTurn(promptTurnID, result: .failure(error))
+            throw error
+        }
         if let diagnosticMessage = openCodeEmptyPromptDiagnosticMessage(from: response, stopReason: stopReason) {
             #if DEBUG
                 if isRawACPCaptureEnabled {
@@ -2019,6 +2038,17 @@ package actor ACPAgentSessionController {
         let text = Self.strippingANSIEscapeSequences(from: rawText)
         guard !text.isEmpty else { return }
         stderrLineCount += 1
+        if let grace = openCodeLimitGrace {
+            if let sessionID, state == .promptRunning, let key = pendingOpenCodePromptKey,
+               pendingRequests[key]?.timeoutTask == nil,
+               let halt = OpenCodeACPPromptLimit.processorHaltDate(text, sessionID: sessionID),
+               halt > (lastOpenCodePromptProgress ?? .distantPast)
+            {
+                armOpenCodePromptLimit(for: key, after: grace)
+            }
+            // Opted-in OpenCode logging can contain private provider bodies.
+            return
+        }
         let disposition = provider.stderrLineDisposition(text)
         guard disposition != .discard else { return }
         lastStderrPreview = Self.truncatedDiagnosticPreview(text)
@@ -2095,6 +2125,12 @@ package actor ACPAgentSessionController {
                         inboundSequence: messageSequence
                     ))
                 } else if let error = json["error"] as? [String: Any] {
+                    if pendingRequest.method == "session/prompt", openCodeLimitGrace != nil,
+                       OpenCodeACPPromptLimit.matchesResponseError(error)
+                    {
+                        pendingRequest.continuation.resume(throwing: OpenCodeACPPromptLimit.rateLimitOrQuota)
+                        return
+                    }
                     let message = Self.responseErrorMessage(from: error)
                     let code = Self.responseErrorCode(from: error)
                     let codeText = code.map { " code=\($0)" } ?? ""
@@ -2112,6 +2148,9 @@ package actor ACPAgentSessionController {
                 } else {
                     pendingRequest.continuation.resume(throwing: ControllerError.protocolViolation("Missing result/error for request \(id.displayValue)"))
                 }
+                return
+            }
+            if let retiredOpenCodePromptKey, candidateStorageKeys(for: id).contains(retiredOpenCodePromptKey) {
                 return
             }
             if Self.isRecognizedUnmatchedResponse(json, provider: provider) {
@@ -2243,6 +2282,10 @@ package actor ACPAgentSessionController {
             }
         }
 
+        if openCodeLimitGrace != nil, self.sessionID == params["sessionId"] as? String {
+            if retiredOpenCodePromptKey != nil { return }
+            updateOpenCodePromptLimit(from: update)
+        }
         let normalizedEvents = provider.normalizeSessionUpdate(update, sessionID: sessionID)
         #if DEBUG
             captureNormalizedACPEvents(normalizedEvents, sessionID: sessionID, sourceUpdate: update)
@@ -2693,6 +2736,63 @@ package actor ACPAgentSessionController {
             pendingRequest.timeoutTask?.cancel()
             pendingRequest.continuation.resume(throwing: error)
         }
+    }
+
+    private var pendingOpenCodePromptKey: String? {
+        pendingRequests.first { $0.value.method == "session/prompt" }?.key
+    }
+
+    private func updateOpenCodePromptLimit(from update: [String: Any]) {
+        guard state == .promptRunning, let grace = openCodeLimitGrace,
+              let key = pendingOpenCodePromptKey else { return }
+        var retryDelay: Duration?
+        switch update["sessionUpdate"] as? String {
+        case "session_info_update":
+            guard let meta = update["_meta"] as? [String: Any], let retry = meta["opencode/retry"] else { return }
+            if let retry = retry as? [String: Any], let error = retry["error"] as? [String: Any] {
+                if OpenCodeACPPromptLimit.matchesRetryError(error) {
+                    // Keep a previously observed retry deadline if a later update is malformed.
+                    guard let delay = OpenCodeACPPromptLimit.retryDelay(retry) else { return }
+                    retryDelay = delay
+                }
+            } else if !(retry is NSNull) {
+                return
+            }
+        case "agent_message_chunk", "agent_thought_chunk":
+            guard let content = update["content"] as? [String: Any], let text = content["text"] as? String,
+                  !text.isEmpty else { return }
+        case "tool_call", "tool_call_update":
+            guard let status = update["status"] as? String,
+                  ["in_progress", "completed", "failed"].contains(status) else { return }
+        default:
+            return
+        }
+        // stderr and ACP stdout drain independently. A halt logged before this
+        // update cannot re-arm the watchdog after the prompt resumed.
+        lastOpenCodePromptProgress = Date()
+        pendingRequests[key]?.timeoutTask?.cancel()
+        pendingRequests[key]?.timeoutTask = nil
+        if let retryDelay {
+            armOpenCodePromptLimit(for: key, after: retryDelay + grace)
+        }
+    }
+
+    private func armOpenCodePromptLimit(for key: String, after delay: Duration) {
+        pendingRequests[key]?.timeoutTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: delay)
+            } catch {
+                return
+            }
+            await self?.expireOpenCodePromptLimit(for: key)
+        }
+    }
+
+    private func expireOpenCodePromptLimit(for key: String) {
+        guard !Task.isCancelled, state == .promptRunning,
+              let pending = pendingRequests.removeValue(forKey: key) else { return }
+        retiredOpenCodePromptKey = key
+        pending.continuation.resume(throwing: OpenCodeACPPromptLimit.rateLimitOrQuota)
     }
 
     private func handleProtocolViolation(_ message: String) {

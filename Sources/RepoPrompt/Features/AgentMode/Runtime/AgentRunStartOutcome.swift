@@ -131,6 +131,7 @@ struct AgentDirectRunStartOptions: Equatable {
     var stopFence: AgentRunStartStopFence?
     /// Positive, exact retained-row candidate; absent for every non-composer producer.
     var localComposerCandidate: UUID?
+    var autoEffortSelection: AutoEffortTurnSelection?
     /// Exact row appended by this submission, never inferred from transcript history.
     /// Auto-wake and maintenance producers append no user row and leave this absent.
     var initialUserItemID: UUID?
@@ -226,7 +227,17 @@ final class AgentRunStartOutcomeRecorder {
         didSet { hasRecordedOutcome = true }
     }
 
-    init() {}
+    let allowsStartup: () -> Bool
+    private let attemptStarted: ((AgentRunOwnership) -> Void)?
+
+    init(allowsStartup: @escaping () -> Bool = { true }, attemptStarted: ((AgentRunOwnership) -> Void)? = nil) {
+        self.allowsStartup = allowsStartup
+        self.attemptStarted = attemptStarted
+    }
+
+    func recordNewAttempt(_ ownership: AgentRunOwnership) {
+        attemptStarted?(ownership)
+    }
 
     func recordAccepted() {
         outcome = .accepted

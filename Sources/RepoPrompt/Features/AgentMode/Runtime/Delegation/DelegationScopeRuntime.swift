@@ -807,6 +807,20 @@ final class DelegationScopeRuntime: ObservableObject {
         return .success(request)
     }
 
+    /// Read an existing exact outcome before asking the target whether it can admit *new* work.
+    /// This neither allocates a request nor treats revocation as permission to replay an effect.
+    func retainedOverseeInitialOutcome(
+        requesterSessionID: UUID, targetSessionID: UUID, reason: String, idempotencyKey: String
+    ) -> Result<Value, DelegationScopeRequestError>? {
+        guard availability != .terminating,
+              let requestID = requestIDByKey["\(requesterSessionID.uuidString)|\(idempotencyKey)"],
+              let request = requests[requestID], let outcome = overseeInitialOutcomes[requestID] else { return nil }
+        return request.matches(
+            kind: .session(targetSessionID: targetSessionID), capabilities: [.observe, .control, .restructure],
+            guardrails: .init(), expiresInSeconds: nil, reason: reason
+        ) ? .success(outcome) : .failure(.idempotencyConflict)
+    }
+
     func beginOverseeInitialOutcome(requestID: UUID) {
         guard requests[requestID]?.state == .pending else { return }
         overseeInitialRequests.insert(requestID)

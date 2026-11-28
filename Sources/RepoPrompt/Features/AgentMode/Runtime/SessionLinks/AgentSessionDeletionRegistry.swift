@@ -215,8 +215,11 @@ final class AgentSessionDeletionRegistry {
         #endif
         let observer = commitObserver
         let changeObserver = changeObserver
+        let drain = self === Self.shared ? AgentSessionRuntimeHost.beginCommittedDetachedSessionDeletion(token.sessionID) : nil
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
         let task = Task { @MainActor in
             await observer?(token.sessionID, token.origin, fileRemoved)
+            if let drain { _ = await drain.wait(until: deadline) }
             changeObserver?()
         }
         commitTasksBySession[token.sessionID] = task

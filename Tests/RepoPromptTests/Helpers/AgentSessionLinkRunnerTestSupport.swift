@@ -684,8 +684,8 @@ final class AgentSessionLinkACPResponseGate {
     private let handle: FileHandle
     private var released = false
 
-    init(directory: URL) throws {
-        path = directory.appendingPathComponent("response-gate").path
+    init(directory: URL, name: String = "response-gate") throws {
+        path = directory.appendingPathComponent(name).path
         guard mkfifo(path, 0o600) == 0 else {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
         }
@@ -699,10 +699,10 @@ final class AgentSessionLinkACPResponseGate {
         }
     }
 
-    func release() {
+    func release(consumers: Int = 1) {
         guard !released else { return }
         released = true
-        try? handle.write(contentsOf: Data([1]))
+        try? handle.write(contentsOf: Data(repeating: 1, count: consumers))
     }
 
     deinit {
@@ -729,6 +729,7 @@ enum AgentSessionLinkACPServerScript {
     /// - `ACP_FAIL_METHOD`: rejects the named RPC after any response gate has released.
     /// - `ACP_DEVIN_FIXTURE` (`1`): advertises SWE-2 with medium/high/max thinking choices.
     /// - `ACP_USAGE_UPDATE_ON_PROMPT` (`used,size`): a `usage_update` during each prompt.
+    /// - `ACP_ASSISTANT_TEXT_ON_PROMPT`: emits one assistant text delta on a successful prompt.
     /// - `ACP_FOREIGN_ADVERTISE_AFTER_PROMPT` (comma list): a list for another session during each prompt.
     /// - `ACP_UNMATCHED_RESPONSE_ON_PROMPT`: a response with an unknown id during each prompt (a protocol
     ///   violation that fails the controller).
@@ -835,11 +836,17 @@ enum AgentSessionLinkACPServerScript {
             method = request.get("method")
             params = request.get("params") or {}
             if method == os.environ.get("ACP_HOLD_METHOD"):
-                gate_path = os.environ["ACP_RESPONSE_GATE"]
-                with open(gate_path + ".entered", "w"):
-                    pass
-                with open(gate_path, "rb", buffering=0) as gate:
-                    gate.read(1)
+                gate_path = os.environ.get("ACP_RESPONSE_GATE")
+                gates_by_prompt = json.loads(os.environ.get("ACP_RESPONSE_GATES_JSON", "{}"))
+                for marker, alternative_gate in gates_by_prompt.items():
+                    if marker in json.dumps(params.get("prompt") or []):
+                        gate_path = alternative_gate
+                        break
+                if gate_path:
+                    with open(gate_path + ".entered", "w"):
+                        pass
+                    with open(gate_path, "rb", buffering=0) as gate:
+                        gate.read(1)
             if method == os.environ.get("ACP_FAIL_METHOD"):
                 respond_error(request.get("id"), "injected startup failure")
                 continue
@@ -903,6 +910,11 @@ enum AgentSessionLinkACPServerScript {
                 if fail_marker and fail_marker in text:
                     respond_error(request.get("id"), "prompt rejected")
                 else:
+                    if os.environ.get("ACP_ASSISTANT_TEXT_ON_PROMPT"):
+                        notify_update(params.get("sessionId"), {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": os.environ["ACP_ASSISTANT_TEXT_ON_PROMPT"]}
+                        })
                     respond(request.get("id"), {
                         "stopReason": "end_turn",
                         "usage": {"inputTokens": 1, "outputTokens": 1}

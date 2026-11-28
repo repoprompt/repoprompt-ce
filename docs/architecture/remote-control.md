@@ -5,15 +5,11 @@ client. It is not a network version of the existing Unix-socket MCP transport.
 
 ## Standalone wire contract
 
-RepoPrompt CE owns its Foundation-only protocol implementation in
-`Sources/RepoPromptRemoteProtocol/` and builds it as an internal SwiftPM target.
-It has no source, package, path, submodule, or build dependency on any companion
-application repository. `Sources/RepoPromptShared/RemoteProtocolExports.swift`
-re-exports the internal target for desktop consumers without importing the app
-UI or MCP implementation.
-
-Companion clients build their protocol implementations independently. The
-shared Swift sources and JSON fixtures define the versioned Iroh wire contract.
+Both applications consume the same `RepoPromptRemoteNetworking` Swift package
+from the RepoPrompt Remote repository. The desktop pins a package revision.
+`RepoPromptShared` re-exports the Foundation-only protocol module for existing
+desktop consumers. Additive fields and compatibility fixtures let each
+application upgrade independently.
 
 `RemoteSnapshot` is the authoritative fleet projection sent after pairing and
 on reconnect. It contains desktop and connection state, authorization, all saved
@@ -101,12 +97,11 @@ credential before clearing the live connection.
 
 ## Local development integration
 
-RepoPrompt CE and RepoPrompt Remote are standalone repositories. CE owns its
-protocol implementation in `Sources/RepoPromptRemoteProtocol` and its Iroh
-transport package in `Packages/RepoPromptIrohTransport`; neither package resolves
-source from a sibling checkout. Remote owns its corresponding implementation.
-Wire fixtures and additive protocol contract tests—not shared source
-distribution—keep the two applications compatible.
+Use `REPOPROMPT_REMOTE_NETWORKING_PATH` with an absolute path to the
+RepoPrompt Remote checkout when testing desktop and package changes together.
+Set `REPOPROMPT_IROH_USE_LOCAL_ARTIFACT=1` to use the XCFramework rebuilt in that
+checkout. The normal desktop build resolves the pinned package revision and
+checksum-verified XCFramework without a sibling checkout.
 
 When developing the standalone mobile checkout, run `xcodegen generate`. A fast
 Simulator Debug build may disable signing:

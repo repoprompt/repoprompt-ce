@@ -611,7 +611,7 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
     private func bindingContext(_ binding: DomainBinding) -> DomainContextIdentity? {
         switch binding {
         case let .context(identity, _), let .runScoped(_, identity): identity
-        case .unbound, .appPresentationWindow: nil
+        case .unbound, .appPresentationWindow, .canonicalRunScoped, .savedRunScoped: nil
         }
     }
 
@@ -633,7 +633,7 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
                 "workspace_id": .string(identity.workspaceID.uuidString),
                 "context_id": .string(identity.contextID.uuidString)
             ])
-        case .appPresentationWindow:
+        case .appPresentationWindow, .canonicalRunScoped, .savedRunScoped:
             .object(["kind": .string("invalid_app_presentation")])
         }
     }

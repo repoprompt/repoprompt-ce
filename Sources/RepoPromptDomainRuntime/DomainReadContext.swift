@@ -4,6 +4,7 @@ package enum DomainReadBindingKind: Hashable, Sendable {
     case explicit
     case appPresentation
     case runScoped(runID: UUID)
+    case savedRunScoped(runID: UUID, sessionID: UUID)
 }
 
 /// Immutable, generation-fenced authority passed to shared read providers.

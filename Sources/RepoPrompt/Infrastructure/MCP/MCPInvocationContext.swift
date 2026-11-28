@@ -20,6 +20,10 @@ extension MCPInvocationContextBridge {
 struct MCPTabContextSnapshot {
     /// Independent route incarnation; not a transport route ID or fresh admission proof.
     var routeOwnerIdentity: ObjectIdentifier?
+    /// Only the independently composed saved host sets this when issuing its run receipt.
+    var savedCarrierSessionID: UUID?
+    /// A canonical policy issued during an active attempt never follows another attempt.
+    var runAttemptIDAtBinding: UUID?
     enum ModelWriterAtBinding {
         case unrecorded
         case unavailable

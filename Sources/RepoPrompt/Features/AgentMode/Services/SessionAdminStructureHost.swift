@@ -48,6 +48,8 @@ enum SessionAdminLifecycleOutcome: Equatable {
 /// It is a lifetime hold only, never permission to mutate the session.
 @MainActor
 struct SessionAdminPlacementPreparation {
+    /// When the host prepared a runtime, carry its exact admitted command into the commit.
+    var commit: ((_ parentID: UUID, _ scopeID: UUID?) throws -> DelegationPlacementCommit?)?
     let release: () -> Void
 }
 

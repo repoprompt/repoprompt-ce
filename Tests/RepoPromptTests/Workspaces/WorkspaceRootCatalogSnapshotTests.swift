@@ -243,6 +243,145 @@ import XCTest
         }
 
         @MainActor
+        func testDetachedRetainedPrimaryRootDoesNotInvalidateActiveWorkspaceCatalogSnapshot() async throws {
+            let priorRootURL = try makeTemporaryRoot(name: "CatalogDetachedPrior")
+            let targetRootURL = try makeTemporaryRoot(name: "CatalogActiveTarget")
+            let priorFileURL = priorRootURL.appendingPathComponent("PriorDetached.txt")
+            let targetFileURL = targetRootURL.appendingPathComponent("TargetVisible.txt")
+            try "prior workspace content\n".write(to: priorFileURL, atomically: true, encoding: .utf8)
+            try "target workspace content\n".write(to: targetFileURL, atomically: true, encoding: .utf8)
+
+            let prior = WorkspaceModel(name: "Prior", repoPaths: [priorRootURL.path])
+            let target = WorkspaceModel(name: "Target", repoPaths: [targetRootURL.path])
+            let rootless = WorkspaceModel(name: "Rootless", repoPaths: [])
+            let manager = makeManager(workspaces: [prior, target, rootless], active: rootless)
+            let store = manager.fileManager.workspaceFileContextStore
+            let reader = WorkspaceReadableFileService(store: store)
+
+            let priorSwitch = await manager.switchWorkspace(to: prior, saveState: false, reason: "detached-prior-load")
+            XCTAssertTrue(priorSwitch.didSwitch)
+            let priorLoaded = await store.rootRefs(scope: .visibleWorkspace)
+            let priorRoot = try XCTUnwrap(priorLoaded.first)
+            let retention = try await store.retainRoots(ids: [priorRoot.id])
+            addTeardownBlock { await store.releaseRootRetention(retention) }
+
+            let targetSwitch = await manager.switchWorkspace(to: target, saveState: false, reason: "detached-to-configured")
+            XCTAssertTrue(targetSwitch.didSwitch)
+            let allLoadedAfterTargetSwitch = await store.rootRefs()
+            XCTAssertTrue(
+                allLoadedAfterTargetSwitch.contains { $0.id == priorRoot.id },
+                "Prior workspace root must stay retained in the store after presentation detach"
+            )
+
+            let targetSnapshot = try await manager.awaitWorkspaceRootCatalogSnapshot(
+                workspaceID: target.id,
+                timeout: .seconds(1)
+            )
+            let expectedTargetPath = targetRootURL.standardizedFileURL.path
+            XCTAssertEqual(targetSnapshot.configuredRootPaths, [expectedTargetPath])
+            XCTAssertEqual(targetSnapshot.primaryRoots.map(\.standardizedFullPath), [expectedTargetPath])
+
+            // Representative visible tree, search, and file-read resolution must succeed on the active
+            // workspace without leaking or colliding with the prior detached retained root.
+            let targetTree = await store.makeCurrentSnapshotFileTreePresentation(
+                selection: StoredSelection(),
+                request: WorkspaceFileTreePresentationRequest(
+                    mode: .full,
+                    filePathDisplay: .relative,
+                    onlyIncludeRootsWithSelectedFiles: false,
+                    includeLegend: false,
+                    showCodeMapMarkers: false,
+                    rootScope: .visibleWorkspace
+                ),
+                lookupContext: .visibleWorkspace,
+                profile: .mcpRead
+            )
+            XCTAssertTrue(targetTree.content.contains("TargetVisible.txt"))
+            XCTAssertFalse(targetTree.content.contains("PriorDetached.txt"))
+
+            let targetSearchCatalog = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+            XCTAssertEqual(targetSearchCatalog.files.map(\.name), ["TargetVisible.txt"])
+            let targetSearch = try await StoreBackedWorkspaceSearch.search(
+                pattern: "*.txt",
+                mode: .path,
+                isRegex: false,
+                caseInsensitive: true,
+                maxPaths: 20,
+                paths: [],
+                rootScope: .visibleWorkspace,
+                store: store,
+                workspaceManager: manager
+            )
+            XCTAssertEqual(targetSearch.paths, [targetFileURL.standardizedFileURL.path])
+
+            let targetRead = try await reader.resolveReadFileRequest("TargetVisible.txt", rootScope: .visibleWorkspace)
+            guard case let .workspace(targetMatch) = targetRead else {
+                return XCTFail("Expected visible file-read resolution for TargetVisible.txt, got \(targetRead)")
+            }
+            XCTAssertEqual(targetMatch.file.standardizedRelativePath, "TargetVisible.txt")
+            let detachedReadOnTarget = try await reader.resolveReadFileRequest("PriorDetached.txt", rootScope: .visibleWorkspace)
+            if case .workspace = detachedReadOnTarget {
+                XCTFail("Detached retained root file must not resolve in the active visible workspace")
+            }
+
+            let rootlessSwitch = await manager.switchWorkspace(to: rootless, saveState: false, reason: "detached-to-rootless")
+            XCTAssertTrue(rootlessSwitch.didSwitch)
+            let allLoadedAfterRootlessSwitch = await store.rootRefs()
+            XCTAssertTrue(allLoadedAfterRootlessSwitch.contains { $0.id == priorRoot.id })
+
+            let rootlessSnapshot = try await manager.awaitWorkspaceRootCatalogSnapshot(
+                workspaceID: rootless.id,
+                timeout: .seconds(1)
+            )
+            XCTAssertTrue(rootlessSnapshot.isGenuinelyRootless)
+            XCTAssertEqual(rootlessSnapshot.configuredRootPaths, [])
+            XCTAssertEqual(rootlessSnapshot.primaryRoots, [])
+
+            let rootlessTree = await store.makeCurrentSnapshotFileTreePresentation(
+                selection: StoredSelection(),
+                request: WorkspaceFileTreePresentationRequest(
+                    mode: .full,
+                    filePathDisplay: .relative,
+                    onlyIncludeRootsWithSelectedFiles: false,
+                    includeLegend: false,
+                    showCodeMapMarkers: false,
+                    rootScope: .visibleWorkspace
+                ),
+                lookupContext: .visibleWorkspace,
+                profile: .mcpRead
+            )
+            XCTAssertFalse(rootlessTree.content.contains("PriorDetached.txt"))
+            XCTAssertFalse(rootlessTree.content.contains("TargetVisible.txt"))
+
+            let rootlessSearchCatalog = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+            XCTAssertTrue(rootlessSearchCatalog.files.isEmpty)
+            do {
+                _ = try await StoreBackedWorkspaceSearch.search(
+                    pattern: "*.txt",
+                    mode: .path,
+                    isRegex: false,
+                    caseInsensitive: true,
+                    maxPaths: 20,
+                    paths: [],
+                    rootScope: .visibleWorkspace,
+                    store: store,
+                    workspaceManager: manager
+                )
+                XCTFail("Rootless visible search must reject instead of searching a detached retained root")
+            } catch let error as FileManagerError {
+                guard case let .fileSystemServiceNotFoundWithContext(message) = error else {
+                    return XCTFail("Expected no-workspace FileManagerError, got \(error)")
+                }
+                XCTAssertTrue(message.contains("No workspace is currently loaded in this window"))
+            }
+
+            let detachedReadOnRootless = try await reader.resolveReadFileRequest("PriorDetached.txt", rootScope: .visibleWorkspace)
+            if case .workspace = detachedReadOnRootless {
+                XCTFail("Detached retained root file must not resolve in a rootless visible workspace")
+            }
+        }
+
+        @MainActor
         private func makeManager(
             workspaces: [WorkspaceModel],
             active: WorkspaceModel

@@ -1,5 +1,5 @@
 {
-  "originHash" : "accd1db04a2e8f28587156093c6a6f9f21c59b40e2164152578f3bf7cbd79d88",
+  "originHash" : "cadbb38a359afdb4c2036c4a2b8e3b5be231b103126cbad2a93ce782fca96b3c",
   "pins" : [
     {
       "identity" : "async-http-client",
@@ -53,6 +53,14 @@
       "state" : {
         "revision" : "2cbb952ac1a0b1dc465b05c1a480a922ab767849",
         "version" : "0.6.0"
+      }
+    },
+    {
+      "identity" : "repoprompt-remote",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/repoprompt/repoprompt-remote.git",
+      "state" : {
+        "revision" : "d34e2f500890ede9e5447675aac176f402f50f8d"
       }
     },
     {
