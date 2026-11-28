@@ -5172,3 +5172,169 @@ extension CodexResumeWedgeCommitTests {
         XCTAssertNil(absent.codexErrorInfo)
     }
 }
+
+// MARK: - In-flight RepoPrompt MCP calls (Codex-started, not yet tracked by the app)
+
+extension CodexResumeWedgeCommitTests {
+    private static let repoPromptApplyEditsEventName = "mcp__\(MCPIntegrationHelper.repoPromptMCPServerName)__apply_edits"
+
+    /// A `thread/read` snapshot parsed by the real parser: MCP items keep the bare `tool` name.
+    private static func repoPromptCallSnapshot(
+        itemID: UUID,
+        itemStatus: String
+    ) -> CodexNativeSessionController.ThreadSnapshot {
+        CodexNativeSessionController.test_parseThreadSnapshot([
+            "thread": [
+                "id": oldThreadID,
+                "status": ["type": "active"],
+                "turns": [[
+                    "id": graceTurnID,
+                    "status": "inProgress",
+                    "itemsView": "full",
+                    "items": [[
+                        "type": "mcpToolCall",
+                        "id": itemID.uuidString,
+                        "server": MCPIntegrationHelper.repoPromptMCPServerName,
+                        "tool": "apply_edits",
+                        "status": itemStatus
+                    ]]
+                ]]
+            ]
+        ], fallbackEffort: nil)
+    }
+
+    private func startRepoPromptCall(
+        _ f: Fixture,
+        controller: WedgeFakeCodexController,
+        invocationID: UUID
+    ) async {
+        await f.coordinator.test_handleCodexNativeEvent(
+            .toolCall(name: Self.repoPromptApplyEditsEventName, invocationID: invocationID, argsJSON: #"{"path":"a.swift"}"#),
+            session: f.session, sourceController: controller
+        )
+    }
+
+    func testInFlightRepoPromptMCPCallIsNotRecoveredDuringLongSilence() async throws {
+        let (f, old) = try await makeGraceFixture()
+        let invocationID = UUID()
+        await startRepoPromptCall(f, controller: old, invocationID: invocationID)
+        XCTAssertEqual(f.session.codexNativeToolLiveness.inFlight.count, 1, "a Codex-started RepoPrompt call opens a liveness span")
+        XCTAssertFalse(f.session.items.contains { $0.toolInvocationID == invocationID }, "the native transcript still skips it")
+
+        let snapshot = Self.repoPromptCallSnapshot(itemID: invocationID, itemStatus: "inProgress")
+        XCTAssertTrue(snapshot.hasAuthoritativeActiveTurnItems)
+        XCTAssertEqual(snapshot.activeToolItems.map(\.toolName), ["apply_edits"], "snapshots carry the bare MCP tool name")
+        XCTAssertEqual(snapshot.activeToolItems.map(\.invocationID), [invocationID])
+        old.setRecoverySnapshot(snapshot)
+
+        // Recovery is 100 s and grace 200 s in this fixture; stay silent far past both.
+        for seconds: TimeInterval in [150, 1000, 5000] {
+            silence(f, for: seconds)
+            _ = await probe(f)
+            _ = await probe(f)
+            XCTAssertTrue(f.factory.controllers.isEmpty, "silence \(seconds)s: an in-flight call is not a stall")
+            XCTAssertEqual(old.shutdownCount, 0, "silence \(seconds)s")
+            XCTAssertTrue(f.session.runState.isActive, "silence \(seconds)s")
+            XCTAssertEqual(f.session.codexNativeToolLiveness.inFlight.count, 1, "silence \(seconds)s")
+            XCTAssertNil(f.session.codexWatchdogState.activeTurnGrace, "silence \(seconds)s: corroboration is progress")
+        }
+
+        f.session.codexWatchdogState.activeTurnGrace = .init(until: Date().addingTimeInterval(-1), reason: .stillInProgress)
+        silence(f, for: 5000)
+        _ = await probe(f)
+        XCTAssertTrue(f.factory.controllers.isEmpty, "an expired grace does not override a corroborated call")
+        XCTAssertEqual(old.shutdownCount, 0)
+        XCTAssertFalse(f.session.items.contains {
+            $0.kind == .system && $0.text == "Codex became idle before the run resolved. Send a message to continue."
+        })
+    }
+
+    func testRepoPromptMCPResultClosesSpanWithoutNativeTranscriptRow() async throws {
+        let (f, old) = try await makeGraceFixture()
+        for isError in [false, true] {
+            let invocationID = UUID()
+            await startRepoPromptCall(f, controller: old, invocationID: invocationID)
+            XCTAssertEqual(f.session.codexNativeToolLiveness.inFlight.count, 1)
+            for _ in 0 ..< 2 {
+                await f.coordinator.test_handleCodexNativeEvent(
+                    .toolResult(
+                        name: Self.repoPromptApplyEditsEventName, invocationID: invocationID,
+                        argsJSON: #"{"path":"a.swift"}"#, resultJSON: #"{"status":"completed"}"#, isError: isError
+                    ),
+                    session: f.session, sourceController: old
+                )
+                XCTAssertTrue(f.session.codexNativeToolLiveness.inFlight.isEmpty, "isError=\(isError): the result closes the span")
+            }
+            XCTAssertFalse(f.session.items.contains { $0.toolInvocationID == invocationID }, "isError=\(isError)")
+        }
+    }
+
+    func testRepoPromptSpanWithLostCompletionDoesNotProtectSilentTurn() async throws {
+        let startup = TestReleaseFence(name: "terminal repoprompt span reattach startup")
+        let (f, old) = try await makeGraceFixture([[.suspendedSuccess(Self.oldThreadID, startup)]])
+        let invocationID = UUID()
+        await startRepoPromptCall(f, controller: old, invocationID: invocationID)
+        old.setRecoverySnapshot(Self.repoPromptCallSnapshot(itemID: invocationID, itemStatus: "completed"))
+        silence(f, for: 150)
+
+        _ = await probe(f)
+        XCTAssertTrue(f.session.codexNativeToolLiveness.inFlight.isEmpty, "a terminal item reconciles the lost completion")
+        XCTAssertTrue(f.factory.controllers.isEmpty, "a late first sample only records the comparison")
+        _ = await probe(f)
+        XCTAssertEqual(f.session.codexWatchdogState.activeTurnGrace?.reason, .stillInProgress, "the silent turn earns the usual grace")
+        XCTAssertTrue(f.factory.controllers.isEmpty)
+
+        f.session.codexWatchdogState.activeTurnGrace?.until = Date().addingTimeInterval(-1)
+        let recovery = Task { await probe(f) }
+        addTeardownBlock { @MainActor in
+            startup.release()
+            recovery.cancel()
+            _ = await recovery.value
+        }
+        let entered = await startup.waitUntilEntered(timeout: 4)
+        XCTAssertTrue(entered, "a genuinely silent turn still reattaches when the grace expires")
+        XCTAssertEqual(old.shutdownCount, 1)
+        startup.release()
+        _ = await recovery.value
+    }
+
+    func testOpenRepoPromptSpanDoesNotDelayNoActiveTurnOrFailedProbeRecovery() async throws {
+        for variant in ["no-active-turn", "probe-failed", "active-without-item", "active-other-item"] {
+            let startup = TestReleaseFence(name: "open repoprompt span recovery startup \(variant)")
+            let (f, old) = try await makeGraceFixture([[.suspendedSuccess(Self.oldThreadID, startup)]])
+            await startRepoPromptCall(f, controller: old, invocationID: UUID())
+            switch variant {
+            case "no-active-turn":
+                old.setRecoverySnapshot(Self.graceSnapshot(active: false))
+            case "probe-failed":
+                old.setRecoverySnapshotFailure()
+            case "active-other-item":
+                // Same bare tool name, different item: identity, not the name, corroborates.
+                old.setRecoverySnapshot(Self.repoPromptCallSnapshot(itemID: UUID(), itemStatus: "inProgress"))
+            default:
+                // E.g. an app-server restarted mid-call: Codex reports the turn without the item.
+                old.setRecoverySnapshot(Self.graceSnapshot())
+            }
+            silence(f, for: 150)
+            _ = await probe(f)
+            XCTAssertTrue(f.factory.controllers.isEmpty, "\(variant): first sample is only a comparison")
+            if variant.hasPrefix("active-") {
+                _ = await probe(f)
+                XCTAssertEqual(f.session.codexWatchdogState.activeTurnGrace?.reason, .stillInProgress, variant)
+                f.session.codexWatchdogState.activeTurnGrace?.until = Date().addingTimeInterval(-1)
+            }
+
+            let recovery = Task { await probe(f) }
+            addTeardownBlock { @MainActor in
+                startup.release()
+                recovery.cancel()
+                _ = await recovery.value
+            }
+            let entered = await startup.waitUntilEntered(timeout: 4)
+            XCTAssertTrue(entered, "\(variant): an uncorroborated local span never vetoes recovery")
+            XCTAssertEqual(old.shutdownCount, 1, variant)
+            startup.release()
+            _ = await recovery.value
+        }
+    }
+}

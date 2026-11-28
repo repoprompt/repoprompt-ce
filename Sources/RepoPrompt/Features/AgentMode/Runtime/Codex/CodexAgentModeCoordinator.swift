@@ -1059,7 +1059,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         session: AgentTabSession,
         at timestamp: Date
     ) {
-        guard !AgentToolTrackingSupport.isRepoPromptTool(toolName) else { return }
+        // RepoPrompt MCP calls are included: Codex can start one before the app registers it
+        // as an active tool, and only this span lets a probe corroborate it as in flight.
         let key = Self.matchingNativeToolLivenessKey(
             in: session.codexNativeToolLiveness,
             toolName: toolName,
@@ -1116,7 +1117,6 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         argsJSON: String?,
         session: AgentTabSession
     ) {
-        guard !AgentToolTrackingSupport.isRepoPromptTool(toolName) else { return }
         guard let key = Self.matchingNativeToolLivenessKey(
             in: session.codexNativeToolLiveness,
             toolName: toolName,
@@ -1157,6 +1157,23 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         }
     }
 
+    /// Snapshot MCP items carry the bare tool name (`apply_edits`) while lifecycle events carry
+    /// the server-qualified one (`mcp__RepoPromptCE__apply_edits`). Identity still comes from the
+    /// item's invocation ID; this only keeps the name check from rejecting a matching span.
+    private static func snapshotRepoPromptToolNameMatches(
+        _ snapshotToolName: String?,
+        executionToolName: String
+    ) -> Bool {
+        guard AgentToolTrackingSupport.isRepoPromptTool(executionToolName),
+              let snapshotToolName = AgentToolNamePolicy.accepted(snapshotToolName),
+              AgentToolTrackingSupport.isRepoPromptTool(snapshotToolName)
+        else {
+            return false
+        }
+        return MCPIntegrationHelper.normalizedRepoPromptToolName(snapshotToolName)
+            == MCPIntegrationHelper.normalizedRepoPromptToolName(executionToolName)
+    }
+
     private func snapshotToolKindIsCompatible(
         _ item: CodexNativeSessionController.ThreadSnapshot.ToolItemObservation,
         execution: AgentModeViewModel.CodexNativeToolLivenessState.Execution
@@ -1165,7 +1182,13 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         return switch item.kind {
         case .commandExecution:
             Self.isSnapshotCommandExecutionToolName(normalizedToolName)
-        case .mcpToolCall, .dynamicToolCall:
+        case .mcpToolCall:
+            normalizedToolName != "bash"
+                && (
+                    Self.normalizedExternalToolName(item.toolName).map { $0 == normalizedToolName } == true
+                        || Self.snapshotRepoPromptToolNameMatches(item.toolName, executionToolName: execution.toolName)
+                )
+        case .dynamicToolCall:
             normalizedToolName != "bash"
                 && Self.normalizedExternalToolName(item.toolName).map { $0 == normalizedToolName } == true
         case .fileChange:
@@ -9960,10 +9983,6 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             let toolName = AgentToolNamePolicy.accepted(toolName) ?? AgentToolNamePolicy.fallbackName
             clearCodexPendingAuthRetryTurn(session)
             sealAssistantBoundary(session)
-            if AgentToolTrackingSupport.isExplicitRepoPromptTool(toolName) {
-                AgentModeViewModel.logCodexDebug("[AgentModeVM][CodexUI] skip native explicit RepoPrompt toolResult tool=\(toolName)")
-                return
-            }
             let parsedBashResult = Self.normalizedExternalToolName(toolName) == "bash"
                 ? BashToolResultParser.parseLivenessMetadata(raw: resultJSON)
                 : nil
@@ -9988,6 +10007,11 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                     argsJSON: argsJSON,
                     session: session
                 )
+            }
+            // Transcript suppression only; the liveness span above must still close.
+            if AgentToolTrackingSupport.isExplicitRepoPromptTool(toolName) {
+                AgentModeViewModel.logCodexDebug("[AgentModeVM][CodexUI] skip native explicit RepoPrompt toolResult tool=\(toolName)")
+                return
             }
             guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { return }
             if Self.normalizedExternalToolName(toolName) == "bash" {
