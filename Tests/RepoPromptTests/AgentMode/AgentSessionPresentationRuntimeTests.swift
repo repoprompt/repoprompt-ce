@@ -83,6 +83,77 @@ final class AgentSessionPresentationRuntimeTests: XCTestCase {
         XCTAssertNil(replacement.activeAgentRunStartedAt)
     }
 
+    func testReattachmentSeedsAlreadySettledStateWithoutReplayingCompletion() throws {
+        let runtime = AgentSessionPresentationRuntime()
+        let session = AgentTabSession(tabID: UUID())
+        let outgoing = Events(), incoming = Events()
+        let initial = runtime.attach(session, sink: outgoing.sink)
+        let hooks = runtime.makeRunHooks()
+        session.runState = .running
+        hooks.setAgentRunActive(session, true)
+        runtime.detach(initial)
+        session.runState = .idle
+        hooks.setAgentRunActive(session, false)
+        hooks.notifyAgentTurnComplete(session)
+
+        var epochIsCurrent = true
+        var seeds = 0
+        let next = try XCTUnwrap(runtime.attachCurrent(session, sink: incoming.sink, isDestinationCurrent: { epochIsCurrent }) { settled in
+            XCTAssertTrue(settled === session)
+            XCTAssertEqual(settled.runState, .idle)
+            XCTAssertNil(settled.activeAgentRunStartedAt)
+            seeds += 1
+        })
+        XCTAssertEqual(seeds, 1)
+        XCTAssertEqual(incoming.completions, 0)
+        runtime.detach(initial)
+        hooks.requestUIRefresh(session, true)
+        XCTAssertEqual(incoming.refreshes, 1)
+        epochIsCurrent = false
+        hooks.requestUIRefresh(session, true)
+        XCTAssertEqual(incoming.refreshes, 1)
+        runtime.detach(next)
+    }
+
+    func testRejectedProvisionalAttachmentLeavesCurrentPresenterInstalled() {
+        let runtime = AgentSessionPresentationRuntime()
+        let session = AgentTabSession(tabID: UUID())
+        let incumbent = Events(), candidate = Events()
+        _ = runtime.attach(session, sink: incumbent.sink)
+        var destinationIsCurrent = true
+        runtime.detachedSink = .init(turnComplete: { _ in }, turnFailed: { _, _ in }, stateChanged: {
+            destinationIsCurrent = false
+        })
+
+        let refused = runtime.attachCurrent(session, sink: candidate.sink, isDestinationCurrent: { destinationIsCurrent }) { _ in
+            XCTFail("The destination was invalidated before seeding")
+        }
+
+        XCTAssertNil(refused)
+        runtime.makeRunHooks().requestUIRefresh(session, true)
+        XCTAssertEqual(incumbent.refreshes, 1)
+        XCTAssertEqual(candidate.refreshes, 0)
+    }
+
+    func testReentrantSuccessorAttachmentPreventsObsoleteSeed() {
+        let runtime = AgentSessionPresentationRuntime()
+        let session = AgentTabSession(tabID: UUID())
+        let obsolete = Events(), successor = Events()
+        runtime.detachedSink = .init(turnComplete: { _ in }, turnFailed: { _, _ in }, stateChanged: {
+            runtime.detachedSink = nil
+            _ = runtime.attach(session, sink: successor.sink)
+        })
+
+        let stale = runtime.attachCurrent(session, sink: obsolete.sink, isDestinationCurrent: { true }) { _ in
+            XCTFail("An obsolete presenter must not seed over its successor")
+        }
+
+        XCTAssertNil(stale)
+        runtime.makeRunHooks().requestUIRefresh(session, true)
+        XCTAssertEqual(successor.refreshes, 1)
+        XCTAssertEqual(obsolete.refreshes, 0)
+    }
+
     func testRouterHooksDoNotRetainOptionalPresenter() throws {
         let runtime = AgentSessionPresentationRuntime()
         let session = AgentTabSession(tabID: UUID())

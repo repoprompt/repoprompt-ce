@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import os
+import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 @testable import RepoPromptMCPServer
@@ -827,7 +828,12 @@ final class ManageWorktreeSessionAuthorityTests: XCTestCase {
                 let original = try XCTUnwrap(viewModel.runtimeCommand(sessionID: fixture.sessionID))
                 var replaced = false
                 var successorItemCount = 0
-                viewModel.test_setAgentSessionSaver { _, _, _ in
+                viewModel.test_setAgentSessionSaver { saved, _, _ in
+                    // A delayed ordinary save must not advance the replacement trigger.
+                    // Only the post-create save can carry this test's first binding.
+                    guard saved.id == fixture.sessionID, !saved.worktreeBindings.isEmpty else {
+                        return fixture.physical.appendingPathComponent("session.json")
+                    }
                     if !replaced {
                         replaced = true
                         viewModel.test_removeSession(tabID: fixture.session.tabID)
@@ -1698,13 +1704,32 @@ final class ManageWorktreeSessionAuthorityTests: XCTestCase {
                 _ = try git.runGit(["worktree", "add", "--detach", physical.path, "HEAD"], at: logical)
                 let identity = try XCTUnwrap(GitWorktreeIdentityResolver.resolve(atWorkTreeRoot: physical))
                 let vm = driver.window.agentModeViewModel
-                let session = AgentModeViewModel.TabSession(tabID: driver.tabID)
-                session.hasLoadedPersistedState = true
+                let adopted = await vm.awaitWorkspaceRuntimeAdoption(expectedWorkspaceID: driver.fixture.workspace.id)
+                _ = try XCTUnwrap(adopted ? vm.runtimeHost.workspaceActivation : nil, "Wait for the canonical Agent host, not just Git-data setup.")
+                let runtime = try XCTUnwrap(driver.fixture.runtime)
+                let authority = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: driver.window.windowID)
+                let workspaceID = driver.fixture.workspace.id
+                let canonical = await authority.canonicalWorkspaceSnapshot(workspaceID)
+                let snapshot = try XCTUnwrap(canonical)
+                var workspace = try JSONDecoder().decode(WorkspaceModel.self, from: snapshot.document.documentBytes)
+                let index = try XCTUnwrap(workspace.composeTabs.firstIndex { $0.id == driver.tabID })
                 let sessionID = UUID()
-                vm.test_installLiveSession(session)
-                _ = vm.test_installPersistentSessionBinding(sessionID: sessionID, on: session, updateWorkspaceMetadata: true)
-                XCTAssertNotNil(session.restorationAdmissionFailureMessage)
-                session.recordRestorationAuthoritative(.persistedPayloadApplied)
+                workspace.composeTabs[index].activeAgentSessionID = sessionID
+                let persisted = AgentSession(
+                    id: sessionID, workspaceID: workspaceID, composeTabID: driver.tabID,
+                    name: workspace.composeTabs[index].name, agentKind: AgentProviderKind.claudeCode.rawValue,
+                    autoWakeOnOversightUpdates: false
+                )
+                _ = try await AgentSessionDataService.shared.saveAgentSession(persisted, for: workspace)
+                let commit = try await authority.replaceWorkingFailClosed(
+                    workspace, fileURL: snapshot.document.fileURL, expectedWorkspaceRevision: snapshot.revisions.workingRevision
+                )
+                XCTAssertEqual(commit.disposition, .applied)
+                let projection = try XCTUnwrap(driver.window.domainWorkspacePresentationBridgeForTesting)
+                let refreshed = await projection.refreshForAgentAdmission()
+                XCTAssertTrue(refreshed)
+                let session = await vm.ensureSessionReady(tabID: driver.tabID, reconnectActiveProviders: false, expectedWorkspaceID: workspaceID)
+                XCTAssertEqual(session.activeAgentSessionID, sessionID)
                 _ = try XCTUnwrap(
                     session.permitsBoundOperationAndSave ? session.currentRestorationBindingToken : nil,
                     "Worktree provider operations require an already-restored session."
@@ -1712,7 +1737,6 @@ final class ManageWorktreeSessionAuthorityTests: XCTestCase {
                 vm.test_setAgentSessionSaver { _, _, _ in git.sandbox.appendingPathComponent("session.json") }
                 let tools = await driver.window.mcpServer.windowMCPTools
                 let tool = try XCTUnwrap(tools.first { $0.name == "manage_worktree" })
-                let runtime = try XCTUnwrap(driver.fixture.runtime)
                 let security = DomainToolInvocationSecurityContext(
                     principal: DomainClientPrincipal(
                         principalID: UUID(),

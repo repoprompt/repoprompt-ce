@@ -146,31 +146,9 @@ extension AgentModeViewModel {
         selectedModelRaw: String,
         selections: [ACPModelParameterSelection]
     ) throws {
-        guard !selections.isEmpty else { return }
-        // One concept — which providers may carry model parameters — one answer: ACP providers
-        // (Cursor, OpenCode). Derive the provider from the selected agent and use the
-        // provider-aware canonicalisation rather than a hardcoded Cursor identity. A non-ACP
-        // agent is still rejected, and selections must match the selected provider AND model.
-        guard let providerID = selectedAgent.acpProviderID else {
-            throw MCPError.invalidParams(
-                "Model parameters are supported only for ACP providers; cannot apply them to \(selectedAgent.displayName)."
-            )
-        }
-        let selectedModelIdentity = ACPModelParameterIdentity.canonicalBaseModelRaw(
-            selectedModelRaw,
-            providerID: providerID
+        try AgentSessionRuntimeHost.validateMCPModelParameters(
+            selectedAgent: selectedAgent, selectedModelRaw: selectedModelRaw, parameters: selections
         )
-        guard selections.allSatisfy({
-            $0.providerID == providerID
-                && ACPModelParameterIdentity.canonicalBaseModelRaw(
-                    $0.baseModelRaw,
-                    providerID: providerID
-                ) == selectedModelIdentity
-        }) else {
-            throw MCPError.invalidParams(
-                "Model parameters do not match the configured \(selectedAgent.displayName) base model."
-            )
-        }
     }
 
     private func mcpStoreModelParameterSelections(
@@ -190,13 +168,7 @@ extension AgentModeViewModel {
             selectedAgent: selectedAgent, selectedModelRaw: selectedModelRaw, selections: selections
         )
 
-        session.recordAcceptedACPModelParameterWrite(selections)
-        let updatedSelections = ACPModelParameterSelection.normalized(
-            session.acpModelParameterSelections + selections
-        )
-        guard updatedSelections != session.acpModelParameterSelections else { return }
-        session.acpModelParameterSelections = updatedSelections
-        session.isDirty = true
+        guard session.storeMCPModelParameters(selections) else { return }
         if schedulePersistence {
             persistenceRuntime.scheduleSave(for: tabID)
         }

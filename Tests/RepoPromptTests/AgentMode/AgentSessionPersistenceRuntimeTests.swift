@@ -669,6 +669,8 @@ final class AgentSessionPersistenceRuntimeTests: XCTestCase {
         XCTAssertTrue(f.scope.sessions[f.session.tabID] === f.session)
         XCTAssertFalse(f.scope.hasReleasedWriterClaims)
         XCTAssertEqual(f.store.retainedDrains.count, 1)
+        XCTAssertFalse(f.session.runState.isActive)
+        XCTAssertTrue(AppDelegate.hasUnsettledAgentExecution(store: f.store), "A failed final save still owns process lifetime")
         let windowManager = WindowStatesManager.makeForTesting(
             windowSessionFileURL: f.root.appendingPathComponent("windows.json"), agentRuntimeStore: f.store
         )
@@ -697,7 +699,10 @@ final class AgentSessionPersistenceRuntimeTests: XCTestCase {
         f.scope.noteSettlementChanged()
         XCTAssertEqual(writes, 2, "Observation cannot retry a failed save")
         try FileManager.default.removeItem(at: url)
-        drain.attemptRecovery()
+        let prefix = WindowStatesManager.agentHostRecoveryWarningPrefix
+        await windowManager.retryRetainedAgentHostDrain(warningID: prefix + UUID().uuidString)
+        XCTAssertEqual(writes, 2, "An unrelated warning cannot retry the retained writer")
+        await windowManager.retryRetainedAgentHostDrain(warningID: prefix + drain.recoveryID.uuidString)
         let result = await drain.wait(until: .now.advanced(by: .seconds(5)))
         XCTAssertEqual(result, .released)
         XCTAssertEqual(writes, 3)
@@ -714,6 +719,7 @@ final class AgentSessionPersistenceRuntimeTests: XCTestCase {
         XCTAssertFalse(f.session.isDirty)
         XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
         XCTAssertTrue(f.store.retainedDrains.isEmpty)
+        XCTAssertFalse(AppDelegate.hasUnsettledAgentExecution(store: f.store))
         XCTAssertEqual(drain.sessionOutcomes[cleanSibling.tabID]?.outcome, .released, "Recovery preserves the original exact sibling acknowledgement")
     }
 

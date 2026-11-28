@@ -100,7 +100,7 @@ enum CommandCenterSubmissionHost {
             let vm = owner.location.window.agentModeViewModel
             guard source.isCurrent() else { return .incomplete(id) }
             if let draft {
-                guard let write = vm.runtimeSessionStore.interactions(routeID: owner.location.window.windowID, approvalStore: vm.applyEditsApprovalStore).setAutoEditEnabled(draft.autoEdit, for: owner.session) else { return .incomplete(id) }
+                guard let write = vm.interactionRuntime.setAutoEditEnabled(draft.autoEdit, for: owner.session) else { return .incomplete(id) }
                 await write.value
                 guard source.isCurrent() else { return .incomplete(id) }
             }

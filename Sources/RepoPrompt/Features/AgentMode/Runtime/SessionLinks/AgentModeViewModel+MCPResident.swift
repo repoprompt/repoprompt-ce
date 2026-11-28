@@ -40,7 +40,7 @@ extension AgentModeViewModel {
         return MCPResidentTarget(
             session: session,
             endpoint: endpoint,
-            window: WindowStatesManager.shared.window(withID: endpoint.windowID)
+            window: WindowStatesManager.shared.window(withID: windowID)
         )
     }
 
@@ -54,11 +54,13 @@ extension AgentModeViewModel {
     private func mcpActivationTargetIsCurrent(
         _ target: MCPResidentTarget, ownership: MCPActivationOwnership = .resident
     ) -> Bool {
+        // The execution endpoint names the retained host route. Resident entry points also
+        // require their own physical presentation witness; neither ID can substitute for the other.
         guard !WindowStatesManager.shared.isTerminating,
-              target.endpoint.windowID == windowID,
+              target.endpoint.windowID == runtimeHost.routeID,
               let current = try? authoritativeLiveSession(for: target.endpoint.sessionID)
         else { return false }
-        let registered = WindowStatesManager.shared.window(withID: target.endpoint.windowID)
+        let registered = WindowStatesManager.shared.window(withID: windowID)
         if let admittedWindow = target.window {
             guard registered === admittedWindow, !admittedWindow.isClosing,
                   admittedWindow.agentModeViewModel === self else { return false }
@@ -104,16 +106,10 @@ extension AgentModeViewModel {
         if let failure = target.session.restorationAdmissionFailureMessage {
             throw MCPError.invalidParams(failure)
         }
-        guard mcpActivationTargetIsCurrent(target, ownership: ownership),
-              agentSessionLinkPromptInventoryHoldsByEndpoint[target.endpoint] == nil
-        else { throw MCPError.invalidParams(Self.mcpResidentTargetError) }
-        let published = agentSessionLinkPromptInventoryBySessionID[target.endpoint.sessionID]
-        let publishedLinks = published?.endpoint == target.endpoint && published?.inventory.isEmpty == false
-        if authoritativeHasLinks || publishedLinks {
-            throw MCPError.invalidParams(
-                "Session \(target.endpoint.sessionID.uuidString) is app-owned and oversees other sessions. MCP activation would revoke its oversight links. Use agent_run.steer with wait=false, agent_run.poll, and agent_manage.get_log."
-            )
+        guard mcpActivationTargetIsCurrent(target, ownership: ownership) else {
+            throw MCPError.invalidParams(Self.mcpResidentTargetError)
         }
+        try linkExecutionRuntime.mcpRequireResidentLinkFence(target.endpoint, authoritativeHasLinks: authoritativeHasLinks)
     }
 
     func mcpRequireActivationOwnerFence(
@@ -138,7 +134,15 @@ extension AgentModeViewModel {
         guard mcpResidentTargetIsCurrent(target), target.session.permitsBoundOperationAndSave else {
             throw MCPError.invalidParams("Live status is not ready for this session binding. Retry agent_run.poll.")
         }
-        let session = target.session
+        return Self.mcpResidentStatusSnapshot(
+            target.session, sessionID: target.endpoint.sessionID,
+            title: workspaceManager?.composeTabName(with: target.session.tabID) ?? "Agent Session"
+        )
+    }
+
+    /// Sanitized value-only snapshot. The exact owner is authorized by the calling surface;
+    /// source text and protected interaction payloads are never projected here.
+    static func mcpResidentStatusSnapshot(_ session: AgentTabSession, sessionID: UUID, title: String) -> AgentRunMCPSnapshot {
         let state = Self.statusProjection(for: session).status
         let status: AgentRunMCPSnapshot.Status = if state == .awaitingUser {
             .waitingForInput
@@ -152,8 +156,8 @@ extension AgentModeViewModel {
             }
         }
         return AgentRunMCPSnapshot(
-            sessionID: target.endpoint.sessionID, runID: session.runID, tabID: session.tabID,
-            sessionName: workspaceManager?.composeTabName(with: session.tabID) ?? "Agent Session",
+            sessionID: sessionID, runID: session.runID, tabID: session.tabID,
+            sessionName: title,
             agentRaw: session.selectedAgent.rawValue, agentDisplayName: session.selectedAgent.displayName,
             modelRaw: session.selectedModelRaw, reasoningEffortRaw: session.selectedReasoningEffortRaw,
             modelParameterSelections: AgentSessionMCPRuntime.snapshotModelParameterSelections(for: session),
@@ -175,15 +179,22 @@ extension AgentModeViewModel {
     func mcpResidentOverseerValue(_ target: MCPResidentTarget, hasOutboundLinks: Bool) throws -> Value {
         guard mcpResidentTargetIsCurrent(target) else { throw MCPError.invalidParams(Self.mcpResidentTargetError) }
         let counts = try mcpResidentLaneStateCounts(for: target.endpoint, hasOutboundLinks: hasOutboundLinks)
-        return .object([
-            "status": .string(Self.statusProjection(for: target.session).status.rawValue),
-            "context": AgentSessionLinkResponseRenderer.contextLoadValue(Self.observationContextLoad(for: target.session)),
+        return Self.mcpResidentOverseerValue(session: target.session, endpoint: target.endpoint, counts: counts)
+    }
+
+    static func mcpResidentOverseerValue(
+        session: AgentTabSession, endpoint: DomainAgentSessionLinkEndpointIdentity,
+        counts: (idle: Int, running: Int, awaitingUser: Int, unavailable: Int)
+    ) -> Value {
+        .object([
+            "status": .string(statusProjection(for: session).status.rawValue),
+            "context": AgentSessionLinkResponseRenderer.contextLoadValue(observationContextLoad(for: session)),
             "lane_count": .int(counts.idle + counts.running + counts.awaitingUser + counts.unavailable),
             "lane_states": .object([
                 "idle": .int(counts.idle), "running": .int(counts.running),
                 "awaiting_user": .int(counts.awaitingUser), "unavailable": .int(counts.unavailable)
             ]),
-            "pending_attention": .int(AgentSessionLinkRuntimeBridge.shared.pendingAttentionOccurrenceCount(for: target.endpoint))
+            "pending_attention": .int(AgentSessionLinkRuntimeBridge.shared.pendingAttentionOccurrenceCount(for: endpoint))
         ])
     }
 
@@ -219,17 +230,45 @@ extension AgentModeViewModel {
         remoteAttachments: [AgentFileAttachment] = [],
         windowIsAvailable: @escaping @MainActor () -> Bool
     ) async throws -> MCPInstructionDispatch {
+        try await submitBoundTaskInput(
+            session: target.session, endpoint: target.endpoint, text: text, workflow: workflow,
+            attachments: remoteAttachments
+        ) {
+            windowIsAvailable() && self.mcpResidentTargetIsCurrent(target)
+        }
+    }
+
+    /// Paired Remote can send to the exact writer even when the session has no MCP registration.
+    func submitRemoteSessionMessage(
+        to session: TabSession, sessionID: UUID, workspaceID: UUID, text: String,
+        attachments: [AgentFileAttachment], validateDispatch: @escaping @MainActor () throws -> Void
+    ) async throws -> MCPInstructionDispatch {
+        try validateDispatch()
+        guard let endpoint = linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: session.tabID),
+              endpoint.sessionID == sessionID, endpoint.workspaceID == workspaceID
+        else { throw MCPError.invalidParams(Self.mcpResidentTargetError) }
+        return try await submitBoundTaskInput(
+            session: session, endpoint: endpoint, text: text, workflow: nil, attachments: attachments
+        ) {
+            (try? validateDispatch()) != nil && self.linkExecutionRuntime.admit(endpoint: endpoint)?.writer.session === session
+        }
+    }
+
+    private func submitBoundTaskInput(
+        session: TabSession, endpoint: DomainAgentSessionLinkEndpointIdentity, text: String,
+        workflow: AgentWorkflowDefinition?, attachments: [AgentFileAttachment],
+        targetIsCurrent: @escaping @MainActor () -> Bool
+    ) async throws -> MCPInstructionDispatch {
         try Task.checkCancellation()
-        guard !target.session.isAwaitingWorkspaceAdoption else {
+        guard !session.isAwaitingWorkspaceAdoption else {
             throw MCPError.invalidParams(Self.mcpResidentBusyError)
         }
-        if let failure = target.session.restorationAdmissionFailureMessage {
+        if let failure = session.restorationAdmissionFailureMessage {
             throw MCPError.invalidParams(failure)
         }
-        guard windowIsAvailable(), mcpResidentTargetIsCurrent(target) else {
+        guard targetIsCurrent() else {
             throw MCPError.invalidParams(Self.mcpResidentTargetError)
         }
-        let session = target.session
         let protectedPrompt = session.pendingApplyEditsReview != nil || session.pendingWorktreeMergeReview != nil
             || mcpRuntime.mcpPendingInteraction(for: session).map { $0.kind != .instruction } == true
         guard !protectedPrompt else { throw MCPError.invalidParams(Self.mcpResidentProtectedError) }
@@ -241,7 +280,7 @@ extension AgentModeViewModel {
             route: agentSessionLinkManagedSteerRoute(for: session)
         )
         let frame = Self.mcpResidentTaskFrame(text)
-        if !remoteAttachments.isEmpty {
+        if !attachments.isEmpty {
             guard case .idleTurn = admission else {
                 throw MCPError.invalidParams("Wait for the current run to finish before sending attachments.")
             }
@@ -259,7 +298,7 @@ extension AgentModeViewModel {
             }
         case let .steer(route):
             let sink = AgentSessionLinkManagedSteerSink()
-            let turn = AgentNoncomposerTurn(endpoint: target.endpoint, providerText: frame, sink: sink)
+            let turn = AgentNoncomposerTurn(endpoint: endpoint, providerText: frame, sink: sink)
             guard submitNoncomposerSteer(
                 tabID: session.tabID, session: session, displayText: frame,
                 turn: turn, route: route, workflow: workflow
@@ -279,7 +318,7 @@ extension AgentModeViewModel {
         case .idleTurn:
             guard let submitTarget = makeComposerSubmitTarget(tabID: session.tabID, session: session),
                   submitTarget.route == .existingAgentSession,
-                  submitTarget.expectedSourceAgentSessionID == target.endpoint.sessionID
+                  submitTarget.expectedSourceAgentSessionID == endpoint.sessionID
             else { throw MCPError.invalidParams(Self.mcpResidentBusyError) }
             let attempt = AgentComposerSubmitAttempt(
                 id: UUID(), target: submitTarget, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: ""
@@ -293,12 +332,11 @@ extension AgentModeViewModel {
                 includeBuiltInSessionCleanupGuidance: GlobalSettingsStore.shared.showBuiltInWorkflowCleanupGuidance()
             )
             let outcome = await linkExecutionRuntime.persistAndStartNoncomposerTurn(
-                session: session, tabID: session.tabID, workspaceID: target.endpoint.workspaceID,
+                session: session, tabID: session.tabID, workspaceID: endpoint.workspaceID,
                 claim: claim, displayText: frame, providerMessage: payload, workflow: workflow,
-                attribution: nil, stopFence: stopFence, attachments: remoteAttachments
+                attribution: nil, stopFence: stopFence, attachments: attachments
             ) {
-                windowIsAvailable() && self.mcpResidentTargetIsCurrent(target)
-                    && self.composerSubmitRuntime.isCurrent(claim) && stopFence.permitsStart(of: session)
+                targetIsCurrent() && self.composerSubmitRuntime.isCurrent(claim) && stopFence.permitsStart(of: session)
                     && AgentSessionLinkDeliveryReadiness.failure(snapshot: AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
                         session: session, endpointMatchesGrant: true, isClosing: false,
                         ignoresComposerSubmissionInFlight: true,

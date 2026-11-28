@@ -71,7 +71,7 @@ final class AgentSessionStatusCensus {
                 let ids = Set(vm.sessions.values.compactMap(\.activeAgentSessionID))
                 return vm.agentSessionLinkCandidates(forSessionIDs: ids, includeLocation: false).values.flatMap(\.self)
             }
-            return candidates.map { candidate in
+            let presenters = candidates.map { candidate in
                 let vm = manager.modelRoutingWindow(withID: candidate.windowID)?.agentModeViewModel
                 let eligible = candidate.hasLoadedPersistedState && !candidate.bindingTransitionInProgress
                     && candidate.restorationReadiness.permitsBoundOperationAndSave
@@ -94,9 +94,9 @@ final class AgentSessionStatusCensus {
                 sample.oversightRole = vm?.agentSidebarOversightRole(tabID: candidate.tabID, expectedSessionID: candidate.sessionID) ?? .none
                 return sample
             }
+            return presenters + manager.savedHostStatusSamples()
         }, observe: { candidate, changed in
-            manager.modelRoutingWindow(withID: candidate.windowID)?.agentModeViewModel
-                .agentSessionLinkInstallObservation(for: candidate, onChange: changed)
+            manager.agentSessionLinkInstallObservation(for: candidate, onChange: changed)
         }, isEnabled: isEnabled)
     }
 

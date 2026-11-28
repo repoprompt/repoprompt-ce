@@ -2,6 +2,16 @@ import Foundation
 import RepoPromptDomainRuntime
 
 extension AgentModeViewModel {
+    func enterSelfNoopBody(origin: AgentSelfMCPCallOrigin, invocationID: UUID, argumentsAreEmpty: Bool) {
+        linkExecutionRuntime.enterSelfNoopBody(origin: origin, invocationID: invocationID, argumentsAreEmpty: argumentsAreEmpty)
+    }
+
+    func acceptSelfNoopBody(origin: AgentSelfMCPCallOrigin, endpoint: DomainAgentSessionLinkEndpointIdentity?, invocationID: UUID) {
+        linkExecutionRuntime.acceptSelfNoopBody(origin: origin, endpoint: endpoint, invocationID: invocationID)
+    }
+}
+
+extension AgentSessionLinkExecutionRuntime {
     /// Count the body, not registration or a deduplicated transcript representation. A suspended
     /// old body never counts against a replacement attempt.
     func enterSelfNoopBody(origin: AgentSelfMCPCallOrigin, invocationID: UUID, argumentsAreEmpty: Bool) {
@@ -19,7 +29,7 @@ extension AgentModeViewModel {
         guard let session = sessions[origin.endpoint.tabID], session.runID == origin.runID,
               let owner = session.activeRunOwnership, owner.attemptID == origin.runAttemptID,
               session.isCurrentRunAttemptForCurrentBinding(owner) else { return }
-        guard let endpoint, linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: session.tabID) == endpoint,
+        guard let endpoint, agentSessionLinkObserverEndpoint(tabID: session.tabID) == endpoint,
               let wakeID = session.quietLedger.routineWakeID(owner: owner),
               !session.hasOwnPendingQuietInteraction
         else {

@@ -74,29 +74,20 @@ struct AgentSessionOverseerBootstrapRefusal: Equatable {
     }
 }
 
-extension AgentModeViewModel {
+extension AgentSessionLinkExecutionRuntime {
     /// nil when `agentSessionLinkBootstrapState(for:)` would admit this endpoint now.
     func agentSessionLinkBootstrapRefusal(
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> AgentSessionOverseerBootstrapRefusal? {
         guard agentSessionLinkBootstrapState(for: endpoint) == nil else { return nil }
         let isLane = sessions[endpoint.tabID]?.createdByOverseerSessionID != nil
-        return .classify(candidate: linkExecutionRuntime.agentSessionLinkModelCandidate(for: endpoint), isOverseerLane: isLane)
-    }
-}
-
-extension AgentModeViewModel {
-    /// Never overlays a captured endpoint onto a replacement: recomputes only the live current
-    /// owner, with its current generation, eligibility and activation.
-    func agentSessionLinkRepaintCurrentPillIfOwned(_ session: AgentTabSession) {
-        guard sessions[session.tabID] === session, currentTabID == session.tabID else { return }
-        syncStatusPillsUIStateIfMonitorStale()
+        return .classify(candidate: agentSessionLinkModelCandidate(for: endpoint), isOverseerLane: isLane)
     }
 
     func agentSessionLinkBootstrapState(
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> AgentSessionOverseerBootstrapState? {
-        guard let candidate = linkExecutionRuntime.agentSessionLinkModelCandidate(for: endpoint),
+        guard let candidate = agentSessionLinkModelCandidate(for: endpoint),
               let session = sessions[endpoint.tabID],
               session.createdByOverseerSessionID == nil,
               AgentSessionLinkEndpointEligibility.addDisabledReason(
@@ -124,6 +115,30 @@ extension AgentModeViewModel {
               let session = sessions[endpoint.tabID]
         else { return false }
         session.oversight.overseerActivation = AgentSessionOverseerActivation(endpoint: endpoint, token: UUID())
+        return true
+    }
+}
+
+extension AgentModeViewModel {
+    /// Never overlays a captured endpoint onto a replacement: recomputes only the live current
+    /// owner, with its current generation, eligibility and activation.
+    func agentSessionLinkRepaintCurrentPillIfOwned(_ session: AgentTabSession) {
+        guard sessions[session.tabID] === session, currentTabID == session.tabID else { return }
+        syncStatusPillsUIStateIfMonitorStale()
+    }
+
+    func agentSessionLinkBootstrapState(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> AgentSessionOverseerBootstrapState? {
+        linkExecutionRuntime.agentSessionLinkBootstrapState(for: endpoint)
+    }
+
+    func agentSessionLinkBootstrapRefusal(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> AgentSessionOverseerBootstrapRefusal? {
+        linkExecutionRuntime.agentSessionLinkBootstrapRefusal(for: endpoint)
+    }
+
+    func agentSessionLinkActivateOverseer(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity, expected: AgentSessionOverseerBootstrapState
+    ) -> Bool {
+        guard linkExecutionRuntime.agentSessionLinkActivateOverseer(for: endpoint, expected: expected) else { return false }
         syncStatusPillsUIStateIfMonitorStale()
         return true
     }

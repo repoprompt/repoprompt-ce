@@ -1,0 +1,361 @@
+import Foundation
+import MCP
+import RepoPromptAIContracts
+import RepoPromptDomainRuntime
+
+@MainActor
+enum AgentExternalMCPRunStarter {
+    struct StartOutcome: Equatable {
+        let snapshot: AgentRunMCPSnapshot
+        let delivery: AgentModeViewModel.MCPInstructionDispatch
+    }
+
+    /// The caller supplies the originally admitted runtime and its producer-specific adapters.
+    /// The pending-start fence and configured-save/dispatch ordering cannot vary by presenter.
+    struct PendingStartActions {
+        let ownerIsCurrent: @MainActor () -> Bool
+        let configure: @MainActor () async throws -> Void
+        let prepareRequestBinding: @MainActor () async throws -> Void
+        let commitConfiguration: @MainActor () async throws -> Void
+        let dispatch: @MainActor (_ requirePendingStart: @escaping @MainActor () throws -> Void) async throws -> AgentModeViewModel.MCPInstructionDispatch
+        let snapshot: @MainActor () async -> AgentRunMCPSnapshot
+        var requireAuthority: @MainActor () throws -> Void = {}
+    }
+
+    static func finishPendingStart(
+        sessionID: UUID, tabID: UUID, session: AgentTabSession?, ownedActivation: AgentMCPControlContext,
+        originalStopFence: AgentRunStartStopFence? = nil, expiry: AgentRunStartExpiry?, actions: PendingStartActions
+    ) async throws -> StartOutcome {
+        try expiry?.recordActivation(sessionID: sessionID, tabID: tabID)
+        guard let session, session.activeAgentSessionID == sessionID,
+              session.mcpControlContext == ownedActivation, session.mcpFollowUpRunPending
+        else {
+            throw MCPError.invalidParams("The pending agent start was withdrawn or replaced during activation.")
+        }
+        let stop = originalStopFence ?? AgentRunStartStopFence(session: session)
+        let requirePendingStart: @MainActor () throws -> Void = {
+            try actions.requireAuthority()
+            guard actions.ownerIsCurrent(), session.activeAgentSessionID == sessionID,
+                  session.mcpControlContext == ownedActivation, stop.permitsStart(of: session)
+            else {
+                throw MCPError.invalidParams("The pending agent start was withdrawn or replaced before dispatch.")
+            }
+        }
+        try actions.requireAuthority()
+        try await actions.configure()
+        try await actions.prepareRequestBinding()
+        try Task.checkCancellation()
+        try requirePendingStart()
+        if let expiry, expiry.expiredBeforeActivation { throw expiry.timeoutError }
+        try await actions.commitConfiguration()
+        try Task.checkCancellation()
+        try requirePendingStart()
+        let delivery = try await actions.dispatch(requirePendingStart)
+        return await .init(snapshot: actions.snapshot(), delivery: delivery)
+    }
+
+    typealias RequestMetadata = MCPRequestMetadata
+    typealias BindCurrentRequestToTab = (_ tabID: UUID, _ metadata: MCPRequestMetadata, _ startExpiry: AgentRunStartExpiry?) async throws -> Void
+    typealias DispatchInstruction = @MainActor (
+        _ sessionID: UUID,
+        _ tabID: UUID,
+        _ message: String,
+        _ workflow: AgentWorkflowDefinition?,
+        _ agentModeVM: AgentModeViewModel
+    ) async throws -> AgentModeViewModel.MCPInstructionDispatch
+
+    private enum RequestBindingDisposition {
+        case preserveCallerBinding
+        case applyRequestBindingPolicy(BindCurrentRequestToTab)
+    }
+
+    /// Extracts a reasoning effort suffix from a model string if present.
+    /// Supports Codex variants such as "gpt-5.4-high" and Claude variants such as
+    /// "claude-opus-5-5:low" without changing the model selection.
+    /// The model string is passed through unchanged (preserving service tier and other modifiers);
+    /// only the effort is extracted separately.
+    static func extractReasoningEffort(from modelRaw: String?) -> (model: String?, effort: String?) {
+        guard let modelRaw, !modelRaw.isEmpty else { return (modelRaw, nil) }
+        let specifier = CodexModelSpecifier(raw: modelRaw)
+        if let effort = specifier.reasoningEffort {
+            return (modelRaw, effort.rawValue)
+        }
+        if let effort = ClaudeModelSpecifier(raw: modelRaw).explicitEffortLevel {
+            return (modelRaw, effort.rawValue)
+        }
+        return (modelRaw, nil)
+    }
+
+    static func startPreservingCallerBinding(
+        target: AgentModeViewModel.MCPSessionTarget,
+        message: String,
+        metadata: MCPRequestMetadata,
+        agentModeVM: AgentModeViewModel,
+        agentRaw: String?,
+        modelRaw: String?,
+        reasoningEffortRaw: String?,
+        taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
+        workflow: AgentWorkflowDefinition? = nil,
+        expectedParentSessionID: UUID? = nil,
+        oracleReviewSource: AgentRunOracleReviewSource? = nil,
+        preserveRoutedInitialEffort: Bool = false,
+        dispatchInstruction: DispatchInstruction? = nil,
+        startExpiry: AgentRunStartExpiry? = nil,
+        remoteAttachments: [AgentFileAttachment]? = nil,
+        remoteInterviewFirst: Bool? = nil,
+        validateDispatch: (@MainActor () throws -> Void)? = nil,
+        workspaceAuthority: AgentModeViewModel.MCPWorkspaceTargetAuthority? = nil
+    ) async throws -> StartOutcome {
+        try await startWithBindingDisposition(
+            target: target,
+            message: message,
+            metadata: metadata,
+            bindingDisposition: .preserveCallerBinding,
+            agentModeVM: agentModeVM,
+            agentRaw: agentRaw,
+            modelRaw: modelRaw,
+            reasoningEffortRaw: reasoningEffortRaw,
+            taskLabelKind: taskLabelKind,
+            workflow: workflow,
+            expectedParentSessionID: expectedParentSessionID,
+            oracleReviewSource: oracleReviewSource,
+            preserveRoutedInitialEffort: preserveRoutedInitialEffort,
+            dispatchInstruction: dispatchInstruction,
+            startExpiry: startExpiry,
+            remoteAttachments: remoteAttachments,
+            remoteInterviewFirst: remoteInterviewFirst,
+            validateDispatch: validateDispatch,
+            workspaceAuthority: workspaceAuthority
+        )
+    }
+
+    static func startApplyingRequestBindingPolicy(
+        target: AgentModeViewModel.MCPSessionTarget,
+        message: String,
+        metadata: MCPRequestMetadata,
+        bindCurrentRequestToTab: @escaping BindCurrentRequestToTab,
+        agentModeVM: AgentModeViewModel,
+        agentRaw: String?,
+        modelRaw: String?,
+        reasoningEffortRaw: String?,
+        taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
+        workflow: AgentWorkflowDefinition? = nil,
+        expectedParentSessionID: UUID? = nil,
+        oracleReviewSource: AgentRunOracleReviewSource? = nil,
+        preserveRoutedInitialEffort: Bool = false,
+        dispatchInstruction: DispatchInstruction? = nil,
+        startExpiry: AgentRunStartExpiry? = nil
+    ) async throws -> StartOutcome {
+        try await startWithBindingDisposition(
+            target: target,
+            message: message,
+            metadata: metadata,
+            bindingDisposition: .applyRequestBindingPolicy(bindCurrentRequestToTab),
+            agentModeVM: agentModeVM,
+            agentRaw: agentRaw,
+            modelRaw: modelRaw,
+            reasoningEffortRaw: reasoningEffortRaw,
+            taskLabelKind: taskLabelKind,
+            workflow: workflow,
+            expectedParentSessionID: expectedParentSessionID,
+            oracleReviewSource: oracleReviewSource,
+            preserveRoutedInitialEffort: preserveRoutedInitialEffort,
+            dispatchInstruction: dispatchInstruction,
+            startExpiry: startExpiry
+        )
+    }
+
+    private static func startWithBindingDisposition(
+        target: AgentModeViewModel.MCPSessionTarget,
+        message: String,
+        metadata: MCPRequestMetadata,
+        bindingDisposition: RequestBindingDisposition,
+        agentModeVM: AgentModeViewModel,
+        agentRaw: String?,
+        modelRaw: String?,
+        reasoningEffortRaw: String?,
+        taskLabelKind: AgentModelCatalog.TaskLabelKind?,
+        workflow: AgentWorkflowDefinition?,
+        expectedParentSessionID: UUID?,
+        oracleReviewSource: AgentRunOracleReviewSource?,
+        preserveRoutedInitialEffort: Bool,
+        dispatchInstruction: DispatchInstruction?,
+        startExpiry: AgentRunStartExpiry?,
+        remoteAttachments: [AgentFileAttachment]? = nil,
+        remoteInterviewFirst: Bool? = nil,
+        validateDispatch: (@MainActor () throws -> Void)? = nil,
+        workspaceAuthority: AgentModeViewModel.MCPWorkspaceTargetAuthority? = nil
+    ) async throws -> StartOutcome {
+        let resolvedModel: String?
+        let resolvedEffort: String?
+        if let reasoningEffortRaw {
+            resolvedModel = modelRaw
+            resolvedEffort = reasoningEffortRaw
+        } else {
+            let extracted = extractReasoningEffort(from: modelRaw)
+            resolvedModel = extracted.model
+            resolvedEffort = extracted.effort
+        }
+        guard let sessionID = target.sessionID else {
+            throw MCPError.internalError("Failed to resolve target agent session ID.")
+        }
+        #if DEBUG
+            agentModeVM.perfRecorder.event("mcp.routing.externalRunStarterActivate", tabID: target.tabID, fields: [
+                "sessionID": sessionID.uuidString,
+                "connectionID": metadata.connectionID?.uuidString ?? "nil",
+                "clientName": metadata.clientName ?? "nil",
+                "windowID": metadata.windowID.map(String.init) ?? "nil",
+                "taskLabel": taskLabelKind?.rawValue ?? "nil",
+                "agent": agentRaw ?? "nil",
+                "model": resolvedModel ?? "nil",
+                "workflowID": workflow?.id ?? "nil",
+                "workflowName": workflow?.displayName ?? "nil"
+            ])
+        #endif
+        func requireWorkspaceAuthority() throws {
+            try validateDispatch?()
+            if let workspaceAuthority {
+                try agentModeVM.requireCurrentMCPWorkspaceTarget(
+                    workspaceAuthority.target,
+                    expectedWorkspaceID: workspaceAuthority.expectedWorkspaceID,
+                    allowMatchingControlledSession: workspaceAuthority.allowMatchingControlledSession
+                )
+            }
+        }
+        // A fresh target remains creation-owned through control, model and request setup.
+        // Only the complete initial configuration may cross the first durable-save boundary.
+        let ownedActivation: AgentModeViewModel.AgentMCPControlContext
+        do {
+            try requireWorkspaceAuthority()
+            ownedActivation = try await agentModeVM.mcpActivateControlContext(
+                forTabID: target.tabID,
+                sessionID: sessionID,
+                originatingConnectionID: metadata.connectionID,
+                taskLabelKind: taskLabelKind,
+                startPending: true,
+                creationHandle: target.creationHandle
+            )
+        } catch {
+            // Activation owns rollback of its registration. Do not tear down a different
+            // context if this attempt failed before returning an owned activation.
+            agentModeVM.failSessionCreation(
+                target.creationHandle,
+                message: "This session did not finish preparing its first run. Create a new session."
+            )
+            throw error
+        }
+
+        // All failures after activation may clean up only this exact inactive producer.
+        let activatedSession = agentModeVM.session(for: target.tabID, createIfNeeded: false)
+        do {
+            let outcome = try await finishPendingStart(
+                sessionID: sessionID, tabID: target.tabID, session: activatedSession,
+                ownedActivation: ownedActivation, expiry: startExpiry, actions: .init(
+                    ownerIsCurrent: { agentModeVM.session(for: target.tabID, createIfNeeded: false) === activatedSession },
+                    configure: {
+                        if let oracleReviewSource {
+                            try agentModeVM.mcpStageAgentRunOracleReviewSource(
+                                oracleReviewSource, targetTabID: target.tabID,
+                                targetSessionID: sessionID, expectedParentSessionID: expectedParentSessionID
+                            )
+                        }
+                        try await agentModeVM.mcpConfigureSession(
+                            tabID: target.tabID, agentRaw: agentRaw, modelRaw: resolvedModel,
+                            reasoningEffortRaw: resolvedEffort, requireInactiveRunState: true,
+                            validateDispatch: validateDispatch, workspaceAuthority: workspaceAuthority,
+                            creationHandle: target.creationHandle
+                        )
+                    }, prepareRequestBinding: {
+                        switch bindingDisposition {
+                        case .preserveCallerBinding:
+                            #if DEBUG
+                                agentModeVM.perfRecorder.event("mcp.routing.externalRunStarterPreservedCallerBinding", tabID: target.tabID, fields: [
+                                    "sessionID": sessionID.uuidString,
+                                    "connectionID": metadata.connectionID?.uuidString ?? "nil",
+                                    "windowID": metadata.windowID.map(String.init) ?? "nil"
+                                ])
+                            #endif
+                        case let .applyRequestBindingPolicy(bindCurrentRequestToTab):
+                            try await bindCurrentRequestToTab(target.tabID, metadata, startExpiry)
+                            #if DEBUG
+                                agentModeVM.perfRecorder.event("mcp.routing.externalRunStarterBoundRequest", tabID: target.tabID, fields: [
+                                    "sessionID": sessionID.uuidString,
+                                    "connectionID": metadata.connectionID?.uuidString ?? "nil",
+                                    "windowID": metadata.windowID.map(String.init) ?? "nil"
+                                ])
+                            #endif
+                        }
+                    }, commitConfiguration: {
+                        guard await agentModeVM.commitConfiguredSessionCreation(target: target) else {
+                            throw MCPError.internalError("Failed to persist the configured agent session before starting it.")
+                        }
+                    }, dispatch: { requirePendingStart in
+                        if let dispatchInstruction {
+                            return try await dispatchInstruction(sessionID, target.tabID, message, workflow, agentModeVM)
+                        }
+                        return try await agentModeVM.mcpDispatchInstruction(
+                            sessionID: sessionID, text: message, allowStartingRun: true, workflow: workflow,
+                            preserveRoutedInitialEffort: preserveRoutedInitialEffort, remoteAttachments: remoteAttachments,
+                            remoteInterviewFirst: remoteInterviewFirst,
+                            validateInitialStart: requirePendingStart
+                        )
+                    }, snapshot: { await resolveInitialSnapshot(sessionID: sessionID, agentModeVM: agentModeVM) },
+                    requireAuthority: requireWorkspaceAuthority
+                )
+            )
+            #if DEBUG
+                agentModeVM.perfRecorder.event("mcp.routing.externalRunStarterDispatched", tabID: target.tabID, fields: [
+                    "sessionID": sessionID.uuidString,
+                    "connectionID": metadata.connectionID?.uuidString ?? "nil",
+                    "snapshotStatus": outcome.snapshot.status.rawValue
+                ])
+            #endif
+            return outcome
+        } catch {
+            agentModeVM.failSessionCreation(
+                target.creationHandle,
+                message: "This session did not finish preparing its first run. Create a new session."
+            )
+            if let activatedSession,
+               agentModeVM.session(for: target.tabID, createIfNeeded: false) === activatedSession,
+               activatedSession.mcpControlContext == ownedActivation
+            {
+                _ = await agentModeVM.mcpDeactivateOwnedControlContext(
+                    sessionID: sessionID,
+                    expectedContext: ownedActivation
+                )
+            }
+            throw error
+        }
+    }
+
+    private static func resolveInitialSnapshot(
+        sessionID: UUID,
+        agentModeVM: AgentModeViewModel
+    ) async -> AgentRunMCPSnapshot {
+        await resolveInitialSnapshot(sessionID: sessionID, registration: agentModeVM.mcpRuntime.registration(sessionID: sessionID)) {
+            agentModeVM.mcpSnapshot(registration: $0)
+        }
+    }
+
+    static func resolveInitialSnapshot(
+        sessionID: UUID, registration: AgentRunSessionStore.Registration?,
+        live: @MainActor (AgentRunSessionStore.Registration) -> AgentRunMCPSnapshot?
+    ) async -> AgentRunMCPSnapshot {
+        guard let registration else { return .expired(sessionID: sessionID) }
+        if let liveSnapshot = live(registration) {
+            return liveSnapshot
+        }
+        if let storedSnapshot = await AgentRunSessionStore.snapshot(for: registration) {
+            return storedSnapshot
+        }
+        await Task.yield()
+        if let liveSnapshot = live(registration) {
+            return liveSnapshot
+        }
+        if let storedSnapshot = await AgentRunSessionStore.snapshot(for: registration) {
+            return storedSnapshot
+        }
+        return .expired(sessionID: sessionID)
+    }
+}

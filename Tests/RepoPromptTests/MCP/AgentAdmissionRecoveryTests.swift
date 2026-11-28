@@ -1,6 +1,8 @@
+import MCP
 import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+@testable import RepoPromptMCPServer
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
 import RepoPromptShared
@@ -10,6 +12,156 @@ import XCTest
 #if DEBUG
     @MainActor
     final class AgentAdmissionRecoveryTests: XCTestCase {
+        func testIndependentAdmissionRecoverySavesOnlyItsFencedWorkingRemoval() async throws {
+            try await checkIndependentAdmissionRecovery(superseded: false)
+        }
+
+        func testIndependentAdmissionRecoveryDoesNotSaveSupersedingWorkingRevision() async throws {
+            try await checkIndependentAdmissionRecovery(superseded: true)
+        }
+
+        private func checkIndependentAdmissionRecovery(superseded: Bool) async throws {
+            let sessionID = UUID()
+            let provisional = ComposeTabState(name: "Provisional child", activeAgentSessionID: sessionID)
+            let peer = ComposeTabState(name: "Peer", promptText: "preserve this exact peer")
+            let workspace = WorkspaceModel(
+                name: "Independent admission recovery", repoPaths: [],
+                composeTabs: [peer, provisional], activeComposeTabID: peer.id
+            )
+            let store = try await seedIndependentWorkspace(workspace)
+            let beforeRead = await store.canonicalWorkspaceSnapshot(workspace.id)
+            let before = try XCTUnwrap(beforeRead)
+            XCTAssertTrue(before.health.acceptsMutations)
+            XCTAssertNil(before.revisions.dirtyRevision)
+
+            let identity = AgentProvisionalAdmissionIdentity(
+                recoveryID: UUID(), workspaceID: workspace.id, tabID: provisional.id,
+                sessionID: sessionID, replacementTabID: UUID()
+            )
+            var ownedCommit: AgentAdmissionRecoveryWorkingCommit?
+            let workingCommit = WorkspaceAgentAdmissionRecovery.WorkingCommit(
+                read: { ownedCommit }, record: { ownedCommit = $0 }, forget: { ownedCommit = nil }
+            )
+            let origin = DomainCommandOrigin.appMCP(connectionID: UUID())
+            let failedFirstSave = await WorkspaceAgentAdmissionRecovery.recover(
+                identity: identity, mutation: .removeTab, store: store, origin: origin,
+                decode: { try JSONDecoder().decode(WorkspaceModel.self, from: $0.documentBytes) },
+                workingCommit: workingCommit, projection: WorkspaceAgentAdmissionRecovery.independentProjection,
+                hooks: .init(allowWorkingSave: { _ in false })
+            )
+            let owned = try XCTUnwrap(ownedCommit)
+            XCTAssertEqual(failedFirstSave, .retryablePartial(owned))
+            XCTAssertEqual(owned.revision, before.revisions.workingRevision + 1)
+            let dirtyRead = await store.canonicalWorkspaceSnapshot(workspace.id)
+            let dirty = try XCTUnwrap(dirtyRead)
+            XCTAssertEqual(dirty.revisions.dirtyRevision, owned.revision)
+            XCTAssertEqual(dirty.document.contentDigest, owned.digest)
+            var interveningDocument: DomainWorkspaceDocument?
+            if superseded {
+                var changed = try JSONDecoder().decode(WorkspaceModel.self, from: dirty.document.documentBytes)
+                changed.composeTabs[0].promptText = "unrelated dirty peer edit"
+                let document = try WorkspaceAgentAdmissionDocument.encode(changed, fileURL: dirty.document.fileURL)
+                let competing = await WorkspaceAgentAdmissionDocument.execute(
+                    .replaceWorkingDocument(document), store: store, origin: .appMCP(connectionID: UUID()),
+                    expectedRevision: owned.revision
+                )
+                XCTAssertEqual(competing.disposition, .applied)
+                interveningDocument = document
+            }
+            let result = await WorkspaceAgentAdmissionRecovery.recover(
+                identity: identity, mutation: .removeTab, store: store, origin: origin,
+                decode: { try JSONDecoder().decode(WorkspaceModel.self, from: $0.documentBytes) },
+                workingCommit: workingCommit, projection: WorkspaceAgentAdmissionRecovery.independentProjection
+            )
+            XCTAssertNil(ownedCommit)
+            let afterRead = await store.canonicalWorkspaceSnapshot(workspace.id)
+            let after = try XCTUnwrap(afterRead)
+            if let interveningDocument {
+                XCTAssertEqual(result, .ownershipChanged)
+                XCTAssertEqual(after.revisions.workingRevision, owned.revision + 1)
+                XCTAssertEqual(after.revisions.dirtyRevision, after.revisions.workingRevision)
+                XCTAssertEqual(after.document.contentDigest, interveningDocument.contentDigest)
+                XCTAssertEqual(after.revisions.savedRevision, before.revisions.savedRevision)
+                return
+            }
+            XCTAssertEqual(result, .recovered(revision: owned.revision, digest: owned.digest))
+            XCTAssertNil(after.revisions.dirtyRevision)
+            XCTAssertEqual(after.revisions.workingRevision, owned.revision, "Retry must not replace the owned working bytes")
+            let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: after.document.documentBytes)
+            XCTAssertEqual(canonical.composeTabs, [peer])
+            XCTAssertEqual(canonical.activeComposeTabID, peer.id)
+            let saved = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: after.document.fileURL))
+            XCTAssertEqual(saved, canonical)
+        }
+
+        func testCanonicalBackgroundTabPublishesOnlyAfterBlockedWriterAndDiscardsExactly() async throws {
+            let foreground = ComposeTabState(name: "Foreground", promptText: "preserve original foreground")
+            let workspace = WorkspaceModel(
+                name: "Independent child admission", repoPaths: [], composeTabs: [foreground], activeComposeTabID: foreground.id
+            )
+            let store = try await seedIndependentWorkspace(workspace)
+            let allocation = AgentSessionCreationClaim(workspaceID: workspace.id)
+            let runtimeStore = AgentSessionRuntimeStore()
+            let scope = runtimeStore.makeScope()
+            let tab = ComposeTabState(name: "Child", activeAgentSessionID: allocation.sessionID)
+            var creationCommand: AgentSessionRuntimeStore.Command?
+            let coordinator = WorkspaceAgentAdmissionCoordinator()
+            let transaction = WorkspaceAgentCanonicalFreshAdmission(
+                authority: .init(store: store, windowID: -910), connectionID: UUID(), coordinator: coordinator
+            )
+            let result = try await transaction.publish(workspaceID: workspace.id, sessionID: allocation.sessionID, adapters: .init(
+                makeTab: { _ in tab }, prepareWriter: { candidate in
+                    XCTAssertEqual(candidate, tab)
+                    let session = scope.makeSession(tabID: candidate.id)
+                    session.beginPersistentBindingTransition()
+                    session.installPersistentSessionBinding(.init(
+                        tabID: session.tabID, sessionID: allocation.sessionID, workspaceID: workspace.id
+                    ))
+                    guard let handle = session.acceptFreshCreation(allocation, workspaceID: workspace.id) else { return false }
+                    scope.replaceSessions([session.tabID: session])
+                    creationCommand = try? scope.admit(session: session, expectedWorkspaceID: workspace.id, requirement: .creation(handle))
+                    XCTAssertNil(try? scope.admit(session: session, expectedWorkspaceID: workspace.id), "A provisional writer cannot run")
+                    return creationCommand != nil
+                }, ownsWriter: { creationCommand?.isCurrent == true }, validateSource: { true }, sourceIsCurrent: { true }
+            ))
+            guard case let .created(created, receipt, claim) = result else {
+                return XCTFail("The exact independent carrier did not commit: \(result)")
+            }
+            XCTAssertEqual(created, tab)
+            XCTAssertTrue(coordinator.hasActiveProvisionalSession(workspaceID: workspace.id, sessionID: allocation.sessionID))
+            let savedRead = await store.canonicalWorkspaceSnapshot(workspace.id)
+            let saved = try XCTUnwrap(savedRead)
+            XCTAssertEqual(receipt.commitEvidence, .saved(revision: saved.revisions.savedRevision, digest: saved.document.contentDigest))
+            let projected = try JSONDecoder().decode(WorkspaceModel.self, from: saved.document.documentBytes)
+            XCTAssertEqual(projected.composeTabs, [foreground, tab])
+            XCTAssertEqual(projected.activeComposeTabID, foreground.id, "Background admission may not select its carrier")
+            let removal = await transaction.discard(claim) { creationCommand?.isCurrent == true }
+            guard case .recovered = removal else { return XCTFail("Unexpected compensation: \(removal)") }
+            let compensatedRead = await store.canonicalWorkspaceSnapshot(workspace.id)
+            let compensated = try XCTUnwrap(compensatedRead)
+            XCTAssertNil(compensated.revisions.dirtyRevision)
+            let surviving = try JSONDecoder().decode(WorkspaceModel.self, from: compensated.document.documentBytes)
+            XCTAssertEqual(surviving.composeTabs, [foreground])
+            XCTAssertEqual(surviving.activeComposeTabID, foreground.id)
+            XCTAssertFalse(coordinator.hasActiveProvisionalSession(workspaceID: workspace.id, sessionID: allocation.sessionID))
+        }
+
+        private func seedIndependentWorkspace(_ workspace: WorkspaceModel) async throws -> DomainWorkspaceStore {
+            _ = try writeWorkspace(workspace)
+            try writeIndex([workspace])
+            let runtime = MCPDomainRuntime(configuration: .init(
+                mode: .app, profileIdentifier: "independent-admission-\(UUID().uuidString)",
+                storageDirectory: storageRoot.appendingPathComponent("independent-state", isDirectory: true),
+                workspaceStorageDirectory: storageRoot,
+                eventDirectory: storageRoot.appendingPathComponent("independent-events", isDirectory: true),
+                temporaryDirectory: storageRoot.appendingPathComponent("independent-tmp", isDirectory: true),
+                externalReloadInterval: nil
+            ))
+            runtimes.append(runtime)
+            try await runtime.start()
+            return runtime.workspaceStore
+        }
+
         func testAdmissionTimingUsesRealFreshAndExistingTabSaveScopes() async throws {
             for kind in [WorkspaceAgentAdmissionTiming.Kind.freshTab, .existingTab] {
                 let coordinator = WorkspaceAgentAdmissionCoordinator()
@@ -4049,6 +4201,371 @@ import XCTest
             )
             XCTAssertEqual(postAcceptanceLookup.tabID, successor.tabID)
             XCTAssertNil(postAcceptanceLookup.recoveryClaim)
+        }
+
+        func testPerformWorkspaceAdoptionCancelWithoutSuccessorCompletesDiscoveryEpoch() async throws {
+            let fixture = try await establishCleanActiveWorkspaceBaseline()
+            let agent = makeAgentModeViewModel(for: fixture)
+            defer {
+                agent.runService.testBeforeCancellationCommit = nil
+            }
+            addTeardownBlock { @MainActor in
+                await agent.test_retireAndCancelFixture()
+            }
+
+            let activeSession = agent.session(for: fixture.leftTab.id)
+            activeSession.runState = .running
+            activeSession.installRunID(UUID())
+
+            var enteredCancellation = false
+            var releaseCancellation: CheckedContinuation<Void, Never>?
+            agent.runService.testBeforeCancellationCommit = { _ in
+                enteredCancellation = true
+                await withCheckedContinuation { continuation in
+                    releaseCancellation = continuation
+                }
+            }
+
+            let targetWorkspace = fixture.workspaceA
+            let switchTask = Task { @MainActor in
+                await agent.handleWorkspaceSwitch(targetWorkspace)
+            }
+            defer {
+                releaseCancellation?.resume()
+                releaseCancellation = nil
+                switchTask.cancel()
+            }
+
+            try await AsyncTestWait.waitUntil("suspend legacy teardown inside cancelAgentRun") {
+                enteredCancellation && releaseCancellation != nil
+            }
+            XCTAssertFalse(agent.agentSessionLinkDiscoveryState.isComplete)
+            XCTAssertTrue(agent.workspaceSwitchInFlight)
+
+            // Cancel the adoption task with NO successor switch; E8-E10 must settle discoveryEpoch.
+            switchTask.cancel()
+            releaseCancellation?.resume()
+            releaseCancellation = nil
+            await switchTask.value
+
+            XCTAssertTrue(
+                agent.agentSessionLinkDiscoveryState.isComplete,
+                "Cancelling adoption without a successor must not leak an open discoveryEpoch"
+            )
+            XCTAssertEqual(agent.agentSessionLinkDiscoveryState.epoch.workspaceID, targetWorkspace.id)
+            XCTAssertFalse(agent.workspaceSwitchInFlight)
+            XCTAssertNil(agent.activeSessionLoadInProgressTabID)
+            XCTAssertEqual(agent.test_sessionIndexOwner?.workspaceID, targetWorkspace.id)
+        }
+
+        func testAgentRunPollAndWaitSurfaceActivationFailureOnlyWhenUnregistered() async throws {
+            let directory = storageRoot.appendingPathComponent("activation-poll-wait-\(UUID().uuidString)", isDirectory: true)
+            let runtime = MCPDomainRuntime(configuration: .init(
+                mode: .app,
+                profileIdentifier: "activation-poll-wait-\(UUID().uuidString)",
+                storageDirectory: directory,
+                workspaceStorageDirectory: directory.appendingPathComponent("workspaces", isDirectory: true),
+                eventDirectory: directory.appendingPathComponent("events", isDirectory: true),
+                temporaryDirectory: directory.appendingPathComponent("tmp", isDirectory: true),
+                externalReloadInterval: nil
+            ))
+            try await runtime.start()
+            addTeardownBlock {
+                _ = await runtime.shutdown()
+            }
+
+            let transport = MCPService(
+                controller: ServerController(),
+                hostBootstrapOperation: {},
+                controllerStartOperation: {},
+                controllerFullShutdownOperation: {}
+            )
+            addTeardownBlock {
+                await transport.fullShutdown()
+            }
+
+            let liveSessionID = UUID()
+            let terminalSessionID = UUID()
+            let unregisteredSessionID = UUID()
+            let liveTab = ComposeTabState(name: "Live MCP", activeAgentSessionID: liveSessionID)
+            let terminalTab = ComposeTabState(name: "Terminal MCP", activeAgentSessionID: terminalSessionID)
+            var workspaceA = WorkspaceModel(
+                name: "Activation Poll A",
+                repoPaths: [],
+                customStoragePath: directory.appendingPathComponent("sessions-a", isDirectory: true)
+            )
+            workspaceA.composeTabs = [liveTab, terminalTab]
+            workspaceA.activeComposeTabID = liveTab.id
+
+            let failedTab = ComposeTabState(name: "Failed Activation", activeAgentSessionID: unregisteredSessionID)
+            var workspaceB = WorkspaceModel(
+                name: "Activation Poll B",
+                repoPaths: [],
+                customStoragePath: directory.appendingPathComponent("sessions-b", isDirectory: true)
+            )
+            workspaceB.composeTabs = [failedTab]
+            workspaceB.activeComposeTabID = failedTab.id
+
+            let authority = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: 0)
+            _ = try await authority.create(
+                workspaceA,
+                fileURL: runtime.configuration.workspaceStorageDirectory.appendingPathComponent("\(workspaceA.id.uuidString).json")
+            )
+            _ = try await authority.create(
+                workspaceB,
+                fileURL: runtime.configuration.workspaceStorageDirectory.appendingPathComponent("\(workspaceB.id.uuidString).json")
+            )
+            _ = try await AgentSessionDataService.shared.saveAgentSession(
+                AgentSession(
+                    id: liveSessionID,
+                    workspaceID: workspaceA.id,
+                    composeTabID: liveTab.id,
+                    name: "Live registered session",
+                    itemCount: 0
+                ),
+                for: workspaceA
+            )
+            _ = try await AgentSessionDataService.shared.saveAgentSession(
+                AgentSession(
+                    id: terminalSessionID,
+                    workspaceID: workspaceA.id,
+                    composeTabID: terminalTab.id,
+                    name: "Terminal registered session",
+                    itemCount: 0
+                ),
+                for: workspaceA
+            )
+            _ = try await AgentSessionDataService.shared.saveAgentSession(
+                AgentSession(
+                    id: unregisteredSessionID,
+                    workspaceID: workspaceB.id,
+                    composeTabID: failedTab.id,
+                    name: "Unregistered failed-workspace session",
+                    itemCount: 0
+                ),
+                for: workspaceB
+            )
+
+            let window = WindowState(
+                domainRuntime: runtime,
+                visibleAgentProviderResources: .live(),
+                mcpTransport: transport
+            )
+            WindowStatesManager.shared.registerWindowState(window)
+            addTeardownBlock { @MainActor in
+                let host = window.agentModeViewModel.runtimeHost
+                if WindowStatesManager.shared.allWindows.contains(where: { $0 === window }) {
+                    WindowStatesManager.shared.unregisterWindowState(window)
+                    await window.tearDown()
+                }
+                if host.workspaceActivation != nil, !host.scope.hasReleasedWriterClaims {
+                    _ = await AgentSessionHostDrainRuntime.shutdown([host.beginFinalShutdown()])
+                }
+            }
+
+            let manager = window.workspaceManager
+            let agent = window.agentModeViewModel
+            try await AsyncTestWait.waitUntil("project canonical workspaces") {
+                manager.workspace(withID: workspaceA.id) != nil && manager.workspace(withID: workspaceB.id) != nil
+            }
+            let switchToA = await manager.requestWorkspaceSwitch(
+                to: workspaceA,
+                reason: "activationPollWaitTestA",
+                silent: true
+            )
+            XCTAssertTrue(switchToA.didSwitch)
+            let adoptedA = await agent.awaitWorkspaceRuntimeAdoption(expectedWorkspaceID: workspaceA.id)
+            XCTAssertTrue(adoptedA)
+            let outgoingHost = agent.runtimeHost
+            XCTAssertEqual(outgoingHost.workspaceActivation?.key.owner.workspaceID, workspaceA.id)
+
+            let liveSession = await agent.ensureSessionReady(tabID: liveTab.id)
+            liveSession.isMCPOriginated = true
+            let liveContext = try await agent.mcpActivateControlContext(
+                forTabID: liveTab.id,
+                sessionID: liveSessionID,
+                originatingConnectionID: nil,
+                taskLabelKind: .pair,
+                startPending: true
+            )
+            addTeardownBlock {
+                await AgentRunSessionStore.cleanup(registration: liveContext.registration)
+            }
+            let liveBeginResult = await AgentRunSessionStore.beginEpoch(
+                registration: liveContext.registration,
+                activationID: liveContext.activationID,
+                expectedCurrentEpoch: nil,
+                transitionKind: .initial
+            )
+            guard case let .accepted(liveEpoch) = liveBeginResult else {
+                return XCTFail("Expected accepted epoch for live test registration, got \(liveBeginResult)")
+            }
+            liveSession.mcpControlContext?.currentEpoch = liveEpoch
+            liveSession.runState = .waitingForUser
+            liveSession.mcpFollowUpRunPending = false
+            XCTAssertEqual(agent.mcpSnapshot(registration: liveContext.registration)?.status, .waitingForInput)
+
+            let terminalSession = await agent.ensureSessionReady(tabID: terminalTab.id)
+            terminalSession.isMCPOriginated = true
+            let terminalContext = try await agent.mcpActivateControlContext(
+                forTabID: terminalTab.id,
+                sessionID: terminalSessionID,
+                originatingConnectionID: nil,
+                taskLabelKind: .pair,
+                startPending: true
+            )
+            addTeardownBlock {
+                await AgentRunSessionStore.cleanup(registration: terminalContext.registration)
+            }
+            let beginResult = await AgentRunSessionStore.beginEpoch(
+                registration: terminalContext.registration,
+                activationID: terminalContext.activationID,
+                expectedCurrentEpoch: nil,
+                transitionKind: .initial
+            )
+            guard case let .accepted(terminalEpoch) = beginResult else {
+                return XCTFail("Expected accepted epoch for terminal test registration, got \(beginResult)")
+            }
+            terminalSession.mcpControlContext?.currentEpoch = terminalEpoch
+            // Transition runState while mcpFollowUpRunPending is still true so Combine's willSet
+            // observer never publishes a spurious .completed snapshot for the prior .idle state.
+            terminalSession.runState = .running
+            let terminalSnapshot = AgentRunMCPSnapshot(
+                sessionID: terminalSessionID,
+                tabID: terminalTab.id,
+                sessionName: "Terminal registered session",
+                agentRaw: AgentProviderKind.openCode.rawValue,
+                agentDisplayName: AgentProviderKind.openCode.displayName,
+                modelRaw: "test-model",
+                reasoningEffortRaw: nil,
+                status: .completed,
+                statusText: nil,
+                latestAssistantPreview: "Terminal authoritative result",
+                interaction: nil,
+                transcriptItemCount: 1,
+                updatedAt: Date(),
+                parentSessionID: nil,
+                failureReason: nil,
+                worktreeBindings: [],
+                activeWorktreeMerges: []
+            )
+            let publishResult = await AgentRunSessionStore.publishTerminal(
+                AgentRunTerminalPublicationEnvelope(epoch: terminalEpoch, snapshot: terminalSnapshot),
+                registration: terminalContext.registration,
+                commitID: UUID(),
+                successorKind: nil
+            )
+            guard case .accepted = publishResult else {
+                return XCTFail("Expected accepted terminal publication, got \(publishResult)")
+            }
+            let storedTerminalSnapshot = await AgentRunSessionStore.snapshot(for: terminalContext.registration)
+            XCTAssertEqual(storedTerminalSnapshot, terminalSnapshot)
+
+            let originalPrepare = try XCTUnwrap(agent.canonicalWorkspaceHostPreparation)
+            agent.canonicalWorkspaceHostPreparation = { candidate, owner, activations in
+                if candidate.id == workspaceB.id {
+                    throw AgentHostWorkspaceResources.Failure.authorityUnavailable
+                }
+                return try await originalPrepare(candidate, owner, activations)
+            }
+            let switchToB = await manager.requestWorkspaceSwitch(
+                to: workspaceB,
+                reason: "activationPollWaitTestB",
+                silent: true
+            )
+            XCTAssertTrue(switchToB.didSwitch)
+            let adoptedB = await agent.awaitWorkspaceRuntimeAdoption(expectedWorkspaceID: workspaceB.id)
+            XCTAssertFalse(adoptedB)
+            XCTAssertEqual(agent.refusedWorkspaceActivationOwner?.workspaceID, workspaceB.id)
+            XCTAssertTrue(agent.runtimeHost === outgoingHost)
+
+            let expectedRefusalMessage = "Agent Mode could not start for this workspace. Use Retry in Agent Mode, then run this command again."
+            if case let .invalidParams(message)? = agent.workspaceActivationRefusalMCPError(expectedWorkspaceID: workspaceB.id) {
+                XCTAssertEqual(message, expectedRefusalMessage)
+            } else {
+                XCTFail("Expected activation refusal error for active refused workspace")
+            }
+            if case let .invalidParams(message)? = agent.workspaceActivationRefusalMCPError(expectedWorkspaceID: nil) {
+                XCTAssertEqual(message, expectedRefusalMessage)
+            } else {
+                XCTFail("Expected activation refusal error when expectedWorkspaceID is nil")
+            }
+            XCTAssertNil(agent.workspaceActivationRefusalMCPError(expectedWorkspaceID: workspaceA.id))
+
+            let service = AgentRunMCPToolService(
+                toolName: MCPWindowToolName.agentRun,
+                captureRequestMetadata: { .init(connectionID: nil, clientName: nil, windowID: window.windowID) },
+                requireTargetWindow: { window },
+                resolveRequestedTabID: { _ in nil },
+                resolveSpawnParentSourceTabID: { _ in nil },
+                resolveSpawnParentSessionID: { _, _ in nil },
+                withHeartbeat: { _, _, _, _, operation in try await operation() },
+                startRun: { _, _, _, _, _, _, _, _, _, _, _, _, _ in
+                    throw MCPError.internalError("Unexpected run dispatch")
+                }
+            )
+
+            for request: [String: Value] in [
+                ["op": .string("poll"), "session_id": .string(unregisteredSessionID.uuidString)],
+                ["op": .string("wait"), "session_id": .string(unregisteredSessionID.uuidString), "timeout": .int(1)],
+                [
+                    "op": .string("poll"),
+                    "session_ids": .array([.string(liveSessionID.uuidString), .string(unregisteredSessionID.uuidString)])
+                ],
+                [
+                    "op": .string("wait"),
+                    "session_ids": .array([.string(liveSessionID.uuidString), .string(unregisteredSessionID.uuidString)]),
+                    "timeout": .int(1)
+                ]
+            ] {
+                do {
+                    _ = try await service.execute(args: request)
+                    XCTFail("Expected activation refusal error for unregistered request \(request)")
+                } catch {
+                    guard case let MCPError.invalidParams(message) = error else {
+                        return XCTFail("Unexpected error for unregistered request: \(error)")
+                    }
+                    XCTAssertEqual(message, expectedRefusalMessage)
+                }
+            }
+
+            for request: [String: Value] in [
+                ["op": .string("poll"), "session_id": .string(liveSessionID.uuidString)],
+                ["op": .string("wait"), "session_id": .string(liveSessionID.uuidString), "timeout": .int(1)]
+            ] {
+                let value = try await service.execute(args: request)
+                XCTAssertEqual(value.objectValue?["session_id"], .string(liveSessionID.uuidString))
+                XCTAssertEqual(value.objectValue?["status"], .string("waiting_for_input"))
+            }
+
+            for request: [String: Value] in [
+                ["op": .string("poll"), "session_id": .string(terminalSessionID.uuidString)],
+                ["op": .string("wait"), "session_id": .string(terminalSessionID.uuidString), "timeout": .int(1)]
+            ] {
+                let value = try await service.execute(args: request)
+                XCTAssertEqual(value.objectValue?["session_id"], .string(terminalSessionID.uuidString))
+                XCTAssertEqual(value.objectValue?["status"], .string("completed"))
+                XCTAssertEqual(value.objectValue?["assistant_text"], .string("Terminal authoritative result"))
+            }
+
+            let multiPoll = try await service.execute(args: [
+                "op": .string("poll"),
+                "session_ids": .array([.string(liveSessionID.uuidString), .string(terminalSessionID.uuidString)])
+            ])
+            let polledSnapshots = try XCTUnwrap(multiPoll.objectValue?["snapshots"]?.arrayValue)
+            XCTAssertEqual(polledSnapshots.count, 2)
+            XCTAssertEqual(polledSnapshots[0].objectValue?["session_id"], .string(liveSessionID.uuidString))
+            XCTAssertEqual(polledSnapshots[0].objectValue?["status"], .string("waiting_for_input"))
+            XCTAssertEqual(polledSnapshots[1].objectValue?["session_id"], .string(terminalSessionID.uuidString))
+            XCTAssertEqual(polledSnapshots[1].objectValue?["status"], .string("completed"))
+
+            let multiWait = try await service.execute(args: [
+                "op": .string("wait"),
+                "session_ids": .array([.string(liveSessionID.uuidString), .string(terminalSessionID.uuidString)]),
+                "timeout": .int(1)
+            ])
+            XCTAssertEqual(multiWait.objectValue?["session_id"], .string(liveSessionID.uuidString))
+            XCTAssertEqual(multiWait.objectValue?["status"], .string("waiting_for_input"))
         }
 
         private struct Fixture {

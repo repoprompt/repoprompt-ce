@@ -54,6 +54,7 @@ final class HeadlessAgentModeRunner {
         }
         let binding = session.currentRestorationBindingToken
         let ownership = session.beginRunAttempt(source: "headless")
+        startOutcome?.recordNewAttempt(ownership)
         session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .preparingRuntime)
         session.runningStatusText = nil
         session.runningStatusSource = nil

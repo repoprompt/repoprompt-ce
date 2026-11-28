@@ -173,7 +173,7 @@ final class MCPSelectionToolProvider: MCPAppToolProviding {
         let sliceParseErrors = parsedInputs.sliceErrors
         let mode = args["mode"]?.stringValue?.lowercased() ?? "full"
         if try await (dependencies.context.requirePromptVM()).codeMapsGloballyDisabled, mode == "codemap_only" || op == "demote" {
-            throw MCPError.invalidParams(MCPServerViewModel.codeMapsGloballyDisabledMCPMessage)
+            throw MCPError.invalidParams(MCPSelectionArguments.codeMapsGloballyDisabledMCPMessage)
         }
         try Task.checkCancellation()
         let view = (args["view"]?.stringValue ?? "summary").lowercased()
@@ -246,7 +246,7 @@ final class MCPSelectionToolProvider: MCPAppToolProviding {
                 fence: nil
             )
         }
-        let physicalParsedInputs = MCPServerViewModel.ManageSelectionInputs(
+        let physicalParsedInputs = MCPSelectionArguments.Inputs(
             paths: lookupContext.translateInputPaths(artifactResolution.ordinaryPaths),
             sliceInputs: lookupContext.translateSliceInputs(artifactResolution.ordinarySliceInputs),
             sliceErrors: parsedInputs.sliceErrors,

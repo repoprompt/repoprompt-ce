@@ -259,7 +259,7 @@ final class MCPReadMutationPathContractTests: XCTestCase {
                 }
                 let task = Task {
                     do {
-                        let result = try await MCPServerViewModel.resolveReadFileRequestAfterFreshness(
+                        let result = try await MCPWorkspaceFileRead.resolveReadFileRequestAfterFreshness(
                             WorkspaceExactFileInput.parse(path),
                             readableService: readableService,
                             rootScope: .visibleWorkspace,
@@ -640,7 +640,7 @@ final class MCPReadMutationPathContractTests: XCTestCase {
             let completion = MCPPathContractReleaseGate(name: "qualified replay read completion")
             let readTask = Task { @MainActor in
                 let readableService = WorkspaceReadableFileService(store: fixture.store)
-                let resolution = try await MCPServerViewModel.resolveReadFileRequestAfterFreshness(
+                let resolution = try await MCPWorkspaceFileRead.resolveReadFileRequestAfterFreshness(
                     WorkspaceExactFileInput.parse(fixture.match.canonicalPath),
                     readableService: readableService,
                     rootScope: .visibleWorkspace,
@@ -651,7 +651,7 @@ final class MCPReadMutationPathContractTests: XCTestCase {
                 guard case let .workspace(match) = resolution else {
                     throw MCPPathContractTestError.unexpectedResolution(String(describing: resolution))
                 }
-                guard let snapshot = try await MCPServerViewModel.workspaceContentLoadForTesting(
+                guard let snapshot = try await MCPWorkspaceFileRead.workspaceContentLoadForTesting(
                     store: fixture.store,
                     file: match.file
                 ) else {
@@ -738,7 +738,7 @@ final class MCPReadMutationPathContractTests: XCTestCase {
             )
             let completion = MCPPathContractReleaseGate(name: "bare relative read completion")
             let readTask = Task { @MainActor in
-                let resolution = try await MCPServerViewModel.resolveReadFileRequestAfterFreshness(
+                let resolution = try await MCPWorkspaceFileRead.resolveReadFileRequestAfterFreshness(
                     .relative("Target.swift"),
                     readableService: WorkspaceReadableFileService(store: fixture.store),
                     rootScope: .visibleWorkspace,
@@ -776,7 +776,7 @@ final class MCPReadMutationPathContractTests: XCTestCase {
             )
             let completion = MCPPathContractReleaseGate(name: "unresolved qualified read completion")
             let readTask = Task { @MainActor in
-                let resolution = try await MCPServerViewModel.resolveReadFileRequestAfterFreshness(
+                let resolution = try await MCPWorkspaceFileRead.resolveReadFileRequestAfterFreshness(
                     .explicitRoot(alias: "MissingBinding", relativePath: "Target.swift"),
                     readableService: WorkspaceReadableFileService(store: fixture.store),
                     rootScope: .visibleWorkspace,
