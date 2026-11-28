@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 import RepoPromptSecureStorage
 
@@ -67,6 +68,7 @@ struct AgentPermissionStorageResetResult: Equatable {
 }
 
 extension Notification.Name {
+    static let agentPermissionPresentationDidChange = Notification.Name("RepoPrompt.agentPermissionPresentationDidChange")
     static let agentPermissionSecureStoreDidChange = Notification.Name("RepoPrompt.agentPermissionSecureStoreDidChange")
     static let agentPermissionSecureStoreDiagnosticsDidChange = Notification.Name("RepoPrompt.agentPermissionSecureStoreDiagnosticsDidChange")
 }
@@ -372,7 +374,9 @@ struct SecureAntigravityPermissionDocument: Codable, Equatable {
     }
 }
 
-final class AgentPermissionSecureStore {
+/// Backend access, document caches, and diagnostics are serialized by lock.
+/// Presentation uses its own short lock, which is never held during backend access.
+final class AgentPermissionSecureStore: @unchecked Sendable {
     static let shared = AgentPermissionSecureStore(secureStrings: SecureKeysService())
 
     private let secureStrings: SecurePlainStringStoring
@@ -382,6 +386,28 @@ final class AgentPermissionSecureStore {
     private let now: () -> Date
     private let notificationCenter: NotificationCenter
 
+    struct Documents: Equatable {
+        var codex: SecureCodexPermissionDocument?
+        var claude: SecureClaudePermissionDocument?
+        var openCode: SecureOpenCodePermissionDocument?
+        var cursor: SecureCursorPermissionDocument?
+        var grokBuild: SecureGrokBuildPermissionDocument?
+        var antigravity: SecureAntigravityPermissionDocument?
+        var devin: SecureDevinPermissionDocument?
+
+        func contains(_ providerID: AgentProviderBindingID) -> Bool {
+            switch providerID {
+            case .codex: codex != nil
+            case .claude: claude != nil
+            case .openCode: openCode != nil
+            case .cursor: cursor != nil
+            case .grokBuild: grokBuild != nil
+            case .antigravity: antigravity != nil
+            case .devin: devin != nil
+            }
+        }
+    }
+
     private var subagentCache: SecureSubagentPermissionDocument?
     private var codexCache: SecureCodexPermissionDocument?
     private var claudeCache: SecureClaudePermissionDocument?
@@ -390,6 +416,11 @@ final class AgentPermissionSecureStore {
     private var grokBuildCache: SecureGrokBuildPermissionDocument?
     private var antigravityCache: SecureAntigravityPermissionDocument?
     private var devinCache: SecureDevinPermissionDocument?
+    private var operationDepth = 0
+    private let presentationLock = NSLock()
+    private var presentedDocuments = Documents()
+    private var pendingPresentationLoads: Set<AgentProviderBindingID> = []
+    private let readQueue = DispatchQueue(label: "RepoPrompt.AgentPermissionSecureStore.read", qos: .userInitiated)
     private var diagnosticsByDomain: [AgentPermissionSecureDomain: AgentPermissionStorageDiagnostic] = [:]
     private let permissionDecisionAccessMode: KeychainAccessMode = .nonInteractive(reason: .permissionDecision)
 
@@ -431,7 +462,7 @@ final class AgentPermissionSecureStore {
     }
 
     func clearCachedDocuments() {
-        withLock {
+        withLockAndDeferredSideEffects { _ in
             subagentCache = nil
             codexCache = nil
             claudeCache = nil
@@ -440,6 +471,53 @@ final class AgentPermissionSecureStore {
             grokBuildCache = nil
             antigravityCache = nil
             devinCache = nil
+        }
+    }
+
+    /// Returns the latest committed cache contents and schedules at most one cold load
+    /// per provider. The load publishes under the same lock as writes and invalidation.
+    func presentationDocuments(for providerID: AgentProviderBindingID) -> Documents {
+        presentationLock.lock()
+        let snapshot = presentedDocuments
+        let shouldLoad = !snapshot.contains(providerID) && pendingPresentationLoads.insert(providerID).inserted
+        presentationLock.unlock()
+
+        if shouldLoad {
+            readQueue.async { [self] in
+                withLockAndDeferredSideEffects(finishingPresentationLoad: providerID) { effects in
+                    loadProviderPermissionsLocked(providerID, deferred: &effects)
+                }
+            }
+        }
+        return snapshot
+    }
+
+    /// Reads the last committed Codex document without waiting on the store or starting a load.
+    func cachedCodexPermissions() -> SecureCodexPermissionDocument? {
+        presentationLock.withLock { presentedDocuments.codex }
+    }
+
+    private func loadProviderPermissionsLocked(
+        _ providerID: AgentProviderBindingID,
+        deferred effects: inout DeferredSideEffects
+    ) {
+        switch providerID {
+        case .codex: _ = loadCodexPermissionsLocked(deferred: &effects)
+        case .claude: _ = loadClaudePermissionsLocked(deferred: &effects)
+        case .openCode: _ = loadOpenCodePermissionsLocked(deferred: &effects)
+        case .cursor: _ = loadCursorPermissionsLocked(deferred: &effects)
+        case .grokBuild: _ = loadGrokBuildPermissionsLocked(deferred: &effects)
+        case .antigravity: _ = loadAntigravityPermissionsLocked(deferred: &effects)
+        case .devin: _ = loadDevinPermissionsLocked(deferred: &effects)
+        }
+    }
+
+    /// Execution callers can await the canonical store without blocking their actor.
+    func readOffMain<Value: Sendable>(
+        _ read: @escaping @Sendable (AgentPermissionSecureStore) -> Value
+    ) async -> Value {
+        await withCheckedContinuation { continuation in
+            readQueue.async { [self] in continuation.resume(returning: read(self)) }
         }
     }
 
@@ -1304,13 +1382,39 @@ final class AgentPermissionSecureStore {
         return body()
     }
 
-    private func withLockAndDeferredSideEffects<T>(_ body: (inout DeferredSideEffects) -> T) -> T {
+    private func withLockAndDeferredSideEffects<T>(
+        finishingPresentationLoad providerID: AgentProviderBindingID? = nil,
+        _ body: (inout DeferredSideEffects) -> T
+    ) -> T {
         var effects = DeferredSideEffects()
-        let result: T = {
-            lock.lock()
-            defer { lock.unlock() }
-            return body(&effects)
-        }()
+        let (result, presentationChanged) = withLock {
+            operationDepth += 1
+            defer { operationDepth -= 1 }
+
+            let result = body(&effects)
+            guard operationDepth == 1 else { return (result, false) }
+            let documents = Documents(
+                codex: codexCache,
+                claude: claudeCache,
+                openCode: openCodeCache,
+                cursor: cursorCache,
+                grokBuild: grokBuildCache,
+                antigravity: antigravityCache,
+                devin: devinCache
+            )
+            let presentationChanged = presentationLock.withLock {
+                if let providerID {
+                    pendingPresentationLoads.remove(providerID)
+                }
+                guard presentedDocuments != documents else { return false }
+                presentedDocuments = documents
+                return true
+            }
+            return (result, presentationChanged)
+        }
+        if presentationChanged {
+            notificationCenter.post(name: .agentPermissionPresentationDidChange, object: self)
+        }
         performDeferredSideEffects(effects)
         return result
     }

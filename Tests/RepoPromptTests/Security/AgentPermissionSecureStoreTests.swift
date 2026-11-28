@@ -1,5 +1,7 @@
 import Foundation
+import RepoPromptAIContracts
 @testable import RepoPromptApp
+import RepoPromptCodexProvider
 import RepoPromptSecureStorage
 import XCTest
 
@@ -441,6 +443,168 @@ final class AgentPermissionSecureStoreTests: XCTestCase {
         XCTAssertEqual(saved.permissionLevel(), .autoEdit)
     }
 
+    @MainActor
+    func testComposerPermissionRefreshDoesNotWaitForBlockedClaudeRead() async throws {
+        let secureStrings = FakeSecurePlainStringStore()
+        secureStrings.plainValues[AgentPermissionSecureDomain.claude.storageKey] = try encode(
+            SecureClaudePermissionDocument(permissionModeRaw: ClaudeAgentToolPreferences.PermissionLevel.fullAccess.permissionMode)
+        )
+        secureStrings.plainValues[AgentPermissionSecureDomain.grokBuild.storageKey] = try encode(
+            SecureGrokBuildPermissionDocument(permissionLevelRaw: GrokBuildAgentToolPreferences.PermissionLevel.fullAccess.rawValue)
+        )
+        let entered = expectation(description: "Claude secure read entered")
+        let unblock = DispatchSemaphore(value: 0)
+        defer { unblock.signal() }
+        secureStrings.beforePlainRead = { account in
+            guard account == .agentPermissionClaudeDocument else { return }
+            XCTAssertFalse(Thread.isMainThread)
+            entered.fulfill()
+            XCTAssertEqual(unblock.wait(timeout: .now() + 5), .success)
+        }
+        let store = makeStore(secureStrings: secureStrings)
+        let bindings = try AgentModeProviderBindingService(preferences: AgentProviderPreferenceSnapshotStore(
+            defaults: XCTUnwrap(UserDefaults(suiteName: UUID().uuidString)),
+            securePermissions: store,
+            codexMCPServerEntries: { [] }
+        ))
+        func controls(_ provider: AgentProviderKind) -> AgentProviderControlsBinding {
+            bindings.controlsBinding(
+                selectedAgent: provider,
+                permissionProfile: .userConfigured,
+                isSubagent: false,
+                externallyManagedReason: nil
+            )
+        }
+
+        XCTAssertEqual(controls(.claudeCode).claudeTools?.bashToolEnabled, false)
+        await fulfillment(of: [entered], timeout: 3)
+        XCTAssertEqual(controls(.claudeCode).claudeTools?.mcpStrictModeEnabled, true)
+        XCTAssertNotNil(controls(.claudeCode).permission.externallyManagedReason)
+        XCTAssertFalse(controls(.grokBuild).runtimePermission.autoApproveAllACPToolPermissions)
+        XCTAssertNotNil(controls(.grokBuild).permission.externallyManagedReason)
+        unblock.signal()
+
+        // A write queued after hydration must be what a later presentation refresh sees.
+        let didRevoke = await store.readOffMain {
+            $0.setClaudePermissionLevel(.requireApproval)
+        }
+        XCTAssertTrue(didRevoke)
+        XCTAssertNil(controls(.claudeCode).permission.externallyManagedReason)
+        XCTAssertEqual(controls(.claudeCode).runtimePermission.claudePermissionMode, ClaudeAgentToolPreferences.PermissionLevel.requireApproval.permissionMode)
+        XCTAssertTrue(controls(.grokBuild).runtimePermission.autoApproveAllACPToolPermissions)
+        XCTAssertEqual(secureStrings.plainGetAccessModes, Array(repeating: .nonInteractive(reason: .permissionDecision), count: 2))
+
+        secureStrings.beforePlainRead = nil
+        store.clearCachedDocuments()
+        XCTAssertNotNil(controls(.claudeCode).permission.externallyManagedReason)
+        let reloaded = await store.readOffMain { $0.claudePermissions().permissionLevel().rawValue }
+        XCTAssertEqual(reloaded, ClaudeAgentToolPreferences.PermissionLevel.requireApproval.rawValue)
+    }
+
+    @MainActor
+    func testCodexStartupConfigAwaitsAuthoritativeReadAndFailsClosedOnDenial() async {
+        let secureStrings = FakeSecurePlainStringStore(plainGetError: KeychainService.KeychainError.interactionNotAllowed)
+        let entered = expectation(description: "Codex secure read entered")
+        let unblock = DispatchSemaphore(value: 0)
+        defer { unblock.signal() }
+        secureStrings.beforePlainRead = { account in
+            XCTAssertEqual(account, .agentPermissionCodexDocument)
+            XCTAssertFalse(Thread.isMainThread)
+            entered.fulfill()
+            XCTAssertEqual(unblock.wait(timeout: .now() + 5), .success)
+        }
+        let store = makeStore(secureStrings: secureStrings)
+        let options = CodexNativeSessionController.Options.agentModeDefault(
+            mcpServerEntriesProvider: { [] },
+            permissionReader: .init(secureStore: store)
+        )
+        let configTask = Task {
+            let config = await options.configOverridesProvider()
+            return config["features.shell_tool"] as? Bool
+        }
+        await fulfillment(of: [entered], timeout: 3)
+        XCTAssertNil(store.presentationDocuments(for: .codex).codex)
+        unblock.signal()
+
+        let shellEnabled = await configTask.value
+        XCTAssertEqual(shellEnabled, false)
+        XCTAssertEqual(secureStrings.plainGetAccessModes, [.nonInteractive(reason: .permissionDecision)])
+        XCTAssertEqual(store.diagnostic(for: .codex)?.kind, .keychainInteractionNotAllowed)
+    }
+
+    #if DEBUG
+        func testPreparedCodexTurnUsesCurrentOrRestrictivePermissionsWithoutReloading() async throws {
+            let secureStrings = try FakeSecurePlainStringStore(
+                plainPayload: encode(SecureCodexPermissionDocument(
+                    sandboxModeRaw: CodexAgentToolPreferences.SandboxMode.workspaceWrite.persistedValue
+                ))
+            )
+            let store = makeStore(secureStrings: secureStrings)
+            let options = CodexNativeSessionController.Options.agentModeDefault(
+                permissionReader: .init(secureStore: store),
+                readsUserConfiguredRequestPermissions: true
+            )
+            let controller = CodexNativeSessionController(
+                client: CodexAppServerClient(), runID: UUID(), tabID: UUID(), windowID: 1,
+                workspacePaths: .uniform(nil), options: options,
+                requestExecutor: { method, params, _ in
+                    XCTAssertEqual(method, "turn/start")
+                    let policy = params?["sandboxPolicy"] as? [String: Any]
+                    XCTAssertEqual(policy?["type"] as? String, "readOnly")
+                    return ["turn": ["id": "submission"]]
+                }
+            )
+            controller.test_installThreadState(threadID: "thread")
+            await controller.prepareUserTurnPermissions()
+            XCTAssertTrue(store.setCodexPermissionLevel(.readOnly))
+            secureStrings.beforePlainRead = { _ in XCTFail("Prepared send must not read the Keychain again") }
+
+            for invalidateCache in [false, true] {
+                if invalidateCache { store.clearCachedDocuments() }
+                let result = try await controller.startUserTurnWithPreparedPermissions(
+                    text: "request", attachments: [], model: nil, reasoningEffort: nil, serviceTier: nil
+                )
+                XCTAssertEqual(result.provisionalSubmissionID, "submission")
+            }
+            XCTAssertEqual(secureStrings.plainGetAccessModes, [.nonInteractive(reason: .permissionDecision)])
+        }
+
+        func testCodexThreadStartupUsesAuthoritativePermissionsAfterBlockedRead() async throws {
+            let secureStrings = try FakeSecurePlainStringStore(
+                plainPayload: encode(SecureCodexPermissionDocument(
+                    sandboxModeRaw: CodexAgentToolPreferences.SandboxMode.readOnly.persistedValue
+                ))
+            )
+            let entered = expectation(description: "Codex thread permission read entered")
+            let unblock = DispatchSemaphore(value: 0)
+            defer { unblock.signal() }
+            secureStrings.beforePlainRead = { _ in
+                XCTAssertFalse(Thread.isMainThread)
+                entered.fulfill()
+                XCTAssertEqual(unblock.wait(timeout: .now() + 5), .success)
+            }
+            let store = makeStore(secureStrings: secureStrings)
+            let options = CodexNativeSessionController.Options.agentModeDefault(
+                permissionReader: .init(secureStore: store),
+                readsUserConfiguredRequestPermissions: true
+            )
+            let controller = CodexNativeSessionController(
+                client: CodexAppServerClient(), runID: UUID(), tabID: UUID(), windowID: 1,
+                workspacePaths: .uniform(nil), options: options,
+                requestExecutor: { method, params, _ in
+                    XCTAssertEqual(method, "thread/start")
+                    XCTAssertEqual(params?["sandbox"] as? String, CodexAgentToolPreferences.SandboxMode.readOnly.appServerRequestValue(style: .configStyle))
+                    return [:]
+                }
+            )
+            let start = Task { _ = try await controller.test_startThreadBinding() }
+            await fulfillment(of: [entered], timeout: 3)
+            unblock.signal()
+            try await start.value
+            XCTAssertEqual(secureStrings.plainGetAccessModes, [.nonInteractive(reason: .permissionDecision)])
+        }
+    #endif
+
     private func makeStore(
         secureStrings: FakeSecurePlainStringStore,
         notificationCenter: NotificationCenter = NotificationCenter()
@@ -468,6 +632,7 @@ private final class FakeSecurePlainStringStore: SecurePlainStringStoring {
 
     var plainValues: [String: String] = [:]
     var plainGetError: Error?
+    var beforePlainRead: ((SecureStorageAccount) -> Void)?
     var saveError: Error?
     var failSaveKeys: Set<String> = []
 
@@ -492,6 +657,7 @@ private final class FakeSecurePlainStringStore: SecurePlainStringStoring {
 
     func getPlainValue(for account: SecureStorageAccount, accessMode: KeychainAccessMode) throws -> String? {
         plainGetAccessModes.append(accessMode)
+        beforePlainRead?(account)
         if let plainGetError {
             throw plainGetError
         }

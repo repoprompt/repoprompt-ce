@@ -55,29 +55,34 @@ final class AgentProviderPreferenceSnapshotStore {
         claudeEffortLevel: ClaudeCodeEffortLevel? = nil,
         permissionProfile: AgentProviderPermissionProfile,
         isSubagent _: Bool,
-        externallyManagedReason: String?
+        externallyManagedReason: String?,
+        forPresentation: Bool = false
     ) -> AgentProviderControlsBinding {
         let providerID = selectedAgent.providerBindingID
+        let documents = forPresentation ? securePermissions?.presentationDocuments(for: providerID) : nil
+        let reason = externallyManagedReason ?? (documents?.contains(providerID) == false ? "Loading provider permissions…" : nil)
         let permission = permissionChromeBinding(
             for: providerID,
             profile: permissionProfile,
-            externallyManagedReason: externallyManagedReason
+            externallyManagedReason: reason,
+            documents: documents
         )
         return AgentProviderControlsBinding(
             revision: revision(for: providerID),
             selectedAgent: selectedAgent,
             providerID: providerID,
             permission: permission,
-            runtimePermission: runtimePermission(for: selectedAgent, profile: permissionProfile),
+            runtimePermission: runtimePermission(for: selectedAgent, profile: permissionProfile, documents: documents),
             codexTools: providerID == .codex
-                ? codexToolSettingsBinding(profile: permissionProfile)
+                ? codexToolSettingsBinding(profile: permissionProfile, document: documents.map { $0.codex ?? .failClosedDocument() })
                 : nil,
             claudeTools: providerID == .claude
                 ? claudeToolSettingsBinding(
                     profile: permissionProfile,
                     selectedAgent: selectedAgent,
                     selectedModelRaw: selectedModelRaw,
-                    sessionEffortLevel: claudeEffortLevel
+                    sessionEffortLevel: claudeEffortLevel,
+                    document: documents.map { $0.claude ?? .failClosedDocument() }
                 )
                 : nil
         )
@@ -87,6 +92,14 @@ final class AgentProviderPreferenceSnapshotStore {
         for agent: AgentProviderKind,
         profile: AgentProviderPermissionProfile
     ) -> AgentProviderRuntimePermissionBinding {
+        runtimePermission(for: agent, profile: profile, documents: nil)
+    }
+
+    private func runtimePermission(
+        for agent: AgentProviderKind,
+        profile: AgentProviderPermissionProfile,
+        documents: AgentPermissionSecureStore.Documents?
+    ) -> AgentProviderRuntimePermissionBinding {
         switch agent.providerBindingID {
         case .codex:
             let sandboxMode: CodexAgentToolPreferences.SandboxMode
@@ -94,9 +107,12 @@ final class AgentProviderPreferenceSnapshotStore {
             let approvalReviewer: CodexAgentToolPreferences.ApprovalReviewer
             switch profile {
             case .userConfigured:
-                sandboxMode = CodexAgentToolPreferences.sandboxMode(defaults: defaults, secureStore: securePermissions)
-                approvalPolicy = CodexAgentToolPreferences.approvalPolicy(defaults: defaults, secureStore: securePermissions)
-                approvalReviewer = CodexAgentToolPreferences.approvalReviewer(defaults: defaults, secureStore: securePermissions)
+                sandboxMode = documents.map { ($0.codex ?? .failClosedDocument()).sandboxMode() }
+                    ?? CodexAgentToolPreferences.sandboxMode(defaults: defaults, secureStore: securePermissions)
+                approvalPolicy = documents.map { ($0.codex ?? .failClosedDocument()).approvalPolicy() }
+                    ?? CodexAgentToolPreferences.approvalPolicy(defaults: defaults, secureStore: securePermissions)
+                approvalReviewer = documents.map { ($0.codex ?? .failClosedDocument()).approvalReviewer() }
+                    ?? CodexAgentToolPreferences.approvalReviewer(defaults: defaults, secureStore: securePermissions)
             case .mcpSafeDefaults:
                 let level = CodexAgentToolPreferences.PermissionLevel.autoReview
                 sandboxMode = level.sandboxMode
@@ -120,7 +136,8 @@ final class AgentProviderPreferenceSnapshotStore {
         case .claude:
             let permissionMode: String = switch profile {
             case .userConfigured:
-                ClaudeAgentToolPreferences.permissionMode(defaults: defaults, secureStore: securePermissions)
+                documents.map { ($0.claude ?? .failClosedDocument()).permissionMode() }
+                    ?? ClaudeAgentToolPreferences.permissionMode(defaults: defaults, secureStore: securePermissions)
             case .mcpSafeDefaults:
                 ClaudeAgentToolPreferences.PermissionLevel.requireApproval.permissionMode
             case let .providerOverride(.claude(level)):
@@ -132,13 +149,13 @@ final class AgentProviderPreferenceSnapshotStore {
                 claudePermissionMode: permissionMode
             )
         case .openCode:
-            let level = effectiveOpenCodePermissionLevel(profile: profile)
+            let level = effectiveOpenCodePermissionLevel(profile: profile, documents: documents)
             return AgentProviderRuntimePermissionBinding(
                 acpSessionModeID: level.sessionModeID,
                 acceptsPendingACPApprovalWhenActivated: level.acceptsPendingApprovalWhenActivated
             )
         case .antigravity:
-            let level = effectiveAntigravityPermissionLevel(profile: profile)
+            let level = effectiveAntigravityPermissionLevel(profile: profile, documents: documents)
             let modeID = switch level {
             case .default: "default"
             case .autoEdit: "auto_edit"
@@ -150,13 +167,13 @@ final class AgentProviderPreferenceSnapshotStore {
                 acceptsPendingACPApprovalWhenActivated: level == .yolo
             )
         case .cursor:
-            let level = effectiveCursorPermissionLevel(profile: profile)
+            let level = effectiveCursorPermissionLevel(profile: profile, documents: documents)
             return AgentProviderRuntimePermissionBinding(
                 autoApproveAllACPToolPermissions: level.autoApprovesACPToolPermissions,
                 acceptsPendingACPApprovalWhenActivated: level.autoApprovesACPToolPermissions
             )
         case .grokBuild:
-            let level = effectiveGrokBuildPermissionLevel(profile: profile)
+            let level = effectiveGrokBuildPermissionLevel(profile: profile, documents: documents)
             // For Grok this flag becomes a launch-time `--always-approve` argument in the
             // provider; the controller never auto-selects ACP permission options for it.
             return AgentProviderRuntimePermissionBinding(
@@ -164,7 +181,7 @@ final class AgentProviderPreferenceSnapshotStore {
                 acceptsPendingACPApprovalWhenActivated: level.launchesWithAlwaysApprove
             )
         case .devin:
-            let level = effectiveDevinPermissionLevel(profile: profile)
+            let level = effectiveDevinPermissionLevel(profile: profile, documents: documents)
             // Devin's level becomes a launch-time `--permission-mode` argument. RepoPrompt
             // does not auto-select Devin permission options, so the auto-approval flags stay
             // false for every mode.
@@ -351,11 +368,12 @@ final class AgentProviderPreferenceSnapshotStore {
     private func permissionChromeBinding(
         for providerID: AgentProviderBindingID,
         profile: AgentProviderPermissionProfile,
-        externallyManagedReason: String?
+        externallyManagedReason: String?,
+        documents: AgentPermissionSecureStore.Documents?
     ) -> AgentPermissionChromeBinding {
         switch providerID {
         case .codex:
-            let effective = effectiveCodexPermissionLevel(profile: profile)
+            let effective = effectiveCodexPermissionLevel(profile: profile, documents: documents)
             return AgentPermissionChromeBinding(
                 providerID: providerID,
                 displayName: effective.displayName,
@@ -375,7 +393,7 @@ final class AgentProviderPreferenceSnapshotStore {
                 }
             )
         case .claude:
-            let effective = effectiveClaudePermissionLevel(profile: profile)
+            let effective = effectiveClaudePermissionLevel(profile: profile, documents: documents)
             return AgentPermissionChromeBinding(
                 providerID: providerID,
                 displayName: effective.displayName,
@@ -395,7 +413,7 @@ final class AgentProviderPreferenceSnapshotStore {
                 }
             )
         case .openCode:
-            let effective = effectiveOpenCodePermissionLevel(profile: profile)
+            let effective = effectiveOpenCodePermissionLevel(profile: profile, documents: documents)
             return AgentPermissionChromeBinding(
                 providerID: providerID,
                 displayName: effective.displayName,
@@ -415,7 +433,7 @@ final class AgentProviderPreferenceSnapshotStore {
                 }
             )
         case .antigravity:
-            let effective = effectiveAntigravityPermissionLevel(profile: profile)
+            let effective = effectiveAntigravityPermissionLevel(profile: profile, documents: documents)
             return AgentPermissionChromeBinding(
                 providerID: providerID,
                 displayName: effective.displayName,
@@ -435,7 +453,7 @@ final class AgentProviderPreferenceSnapshotStore {
                 }
             )
         case .cursor:
-            let effective = effectiveCursorPermissionLevel(profile: profile)
+            let effective = effectiveCursorPermissionLevel(profile: profile, documents: documents)
             return AgentPermissionChromeBinding(
                 providerID: providerID,
                 displayName: effective.displayName,
@@ -455,7 +473,7 @@ final class AgentProviderPreferenceSnapshotStore {
                 }
             )
         case .grokBuild:
-            let effective = effectiveGrokBuildPermissionLevel(profile: profile)
+            let effective = effectiveGrokBuildPermissionLevel(profile: profile, documents: documents)
             return AgentPermissionChromeBinding(
                 providerID: providerID,
                 displayName: effective.displayName,
@@ -475,7 +493,7 @@ final class AgentProviderPreferenceSnapshotStore {
                 }
             )
         case .devin:
-            let effective = effectiveDevinPermissionLevel(profile: profile)
+            let effective = effectiveDevinPermissionLevel(profile: profile, documents: documents)
             return AgentPermissionChromeBinding(
                 providerID: providerID,
                 displayName: effective.displayName,
@@ -502,7 +520,8 @@ final class AgentProviderPreferenceSnapshotStore {
     ///
     /// SEARCH-HELPER: Safe Managed, Codex Bash override, Codex MCP server toggles
     private func codexToolSettingsBinding(
-        profile: AgentProviderPermissionProfile
+        profile: AgentProviderPermissionProfile,
+        document: SecureCodexPermissionDocument?
     ) -> CodexToolSettingsBinding {
         let entries = codexMCPServerEntriesProvider()
         var states: [String: Bool] = [:]
@@ -511,13 +530,15 @@ final class AgentProviderPreferenceSnapshotStore {
         case .userConfigured, .providerOverride:
             for entry in entries {
                 let key = normalizedServerToggleKey(entry.normalizedName)
-                states[key] = CodexAgentToolPreferences.mcpServerEnabled(
-                    normalizedName: entry.normalizedName,
-                    defaults: defaults,
-                    secureStore: securePermissions
-                )
+                states[key] = document.map { CodexAgentToolPreferences.mcpServerEnabled(normalizedName: entry.normalizedName, document: $0) }
+                    ?? CodexAgentToolPreferences.mcpServerEnabled(
+                        normalizedName: entry.normalizedName,
+                        defaults: defaults,
+                        secureStore: securePermissions
+                    )
             }
-            bashToolEnabled = CodexAgentToolPreferences.bashToolEnabled(defaults: defaults, secureStore: securePermissions)
+            bashToolEnabled = document.map { $0.bashToolEnabled ?? false }
+                ?? CodexAgentToolPreferences.bashToolEnabled(defaults: defaults, secureStore: securePermissions)
         case .mcpSafeDefaults:
             // Codex Safe Managed keeps its product-default Bash capability while suppressing
             // every user-toggled third-party MCP server. Search remains user-configurable.
@@ -550,15 +571,18 @@ final class AgentProviderPreferenceSnapshotStore {
         profile: AgentProviderPermissionProfile,
         selectedAgent: AgentProviderKind,
         selectedModelRaw: String?,
-        sessionEffortLevel: ClaudeCodeEffortLevel?
+        sessionEffortLevel: ClaudeCodeEffortLevel?,
+        document: SecureClaudePermissionDocument?
     ) -> ClaudeToolSettingsBinding {
         let effortLevel = sessionEffortLevel
             ?? claudeEffortLevel(selectedAgent: selectedAgent, selectedModelRaw: selectedModelRaw)
         switch profile {
         case .userConfigured, .providerOverride:
             return ClaudeToolSettingsBinding(
-                bashToolEnabled: ClaudeAgentToolPreferences.bashToolEnabled(defaults: defaults, secureStore: securePermissions),
-                mcpStrictModeEnabled: ClaudeAgentToolPreferences.mcpStrictModeEnabled(defaults: defaults, secureStore: securePermissions),
+                bashToolEnabled: document.map { $0.bashToolEnabled ?? false }
+                    ?? ClaudeAgentToolPreferences.bashToolEnabled(defaults: defaults, secureStore: securePermissions),
+                mcpStrictModeEnabled: document.map { $0.mcpStrictModeEnabled ?? true }
+                    ?? ClaudeAgentToolPreferences.mcpStrictModeEnabled(defaults: defaults, secureStore: securePermissions),
                 toolSearchEnabled: ClaudeAgentToolPreferences.toolSearchEnabled(defaults: defaults),
                 effortLevel: effortLevel,
                 agentModePromptDelivery: ClaudeAgentToolPreferences.agentModePromptDelivery(defaults: defaults)
@@ -624,49 +648,72 @@ final class AgentProviderPreferenceSnapshotStore {
     }
 
     private func effectiveCodexPermissionLevel(
-        profile: AgentProviderPermissionProfile
+        profile: AgentProviderPermissionProfile,
+        documents: AgentPermissionSecureStore.Documents?
     ) -> CodexAgentToolPreferences.PermissionLevel {
-        profile.codexPermissionLevel(loadUserConfigured: { CodexAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions) })
+        profile.codexPermissionLevel(loadUserConfigured: {
+            documents.map { ($0.codex ?? .failClosedDocument()).permissionLevel() }
+                ?? CodexAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
+        })
     }
 
     private func effectiveClaudePermissionLevel(
-        profile: AgentProviderPermissionProfile
+        profile: AgentProviderPermissionProfile,
+        documents: AgentPermissionSecureStore.Documents?
     ) -> ClaudeAgentToolPreferences.PermissionLevel {
-        profile.claudePermissionLevel(loadUserConfigured: { ClaudeAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions) })
+        profile.claudePermissionLevel(loadUserConfigured: {
+            documents.map { ($0.claude ?? .failClosedDocument()).permissionLevel() }
+                ?? ClaudeAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
+        })
     }
 
     private func effectiveOpenCodePermissionLevel(
-        profile: AgentProviderPermissionProfile
+        profile: AgentProviderPermissionProfile,
+        documents: AgentPermissionSecureStore.Documents?
     ) -> OpenCodeAgentToolPreferences.PermissionLevel {
-        profile.openCodePermissionLevel(loadUserConfigured: { OpenCodeAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions) })
+        profile.openCodePermissionLevel(loadUserConfigured: {
+            documents.map { ($0.openCode ?? .failClosedDocument()).permissionLevel() }
+                ?? OpenCodeAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
+        })
     }
 
     private func effectiveAntigravityPermissionLevel(
-        profile: AgentProviderPermissionProfile
+        profile: AgentProviderPermissionProfile,
+        documents: AgentPermissionSecureStore.Documents?
     ) -> AntigravityAgentToolPreferences.PermissionLevel {
-        profile.antigravityPermissionLevel(loadUserConfigured: { AntigravityAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions) })
+        profile.antigravityPermissionLevel(loadUserConfigured: {
+            documents.map { ($0.antigravity ?? .failClosedDocument()).permissionLevel() }
+                ?? AntigravityAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
+        })
     }
 
     private func effectiveCursorPermissionLevel(
-        profile: AgentProviderPermissionProfile
+        profile: AgentProviderPermissionProfile,
+        documents: AgentPermissionSecureStore.Documents?
     ) -> CursorAgentToolPreferences.PermissionLevel {
-        profile.cursorPermissionLevel(loadUserConfigured: { CursorAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions) })
+        profile.cursorPermissionLevel(loadUserConfigured: {
+            documents.map { ($0.cursor ?? .failClosedDocument()).permissionLevel() }
+                ?? CursorAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
+        })
     }
 
     private func effectiveGrokBuildPermissionLevel(
-        profile: AgentProviderPermissionProfile
+        profile: AgentProviderPermissionProfile,
+        documents: AgentPermissionSecureStore.Documents?
     ) -> GrokBuildAgentToolPreferences.PermissionLevel {
-        profile.grokBuildPermissionLevel(loadUserConfigured: { GrokBuildAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions) })
+        profile.grokBuildPermissionLevel(loadUserConfigured: {
+            documents.map { ($0.grokBuild ?? .failClosedDocument()).permissionLevel() }
+                ?? GrokBuildAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
+        })
     }
 
     private func effectiveDevinPermissionLevel(
-        profile: AgentProviderPermissionProfile
+        profile: AgentProviderPermissionProfile,
+        documents: AgentPermissionSecureStore.Documents?
     ) -> DevinAgentToolPreferences.PermissionLevel {
         profile.devinPermissionLevel(
-            userConfigured: DevinAgentToolPreferences.permissionLevel(
-                defaults: defaults,
-                secureStore: securePermissions
-            )
+            userConfigured: documents.map { ($0.devin ?? .failClosedDocument()).permissionLevel() }
+                ?? DevinAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
         )
     }
 
