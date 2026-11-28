@@ -246,6 +246,55 @@ struct AgentTranscriptRow: View, @MainActor Equatable {
     let codexManagedLoginAction: CodexManagedLoginAction?
     @State private var showingRetainedContent = false
 
+    struct RetainedContent {
+        let input: String?
+        let output: String?
+        let fallbackText: String?
+        let isToolResult: Bool
+        let outputUnavailable: Bool
+
+        init(item: AgentChatItem, hydratedResult: String?) {
+            let summaryOnly = toolResultIsSummaryOnly(item)
+            input = item.toolArgsJSON.flatMap { $0.isEmpty ? nil : $0 }
+            if let hydratedResult, !hydratedResult.isEmpty {
+                output = hydratedResult
+            } else if !summaryOnly, let stored = item.toolResultJSON, !stored.isEmpty {
+                output = stored
+            } else {
+                output = nil
+            }
+            fallbackText = output == nil && !summaryOnly && !item.text.isEmpty ? item.text : nil
+            isToolResult = item.kind == .toolResult
+            outputUnavailable = summaryOnly && output == nil
+        }
+
+        var hasSections: Bool {
+            input != nil || output != nil || fallbackText != nil
+        }
+
+        var source: String? {
+            isToolResult ? output : input
+        }
+
+        var readableText: String {
+            var sections: [String] = []
+            if let input {
+                sections.append("Input\n\(ToolResultMarkdownRenderer.readableStructuredPayload(input))")
+            }
+            if let output {
+                sections.append("Output\n\(ToolResultMarkdownRenderer.readableResult(output))")
+            } else if let fallbackText {
+                let text = isToolResult ? ToolResultMarkdownRenderer.readableResult(fallbackText)
+                    : ToolResultMarkdownRenderer.readableStructuredPayload(fallbackText)
+                sections.append("\(isToolResult ? "Output" : "Text")\n\(text)")
+            }
+            if outputUnavailable {
+                sections.append("Full output was not retained or is unavailable.")
+            }
+            return sections.joined(separator: "\n\n")
+        }
+    }
+
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.inputs == rhs.inputs
             && lhs.agentModeVM === rhs.agentModeVM
@@ -255,10 +304,32 @@ struct AgentTranscriptRow: View, @MainActor Equatable {
     }
 
     var body: some View {
+        Group {
+            if let batch = Self.delegationBatch(for: inputs.item) {
+                AgentDelegationDecisionDisclosure(batch: batch, copy: copyContent)
+                    .contextMenu {
+                        Button("Copy Batch") { copyContent(batch.text) }
+                    }
+            } else {
+                messageBubble
+            }
+        }
+        .environment(\.agentTranscriptDisclosureScope, .init(
+            store: agentModeVM.ui.transcript, workspaceID: inputs.workspaceID,
+            tabID: inputs.tabID, itemID: inputs.item.id
+        ))
+    }
+
+    static func delegationBatch(for item: AgentChatItem) -> AgentDelegationDecisionBatch? {
+        guard item.kind == .user, let batch = item.delegationDecisionBatch, !batch.decisions.isEmpty else { return nil }
+        return batch
+    }
+
+    private var messageBubble: some View {
         let cancelAction: (() -> Void)? = inputs.cancelRunID.map { runID in
             { [weak agentModeVM] in agentModeVM?.cancelActiveToolsForRun(runID: runID, reason: "tool_card_header_cancel") }
         }
-        AgentMessageBubble(
+        return AgentMessageBubble(
             item: inputs.item,
             isMostRecentEditBubble: inputs.isMostRecentEditBubble,
             windowID: inputs.windowID,
@@ -288,20 +359,17 @@ struct AgentTranscriptRow: View, @MainActor Equatable {
         .environment(\.markdownFileLinkOpener, MarkdownFileLinkOpener { target in
             await promptManager.fileManager.openFileForMarkdownLink(target)
         })
-        .environment(\.agentTranscriptDisclosureScope, .init(
-            store: agentModeVM.ui.transcript, workspaceID: inputs.workspaceID,
-            tabID: inputs.tabID, itemID: inputs.item.id
-        ))
         .environment(\.agentToolCardAutoExpandEnabled, inputs.autoExpandEnabled)
         .environment(\.agentLiveBashExecutionByItemID, inputs.liveBashExecution.map { [inputs.item.id: $0] } ?? [:])
         .environment(\.agentApprovalVisible, inputs.approvalVisible)
         .contextMenu {
             if isToolRow {
-                if !retainedSections.isEmpty {
+                let content = retainedContent
+                if content.hasSections {
                     Button("View Retained Content…") { showingRetainedContent = true }
-                    Button("Copy Content") { copyContent(readableRetainedContent) }
-                    if let sourceRetainedContent {
-                        Button("Copy Source") { copyContent(sourceRetainedContent) }
+                    Button("Copy Content") { copyContent(content.readableText) }
+                    if let source = content.source {
+                        Button("Copy Source") { copyContent(source) }
                     }
                 }
             } else if !inputs.item.text.isEmpty {
@@ -309,18 +377,20 @@ struct AgentTranscriptRow: View, @MainActor Equatable {
             }
         }
         .sheet(isPresented: $showingRetainedContent) {
+            let content = retainedContent
+            let readableText = content.readableText
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
                     Text("Retained Tool Content").font(.headline)
                     Spacer()
-                    Button("Copy Content") { copyContent(readableRetainedContent) }
-                    if let sourceRetainedContent {
-                        Button("Copy Source") { copyContent(sourceRetainedContent) }
+                    Button("Copy Content") { copyContent(readableText) }
+                    if let source = content.source {
+                        Button("Copy Source") { copyContent(source) }
                     }
                     Button("Done") { showingRetainedContent = false }
                         .keyboardShortcut(.defaultAction)
                 }
-                ToolScrollableMarkdownTextView(text: readableRetainedContent, maxHeight: 400)
+                ToolScrollableMarkdownTextView(text: readableText, maxHeight: 400)
             }
             .padding()
             .frame(minWidth: 620)
@@ -331,38 +401,8 @@ struct AgentTranscriptRow: View, @MainActor Equatable {
         inputs.item.kind == .toolCall || inputs.item.kind == .toolResult
     }
 
-    private var retainedSections: [(title: String, text: String)] {
-        let item = inputs.item
-        var sections: [(String, String)] = []
-        if let args = item.toolArgsJSON, !args.isEmpty { sections.append(("Input", args)) }
-        if let result = retainedResultSource {
-            sections.append(("Output", result))
-        } else if !item.text.isEmpty, !toolResultIsSummaryOnly(item) {
-            sections.append((item.kind == .toolResult ? "Output" : "Text", item.text))
-        }
-        return sections
-    }
-
-    private var readableRetainedContent: String {
-        var sections = retainedSections.map { "\($0.title)\n\(ToolResultMarkdownRenderer.readablePayload($0.text))" }
-        if toolResultIsSummaryOnly(inputs.item), retainedResultSource == nil {
-            sections.append("Full output was not retained or is unavailable.")
-        }
-        return sections.joined(separator: "\n\n")
-    }
-
-    private var retainedResultSource: String? {
-        if let hydrated = inputs.rawToolResultPayload, !hydrated.isEmpty { return hydrated }
-        guard !toolResultIsSummaryOnly(inputs.item),
-              let stored = inputs.item.toolResultJSON, !stored.isEmpty
-        else { return nil }
-        return stored
-    }
-
-    private var sourceRetainedContent: String? {
-        if inputs.item.kind == .toolResult { return retainedResultSource }
-        guard let args = inputs.item.toolArgsJSON, !args.isEmpty else { return nil }
-        return args
+    private var retainedContent: RetainedContent {
+        RetainedContent(item: inputs.item, hydratedResult: inputs.rawToolResultPayload)
     }
 
     private func copyContent(_ text: String) {
@@ -391,6 +431,53 @@ struct AgentTranscriptRow: View, @MainActor Equatable {
                 )
             }
         )
+    }
+}
+
+@MainActor
+private struct AgentDelegationDecisionDisclosure: View {
+    let batch: AgentDelegationDecisionBatch
+    let copy: (String) -> Void
+    @AgentTranscriptDisclosure("AgentDelegationDecisionDisclosure") private var isExpanded = false
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $isExpanded) {
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(batch.decisions.indices, id: \.self) { index in
+                    let decision = batch.decisions[index]
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text(outcomeLabel(decision.outcome)).fontWeight(.medium)
+                            Spacer()
+                            Button("Copy Decision") { copy(decision.text) }
+                        }
+                        if let target = decision.targetSessionID {
+                            Text("Target: \(target.uuidString)").font(.caption.monospaced()).textSelection(.enabled)
+                        }
+                        Text(decision.text).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                    }
+                }
+                Button("Copy Batch") { copy(batch.text) }
+            }
+            .padding(.top, 6)
+        } label: {
+            HStack(spacing: 6) {
+                Label("Delegation decisions", systemImage: "checkmark.shield")
+                Text(summary).foregroundStyle(.secondary).lineLimit(1)
+            }
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var summary: String {
+        guard let first = batch.decisions.first else { return "0" }
+        let mixed = batch.decisions.contains { $0.outcome != first.outcome }
+        return "\(batch.decisions.count) · \(mixed ? "Mixed outcomes" : outcomeLabel(first.outcome))"
+    }
+
+    private func outcomeLabel(_ outcome: String) -> String {
+        outcome.replacingOccurrences(of: "_", with: " ").capitalized
     }
 }
 
@@ -602,7 +689,10 @@ struct AgentMessageBubble: View {
     // MARK: - User Bubble
 
     private var userBubble: some View {
-        HStack {
+        let displayText = AgentModeViewModel.mcpResidentTaskDisplayText(
+            item.text, origin: item.userInputOrigin, attribution: item.crossSessionAttribution
+        )
+        return HStack {
             Spacer(minLength: 60)
 
             VStack(alignment: .trailing, spacing: 6) {
@@ -638,7 +728,7 @@ struct AgentMessageBubble: View {
                         TaggedFilesBadge(attachments: item.taggedFileAttachments)
                     }
                     MarkdownTextView(
-                        text: item.text,
+                        text: displayText,
                         isMarkdown: true,
                         allowInteraction: true,
                         bareURLLinkificationPolicy: .httpHTTPSOnly
@@ -649,7 +739,7 @@ struct AgentMessageBubble: View {
                 .background(BubbleColors.lightBlue)
                 .cornerRadius(20)
 
-                MessageFooterStrip(text: item.text, timestamp: item.timestamp, isTrailing: true, handoffConfig: handoffConfig, hasHandoffButton: handoffConfig != nil)
+                MessageFooterStrip(text: displayText, timestamp: item.timestamp, isTrailing: true, handoffConfig: handoffConfig, hasHandoffButton: handoffConfig != nil)
             }
         }
     }

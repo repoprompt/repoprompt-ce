@@ -10,6 +10,19 @@ package protocol AntigravityACPModelDiscoveryClient: Sendable {
 /// polling behavior: poll only while subscribed, coalesce refreshes, keep the last good
 /// snapshot on failure, and warm the persisted registry before live discovery completes.
 package actor AntigravityACPModelPollingService {
+    package enum DiscoveryError: Error {
+        case noModels
+        case signInRequired
+    }
+
+    package enum RefreshOutcome {
+        case connected
+        case noModels
+        case signInRequired
+        case failed(any Error)
+        case cancelled
+    }
+
     package struct Snapshot: Equatable {
         package let models: ACPDiscoveredSessionModels
         package let fetchedAt: Date
@@ -22,7 +35,7 @@ package actor AntigravityACPModelPollingService {
     private let intervalNanos: UInt64
 
     private var pollingTask: Task<Void, Never>?
-    private var inFlightRefresh: Task<Bool, Never>?
+    private var inFlightRefresh: Task<RefreshOutcome, Never>?
     private var continuations: [UUID: AsyncStream<Snapshot>.Continuation] = [:]
     #if DEBUG
         private var testRefreshNowInFlightJoinObservers: [UUID: AsyncStream<Void>.Continuation] = [:]
@@ -103,9 +116,8 @@ package actor AntigravityACPModelPollingService {
         return stream
     }
 
-    @discardableResult
-    package func refreshNow(workspacePath: String?) async -> Bool {
-        guard !isShutdown else { return false }
+    package func refreshNow(workspacePath: String?) async -> RefreshOutcome {
+        guard !isShutdown else { return .cancelled }
         preferredWorkspacePath = normalizedWorkspacePath(workspacePath)
         if let existing = inFlightRefresh {
             #if DEBUG
@@ -177,33 +189,47 @@ package actor AntigravityACPModelPollingService {
         }
     #endif
 
-    private func performRefresh() async -> Bool {
-        guard !isShutdown else { return false }
+    private func performRefresh() async -> RefreshOutcome {
+        guard !isShutdown else { return .cancelled }
         if let existing = inFlightRefresh {
             return await existing.value
         }
 
         let workspacePath = preferredWorkspacePath
-        let task = Task<Bool, Never> { [weak self, workspacePath] in
-            guard let self else { return false }
+        let task = Task<RefreshOutcome, Never> { [weak self, workspacePath] in
+            guard let self else { return .cancelled }
             do {
                 let discovered = try await client.discoverModels(workspacePath: workspacePath)
-                guard !Task.isCancelled else { return false }
+                try Task.checkCancellation()
                 if let discovered {
                     await applyRefreshResult(discovered)
-                } else {
-                    await publishLiveReadinessWithoutModels()
+                    return discovered.options.isEmpty ? .noModels : .connected
                 }
-                return true
+                await publishLiveReadinessWithoutModels()
+                return .noModels
             } catch {
                 // Keep the last registry/cache snapshot when preflight or ACP discovery fails.
-                await recordFailure(error.localizedDescription)
-                return false
+                guard !Task.isCancelled, !(error is CancellationError) else { return .cancelled }
+                await markCachedSnapshotNotLive()
+                switch error {
+                case DiscoveryError.noModels: return .noModels
+                case DiscoveryError.signInRequired: return .signInRequired
+                default:
+                    await recordFailure(error.localizedDescription)
+                    return .failed(error)
+                }
             }
         }
         inFlightRefresh = task
         defer { inFlightRefresh = nil }
         return await task.value
+    }
+
+    private func markCachedSnapshotNotLive() {
+        guard !isShutdown, let latest, latest.isLiveDiscovery else { return }
+        // Keep the models, but let the next successful refresh publish recovery even
+        // when the catalog has not changed.
+        self.latest = Snapshot(models: latest.models, fetchedAt: latest.fetchedAt, isLiveDiscovery: false)
     }
 
     private func recordFailure(_ message: String) {

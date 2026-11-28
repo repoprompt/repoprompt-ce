@@ -687,6 +687,68 @@ class StableTipFloorTests(unittest.TestCase):
             self.assertNotEqual(mismatched.returncode, 0)
             self.assertIn("does not match its checked-in rollout declaration", mismatched.stderr)
 
+    def test_tip_successor_resolves_newer_live_transition_and_retains_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            def tag(label: str) -> str:
+                return "tip-" + hashlib.sha1(label.encode()).hexdigest()[:12]
+
+            preparer = self.generate_release(root, "preparer", "preparer", "43.24.43")
+            anchor = self.generate_release(
+                root, "anchor", "transition", "44.25.57", [preparer], tag=tag("anchor")
+            )
+            transition = self.generate_release(
+                root, "next", "transition", "44.26.32", [preparer], tag=tag("next")
+            )
+            planned = self.generate_release(
+                root, "planned", "successor", "44.26.33", [anchor, preparer]
+            )
+            published = self.generate_release(
+                root, "published", "successor", "44.26.33",
+                [transition, preparer], tag=tag("published"),
+            )
+            observed = root / "live-release.json"
+            resolved = root / "resolved-tip-rollout.json"
+
+            def resolve(live: dict[str, Path | str], observed_tag: str) -> subprocess.CompletedProcess[str]:
+                observed.write_text(json.dumps({"tag_name": observed_tag}))
+                return self.rollout(
+                    "resolve-tip-successor", "--policy", str(POLICY),
+                    "--declaration", str(planned["declaration"]),
+                    "--transition-anchor", str(anchor["manifest"]),
+                    "--live-release", str(observed), "--live-manifest", str(live["manifest"]),
+                    "--live-appcast", str(live["appcast"]), "--output", str(resolved),
+                )
+
+            for live in (anchor, transition, published):
+                with self.subTest(live=live["tag"]):
+                    result = resolve(live, str(live["tag"]))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    expected = anchor if live is anchor else transition
+                    self.assertEqual(
+                        json.loads(resolved.read_text())["predecessors"],
+                        [
+                            {
+                                "role": item["role"],
+                                "tag": item["tag"],
+                                "rolloutManifestSha256": hashlib.sha256(Path(item["manifest"]).read_bytes()).hexdigest(),
+                            }
+                            for item in (expected, preparer)
+                        ],
+                    )
+
+            accepted = self.validate_progression(published, transition, Path(planned["declaration"]))
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            wrong_observation = resolve(transition, str(anchor["tag"]))
+            self.assertNotEqual(wrong_observation.returncode, 0)
+            self.assertIn("differs from the observed release", wrong_observation.stderr)
+            older = self.generate_release(
+                root, "older", "transition", "44.25.56", [preparer], tag=tag("older")
+            )
+            rejected = resolve(older, str(older["tag"]))
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("does not advance the checked-in transition anchor", rejected.stderr)
+
     def test_retired_tip_reset_authority_declaration_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             declaration_path = Path(temporary_directory) / "tip-rollout.json"

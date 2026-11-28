@@ -90,6 +90,7 @@ extension AgentSessionLinkExecutionRuntime {
         publication: AgentRunTerminalPublicationResult,
         teardownSettled: @escaping @MainActor () -> Bool
     ) {
+        let overflowOrigin = admitClaudeOverflowCompaction(session: session, revision: revision, publication: publication)
         if session.selfCompactState.active?.phase == .scheduled {
             let requestID = session.selfCompactState.active?.id
             let task = agentSelfCompactScheduler(for: session).terminalSettled(
@@ -98,6 +99,7 @@ extension AgentSessionLinkExecutionRuntime {
                 terminalState: revision.terminalState,
                 publication: publication,
                 successorClaimed: revision.successorKind != nil,
+                verifiedOverflowOrigin: overflowOrigin,
                 teardownSettled: teardownSettled
             )
             if let task, let requestID {
@@ -109,11 +111,48 @@ extension AgentSessionLinkExecutionRuntime {
             completion.compactTurnSettled(
                 revision: revision,
                 publication: publication,
-                teardownSettled: teardownSettled,
+                teardownSettled: { [weak self, weak session] in
+                    guard teardownSettled() else { return false }
+                    guard session?.selfCompactState.active?.claudeOverflowHoldID != nil else { return true }
+                    guard let runID = revision.expectedRunID else { return false }
+                    return self?.activeMCPToolProbe?(runID) == false
+                },
                 assistantOrToolRowCount: rowCount,
                 vouchedTokenCount: session.vouchedContextCount?.tokens
             )
         }
+    }
+
+    private func admitClaudeOverflowCompaction(
+        session: TabSession, revision: AgentRunTerminalCommitRevision, publication: AgentRunTerminalPublicationResult
+    ) -> Bool {
+        guard case .accepted(successorEpoch: nil) = publication,
+              revision.failureReason == .contextExhausted, revision.terminalState == .failed,
+              revision.successorKind == nil, let runID = revision.expectedRunID,
+              let hold = session.activeClaudeContextAutoWakeHold,
+              hold.recoveryOriginAttemptID == revision.ownership.attemptID,
+              let conversation = hold.conversationID, conversation == session.providerSessionID,
+              session.claudeOverflowRecoveryAttemptedConversation != conversation,
+              session.selfCompactState.active == nil, !session.selfCompactPersistenceWarning,
+              let endpoint = agentSessionLinkObserverEndpoint(tabID: session.tabID),
+              let generation = endpoint.persistentBindingGeneration,
+              agentSelfCompactHasExclusiveWriter(session, endpoint: endpoint)
+        else { return false }
+        let owner = AgentSelfCompactOwner(
+            windowID: endpoint.windowID, workspaceID: endpoint.workspaceID, tabID: endpoint.tabID,
+            sessionID: endpoint.sessionID, persistentBindingGeneration: generation,
+            bindingTransitionGeneration: endpoint.bindingTransitionGeneration,
+            runID: runID, runAttemptID: revision.ownership.attemptID
+        )
+        var attempt = AgentSelfCompactAttempt(
+            idempotencyKey: UUID().uuidString, note: "Host context recovery (no continuation)", owner: owner
+        )
+        attempt.admittedSupport = .claudeCode
+        attempt.claudeOverflowHoldID = hold.id
+        attempt.compactProviderConversation = conversation
+        session.claudeOverflowRecoveryAttemptedConversation = conversation
+        session.selfCompactState.active = attempt
+        return true
     }
 
     func agentSelfCompactCancelForAcceptedLocalInput(_ session: TabSession) {
@@ -126,7 +165,12 @@ extension AgentSessionLinkExecutionRuntime {
         previous: AgentSelfCompactState, state: AgentSelfCompactState,
         session: TabSession, runtime: AgentSessionLinkExecutionRuntime?, includesCancellation: Bool
     ) {
-        if previous.active != nil, state.active == nil {
+        if previous.active?.claudeOverflowHoldID != nil, state.active == nil,
+           state.latest?.completionVerified != true, session.activeClaudeContextAutoWakeHold != nil
+        {
+            session.appendItem(AgentChatItem.system("Claude context recovery could not be verified. Auto-wake stays paused.", sequenceIndex: session.nextSequenceIndex))
+            runtime?.updateBindingsFromSession(session)
+        } else if previous.active != nil, state.active == nil {
             let row: AgentChatItem? = switch state.latest?.outcome {
             case .cancelled where includesCancellation:
                 AgentChatItem.selfCompactionCancelled(sequenceIndex: session.nextSequenceIndex)
@@ -269,6 +313,10 @@ extension AgentSessionLinkExecutionRuntime {
                   active.phase == .dispatchingCompact || active.phase == .awaitingCompactTurn
             else { return false }
             // Claude and ACP can return from run startup before their compact transport write.
+            if let holdID = active.claudeOverflowHoldID {
+                guard session.activeClaudeContextAutoWakeHold?.id == holdID,
+                      session.providerSessionID == active.compactProviderConversation else { return false }
+            }
             return physicalStartIsSafe()
         }
         let attempt = AgentComposerSubmitAttempt(
@@ -298,7 +346,11 @@ extension AgentSessionLinkExecutionRuntime {
 
         // The fixed system row and attempt state are saved before any native command. The note
         // itself is never written to provider-replayed row text.
-        let row = AgentChatItem.selfCompactionRequest(sequenceIndex: session.nextSequenceIndex)
+        let row = if session.selfCompactState.active?.claudeOverflowHoldID != nil {
+            AgentChatItem.system("Recovering Claude context with one native compaction.", sequenceIndex: session.nextSequenceIndex)
+        } else {
+            AgentChatItem.selfCompactionRequest(sequenceIndex: session.nextSequenceIndex)
+        }
         session.appendItem(row)
         updateBindingsFromSession(session)
         requestUIRefresh(tabID: owner.tabID, urgent: true)
@@ -311,8 +363,13 @@ extension AgentSessionLinkExecutionRuntime {
         }
         guard ready() else { return false }
         var state = session.selfCompactState
-        state.active?.compactProviderConversation = support == .codex
-            ? session.codexConversationID : session.providerSessionID
+        if let holdID = state.active?.claudeOverflowHoldID {
+            guard session.activeClaudeContextAutoWakeHold?.id == holdID,
+                  state.active?.compactProviderConversation == session.providerSessionID else { return false }
+        } else {
+            state.active?.compactProviderConversation = support == .codex
+                ? session.codexConversationID : session.providerSessionID
+        }
         state.active?.usedTokensBeforeCompact = session.vouchedContextCount?.tokens
         session.selfCompactState = state
         session.selfCompactNativeCompletion = agentSelfCompactNativeCompletion(for: session)
@@ -352,6 +409,20 @@ extension AgentSessionLinkExecutionRuntime {
                 return await agentSelfCompactDispatchNote(
                     requestID: requestID, session: session, stillAdmissible: stillAdmissible
                 )
+            },
+            verifyOverflow: { [weak self, weak session] attempt in
+                guard let self, let session, let runID = attempt.compactRunID,
+                      activeMCPToolProbe?(runID) == false,
+                      let hold = session.activeClaudeContextAutoWakeHold, hold.id == attempt.claudeOverflowHoldID,
+                      session.providerSessionID == attempt.compactProviderConversation,
+                      ClaudeOverflowRecoveryPolicy.hasHeadroom(
+                          postTokens: attempt.claudePostCompactTokens,
+                          window: AgentModeViewModel.observationContextLoad(for: session)?.windowTokens
+                      ) else { return false }
+                session.clearClaudeContextAutoWakeHold(matching: hold)
+                session.appendItem(AgentChatItem.system("Claude context recovered. Auto-wake can resume for new work.", sequenceIndex: session.nextSequenceIndex))
+                updateBindingsFromSession(session)
+                return true
             },
             producerStarted: { [weak self, weak session] requestID, task in
                 guard let session else { return }

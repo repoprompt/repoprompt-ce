@@ -35,6 +35,12 @@ package struct ClaudeNativeTurnCorrelation {
         !outstanding.isEmpty
     }
 
+    /// A bare native command has no assistant-message owner on some CLI versions.
+    /// Its boundary can be attributed without an explicit ID only while it is the sole input.
+    package var onlyOutstandingInputID: UUID? {
+        outstanding.count == 1 ? outstanding.first : nil
+    }
+
     package var providerTurnID: UUID? {
         execution.flatMap { $0.providerInitiated ? $0.id : nil }
     }

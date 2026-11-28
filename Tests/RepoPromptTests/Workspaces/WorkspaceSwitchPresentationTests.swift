@@ -6,6 +6,18 @@ import XCTest
 
 @MainActor
 final class WorkspaceSwitchPresentationTests: XCTestCase {
+    func testConfirmationDistinguishesRetainedAgentExecutionFromCancelledChat() {
+        let confirmation = WorkspaceSwitchConfirmation(
+            targetWorkspaceName: "Other",
+            items: [.init(id: "chat", count: 1, singularLabel: "active chat session", pluralLabel: "active chat sessions")],
+            preservesActiveAgentExecution: true
+        )
+        XCTAssertEqual(
+            confirmation.message,
+            "Switching to \"Other\" will terminate 1 active chat session. Agent runs in the original workspace will continue. Do you want to continue?"
+        )
+    }
+
     func testBlockedResultsPublishSharedNoticeAndStaleDismissalCannotClearReplacement() async throws {
         let manager = makeComposition().workspaceManager
         await manager.awaitInitialized()

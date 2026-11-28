@@ -19,6 +19,28 @@ The generated bundle is the upstream authority. It is never checked in or hand-e
 contract at `Scripts/Fixtures/codex-app-server-contract.json` records only the fields RPCE sends or
 consumes at its current integration boundary.
 
+## Local rollout storage
+
+The bundled app-server starts with `-c features.local_thread_store_compression=true`,
+without rewriting `config.toml`. The [Codex 0.137.0 release](https://github.com/openai/codex/releases/tag/rust-v0.137.0)
+added `.jsonl.zst` reads, materialization before append, and cold-rollout compression.
+The 0.170.0 pin has this feature off by default.
+
+Codex’s [native worker](https://github.com/openai/codex/blob/rust-v0.170.0/codex-rs/rollout/src/compression.rs)
+processes existing and future cold rollouts in `sessions` and `archived_sessions` (at
+least seven days old). It coordinates same-home workers, skips active Codex writers,
+checks the source for changes, and verifies and syncs a same-directory temp file
+before atomic, no-clobber publication. It removes the original only after
+publication. An open read-only descriptor can still read its original inode.
+Debug and Release use separate managed homes. Do not use a pre-lock or other
+noncooperating writer in a home where compression is enabled.
+
+Codex owns listing, resume, and append. RepoPrompt's read-only command-status
+reconciliation handles either representation, preferring plain JSONL if both
+exist. This does not touch `~/.codex`, the native `session_index.jsonl` append
+log, Agent Mode session persistence, or debugging exports. Custom runtime
+compression settings are not changed.
+
 ## Version contract
 
 - The contract floor is **Codex CLI 0.170.0**.
@@ -28,8 +50,9 @@ consumes at its current integration boundary.
 
 This schema baseline and exact CI pin are distinct from
 `CodexRuntimeAuthority.minimumExternalVersion`, the compatibility floor for an explicitly selected
-custom executable. That external floor remains 0.149.0 unless an observed consumed request or
-response incompatibility requires it to move.
+custom executable. The external floor is 0.155.0 because custom executables share the managed
+rollout store and need to participate in the same writer lock as native compression. This is a
+storage compatibility requirement, not a change to the app-server schema baseline.
 
 When advancing Codex, install the intended version, run the gate, reconcile RPCE with the generated
 schema, then update the CI pin and contract floor together. Do not copy the complete generated
@@ -41,8 +64,8 @@ requirement.
 The initial projection covers:
 
 - the client requests RPCE sends for initialization, model discovery, hook discovery, hook-trust
-  config writes, thread lifecycle, goals, turns, interruption, steering, compaction, and the optional
-  memory-mode setting;
+  config writes, the effective-config read that preserves configured developer instructions, thread
+  lifecycle, goals, turns, interruption, steering, compaction, and the optional memory-mode setting;
 - request fields RPCE always or conditionally emits, including nested initialize metadata, turn-input
   variants, sandbox-policy variants, and detection of newly required upstream fields;
 - incoming parameter and response paths RPCE reads, with explicit required, optional, conditional,

@@ -759,6 +759,11 @@ struct AgentMonitorPopoverView: View {
             .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
             .foregroundStyle(.secondary)
             .lineLimit(2)
+            if pending.wakeNowRefusal == .claudeSizeFailure {
+                Text(AgentMonitorWakeNowRefusal.claudeSizeFailure.message)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+                    .foregroundStyle(.secondary)
+            }
             if !pending.groups.isEmpty {
                 DisclosureGroup(
                     AgentMonitorPendingUpdatesCopy.detailsLabel,
@@ -977,6 +982,19 @@ struct AgentMonitorPopoverView: View {
             }
             ForEach(props.persistence.warnings) { warning in
                 messageText(warning.message)
+                if warning.canRetrySessionSettlement {
+                    Button("Retry session settlement") {
+                        guard !isRetryingSave else { return }
+                        isRetryingSave = true
+                        Task {
+                            await AgentSessionLinkRuntimeBridge.shared.retrySessionSettlement(warningID: warning.id)
+                            isRetryingSave = false
+                        }
+                    }
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+                    .disabled(isRetryingSave)
+                    .accessibilityHint("Retries saving and releasing the original Agent session resources")
+                }
             }
             if props.persistence.hasPendingCleanupRetry {
                 Button("Retry saving") {

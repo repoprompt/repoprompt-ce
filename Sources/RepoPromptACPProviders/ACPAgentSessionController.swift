@@ -146,6 +146,12 @@ package actor ACPAgentSessionController {
         }
     }
 
+    package nonisolated static func isAuthenticationRequired(_ error: any Error) -> Bool {
+        // ACP reserves -32000 for authentication-required responses.
+        guard case let ControllerError.requestFailed(_, code) = error else { return false }
+        return code == -32000
+    }
+
     private enum JSONRPCID: Hashable {
         case string(String)
         case int(Int)
@@ -343,6 +349,9 @@ package actor ACPAgentSessionController {
     private var nextRequestID = 1
     private var inboundMessageSequence: UInt64 = 0
     private var pendingRequests: [String: PendingRequest] = [:]
+    private var openCodeLimitGrace: Duration?
+    private var lastOpenCodePromptProgress: Date?
+    private var retiredOpenCodePromptKey: String?
     // Wire identity is typed; approval identity is a fresh incarnation owned by this controller.
     private var pendingPermissionRequests: [String: PendingPermissionRequest] = [:]
     private var permissionStorageKeyByApprovalID: [String: String] = [:]
@@ -360,6 +369,7 @@ package actor ACPAgentSessionController {
     private var sessionID: String?
     private var providerSessionIdentity: ACPProviderSessionIdentity
     private var didEmitTerminal = false
+    private var lastPromptFailurePreservedSession = false
     private var eventStreamFinished = false
     private var loadSessionSupported = false
     private var promptImagesSupported = false
@@ -476,6 +486,12 @@ package actor ACPAgentSessionController {
 
     package var hasReusableSession: Bool {
         state == .sessionOpen && process != nil && sessionID != nil
+    }
+
+    /// Whether the latest prompt turn failed with an error the provider attests left its session
+    /// open, and the session is still reusable now.
+    package var retainsSessionAfterLastPromptFailure: Bool {
+        lastPromptFailurePreservedSession && hasReusableSession
     }
 
     /// Whether a provider session is live right now — open or running a turn — as opposed to
@@ -618,9 +634,15 @@ package actor ACPAgentSessionController {
         #endif
         guard state == .sessionOpen, process != nil, sessionID != nil else { return false }
         didEmitTerminal = false
+        lastPromptFailurePreservedSession = false
         eventStreamFinished = false
         resetEventsStreamForNextTurn()
         return true
+    }
+
+    func enableOpenCodeHeadlessPromptLimitHandling(grace: Duration) {
+        guard provider.providerID == .openCode, state == .idle else { return }
+        openCodeLimitGrace = grace
     }
 
     package func bootstrap() async throws -> BootstrapResult {
@@ -632,7 +654,12 @@ package actor ACPAgentSessionController {
         state = .launching
         log("Launching ACP transport")
         diagnose(.phaseStarted("launch"))
-        let environment = await resolvedEnvironment()
+        var environment = await resolvedEnvironment()
+        if openCodeLimitGrace != nil {
+            // OpenCode v1 only writes its structured halt diagnostic to stderr with this opt-in.
+            environment["OPENCODE_PRINT_LOGS"] = "1"
+            environment["OPENCODE_LOG_LEVEL"] = "ERROR"
+        }
         try host.preflightInjectedMCPServers(in: sessionConfiguration, environment: environment)
         let workingDirectory = CommandPathResolver.expandPath(
             launchConfiguration.workingDirectory ?? FileManager.default.temporaryDirectory.path,
@@ -876,6 +903,8 @@ package actor ACPAgentSessionController {
         recentDevinToolCallIDs.removeAll()
         let promptTurnID = UUID()
         activePromptTurnID = promptTurnID
+        lastOpenCodePromptProgress = nil
+        lastPromptFailurePreservedSession = false
         resetActivePromptTrace()
         state = .promptRunning
         log("Submitting ACP prompt")
@@ -954,12 +983,26 @@ package actor ACPAgentSessionController {
                 }
             #endif
             settlePromptTurn(promptTurnID, result: .failure(error))
+            // Latched when the response arrived; only the preserved branch below sets it again.
+            lastPromptFailurePreservedSession = false
             // Local admission refused before construction or transport; the connection is intact.
             if refusedUnsupportedImages {
                 if state == .promptRunning { state = .sessionOpen }
                 throw error
             }
             if error is CancellationError {
+                throw error
+            }
+            // The provider ended only this turn and keeps its session: fail the turn without
+            // cancelling or retiring the session, so the next user message reuses it. Never resent.
+            if let preserved = error as? ACPSessionPreservingPromptFailure,
+               state == .promptRunning, process != nil, self.sessionID == sessionID
+            {
+                log("ACP prompt failed; provider session stays open: \(preserved.userMessage)")
+                cancelPendingPermissionRequestsLocally()
+                emitTerminal(state: .failed, errorText: preserved.userMessage)
+                state = .sessionOpen
+                lastPromptFailurePreservedSession = true
                 throw error
             }
             let message = displayText(for: provider.normalizeError(error))
@@ -983,6 +1026,11 @@ package actor ACPAgentSessionController {
         // actor drain pending stderr so openCodeEmptyPromptDiagnosticMessage
         // sees the error line.
         await Task.yield()
+        if openCodeLimitGrace != nil, Task.isCancelled {
+            let error = CancellationError()
+            settlePromptTurn(promptTurnID, result: .failure(error))
+            throw error
+        }
         if let diagnosticMessage = openCodeEmptyPromptDiagnosticMessage(from: response, stopReason: stopReason) {
             #if DEBUG
                 if isRawACPCaptureEnabled {
@@ -1667,6 +1715,11 @@ package actor ACPAgentSessionController {
         guard sessionID != nil else {
             throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
         }
+        // A turn the provider failed while keeping its session has already ended its run; steering
+        // into that run is refused, as after any failed turn. The next run's turn clears this.
+        guard !lastPromptFailurePreservedSession else {
+            throw ControllerError.invalidState(expected: "a turn still in progress", actual: state)
+        }
         #if DEBUG
             if testHoldNextSteeringInterrupt {
                 testHoldNextSteeringInterrupt = false
@@ -1940,6 +1993,7 @@ package actor ACPAgentSessionController {
             for await chunk in stderrChannel.stream {
                 await handleStderrChunk(chunk)
             }
+            await handleStderrEOF()
         }
     }
 
@@ -1967,21 +2021,41 @@ package actor ACPAgentSessionController {
     }
 
     private func handleStderrChunk(_ data: Data) {
-        stderrFramer.feed(data) { lineData in
-            guard
-                let trimmed = trimmedASCIIWhitespace(lineData),
-                let rawText = String(data: trimmed, encoding: .utf8),
-                !rawText.isEmpty
-            else { return }
-            let text = Self.strippingANSIEscapeSequences(from: rawText)
-            guard !text.isEmpty else { return }
-            stderrLineCount += 1
-            lastStderrPreview = Self.truncatedDiagnosticPreview(text)
-            recordActivePromptStderrLine(text)
-            diagnose(.stderrLine(text))
-            guard provider.shouldEmitStderrLine(text) else { return }
-            emit(.stream(AIStreamResult(type: "system", text: text)))
+        stderrFramer.feed(data) { handleStderrLine($0) }
+    }
+
+    private func handleStderrEOF() {
+        guard state != .closing, state != .closed else { return }
+        stderrFramer.flush { handleStderrLine($0) }
+    }
+
+    private func handleStderrLine(_ lineData: Data) {
+        guard
+            let trimmed = trimmedASCIIWhitespace(lineData),
+            let rawText = String(data: trimmed, encoding: .utf8),
+            !rawText.isEmpty
+        else { return }
+        let text = Self.strippingANSIEscapeSequences(from: rawText)
+        guard !text.isEmpty else { return }
+        stderrLineCount += 1
+        if let grace = openCodeLimitGrace {
+            if let sessionID, state == .promptRunning, let key = pendingOpenCodePromptKey,
+               pendingRequests[key]?.timeoutTask == nil,
+               let halt = OpenCodeACPPromptLimit.processorHaltDate(text, sessionID: sessionID),
+               halt > (lastOpenCodePromptProgress ?? .distantPast)
+            {
+                armOpenCodePromptLimit(for: key, after: grace)
+            }
+            // Opted-in OpenCode logging can contain private provider bodies.
+            return
         }
+        let disposition = provider.stderrLineDisposition(text)
+        guard disposition != .discard else { return }
+        lastStderrPreview = Self.truncatedDiagnosticPreview(text)
+        recordActivePromptStderrLine(text)
+        diagnose(.stderrLine(text))
+        guard disposition == .transcript else { return }
+        emit(.stream(AIStreamResult(type: "system", text: text)))
     }
 
     /// CLI providers log with terminal colors; ANSI escape sequences would render as raw
@@ -2051,14 +2125,32 @@ package actor ACPAgentSessionController {
                         inboundSequence: messageSequence
                     ))
                 } else if let error = json["error"] as? [String: Any] {
+                    if pendingRequest.method == "session/prompt", openCodeLimitGrace != nil,
+                       OpenCodeACPPromptLimit.matchesResponseError(error)
+                    {
+                        pendingRequest.continuation.resume(throwing: OpenCodeACPPromptLimit.rateLimitOrQuota)
+                        return
+                    }
                     let message = Self.responseErrorMessage(from: error)
                     let code = Self.responseErrorCode(from: error)
                     let codeText = code.map { " code=\($0)" } ?? ""
                     diagnose(.info("ACP request \(pendingRequest.method) failed\(codeText): \(message)"))
-                    pendingRequest.continuation.resume(throwing: ControllerError.requestFailed(message, code: code))
+                    if pendingRequest.method == "session/prompt",
+                       let preserved = provider.sessionPreservingPromptFailure(forResponseError: error)
+                    {
+                        // Latched before the prompt's catch runs, so a steer arriving in between
+                        // cannot send session/cancel for a turn the provider already ended.
+                        lastPromptFailurePreservedSession = true
+                        pendingRequest.continuation.resume(throwing: preserved)
+                    } else {
+                        pendingRequest.continuation.resume(throwing: ControllerError.requestFailed(message, code: code))
+                    }
                 } else {
                     pendingRequest.continuation.resume(throwing: ControllerError.protocolViolation("Missing result/error for request \(id.displayValue)"))
                 }
+                return
+            }
+            if let retiredOpenCodePromptKey, candidateStorageKeys(for: id).contains(retiredOpenCodePromptKey) {
                 return
             }
             if Self.isRecognizedUnmatchedResponse(json, provider: provider) {
@@ -2190,6 +2282,10 @@ package actor ACPAgentSessionController {
             }
         }
 
+        if openCodeLimitGrace != nil, self.sessionID == params["sessionId"] as? String {
+            if retiredOpenCodePromptKey != nil { return }
+            updateOpenCodePromptLimit(from: update)
+        }
         let normalizedEvents = provider.normalizeSessionUpdate(update, sessionID: sessionID)
         #if DEBUG
             captureNormalizedACPEvents(normalizedEvents, sessionID: sessionID, sourceUpdate: update)
@@ -2379,21 +2475,47 @@ package actor ACPAgentSessionController {
     }
 
     private func handleProcessExit(_ exitCode: Int32, timedOut: Bool) async {
+        if state != .closing, state != .closed, let stderrConsumerTask {
+            // Process termination can overtake the final pipe data. Drain through the
+            // existing reader, but do not hang if a descendant inherited the stderr FD.
+            let completion = AsyncStream<Void>.makeStream()
+            let drain = Task {
+                await stderrConsumerTask.value
+                completion.continuation.finish()
+            }
+            let timeout = Task {
+                try? await Task.sleep(for: .milliseconds(250))
+                completion.continuation.finish()
+            }
+            for await _ in completion.stream {}
+            drain.cancel()
+            timeout.cancel()
+        }
         guard state != .closing, state != .closed else {
             finishEventsIfNeeded()
             return
         }
 
+        // EOF may be held open by a descendant even though the exited process's
+        // final unterminated diagnostic is already buffered by our reader.
+        handleStderrEOF()
+
+        var message = timedOut
+            ? "ACP process timed out."
+            : "ACP process exited unexpectedly with code \(exitCode)."
+        if let lastStderrPreview {
+            message += " Last stderr line: `\(lastStderrPreview)`."
+        }
         if state == .promptRunning || !didEmitTerminal {
-            let message = timedOut
-                ? "ACP process timed out."
-                : "ACP process exited unexpectedly with code \(exitCode)."
             emit(.stream(AIStreamResult(type: "error", text: message)))
             emitTerminal(state: .failed, errorText: message)
         }
 
-        failAllPromptSettlementWaiters(with: ControllerError.transportClosed)
-        failPendingRequests(with: ControllerError.transportClosed)
+        let failure: ControllerError = lastStderrPreview != nil
+            ? .requestFailed(message)
+            : .transportClosed
+        failAllPromptSettlementWaiters(with: failure)
+        failPendingRequests(with: failure)
         promptImagesSupported = false
         state = .failed
         await clearExpectedAgentPIDIfNeeded()
@@ -2614,6 +2736,63 @@ package actor ACPAgentSessionController {
             pendingRequest.timeoutTask?.cancel()
             pendingRequest.continuation.resume(throwing: error)
         }
+    }
+
+    private var pendingOpenCodePromptKey: String? {
+        pendingRequests.first { $0.value.method == "session/prompt" }?.key
+    }
+
+    private func updateOpenCodePromptLimit(from update: [String: Any]) {
+        guard state == .promptRunning, let grace = openCodeLimitGrace,
+              let key = pendingOpenCodePromptKey else { return }
+        var retryDelay: Duration?
+        switch update["sessionUpdate"] as? String {
+        case "session_info_update":
+            guard let meta = update["_meta"] as? [String: Any], let retry = meta["opencode/retry"] else { return }
+            if let retry = retry as? [String: Any], let error = retry["error"] as? [String: Any] {
+                if OpenCodeACPPromptLimit.matchesRetryError(error) {
+                    // Keep a previously observed retry deadline if a later update is malformed.
+                    guard let delay = OpenCodeACPPromptLimit.retryDelay(retry) else { return }
+                    retryDelay = delay
+                }
+            } else if !(retry is NSNull) {
+                return
+            }
+        case "agent_message_chunk", "agent_thought_chunk":
+            guard let content = update["content"] as? [String: Any], let text = content["text"] as? String,
+                  !text.isEmpty else { return }
+        case "tool_call", "tool_call_update":
+            guard let status = update["status"] as? String,
+                  ["in_progress", "completed", "failed"].contains(status) else { return }
+        default:
+            return
+        }
+        // stderr and ACP stdout drain independently. A halt logged before this
+        // update cannot re-arm the watchdog after the prompt resumed.
+        lastOpenCodePromptProgress = Date()
+        pendingRequests[key]?.timeoutTask?.cancel()
+        pendingRequests[key]?.timeoutTask = nil
+        if let retryDelay {
+            armOpenCodePromptLimit(for: key, after: retryDelay + grace)
+        }
+    }
+
+    private func armOpenCodePromptLimit(for key: String, after delay: Duration) {
+        pendingRequests[key]?.timeoutTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: delay)
+            } catch {
+                return
+            }
+            await self?.expireOpenCodePromptLimit(for: key)
+        }
+    }
+
+    private func expireOpenCodePromptLimit(for key: String) {
+        guard !Task.isCancelled, state == .promptRunning,
+              let pending = pendingRequests.removeValue(forKey: key) else { return }
+        retiredOpenCodePromptKey = key
+        pending.continuation.resume(throwing: OpenCodeACPPromptLimit.rateLimitOrQuota)
     }
 
     private func handleProtocolViolation(_ message: String) {

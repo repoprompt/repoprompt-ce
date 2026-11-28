@@ -129,18 +129,26 @@ package struct AntigravityACPAgentProvider: ACPAgentProvider {
         return "oauth-personal"
     }
 
-    package func shouldEmitStderrLine(_ line: String) -> Bool {
+    package func shouldEmitStderrLine(_: String) -> Bool {
+        // Antigravity process stderr is diagnostic-only, never transcript content.
+        // The controller retains non-discarded stderr for diagnostics and surfaces
+        // the latest line when the process times out or exits unexpectedly.
+        false
+    }
+
+    package func stderrLineDisposition(_ line: String) -> ACPStderrLineDisposition {
         // Antigravity writes its Python harness and raw websocket frames to stderr
-        // (for example `I0906 ... local_connection.py ... RAW WS MSG`). These are
-        // diagnostics, not assistant content, and must never become transcript rows.
+        // (for example `I0906 ... local_connection.py ... RAW WS MSG`).
+        // Discard raw websocket frames before they reach diagnostic buffers or
+        // error previews, because frame payloads can contain arbitrary assistant
+        // text, tool errors, or full prompt bodies. Keep all other stderr in
+        // diagnostics only so process logs never render as chat transcript rows.
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-        let isAntigravityHarnessLog = trimmed.range(of: #"^I\d{4}\s+\d+\s"#, options: .regularExpression) != nil
-        guard isAntigravityHarnessLog else { return true }
-        let lowercased = trimmed.lowercased()
-        return lowercased.contains("error")
-            || lowercased.contains("exception")
-            || lowercased.contains("traceback")
-            || lowercased.contains("failed")
+        let frameHeader = #"^[DIWEF]\d{4}\s+(?:\d{2}:\d{2}:\d{2}(?:\.\d+)?\s+)?\d+\s+local_connection\.py(?::\d+\])?\s+RAW WS MSG\b"#
+        if trimmed.range(of: frameHeader, options: .regularExpression) != nil {
+            return .discard
+        }
+        return .diagnosticsOnly
     }
 
     package func normalizeError(_ error: Error) -> Error {

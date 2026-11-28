@@ -3515,7 +3515,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                         XCTAssertEqual(result, .startedRun)
                     } else {
                         let result = try await vm.submitDelegationDecision(
-                            "first idle decision",
+                            .init(decisions: [.init(outcome: "granted", targetSessionID: nil, text: "first idle decision")]),
                             tabID: session.tabID,
                             expectedSessionID: XCTUnwrap(session.activeAgentSessionID),
                             stopFence: .init(session: session)
@@ -3527,6 +3527,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     XCTAssertTrue(starts[0].contains(resident ? "resident assigned task" : "first idle decision"))
                     XCTAssertEqual(session.items.count, rows + 1)
                     XCTAssertNotNil(session.items.last?.dispatchedProviderText)
+                    XCTAssertEqual(session.items.last?.delegationDecisionBatch?.text, resident ? nil : "first idle decision")
                     XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .sending)
                     XCTAssertEqual(session.draftText, "untouched draft")
                     XCTAssertNil(session.activeComposerSubmitAttempt)
@@ -5191,96 +5192,68 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             }
         }
 
-        func testSwitchExactOwnerProbeUsesFreshPreparedOwnerWitness() async throws {
-            try await withFixture { fixture in
+        func testSavedHostCaptureRevalidatesTheCanonicalCarrierWithoutReplacingItsWriter() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("CanonicalCarrier-\(UUID())")
+            let runtime = MCPDomainRuntime(configuration: .init(
+                mode: .app, profileIdentifier: "carrier-\(UUID())", storageDirectory: directory,
+                workspaceStorageDirectory: directory.appendingPathComponent("workspaces"),
+                eventDirectory: directory.appendingPathComponent("events"), temporaryDirectory: directory.appendingPathComponent("tmp"),
+                externalReloadInterval: nil
+            ))
+            try await runtime.start()
+            addTeardownBlock {
+                _ = await runtime.shutdown()
+                try? FileManager.default.removeItem(at: directory)
+            }
+            try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(runtime) {
                 let manager = WindowStatesManager.shared
-                let workspaces = fixture.window.workspaceManager
-                let index = try XCTUnwrap(workspaces.workspaces.firstIndex { $0.id == fixture.workspace.id })
                 let savedID = UUID()
-                let tab = ComposeTabState(id: UUID(), name: "Private owner", activeAgentSessionID: savedID)
+                let tab = ComposeTabState(id: UUID(), name: "Saved carrier", activeAgentSessionID: savedID)
+                var workspace = WorkspaceModel(name: "Saved carrier", repoPaths: [], customStoragePath: directory.appendingPathComponent("sessions"))
+                workspace.composeTabs = [ComposeTabState()]
+                workspace.stashedTabs = [StashedTab(tab: tab)]
+                let url = directory.appendingPathComponent("workspace.json")
+                let authority = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: 101)
+                let created = try await authority.create(workspace, fileURL: url)
+                XCTAssertEqual(created.disposition, .applied)
                 _ = try await AgentSessionDataService.shared.saveAgentSession(
-                    AgentSession(id: savedID, workspaceID: fixture.workspace.id, composeTabID: tab.id, name: "Private owner", items: []),
-                    for: workspaces.workspaces[index]
+                    .init(id: savedID, workspaceID: workspace.id, composeTabID: tab.id, name: "Saved carrier", items: []), for: workspace
                 )
-                workspaces.workspaces[index].stashedTabs.append(StashedTab(tab: tab))
-                workspaces.activeWorkspace = workspaces.workspaces[index]
-                let originalFactory = manager.test_preparedOversightOwnerFactory
-                let originalRegistry = AgentSessionCarrierResolver.preparedSessionRuntimes
-                var factoryCalls = 0
-                var providerCalls = 0
-                manager.test_preparedOversightOwnerFactory = { workspace, source in
-                    factoryCalls += 1
-                    return WindowState.makePreparedSessionOwner(workspace: workspace, borrowing: source, agentModeViewModelFactory: { windowID, prompt, workspaceManager, server in
-                        let vm = AgentModeViewModel(
-                            testWindowID: windowID,
-                            codexControllerFactory: { _, _, _, _, _, _ in
-                                providerCalls += 1
-                                preconditionFailure("Private-owner fixture must never construct a provider")
-                            },
-                            claudeControllerFactory: { _, _, _, _ in
-                                providerCalls += 1
-                                preconditionFailure("Private-owner fixture must never construct a provider")
-                            },
-                            testMCPServer: server,
-                            testWorkspaceFileContextStore: prompt.workspaceFileContextStore
-                        )
-                        vm.promptManager = prompt
-                        vm.workspaceManager = workspaceManager
-                        return vm
-                    })
-                }
-                AgentSessionCarrierResolver.preparedSessionRuntimes = manager
                 manager.beginPreparedOversightPreparation(savedID)
-                @MainActor func cleanupPreparedOwner() async {
-                    if let owner = manager.preparedOversightWindows.removeValue(forKey: savedID) {
-                        owner.beginClose()
-                        let retired = await owner.tearDownPreparedSessionOwner()
-                        XCTAssertTrue(retired)
-                    }
-                    manager.preparedOversightRunObservations.removeValue(forKey: savedID)?.invalidate()
-                    manager.preparedOversightCarrierSubscriptions.removeValue(forKey: savedID)
-                    manager.preparedOversightOwnerLocations.removeValue(forKey: savedID)
-                    manager.preparedOversightLocations.removeValue(forKey: savedID)
-                    manager.test_preparedOversightOwnerFactory = originalFactory
-                    AgentSessionCarrierResolver.preparedSessionRuntimes = originalRegistry
-                    manager.endPreparedOversightPreparation(savedID)
+                defer { manager.endPreparedOversightPreparation(savedID) }
+                let writer = try await manager.prepareSavedOversightTarget(savedID, isStillAuthorized: { true }).get()
+                let host = try XCTUnwrap(writer.scope.executableHost)
+                addTeardownBlock { @MainActor in
+                    let drain = host.beginRetirement()
+                    drain.startIfNeeded()
+                    _ = await drain.wait(until: .now.advanced(by: .seconds(5)))
                 }
-                do {
-                    let result = await manager.prepareSavedOversightTarget(savedID, isStillAuthorized: { true })
-                    guard case let .success(owner) = result else {
-                        XCTFail("Private-owner preparation must succeed: \(result)")
-                        throw CancellationError()
-                    }
-                    XCTAssertTrue(owner.isPreparedSessionOwner)
-                    XCTAssertFalse(owner === fixture.window)
-                    XCTAssertEqual(factoryCalls, 1)
-                    XCTAssertTrue(manager.preparedOversightWindows[savedID] === owner)
-                    let session = try XCTUnwrap(owner.agentModeViewModel.sessions[tab.id])
-                    let probe = try XCTUnwrap(owner.agentModeViewModel.providerSwitchExactOwnerProbe)
-                    XCTAssertTrue(probe(session))
-                    let replacement = AgentTabSession(tabID: tab.id)
-                    replacement.testInstallPersistentSessionBinding(sessionID: savedID)
-                    XCTAssertEqual(replacement.activeAgentSessionID, session.activeAgentSessionID)
-                    XCTAssertFalse(probe(replacement))
-                    let stash = workspaces.workspaces[index].stashedTabs
-                    workspaces.workspaces[index].stashedTabs.removeAll { $0.tab.id == tab.id }
-                    workspaces.activeWorkspace = workspaces.workspaces[index]
-                    XCTAssertFalse(probe(session), "The same closure must observe withdrawal of its saved carrier witness")
-                    XCTAssertFalse(probe(replacement))
-                    workspaces.workspaces[index].stashedTabs = stash
-                    workspaces.activeWorkspace = workspaces.workspaces[index]
-                    XCTAssertTrue(probe(session), "A fresh restored witness must be observed without replacing the closure")
-                    XCTAssertEqual(providerCalls, 0)
-                    let released = await manager.releasePreparedOversightOwnerForVisit(sessionID: savedID, preparingReplacement: true)
-                    XCTAssertTrue(released)
-                    XCTAssertNil(manager.preparedOversightWindows[savedID])
-                    XCTAssertNil(manager.preparedOversightCarrierSubscriptions[savedID])
-                    XCTAssertNil(manager.preparedOversightOwnerLocations[savedID])
-                    await cleanupPreparedOwner()
-                } catch {
-                    await cleanupPreparedOwner()
-                    throw error
-                }
+                let command = try writer.admitCommand().get()
+                let capture = try await host.captureStartupResources(for: command, rootIDs: [])
+                let valid = await capture.validate()
+                XCTAssertTrue(valid)
+                let intruder = AgentTabSession(tabID: tab.id)
+                intruder.testInstallPersistentSessionBinding(sessionID: savedID)
+                XCTAssertThrowsError(try host.scope.admit(session: intruder, expectedWorkspaceID: workspace.id))
+                var withdrawn = workspace
+                withdrawn.stashedTabs = []
+                let removal = try await authority.replaceWorking(withdrawn, fileURL: url, expectedWorkspaceRevision: nil)
+                XCTAssertEqual(removal.disposition, .applied)
+                let stale = await capture.validate()
+                XCTAssertFalse(stale)
+                let restored = try await authority.replaceWorking(workspace, fileURL: url, expectedWorkspaceRevision: nil)
+                XCTAssertEqual(restored.disposition, .applied)
+                let superseded = await capture.validate()
+                XCTAssertFalse(superseded, "A stale capture cannot become current again through matching bytes")
+                let current = try await host.captureStartupResources(for: command, rootIDs: [])
+                let currentIsValid = await current.validate()
+                XCTAssertTrue(currentIsValid)
+                XCTAssertNil(writer.session.activeRunOwnership)
+                XCTAssertTrue(host.scope.sessions[tab.id] === writer.session)
+                let drain = host.beginRetirement()
+                drain.startIfNeeded()
+                let outcome = await drain.wait(until: .now.advanced(by: .seconds(5)))
+                XCTAssertEqual(outcome, .released)
             }
         }
 
@@ -5345,13 +5318,16 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 let workspaceIndex = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == workspaceID })
                 manager.workspaces[workspaceIndex].composeTabs.append(contentsOf: savedTabs)
                 for (id, tab) in zip(preparedIDs, preparedTabs) {
-                    let prepared = await first.viewModel.prepareSavedOversightSession(
-                        tabID: tab,
-                        sessionID: id,
-                        workspaceID: workspaceID,
-                        isStillAuthorized: { true }
-                    )
-                    XCTAssertTrue(prepared)
+                    // These seven nodes belong to the already composed legacy window; load
+                    // its ordinary bound tabs without invoking saved-target preparation.
+                    let session = first.viewModel.session(for: tab)
+                    if session.activeAgentSessionID == nil {
+                        _ = try XCTUnwrap(first.viewModel.test_installPersistentSessionBinding(sessionID: id, on: session))
+                    }
+                    let loaded = await first.viewModel.ensureSessionReady(tabID: tab, reconnectActiveProviders: false)
+                    XCTAssertTrue(loaded === session)
+                    XCTAssertEqual(loaded.activeAgentSessionID, id)
+                    XCTAssertTrue(loaded.permitsBoundOperationAndSave)
                 }
                 let preparedAt = clock.now
                 // An agreeing recovered catalog replica does not become a second payload writer.

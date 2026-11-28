@@ -126,6 +126,7 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
     private var correlation = ClaudeNativeTurnCorrelation()
     private var correlationFailed = false
     private var turnWasInterrupted = false
+    private var isolatedCompactInput: (id: UUID, conversation: String)?
 
     // MARK: - Authoritative lifecycle (session_state_changed)
 
@@ -133,6 +134,7 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
     /// controller's lifetime.  When true, turn completion defers until `idle` (or a fallback
     /// timeout) rather than completing immediately on `result/message_stop`.
     private var observedSessionStateChangedEvents = false
+    private var compactReceipt: ClaudeNativeCompactReceipt?
 
     private struct DeferredCompletion {
         let executionID: UUID
@@ -564,15 +566,38 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
         try writeUserMessage(text)
     }
 
-    private func writeUserMessage(_ text: String) throws -> UUID {
+    package func sendIsolatedCompact(expectedConversation: String) async throws -> UUID {
+        guard !Task.isCancelled else { throw ControllerError.cancelledBeforeWrite }
+        guard isInitialized, !isShuttingDown, sessionID == expectedConversation, !turnInFlight else {
+            throw ControllerError.configurationNotCurrent
+        }
+        return try writeUserMessage("/compact", isolatedCompactConversation: expectedConversation)
+    }
+
+    package func compactContext(expectedConversationID: String) async throws -> UUID {
+        guard !Task.isCancelled else { throw ControllerError.cancelledBeforeWrite }
+        guard isInitialized, !isShuttingDown, sessionID == expectedConversationID, !turnInFlight else {
+            throw ControllerError.configurationNotCurrent
+        }
+        return try writeUserMessage("/compact")
+    }
+
+    private func writeUserMessage(_ text: String, isolatedCompactConversation: String? = nil) throws -> UUID {
         guard hasActiveSession else {
             throw ControllerError.processNotRunning
         }
         guard !correlationFailed else { throw ControllerError.processNotRunning }
         let id = UUID()
         let payload = try ClaudeSDKProtocolCodec.encodeUserMessage(text: text, sessionID: sessionID, uuid: id)
+        compactReceipt = nil
+        let compactConversation = text == "/compact" && !correlation.hasOutstanding
+            && correlation.providerTurnID == nil && deferredCompletions.isEmpty ? sessionID : nil
         try sendLine(payload)
         correlation.register(id)
+        isolatedCompactInput = isolatedCompactConversation.map { (id, $0) }
+        if let compactConversation {
+            compactReceipt = .init(conversationID: compactConversation, turnID: id)
+        }
         return id
     }
 
@@ -819,6 +844,8 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
         observedSessionStateChangedEvents = false
         cancelAuthoritativeLifecycleState()
         correlation = ClaudeNativeTurnCorrelation()
+        isolatedCompactInput = nil
+        compactReceipt = nil
         correlationFailed = false
         // Reset runtime init aggregation state so stale metadata doesn't leak across runs.
         initializeResponseSnapshot = nil
@@ -1531,7 +1558,18 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
 
     private func handleStreamPayload(_ payload: [String: Any]) {
         guard !isShuttingDown else { return }
-        recordObservedSessionID(Self.firstSessionIdentifier(in: payload))
+        let isResultPayload = payload["type"] as? String == "result"
+        // A subordinate result must never consume a main-thread input or install a hold.
+        if isResultPayload, Self.isSubagentActivity(payload) { return }
+        let isCompactBoundary = payload["type"] as? String == "system" && payload["subtype"] as? String == "compact_boundary"
+        let compactInputID = isCompactBoundary ? compactBoundaryInputID(payload) : nil
+        if isCompactBoundary, let isolatedCompactInput, correlation.onlyOutstandingInputID == isolatedCompactInput.id {
+            // Foreign or stale boundary frames must not change the active conversation or become
+            // an occupancy fence for this exact maintenance turn.
+            guard compactInputID != nil else { return }
+        } else {
+            recordObservedSessionID(Self.firstSessionIdentifier(in: payload))
+        }
         #if DEBUG
             if host.isReasoningExtractionEnabled() {
                 let debugPayloadType = (payload["type"] as? String) ?? "<missing>"
@@ -1572,7 +1610,6 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
         // provider session/model and tool-invocation context.
         let streamResults = translator.parseNDJSONLine(data)
         guard !correlationFailed else { return }
-        let isResultPayload = payload["type"] as? String == "result"
         var completion: DeferredCompletion?
         var ownsOutput = true
         if correlation.enabled {
@@ -1580,7 +1617,15 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
                 let previousProviderTurnID = correlation.providerTurnID
                 var frameOwnsOutput: Bool?
                 if Self.isMainThreadActivity(payload) {
-                    frameOwnsOutput = try correlation.observeActivity(payload)
+                    // The synthetic rejection isn't a provider-initiated turn. If marked with
+                    // a host identity, ordinary correlation can still use that exact evidence.
+                    if ClaudeCompatibleProviderRuntimeBridge.isSyntheticSizeRejection(payload),
+                       try ClaudeNativeTurnCorrelation.inputIDs(payload) == nil
+                    {
+                        frameOwnsOutput = false
+                    } else {
+                        frameOwnsOutput = try correlation.observeActivity(payload)
+                    }
                 } else if payload["type"] as? String == "command_lifecycle",
                           payload["state"] as? String == "started",
                           let commandID = payload["command_uuid"] as? String,
@@ -1592,7 +1637,21 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
                     emit(.providerTurnStarted(turnID: providerID))
                 }
                 if isResultPayload {
-                    let resolved = try correlation.resolve(payload)
+                    if correlation.hasOutstanding,
+                       ClaudeCompatibleProviderRuntimeBridge.classifySizeFailure(payload, conversationID: sessionID)?.source == .localCLIRejection,
+                       try ClaudeNativeTurnCorrelation.inputIDs(payload) == nil
+                    {
+                        // The capture is unkeyed. After keyed negotiation, no FIFO guess can
+                        // safely answer host input or attach a poisoned-conversation hold.
+                        throw ClaudeNativeTurnCorrelation.CorrelationError.missingAnswerIdentity
+                    }
+                    var answeringPayload = payload
+                    if correlation.providerTurnID == nil, try ClaudeNativeTurnCorrelation.inputIDs(payload) == nil,
+                       let compactAnswer = compactReceipt?.unkeyedCommandAnswer(payload, currentConversation: sessionID)
+                    {
+                        answeringPayload["user_message_uuid"] = compactAnswer.uuidString
+                    }
+                    let resolved = try correlation.resolve(answeringPayload)
                     ownsOutput = !resolved.inputIDs.isEmpty || resolved.providerTurnID != nil
                     let stopReason = streamResults.last(where: { $0.type == "message_stop" })?.stopReason
                     let status: TurnStatus = resolved.interrupted ? .cancelled : determineTurnStatus(from: payload, stopReasonHint: stopReason)
@@ -1635,13 +1694,33 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
             recordObservedSessionID(translatorSessionID)
         }
 
+        if !correlationFailed, !Self.isSubagentActivity(payload) {
+            if isResultPayload {
+                let answered = correlation.enabled ? completion?.inputIDs : nil
+                if let evidence = compactReceipt?.finish(
+                    payload, answeredIDs: answered, isKeyed: correlation.enabled,
+                    currentConversation: sessionID
+                ) {
+                    emit(.stream(AIStreamResult(type: AIStreamResult.transportActivityType, text: nil, claudeCompactEvidence: evidence)))
+                }
+                compactReceipt = nil
+            } else if correlation.providerTurnID == nil {
+                compactReceipt?.observeBoundary(payload)
+            } else {
+                compactReceipt = nil
+            }
+        }
+
         // Only complete a turn when the original payload is a "result" type — the
         // authoritative turn-boundary signal from the SDK.  Forwarded stream events
         // (message_delta with stop_reason, message_stop) can also produce translated
         // "message_stop" results, but they are NOT turn boundaries; using them would
         // cause pendingTurnIDs to desynchronize when multiple message_stop results
         // arrive per turn.
-        for result in streamResults {
+        for var result in streamResults {
+            if result.type == "system" {
+                result.nativeCompactInputID = compactInputID
+            }
             #if DEBUG
                 if host.isReasoningExtractionEnabled(), result.type == "reasoning" {
                     let text = result.reasoning ?? result.text ?? ""
@@ -1710,6 +1789,20 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
             } else {
                 emitCompletion(completion)
             }
+        }
+    }
+
+    private func compactBoundaryInputID(_ payload: [String: Any]) -> UUID? {
+        guard !Self.isSubagentActivity(payload), let input = isolatedCompactInput,
+              correlation.onlyOutstandingInputID == input.id, correlation.providerTurnID == nil,
+              sessionID == input.conversation,
+              Self.firstSessionIdentifier(in: payload).map({ $0 == input.conversation }) != false
+        else { return nil }
+        do {
+            if let ids = try ClaudeNativeTurnCorrelation.inputIDs(payload), ids != [input.id] { return nil }
+            return input.id
+        } catch {
+            return nil
         }
     }
 
@@ -2010,6 +2103,9 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
             return .cancelled
         }
 
+        if let failure = ClaudeCompatibleProviderRuntimeBridge.classifySizeFailure(payload, conversationID: sessionID) {
+            return .claudeSizeFailure(failure)
+        }
         if (payload["is_error"] as? Bool) == true
             || subtype.contains("error")
             || !resultErrors.isEmpty
@@ -2905,6 +3001,8 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
     /// Reset the queue to empty.
     private func clearTurnIDQueue() {
         correlation = ClaudeNativeTurnCorrelation()
+        isolatedCompactInput = nil
+        compactReceipt = nil
         correlationFailed = false
         turnWasInterrupted = false
     }

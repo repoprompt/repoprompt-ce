@@ -366,6 +366,29 @@ class CatalogTests(unittest.TestCase):
         self.assertNotIn('compression-level:', cache_save)
         self.assertNotIn('if-no-files-found:', cache_save)
 
+    def test_workflows_cache_binary_artifacts_independently_of_root_workspace_state(self) -> None:
+        workflows = SCRIPT_DIR.parent / '.github/workflows'
+        binary_keys = []
+        binary_paths = []
+        for filename in ('ci.yml', 'ci-integration-products.yml', 'ci-main.yml'):
+            with self.subTest(workflow=filename):
+                workflow = (workflows / filename).read_text()
+                self.assertNotIn('.build/workspace-state.json', workflow)
+                self.assertNotIn('            .build\n', workflow)
+                restore, = (step for step in workflow.split('\n      - name: ')
+                            if 'swiftpm-binaries-' in step)
+                paths, key = restore.split('          path: |\n', 1)[1].split('          key: ', 1)
+                self.assertIn("'Package.resolved'", key)
+                binary_paths.append(paths)
+                binary_keys.append(key.splitlines()[0])
+                if filename == 'ci.yml':
+                    save = workflow.split('      - name: Save checksum-verified SwiftPM binary artifacts', 1)[1]
+                    saved_paths, saved_key = save.split('          path: |\n', 1)[1].split('          key: ', 1)
+                    binary_paths.append(saved_paths)
+                    self.assertEqual(saved_key.splitlines()[0], '${{ steps.binaries-cache.outputs.cache-primary-key }}')
+        self.assertEqual(len(set(binary_keys)), 1)
+        self.assertEqual(len(set(binary_paths)), 1)
+
     def test_required_style_retains_core_and_sentry_without_release_builds(self) -> None:
         ci = (SCRIPT_DIR.parent / '.github/workflows/ci.yml').read_text()
         final = ci.split('  style:', 1)[1].split('  secret-scan:', 1)[0]

@@ -171,6 +171,7 @@ struct CLIProvidersSettingsView: View {
                 // CLI providers.
                 codexCard
                 claudeCodeCard
+                SubscriptionAccountsReadOnlySection()
                 claudeCompatibleBackendsSection
                 openCodeCard
                 cursorCard

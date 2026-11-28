@@ -211,15 +211,15 @@ The ladder now enforces:
 - The client is a second fence: once the running bundle identifier is the successor identity,
   `SparkleUpdateFeedDelegate.bestValidUpdate(in:for:)` and the passive appcast check never select a
   `package`/`interactive-package` item (`IdentityTransitionUpdatePolicy`).
-- Both checked-in declarations are `successor`. Tip retains the last published T pinned in
-  `tip-rollout.json` and P; Stable
-  retains `v1.10.0` and the Tip-origin P. `S` items carry T's build as their floor.
+- Both checked-in declarations are `successor`. Stable retains `v1.10.0` and the Tip-origin P.
+  Tip pins the exact P and a minimum T. At feed generation, it authenticates the latest published
+  Tip manifest and appcast, then uses that T or the exact T already retained by a published S.
+  `S` items carry the selected T's build as their floor.
 
-Cutover: a Tip run admitted before the successor declaration merged still uses its own pinned
-tooling, which admits T → T. If such a run publishes one more T first, the first S fails closed:
-it no longer retains the live T. Re-observe the live Tip manifest, re-pin `tip-rollout.json` to
-that exact T tag and digest, and merge again. Never hand-edit or move `releases/latest`; the
-one-shot check compares against the authenticated latest release.
+A Tip run admitted before cutover can publish a newer T using its pinned tooling. The first S
+retains that T if GitHub already served it when the feed was generated. If live T moves after
+generation, the final publication check rejects the stale candidate. A fresh run resolves the
+new history without another source change.
 
 Known consequences of the already-published duplicate T items:
 

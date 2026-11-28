@@ -982,6 +982,45 @@ def expected_retained_history(live: dict, live_digest: str, candidate_role: str)
     )
 
 
+def predecessor_pin(item: dict) -> dict:
+    return {key: item[key] for key in ("role", "tag", "rolloutManifestSha256")}
+
+
+def run_resolve_tip_successor(args: argparse.Namespace) -> None:
+    policy = load_policy(Path(args.policy))
+    declaration = load_declaration(Path(args.declaration))
+    if declaration["channel"] != "tip" or declaration["currentRole"] != "successor":
+        raise RolloutError("live predecessor resolution requires a Tip successor declaration")
+
+    anchor, preparer = declaration["predecessors"]
+    (anchor_manifest,) = load_predecessor_manifests(
+        dict(declaration, predecessors=[anchor]), [args.transition_anchor], policy, "RepoPrompt"
+    )
+    live_manifest_path = Path(args.live_manifest)
+    live = validate_tip_manifest_pair(policy, live_manifest_path, Path(args.live_appcast), "live")
+    observed_tag = load_json(Path(args.live_release), "observed Tip release").get("tag_name")
+    if live["sourceTag"] != observed_tag or observed_tag != f"tip-{live['releaseCommit'][:12]}":
+        raise RolloutError("live Tip manifest tag differs from the observed release or its source commit")
+    if live["eligibilityProfile"] != declaration["eligibilityProfile"]:
+        raise RolloutError("live Tip eligibility profile differs from the checked-in declaration")
+
+    retained = expected_retained_history(live, sha256_file(live_manifest_path), "successor")
+    transition, published_preparer = retained
+    if predecessor_pin(published_preparer) != preparer:
+        raise RolloutError("live Tip preparer differs from the checked-in manifest pin")
+    if transition["tag"] == anchor["tag"]:
+        if predecessor_pin(transition) != anchor:
+            raise RolloutError("live Tip transition bytes differ from the checked-in manifest pin")
+    elif parse_build(transition["buildNumber"], "live transition build") <= parse_build(
+        anchor_manifest["appcastItems"][0]["buildNumber"], "pinned transition build"
+    ):
+        raise RolloutError("live Tip transition does not advance the checked-in transition anchor")
+
+    resolved = dict(declaration, predecessors=[predecessor_pin(transition), preparer])
+    Path(args.output).write_text(json.dumps(resolved, indent=2) + "\n", encoding="utf-8")
+    print(f"OK: resolved Tip successor history from {observed_tag}; retaining {transition['tag']}.")
+
+
 def validate_candidate_matches_declaration(declaration: dict, candidate: dict) -> None:
     for declaration_key, manifest_key in (
         ("channel", "channel"),
@@ -996,6 +1035,13 @@ def validate_candidate_matches_declaration(declaration: dict, candidate: dict) -
                 f"{declaration_key}={declaration[declaration_key]!r} "
                 f"manifest={candidate[manifest_key]!r}"
             )
+    if declaration["channel"] == "tip" and declaration["currentRole"] == "successor":
+        transition, preparer = candidate["appcastItems"][1:]
+        anchor, preparer_pin = declaration["predecessors"]
+        if predecessor_pin(preparer) != preparer_pin:
+            raise RolloutError("candidate Tip preparer differs from the checked-in manifest pin")
+        if transition["tag"] == anchor["tag"] and predecessor_pin(transition) != anchor:
+            raise RolloutError("candidate Tip transition bytes differ from the checked-in manifest pin")
 
 
 def run_validate_live_tip_progression(args: argparse.Namespace) -> None:
@@ -1488,6 +1534,11 @@ def build_parser() -> argparse.ArgumentParser:
     predecessor_values = subparsers.add_parser("predecessor-values")
     predecessor_values.add_argument("--declaration", required=True)
     predecessor_values.set_defaults(func=run_predecessor_values)
+
+    resolve_successor = subparsers.add_parser("resolve-tip-successor")
+    for flag in ("policy", "declaration", "transition-anchor", "live-release", "live-manifest", "live-appcast", "output"):
+        resolve_successor.add_argument(f"--{flag}", required=True)
+    resolve_successor.set_defaults(func=run_resolve_tip_successor)
 
     generate = subparsers.add_parser("generate")
     add_shared_generate_arguments(generate)

@@ -40,6 +40,7 @@ final class AgentSessionRunStartRuntime {
         attachments: [AgentFileAttachment] = [],
         taggedFileAttachments: [AgentTaggedFileAttachment] = [],
         codexFallbackContext: AgentTabSession.CodexFallbackSubmissionContext? = nil,
+        appliedWorkflow: AgentWorkflowDefinition? = nil,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
         directStartOptions: AgentDirectRunStartOptions = .default,
         startOutcome: AgentRunStartOutcomeRecorder? = nil,
@@ -60,6 +61,14 @@ final class AgentSessionRunStartRuntime {
               !owner.isRetiring, !owner.hasReleasedWriterClaims,
               let originalMembership = owner.membership(of: session) else { return nil }
         defer { withExtendedLifetime(owner) {} }
+        func overflowInputIsAllowed() -> Bool {
+            !session.pendingHandoff.awaitsLocalClaudeOverflowInput || directStartOptions.localComposerCandidate != nil
+        }
+        guard overflowInputIsAllowed() else {
+            let message = "Send a new message in the composer to continue the fresh Claude conversation."
+            startOutcome?.recordStartFailure(message: message)
+            return .failed(message: message)
+        }
         let tabID = session.tabID
         var writer: AgentSessionRuntimeStore.Writer?
         if let sessionID = session.activeAgentSessionID {
@@ -89,7 +98,7 @@ final class AgentSessionRunStartRuntime {
         }
         func isCurrent() -> Bool {
             guard owner.sessions[tabID] === session, !owner.isRetiring, !owner.hasReleasedWriterClaims,
-                  resourcesAreCurrent() else { return false }
+                  overflowInputIsAllowed(), resourcesAreCurrent(), startOutcome?.allowsStartup() != false else { return false }
             if let writer { return writer.isCurrent }
             // A blank draft has no persistent Writer yet. Its slot still has exact provenance:
             // preparation must not adopt a remove/re-add of the same unbound object.
@@ -289,11 +298,14 @@ final class AgentSessionRunStartRuntime {
         }
         var inputSources = providerSwitchPreparation?.inputSources ?? []
         func inputIsCurrent() -> Bool {
-            command.isCurrent && resourcesAreCurrent() && stopFence.permitsStart(of: session) && periodicStartIsCurrent()
+            startOutcome?.allowsStartup() != false && command.isCurrent && resourcesAreCurrent()
+                && stopFence.permitsStart(of: session) && periodicStartIsCurrent()
                 && inputSources.allSatisfy { $0.isCurrent() }
         }
         func runInputIsCurrent() -> Bool {
-            periodicStartIsCurrent() && stopFence.permitsStart(of: session) && command.isCurrent && resourcesAreCurrent()
+            startOutcome?.allowsStartup() != false
+                && directStartOptions.providerControlCommand?.claudeWakeCompaction?.isCurrent(for: session) != false
+                && periodicStartIsCurrent() && stopFence.permitsStart(of: session) && command.isCurrent && resourcesAreCurrent()
                 && session.operationAdmissionFailureMessage == nil && inputSources.allSatisfy { $0.isCurrent() }
         }
         guard await owner.mcp.prepareWaitTrackingForRunStart(session: session, stopFence: stopFence) else { return nil }
@@ -304,6 +316,7 @@ final class AgentSessionRunStartRuntime {
         // the rendered lane claim the supplement path attaches.
         let switchMessages: (user: String, initial: String)?
         if session.pendingHandoff.providerSwitchDelivery != nil {
+            guard directStartOptions.providerControlCommand?.claudeWakeCompaction == nil else { return nil }
             switchMessages = await links.prepareProviderSwitchHandoverForSend(providerSwitchPreparation, session: session, stopFence: stopFence)
             guard inputIsCurrent() else { return nil }
             guard switchMessages != nil else {
@@ -397,7 +410,10 @@ final class AgentSessionRunStartRuntime {
         AgentSessionProviderInputRuntime.recordTaggedFileFailures(taggedFileFailures, session: session, scope: owner)
         candidateTransferred = true
         claudeEventsTransferred = true
-        return await environment.composition().startRun(
+        let wasActiveBeforeStart = session.runState.isActive
+        let startedAt = Date()
+        let outcomeRecorder = startOutcome ?? AgentRunStartOutcomeRecorder()
+        let outcome = await environment.composition().startRun(
             tabID: tabID,
             session: session,
             origin: command,
@@ -409,12 +425,22 @@ final class AgentSessionRunStartRuntime {
             autoEffortSelection: autoEffortSelection,
             providerControlCommand: directStartOptions.providerControlCommand,
             selfCompactDispatchID: directStartOptions.selfCompactDispatchID,
-            startOutcome: startOutcome,
+            startOutcome: outcomeRecorder,
             stopFence: stopFence,
             localComposerCandidate: directStartOptions.localComposerCandidate,
             initialUserItemID: directStartOptions.initialUserItemID,
             preparedClaudeEvents: preparedClaudeEvents
         )
+        if writer.isCurrent, session.recordRunMetadataIfAccepted(
+            wasActiveBeforeStart: wasActiveBeforeStart,
+            dispatchAccepted: outcomeRecorder.outcome.didStart,
+            workflow: appliedWorkflow,
+            startedAt: startedAt
+        ) {
+            owner.presentation.bindingChanged(session)
+            owner.persistence.scheduleSave(for: session)
+        }
+        return outcome
     }
 
     /// Accepted steering has a runtime-owned producer even when its presentation detaches.

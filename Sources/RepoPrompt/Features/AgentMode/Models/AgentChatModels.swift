@@ -96,6 +96,23 @@ public enum AgentDisplayableText {
     }
 }
 
+// MARK: - Delegation Decision Metadata
+
+/// Ordered app-authored notices, retaining the exact provider text for each decision.
+public struct AgentDelegationDecisionBatch: Codable, Sendable, Equatable {
+    struct Decision: Codable, Equatable {
+        let outcome: String
+        let targetSessionID: UUID?
+        let text: String
+    }
+
+    let decisions: [Decision]
+
+    var text: String {
+        decisions.map(\.text).joined(separator: "\n")
+    }
+}
+
 // MARK: - Codex Goal Mode Metadata
 
 public struct AgentCodexGoalModeMetadata: Codable, Sendable, Equatable {
@@ -230,6 +247,9 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
     /// Positive retained composer authorship; absent means other or unknown.
     public var userInputOrigin: AgentUserInputOrigin?
 
+    /// App-authored presentation metadata; never inferred from the row text.
+    public var delegationDecisionBatch: AgentDelegationDecisionBatch?
+
     /// Set on attributed user deliveries and fixed-text system control rows.
     public var crossSessionAttribution: AgentCrossSessionAttribution?
 
@@ -273,6 +293,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         codexGoalMode: AgentCodexGoalModeMetadata? = nil,
         isLocalControlPlaneEcho: Bool = false,
         userInputOrigin: AgentUserInputOrigin? = nil,
+        delegationDecisionBatch: AgentDelegationDecisionBatch? = nil,
         crossSessionAttribution: AgentCrossSessionAttribution? = nil,
         dispatchedProviderText: String? = nil,
         laneUpdateDisplayAttribution: AgentLaneUpdateDisplayAttribution? = nil,
@@ -300,6 +321,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         self.codexGoalMode = codexGoalMode
         self.isLocalControlPlaneEcho = isLocalControlPlaneEcho
         self.userInputOrigin = userInputOrigin
+        self.delegationDecisionBatch = delegationDecisionBatch
         self.crossSessionAttribution = crossSessionAttribution
         self.dispatchedProviderText = dispatchedProviderText
         self.laneUpdateDisplayAttribution = laneUpdateDisplayAttribution?.validated
@@ -319,6 +341,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         case toolName, toolInvocationID, toolArgsJSON, toolResultJSON, toolIsError
         case reasoning, sequenceIndex, isStreaming, workflow, codexGoalMode, isLocalControlPlaneEcho
         case userInputOrigin
+        case delegationDecisionBatch
         case crossSessionAttribution
         case dispatchedProviderText
         case laneUpdateDisplayAttribution
@@ -349,6 +372,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         codexGoalMode = try c.decodeIfPresent(AgentCodexGoalModeMetadata.self, forKey: .codexGoalMode)
         isLocalControlPlaneEcho = try c.decodeIfPresent(Bool.self, forKey: .isLocalControlPlaneEcho) ?? false
         userInputOrigin = AgentUserInputOrigin(rawValue: (try? c.decode(String.self, forKey: .userInputOrigin)) ?? "")
+        delegationDecisionBatch = try? c.decodeIfPresent(AgentDelegationDecisionBatch.self, forKey: .delegationDecisionBatch)
         crossSessionAttribution = try c.decodeIfPresent(
             AgentCrossSessionAttribution.self,
             forKey: .crossSessionAttribution
@@ -575,6 +599,7 @@ extension AgentChatItem {
             codexGoalMode: codexGoalMode,
             isLocalControlPlaneEcho: isLocalControlPlaneEcho,
             userInputOrigin: userInputOrigin,
+            delegationDecisionBatch: delegationDecisionBatch,
             crossSessionAttribution: crossSessionAttribution,
             dispatchedProviderText: dispatchedProviderText,
             laneUpdateDisplayAttribution: laneUpdateDisplayAttribution,
@@ -627,6 +652,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
     public var codexGoalMode: AgentCodexGoalModeMetadata?
     public var isLocalControlPlaneEcho: Bool
     public var userInputOrigin: AgentUserInputOrigin?
+    public var delegationDecisionBatch: AgentDelegationDecisionBatch?
     public var crossSessionAttribution: AgentCrossSessionAttribution?
     public var dispatchedProviderText: String?
     /// Local-display lane labels for an accepted lane-update row. Persisted with the session file
@@ -657,6 +683,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         codexGoalMode = item.codexGoalMode
         isLocalControlPlaneEcho = item.isLocalControlPlaneEcho
         userInputOrigin = item.userInputOrigin
+        delegationDecisionBatch = item.delegationDecisionBatch
         crossSessionAttribution = item.crossSessionAttribution
         dispatchedProviderText = item.dispatchedProviderText
         laneUpdateDisplayAttribution = item.laneUpdateDisplayAttribution?.validated
@@ -736,6 +763,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
             codexGoalMode: codexGoalMode,
             isLocalControlPlaneEcho: isLocalControlPlaneEcho,
             userInputOrigin: userInputOrigin,
+            delegationDecisionBatch: delegationDecisionBatch,
             crossSessionAttribution: crossSessionAttribution,
             dispatchedProviderText: dispatchedProviderText,
             laneUpdateDisplayAttribution: laneUpdateDisplayAttribution,
@@ -777,6 +805,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         case codexGoalMode
         case isLocalControlPlaneEcho
         case userInputOrigin
+        case delegationDecisionBatch
         case crossSessionAttribution
         case dispatchedProviderText
         case laneUpdateDisplayAttribution
@@ -807,6 +836,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         codexGoalMode = try container.decodeIfPresent(AgentCodexGoalModeMetadata.self, forKey: .codexGoalMode)
         isLocalControlPlaneEcho = try container.decodeIfPresent(Bool.self, forKey: .isLocalControlPlaneEcho) ?? false
         userInputOrigin = AgentUserInputOrigin(rawValue: (try? container.decode(String.self, forKey: .userInputOrigin)) ?? "")
+        delegationDecisionBatch = try? container.decodeIfPresent(AgentDelegationDecisionBatch.self, forKey: .delegationDecisionBatch)
         crossSessionAttribution = try container.decodeIfPresent(
             AgentCrossSessionAttribution.self,
             forKey: .crossSessionAttribution

@@ -1180,6 +1180,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
         package var providerConversationCleanupAction: String?
         package var restrictMCPAgentDiscoveryToRoleLabels: Bool?
         package var agentSessionHandoffInstructions: String?
+        package var claudeWakeCompactionThresholdPercent: Int?
         package var subagentDefaultWaitSeconds: Int?
         /// App-global UI preference; skips only the confirmation dialog, never authority.
         package var suppressOversightLinkConfirmation: Bool?
@@ -1217,6 +1218,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             providerConversationCleanupAction: String? = nil,
             restrictMCPAgentDiscoveryToRoleLabels: Bool? = nil,
             agentSessionHandoffInstructions: String? = nil,
+            claudeWakeCompactionThresholdPercent: Int? = nil,
             subagentDefaultWaitSeconds: Int? = nil,
             suppressOversightLinkConfirmation: Bool? = nil,
             providerEnvironmentWithheldNames: [String]? = nil,
@@ -1251,6 +1253,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             self.providerConversationCleanupAction = providerConversationCleanupAction
             self.restrictMCPAgentDiscoveryToRoleLabels = restrictMCPAgentDiscoveryToRoleLabels
             self.agentSessionHandoffInstructions = agentSessionHandoffInstructions
+            self.claudeWakeCompactionThresholdPercent = claudeWakeCompactionThresholdPercent
             self.subagentDefaultWaitSeconds = subagentDefaultWaitSeconds
             self.suppressOversightLinkConfirmation = suppressOversightLinkConfirmation
             self.providerEnvironmentWithheldNames = providerEnvironmentWithheldNames

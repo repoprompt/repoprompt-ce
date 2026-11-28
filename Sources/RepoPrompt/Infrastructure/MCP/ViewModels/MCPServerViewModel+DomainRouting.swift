@@ -48,7 +48,7 @@ extension MCPServerViewModel {
             true
         case .context, .appPresentationWindow:
             existing != target
-        case .runScoped:
+        case .runScoped, .canonicalRunScoped, .savedRunScoped:
             false
         }
     }
@@ -62,11 +62,12 @@ extension MCPServerViewModel {
         resolvedBindingKind: DomainReadBindingKind
     ) -> Bool {
         switch (requestedRunID, resolvedBindingKind) {
-        case let (.some(requestedRunID), .runScoped(actualRunID)):
+        case let (.some(requestedRunID), .runScoped(actualRunID)),
+             let (.some(requestedRunID), .savedRunScoped(actualRunID, _)):
             requestedRunID == actualRunID
         case (.some, _):
             false
-        case (nil, .runScoped):
+        case (nil, .runScoped), (nil, .savedRunScoped):
             false
         case (nil, _):
             true

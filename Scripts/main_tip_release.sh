@@ -640,28 +640,59 @@ derive_sparkle_public_key() {
     xcrun swift "$CONTROL_PLANE_SCRIPTS_DIR/derive_sparkle_public_key.swift" "$1"
 }
 
+fetch_tip_predecessor_manifest() {
+    local tag="$1" digest="$2" path="$3" actual_digest
+    curl --disable --fail --location --silent --show-error --proto '=https' --tlsv1.2 \
+        --connect-timeout 10 --max-time 30 \
+        "https://github.com/$TIP_UPDATE_REPOSITORY/releases/download/$tag/identity-rollout.json" \
+        --output "$path"
+    actual_digest="$(shasum -a 256 "$path" | awk '{print $1}')"
+    [[ "$actual_digest" == "$digest" ]] || fail "Tip predecessor manifest digest mismatch for $tag"
+}
+
+resolve_tip_successor_declaration() {
+    local directory="$1" observed="$1/live" pins role tag digest
+    require_command gh
+    source "$CONTROL_PLANE_SCRIPTS_DIR/release_observation.sh"
+    OBSERVATION_GH_TOKEN="${TIP_ROLLOUT_OBSERVATION_TOKEN:-$TIP_GH_TOKEN}" \
+        fetch_observed_rollout_pair "$TIP_UPDATE_REPOSITORY" latest tip "$observed" ||
+        fail "Could not verify the published Tip rollout predecessor"
+    pins="$(python3 "$ROLLOUT_TOOL" predecessor-values --declaration "$ROLLOUT_DECLARATION")"
+    IFS=$'\t' read -r role tag digest <<< "$pins"
+    [[ "$role" == transition ]] || fail "Missing checked-in Tip transition anchor"
+    fetch_tip_predecessor_manifest "$tag" "$digest" "$directory/transition-anchor.json"
+    python3 "$ROLLOUT_TOOL" resolve-tip-successor \
+        --policy "$APPLE_IDENTITY_POLICY" \
+        --declaration "$ROLLOUT_DECLARATION" \
+        --transition-anchor "$directory/transition-anchor.json" \
+        --live-release "$observed/release.json" \
+        --live-manifest "$observed/manifest.json" \
+        --live-appcast "$observed/appcast.xml" \
+        --output "$directory/resolved-tip-rollout.json"
+}
+
 generate_tip_rollout_appcast() {
     require_env SPARKLE_PRIVATE_KEY
     local predecessor_dir="$TMP_DIR/predecessors"
     mkdir -p "$predecessor_dir"
+    local declaration="$ROLLOUT_DECLARATION"
+    if [[ "$ROLLOUT_ROLE" == successor ]]; then
+        resolve_tip_successor_declaration "$predecessor_dir"
+        declaration="$predecessor_dir/resolved-tip-rollout.json"
+    fi
     # macOS still ships Bash 3.2, where expanding an empty array under
     # `set -u` aborts the script. Keep this argument vector non-empty for the
     # preparer role, whose rollout intentionally has no predecessors.
-    local rollout_generate_args=(--declaration "$ROLLOUT_DECLARATION")
-    local position=0 role tag digest path actual_digest
+    local rollout_generate_args=(--declaration "$declaration")
+    local position=0 role tag digest path pins
+    pins="$(python3 "$ROLLOUT_TOOL" predecessor-values --declaration "$declaration")"
     while IFS=$'\t' read -r role tag digest; do
         [[ -n "$role" ]] || continue
         position=$((position + 1))
         path="$predecessor_dir/$position-identity-rollout.json"
-        curl --fail --location --silent --show-error \
-            --connect-timeout 10 --max-time 30 \
-            "https://github.com/$TIP_UPDATE_REPOSITORY/releases/download/$tag/identity-rollout.json" \
-            --output "$path"
-        actual_digest="$(shasum -a 256 "$path" | awk '{print $1}')"
-        [[ "$actual_digest" == "$digest" ]] ||
-            fail "Tip predecessor $role manifest digest mismatch for $tag"
+        fetch_tip_predecessor_manifest "$tag" "$digest" "$path"
         rollout_generate_args+=(--predecessor-manifest "$path")
-    done < <(python3 "$ROLLOUT_TOOL" predecessor-values --declaration "$ROLLOUT_DECLARATION")
+    done <<< "$pins"
 
     local enclosure_signature
     enclosure_signature="$(printf '%s' "$SPARKLE_PRIVATE_KEY" |
@@ -697,6 +728,16 @@ generate_tip_rollout_appcast() {
         --app-artifact-manifest "$FINAL_ARTIFACT_MANIFEST" \
         --appcast "$APPCAST" \
         --manifest "$ROLLOUT_MANIFEST"
+
+    if [[ "$ROLLOUT_ROLE" == successor ]]; then
+        python3 "$ROLLOUT_TOOL" validate-live-tip-progression \
+            --policy "$APPLE_IDENTITY_POLICY" \
+            --declaration "$ROLLOUT_DECLARATION" \
+            --live-manifest "$predecessor_dir/live/manifest.json" \
+            --live-appcast "$predecessor_dir/live/appcast.xml" \
+            --candidate-manifest "$ROLLOUT_MANIFEST" \
+            --candidate-appcast "$APPCAST"
+    fi
 
     local private_key_file="$TMP_DIR/tip-sparkle-private-key"
     local public_key_file="$TMP_DIR/tip-sparkle-public-key"

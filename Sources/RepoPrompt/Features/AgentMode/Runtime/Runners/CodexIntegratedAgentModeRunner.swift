@@ -26,7 +26,8 @@ final class CodexIntegratedAgentModeRunner {
         fallbackContext: AgentTabSession.CodexFallbackSubmissionContext?,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
         selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
-        stopFence: AgentRunStartStopFence? = nil
+        stopFence: AgentRunStartStopFence? = nil,
+        startOutcome: AgentRunStartOutcomeRecorder? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome {
         guard case .restored = origin.requirement, origin.writer.session === session, origin.isCurrent,
               providerLaunchInput?.isCurrent(for: session) != false,
@@ -50,6 +51,7 @@ final class CodexIntegratedAgentModeRunner {
         } else {
             guard stopFence?.permitsStart(of: session) ?? true else { return .cancelled }
             ownership = session.beginRunAttempt(source: "codex")
+            startOutcome?.recordNewAttempt(ownership)
             createdOwnership = true
             session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .preparingRuntime)
         }
