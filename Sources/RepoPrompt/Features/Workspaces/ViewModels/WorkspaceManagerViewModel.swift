@@ -1978,18 +1978,6 @@ class WorkspaceManagerViewModel: ObservableObject {
     private var fullDocumentWriteBaselines: [UUID: FullDocumentWriteBaseline] = [:]
     private var fullDocumentAdoptionGenerations: [UUID: UInt64] = [:]
     private var pendingFullDocumentWrites: [UUID: PendingFullDocumentWrite] = [:]
-    private struct MetadataSaveDrain {
-        var count = 0
-        var waiters: [UUID: OwnSaveWaitGate] = [:]
-    }
-
-    // Track accepted saves independently of field ownership: even a superseded task may still
-    // be processing a committed write. Snapshot hides use the same drain without a child task.
-    private var metadataSaveDrains: [UUID: MetadataSaveDrain] = [:]
-    private var workspaceSaveShutdownDeadline: ContinuousClock.Instant?
-    private var workspaceSaveShutdownFenced = false
-    private var workspaceSaveShutdownTimer: Timer?
-    private var shutdownSaveWaiters: [UUID: OwnSaveWaitGate] = [:]
     private var workspaceRenameIntentByID: [UUID: UUID] = [:]
     private var workspaceHiddenIntentByID: [UUID: UUID] = [:]
     /// For each field with a pending choice in this window: the values observed before each of
@@ -5180,7 +5168,6 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     func prepareForWindowClose() {
-        beginWorkspaceSaveShutdown(deadline: .now.advanced(by: .seconds(AppTerminationCoordinator.defaultCleanupTimeout)))
         isPreparingForWindowClose = true
         domainCatalogRefreshCancellation?()
         // Revoke and cancel startup; its handle stays retained so teardown can join it.
@@ -5226,7 +5213,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     // MARK: - Private Timer Control
 
     private func startPollTimer() {
-        guard !isPreparingForWindowClose, workspaceSaveShutdownDeadline == nil, !workspaceSaveShutdownFenced else { return }
+        guard !isPreparingForWindowClose else { return }
         pollTimer?.invalidate()
         pollTimer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
@@ -5350,8 +5337,9 @@ class WorkspaceManagerViewModel: ObservableObject {
     /// Waits for an own save to finish without cancelling it. If the waiting caller is cancelled
     /// first, only the wait ends (the save keeps running under its owner) and this throws
     /// `CancellationError`, so a cancelled admission never holds its lease on another task's write.
-    private static func awaitOwnSaveCompletion(_ task: Task<Void, Never>, gate: OwnSaveWaitGate = OwnSaveWaitGate()) async throws {
+    private static func awaitOwnSaveCompletion(_ task: Task<Void, Never>) async throws {
         try Task.checkCancellation()
+        let gate = OwnSaveWaitGate()
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 gate.install(continuation)
@@ -5381,120 +5369,21 @@ class WorkspaceManagerViewModel: ObservableObject {
         return pollTimerSaveTask
     }
 
-    func beginWorkspaceSaveShutdown(deadline: ContinuousClock.Instant) {
-        guard !workspaceSaveShutdownFenced,
-              workspaceSaveShutdownDeadline.map({ deadline < $0 }) ?? true
-        else { return }
-        workspaceSaveShutdownDeadline = deadline
-        stopPollTimer()
-        workspaceSaveShutdownTimer?.invalidate()
-        let remaining = ContinuousClock.now.duration(to: deadline).components
-        let seconds = Double(remaining.seconds) + Double(remaining.attoseconds) / 1e18
-        guard seconds > 0 else {
-            fenceWorkspaceSaveShutdown()
-            return
-        }
-        let timer = Timer(timeInterval: seconds, repeats: false) { [weak self] _ in
-            MainActor.assumeIsolated { self?.fenceWorkspaceSaveShutdown() }
-        }
-        workspaceSaveShutdownTimer = timer
-        RunLoop.main.add(timer, forMode: .common)
-        RunLoop.main.add(timer, forMode: .modalPanel)
-    }
-
-    func fenceWorkspaceSaveShutdown() {
-        guard !workspaceSaveShutdownFenced else { return }
-        workspaceSaveShutdownFenced = true
-        ownSaveFenceGeneration &+= 1
-        workspaceSaveShutdownTimer?.invalidate()
-        workspaceSaveShutdownTimer = nil
-        for gate in shutdownSaveWaiters.values {
-            gate.resume(with: .failure(CancellationError()))
-        }
-    }
-
-    private func checkWorkspaceSaveShutdown() throws {
-        try Task.checkCancellation()
-        if let deadline = workspaceSaveShutdownDeadline, ContinuousClock.now >= deadline {
-            fenceWorkspaceSaveShutdown()
-        }
-        if workspaceSaveShutdownFenced { throw WorkspacePersistenceFailure(category: .cancelled) }
-    }
-
-    private func beginMetadataSave(workspaceID: UUID) -> Bool {
-        guard workspaceSaveShutdownDeadline == nil, !workspaceSaveShutdownFenced else { return false }
-        metadataSaveDrains[workspaceID, default: MetadataSaveDrain()].count += 1
-        return true
-    }
-
-    private func finishMetadataSave(workspaceID: UUID) {
-        guard let drain = metadataSaveDrains[workspaceID] else { return }
-        if drain.count > 1 {
-            metadataSaveDrains[workspaceID]?.count -= 1
-        } else {
-            metadataSaveDrains.removeValue(forKey: workspaceID)
-            drain.waiters.values.forEach { $0.resume(with: .success(())) }
-        }
-    }
-
-    private func awaitMetadataSaves(workspaceID: UUID, bounded: Bool = true) async throws {
-        while metadataSaveDrains[workspaceID] != nil {
-            if bounded { try checkWorkspaceSaveShutdown() }
-            let id = UUID()
-            let gate = OwnSaveWaitGate()
-            metadataSaveDrains[workspaceID]?.waiters[id] = gate
-            if bounded { shutdownSaveWaiters[id] = gate }
-            defer {
-                metadataSaveDrains[workspaceID]?.waiters.removeValue(forKey: id)
-                shutdownSaveWaiters.removeValue(forKey: id)
-            }
-            try await withTaskCancellationHandler {
-                try await withCheckedThrowingContinuation { gate.install($0) }
-            } onCancel: {
-                gate.resume(with: .failure(CancellationError()))
-            }
-        }
-        if bounded { try checkWorkspaceSaveShutdown() }
-    }
-
-    private func awaitShutdownSave(_ task: Task<Void, Never>) async throws {
-        try checkWorkspaceSaveShutdown()
-        let id = UUID()
-        let gate = OwnSaveWaitGate()
-        shutdownSaveWaiters[id] = gate
-        defer { shutdownSaveWaiters.removeValue(forKey: id) }
-        try await Self.awaitOwnSaveCompletion(task, gate: gate)
-        try checkWorkspaceSaveShutdown()
-    }
-
-    /// Close and quit share one deadline for admitted saves and their final captures.
-    /// Expiry unblocks teardown without cancelling an authority invocation already in flight.
+    /// Window close: let this window's own saves (including the final `onDisappear` capture)
+    /// finish instead of abandoning them mid-write. Bounded: saves scheduled while awaiting are
+    /// picked up for at most a few passes; nothing new is scheduled once teardown runs.
     func awaitOwnSavesForWindowClose() async {
-        do {
-            while let workspaceID = metadataSaveDrains.keys.first {
-                try await awaitMetadataSaves(workspaceID: workspaceID)
+        for _ in 0 ..< 3 {
+            var tasks = scheduledWorkspaceSaveTasks.values.flatMap(\.values)
+            if pollTimerSaveTaskID != nil, let pollTimerSaveTask {
+                tasks.append(pollTimerSaveTask)
             }
-            for _ in 0 ..< 3 {
-                var tasks = scheduledWorkspaceSaveTasks.values.flatMap(\.values)
-                tasks.append(contentsOf: domainWorkingCommitTasks.values)
-                if pollTimerSaveTaskID != nil, let pollTimerSaveTask { tasks.append(pollTimerSaveTask) }
-                guard !tasks.isEmpty else { return }
-                for task in tasks {
-                    try await awaitShutdownSave(task)
-                }
+            guard !tasks.isEmpty else { return }
+            for task in tasks {
+                await task.value
             }
-        } catch {
-            fenceWorkspaceSaveShutdown()
         }
     }
-
-    #if DEBUG
-        func debugDrainMetadataSaves() async throws {
-            while let workspaceID = metadataSaveDrains.keys.first {
-                try await awaitMetadataSaves(workspaceID: workspaceID, bounded: false)
-            }
-        }
-    #endif
 
     // MARK: - INDEX LOAD/SAVE
 
@@ -8279,8 +8168,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     /// Coalesces high-frequency UI captures before issuing one durable working-state command.
     private func publishWorkingDocumentToDomainAuthority(_ workspace: WorkspaceModel) {
-        guard workspaceSaveShutdownDeadline == nil, !workspaceSaveShutdownFenced,
-              !workspace.isEphemeral,
+        guard !workspace.isEphemeral,
               !agentAdmissionRecoveryOwnsWorkspace(workspace.id),
               let domainWorkspaceAuthorityClient
         else { return }
@@ -8318,8 +8206,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 else { return }
                 let document = try await WorkspaceFileDecodeCache.shared.documentPreparation.document(for: workspace, fileURL: fileURL)
                 try Task.checkCancellation()
-                guard workspaceSaveShutdownDeadline == nil, !workspaceSaveShutdownFenced,
-                      domainWorkingCommitGeneration[workspaceID] == generation,
+                guard domainWorkingCommitGeneration[workspaceID] == generation,
                       self.workspace(withID: workspaceID)?.isEphemeral == false
                 else { return }
                 try registerPendingFullDocumentWrite(
@@ -15315,11 +15202,10 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     func renameWorkspace(_ workspace: WorkspaceModel, newName: String) {
-        guard !isPreparingForWindowClose, let index = workspaces.firstIndex(where: { $0.id == workspace.id }) else { return }
+        guard let index = workspaces.firstIndex(where: { $0.id == workspace.id }) else { return }
         let finalName = newName.trimmingCharacters(in: .whitespaces)
         guard !finalName.isEmpty else { return }
 
-        guard beginMetadataSave(workspaceID: workspace.id) else { return }
         let previousName = workspaces[index].name
         workspaces[index].name = finalName
         workspaces[index].dateModified = Date()
@@ -15335,7 +15221,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             .union([previousName])
         workspaceRenameIntentByID[workspaceID] = intentID
         workspaceRenamePriorNamesByID[workspaceID] = priorNames.union([finalName])
-        let intent = metadataIntent(.name, workspace: workspaces[index]) { [weak self] workspace in
+        let intent = WorkspaceSaveFieldIntent { [weak self] workspace in
             guard self?.workspaceRenameIntentByID[workspaceID] == intentID,
                   priorNames.contains(workspace.name) || workspace.name == finalName
             else { return false }
@@ -15344,18 +15230,17 @@ class WorkspaceManagerViewModel: ObservableObject {
             return true
         }
         Task { @MainActor [weak self] in
-            guard let self else { return }
+            guard let self,
+                  workspaceRenameIntentByID[workspaceID] == intentID,
+                  var workspaceToSave = workspaces.first(where: { $0.id == workspaceID })
+            else { return }
             defer {
-                finishMetadataSave(workspaceID: workspaceID)
                 if workspaceRenameIntentByID[workspaceID] == intentID {
                     workspaceRenameIntentByID.removeValue(forKey: workspaceID)
                     workspaceRenamePriorNamesByID.removeValue(forKey: workspaceID)
                 }
             }
-            guard workspaceRenameIntentByID[workspaceID] == intentID,
-                  var workspaceToSave = workspaces.first(where: { $0.id == workspaceID }),
-                  intent.apply(&workspaceToSave)
-            else { return }
+            guard intent.apply(&workspaceToSave) else { return }
             if let currentIndex = workspaces.firstIndex(where: { $0.id == workspaceID }) {
                 workspaces[currentIndex].name = workspaceToSave.name
                 workspaces[currentIndex].dateModified = workspaceToSave.dateModified
@@ -15407,8 +15292,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     /// Preserves the predecessor optimistic hidden-state flow for ordinary UI mutations.
     private func setOrdinaryWorkspaceHidden(_ workspace: WorkspaceModel, hidden: Bool) {
-        guard !isPreparingForWindowClose, let index = workspaces.firstIndex(where: { $0.id == workspace.id }) else { return }
-        guard beginMetadataSave(workspaceID: workspace.id) else { return }
+        guard let index = workspaces.firstIndex(where: { $0.id == workspace.id }) else { return }
         let lifecycle = workspaces[index].consolidatedIntoWorkspaceID
         workspaces[index].isHiddenInMenus = hidden
         workspaces[index].dateModified = Date()
@@ -15418,21 +15302,20 @@ class WorkspaceManagerViewModel: ObservableObject {
         let intentDateModified = workspaces[index].dateModified
         workspaceHiddenIntentByID[workspaceID] = intentID
         let intent = hiddenFieldIntent(
-            workspace: workspaces[index], intentID: intentID, hidden: hidden,
+            workspaceID: workspaceID, intentID: intentID, hidden: hidden,
             lifecycle: lifecycle, intentDateModified: intentDateModified
         )
         Task { @MainActor [weak self] in
-            guard let self else { return }
+            guard let self,
+                  workspaceHiddenIntentByID[workspaceID] == intentID,
+                  var workspaceToSave = workspaces.first(where: { $0.id == workspaceID })
+            else { return }
             defer {
-                finishMetadataSave(workspaceID: workspaceID)
                 if workspaceHiddenIntentByID[workspaceID] == intentID {
                     workspaceHiddenIntentByID.removeValue(forKey: workspaceID)
                 }
             }
-            guard workspaceHiddenIntentByID[workspaceID] == intentID,
-                  var workspaceToSave = workspaces.first(where: { $0.id == workspaceID }),
-                  intent.apply(&workspaceToSave)
-            else { return }
+            guard intent.apply(&workspaceToSave) else { return }
             if let currentIndex = workspaces.firstIndex(where: { $0.id == workspaceID }) {
                 workspaces[currentIndex].isHiddenInMenus = workspaceToSave.isHiddenInMenus
                 workspaces[currentIndex].dateModified = workspaceToSave.dateModified
@@ -15491,14 +15374,13 @@ class WorkspaceManagerViewModel: ObservableObject {
     /// The hidden-state change of one request. Showing a recovery copy is a restore, which
     /// `setWorkspaceHidden` routes elsewhere; a consolidation or restore since the request ends it.
     private func hiddenFieldIntent(
-        workspace: WorkspaceModel,
+        workspaceID: UUID,
         intentID: UUID,
         hidden: Bool,
         lifecycle: UUID?,
         intentDateModified: Date
     ) -> WorkspaceSaveFieldIntent {
-        let workspaceID = workspace.id
-        return metadataIntent(.hidden, workspace: workspace) { [weak self] workspace in
+        WorkspaceSaveFieldIntent { [weak self] workspace in
             guard self?.workspaceHiddenIntentByID[workspaceID] == intentID,
                   workspace.consolidatedIntoWorkspaceID == lifecycle,
                   hidden || workspace.consolidatedIntoWorkspaceID == nil
@@ -15593,8 +15475,6 @@ class WorkspaceManagerViewModel: ObservableObject {
                 return current
             }
             try validateConsolidationLifecycle(workspace)
-            guard beginMetadataSave(workspaceID: workspace.id) else { throw WorkspacePersistenceFailure(category: .cancelled) }
-            defer { finishMetadataSave(workspaceID: workspace.id) }
             var updated = current
             updated.isHiddenInMenus = hidden
             updated.dateModified = Date()
@@ -15618,7 +15498,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 updated,
                 source: .setWorkspaceHiddenFromSnapshot,
                 fieldIntent: hiddenFieldIntent(
-                    workspace: updated, intentID: intentID, hidden: hidden,
+                    workspaceID: updated.id, intentID: intentID, hidden: hidden,
                     lifecycle: current.consolidatedIntoWorkspaceID, intentDateModified: updated.dateModified
                 )
             )
@@ -16814,7 +16694,6 @@ class WorkspaceManagerViewModel: ObservableObject {
         // following a still-running tab-creation save).
         // An in-flight poll save of this workspace is a predecessor too.
         let predecessors = ownTrackedSaveTasks(workspaceID: workspaceID)
-        let isCloseSave = workspaceSaveShutdownDeadline != nil
         let task = Task { @MainActor [weak self] in
             defer {
                 self?.scheduledWorkspaceSaveTasks[workspaceID]?.removeValue(forKey: taskID)
@@ -16822,15 +16701,9 @@ class WorkspaceManagerViewModel: ObservableObject {
                     self?.scheduledWorkspaceSaveTasks.removeValue(forKey: workspaceID)
                 }
             }
-            do {
-                for predecessor in predecessors {
-                    try await self?.awaitShutdownSave(predecessor)
-                }
-                if isCloseSave {
-                    try await self?.awaitMetadataSaves(workspaceID: workspaceID)
-                }
-                try self?.checkWorkspaceSaveShutdown()
-            } catch { return }
+            for predecessor in predecessors {
+                await predecessor.value
+            }
             await self?.saveWorkspaceAsync(
                 workspaceID: workspaceID,
                 fileURL: fileURL,
@@ -16861,21 +16734,6 @@ class WorkspaceManagerViewModel: ObservableObject {
         /// workspace still accepts it. A rename requires a name observed or requested by this
         /// window's pending choices, so it cannot replace an unrelated peer rename.
         let apply: @MainActor (inout WorkspaceModel) -> Bool
-        let field: WorkspaceMetadataField
-        let fileURL: URL
-        let workspaceFence: UInt64
-        let lifecycle: UUID?
-    }
-
-    private func metadataIntent(
-        _ field: WorkspaceMetadataField, workspace: WorkspaceModel,
-        apply: @escaping @MainActor (inout WorkspaceModel) -> Bool
-    ) -> WorkspaceSaveFieldIntent {
-        WorkspaceSaveFieldIntent(
-            apply: apply, field: field, fileURL: workspaceFileURL(for: workspace),
-            workspaceFence: ownSaveFenceByWorkspaceID[workspace.id, default: 0],
-            lifecycle: workspace.consolidatedIntoWorkspaceID
-        )
     }
 
     /// Extra attempts a field save may spend applying its change again to another window's save,
@@ -17116,13 +16974,13 @@ class WorkspaceManagerViewModel: ObservableObject {
         ownSaveFence: OwnSaveFence?
     ) async throws -> WorkspaceModel? {
         let workspaceID = proposal.id
-        guard workspaceSaveShutdownDeadline == nil, let refresh = domainCatalogRefreshAwaiter else { return nil }
+        guard let refresh = domainCatalogRefreshAwaiter else { return nil }
         for _ in 0 ..< 2 {
             // Stop if the refresh did not complete for the current bridge run; adoption itself is
             // proven separately by the write baseline below.
             guard await refresh() else { return nil }
             try Task.checkCancellation()
-            guard workspaceSaveShutdownDeadline == nil, !isPreparingForWindowClose,
+            guard !isPreparingForWindowClose,
                   isOwnSaveFenceCurrent(ownSaveFence, workspaceID: workspaceID),
                   var current = workspace(withID: workspaceID), !current.isEphemeral,
                   workspaceFileURL(for: current) == fileURL
@@ -17386,13 +17244,17 @@ class WorkspaceManagerViewModel: ObservableObject {
                     remainingFieldIntentRebases: remainingFieldIntentRebases
                 )
             }
-            try checkWorkspaceSaveShutdown()
             // Last point before this save writes to the authority. A superseded own save bails
             // here; past this point it is never interrupted by its superseding owner.
             guard isOwnSaveFenceCurrent(ownSaveFence, workspaceID: workspaceToSave.id) else {
                 throw WorkspacePersistenceFailure(category: .cancelled)
             }
-            try validateMetadataSubmission(fieldIntent, workspace: workspaceToSave)
+            if let fieldIntent {
+                var validated = workspaceToSave
+                guard fieldIntent.apply(&validated), validated == workspaceToSave else {
+                    throw WorkspacePersistenceFailure(category: .cancelled)
+                }
+            }
             if let existing {
                 // A manager without an accepted authority baseline may save only when its
                 // observed local model is exactly the canonical model it just read. Otherwise
@@ -17496,28 +17358,35 @@ class WorkspaceManagerViewModel: ObservableObject {
             )
             // Another window's save won the revision check. A field save rebases onto that save,
             // once this window has adopted it, instead of dropping the change.
-            guard let fieldIntent, !workingCommitted, remainingFieldIntentRebases > 0, !requiresExactSnapshotAttempt,
+            guard let fieldIntent, remainingFieldIntentRebases > 0, !requiresExactSnapshotAttempt,
                   outcome.errorCode == .stateConflict, outcome.diagnostic == "workspace_revision_mismatch"
             else { throw failure }
             pendingOperationIDs.forEach { pendingFullDocumentWrites.removeValue(forKey: $0) }
             pendingOperationIDs = []
-            guard let rebased = try await workspaceRebasingFieldIntentAfterConflict(
-                proposal: workspaceToSave, fileURL: targetURL,
-                fieldIntent: fieldIntent, ownSaveFence: ownSaveFence
-            ) else { throw failure }
-            return try await persistWorkspaceThroughDomainAuthority(
-                rebased,
-                targetURL: targetURL,
-                preserveDiskRepoPathsIfUnchangedSinceBaseline: preserveDiskRepoPathsIfUnchangedSinceBaseline,
-                source: source,
-                remainingRetryCount: 1,
-                issueClearance: issueClearance,
-                ownedPublicationGeneration: ownedPublicationGeneration,
-                ownSaveFence: ownSaveFence,
-                recaptureActivationGeneration: recaptureActivationGeneration,
-                fieldIntent: fieldIntent,
-                remainingFieldIntentRebases: remainingFieldIntentRebases - 1
-            )
+            do {
+                guard let rebased = try await workspaceRebasingFieldIntentAfterConflict(
+                    proposal: workspaceToSave, fileURL: targetURL,
+                    fieldIntent: fieldIntent, ownSaveFence: ownSaveFence
+                ) else { throw failure }
+                return try await persistWorkspaceThroughDomainAuthority(
+                    rebased,
+                    targetURL: targetURL,
+                    preserveDiskRepoPathsIfUnchangedSinceBaseline: preserveDiskRepoPathsIfUnchangedSinceBaseline,
+                    source: source,
+                    remainingRetryCount: 1,
+                    issueClearance: issueClearance,
+                    ownedPublicationGeneration: ownedPublicationGeneration,
+                    ownSaveFence: ownSaveFence,
+                    recaptureActivationGeneration: recaptureActivationGeneration,
+                    fieldIntent: fieldIntent,
+                    remainingFieldIntentRebases: remainingFieldIntentRebases - 1
+                )
+            } catch let later as DomainWorkspaceAuthorityOperationError where workingCommitted {
+                throw DomainWorkspaceAuthorityOperationError(outcome: later.outcome, workingCommitted: true)
+            } catch where workingCommitted {
+                // A local refusal after the working phase must not hide that it committed.
+                throw failure
+            }
         }
 
         if let index = workspaceIndex(for: workspaceToSave.id),
@@ -17657,75 +17526,6 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     // File I/O queue removed - now using async/await for non-blocking operations
 
-    private func validateMetadataSubmission(_ intent: WorkspaceSaveFieldIntent?, workspace: WorkspaceModel) throws {
-        guard let intent else { return }
-        var validated = workspace
-        guard intent.workspaceFence == ownSaveFenceByWorkspaceID[workspace.id, default: 0],
-              intent.fileURL == workspaceFileURL(for: workspace),
-              intent.lifecycle == workspace.consolidatedIntoWorkspaceID,
-              intent.apply(&validated), validated == workspace
-        else { throw WorkspacePersistenceFailure(category: .cancelled) }
-    }
-
-    private func saveClosingWorkspaceMetadata(_ intent: WorkspaceSaveFieldIntent, workspaceID: UUID) async throws -> URL {
-        try checkWorkspaceSaveShutdown()
-        guard let client = domainWorkspaceAuthorityClient,
-              let canonical = await client.canonicalWorkspaceSnapshot(workspaceID),
-              canonical.document.workspaceID == workspaceID, canonical.document.fileURL == intent.fileURL,
-              canonical.health.acceptsMutations, canonical.revisions.dirtyRevision == nil
-        else { throw WorkspacePersistenceFailure(category: .workspaceChanged) }
-        let preparation = WorkspaceFileDecodeCache.shared.documentPreparation
-        var patched = try await preparation.metadataModel(for: canonical.document)
-        guard !patched.isEphemeral, intent.apply(&patched) else {
-            throw WorkspacePersistenceFailure(category: .cancelled)
-        }
-        let document = try await preparation.documentByApplyingMetadata(
-            intent.field, model: patched, in: canonical.document
-        )
-        try checkWorkspaceSaveShutdown()
-        try validateConsolidationLifecycle(patched)
-        try validateMetadataSubmission(intent, workspace: patched)
-        guard let current = workspace(withID: workspaceID), !current.isEphemeral,
-              workspaceFileURL(for: current) == intent.fileURL,
-              !agentAdmissionRecoveryOwnsWorkspace(workspaceID)
-        else { throw WorkspacePersistenceFailure(category: .workspaceChanged) }
-
-        let issueClearance = DomainAuthorityIssueClearance(issueID: domainWorkspaceAuthorityIssue?.id)
-        let adoptionGeneration = fullDocumentAdoptionGenerations[workspaceID, default: 0]
-        let result = try await client.saveFailClosed(
-            document, expectedWorkspaceRevision: canonical.revisions.workingRevision,
-            expectedContentDigest: canonical.document.contentDigest
-        )
-        // A field-only CAS does not prove local ancestry. A newer accepted projection can.
-        if result.workingCommitted, fullDocumentAdoptionGenerations[workspaceID, default: 0] == adoptionGeneration {
-            invalidateFullDocumentAdoption(workspaceID: workspaceID)
-        }
-        guard let outcome = result.finalOutcome else {
-            throw WorkspacePersistenceFailure(category: .persistenceFailure)
-        }
-        applyDomainAuthorityOutcome(outcome, workspaceID: workspaceID, issueClearance: issueClearance)
-        guard Self.isSuccessfulDomainOutcome(outcome) else {
-            throw DomainWorkspaceAuthorityOperationError(outcome: outcome, workingCommitted: result.workingCommitted)
-        }
-        WorkspaceFileDecodeCache.shared.invalidate(url: intent.fileURL)
-        if !workspaceSaveShutdownFenced,
-           let revision = (outcome.workspace?.revisions ?? outcome.after)?.workingRevision,
-           domainWorkspaceRevisionsByID[workspaceID]?.workingRevision == revision,
-           domainWorkspaceDigestsByID[workspaceID] == document.contentDigest,
-           intent.workspaceFence == ownSaveFenceByWorkspaceID[workspaceID, default: 0],
-           !agentAdmissionRecoveryOwnsWorkspace(workspaceID),
-           var local = workspace(withID: workspaceID), let index = workspaceIndex(for: workspaceID),
-           !local.isEphemeral, workspaceFileURL(for: local) == intent.fileURL,
-           local.consolidatedIntoWorkspaceID == intent.lifecycle,
-           intent.apply(&local)
-        {
-            let previousName = workspaces[index].name
-            workspaces[index] = local
-            invalidateWorkspaceLocationLabels(workspaceID: workspaceID, previousName: previousName, name: local.name)
-        }
-        return intent.fileURL
-    }
-
     /// Persists a workspace to disk and returns the final file URL.
     /// Async version for non-blocking disk I/O using shared disk writer
     ///
@@ -17752,35 +17552,17 @@ class WorkspaceManagerViewModel: ObservableObject {
                 }
                 return result.fileURL
             }
-            if let fieldIntent, workspaceSaveShutdownDeadline != nil,
-               fullDocumentWriteBaseline(workspaceID: workspace.id) == nil
-            {
-                return try await saveClosingWorkspaceMetadata(fieldIntent, workspaceID: workspace.id)
-            }
-            do {
-                let result = try await persistWorkspaceThroughDomainAuthority(
-                    workspace,
-                    targetURL: targetURL,
-                    preserveDiskRepoPathsIfUnchangedSinceBaseline: preserveDiskRepoPathsIfUnchangedSinceBaseline,
-                    source: source,
-                    remainingRetryCount: 1,
-                    fieldIntent: fieldIntent,
-                    remainingFieldIntentRebases: fieldIntent == nil ? 0 : Self.fieldIntentRebaseLimit
-                )
-                lastSavedVersionByWorkspaceID[workspace.id] = result.savedStateVersion
-                return result.fileURL
-            } catch let error as DomainWorkspaceAuthorityOperationError
-                where workspaceSaveShutdownDeadline != nil && !error.workingCommitted
-                && error.outcome.errorCode == .stateConflict && error.outcome.diagnostic == "workspace_revision_mismatch"
-            {
-                guard let fieldIntent else { throw error }
-                return try await saveClosingWorkspaceMetadata(fieldIntent, workspaceID: workspace.id)
-            } catch let error as WorkspacePersistenceFailure
-                where workspaceSaveShutdownDeadline != nil && error.category == .workspaceChanged
-            {
-                guard let fieldIntent else { throw error }
-                return try await saveClosingWorkspaceMetadata(fieldIntent, workspaceID: workspace.id)
-            }
+            let result = try await persistWorkspaceThroughDomainAuthority(
+                workspace,
+                targetURL: targetURL,
+                preserveDiskRepoPathsIfUnchangedSinceBaseline: preserveDiskRepoPathsIfUnchangedSinceBaseline,
+                source: source,
+                remainingRetryCount: 1,
+                fieldIntent: fieldIntent,
+                remainingFieldIntentRebases: fieldIntent == nil ? 0 : Self.fieldIntentRebaseLimit
+            )
+            lastSavedVersionByWorkspaceID[workspace.id] = result.savedStateVersion
+            return result.fileURL
         }
         let capturedStateVersion = stateVersionByWorkspaceID[workspace.id, default: 0]
         await workspaceDiskWriter.flush(url: targetURL)
@@ -17823,7 +17605,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                     ]
                 )
             #endif
-            return try await saveWorkspaceToFileAsync(workspaces[index], preserveDiskRepoPathsIfUnchangedSinceBaseline: preserveDiskRepoPathsIfUnchangedSinceBaseline, source: source, rootEditContext: rootEditContext, fieldIntent: fieldIntent)
+            return try await saveWorkspaceToFileAsync(workspaces[index], preserveDiskRepoPathsIfUnchangedSinceBaseline: preserveDiskRepoPathsIfUnchangedSinceBaseline, source: source, rootEditContext: rootEditContext)
         }
 
         let changesConsolidationLifecycle = source == .duplicateCleanupCanonicalMerge
@@ -17833,8 +17615,6 @@ class WorkspaceManagerViewModel: ObservableObject {
             try validateConsolidationLifecycle(workspaceToSave)
         }
 
-        try checkWorkspaceSaveShutdown()
-        try validateMetadataSubmission(fieldIntent, workspace: workspaceToSave)
         let metadata = workspaceSaveMetadata(for: workspaceToSave, source: source)
         workspaceSaveTracer.event("workspaceSave.direct.enqueue", metadata: metadata, url: targetURL)
         let finalURL = try await saveWorkspaceToFileAsync(workspaceToSave, baseRoot: currentBaseRoot, metadata: metadata)

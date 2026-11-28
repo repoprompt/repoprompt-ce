@@ -23,7 +23,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     typealias GlobalMCPRegistrationOperation = @MainActor @Sendable () async throws -> Void
     typealias DomainRuntimeShutdownOperation = @Sendable () async -> Void
     private lazy var terminationCoordinator = AppTerminationCoordinator(
-        freeze: { [unowned self] deadline in freezeForTermination(deadline: deadline) },
+        freeze: { [unowned self] in freezeForTermination() },
         cleanup: { [unowned self] in await prepareForTermination() },
         requestTermination: {
             RunLoop.main.perform(inModes: [.common, .modalPanel]) { NSApp.terminate(nil) }
@@ -278,12 +278,11 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         }
     }
 
-    private func freezeForTermination(deadline: ContinuousClock.Instant) {
+    private func freezeForTermination() {
         // 1) Signal termination FIRST to prevent observation crashes.
         // This stops SwiftUI from trying to update views with deallocated objects
         // during the shutdown sequence (fixes EXC_BAD_ACCESS in ObservationRegistrar).
         WindowStatesManager.shared.signalTermination()
-        WindowStatesManager.shared.freezeWorkspaceSavesForTermination(deadline: deadline)
         ProcessTermination.beginAppTerminationFastPath()
         MCPBackgroundModeCoordinator.shared.resetForTermination()
         // Synchronous oversight freeze, before any async teardown can run: quitting closes every
@@ -319,8 +318,6 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         tipHistoryCleanupTask?.cancel()
         await tipHistoryCleanupTask?.value
         guard !Task.isCancelled else { return }
-        await WindowStatesManager.shared.awaitWorkspaceSavesForTermination()
-        guard !Task.isCancelled else { return }
         await WindowStatesManager.shared.shutdownAllAgentSessions()
         guard !Task.isCancelled else { return }
         await WindowStatesManager.shared.stopAllServers()
@@ -336,7 +333,6 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         // These are fast, synchronous, and idempotent.
         MCPBackgroundModeCoordinator.shared.resetForTermination()
         WindowStatesManager.shared.signalTermination()
-        WindowStatesManager.shared.freezeWorkspaceSavesForTermination(deadline: .now)
         ProcessTermination.beginAppTerminationFastPath()
         // Idempotent and synchronous only. Correctness comes from the write-through store and the
         // bounded `.terminateLater` settlement above, never from work attempted here.

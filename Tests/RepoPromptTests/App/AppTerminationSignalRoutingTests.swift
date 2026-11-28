@@ -53,7 +53,7 @@ final class AppTerminationCoordinatorTests: XCTestCase {
         var replies = 0
         let finished = expectation(description: "termination reply")
         let coordinator = AppTerminationCoordinator(
-            freeze: { _ in freezes += 1 },
+            freeze: { freezes += 1 },
             cleanup: { cleanups += 1 },
             requestTermination: { XCTFail("Unexpected independent quit") }
         )
@@ -73,7 +73,7 @@ final class AppTerminationCoordinatorTests: XCTestCase {
         var cleaned = false
         let resumed = expectation(description: "installation resumed")
         let coordinator = AppTerminationCoordinator(
-            freeze: { _ in }, cleanup: { cleaned = true },
+            freeze: {}, cleanup: { cleaned = true },
             requestTermination: { XCTFail("Sparkle owns termination") }
         )
         XCTAssertTrue(coordinator.postponeInstallation {
@@ -88,7 +88,7 @@ final class AppTerminationCoordinatorTests: XCTestCase {
     func testQuitDuringSparklePreparationPreservesInstallationContinuation() async {
         let resumed = expectation(description: "installation still resumed")
         let coordinator = AppTerminationCoordinator(
-            freeze: { _ in }, cleanup: {}, requestTermination: { XCTFail("Must not race installation") }
+            freeze: {}, cleanup: {}, requestTermination: { XCTFail("Must not race installation") }
         )
         XCTAssertTrue(coordinator.postponeInstallation {
             XCTAssertEqual(coordinator.shouldTerminate(reply: {}), .terminateNow)
@@ -105,7 +105,7 @@ final class AppTerminationCoordinatorTests: XCTestCase {
                 var replied = false
                 var cleaned = false
                 let coordinator = AppTerminationCoordinator(
-                    timeout: 0.02, freeze: { _ in }, cleanup: { cleaned = true },
+                    timeout: 0.02, freeze: {}, cleanup: { cleaned = true },
                     requestTermination: { XCTFail("AppKit reply is pending") }
                 )
                 XCTAssertEqual(coordinator.shouldTerminate(reply: { replied = true }), .terminateLater)
@@ -129,7 +129,7 @@ final class AppTerminationCoordinatorTests: XCTestCase {
         let replied = expectation(description: "deadline reply")
         let started = expectation(description: "cleanup started")
         let coordinator = AppTerminationCoordinator(
-            timeout: 0.05, freeze: { _ in },
+            timeout: 0.05, freeze: {},
             cleanup: {
                 await withCheckedContinuation { continuation = $0
                     started.fulfill()
