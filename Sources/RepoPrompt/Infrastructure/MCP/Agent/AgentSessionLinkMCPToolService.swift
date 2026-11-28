@@ -2271,7 +2271,7 @@ enum AgentSessionLinkResponseRenderer {
     /// Stable delivery receipt. Identical for a duplicate retry except for `duplicate: true`.
     static func sendReceiptValue(_ receipt: DomainAgentSessionLinkSendReceipt) -> Value {
         .object([
-            "result": .string("delivered"),
+            "result": .string(receipt.deliveryState == .providerPromptWritten ? "submitted" : "delivered"),
             "session_id": .string(receipt.targetSessionID.uuidString),
             "target_session_id": .string(receipt.targetSessionID.uuidString),
             "target_item_id": .string(receipt.targetItemID),
@@ -2356,7 +2356,8 @@ enum AgentSessionLinkResponseRenderer {
              .endpointMissingWorkspace, .endpointReadiness, .endpointStopFence,
              .endpointPostSession, .endpointPostObserver, .endpointPostTarget,
              .endpointPostWindow, .endpointPostReadiness,
-             .targetLoading, .targetRestoreUnavailable, .targetCreationIncomplete, .targetNotIdle, .shuttingDown, .notSupported,
+             .targetLoading, .targetRestoreUnavailable, .targetCreationIncomplete, .targetSubscriptionReadOnly,
+             .targetNotIdle, .shuttingDown, .notSupported,
              .noProviderSession, .managementRevoked, .targetAwaitingInteraction, .targetBusy, .targetStopped,
              .steerUnavailable, .steerNotAccepted, .steerUnconfirmed,
              .providerSwitchUnconfirmed, .providerHandoverDoesNotFit, .providerHandoverNeedsReview:

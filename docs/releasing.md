@@ -430,11 +430,16 @@ updater token is reserved for updater-repository reads and writes. The signing p
 isolated ephemeral keychain without changing the runner user's keychain search list.
 
 After P is reviewed, advance `tip-rollout.json` with its exact `identity-rollout.json` digest before
-merging T; advance it again with T and P digests before merging S. Each published role uses an
+merging T. The S declaration pins P and the minimum accepted T tag and digest. When generating an
+S feed, the release job uses the same published T or a newer authenticated live T with that exact
+P. After S is live, later S releases retain the same T and P. Each published role uses an
 immutable `tip-<shortsha>` tag and the tip-only repository's latest release. Do not mark it as a
 prerelease, because GitHub excludes prereleases from `releases/latest`.
 
-Historical replacement-preparer checkpoint (superseded by the no-new-Eric runbook above):
+Historical replacement-preparer checkpoint (superseded by the no-new-Eric runbook above; the
+`resetAuthority` mechanism is now retired and a schema-2 Tip declaration fails closed, because
+a T → replacement-P reset repeats the one-time identity transition for migrated clients; see
+[One-time transition](architecture/apple-identity-migration.md#one-time-transition)):
 Stable 1.4.0 was the official Stable epoch at build `36`. The authenticated Tip at that checkpoint
 was transition tag `tip-57b572038048`, build `35.15.39`, with rollout-manifest SHA-256
 `c8d28103b5e95370fc0de7df19c34797552e99803228794754bfbfe292e3e421`; it retains preparer

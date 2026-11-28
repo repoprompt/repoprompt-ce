@@ -109,6 +109,7 @@ extension AgentModeViewModel {
         guard mcpActivationTargetIsCurrent(target, ownership: ownership) else {
             throw MCPError.invalidParams(Self.mcpResidentTargetError)
         }
+        try AgentSessionMCPRuntime.requireSubscriptionAccountAdmission(target.session)
         try linkExecutionRuntime.mcpRequireResidentLinkFence(target.endpoint, authoritativeHasLinks: authoritativeHasLinks)
     }
 
@@ -269,6 +270,7 @@ extension AgentModeViewModel {
         guard targetIsCurrent() else {
             throw MCPError.invalidParams(Self.mcpResidentTargetError)
         }
+        try AgentSessionMCPRuntime.requireSubscriptionAccountAdmission(session)
         let protectedPrompt = session.pendingApplyEditsReview != nil || session.pendingWorktreeMergeReview != nil
             || mcpRuntime.mcpPendingInteraction(for: session).map { $0.kind != .instruction } == true
         guard !protectedPrompt else { throw MCPError.invalidParams(Self.mcpResidentProtectedError) }

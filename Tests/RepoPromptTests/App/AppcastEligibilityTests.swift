@@ -98,6 +98,118 @@ final class AppcastEligibilityTests: XCTestCase {
         XCTAssertEqual(transitionedClient.buildNumber, "200")
     }
 
+    /// The repeated-transition regression: Tip kept re-publishing T, whose only
+    /// floor is the preparer build, so an already-migrated client preferred each
+    /// newer T package (privileged installer + slow PKG) over the successor ZIP.
+    private func repeatedTransitionLadder() -> [AppcastVersion] {
+        func item(_ build: String, floor: String?, package: Bool) -> String {
+            """
+                <item>
+                    <sparkle:shortVersionString>1.10.0</sparkle:shortVersionString>
+                    <sparkle:version>\(build)</sparkle:version>
+                    \(floor.map { "<sparkle:minimumUpdateVersion>\($0)</sparkle:minimumUpdateVersion>" } ?? "")
+                    <enclosure url="https://example.com/RepoPrompt-\(build).\(package ? "pkg" : "zip")"
+                        sparkle:installationType="\(package ? "package" : "application")" />
+                </item>
+            """
+        }
+        let xml = """
+        <?xml version="1.0" encoding="utf-8"?>
+        <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+            <channel>
+                \(item("44.25.70", floor: "43.24.43", package: true))
+                \(item("44.25.60", floor: "44.25.57", package: false))
+                \(item("44.25.57", floor: "43.24.43", package: true))
+                \(item("43.24.43", floor: nil, package: false))
+            </channel>
+        </rss>
+        """
+        return AppcastParser().parseItems(data: Data(xml.utf8))
+    }
+
+    func testMigratedClientNeverSelectsAnotherIdentityTransitionPackage() throws {
+        let items = repeatedTransitionLadder()
+        XCTAssertEqual(items.count, 4)
+
+        var migrated = context(build: "44.25.57")
+        let unguarded = try XCTUnwrap(AppcastParser.select(from: items, context: migrated))
+        XCTAssertEqual(unguarded.buildNumber, "44.25.70", "pre-fix: the newer T package wins")
+        XCTAssertEqual(unguarded.installationType, "package")
+
+        migrated.hasCompletedIdentityTransition = true
+        let guarded = try XCTUnwrap(AppcastParser.select(from: items, context: migrated))
+        XCTAssertEqual(guarded.buildNumber, "44.25.60")
+        XCTAssertEqual(guarded.installationType, "application")
+
+        // Two consecutive successor updates stay application ZIPs.
+        var successor = context(build: "44.25.60")
+        successor.hasCompletedIdentityTransition = true
+        let next = try XCTUnwrap(AppcastParser.select(from: items, context: successor))
+        XCTAssertEqual(next.installationType, "application")
+
+        // The unmigrated legacy preparer still takes exactly one transition package.
+        let preparer = try XCTUnwrap(AppcastParser.select(from: items, context: context(build: "43.24.43")))
+        XCTAssertEqual(preparer.installationType, "package")
+    }
+
+    func testSparkleSelectionSkipsIdentityTransitionPackagesForSuccessorIdentity() {
+        typealias Policy = IdentityTransitionUpdatePolicy
+        XCTAssertTrue(Policy.hasCompletedIdentityTransition(bundleIdentifier: "com.repoprompt.ce"))
+        XCTAssertFalse(Policy.hasCompletedIdentityTransition(bundleIdentifier: "com.pvncher.repoprompt.ce"))
+        XCTAssertFalse(Policy.hasCompletedIdentityTransition(bundleIdentifier: nil))
+        XCTAssertTrue(Policy.requiresPrivilegedInstaller(installationType: "package"))
+        XCTAssertTrue(Policy.requiresPrivilegedInstaller(installationType: "interactive-package"))
+        XCTAssertFalse(Policy.requiresPrivilegedInstaller(installationType: "application"))
+        XCTAssertFalse(Policy.requiresPrivilegedInstaller(installationType: nil))
+
+        struct Item: Equatable {
+            let build: String
+            let type: String
+            var floorOK = true
+        }
+        func select(_ items: [Item], installed: String? = "44.25.57") -> Policy.Selection<Item> {
+            Policy.successorSelection(
+                from: items,
+                currentBuild: installed,
+                installationType: \.type,
+                buildVersion: \.build,
+                meetsMinimumUpdateVersion: \.floorOK
+            )
+        }
+
+        guard case .sparkleDefault = select([Item(build: "45", type: "application")]) else {
+            return XCTFail("feeds without a privileged installer keep Sparkle's selection")
+        }
+        let ladder = [
+            Item(build: "44.25.70", type: "package"),
+            Item(build: "44.25.62", type: "application", floorOK: false),
+            Item(build: "44.25.61", type: "application"),
+            Item(build: "44.25.60", type: "application"),
+            Item(build: "44.25.57", type: "package"),
+            Item(build: "43.24.43", type: "application")
+        ]
+        // Running T: the newest eligible successor ZIP, never the newer package.
+        guard case let .item(fromTransition) = select(ladder) else {
+            return XCTFail("expected the successor application update")
+        }
+        XCTAssertEqual(fromTransition, Item(build: "44.25.61", type: "application"))
+        // Second consecutive update: running S1 still selects a newer ZIP.
+        guard case let .item(fromSuccessor) = select(ladder, installed: "44.25.60") else {
+            return XCTFail("expected the next successor application update")
+        }
+        XCTAssertEqual(fromSuccessor, Item(build: "44.25.61", type: "application"))
+        // Up to date: never re-offer the installed build or an older preparer ZIP.
+        guard case .noUpdate = select(ladder, installed: "44.25.61") else {
+            return XCTFail("the installed build or an older ZIP must not be selected")
+        }
+        guard case .noUpdate = select([Item(build: "44.25.70", type: "package")]) else {
+            return XCTFail("a feed offering only a transition package has no successor update")
+        }
+        guard case .noUpdate = select(ladder, installed: nil) else {
+            return XCTFail("an unreadable host build fails closed when a package is advertised")
+        }
+    }
+
     func testMinimumSystemVersionExcludesItemsOnOlderOS() {
         let items = AppcastParser().parseItems(data: Data(siblingLadderXML.utf8))
 

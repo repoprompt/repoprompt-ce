@@ -843,6 +843,9 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
                     let previousRead = spawn.readAccess(for: previousTargets, operation: .runWait)
                     let previousCursor = try XCTUnwrap(previousRead.waitCursor(launchedID))
 
+                    try await assertReadOnlySubscriptionRefusesCanonicalInput(childSession) { arguments in
+                        try await invoke(MCPWindowToolName.agentRun, arguments)
+                    }
                     let restarted = try await invoke(MCPWindowToolName.agentRun, [
                         "op": .string("start"), "_tabID": .string(childSession.tabID.uuidString), "message": .string(cancelledMessage),
                         "model_id": .string(modelID), "timeout": .int(10), "detach": .bool(true)
@@ -941,6 +944,47 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
             throw error
         }
         _ = await runtime.shutdown()
+    }
+
+    private func assertReadOnlySubscriptionRefusesCanonicalInput(
+        _ session: AgentTabSession, invoke: ([String: Value]) async throws -> Value
+    ) async throws {
+        let sessionID: Value = try .string(XCTUnwrap(session.activeAgentSessionID).uuidString)
+        let binding = session.subscriptionAccountBinding
+        let generation = session.mcpControlActivationGeneration
+        let context = session.mcpControlContext
+        let selectedModel = session.selectedModelRaw
+        let rowCount = session.items.count
+        let autoEdit = session.autoEditEnabled
+        session.subscriptionAccountBinding = .detached
+        defer { session.subscriptionAccountBinding = binding }
+
+        let poll = try await invoke(["op": .string("poll"), "session_id": sessionID])
+        XCTAssertEqual(poll.objectValue?["session_id"], sessionID)
+        let input: [[String: Value]] = [
+            [
+                "op": .string("start"),
+                "_tabID": .string(session.tabID.uuidString),
+                "model_id": .string("invalid-provider:invalid-model"),
+                "message": .string("Refuse before model resolution"),
+                "detach": .bool(true)
+            ],
+            ["op": .string("steer"), "session_id": sessionID, "message": .string("Refuse before saving input"), "wait": .bool(false)]
+        ]
+        for arguments in input {
+            do {
+                _ = try await invoke(arguments)
+                XCTFail("Canonical MCP input must refuse a read-only subscription session")
+            } catch let MCPError.invalidParams(message) {
+                XCTAssertEqual(message, AgentSessionSubscriptionBinding.notRunnableMessage)
+            }
+        }
+        XCTAssertEqual(session.mcpControlActivationGeneration, generation)
+        XCTAssertEqual(session.mcpControlContext, context)
+        XCTAssertEqual(session.selectedModelRaw, selectedModel)
+        XCTAssertEqual(session.autoEditEnabled, autoEdit)
+        XCTAssertEqual(session.items.count, rowCount)
+        XCTAssertFalse(session.mcpFollowUpRunPending)
     }
 
     func testIndependentModelCatalogRetainsIdleRouteWithoutAdmittingToolBodies() async throws {

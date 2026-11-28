@@ -1857,6 +1857,9 @@ final class AgentSessionLinkRuntimeBridge {
             for chain in Array(chains.values) {
                 await chain.tail?.value
             }
+            // Tests that inspect projected rows or passive notices join the downstream work
+            // explicitly. Agent reads join the target publication alone.
+            await refreshTask?.value
         }
 
         func test_refreshStatus(sessionIDs: Set<UUID>) async {
@@ -4784,9 +4787,13 @@ final class AgentSessionLinkRuntimeBridge {
         if chain.scheduledFrame == nil, facts == nil, lastPublishedSnapshotBySession[sessionID] == snapshot { return }
         // Deduplicate the pair. Private settlement advancement is not public activity/readiness.
         guard chain.scheduledFrame?.snapshot != snapshot || chain.scheduledFrame?.runFacts != facts else { return }
-        let publicChanged = lastPublishedSnapshotBySession[sessionID]?.hasSamePublishedState(as: snapshot) != true
+        let previousSnapshot = lastPublishedSnapshotBySession[sessionID]
+        let publicChanged = previousSnapshot?.hasSamePublishedState(as: snapshot) != true
         lastPublishedSnapshotBySession[sessionID] = snapshot
-        if publicChanged, snapshot.idleForSend {
+        let readOnlyBlocker = AgentSessionLinkDeliveryReadiness.BlockReason.targetSubscriptionReadOnly.rawValue
+        let becameReadOnly = snapshot.board.sendBlockers.contains(readOnlyBlocker)
+            && previousSnapshot?.board.sendBlockers.contains(readOnlyBlocker) != true
+        if publicChanged, snapshot.idleForSend || becameReadOnly {
             notePendingSendReadiness(forTargetSession: sessionID)
         }
         let sequence = allocateSourcePublicationSequence(for: sessionID)
@@ -4827,7 +4834,9 @@ final class AgentSessionLinkRuntimeBridge {
             guard chains[sessionID] === chain, chain.scheduledFrame?.sourceSequence == sequence,
                   chain.endpoint == endpoint, self.host === host,
                   !isFrozenForTermination else { return }
-            await requestProjectionRefresh(.sessions(Set(observers)))
+            // Readiness and status are already committed. UI and prompt projections may
+            // converge independently of the next target publication and of wait callers.
+            _ = enqueueProjectionRefresh(.sessions(Set(observers)))
         }
     }
 
@@ -4844,11 +4853,12 @@ final class AgentSessionLinkRuntimeBridge {
     /// Scopes merge rather than overwrite: a status-only refresh queued behind a membership change
     /// must not narrow that pending full rebuild.
     private func requestProjectionRefresh(_ scope: ProjectionRefreshScope = .full) async {
+        await enqueueProjectionRefresh(scope).value
+    }
+
+    private func enqueueProjectionRefresh(_ scope: ProjectionRefreshScope) -> Task<Void, Never> {
         pendingRefreshScope = pendingRefreshScope?.merged(with: scope) ?? scope
-        if let refreshTask {
-            await refreshTask.value
-            return
-        }
+        if let refreshTask { return refreshTask }
         let task = Task { [weak self] in
             guard let self else { return }
             while let scope = pendingRefreshScope {
@@ -4858,7 +4868,7 @@ final class AgentSessionLinkRuntimeBridge {
             refreshTask = nil
         }
         refreshTask = task
-        await task.value
+        return task
     }
 
     private func performProjectionRefresh(_ scope: ProjectionRefreshScope) async {
@@ -7181,14 +7191,15 @@ final class AgentSessionLinkRuntimeBridge {
             return chain
         }
         await host.agentSessionLinkRefreshSubagentCensus(for: targets.map(\.candidate))
-        for chain in owners {
-            guard chains[chain.endpoint.sessionID] === chain else { continue }
+        let publications = owners.compactMap { chain -> Task<Void, Never>? in
+            guard chains[chain.endpoint.sessionID] === chain else { return nil }
             let candidate = host.agentSessionLinkCandidate(for: chain.endpoint, includeLocation: false)
             // No suspension between the exact host read and ownership-guarded sampling.
             publishTargetSnapshot(endpoint: chain.endpoint, originatingChain: chain, lookup: .resolved(candidate))
+            return chain.tail
         }
-        for chain in owners {
-            await chain.tail?.value
+        for publication in publications {
+            await publication.value
         }
     }
 
@@ -8249,7 +8260,7 @@ final class AgentSessionLinkRuntimeBridge {
                 // waits for the next accepted readiness publication rather than retrying on a timer.
                 park(.targetReadiness, failure: failure)
             case .persistenceFailed, .persistenceIndeterminate, .targetRestoreUnavailable, .targetCreationIncomplete,
-                 .providerHandoverDoesNotFit, .providerHandoverNeedsReview:
+                 .providerHandoverDoesNotFit, .providerHandoverNeedsReview, .targetSubscriptionReadOnly:
                 // Terminal for this entry. `persistence_failed` is retryable by the caller, but only
                 // by explicitly queuing again — never by a background loop over failing storage.
                 clear(.failed(failure))
@@ -8328,10 +8339,7 @@ final class AgentSessionLinkRuntimeBridge {
 
     // MARK: Drain triggers
 
-    /// Readiness trigger: an accepted publication reporting this target will now take a send.
-    ///
-    /// Event-driven by construction — it runs only from an accepted (deduplicated) target
-    /// publication, so an unchanged target produces no drains at all and nothing polls.
+    /// A changed target publication can resume delivery or settle input when a target becomes read-only.
     private func notePendingSendReadiness(forTargetSession sessionID: UUID) {
         let references = pendingSendsByReference
             .filter { $0.value.targetSessionID == sessionID }

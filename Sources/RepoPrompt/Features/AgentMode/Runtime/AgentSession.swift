@@ -245,6 +245,7 @@ struct AgentSession: Codable, Identifiable {
     /// Provider-neutral cleanup metadata. This is distinct from resumability:
     /// a session ID may route cleanup, but does not imply remote deletion support.
     var providerCleanupHandle: ProviderConversationCleanupHandle?
+    var subscriptionAccountBinding: AgentSessionSubscriptionBinding
     var autoEditEnabled: Bool
     /// Whether this observer session may reserve one system-origin follow-up turn when sessions it
     /// oversees change status.
@@ -359,6 +360,7 @@ struct AgentSession: Codable, Identifiable {
         lastRunStartedAt: Date? = nil,
         providerSessionID: String? = nil,
         providerCleanupHandle: ProviderConversationCleanupHandle? = nil,
+        subscriptionAccountBinding: AgentSessionSubscriptionBinding = .legacy,
         autoEditEnabled: Bool = true,
         autoWakeOnOversightUpdates: Bool = false,
         agentSessionLinkAutoWakeTargetSessionIDs: Set<UUID> = [],
@@ -417,6 +419,7 @@ struct AgentSession: Codable, Identifiable {
         self.lastRunStartedAt = lastRunStartedAt
         self.providerSessionID = providerSessionID
         self.providerCleanupHandle = providerCleanupHandle
+        self.subscriptionAccountBinding = subscriptionAccountBinding
         self.autoEditEnabled = autoEditEnabled
         self.autoWakeOnOversightUpdates = autoWakeOnOversightUpdates
         self.agentSessionLinkAutoWakeTargetSessionIDs = agentSessionLinkAutoWakeTargetSessionIDs
@@ -477,6 +480,7 @@ struct AgentSession: Codable, Identifiable {
         case lastRunStartedAt
         case providerSessionID
         case providerCleanupHandle
+        case subscriptionAccountBinding
         case autoEditEnabled
         case autoWakeOnOversightUpdates
         case agentSessionLinkAutoWakeTargetSessionIDs
@@ -542,6 +546,7 @@ struct AgentSession: Codable, Identifiable {
         lastRunStartedAt = try container.decodeIfPresent(Date.self, forKey: .lastRunStartedAt)
         providerSessionID = try container.decodeIfPresent(String.self, forKey: .providerSessionID)
         providerCleanupHandle = try container.decodeIfPresent(ProviderConversationCleanupHandle.self, forKey: .providerCleanupHandle)
+        subscriptionAccountBinding = try container.decode(AgentSessionSubscriptionBinding.self, forKey: .subscriptionAccountBinding)
         autoEditEnabled = try container.decode(Bool.self, forKey: .autoEditEnabled)
         // Additive and `decodeIfPresent`: every session written before version 8 decodes as off.
         // Fresh live sessions now start on, but restore deliberately preserves this legacy value.
@@ -659,7 +664,8 @@ extension AgentSession {
     }
 
     var resolvedProviderCleanupHandle: ProviderConversationCleanupHandle? {
-        ProviderConversationCleanupHandle.resolved(
+        guard !subscriptionAccountBinding.blocksProviderOperations else { return nil }
+        return ProviderConversationCleanupHandle.resolved(
             provider: agentKind ?? AgentProviderKind.claudeCode.rawValue,
             explicit: providerCleanupHandle,
             providerSessionID: providerSessionID,

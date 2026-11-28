@@ -125,7 +125,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         _ = try installRestoredFixtureBinding(session, in: vm)
         let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(vm, tabID: session.tabID)
         fixture.host.beforeActivation = { activating in
-            if activating == fixture.target.domainEndpoint { await vm.agentSessionLinkWillActivate(endpoint) }
+            if activating == fixture.target.domainEndpoint { await vm.linkExecutionRuntime.prepareForLinkActivation(endpoint) }
         }
         guard case .added = await addLink(fixture) else { return XCTFail("Link must activate") }
         let armed = await vm.armComputerUseForLocalUser(session: session)
@@ -4666,6 +4666,29 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         }
     }
 
+    func testCensusReadCompletesWhileTheProjectionIsSuspended() async throws {
+        let fixture = makeFixture()
+        guard case .added = await addLink(fixture) else { return XCTFail("Could not establish a link") }
+        await fixture.bridge.test_settleTargetPublications()
+        let target = try await authorizedTarget(fixture.bridge, operation: .monitorWait, observer: fixture.observer, target: fixture.target)
+        fixture.host.runFacts[fixture.target.sessionID] = .init(settledThrough: 9, ordinaryThrough: 8)
+        let gate = TestReleaseFence(name: "downstream presentation")
+        fixture.bridge.test_afterPresentationSnapshot = { await gate.enterAndWait() }
+        defer {
+            fixture.bridge.test_afterPresentationSnapshot = nil
+            gate.release()
+        }
+        let completed = expectation(description: "target publication releases the wait preflight")
+        let census = Task {
+            await fixture.bridge.refreshLaneBoardCensus(for: [target])
+            completed.fulfill()
+        }
+        guard await gate.waitUntilEntered() else { return }
+        await fulfillment(of: [completed], timeout: 3)
+        gate.release()
+        await census.value
+    }
+
     func testCensusKnownAbsenceDoesNotRediscoverOrSample() async throws {
         let fixture = makeFixture()
         guard case .added = await addLink(fixture) else { return XCTFail("add failed") }
@@ -6504,6 +6527,44 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             .delivered(receipt),
             "The terminal outcome stays readable through poll until the next queue mutation"
         )
+    }
+
+    func testReadOnlySubscriptionSettlesQueuedSendWithoutSpendingTheKey() async {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        stageBusyTarget(fixture)
+        let queued = await queueSend(fixture)
+        XCTAssertEqual(queued, .queued(replaced: false, duplicate: false))
+
+        fixture.host.sendOutcome = .blocked(.targetSubscriptionReadOnly)
+        fixture.host.snapshotOverrides[fixture.target.sessionID] = .init(
+            sessionID: fixture.target.sessionID,
+            displayName: fixture.target.displayName,
+            providerDisplayName: "Codex CLI",
+            status: .idle,
+            board: .init(
+                runOutcome: .none, failureReason: nil,
+                sendBlockers: [AgentSessionLinkSendFailure.targetSubscriptionReadOnly.rawValue],
+                subagentRunning: 0, subagentFinished: 0
+            ),
+            idleForSend: false, pendingInteractionKind: nil, latestVisibleAssistantPreview: nil,
+            visibleRowCount: 1, lastActivityAt: Date(timeIntervalSince1970: 2000)
+        )
+        fixture.host.fireObservation(for: fixture.target.sessionID)
+        await settleDrains { await self.pendingSend(fixture)?.lastResult != nil }
+        let projection = await pendingSend(fixture)
+        XCTAssertNil(projection?.pending)
+        XCTAssertEqual(projection?.lastResult?.outcome, .failed(.targetSubscriptionReadOnly))
+        let ledger = await fixture.authority.snapshot()
+        XCTAssertEqual(ledger.inFlightSendCount, 0)
+        XCTAssertEqual(ledger.retainedSendOutcomeCount, 0)
+
+        stageReadyTarget(fixture)
+        await publishTargetActivity(fixture, status: .idle, activity: 2001)
+        guard case let .send(.receipt(receipt)) = await queueSend(fixture) else {
+            return XCTFail("A refused key may be used after the target becomes writable")
+        }
+        XCTAssertFalse(receipt.duplicate)
     }
 
     func testMissingStartStopFenceRejectsQueuedSendBeforeAdmission() async {

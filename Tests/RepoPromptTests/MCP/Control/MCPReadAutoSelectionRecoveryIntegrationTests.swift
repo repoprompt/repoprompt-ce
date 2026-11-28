@@ -16,6 +16,118 @@ import XCTest
             try await assertCreatedFileUsesLatestBoundSelection(toolName: MCPWindowToolName.applyEdits)
         }
 
+        func testApplyEditsDisconnectReleasesPrepublicationCodemapFence() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(
+                    lease: lease,
+                    domainRuntime: AppDomainRuntimeComposition.shared.runtime
+                )
+                let context = fixture.contextA
+                let store = context.window.workspaceFileContextStore
+                let cleanupGate = TestReleaseFence(name: "store-owned CodeMap cleanup during edit resolution")
+                let target = context.rootURL.appendingPathComponent("Uncatalogued.swift")
+                var endpoints: [PersistentMCPTestEndpoint] = []
+                do {
+                    try await fixture.registerDomainWorkspace(context)
+                    try await Self.activateWorkspace(context)
+                    let fileSystemService = await store.fileSystemServiceForTesting(rootID: context.rootID)
+                    let service = try XCTUnwrap(fileSystemService)
+                    try "Uncatalogued.swift\n".write(
+                        to: context.rootURL.appendingPathComponent(".repo_ignore"), atomically: true, encoding: .utf8
+                    )
+                    try await service.updateRespectRepoIgnore(true)
+                    try await service.refreshIgnoreRules()
+                    try "let target = 1\n".write(to: target, atomically: true, encoding: .utf8)
+
+                    let caller = try await Self.makeBoundEndpoint(
+                        label: "uncatalogued-edit", fixture: fixture, requiredToolNames: [MCPWindowToolName.applyEdits]
+                    )
+                    endpoints.append(caller)
+                    let survivor = try await Self.makeBoundEndpoint(
+                        label: "same-root-edit", fixture: fixture, requiredToolNames: [MCPWindowToolName.applyEdits]
+                    )
+                    endpoints.append(survivor)
+                    let input = try WorkspaceExactFileInput.parse(target.path)
+                    let roots = await store.rootRefs(scope: .visibleWorkspace)
+                    _ = try await store.awaitAppliedIngressForExplicitRequest(
+                        input, namespace: .identity(roots: roots), timeout: .seconds(10)
+                    )
+                    let before = await store.file(rootID: context.rootID, relativePath: target.lastPathComponent)
+                    XCTAssertNil(before)
+                    let installed = await store.installCodemapCleanupFlightForTesting(rootID: context.rootID) {
+                        await cleanupGate.enterAndWait()
+                    }
+                    XCTAssertTrue(installed)
+                    guard await cleanupGate.waitUntilEntered() else {
+                        throw CocoaError(.fileReadUnknown)
+                    }
+
+                    // A deliberate miss proves the catalogued file reaches the edit engine without writing.
+                    let control = try await survivor.callTool(
+                        name: MCPWindowToolName.applyEdits,
+                        arguments: [
+                            "path": context.fileURL.path,
+                            "search": "catalogueControlMarkerAbsentFromFixture",
+                            "replace": "let catalogueControl = true",
+                            "all": true
+                        ]
+                    )
+                    XCTAssertTrue(control.rawJSON.contains("\"isError\":true"), control.rawJSON)
+                    XCTAssertTrue(try Self.toolResultText(control).contains("search text not found in file"), control.rawJSON)
+                    XCTAssertEqual(try String(contentsOf: context.fileURL, encoding: .utf8), "\(context.sentinel)\n")
+
+                    let pending = Task {
+                        try await caller.callTool(
+                            name: MCPWindowToolName.applyEdits,
+                            arguments: ["path": target.path, "search": "target = 1", "replace": "target = 2"]
+                        )
+                    }
+                    defer { pending.cancel() }
+                    try await AsyncTestWait.waitUntil("exact materialization joins the gated cleanup", timeout: 10) {
+                        await store.codemapCleanupWaiterCountForTesting(rootID: context.rootID) == 1
+                    }
+                    let fenceHeld = await store.codemapRootMutationFenceIsHeldForTesting(rootID: context.rootID)
+                    XCTAssertTrue(fenceHeld)
+                    let recordDuringWait = await store.file(rootID: context.rootID, relativePath: target.lastPathComponent)
+                    XCTAssertNil(recordDuringWait)
+                    XCTAssertEqual(try String(contentsOf: target, encoding: .utf8), "let target = 1\n")
+                    caller.client.close()
+                    try await AsyncTestWait.waitUntil("disconnect releases the root fence before cleanup ends", timeout: 10) {
+                        await !store.codemapRootMutationFenceIsHeldForTesting(rootID: context.rootID)
+                    }
+                    let cleanupStillPending = await store.codemapCleanupIsPendingForTesting(rootID: context.rootID)
+                    XCTAssertTrue(cleanupStillPending)
+                    let recordAfterDisconnect = await store.file(rootID: context.rootID, relativePath: target.lastPathComponent)
+                    XCTAssertNil(recordAfterDisconnect)
+                    XCTAssertEqual(try String(contentsOf: target, encoding: .utf8), "let target = 1\n")
+
+                    cleanupGate.release()
+                    _ = try? await pending.value
+                    try await AsyncTestWait.waitUntil("store-owned CodeMap cleanup drains", timeout: 10) {
+                        await !store.codemapCleanupIsPendingForTesting(rootID: context.rootID)
+                    }
+                    let retry = try await survivor.callTool(
+                        name: MCPWindowToolName.applyEdits,
+                        arguments: ["path": target.path, "search": "target = 1", "replace": "target = 2"]
+                    )
+                    XCTAssertFalse(retry.rawJSON.contains("\"isError\":true"), retry.rawJSON)
+                    XCTAssertEqual(try String(contentsOf: target, encoding: .utf8), "let target = 2\n")
+                    for endpoint in endpoints {
+                        await Self.cleanupEndpoint(endpoint, manager: fixture.networkManager)
+                    }
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    cleanupGate.release()
+                    for endpoint in endpoints {
+                        await Self.cleanupEndpoint(endpoint, manager: fixture.networkManager)
+                    }
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
         private func assertCreatedFileUsesLatestBoundSelection(toolName: String) async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(

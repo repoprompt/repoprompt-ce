@@ -1089,8 +1089,8 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     /// - adding a whole-profile write path that bypasses this method — which is why the old
     ///   `persistSelectedProfile` was deleted rather than given a scope parameter.
     ///
-    /// - Returns: `true` when the profile was written. Callers with follow-up side effects
-    ///   (notifications, preset exposure) must gate them on this.
+    /// - Returns: `true` when the live profile edit was accepted. Global UI edits are saved
+    ///   off the main actor. Callers with follow-up side effects must gate them on admission.
     @discardableResult
     private func updateSelectedProfile(
         reason: String,
@@ -1128,10 +1128,10 @@ final class AgentModelsSettingsViewModel: ObservableObject {
 
         switch liveScope {
         case .global:
-            settingsManager.setGlobalAgentModelsProfile(
+            guard settingsManager.globalSettingsStore.setGlobalAgentModelsProfileWithDeferredSave(
                 profile,
                 contextBuilderWriteIntent: contextBuilderWriteIntent
-            )
+            ) else { return false }
         case let .workspace(workspaceID):
             settingsManager.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: profile)
         }

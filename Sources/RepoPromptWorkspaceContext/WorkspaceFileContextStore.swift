@@ -2286,9 +2286,11 @@ package actor WorkspaceFileContextStore {
 
         func installCodemapCleanupFlightForTesting(
             rootID: UUID,
+            chainAfterExisting: Bool = false,
             wait: @escaping @Sendable () async -> Void
         ) -> Bool {
-            guard codemapCleanupFlightsByRootID[rootID] == nil,
+            let predecessor = codemapCleanupFlightsByRootID[rootID]
+            guard (predecessor != nil) == chainAfterExisting,
                   let state = rootStatesByID[rootID]
             else { return false }
             let cleanupID = UUID()
@@ -2297,6 +2299,9 @@ package actor WorkspaceFileContextStore {
                 rootLifetimeID: state.lifetimeID
             )
             let task = Task { [weak self] in
+                if let predecessor {
+                    await predecessor.task.value
+                }
                 await wait()
                 await self?.finishCodemapCleanup(rootID: rootID, cleanupID: cleanupID)
             }
@@ -2306,6 +2311,16 @@ package actor WorkspaceFileContextStore {
                 task: task
             )
             return true
+        }
+
+        func codemapRootMutationFenceIsHeldForTesting(rootID: UUID) -> Bool {
+            guard let state = rootStatesByID[rootID] else { return false }
+            let epoch = WorkspaceCodemapRootEpoch(rootID: rootID, rootLifetimeID: state.lifetimeID)
+            return codemapRootMutationFenceTokensByRootEpoch[epoch] != nil
+        }
+
+        func codemapCleanupIsPendingForTesting(rootID: UUID) -> Bool {
+            codemapCleanupFlightsByRootID[rootID] != nil
         }
 
         func codemapCleanupWaiterCountForTesting(rootID: UUID) -> Int {
@@ -18662,13 +18677,15 @@ package actor WorkspaceFileContextStore {
         }
     }
 
-    private func awaitCodemapCleanupFlightsForExactMaterialization(
-        rootIDs: Set<UUID>
-    ) async throws {
-        let flights = rootIDs.compactMap { codemapCleanupFlightsByRootID[$0] }
-        for flight in flights {
+    private func awaitCodemapCleanupForExactMaterialization(rootEpoch: WorkspaceCodemapRootEpoch) async throws {
+        // A detach can append another cleanup while the caller is suspended. Wait for the
+        // current tail while this root lifetime is loaded. The store owns the cleanup chain.
+        while rootStatesByID[rootEpoch.rootID]?.lifetimeID == rootEpoch.rootLifetimeID,
+              let flight = codemapCleanupFlightsByRootID[rootEpoch.rootID]
+        {
             try await waitForCodemapCleanupFlight(flight)
         }
+        try Task.checkCancellation()
     }
 
     private func waitForCodemapCleanupFlight(_ flight: CodemapCleanupFlight) async throws {
@@ -18703,7 +18720,8 @@ package actor WorkspaceFileContextStore {
 
     private func beginCodemapRootMutationFence(
         rootID: UUID,
-        command: CodemapInvalidationCommand
+        command: CodemapInvalidationCommand,
+        cancelCleanupWaitWithCaller: Bool = false
     ) async -> CodemapRootMutationFenceToken? {
         guard let initialState = rootStatesByID[rootID] else { return nil }
         let rootEpoch = WorkspaceCodemapRootEpoch(
@@ -18737,7 +18755,11 @@ package actor WorkspaceFileContextStore {
                 finishCodemapRootMutationFence(token, didCommitMutation: false)
             }
         }
-        await fenceCodemapRootAuthority(rootIDs: [rootID], command: command)
+        await fenceCodemapRootAuthority(
+            rootIDs: [rootID],
+            command: command,
+            cancellableCleanupEpoch: cancelCleanupWaitWithCaller ? rootEpoch : nil
+        )
         guard !Task.isCancelled,
               rootStatesByID[rootID]?.lifetimeID == rootEpoch.rootLifetimeID
         else {
@@ -18880,7 +18902,8 @@ package actor WorkspaceFileContextStore {
 
     private func fenceCodemapRootAuthority(
         rootIDs: [UUID],
-        command: CodemapInvalidationCommand
+        command: CodemapInvalidationCommand,
+        cancellableCleanupEpoch: WorkspaceCodemapRootEpoch? = nil
     ) async {
         let loadedRootIDs = Set(rootIDs.filter { rootStatesByID[$0] != nil })
         guard !loadedRootIDs.isEmpty else { return }
@@ -18930,7 +18953,13 @@ package actor WorkspaceFileContextStore {
                     : previousGeneration + 1
             }
         }
-        await awaitCodemapCleanupFlights(rootIDs: loadedRootIDs)
+        if let cancellableCleanupEpoch {
+            // Cancellation withdraws this waiter. The root mutation caller observes cancellation
+            // and releases its token while store-owned cleanup continues.
+            try? await awaitCodemapCleanupForExactMaterialization(rootEpoch: cancellableCleanupEpoch)
+        } else {
+            await awaitCodemapCleanupFlights(rootIDs: loadedRootIDs)
+        }
     }
 
     package func fenceCodemapAuthorityForCheckoutMutation(rootIDs: [UUID]) async {
@@ -20918,7 +20947,8 @@ package actor WorkspaceFileContextStore {
         )
         let codemapFence = await beginCodemapRootMutationFence(
             rootID: candidate.rootID,
-            command: .catalogAdvanced
+            command: .catalogAdvanced,
+            cancelCleanupWaitWithCaller: true
         )
         EditFlowPerf.lifecycleEvent(
             EditFlowPerf.Lifecycle.WorkspaceExactResolution.checkpoint,
@@ -21044,7 +21074,7 @@ package actor WorkspaceFileContextStore {
                 )
             #endif
             try Task.checkCancellation()
-            try await awaitCodemapCleanupFlightsForExactMaterialization(rootIDs: [candidate.rootID])
+            try await awaitCodemapCleanupForExactMaterialization(rootEpoch: codemapFence.rootEpoch)
             try Task.checkCancellation()
             let currentMaterializedRecord = file(
                 rootID: candidate.rootID,

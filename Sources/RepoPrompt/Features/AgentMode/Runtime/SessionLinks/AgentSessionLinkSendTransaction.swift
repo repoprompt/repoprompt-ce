@@ -180,6 +180,7 @@ enum AgentSessionLinkSendFailure: String, Equatable, Error {
     case targetLoading = "target_loading"
     case targetRestoreUnavailable = "target_restore_unavailable"
     case targetCreationIncomplete = "target_creation_incomplete"
+    case targetSubscriptionReadOnly = "target_subscription_read_only"
     case targetNotIdle = "target_not_idle"
     case providerSwitchUnconfirmed = "provider_switch_unconfirmed"
     case providerHandoverDoesNotFit = "provider_handover_does_not_fit"
@@ -220,6 +221,7 @@ enum AgentSessionLinkSendFailure: String, Equatable, Error {
         case .targetLoading: self = .targetLoading
         case .targetRestoreUnavailable: self = .targetRestoreUnavailable
         case .targetCreationIncomplete: self = .targetCreationIncomplete
+        case .targetSubscriptionReadOnly: self = .targetSubscriptionReadOnly
         case .targetNotIdle: self = .targetNotIdle
         case .providerSwitchUnconfirmed: self = .providerSwitchUnconfirmed
         case .providerHandoverNeedsReview: self = .providerHandoverNeedsReview
@@ -283,7 +285,7 @@ enum AgentSessionLinkSendFailure: String, Equatable, Error {
              .endpointReadiness, .endpointStopFence, .endpointPostSession, .endpointPostObserver,
              .endpointPostTarget, .endpointPostWindow, .endpointPostReadiness,
              .linkRevoked, .persistenceIndeterminate, .targetRestoreUnavailable, .targetCreationIncomplete,
-             .shuttingDown, .managementRevoked, .steerUnconfirmed, .notSupported, .targetStopped,
+             .shuttingDown, .managementRevoked, .steerUnconfirmed, .notSupported, .targetStopped, .targetSubscriptionReadOnly,
              .providerSwitchUnconfirmed, .providerHandoverDoesNotFit, .providerHandoverNeedsReview:
             false
         }
@@ -308,6 +310,8 @@ enum AgentSessionLinkSendFailure: String, Equatable, Error {
             AgentSessionLinkDeliveryReadiness.BlockReason.targetRestoreUnavailable.message
         case .targetCreationIncomplete:
             AgentSessionLinkDeliveryReadiness.BlockReason.targetCreationIncomplete.message
+        case .targetSubscriptionReadOnly:
+            AgentSessionLinkDeliveryReadiness.BlockReason.targetSubscriptionReadOnly.message
         case .targetNotIdle:
             AgentSessionLinkDeliveryReadiness.BlockReason.targetNotIdle.message
         case .providerSwitchUnconfirmed:

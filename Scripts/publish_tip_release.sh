@@ -458,7 +458,6 @@ audit_live_rollout_progression() {
         --candidate-manifest "$CANDIDATE_MANIFEST"
         --candidate-appcast "$CANDIDATE_APPCAST"
         --declaration "$ROLLOUT_DECLARATION"
-        --stable-appcast "$STABLE_APPCAST_PATH"
     )
     if fetch_live_tip_rollout; then
         arguments+=(

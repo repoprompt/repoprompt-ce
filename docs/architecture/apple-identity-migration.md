@@ -45,8 +45,8 @@ Automatic and manual runs use separate single-entry rolling queues without cance
 release work, and publication remains serialized across both lanes. Before any draft mutation and
 again immediately before publication, the publisher
 rechecks protected `main`, validates the authenticated public Tip appcast/manifest, enforces the
-monotonic `P → T → S` state machine while allowing newer same-role builds with exact retained
-manifest bytes, and verifies retained enclosure size/SHA-256 from immutable release assets.
+monotonic `P → T → S` state machine while allowing newer same-role P and S builds with exact
+retained manifest bytes (T is one-shot; see [One-time transition](#one-time-transition)), and verifies retained enclosure size/SHA-256 from immutable release assets.
 For T and S, setup and publication also require the greatest Stable build to remain strictly below
 P's retained Tip build, unless Stable retains exactly the same authenticated P through the shared
 ladder described below; otherwise an unprepared later Stable build could satisfy T's Sparkle floor.
@@ -110,6 +110,8 @@ migration predecessor does not authorize arbitrary rollback or prove archive ret
 9. After the bridge has been proven under both real signing identities, publish a notarized transition
    package (`T`) that installs the successor app. Feeds must keep `P` and `T` available long enough for
    slow-upgrading clients; use Sparkle item eligibility/version constraints instead of new feeds.
+10. Publish `T` exactly once per channel, then only successor (`S`) application updates. See
+    [One-time transition](#one-time-transition).
 
 ## Packaging contract
 
@@ -183,6 +185,56 @@ The normal release gate is completion of the runtime proof below, including a re
 recovery story for a lost committed P journal and a policy that distinguishes a fresh successor
 installation from a client that skipped the preparer/transition bridge. S also requires a later
 declaration change containing both T's and P's exact manifest digests.
+
+### One-time transition
+
+`T` is the one-time identity crossing: a privileged, successor-signed `.pkg` installed by the macOS
+Installer with administrator authorization. Its only Sparkle floor (`minimumUpdateVersion`) is the
+retained P build, so **every** client at or above P, including clients that already run the
+successor identity, is eligible for any T item. Sparkle then prefers the greatest eligible build.
+Between 2026-11-18 and 2026-11-21 the Tip declaration stayed at `transition`. The progression gate
+also admitted "newer same-role builds" for T. So each protected-main push published another T
+(at least thirteen T packages, from `tip-d202e8add969`, build `43.24.69`, onward), and every Tip update re-ran the
+authorized package install on already-migrated Macs. The app-side migration markers persisted
+correctly; the defect was the release ladder re-offering the crossing.
+
+The ladder now enforces:
+
+- `stable_rollout.py` rejects live `T` → newer `T` on Tip and Stable. A live T may only advance to
+  `S` (or be republished byte-identically under the same tag). `S` → `S` keeps rolling with the
+  same retained T and P, so every later release is a successor ZIP application update.
+- The schema-2 Tip `resetAuthority` (live T → replacement P) is retired. A replacement P has no
+  floor, so it would offer a legacy-identity ZIP to migrated clients and start a second P → T cycle.
+  A schema-2 Tip declaration now fails closed.
+- `validate-live-tip-progression --declaration` requires the candidate to match the checked-in
+  declaration's role, identity, migration phase and eligibility profile.
+- The client is a second fence: once the running bundle identifier is the successor identity,
+  `SparkleUpdateFeedDelegate.bestValidUpdate(in:for:)` and the passive appcast check never select a
+  `package`/`interactive-package` item (`IdentityTransitionUpdatePolicy`).
+- Both checked-in declarations are `successor`. Stable retains `v1.10.0` and the Tip-origin P.
+  Tip pins the exact P and a minimum T. At feed generation, it authenticates the latest published
+  Tip manifest and appcast, then uses that T or the exact T already retained by a published S.
+  `S` items carry the selected T's build as their floor.
+
+A Tip run admitted before cutover can publish a newer T using its pinned tooling. The first S
+retains that T if GitHub already served it when the feed was generated. If live T moves after
+generation, the final publication check rejects the stale candidate. A fresh run resolves the
+new history without another source change.
+
+Known consequences of the already-published duplicate T items:
+
+- A Tip client still on an earlier duplicate T build (below the pinned T's build) is below the S
+  floor. It takes the retained T package once more, then only S ZIPs. A Stable v1.10.0 (build
+  `44`) client that switches to Tip is in the same position. Lowering S's floor globally is unsafe,
+  because the floor cannot see the running identity. Those users can skip the extra package by
+  installing the current official successor ZIP from the Tip release page once.
+- Installer payloads are root-owned. After T, `/Applications/RepoPrompt CE.app` is `root:wheel`
+  `755`, so Sparkle's `SPUSystemNeedsAuthorizationAccessForBundlePath` still requires
+  administrator authorization for later ZIP updates. Those updates are fast application replacements,
+  not the slow PKG. Sparkle preserves the old bundle's owner, so this persists until ownership is
+  restored once, for example
+  `sudo chown -R "$(id -un)":admin "/Applications/RepoPrompt CE.app"`, or the app is reinstalled
+  from a downloaded ZIP. Automating that repair is a separate privileged-UX decision.
 
 ## Dormant Stable capability and archived-P handoff
 

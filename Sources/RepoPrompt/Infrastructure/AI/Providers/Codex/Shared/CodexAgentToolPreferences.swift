@@ -79,6 +79,45 @@ enum CodexAgentToolPreferences {
         let enabledMCPServerNames: Set<String>
     }
 
+    typealias RequestPermissions = (
+        approvalPolicy: ApprovalPolicy,
+        sandboxMode: SandboxMode,
+        approvalReviewer: ApprovalReviewer
+    )
+
+    /// Resolves Codex launch and request decisions through the canonical secure store.
+    struct SecurePermissionReader {
+        private let secureStore: AgentPermissionSecureStore
+
+        init(secureStore: AgentPermissionSecureStore = .shared) {
+            self.secureStore = secureStore
+        }
+
+        func snapshot(for entries: [MCPIntegrationHelper.CodexServerEntry]) async -> Snapshot {
+            let document = await secureStore.readOffMain { $0.codexPermissions() }
+            return Snapshot(
+                bashToolEnabled: document.bashToolEnabled ?? false,
+                searchToolEnabled: CodexAgentToolPreferences.searchToolEnabled(),
+                approvalPolicy: document.approvalPolicy(),
+                sandboxMode: document.sandboxMode(),
+                approvalReviewer: document.approvalReviewer(),
+                enabledMCPServerNames: CodexAgentToolPreferences.enabledMCPServerNames(for: entries, document: document)
+            )
+        }
+
+        func prepareRequestPermissions() async {
+            _ = await secureStore.readOffMain { $0.codexPermissions() }
+        }
+
+        func cachedRequestPermissions() -> RequestPermissions {
+            guard let document = secureStore.cachedCodexPermissions() else {
+                // Invalidation after preparation must never broaden the in-flight turn's access.
+                return (.onRequest, .readOnly, .user)
+            }
+            return (document.approvalPolicy(), document.sandboxMode(), document.approvalReviewer())
+        }
+    }
+
     private static let bashToolEnabledKey = "codexAgentTools.bash.enabled"
     private static let searchToolEnabledKey = "codexAgentTools.search.enabled"
     private static let approvalPolicyKey = "codexAgentTools.bash.approvalPolicy"
@@ -358,6 +397,10 @@ enum CodexAgentToolPreferences {
         return storedMCPServerToggles(defaults: defaults)[key] ?? false
     }
 
+    static func mcpServerEnabled(normalizedName: String, document: SecureCodexPermissionDocument) -> Bool {
+        isRepoPromptServer(normalizedName) || document.mcpServerEnabled(normalizedName: normalizedName)
+    }
+
     static func setMCPServerEnabled(
         normalizedName: String,
         isEnabled: Bool,
@@ -413,6 +456,15 @@ enum CodexAgentToolPreferences {
             }
         }
         return enabled
+    }
+
+    static func enabledMCPServerNames(
+        for entries: [MCPIntegrationHelper.CodexServerEntry],
+        document: SecureCodexPermissionDocument
+    ) -> Set<String> {
+        Set(entries.lazy.filter {
+            mcpServerEnabled(normalizedName: $0.normalizedName, document: document)
+        }.map(\.normalizedName)).union([MCPIntegrationHelper.repoPromptMCPServerName])
     }
 
     private static func storedMCPServerToggles(defaults: UserDefaults) -> [String: Bool] {

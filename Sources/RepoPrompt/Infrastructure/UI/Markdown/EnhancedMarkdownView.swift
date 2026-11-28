@@ -98,6 +98,9 @@ final class CodeBlockTextView: NSTextView {
     /// Used by the measurement cache to avoid redundant `ensureLayout` calls.
     private(set) var contentVersion: UInt64 = 0
 
+    /// Keep the source attributes for prefix checks after TextKit normalizes storage.
+    fileprivate var lastReadOnlyInput: NSAttributedString?
+
     private static let plainTextLayoutHeightAllowance: CGFloat = 2
     private static let textTableLayoutHeightAllowance: CGFloat = 4
 
@@ -499,26 +502,11 @@ struct AttributedTextView: NSViewRepresentable {
 
     func updateTextView(_ textView: CodeBlockTextView, coordinator: Coordinator, presentationVisible: Bool) {
         coordinator.opener = linkOpener
-        // Detect attribute changes (not just the raw string).
-        if presentationVisible || isEditable, !textView.attributedString().isEqual(to: attributedString) {
-            #if DEBUG
-                AgentTranscriptTailRenderProbe.sink?(.native(.replacement, probeRowID, textView))
-            #endif
-            let wasFirstResponder = (textView.window?.firstResponder as? NSTextView) == textView
-            let previousSelection = textView.selectedRange()
-            let shouldScrollSelectionToVisible = TextViewSelectionRestorePolicy
-                .shouldScrollSelectionToVisibleAfterAttributedReplacement(
-                    isEditable: isEditable,
-                    wasFirstResponder: wasFirstResponder
-                )
-            textView.textStorage?.setAttributedString(attributedString)
-            textView.restoreSelectionCandidate(
-                previousSelection,
-                scrollToVisible: shouldScrollSelectionToVisible
-            )
-            // Bump content version so the next sizeThatFits performs a real measurement.
-            textView.incrementContentVersion()
-            textView.needsDisplay = true
+        if isEditable || textView.isEditable {
+            textView.lastReadOnlyInput = nil
+        }
+        if presentationVisible || isEditable {
+            updateContent(in: textView)
         }
 
         // Refresh delegates and links, but avoid unchanged AppKit interaction setters.
@@ -533,6 +521,44 @@ struct AttributedTextView: NSViewRepresentable {
         if textView.layoutManager?.allowsNonContiguousLayout != false {
             textView.layoutManager?.allowsNonContiguousLayout = false
         }
+    }
+
+    private var reusableInput: NSAttributedString? {
+        guard !isEditable, !(attributedString is NSMutableAttributedString) else { return nil }
+        return attributedString
+    }
+
+    private func updateContent(in textView: CodeBlockTextView) {
+        let previousInput = textView.lastReadOnlyInput
+        guard previousInput !== attributedString, let storage = textView.textStorage else { return }
+        textView.lastReadOnlyInput = reusableInput
+        guard !storage.isEqual(to: attributedString) else { return }
+
+        #if DEBUG
+            AgentTranscriptTailRenderProbe.sink?(.native(.replacement, probeRowID, textView))
+        #endif
+        let previousSelection = textView.selectedRange()
+        let shouldScrollSelectionToVisible = TextViewSelectionRestorePolicy
+            .shouldScrollSelectionToVisibleAfterAttributedReplacement(
+                isEditable: isEditable,
+                wasFirstResponder: textView.window?.firstResponder === textView
+            )
+        let existingLength = storage.length
+        let previousContent = previousInput ?? storage
+        if !isEditable, existingLength > 0, existingLength < attributedString.length,
+           previousContent.length == existingLength,
+           previousContent.isEqual(to: attributedString.attributedSubstring(from: NSRange(location: 0, length: existingLength)))
+        {
+            // Keep TextKit's existing layout for streaming updates with an unchanged prefix.
+            let suffix = NSRange(location: existingLength, length: attributedString.length - existingLength)
+            storage.append(attributedString.attributedSubstring(from: suffix))
+        } else {
+            storage.setAttributedString(attributedString)
+        }
+        textView.restoreSelectionCandidate(previousSelection, scrollToVisible: shouldScrollSelectionToVisible)
+        textView.incrementContentVersion()
+        // Text storage invalidates the affected display itself. Invalidating the full
+        // view here can synchronously lay out its entire bounds inside updateNSView.
     }
 
     // MARK: Explicit sizing -----------------------------------------------
@@ -606,6 +632,7 @@ struct AttributedTextView: NSViewRepresentable {
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticTextReplacementEnabled = false
         textView.textStorage?.setAttributedString(attributedString)
+        textView.lastReadOnlyInput = reusableInput
         textView.layoutManager?.allowsNonContiguousLayout = false
     }
 }

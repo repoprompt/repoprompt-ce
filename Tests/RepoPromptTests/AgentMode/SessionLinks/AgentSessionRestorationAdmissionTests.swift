@@ -42,6 +42,60 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
         XCTAssertTrue(reopened.providerRequests.events.isEmpty, "Opening an empty session must not start a provider")
     }
 
+    func testReadOnlySubscriptionSessionsReopenWithoutAnUnsavableMigration() async throws {
+        let pinned = AgentSessionSubscriptionBinding.pinned(
+            profileID: .init(backend: .codex, uuid: UUID()), identityEpoch: UUID()
+        )
+        for unsupportedEnvelope in [false, true] {
+            let root = try makeRoot()
+            let tabID = UUID(), sessionID = UUID()
+            let workspace = makeWorkspace(root: root, tabID: tabID, sessionID: sessionID)
+            let saved = AgentSession(
+                id: sessionID, workspaceID: workspace.id, composeTabID: tabID, name: "Read-only history",
+                agentKind: AgentProviderKind.codexExec.rawValue, subscriptionAccountBinding: pinned,
+                autoEditEnabled: false,
+                selfCompactState: .init(latest: .malformedRecovery(at: Date(timeIntervalSince1970: 1)))
+            )
+            var bytes = try JSONEncoder().encode(saved)
+            if unsupportedEnvelope {
+                var document = try XCTUnwrap(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
+                document["subscriptionAccountBinding"] = ["version": 99, "kind": "detached"]
+                bytes = try JSONSerialization.data(withJSONObject: document)
+            }
+            let url = sessionFile(root: root, sessionID: sessionID)
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try bytes.write(to: url)
+            let fixture = try await makeFixture(root: root, workspace: workspace)
+            fixture.vm.test_setSuppressesAgentSessionPersistence(false)
+
+            let restored = await fixture.vm.ensureSessionReady(tabID: tabID)
+            XCTAssertTrue(restored.qualifiedRestorationReadiness.isAuthoritative)
+            XCTAssertEqual(restored.subscriptionAccountBinding, unsupportedEnvelope ? .unreadable : pinned)
+            XCTAssertEqual(restored.operationAdmissionFailureMessage, AgentSessionSubscriptionBinding.notRunnableMessage)
+            XCTAssertEqual(restored.selfCompactState, saved.selfCompactState)
+            XCTAssertNil(restored.lastUserMessageAt)
+            XCTAssertFalse(restored.hasReconciledPersistedCodexCommandStatus)
+
+            let permissions = fixture.vm.interactionRuntime
+            XCTAssertNil(permissions.setAutoEditEnabled(true, for: restored))
+            permissions.applyApprovalSnapshot(
+                .init(scope: permissions.approvalScope(for: restored), autoEditEnabled: true, pendingReview: nil),
+                to: restored
+            )
+            XCTAssertFalse(restored.autoEditEnabled)
+            let originalTitle = fixture.manager.composeTab(with: tabID)?.name
+            fixture.vm.renameSession(tabID: tabID, to: "Unwritable title")
+            XCTAssertEqual(fixture.manager.composeTab(with: tabID)?.name, originalTitle)
+            XCTAssertFalse(restored.isDirty)
+            XCTAssertNil(restored.saveDebounceTask)
+
+            let removal = await fixture.vm.preflightComposeTabsRemoval([tabID], reason: .close, workspaceID: workspace.id)
+            XCTAssertEqual(removal, .proceed)
+            XCTAssertEqual(try Data(contentsOf: url), bytes)
+            XCTAssertTrue(fixture.providerRequests.events.isEmpty)
+        }
+    }
+
     func testRebindPreparationRejectsReacquiredBoundAndUnboundMembers() async throws {
         for loss in ["none", "boundSuccess", "unboundTarget", "boundTarget", "source"] {
             let fixture = try await makeFixture()
@@ -708,7 +762,13 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
             items: [AgentChatItemPersist(from: recoveredRow)], autoEditEnabled: false
         )
         repaired.composeTabID = tabID
-        _ = try await reopened.writer.saveAgentSession(repaired, for: workspace)
+        do {
+            _ = try await reopened.writer.saveAgentSession(repaired, for: workspace)
+            XCTFail("A normal save must preserve a file whose account binding cannot be read")
+        } catch DecodingError.dataCorrupted {
+            XCTAssertEqual(try Data(contentsOf: payloadURL), malformed)
+        }
+        try JSONEncoder().encode(repaired).write(to: payloadURL, options: .atomic)
         let retry = await reopened.vm.retrySessionRestoration(tabID: tabID)
         XCTAssertTrue(retry)
         XCTAssertTrue(restored.qualifiedRestorationReadiness.isAuthoritative)

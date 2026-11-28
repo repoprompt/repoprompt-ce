@@ -219,6 +219,7 @@ enum AgentSessionHydrationRuntime {
         session.codexConversationID = persisted.codexConversationID
         session.codexRolloutPath = persisted.codexRolloutPath
         session.codexInstructionMode = persisted.codexInstructionMode
+        session.subscriptionAccountBinding = persisted.subscriptionAccountBinding
         session.providerCleanupHandle = persisted.resolvedProviderCleanupHandle
         session.codexModel = persisted.codexModel
         session.codexReasoningEffort = persisted.codexReasoningEffort
@@ -314,12 +315,12 @@ enum AgentSessionHydrationRuntime {
             executionLocationFailure: persisted.pendingHandoffExecutionLocationFailure,
             providerSwitchDelivery: persisted.pendingHandoffProviderSwitchDelivery
         )
+        restoreCodexMetadata(from: persisted, to: session)
         session.selfCompactState = persisted.selfCompactState ?? .init()
         session.selfCompactPersistenceWarning = persisted.selfCompactPersistenceWarning
         session.contextWindowCapacity = persisted.contextWindowCapacity
         session.claudeWakeCompactionSpentConversation = persisted.claudeWakeCompactionSpentConversation
         session.claudeAutoCompactWindowTokens = nil
-        restoreCodexMetadata(from: persisted, to: session)
         switch session.selectedAgent {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             session.contextCompactedAt = session.providerTokenUsageByTurn.last(where: { $0.contextCompacted })?.timestamp

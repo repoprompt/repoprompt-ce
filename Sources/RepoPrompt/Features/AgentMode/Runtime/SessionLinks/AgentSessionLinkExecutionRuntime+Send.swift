@@ -579,6 +579,10 @@ extension AgentSessionLinkExecutionRuntime {
             let reason = AgentSessionLinkDeliveryReadiness.restorationBlockReason(liveSession.qualifiedRestorationReadiness)
             return .blocked(AgentSessionLinkSendFailure(reason ?? .targetLoading))
         }
+        guard !liveSession.subscriptionAccountBinding.blocksProviderOperations else {
+            releaseComposerSubmitClaim(claim)
+            return .blocked(.targetSubscriptionReadOnly)
+        }
         guard let command = try? owner.admit(session: liveSession, expectedWorkspaceID: workspaceID) else {
             releaseComposerSubmitClaim(claim)
             return .blocked(.endpointSession)
@@ -621,6 +625,10 @@ extension AgentSessionLinkExecutionRuntime {
         guard command.isCurrent else {
             releaseComposerSubmitClaim(claim)
             return .blocked(.endpointPostSession)
+        }
+        guard !liveSession.subscriptionAccountBinding.blocksProviderOperations else {
+            releaseComposerSubmitClaim(claim)
+            return .blocked(.targetSubscriptionReadOnly)
         }
         liveSession.noteAcceptedTaskInput()
         // 6. Durable acceptance. The bubble keeps raw words; the exact provider payload is metadata.

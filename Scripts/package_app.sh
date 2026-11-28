@@ -308,6 +308,12 @@ generate_sentry_debug_symbols(){
         [[ -f "$BUILD_DIR/$exe" ]] || fail "Missing built executable for dSYM generation: $BUILD_DIR/$exe"
         run xcrun dsymutil "$BUILD_DIR/$exe" -o "$SENTRY_SYMBOLS_DIR/$exe.dSYM"
     done
+    if (( PUBLIC_UNIVERSAL_RELEASE )); then
+        local sparkle_dsym="$ROOT_DIR/Vendor/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/dSYMs/Sparkle.framework.dSYM"
+        [[ -f "$sparkle_dsym/Contents/Resources/DWARF/Sparkle" ]] ||
+            fail "Missing vendored Sparkle framework dSYM payload: $sparkle_dsym"
+        run ditto "$sparkle_dsym" "$SENTRY_SYMBOLS_DIR/Sparkle.framework.dSYM"
+    fi
     printf 'Sentry debug symbols: %s\n' "$SENTRY_SYMBOLS_DIR"
 }
 generate_sentry_debug_symbols

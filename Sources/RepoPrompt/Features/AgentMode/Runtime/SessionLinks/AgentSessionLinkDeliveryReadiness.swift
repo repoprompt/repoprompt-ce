@@ -72,6 +72,7 @@ enum AgentSessionLinkDeliveryReadiness {
         /// a new prompt would cancel it. Held off for its settle window like any other target work.
         var backgroundCompactionSettling: Bool = false
 
+        var subscriptionAccountReadOnly: Bool
         var providerSwitchUnconfirmed = false
         var providerHandoverNeedsReview = false
 
@@ -108,6 +109,7 @@ enum AgentSessionLinkDeliveryReadiness {
             selfCompactBlocksManagedStop: Bool = false,
             stopInProgress: Bool = false,
             backgroundCompactionSettling: Bool = false,
+            subscriptionAccountReadOnly: Bool = false,
             providerSwitchUnconfirmed: Bool = false,
             providerHandoverNeedsReview: Bool = false,
             hasWaitingPrompt: Bool,
@@ -140,6 +142,7 @@ enum AgentSessionLinkDeliveryReadiness {
             self.selfCompactBlocksManagedStop = selfCompactBlocksManagedStop
             self.stopInProgress = stopInProgress
             self.backgroundCompactionSettling = backgroundCompactionSettling
+            self.subscriptionAccountReadOnly = subscriptionAccountReadOnly
             self.providerSwitchUnconfirmed = providerSwitchUnconfirmed
             self.providerHandoverNeedsReview = providerHandoverNeedsReview
             self.hasWaitingPrompt = hasWaitingPrompt
@@ -199,6 +202,7 @@ enum AgentSessionLinkDeliveryReadiness {
         case targetRestoreUnavailable = "target_restore_unavailable"
         /// Creation needs its owner to finish configuration and confirm the matching payload save.
         case targetCreationIncomplete = "target_creation_incomplete"
+        case targetSubscriptionReadOnly = "target_subscription_read_only"
         /// The target is running, waiting, has a pending interaction, or has queued work.
         case targetNotIdle = "target_not_idle"
         case providerSwitchUnconfirmed = "provider_switch_unconfirmed"
@@ -214,6 +218,8 @@ enum AgentSessionLinkDeliveryReadiness {
                 "This session could not be restored. Retry loading it or create a new session; its saved data has not been replaced."
             case .targetCreationIncomplete:
                 "This session is still being created or has not been saved. Open it in the app to finish creation before sending a turn."
+            case .targetSubscriptionReadOnly:
+                AgentSessionSubscriptionBinding.notRunnableMessage
             case .providerSwitchUnconfirmed:
                 AgentSessionLinkSendFailure.providerSwitchUnconfirmed.message
             case .providerHandoverNeedsReview:
@@ -258,6 +264,7 @@ enum AgentSessionLinkDeliveryReadiness {
         if !snapshot.hasLoadedPersistedState {
             return .blocked(.targetLoading)
         }
+        if snapshot.subscriptionAccountReadOnly { return .blocked(.targetSubscriptionReadOnly) }
         if snapshot.providerSwitchUnconfirmed { return .blocked(.providerSwitchUnconfirmed) }
         if snapshot.providerHandoverNeedsReview { return .blocked(.providerHandoverNeedsReview) }
         if isTargetBusy(snapshot) {

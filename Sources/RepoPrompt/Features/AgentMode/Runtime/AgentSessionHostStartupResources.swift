@@ -109,8 +109,12 @@ final class AgentSessionHostStartupResources {
         #if DEBUG
             await test_beforeValidation?()
         #endif
-        guard await lease.isCurrent() else { return false }
-        return isCurrent
+        let resourcesAreCurrent: Bool = if let hostActivation {
+            await hostActivation.validateExecutionInput(lease: lease, command: origin)
+        } else {
+            await lease.isCurrent()
+        }
+        return resourcesAreCurrent && isCurrent
     }
 
     func inputWorkspace(for session: AgentTabSession) async throws -> AgentSessionProviderInputRuntime.WorkspaceSource? {

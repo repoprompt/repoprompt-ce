@@ -378,6 +378,7 @@ extension AgentRunHostAdmission {
         }
 
         let session = initial.command.writer.session
+        try AgentSessionMCPRuntime.requireSubscriptionAccountAdmission(session)
         let resident = AgentModeViewModel.isMCPResidentAppOwned(session)
         if resident {
             let shouldWait = AgentMCPToolHelpers.parseBool(args["wait"]) ?? (args["timeout_seconds"] != nil)
@@ -491,7 +492,7 @@ extension AgentRunHostAdmission {
         guard AgentModeViewModel.isMCPResidentAppOwned(session), executor.agentSessionLinkObserverEndpoint(tabID: session.tabID) == endpoint
         else { throw MCPError.invalidParams(AgentModeViewModel.mcpResidentTargetError) }
         let counts = try executor.mcpResidentLaneStateCounts(
-            for: endpoint, hasOutboundLinks: hasLinks, props: executor.residentMonitorPropsBySessionID[target.sessionID]
+            for: endpoint, hasOutboundLinks: hasLinks, props: target.command.writer.scope.presentation.monitorPropsByEndpoint[endpoint]
         )
         return (residentStatusSnapshot(target), AgentModeViewModel.mcpResidentOverseerValue(session: session, endpoint: endpoint, counts: counts))
     }
@@ -518,9 +519,13 @@ extension AgentRunHostAdmission {
     private func submitExactIdleControlInput(
         _ target: ReadTarget, text: String, workflow: AgentWorkflowDefinition?, resident: Bool, ownsPendingStart: Bool
     ) async throws -> AgentMCPInstructionDispatch {
-        try await requireReadTargets([target], operation: .runSteer)
         let command = target.command
         let session = command.writer.session
+        func requireAdmission() async throws {
+            try await requireReadTargets([target], operation: .runSteer)
+            try AgentSessionMCPRuntime.requireSubscriptionAccountAdmission(session)
+        }
+        try await requireAdmission()
         let scope = command.writer.scope
         guard let executor = scope.linkExecution, let targetHost = scope.executableHost,
               let programmatic = scope.submissions.programmaticTarget(command),
@@ -531,7 +536,7 @@ extension AgentRunHostAdmission {
         else { throw MCPError.invalidParams("The requested Agent session is not ready for a new turn.") }
         let stopFence = AgentRunStartStopFence(session: session)
         func deliver() async throws -> AgentMCPInstructionDispatch {
-            try await requireReadTargets([target], operation: .runSteer)
+            try await requireAdmission()
             guard session.autoEffortJudgmentID == nil else {
                 throw MCPError.invalidParams("Auto effort is already choosing effort for this session. Retry after that turn starts.")
             }
@@ -543,9 +548,12 @@ extension AgentRunHostAdmission {
             )
             let effort = judgesEffort ? await policy.chooseAutoEffortForUserTurn(
                 text: text, session: session, workflow: workflow,
-                isCurrent: { readTargetIsCurrent(target, operation: .runSteer) && stopFence.permitsStart(of: session) }
+                isCurrent: {
+                    readTargetIsCurrent(target, operation: .runSteer) && stopFence.permitsStart(of: session)
+                        && !session.subscriptionAccountBinding.blocksProviderOperations
+                }
             ) : nil
-            try await requireReadTargets([target], operation: .runSteer)
+            try await requireAdmission()
             guard stopFence.permitsStart(of: session), !session.runState.isActive,
                   let claim = executor.claimComposerSubmitAttempt(.init(
                       id: UUID(), target: programmatic, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: ""
@@ -558,9 +566,10 @@ extension AgentRunHostAdmission {
                 claim: claim, displayText: text, providerMessage: providerText, workflow: workflow,
                 attribution: nil, stopFence: stopFence, directStartOptions: .init(autoEffortSelection: effort?.selection),
                 audit: effort.map { choice in { policy.auditForSubmittedTurn($0, session: session, autoEffort: choice.audit) } },
-                revalidateBeforeDispatch: { try await requireReadTargets([target], operation: .runSteer) },
+                revalidateBeforeDispatch: { try await requireAdmission() },
                 dispatchIsCurrent: {
                     readTargetIsCurrent(target, operation: .runSteer) && stopFence.permitsStart(of: session)
+                        && !session.subscriptionAccountBinding.blocksProviderOperations
                         && session.pendingApplyEditsReview == nil && session.pendingWorktreeMergeReview == nil
                 }
             )
