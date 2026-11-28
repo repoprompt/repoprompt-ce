@@ -3435,7 +3435,8 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             workspaceID: workspace.id, workspaceWithID: { $0 == workspace.id ? workspace : nil },
             displayName: { _ in "Host startup" }, isSuppressed: { false }, attachmentWorkspaceDirectory: { directory }
         ).persistenceComposition(scope: host.scope, canonicalStorage: .init(workspaceID: workspace.id, contexts: domain.contextStore))
-        _ = host.scope.interactions(routeID: host.routeID, approvalStore: ApplyEditsApprovalStore())
+        let approvalStore = ApplyEditsApprovalStore()
+        _ = host.scope.interactions(routeID: host.routeID, approvalStore: approvalStore)
         let execution = host.makeExecution(
             dependencies: .init(
                 windowID: host.routeID, connectionPolicyInstaller: policy, expectedPIDPolicyArmer: { _ in true }, mcpServerEnabler: { true },
@@ -3454,7 +3455,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         host.scope.installExecution(execution)
         if codexController != nil {
             host.installCodexRuntime(
-                codex, routeID: route.identity.routeID, approvalStore: ApplyEditsApprovalStore(),
+                codex, routeID: route.identity.routeID, approvalStore: approvalStore,
                 links: f.runtime, mcpServerEnabler: { true }, modelRouterSettingsStore: .shared
             )
         }
