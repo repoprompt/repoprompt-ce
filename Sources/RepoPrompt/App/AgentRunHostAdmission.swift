@@ -3,6 +3,7 @@ import MCP
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptMCPServer
+import RepoPromptWorkspaceCore
 
 /// Admission for commands from an executable Agent route. A transport receipt proves the
 /// caller, not access to a named child; target provenance is checked separately.
@@ -71,8 +72,8 @@ struct AgentRunHostAdmission {
     func provesCanonicalCarrier(in snapshot: DomainWorkspaceSnapshot) -> Bool {
         sourceIsCurrent && snapshot.document.workspaceID == workspaceID && snapshot.health.acceptsMutations
             && activation.executionTab(in: snapshot, command: source) != nil
-            && Set(snapshot.document.metadata.repoPaths.map { ($0 as NSString).standardizingPath })
-            == Set(rootLease.roots.map { ($0.fullPath as NSString).standardizingPath })
+            && snapshot.document.metadata.canonicalLoadableRepoPathSet
+            == Set(rootLease.roots.compactMap { StandardizedPath.canonicalWorkspaceRootPath($0.fullPath) })
     }
 
     func resolveStartSelection(

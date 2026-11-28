@@ -15764,7 +15764,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                 }
                 workspaceID = handle.context.workspaceID
                 workspaceRevision = handle.workspaceRevision
-                authorizedCanonicalRoots = Set(workspace.document.metadata.repoPaths.compactMap {
+                authorizedCanonicalRoots = Set(workspace.document.metadata.canonicalLoadableRepoPaths.compactMap {
                     DomainMutationPathFence.canonicalPath($0)
                 })
             } catch {

@@ -126,6 +126,10 @@ extension AgentModeViewModel {
               refusedWorkspaceActivationOwner == nil,
               canonicalWorkspaceHostPreparation == nil || !isAwaitingWorkspaceAdoption
         else { return nil }
+        let expectedInitialStartLocation = initialStartLocationProps(tabID: tabID)?.selection
+        if workspaceSwitchInFlight, (expectedInitialStartLocation ?? .local) == .local {
+            return nil
+        }
         let resolvedSession: TabSession
         if let heldSession = session ?? sessions[tabID] {
             resolvedSession = heldSession
@@ -134,10 +138,6 @@ extension AgentModeViewModel {
             // recovery must not recreate a detached runtime from its still-visible carrier.
             guard explicitActiveSessionID(for: tabID) == nil else { return nil }
             resolvedSession = self.session(for: tabID)
-        }
-        let expectedInitialStartLocation = initialStartLocationProps(tabID: tabID)?.selection
-        if workspaceSwitchInFlight, (expectedInitialStartLocation ?? .local) == .local {
-            return nil
         }
         guard resolvedSession.operationAdmissionFailureMessage == nil,
               !resolvedSession.isComposerSubmissionInFlight,
@@ -187,7 +187,7 @@ extension AgentModeViewModel {
     /// Single-authority explanation for why Send is currently unavailable for this tab.
     /// Read-only: never allocates or mutates a `TabSession`.
     func composerSubmitDisabledReason(tabID: UUID?, session: TabSession?) -> String? {
-        if let refused = refusedWorkspaceActivationOwner, sessionIndexStore.isOwnerCurrent(refused) {
+        if refusedWorkspaceActivationOwner != nil {
             return Self.workspaceActivationFailureMessage
         }
         if canonicalWorkspaceHostPreparation != nil, isAwaitingWorkspaceAdoption {

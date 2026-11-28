@@ -3,6 +3,7 @@ import MCP
 import RepoPromptDomainRuntime
 import RepoPromptVCS
 import RepoPromptWorkspaceContext
+import RepoPromptWorkspaceCore
 
 /// App wiring only. This creates a child route and empty scope; publishing a carrier and
 /// admitting a provider still belong to the exact workspace and session transactions.
@@ -23,7 +24,9 @@ enum AgentRunHostChildComposition {
         let settings = source.modelRouterSettingsStore
         let diagnostics = AppAgentSessionLinkCatalogEventSink()
         let perf = AppAgentModePerfRecorder()
-        let paths = AgentSessionRuntimeHost.makeSessionWorkspaceProviders { workspace.repoPaths.first }
+        let paths = AgentSessionRuntimeHost.makeSessionWorkspaceProviders {
+            StandardizedPath.canonicalWorkspaceRootPaths(workspace.repoPaths).first
+        }
         let child = AgentSessionRuntimeHost(
             route: route, executionRouteLease: execution, workspacePath: paths.sessionWorkspacePath,
             runtimeWorkspacePaths: paths.codexRuntimeWorkspacePaths,
@@ -271,7 +274,7 @@ extension AgentRunHostStartTransaction {
     ) async throws -> String? {
         let workspace = try await source.canonicalWorkspace()
         func canonicalPaths(_ paths: [String]) -> Set<String> {
-            Set(paths.map { ($0 as NSString).standardizingPath })
+            Set(paths.compactMap { StandardizedPath.canonicalWorkspaceRootPath($0) })
         }
         // Each independently restored target owns a different file store. Match canonical
         // paths, not store-local IDs; both exact leases must still survive every await.
@@ -281,7 +284,7 @@ extension AgentRunHostStartTransaction {
         else { throw MCPFileToolAuthorityFailure.superseded }
         let writer = command.writer
         let session = writer.session
-        let fallbackPath = workspace.repoPaths.first
+        let fallbackPath = StandardizedPath.canonicalWorkspaceRootPaths(workspace.repoPaths).first
         func requireCurrent() async throws {
             try expiry?.throwIfExpired()
             let snapshot = try await source.canonicalSnapshot()
@@ -290,7 +293,8 @@ extension AgentRunHostStartTransaction {
             guard stopFence.permitsStart(of: session),
                   source.sourceIsCurrent, lease.rootsAreCurrent, host.workspaceActivation === activation,
                   activation.owns(scope: host.scope, route: host.route),
-                  snapshot.document.metadata.repoPaths == workspace.repoPaths,
+                  snapshot.document.metadata.canonicalLoadableRepoPaths
+                  == StandardizedPath.canonicalWorkspaceRootPaths(workspace.isSystemWorkspace ? [] : workspace.repoPaths),
                   activation.executionTab(in: snapshot, command: command) != nil, validatesCarrier(snapshot)
             else { throw MCPFileToolAuthorityFailure.superseded }
         }

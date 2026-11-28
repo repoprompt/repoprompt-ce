@@ -3836,6 +3836,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 )
                 if !isActiveUISyncSuppressed {
                     syncTranscriptUIState()
+                    if isAgentModeActive || isAwaitingWorkspaceAdoption || refusedWorkspaceActivationOwner != nil || workspaceSwitchInFlight {
+                        syncComposerUIState()
+                    }
                 }
             }
             .store(in: &cancellables)
@@ -3846,6 +3849,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 activeSwitchOperationID = activity?.operationID
                 if !isActiveUISyncSuppressed {
                     syncTranscriptUIState()
+                    if isAgentModeActive || isAwaitingWorkspaceAdoption || refusedWorkspaceActivationOwner != nil || workspaceSwitchInFlight {
+                        syncComposerUIState()
+                    }
                 }
                 if activity == nil {
                     // A deferral declined while the switch held the owner non-current settles now.
@@ -3854,6 +3860,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     Task { @MainActor [weak self] in
                         guard let self, !isActiveUISyncSuppressed else { return }
                         syncTranscriptUIState()
+                        if isAgentModeActive || isAwaitingWorkspaceAdoption || refusedWorkspaceActivationOwner != nil || workspaceSwitchInFlight {
+                            syncComposerUIState()
+                        }
                     }
                 }
             }
@@ -4963,6 +4972,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             if workspaceSwitchInFlight || shouldDeferForWorkspaceSwitch {
                 pendingTabIDForLoad = nil
                 publishLoadingTranscriptPresentation(tabID: nil)
+                if !isActiveUISyncSuppressed { syncComposerUIState(tabID: nil) }
                 return
             }
             activeSessionLoadInProgressTabID = nil
@@ -4973,12 +4983,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if refusedWorkspaceActivationOwner != nil {
             pendingTabIDForLoad = tabID
             activeSessionLoadInProgressTabID = nil
+            if !isActiveUISyncSuppressed { syncComposerUIState(tabID: tabID) }
             return
         }
         if shouldDeferForWorkspaceSwitch || (canonicalWorkspaceHostPreparation != nil && isAwaitingWorkspaceAdoption) {
             pendingTabIDForLoad = tabID
             activeSessionLoadInProgressTabID = tabID
             publishLoadingTranscriptPresentation(tabID: tabID)
+            if !isActiveUISyncSuppressed, isAgentModeActive || isAwaitingWorkspaceAdoption || workspaceSwitchInFlight {
+                syncComposerUIState(tabID: tabID)
+            }
             return
         }
 
@@ -4994,6 +5008,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             {
                 activeSessionLoadInProgressTabID = tabID
                 publishLoadingTranscriptPresentation(tabID: tabID)
+                if !isActiveUISyncSuppressed { syncComposerUIState(tabID: tabID) }
                 return
             }
             workspaceSwitchInFlight = false
@@ -6832,7 +6847,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     func workspaceActivationRefusalMCPError(expectedWorkspaceID: UUID?) -> MCPError? {
         guard let refused = refusedWorkspaceActivationOwner,
-              sessionIndexStore.isOwnerCurrent(refused),
               expectedWorkspaceID == nil || refused.workspaceID == expectedWorkspaceID
         else { return nil }
         return workspaceAdoptionMCPError(expectedWorkspaceID: expectedWorkspaceID)
@@ -13659,6 +13673,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         activeSessionLoadInProgressTabID = initialActiveTabID
         if workspace != nil {
             publishLoadingTranscriptPresentation(tabID: initialActiveTabID)
+            if !isActiveUISyncSuppressed,
+               isAgentModeActive || canonicalWorkspaceHostPreparation != nil || refusedWorkspaceActivationOwner != nil
+            {
+                syncComposerUIState(tabID: initialActiveTabID)
+            }
         }
         stopOpenCodeModelsSubscription()
         stopCursorModelsSubscription()
@@ -13907,6 +13926,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         guard let workspace else {
             activeSessionLoadInProgressTabID = nil
+            if preservesOrigin, !isActiveUISyncSuppressed {
+                syncComposerUIState(tabID: nil)
+            }
             // A window with no workspace has no bindings to describe, which is a settled answer
             // rather than an unfinished one. Not completing here would make restoration wait forever
             // on a window that will never register a binding.
