@@ -7972,7 +7972,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         }
 
         @MainActor func ownsPhysicalSendAfterProof(allowSelfNote: Bool) -> Bool {
-            inputResourcesAreCurrent() && !Task.isCancelled && effectiveStopFence.permitsStart(of: session)
+            writerReceipt.disposition(for: session) == .current
+                && inputResourcesAreCurrent() && !Task.isCancelled && effectiveStopFence.permitsStart(of: session)
                 && session.runID == sendRunID && session.activeRunAttemptID == sendRunAttemptIDAtEntry
                 && session.codexController.map(ObjectIdentifier.init) == expectedControllerID
                 && session.pendingCodexComputerUseActivation?.id == computerUseActivationID
@@ -8029,6 +8030,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                         session: session
                     ) {
                         await controller.prepareUserTurnPermissions()
+                        guard ownsPhysicalSendAfterProof(allowSelfNote: isSelfNote) else { throw CancellationError() }
                         let physicalSelection = autoEffortSelection == nil
                             ? (model: selection.model, reasoningEffort: selection.reasoningEffort, serviceTier: selection.serviceTier, isAuto: false)
                             : turnSelection()
