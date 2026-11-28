@@ -4787,9 +4787,13 @@ final class AgentSessionLinkRuntimeBridge {
         if chain.scheduledFrame == nil, facts == nil, lastPublishedSnapshotBySession[sessionID] == snapshot { return }
         // Deduplicate the pair. Private settlement advancement is not public activity/readiness.
         guard chain.scheduledFrame?.snapshot != snapshot || chain.scheduledFrame?.runFacts != facts else { return }
-        let publicChanged = lastPublishedSnapshotBySession[sessionID]?.hasSamePublishedState(as: snapshot) != true
+        let previousSnapshot = lastPublishedSnapshotBySession[sessionID]
+        let publicChanged = previousSnapshot?.hasSamePublishedState(as: snapshot) != true
         lastPublishedSnapshotBySession[sessionID] = snapshot
-        if publicChanged, snapshot.idleForSend {
+        let readOnlyBlocker = AgentSessionLinkDeliveryReadiness.BlockReason.targetSubscriptionReadOnly.rawValue
+        let becameReadOnly = snapshot.board.sendBlockers.contains(readOnlyBlocker)
+            && previousSnapshot?.board.sendBlockers.contains(readOnlyBlocker) != true
+        if publicChanged, snapshot.idleForSend || becameReadOnly {
             notePendingSendReadiness(forTargetSession: sessionID)
         }
         let sequence = allocateSourcePublicationSequence(for: sessionID)
@@ -8256,7 +8260,7 @@ final class AgentSessionLinkRuntimeBridge {
                 // waits for the next accepted readiness publication rather than retrying on a timer.
                 park(.targetReadiness, failure: failure)
             case .persistenceFailed, .persistenceIndeterminate, .targetRestoreUnavailable, .targetCreationIncomplete,
-                 .providerHandoverDoesNotFit, .providerHandoverNeedsReview:
+                 .providerHandoverDoesNotFit, .providerHandoverNeedsReview, .targetSubscriptionReadOnly:
                 // Terminal for this entry. `persistence_failed` is retryable by the caller, but only
                 // by explicitly queuing again — never by a background loop over failing storage.
                 clear(.failed(failure))
@@ -8335,10 +8339,7 @@ final class AgentSessionLinkRuntimeBridge {
 
     // MARK: Drain triggers
 
-    /// Readiness trigger: an accepted publication reporting this target will now take a send.
-    ///
-    /// Event-driven by construction — it runs only from an accepted (deduplicated) target
-    /// publication, so an unchanged target produces no drains at all and nothing polls.
+    /// A changed target publication can resume delivery or settle input when a target becomes read-only.
     private func notePendingSendReadiness(forTargetSession sessionID: UUID) {
         let references = pendingSendsByReference
             .filter { $0.value.targetSessionID == sessionID }

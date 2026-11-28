@@ -680,6 +680,25 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
         }
     }
 
+    func testReadOnlySubscriptionRefusesLinkedSendBeforeTranscriptMutation() async throws {
+        for changesDuringAuthorization in [false, true] {
+            let fixture = try makeFixture()
+            if !changesDuringAuthorization { fixture.session.subscriptionAccountBinding = .detached }
+            var authorizationCount = 0
+            let outcome = await send(fixture, commit: {
+                authorizationCount += 1
+                if changesDuringAuthorization { fixture.session.subscriptionAccountBinding = .detached }
+                return .committed
+            })
+            XCTAssertEqual(outcome, .blocked(.targetSubscriptionReadOnly))
+            XCTAssertEqual(authorizationCount, changesDuringAuthorization ? 1 : 0)
+            XCTAssertTrue(fixture.session.items.isEmpty)
+            XCTAssertNil(fixture.session.activeComposerSubmitAttempt)
+            XCTAssertFalse(fixture.events.contains(.save))
+            XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
+        }
+    }
+
     func testDeliversAttributedRowDurablyBeforeProviderStart() async throws {
         let fixture = try makeFixture()
         let request = makeRequest()

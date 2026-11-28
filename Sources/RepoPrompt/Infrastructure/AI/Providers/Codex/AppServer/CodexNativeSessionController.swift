@@ -176,6 +176,16 @@ protocol CodexSessionControlling: AnyObject {
     ) async throws -> CodexNativeSessionController.ThreadSnapshot
     func outstandingBlockingNativeToolCallNames() async -> [String]
     func setThreadName(_ name: String, threadID: String?) async throws
+    /// Complete permission-store I/O before the caller proves and releases provider input.
+    func prepareUserTurnPermissions() async
+    /// Submit already-released provider input without another permission-store suspension.
+    func startUserTurnWithPreparedPermissions(
+        text: String,
+        attachments: [AgentFileAttachment],
+        model: String?,
+        reasoningEffort: String?,
+        serviceTier: String?
+    ) async throws -> CodexTurnStartReceipt
     func startUserTurn(
         text: String,
         attachments: [AgentFileAttachment],
@@ -228,6 +238,21 @@ enum CodexServerResponseDelivery: Equatable {
 }
 
 extension CodexSessionControlling {
+    func prepareUserTurnPermissions() async {}
+
+    func startUserTurnWithPreparedPermissions(
+        text: String,
+        attachments: [AgentFileAttachment],
+        model: String?,
+        reasoningEffort: String?,
+        serviceTier: String?
+    ) async throws -> CodexTurnStartReceipt {
+        try await startUserTurn(
+            text: text, attachments: attachments, model: model,
+            reasoningEffort: reasoningEffort, serviceTier: serviceTier
+        )
+    }
+
     /// Legacy/test controllers cannot silently accept an independently owned routing resource.
     func retainRoutingCleanup(_: MCPRunRoutingCleanupReceipt) -> Bool {
         false
@@ -1177,11 +1202,11 @@ final class CodexNativeSessionController {
         method: String,
         timeout: TimeInterval?,
         useDefaultTimeout: Bool = true,
-        paramsBuilder: (CodexAgentToolPreferences.AppServerRequestValueStyle) async -> [String: Any]
+        paramsBuilder: (CodexAgentToolPreferences.AppServerRequestValueStyle) -> [String: Any]
     ) async throws -> [String: Any] {
         let attemptedStyle = appServerRequestValueStyle
         do {
-            let params = await paramsBuilder(attemptedStyle)
+            let params = paramsBuilder(attemptedStyle)
             try Task.checkCancellation()
             return try await performRequest(
                 method: method,
@@ -1197,7 +1222,7 @@ final class CodexNativeSessionController {
             Self.logCodexDebug(
                 "[CodexNativeController] retrying \(method) with alternate request value style=\(String(describing: fallbackStyle)) after error=\(error.localizedDescription)"
             )
-            let params = await paramsBuilder(fallbackStyle)
+            let params = paramsBuilder(fallbackStyle)
             try Task.checkCancellation()
             let result = try await performRequest(
                 method: method,
@@ -1981,12 +2006,13 @@ final class CodexNativeSessionController {
             // tests: resume_switches_models_preserves_base_instructions). Resending them
             // wastes ~5-6k tokens on every reconnect for no benefit.
             let deadline = ProcessInfo.processInfo.systemUptime + (timeout ?? options.requestTimeout ?? 5)
+            await prepareUserTurnPermissions()
             var result = try await requestWithCompatibleAppServerRequestValueStyle(
                 method: "thread/resume",
                 timeout: timeout
             ) { requestValueStyle in
                 var requestParams = params
-                let permissions = await requestPermissions()
+                let permissions = currentRequestPermissions()
                 requestParams["approvalPolicy"] = permissions.approvalPolicy.appServerRequestValue(style: requestValueStyle)
                 requestParams["sandbox"] = permissions.sandboxMode.appServerRequestValue(style: requestValueStyle)
                 requestParams["approvalsReviewer"] = permissions.approvalReviewer.appServerRequestValue
@@ -2033,12 +2059,13 @@ final class CodexNativeSessionController {
         } else if !baseInstructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             params["baseInstructions"] = baseInstructions
         }
+        await prepareUserTurnPermissions()
         return try await requestWithCompatibleAppServerRequestValueStyle(
             method: "thread/start",
             timeout: timeout
         ) { requestValueStyle in
             var requestParams = params
-            let permissions = await requestPermissions()
+            let permissions = currentRequestPermissions()
             requestParams["approvalPolicy"] = permissions.approvalPolicy.appServerRequestValue(style: requestValueStyle)
             requestParams["sandbox"] = permissions.sandboxMode.appServerRequestValue(style: requestValueStyle)
             requestParams["approvalsReviewer"] = permissions.approvalReviewer.appServerRequestValue
@@ -2517,7 +2544,25 @@ final class CodexNativeSessionController {
         return resolvedThreadID
     }
 
+    func prepareUserTurnPermissions() async {
+        await options.userConfiguredPermissionReader?.prepareRequestPermissions()
+    }
+
     func startUserTurn(
+        text: String,
+        attachments: [AgentFileAttachment],
+        model: String?,
+        reasoningEffort: String?,
+        serviceTier: String?
+    ) async throws -> CodexTurnStartReceipt {
+        await prepareUserTurnPermissions()
+        return try await startUserTurnWithPreparedPermissions(
+            text: text, attachments: attachments, model: model,
+            reasoningEffort: reasoningEffort, serviceTier: serviceTier
+        )
+    }
+
+    func startUserTurnWithPreparedPermissions(
         text: String,
         attachments: [AgentFileAttachment],
         model: String?,
@@ -2555,7 +2600,7 @@ final class CodexNativeSessionController {
                 useDefaultTimeout: false
             ) { requestValueStyle in
                 var requestParams = params
-                let permissions = await requestPermissions()
+                let permissions = currentRequestPermissions()
                 requestParams["approvalPolicy"] = permissions.approvalPolicy.appServerRequestValue(style: requestValueStyle)
                 requestParams["approvalsReviewer"] = permissions.approvalReviewer.appServerRequestValue
                 requestParams["sandboxPolicy"] = Self.appServerTurnSandboxPolicyPayload(
@@ -3443,9 +3488,8 @@ final class CodexNativeSessionController {
         )
     }
 
-    private func requestPermissions() async -> CodexAgentToolPreferences.RequestPermissions {
-        if let reader = options.userConfiguredPermissionReader {
-            let permissions = await reader.requestPermissions()
+    private func currentRequestPermissions() -> CodexAgentToolPreferences.RequestPermissions {
+        if let permissions = options.userConfiguredPermissionReader?.cachedRequestPermissions() {
             return (
                 computerUseRequiresUserReview ? .onRequest : permissions.approvalPolicy,
                 permissions.sandboxMode,

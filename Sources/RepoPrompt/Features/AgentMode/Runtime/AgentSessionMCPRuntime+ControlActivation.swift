@@ -7,6 +7,13 @@ import RepoPromptInstrumentation
 import RepoPromptMCPServer
 
 extension AgentSessionMCPRuntime {
+    /// Authorized status and transcript reads do not require subscription account admission.
+    static func requireSubscriptionAccountAdmission(_ session: AgentTabSession) throws {
+        guard !session.subscriptionAccountBinding.blocksProviderOperations else {
+            throw MCPError.invalidParams(AgentSessionSubscriptionBinding.notRunnableMessage)
+        }
+    }
+
     struct ControlActivationResources {
         let approvalStore: ApplyEditsApprovalStore
         let approvalScope: ApplyEditsApprovalScope
@@ -40,6 +47,7 @@ extension AgentSessionMCPRuntime {
                 throw MCPError.invalidParams("The requested agent session became active before MCP control activation.")
             }
             try revalidateAdmission(activationOwnership)
+            try Self.requireSubscriptionAccountAdmission(session)
         }
         try requireActivationOwner()
         let admission = try await registerControlActivation(

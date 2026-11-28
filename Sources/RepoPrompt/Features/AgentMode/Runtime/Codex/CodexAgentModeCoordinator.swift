@@ -3178,6 +3178,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             return false
         }
         session.noteAcceptedTaskInput() // Fallback replay on reused/new ownership remains ordinary.
+        await controller.prepareUserTurnPermissions()
         let inputProof = await linkExecutionRuntime?.agentSessionLinkProveProviderInput(for: session, claim: monitoring?.claim)
         // Managed metadata and quiet qualification can suspend too, even without local input.
         guard ownsFallbackDispatch()
@@ -3223,7 +3224,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             let oracle = session.oracleBackgroundAwareness.reserve(session: session, providerID: ObjectIdentifier(controller))
             defer { session.oracleBackgroundAwareness.release(oracle) }
             let ordinaryText = released?.text(head.providerText) ?? monitoring?.text ?? head.providerText
-            _ = try await controller.startUserTurn(
+            _ = try await controller.startUserTurnWithPreparedPermissions(
                 text: oracle?.decorating(ordinaryText) ?? ordinaryText,
                 attachments: head.attachments,
                 model: head.model,
@@ -5535,6 +5536,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                     )
                 }
             }
+            let replayAttemptID = session.activeRunAttemptID
+            await controller.prepareUserTurnPermissions()
             let finalReadiness = if routeReadiness == .notRequired,
                                     linkExecutionRuntime?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) != true
             {
@@ -5542,13 +5545,15 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             } else {
                 routeReadiness
             }
-            let inputRouteIsCurrent = linkExecutionRuntime?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: finalReadiness) == true
-            guard session.runState.isActive,
-                  session.runID == runID,
-                  let activeController = session.codexController,
-                  Self.sameCodexControllerInstance(activeController, controller),
-                  inputRouteIsCurrent
-            else {
+            func ownsReplayInput() -> Bool {
+                !Task.isCancelled && session.runState.isActive
+                    && computerUseRecoveryStopFence.permitsStart(of: session)
+                    && session.runID == runID && session.activeRunAttemptID == replayAttemptID
+                    && session.codexController.map(ObjectIdentifier.init) == ObjectIdentifier(controller)
+                    && linkExecutionRuntime?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: finalReadiness) == true
+            }
+
+            guard ownsReplayInput() else {
                 linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                     for: session,
                     dispatchID: replayDispatchID
@@ -5644,11 +5649,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             if let replayClaim, !replayClaim.managedMetadataRequirements.isEmpty {
                 guard let linkExecutionRuntime else { return false }
                 replayProof = await linkExecutionRuntime.agentSessionLinkProveProviderInput(for: session, claim: replayClaim)
-                guard !Task.isCancelled, session.runState.isActive,
-                      computerUseRecoveryStopFence.permitsStart(of: session), session.runID == runID,
-                      session.activeRunAttemptID == computerUseRecoveryAttemptID,
-                      session.codexController.map(ObjectIdentifier.init) == ObjectIdentifier(controller),
-                      linkExecutionRuntime.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: finalReadiness) else { return false }
+                guard ownsReplayInput(), session.activeRunAttemptID == computerUseRecoveryAttemptID else { return false }
             } else {
                 replayProof = nil
             }
@@ -5679,14 +5680,9 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                     persistenceRuntime?.scheduleSave(for: session)
                 }
                 guard await validateCodexComputerUseScope(session: session, controller: controller, activationID: computerUseActivationID) else { throw CancellationError() }
-                if computerUseActivationID != nil {
-                    guard !Task.isCancelled,
-                          session.runState.isActive, computerUseRecoveryStopFence.permitsStart(of: session),
-                          session.runID == runID,
-                          session.activeRunAttemptID == computerUseRecoveryAttemptID,
-                          session.codexController.map(ObjectIdentifier.init) == ObjectIdentifier(controller),
-                          linkExecutionRuntime?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: finalReadiness) == true else { throw CancellationError() }
-                }
+                guard ownsReplayInput(),
+                      computerUseActivationID == nil || session.activeRunAttemptID == computerUseRecoveryAttemptID
+                else { throw CancellationError() }
                 var finalReplayText = replayText
                 if let replayClaim {
                     let requiresLaneBatch = replayTurn.monitoringDispatchContext?.isPeriodic != true
@@ -5698,7 +5694,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 }
                 let oracle = session.oracleBackgroundAwareness.reserve(session: session, providerID: ObjectIdentifier(controller))
                 defer { session.oracleBackgroundAwareness.release(oracle) }
-                let receipt = try await controller.startUserTurn(
+                let receipt = try await controller.startUserTurnWithPreparedPermissions(
                     text: oracle?.decorating(finalReplayText) ?? finalReplayText,
                     attachments: replayTurn.attachments,
                     model: replayTurn.model,
@@ -8032,6 +8028,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                         controller: controller,
                         session: session
                     ) {
+                        await controller.prepareUserTurnPermissions()
                         let physicalSelection = autoEffortSelection == nil
                             ? (model: selection.model, reasoningEffort: selection.reasoningEffort, serviceTier: selection.serviceTier, isAuto: false)
                             : turnSelection()
@@ -8096,7 +8093,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                             let dispatchText = parkedNote.map { $0.frame + "\n\n" + baseText } ?? baseText
                             oracleAwareness = isSelfNote ? nil : session.oracleBackgroundAwareness.reserve(session: session, providerID: ObjectIdentifier(controller))
                             attemptedPhysicalSend = true
-                            receipt = try await controller.startUserTurn(
+                            receipt = try await controller.startUserTurnWithPreparedPermissions(
                                 text: oracleAwareness?.decorating(dispatchText) ?? dispatchText,
                                 attachments: attachments,
                                 model: physicalSelection.model,

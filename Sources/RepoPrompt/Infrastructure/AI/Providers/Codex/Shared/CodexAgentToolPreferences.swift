@@ -105,8 +105,15 @@ enum CodexAgentToolPreferences {
             )
         }
 
-        func requestPermissions() async -> RequestPermissions {
-            let document = await secureStore.readOffMain { $0.codexPermissions() }
+        func prepareRequestPermissions() async {
+            _ = await secureStore.readOffMain { $0.codexPermissions() }
+        }
+
+        func cachedRequestPermissions() -> RequestPermissions {
+            guard let document = secureStore.cachedCodexPermissions() else {
+                // Invalidation after preparation must never broaden the in-flight turn's access.
+                return (.onRequest, .readOnly, .user)
+            }
             return (document.approvalPolicy(), document.sandboxMode(), document.approvalReviewer())
         }
     }

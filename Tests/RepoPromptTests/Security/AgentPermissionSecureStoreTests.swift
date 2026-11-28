@@ -533,6 +533,42 @@ final class AgentPermissionSecureStoreTests: XCTestCase {
     }
 
     #if DEBUG
+        func testPreparedCodexTurnUsesCurrentOrRestrictivePermissionsWithoutReloading() async throws {
+            let secureStrings = try FakeSecurePlainStringStore(
+                plainPayload: encode(SecureCodexPermissionDocument(
+                    sandboxModeRaw: CodexAgentToolPreferences.SandboxMode.workspaceWrite.persistedValue
+                ))
+            )
+            let store = makeStore(secureStrings: secureStrings)
+            let options = CodexNativeSessionController.Options.agentModeDefault(
+                permissionReader: .init(secureStore: store),
+                readsUserConfiguredRequestPermissions: true
+            )
+            let controller = CodexNativeSessionController(
+                client: CodexAppServerClient(), runID: UUID(), tabID: UUID(), windowID: 1,
+                workspacePaths: .uniform(nil), options: options,
+                requestExecutor: { method, params, _ in
+                    XCTAssertEqual(method, "turn/start")
+                    let policy = params?["sandboxPolicy"] as? [String: Any]
+                    XCTAssertEqual(policy?["type"] as? String, "readOnly")
+                    return ["turn": ["id": "submission"]]
+                }
+            )
+            controller.test_installThreadState(threadID: "thread")
+            await controller.prepareUserTurnPermissions()
+            XCTAssertTrue(store.setCodexPermissionLevel(.readOnly))
+            secureStrings.beforePlainRead = { _ in XCTFail("Prepared send must not read the Keychain again") }
+
+            for invalidateCache in [false, true] {
+                if invalidateCache { store.clearCachedDocuments() }
+                let result = try await controller.startUserTurnWithPreparedPermissions(
+                    text: "request", attachments: [], model: nil, reasoningEffort: nil, serviceTier: nil
+                )
+                XCTAssertEqual(result.provisionalSubmissionID, "submission")
+            }
+            XCTAssertEqual(secureStrings.plainGetAccessModes, [.nonInteractive(reason: .permissionDecision)])
+        }
+
         func testCodexThreadStartupUsesAuthoritativePermissionsAfterBlockedRead() async throws {
             let secureStrings = try FakeSecurePlainStringStore(
                 plainPayload: encode(SecureCodexPermissionDocument(

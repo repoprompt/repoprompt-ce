@@ -1744,6 +1744,78 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         MonitorSupplementAssertions.assertNotPersisted(in: fixture.session)
     }
 
+    func testLocalCodexStartDiscardsManagedMetadataRevokedDuringPermissionPreparation() async throws {
+        #if DEBUG
+            let fixture = try makeFixture()
+            await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
+            let observer = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+            let target = AgentSessionLinkIdentityTestSupport.endpoint(sessionID: UUID())
+            let authority = DomainAgentSessionLinkAuthority(identity: .init(
+                runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: .distantPast
+            ))
+            let observation = DomainAgentSessionObservationSnapshot(
+                sessionID: target.sessionID, displayName: "Managed worker", providerDisplayName: nil,
+                status: .idle, board: .empty, idleForSend: true, pendingInteractionKind: nil,
+                latestVisibleAssistantPreview: nil, visibleRowCount: 0, lastActivityAt: .distantPast
+            )
+            guard case let .reserved(reservation, _) = await authority.reserveLink(observer: observer, target: target),
+                  case let .activated(activation) = await authority.activateLink(
+                      reservation: reservation, initialSnapshot: observation, sourcePublicationSequence: 1
+                  )
+            else { return XCTFail("Expected an active Manage grant") }
+            let reference = DomainAgentSessionLinkReference(linkID: activation.grant.id, generation: activation.grant.generation)
+            let links = fixture.viewModel.linkExecutionRuntime
+            links.agentSessionLinkPublishPromptInventory(.init(
+                observerSessionID: observer.sessionID, linkSetRevision: 2,
+                items: [.init(targetSessionID: target.sessionID, displayName: "Managed worker", capabilityNames: ["manage", "poll"], reference: reference)]
+            ), to: observer)
+            links.agentSessionLinkPublishPassiveStatusNotices(.init(
+                observerEndpoint: observer, queueEpoch: UUID(), queueRevision: 1, linkSetRevision: 2,
+                isEnabled: true, isDeliverable: true,
+                entries: [.init(
+                    reference: reference, targetEndpoint: target, targetSessionID: target.sessionID,
+                    displayName: "Managed worker", fromStatus: .running, toStatus: .idle,
+                    changeSequence: 1, managedMetadata: .init(observation)
+                )],
+                unacknowledgedOverflowCount: 0, overflowProduced: 0
+            ), to: observer)
+            let permissionGate = TestReleaseFence(name: "local Codex permission preparation")
+            fixture.controller.setTurnPermissionPreparationGate(permissionGate)
+            var proofCalls = 0
+            fixture.viewModel.test_agentSessionLinkManagedMetadataProof = { observer, requirements in
+                proofCalls += 1
+                XCTAssertFalse(Task.isCancelled, "The ordinary local send remains live after revocation")
+                XCTAssertEqual(requirements.map(\.reference), [reference])
+                return await authority.managedObservationAuthorizations(observer: observer, requirements: requirements)
+            }
+            let ownership = fixture.session.beginRunAttempt(source: "test.codex.permission.revocation")
+            let message = "Continue the local task"
+            let sending = Task { @MainActor in
+                await fixture.coordinator.test_sendCodexNativeMessage(
+                    session: fixture.session, ownership: ownership, text: message, attachments: []
+                )
+            }
+            defer {
+                permissionGate.release()
+                sending.cancel()
+                fixture.controller.setTurnPermissionPreparationGate(nil)
+                fixture.viewModel.test_agentSessionLinkManagedMetadataProof = nil
+            }
+            guard await permissionGate.waitUntilEntered() else { return XCTFail("Permission preparation did not suspend") }
+            XCTAssertEqual(proofCalls, 0, "Authorization proof must follow permission-store I/O")
+            XCTAssertTrue(fixture.startedTurns.isEmpty)
+            guard case .revoked = await authority.revoke(
+                linkID: reference.linkID, generation: reference.generation, reason: .userRequested
+            ) else { return XCTFail("Manage grant did not revoke") }
+            permissionGate.release()
+
+            let outcome = await sending.value
+            XCTAssertEqual(outcome, .sent)
+            XCTAssertEqual(proofCalls, 1)
+            XCTAssertEqual(fixture.startedTurns, [message], "Revoked managed bytes must never reach the provider")
+        #endif
+    }
+
     func testQueuedFallbackManagedOnlyProofRechecksRouteBeforePhysicalStart() async throws {
         #if DEBUG
             for withdrawRoute in [false, true] {
@@ -4807,6 +4879,7 @@ final class MonitorFakeCodexController: CodexSessionControllerPassiveStubDefault
     private var threadStarted = false
     private var startOrResumeHook: (@Sendable () async -> Void)?
     private var sendGate: TestReleaseFence?
+    private var turnPermissionPreparationGate: TestReleaseFence?
     private var routingExpectation: (runID: UUID, routeID: Int, owner: MCPHostRouteResources)?
     private var routingReceipts: [MCPRunRoutingCleanupReceipt] = []
     private var didShutDown = false
@@ -4828,6 +4901,15 @@ final class MonitorFakeCodexController: CodexSessionControllerPassiveStubDefault
 
     func setSendGate(_ gate: TestReleaseFence?) {
         lock.withLock { sendGate = gate }
+    }
+
+    func setTurnPermissionPreparationGate(_ gate: TestReleaseFence?) {
+        lock.withLock { turnPermissionPreparationGate = gate }
+    }
+
+    func prepareUserTurnPermissions() async {
+        let gate = lock.withLock { turnPermissionPreparationGate }
+        await gate?.enterAndWait()
     }
 
     private var startGate: CatalogAuthorityGate?
