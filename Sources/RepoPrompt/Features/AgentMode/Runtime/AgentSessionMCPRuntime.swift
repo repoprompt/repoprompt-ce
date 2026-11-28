@@ -602,11 +602,16 @@ final class AgentSessionMCPRuntime {
             }
     }
 
-    func makeBindingObservationHooks() -> AgentModeRunService.RunBindingObservationHooks {
-        .init(updateBindings: { [self] session in
-            scope?.presentation.bindingChanged(session)
-            handleObservedMCPStateChange(for: session)
-        })
+    func makeBindingObservationHooks(
+        providerResolvedDefaultModel: @escaping (AgentTabSession, UUID, String, AgentRunOwnership) -> Void
+    ) -> AgentModeRunService.RunBindingObservationHooks {
+        .init(
+            updateBindings: { [self] session in
+                scope?.presentation.bindingChanged(session)
+                handleObservedMCPStateChange(for: session)
+            },
+            providerResolvedDefaultModel: providerResolvedDefaultModel
+        )
     }
 
     static func snapshotModelParameterSelections(for session: AgentTabSession) -> [AgentRunMCPSnapshot.ModelParameterSelection] {

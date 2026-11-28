@@ -500,7 +500,13 @@ final class AgentSessionRuntimeHost {
             usage: scope.usage.makeRunHooks(scheduleSave: { persistence.scheduleSave(for: $0) }),
             attachments: scope.attachments.makeRunHooks(),
             presentation: scope.presentation.makeRunHooks(),
-            bindingObservation: publication.makeBindingObservationHooks(),
+            bindingObservation: publication.makeBindingObservationHooks(
+                providerResolvedDefaultModel: { [handoff = scope.handoff] session, rowID, previousModel, ownership in
+                    handoff.providerSwitchSummaryResolvedSourceModel(
+                        session, rowID: rowID, previousModel: previousModel, ownership: ownership
+                    )
+                }
+            ),
             queuedWorkRecovery: scope.drafts.makeRunHooks(),
             persistence: persistence.makeRunHooks(),
             transcript: scope.stream.makeRunHooks(),

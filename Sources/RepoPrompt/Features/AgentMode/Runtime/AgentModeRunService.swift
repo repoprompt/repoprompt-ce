@@ -479,7 +479,8 @@ final class AgentModeRunService {
                 providerControlCommand: providerControlCommand,
                 makeLease: makeLease,
                 stopFence: stopFence,
-                localComposerCandidate: localComposerCandidate
+                localComposerCandidate: localComposerCandidate,
+                initialUserItemID: initialUserItemID
             )
             if let resources {
                 return .resources(resources)

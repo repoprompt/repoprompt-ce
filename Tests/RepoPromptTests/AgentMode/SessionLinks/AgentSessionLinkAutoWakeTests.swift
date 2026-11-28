@@ -684,6 +684,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         }
         XCTAssertEqual(text, reply)
         XCTAssertEqual(revision, session.sourceItemsRevision)
+        XCTAssertNotEqual(session.selectedModelRaw, sourceModel, "The scripted ACP handshake must resolve the selected default model")
         XCTAssertEqual(provider.promptedMessages.count, 1)
         XCTAssertNil(session.pendingHandoff.payload)
     }

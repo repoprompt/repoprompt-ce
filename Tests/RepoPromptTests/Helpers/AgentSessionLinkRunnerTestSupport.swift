@@ -304,7 +304,8 @@ final class AgentSessionLinkRunnerHarness {
                 notifyAgentTurnComplete: { _ in harnessBox?.onTurnComplete?() }
             ),
             bindingObservation: .init(
-                updateBindings: { _ in }
+                updateBindings: { _ in },
+                providerResolvedDefaultModel: { _, _, _, _ in }
             ),
             queuedWorkRecovery: .init(
                 restoreDraftText: { _, _, _, _ in }

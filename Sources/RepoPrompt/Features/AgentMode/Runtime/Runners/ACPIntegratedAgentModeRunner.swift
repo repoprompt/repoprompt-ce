@@ -226,7 +226,8 @@ final class ACPIntegratedAgentModeRunner {
         providerControlCommand: AgentProviderControlCommand? = nil,
         makeLease: @escaping (_ runID: UUID) -> MCPBootstrapLease,
         stopFence: AgentRunStartStopFence? = nil,
-        localComposerCandidate: UUID? = nil
+        localComposerCandidate: UUID? = nil,
+        initialUserItemID: UUID? = nil
     ) async -> AgentRunResourceRequest? {
         var candidateTransferred = false
         defer { if !candidateTransferred, origin.writer.session === session, origin.writer.ownsPersistentClaim { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) } }
@@ -505,7 +506,8 @@ final class ACPIntegratedAgentModeRunner {
                                         lease: lease,
                                         receipt: receipt, providerLaunchInput: providerLaunchInput,
                                         attachmentReservationID: attachmentReservationID,
-                                        localComposerCandidate: localComposerCandidate
+                                        localComposerCandidate: localComposerCandidate,
+                                        initialUserItemID: initialUserItemID
                                     )
                                 }
                                 candidateTransferred = true
@@ -1080,7 +1082,8 @@ final class ACPIntegratedAgentModeRunner {
         receipt: AgentSessionRuntimeStore.WriterReceipt,
         providerLaunchInput: AgentProviderLaunchInput?,
         attachmentReservationID: UUID?,
-        localComposerCandidate: UUID? = nil
+        localComposerCandidate: UUID? = nil,
+        initialUserItemID: UUID?
     ) async {
         let isPeriodic = session.oversight.pendingAutoWake?.isPeriodic == true
         let modelDescription = runRequest.modelString ?? "default"
@@ -1160,7 +1163,12 @@ final class ACPIntegratedAgentModeRunner {
                     invalidatedResumeSessionID: bootstrap.invalidatedResumeSessionID,
                     session: session
                 )
-                _ = syncACPSelectedModelFromRegistryIfNeeded(agentKind: runRequest.agentKind, session: session)
+                let previousModel = session.selectedModelRaw
+                if syncACPSelectedModelFromRegistryIfNeeded(agentKind: runRequest.agentKind, session: session),
+                   let initialUserItemID
+                {
+                    hooks.bindingObservation.providerResolvedDefaultModel(session, initialUserItemID, previousModel, ingressOwner)
+                }
                 session.isDirty = true
                 hooks.persistence.scheduleSave(session)
                 hooks.bindingObservation.updateBindings(session)

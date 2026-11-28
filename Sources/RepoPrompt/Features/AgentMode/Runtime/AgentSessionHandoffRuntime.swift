@@ -102,7 +102,7 @@ final class AgentSessionHandoffRuntime {
     private struct SummaryGeneration {
         let writer: AgentSessionRuntimeStore.WriterIdentity
         let sourceAgent: AgentProviderKind
-        let sourceModel: String
+        var sourceModel: String
         let handoffRevision: UInt64
         let rowID: UUID
         let destination: AgentProviderKind
@@ -219,6 +219,18 @@ final class AgentSessionHandoffRuntime {
         )
     }
 
+    /// ACP can resolve the default model while starting the Summary's original provider
+    /// attempt. Carry that runtime transition forward under the existing writer and row.
+    func providerSwitchSummaryResolvedSourceModel(
+        _ session: AgentTabSession, rowID: UUID, previousModel: String, ownership: AgentRunOwnership
+    ) {
+        guard session.isCurrentRunAttemptForCurrentBinding(ownership),
+              let generation = currentSummaryGeneration(for: session, expectedSourceModel: previousModel),
+              generation.rowID == rowID, generation.outcome == nil
+        else { return }
+        summaryBySessionID[generation.writer.sessionID]?.sourceModel = session.selectedModelRaw
+    }
+
     private func failProviderSwitchSummary(_ session: AgentTabSession, rowID: UUID, message: String) {
         guard let generation = currentSummaryGeneration(for: session), generation.rowID == rowID,
               generation.outcome == nil else { return }
@@ -250,9 +262,12 @@ final class AgentSessionHandoffRuntime {
         scope?.presentation.providerSwitchSummaryChanged(session)
     }
 
-    private func currentSummaryGeneration(for session: AgentTabSession) -> SummaryGeneration? {
+    private func currentSummaryGeneration(
+        for session: AgentTabSession, expectedSourceModel: String? = nil
+    ) -> SummaryGeneration? {
         guard let scope, let id = session.activeAgentSessionID, let generation = summaryBySessionID[id],
-              session.selectedAgent == generation.sourceAgent, session.selectedModelRaw == generation.sourceModel,
+              session.selectedAgent == generation.sourceAgent,
+              (expectedSourceModel ?? session.selectedModelRaw) == generation.sourceModel,
               session.pendingHandoffRevision == generation.handoffRevision,
               let writer = scope.originatingWriter(identity: generation.writer, session: session), writer.isCurrent
         else { return nil }
