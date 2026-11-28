@@ -1,11 +1,16 @@
 {
   "schemaVersion": 1,
   "channel": "tip",
-  "currentRole": "transition",
+  "currentRole": "successor",
   "eligibilityProfile": "tip-identity-dress-rehearsal-v1",
   "expectedMigrationPhase": "disabled",
   "expectedSigningIdentity": "successor",
   "predecessors": [
+    {
+      "role": "transition",
+      "tag": "tip-36e1c395d620",
+      "rolloutManifestSha256": "a4da4157e811dfd4d5c287876ba0c121e01bac55747043eebaf4af54d32aff1c"
+    },
     {
       "role": "preparer",
       "tag": "tip-1e1d9fe4bbc6",

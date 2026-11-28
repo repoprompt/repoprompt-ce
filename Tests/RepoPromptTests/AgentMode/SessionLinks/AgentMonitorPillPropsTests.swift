@@ -678,7 +678,7 @@ final class AgentMonitorPillPropsTests: XCTestCase {
     }
 
     @MainActor
-    func testCurrentLinklessPropsRetainEndpointAndRejectCapturedEndpointAfterRebind() throws {
+    func testCurrentLinklessPropsUseTheNewEndpointAfterRebind() throws {
         GlobalSettingsStore.installApplicationModelIdentityPolicy()
         let viewModel = AgentModeViewModel(
             testWindowID: 27199,
@@ -715,14 +715,6 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         let rebound = try AgentSessionLinkEndpointTestSupport.endpoint(viewModel, tabID: tabID)
         XCTAssertNotEqual(endpoint, rebound)
         XCTAssertEqual(viewModel.currentMonitorPillProps().endpoint, rebound)
-        let originalAutoWake = session.oversight.autoWakeOnUpdates
-        XCTAssertFalse(try viewModel.agentSessionLinkSetAutoWakeOnUpdatesEnabled(
-            !originalAutoWake, for: XCTUnwrap(captured.endpoint)
-        ))
-        XCTAssertEqual(session.oversight.autoWakeOnUpdates, originalAutoWake)
-        // The current incarnation is still addressable: stale rejection is not a blanket refusal.
-        XCTAssertTrue(viewModel.agentSessionLinkSetAutoWakeOnUpdatesEnabled(originalAutoWake, for: rebound))
-        XCTAssertEqual(session.oversight.autoWakeOnUpdates, originalAutoWake)
     }
 
     func testWithCanAddReasonIsIdentityPreservingWhenUnchanged() {

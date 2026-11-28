@@ -36,7 +36,8 @@ final class AgentModeProviderBindingService {
             claudeEffortLevel: claudeEffortLevel,
             permissionProfile: permissionProfile,
             isSubagent: isSubagent,
-            externallyManagedReason: externallyManagedReason
+            externallyManagedReason: externallyManagedReason,
+            forPresentation: true
         )
     }
 
@@ -50,16 +51,13 @@ final class AgentModeProviderBindingService {
     /// Snapshots human-owned Codex capability preferences for a direct Agent Mode launch.
     /// MCP-related sessions remain restricted for their lifetime regardless of preference state.
     func codexCapabilitiesForLaunch(isMCPRelated: Bool) -> CodexCapabilitySettings {
-        guard !isMCPRelated,
-              let tools = preferences
-              .topLevelSettingsControlsBinding(providerID: .codex)
-              .codexTools
-        else { return .disabled }
+        guard !isMCPRelated else { return .disabled }
+        let defaults = preferences.defaults
         return CodexCapabilitySettings(
-            appsEnabled: tools.appsEnabled,
-            pluginsEnabled: tools.pluginsEnabled,
-            mcpElicitationEnabled: tools.mcpElicitationEnabled,
-            toolSuggestionsEnabled: tools.toolSuggestionsEnabled
+            appsEnabled: CodexAgentModeBooleanPreference.apps.isEnabled(defaults: defaults),
+            pluginsEnabled: CodexAgentModeBooleanPreference.plugins.isEnabled(defaults: defaults),
+            mcpElicitationEnabled: CodexAgentModeBooleanPreference.mcpElicitation.isEnabled(defaults: defaults),
+            toolSuggestionsEnabled: CodexAgentModeBooleanPreference.toolSuggestions.isEnabled(defaults: defaults)
         )
     }
 
@@ -154,7 +152,14 @@ final class AgentModeProviderBindingService {
         guard autoEditEnabled == false else { return nil }
 
         if agent == .codexExec {
-            guard CodexAgentToolPreferences.permissionLevel(defaults: preferences.defaults, secureStore: preferences.securePermissions) != .readOnly else { return nil }
+            let level: CodexAgentToolPreferences.PermissionLevel
+            if let store = preferences.securePermissions {
+                guard let document = store.presentationDocuments(for: .codex).codex else { return nil }
+                level = document.permissionLevel()
+            } else {
+                level = CodexAgentToolPreferences.permissionLevel(defaults: preferences.defaults)
+            }
+            guard level != .readOnly else { return nil }
             return AgentModeViewModel.AutoEditPermissionGuidance(
                 provider: .codex,
                 message: "Codex sandbox allows file edits — set Read Only",
@@ -164,7 +169,14 @@ final class AgentModeProviderBindingService {
         }
 
         if agent.usesClaudeTooling {
-            guard ClaudeAgentToolPreferences.permissionLevel(defaults: preferences.defaults, secureStore: preferences.securePermissions) != .requireApproval else { return nil }
+            let level: ClaudeAgentToolPreferences.PermissionLevel
+            if let store = preferences.securePermissions {
+                guard let document = store.presentationDocuments(for: .claude).claude else { return nil }
+                level = document.permissionLevel()
+            } else {
+                level = ClaudeAgentToolPreferences.permissionLevel(defaults: preferences.defaults)
+            }
+            guard level != .requireApproval else { return nil }
             return AgentModeViewModel.AutoEditPermissionGuidance(
                 provider: .claude,
                 message: "Claude sandbox allows file edits — set Require Approval",

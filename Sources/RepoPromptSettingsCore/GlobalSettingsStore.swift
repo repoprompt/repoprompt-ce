@@ -39,7 +39,9 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
     }()
 
     package let defaults: UserDefaults
-    private let fileStore: GlobalSettingsFileStoring
+    private let persistence: GlobalSettingsPersistence
+    private var pendingProfileSave: (id: UUID, hasPendingStartupMigration: Bool)?
+    private var acceptsDeferredProfileSaves = true
     private let invalidAgentModelsProfileAssertion: (String) -> Void
 
     @Published package private(set) var copySettings: [UUID: CopyGlobalSettings] = [:]
@@ -60,7 +62,7 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
     /// True when a failed startup migration must be retried through the raw-preserving
     /// transaction instead of the ordinary typed save path.
     package var isPendingPreservingMigrationRetry: Bool {
-        fileStore.hasPendingStartupMigration
+        pendingProfileSave?.hasPendingStartupMigration ?? persistence.fileStore.hasPendingStartupMigration
     }
 
     @Published package private(set) var sessionDismissedPersistenceBlockReason: GlobalSettingsPersistenceBlockReason?
@@ -84,13 +86,14 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         invalidAgentModelsProfileAssertion: @escaping (String) -> Void = { assertionFailure($0) }
     ) {
         self.defaults = defaults ?? Self.defaultUserDefaults
-        self.fileStore = fileStore
+        persistence = GlobalSettingsPersistence(fileStore: fileStore)
         self.invalidAgentModelsProfileAssertion = invalidAgentModelsProfileAssertion
         load()
         reconcilePersistenceBlockDismissal()
     }
 
     package func reloadFontScaleBodySizeFromDisk(normalize: (Double) -> Double) -> Double? {
+        let fileStore = persistence.fileStore
         do {
             let document = try fileStore.readSnapshot()
             guard let diskRawValue = document?.scalarPreferences?.ui?.fontScaleBodySize else {
@@ -251,6 +254,35 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         _ profile: AgentModelsSettingsProfile,
         contextBuilderWriteIntent: ContextBuilderSettingsWriteIntent
     ) {
+        updateGlobalAgentModelsProfile(profile, contextBuilderWriteIntent: contextBuilderWriteIntent)
+        objectWillChange.send()
+        save()
+        postAgentModelsSettingsDidChange(scope: .global)
+    }
+
+    /// Applies a UI edit immediately and submits its snapshot for ordered persistence.
+    /// The return value reports admission of the live edit. Disk failures surface through
+    /// `persistenceBlockReason` when the save completes.
+    package func setGlobalAgentModelsProfileWithDeferredSave(
+        _ profile: AgentModelsSettingsProfile,
+        contextBuilderWriteIntent: ContextBuilderSettingsWriteIntent
+    ) -> Bool {
+        guard acceptsDeferredProfileSaves else { return false }
+        updateGlobalAgentModelsProfile(profile, contextBuilderWriteIntent: contextBuilderWriteIntent)
+        let id = UUID()
+        pendingProfileSave = (id, isPendingPreservingMigrationRetry)
+        persistence.enqueueSave(makeDocument()) { [weak self] blockReason in
+            self?.completeProfileSave(id: id, blockReason: blockReason)
+        }
+        objectWillChange.send()
+        postAgentModelsSettingsDidChange(scope: .global)
+        return true
+    }
+
+    private func updateGlobalAgentModelsProfile(
+        _ profile: AgentModelsSettingsProfile,
+        contextBuilderWriteIntent: ContextBuilderSettingsWriteIntent
+    ) {
         let oldProfile = globalAgentModelsProfile()
         let normalized = normalizedAgentModelsProfile(profile)
         var modelSelection = scalarPreferences.modelSelection ?? GlobalScalarPreferences.ModelSelectionSettings()
@@ -294,10 +326,6 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
             newProfile: normalized,
             attemptedProfile: profile
         )
-
-        objectWillChange.send()
-        save()
-        postAgentModelsSettingsDidChange(scope: .global)
     }
 
     package func workspaceAgentModelsSettings(for workspaceID: UUID) -> WorkspaceAgentModelsSettings {
@@ -1708,7 +1736,7 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         preferences.subscriptionProfileCatalog = catalog
         var document = makeDocument()
         document.scalarPreferences = preferences
-        guard persist({ try fileStore.save(document) }) else {
+        guard persist({ try $0.save(document) }) else {
             throw SubscriptionCatalogPersistenceError.writeFailed
         }
         objectWillChange.send()
@@ -2193,6 +2221,7 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
 
         let oldGlobalProfile = globalAgentModelsProfile()
         let oldWorkspaceSettings = agentModelsSettingsByWorkspaceID
+        let fileStore = beginSynchronousPersistence()
         let fileExists = FileManager.default.fileExists(atPath: fileStore.fileURL.path)
         var loadedExistingDocument: GlobalSettingsDocument?
         var shouldSyncTelemetryMirror = false
@@ -2213,6 +2242,7 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
             }
         }
         let document = loadedExistingDocument ?? fileStore.loadOrCreateDefault()
+        let blockReason = fileStore.blockReason
         let needsSchemaVersionUpgrade = document.requiredSchemaVersion > document.schemaVersion
         copySettings = document.copySettings
         let migratedContextBuilderState = Self.migratingLegacyContextBuilderState(
@@ -2231,7 +2261,7 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         }
         codeMapsGloballyDisabled = globalDefaults.codeMapsGloballyDisabled ?? false
         nonGitCodeMapsEnabled = globalDefaults.nonGitCodeMapsEnabled ?? false
-        persistenceBlockReason = fileStore.blockReason
+        persistenceBlockReason = blockReason
         if persistenceBlockReason == nil,
            migratedContextBuilderState.didChange
            || seededFileSystemDefaults
@@ -2256,7 +2286,16 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
     /// Returns true only when recovery completed successfully.
     @discardableResult
     package func recoverBlockedPersistenceAfterBackup() -> Bool {
+        let requestedReason = persistenceBlockReason
+        let fileStore = beginSynchronousPersistence()
+        let currentReason = fileStore.blockReason
+        guard let currentReason, currentReason == requestedReason else {
+            // A queued save may have cleared or changed the block while recovery waited.
+            updatePersistenceBlockReason(currentReason)
+            return currentReason == nil
+        }
         let recovered = fileStore.performUserInitiatedRecovery(replacementDocument: makeDocument())
+        let blockReason = fileStore.blockReason
         objectWillChange.send()
         if recovered {
             load(notifyAgentModelsChanges: true)
@@ -2265,7 +2304,7 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
             // Do not reload a missing primary file: that would install and persist defaults.
             // Keep the live document intact and surface the store's actionable blocked state so
             // the user can retry the intended settings after fixing the underlying failure.
-            persistenceBlockReason = fileStore.blockReason
+            persistenceBlockReason = blockReason
         }
         return recovered
     }
@@ -2275,12 +2314,14 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
     /// CE-known fields, then this store reloads those imported settings.
     @discardableResult
     package func importBlockedPersistenceAfterBackup() -> Bool {
+        let fileStore = beginSynchronousPersistence()
         let imported = fileStore.performUserInitiatedCompatibleImport()
+        let blockReason = fileStore.blockReason
         objectWillChange.send()
         if imported {
             load(notifyAgentModelsChanges: true)
         } else {
-            persistenceBlockReason = fileStore.blockReason
+            persistenceBlockReason = blockReason
         }
         return imported
     }
@@ -2291,15 +2332,18 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
     package func retryBlockedPersistenceSave() -> Bool {
         // Reload is an explicit, separate action: never overwrite another writer or
         // persist provisional defaults through the generic save retry.
-        guard persistenceBlockReason != .changedOnDisk,
-              persistenceBlockReason != .missingOnDisk,
-              persistenceBlockReason != .loadFailed
+        let fileStore = beginSynchronousPersistence()
+        let blockReason = fileStore.blockReason
+        guard blockReason != .changedOnDisk,
+              blockReason != .missingOnDisk,
+              blockReason != .loadFailed
         else {
+            updatePersistenceBlockReason(blockReason)
             return false
         }
         if fileStore.hasPendingStartupMigration {
             return persist {
-                try fileStore.retryStartupMigrationPreservingUnknownFields(makeDocument())
+                try $0.retryStartupMigrationPreservingUnknownFields(makeDocument())
             }
         }
         return save()
@@ -2324,10 +2368,12 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
             publishRouterDemand()
         }
 
+        let fileStore = beginSynchronousPersistence()
         do {
             let oldGlobalProfile = globalAgentModelsProfile()
             let oldWorkspaceSettings = agentModelsSettingsByWorkspaceID
             let document = try fileStore.load()
+            let blockReason = fileStore.blockReason
             let needsSchemaVersionUpgrade = document.requiredSchemaVersion > document.schemaVersion
             objectWillChange.send()
             copySettings = document.copySettings
@@ -2345,7 +2391,7 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
             syncTelemetryMirrorFromLoadedSettings(scalarPreferences)
             codeMapsGloballyDisabled = globalDefaults.codeMapsGloballyDisabled ?? false
             nonGitCodeMapsEnabled = globalDefaults.nonGitCodeMapsEnabled ?? false
-            persistenceBlockReason = fileStore.blockReason
+            persistenceBlockReason = blockReason
             if persistenceBlockReason == nil,
                migratedContextBuilderState.didChange
                || seededFileSystemDefaults
@@ -2361,8 +2407,8 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
             emit(.settingsInstalled)
             return true
         } catch {
-            persistenceBlockReason = fileStore.blockReason
             print("⚠️ Failed to reload global settings JSON at \(fileStore.fileURL.path): \(error)")
+            persistenceBlockReason = fileStore.blockReason
             return false
         }
     }
@@ -2665,7 +2711,7 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
     @discardableResult
     private func saveStartupMigration(includeModelSelectionRepair: Bool) -> Bool {
         persist {
-            try fileStore.saveStartupMigrationPreservingUnknownFields(
+            try $0.saveStartupMigrationPreservingUnknownFields(
                 makeDocument(),
                 includeModelSelectionRepair: includeModelSelectionRepair
             )
@@ -2674,22 +2720,92 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
 
     @discardableResult
     private func save() -> Bool {
-        persist { try fileStore.save(makeDocument()) }
+        persist { try $0.save(makeDocument()) }
     }
 
-    private func persist(_ operation: () throws -> Void) -> Bool {
+    private func persist(_ operation: (GlobalSettingsFileStoring) throws -> Void) -> Bool {
+        let fileStore = beginSynchronousPersistence()
         do {
-            try operation()
-            if persistenceBlockReason != fileStore.blockReason {
-                persistenceBlockReason = fileStore.blockReason
-            }
+            try operation(fileStore)
+            updatePersistenceBlockReason(fileStore.blockReason)
             return true
         } catch {
-            if persistenceBlockReason != fileStore.blockReason {
-                persistenceBlockReason = fileStore.blockReason
-            }
             print("⚠️ Failed to save global settings JSON at \(fileStore.fileURL.path): \(error)")
+            updatePersistenceBlockReason(fileStore.blockReason)
             return false
+        }
+    }
+
+    private func beginSynchronousPersistence() -> GlobalSettingsFileStoring {
+        if pendingProfileSave != nil {
+            persistence.waitForSaves()
+            // This operation supersedes any queued publication of an older result.
+            pendingProfileSave = nil
+        }
+        return persistence.fileStore
+    }
+
+    private func completeProfileSave(id: UUID, blockReason: GlobalSettingsPersistenceBlockReason?) {
+        guard pendingProfileSave?.id == id else { return }
+        pendingProfileSave = nil
+        updatePersistenceBlockReason(blockReason)
+    }
+
+    private func updatePersistenceBlockReason(_ blockReason: GlobalSettingsPersistenceBlockReason?) {
+        if persistenceBlockReason != blockReason {
+            persistenceBlockReason = blockReason
+        }
+    }
+
+    package func freezeDeferredProfileSavesForTermination() {
+        acceptsDeferredProfileSaves = false
+    }
+
+    /// Awaits admitted transactions within the app's existing quit deadline. A failed
+    /// transaction retains the normal persistence block reason.
+    package func settleDeferredProfileSavesForTermination() async {
+        guard let pendingProfileSave else { return }
+        await persistence.drain()
+        completeProfileSave(id: pendingProfileSave.id, blockReason: persistence.fileStore.blockReason)
+    }
+}
+
+/// The main actor is the sole submitter. Synchronous mutations drain the queue before
+/// accessing transaction state, preserving their write-through contracts. Deferred writes
+/// use the same transaction state. Snapshot reads are stateless and skip the queue.
+private final class GlobalSettingsPersistence: @unchecked Sendable {
+    let fileStore: GlobalSettingsFileStoring
+    private let queue = DispatchQueue(label: "com.repoprompt.settings.profile-saves", qos: .userInitiated)
+
+    init(fileStore: GlobalSettingsFileStoring) {
+        self.fileStore = fileStore
+    }
+
+    @MainActor
+    func enqueueSave(
+        _ document: GlobalSettingsDocument,
+        completion: @escaping @MainActor @Sendable (GlobalSettingsPersistenceBlockReason?) -> Void
+    ) {
+        queue.async { [self] in
+            do {
+                try fileStore.save(document)
+            } catch {
+                print("⚠️ Failed to save global settings JSON at \(fileStore.fileURL.path): \(error)")
+            }
+            let blockReason = fileStore.blockReason
+            DispatchQueue.main.async { completion(blockReason) }
+        }
+    }
+
+    @MainActor
+    func waitForSaves() {
+        queue.sync {}
+    }
+
+    @MainActor
+    func drain() async {
+        await withCheckedContinuation { continuation in
+            queue.async { continuation.resume() }
         }
     }
 }

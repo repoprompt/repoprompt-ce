@@ -798,7 +798,7 @@ extension AgentSessionLinkExecutionRuntime {
         // qualified join remains transient local-display input: it does not enter prompt context,
         // rendering, receipts, or any lookup after this claim is constructed.
         var locationLabelsByReference: [DomainAgentSessionLinkReference: String] = [:]
-        if let props = displayProps?(context.epoch.endpoint),
+        if let props = scope?.presentation.monitorPropsByEndpoint[context.epoch.endpoint],
            props.endpoint == context.epoch.endpoint
         {
             for row in props.outbound {

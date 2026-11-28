@@ -135,6 +135,7 @@ final class AgentRepromptSettingsTests: XCTestCase {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
         let store = GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: root.appendingPathComponent("settings.json")))
+        addTeardownBlock { await store.settleDeferredProfileSavesForTermination() }
         let keys = KeyManager(secureService: SecureKeysService(secureStorage: TestSecureStorageBackend()))
         return (store, APISettingsViewModel(aiQueriesService: AIQueriesService(keyManager: keys), keyManager: keys, loadStoredDataOnInit: false))
     }

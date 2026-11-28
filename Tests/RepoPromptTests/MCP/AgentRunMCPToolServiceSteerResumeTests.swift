@@ -912,6 +912,37 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         )
     }
 
+    func testReadOnlySubscriptionSessionRefusesMCPInputAndActivationButAllowsPoll() async throws {
+        let window = try await makeWindow()
+        let sessionID = UUID()
+        let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
+        session.subscriptionAccountBinding = .detached
+        let before = session.mcpControlActivationGeneration
+        let run = makeService(window: window, requestedTabID: session.tabID)
+        let manage = makeManageService(window: window)
+        let target: Value = .string(sessionID.uuidString)
+        _ = try await run.execute(args: ["op": .string("poll"), "session_id": target])
+        for operation in ["start", "steer", "resume_session"] {
+            do {
+                switch operation {
+                case "start":
+                    _ = try await run.execute(args: ["op": .string(operation), "message": .string("task")])
+                case "steer":
+                    _ = try await run.execute(args: ["op": .string(operation), "session_id": target, "message": .string("task")])
+                default:
+                    _ = try await manage.execute(args: ["op": .string(operation), "session_id": target])
+                }
+                XCTFail("MCP must refuse \(operation) for a read-only subscription session")
+            } catch {
+                XCTAssertTrue(String(describing: error).contains(AgentSessionSubscriptionBinding.notRunnableMessage))
+            }
+        }
+        XCTAssertEqual(session.mcpControlActivationGeneration, before)
+        XCTAssertNil(session.mcpControlContext)
+        XCTAssertFalse(session.mcpFollowUpRunPending)
+        XCTAssertTrue(session.items.isEmpty)
+    }
+
     func testLinkedResidentResumeAndExistingTabStartRefuseBeforeActivation() async throws {
         let window = try await makeWindow()
         let sessionID = UUID()

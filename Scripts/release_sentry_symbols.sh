@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 # Shared deterministic Sentry debug-symbol policy for public release lanes.
 
+# Each pair names a dSYM and its executable path relative to the app's Contents.
+configure_release_sentry_symbol_mappings() {
+    local app_name="$1"
+    RELEASE_SENTRY_SYMBOL_MAPPINGS=(
+        "$app_name.dSYM" "MacOS/$app_name"
+        "repoprompt-mcp.dSYM" "MacOS/repoprompt-mcp"
+        "Sparkle.framework.dSYM" "Frameworks/Sparkle.framework/Versions/B/Sparkle"
+    )
+}
+
 release_sentry_symbols_fail() {
     printf 'ERROR: %s\n' "$*" >&2
     return 1
@@ -29,13 +39,13 @@ require_release_sentry_symbols_when_enabled() {
     [[ -z "$nested_symlink" ]] ||
         release_sentry_symbols_fail "Sentry debug symbols must not contain symlinks: $nested_symlink" || return 1
 
-    local dsym_name executable_name dsym_dir dwarf_payload
+    local dsym_name executable_path dsym_dir dwarf_payload
     while (( $# > 0 )); do
         dsym_name="$1"
-        executable_name="$2"
+        executable_path="$2"
         shift 2
         dsym_dir="$symbols_dir/$dsym_name"
-        dwarf_payload="$dsym_dir/Contents/Resources/DWARF/$executable_name"
+        dwarf_payload="$dsym_dir/Contents/Resources/DWARF/${executable_path##*/}"
         [[ -d "$dsym_dir" && ! -L "$dsym_dir" ]] ||
             release_sentry_symbols_fail "Sentry-enabled release staging is missing required debug symbols: $dsym_dir" ||
             return 1
@@ -89,28 +99,27 @@ verify_release_sentry_symbol_uuids_before_signing() {
     shift 2
     release_sentry_linking_enabled || return 0
     require_release_sentry_symbols_when_enabled "$symbols_dir" "$@" || return 1
-    require_release_sentry_symbol_mappings "$@" || return 1
 
     local dwarfdump_bin="${REPOPROMPT_DWARFDUMP_BIN:-dwarfdump}"
     command -v "$dwarfdump_bin" >/dev/null 2>&1 ||
         release_sentry_symbols_fail "Missing required command: $dwarfdump_bin" || return 1
 
-    local dsym_name executable_name dwarf_payload staged_executable symbol_uuids executable_uuids
+    local dsym_name executable_path dwarf_payload staged_executable symbol_uuids executable_uuids
     while (( $# > 0 )); do
         dsym_name="$1"
-        executable_name="$2"
+        executable_path="$2"
         shift 2
-        dwarf_payload="$symbols_dir/$dsym_name/Contents/Resources/DWARF/$executable_name"
-        staged_executable="$app_bundle/Contents/MacOS/$executable_name"
+        dwarf_payload="$symbols_dir/$dsym_name/Contents/Resources/DWARF/${executable_path##*/}"
+        staged_executable="$app_bundle/Contents/$executable_path"
         [[ -f "$staged_executable" && ! -L "$staged_executable" ]] ||
-            release_sentry_symbols_fail "Missing staged executable for Sentry UUID validation: $executable_name" ||
+            release_sentry_symbols_fail "Missing staged executable for Sentry UUID validation: $executable_path" ||
             return 1
         symbol_uuids="$(release_sentry_uuid_set "$dwarfdump_bin" "$dwarf_payload" "$dsym_name payload")" ||
             return 1
-        executable_uuids="$(release_sentry_uuid_set "$dwarfdump_bin" "$staged_executable" "$executable_name executable")" ||
+        executable_uuids="$(release_sentry_uuid_set "$dwarfdump_bin" "$staged_executable" "$executable_path executable")" ||
             return 1
         [[ "$symbol_uuids" == "$executable_uuids" ]] ||
-            release_sentry_symbols_fail "Sentry dSYM UUIDs do not match staged executable: $dsym_name -> $executable_name" ||
+            release_sentry_symbols_fail "Sentry dSYM UUIDs do not match staged executable: $dsym_name -> $executable_path" ||
             return 1
     done
 }

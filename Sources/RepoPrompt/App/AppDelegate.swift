@@ -3,6 +3,7 @@ import Combine
 import Darwin
 import Logging
 import RepoPromptProcess
+import RepoPromptSettingsCore
 import Sparkle
 import SwiftUI
 
@@ -283,6 +284,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         // This stops SwiftUI from trying to update views with deallocated objects
         // during the shutdown sequence (fixes EXC_BAD_ACCESS in ObservationRegistrar).
         WindowStatesManager.shared.signalTermination()
+        GlobalSettingsStore.shared.freezeDeferredProfileSavesForTermination()
         ProcessTermination.beginAppTerminationFastPath()
         MCPBackgroundModeCoordinator.shared.resetForTermination()
         // Synchronous oversight freeze, before any async teardown can run: quitting closes every
@@ -293,6 +295,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     }
 
     private func prepareForTermination() async {
+        async let profileSaveSettlement: Void = GlobalSettingsStore.shared.settleDeferredProfileSavesForTermination()
         if !AppLaunchConfiguration.current.suppressesWindowPersistence {
             await WindowStatesManager.shared.persistWindowSessionImmediately(reason: "appShouldTerminate")
         }
@@ -324,6 +327,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         await shutdownDomainRuntimeForTermination()
         guard !Task.isCancelled else { return }
         await NotificationService.shared.prepareForTermination()
+        await profileSaveSettlement
     }
 
     func applicationWillTerminate(_ notification: Notification) {

@@ -1,11 +1,17 @@
 {
   "schemaVersion": 2,
   "channel": "stable",
-  "currentRole": "transition",
+  "currentRole": "successor",
   "eligibilityProfile": "stable-shared-tip-preparer-v1",
   "expectedMigrationPhase": "disabled",
   "expectedSigningIdentity": "successor",
   "predecessors": [
+    {
+      "role": "transition",
+      "tag": "v1.10.0",
+      "rolloutManifestSha256": "c55e018ec0ecb8de496b11ce0b2d19484b1272ebcb8e0b5885704aa799f668f5",
+      "sourceChannel": "stable"
+    },
     {
       "role": "preparer",
       "tag": "tip-1e1d9fe4bbc6",

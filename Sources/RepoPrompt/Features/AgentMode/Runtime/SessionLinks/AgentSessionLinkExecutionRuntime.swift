@@ -63,8 +63,6 @@ final class AgentSessionLinkExecutionRuntime {
     weak var codexCoordinator: CodexAgentModeCoordinator?
     /// Required host-owned drain probe. Absence blocks terminal dispatch.
     var activeMCPToolProbe: (@MainActor (UUID) -> Bool)?
-    /// Display labels are optional and never participate in authority or receipt qualification.
-    var displayProps: (@MainActor (DomainAgentSessionLinkEndpointIdentity) -> AgentMonitorPillProps?)?
 
     init(scope: AgentSessionRuntimeStore.Scope, routeID: Int, commands: Commands, diagnostics: any AgentSessionLinkCatalogEventSink) {
         self.scope = scope
@@ -80,8 +78,6 @@ final class AgentSessionLinkExecutionRuntime {
     var agentSessionLinkPromptInventoryBySessionID: [UUID: AgentSessionLinkPublishedPromptInventory] = [:]
     var agentSessionLinkRunCatalogProjectionByEndpoint: [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkRunCatalogProjection] = [:]
     var agentSessionLinkPromptInventoryHoldsByEndpoint: [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkPromptInventoryHold] = [:]
-    // Only the exact published endpoint can provide resident poll counts without a presenter.
-    var residentMonitorPropsBySessionID: [UUID: AgentMonitorPillProps] = [:]
     var agentSessionLinkNextPromptInventoryHoldToken: UInt64 = 0
     var agentSessionLinkPassiveNoticesBySessionID: [UUID: AgentSessionLinkPassiveStatusNotices.Snapshot] = [:]
     let agentSessionLinkPromptClaimStore = AgentSessionLinkOutboundPromptClaimStore()
@@ -133,6 +129,22 @@ final class AgentSessionLinkExecutionRuntime {
               agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint
         else { return nil }
         return try? writer.admitCommand().get()
+    }
+
+    func publishMonitorProjection(
+        _ props: AgentMonitorPillProps, to endpoint: DomainAgentSessionLinkEndpointIdentity
+    ) {
+        guard let scope, props.endpoint == endpoint,
+              agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+              let session = scope.sessions[endpoint.tabID],
+              scope.presentation.storeMonitorProjection(props, for: endpoint)
+        else { return }
+        scope.presentation.oversightProjectionChanged(session)
+    }
+
+    func prepareForLinkActivation(_ endpoint: DomainAgentSessionLinkEndpointIdentity) async {
+        guard admit(endpoint: endpoint) != nil else { return }
+        await codexCoordinator?.awaitCodexComputerUseRetirement(for: endpoint.tabID)
     }
 
     func hasCurrentRunCatalogRouteTokenInCurrentMCPServer(_ token: AgentSessionLinkRunCatalogRouteToken, tabID: UUID) -> Bool {

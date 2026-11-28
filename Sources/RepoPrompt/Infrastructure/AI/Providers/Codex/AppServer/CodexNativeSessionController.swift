@@ -752,6 +752,7 @@ final class CodexNativeSessionController {
         var approvalPolicyProvider: () -> CodexAgentToolPreferences.ApprovalPolicy
         var sandboxModeProvider: () -> CodexAgentToolPreferences.SandboxMode
         var approvalReviewerProvider: () -> CodexAgentToolPreferences.ApprovalReviewer = { CodexAgentToolPreferences.approvalReviewer() }
+        var userConfiguredPermissionReader: CodexAgentToolPreferences.SecurePermissionReader?
         var authTokensRefreshHandler: ChatgptAuthTokensRefreshHandler?
         /// Process-level reasoning summary override for app-server launch.
         /// Nil preserves Codex process defaults; non-nil values are explicit process overrides.
@@ -798,7 +799,9 @@ final class CodexNativeSessionController {
             computerUseEnabledProvider: @escaping @MainActor () -> Bool = { false },
             computerUseClientPathProvider: @escaping () -> String? = { CodexNativeSessionController.computerUseClientPath() },
             mcpServerEntriesProvider: @escaping () -> [MCPIntegrationHelper.CodexServerEntry] = { MCPIntegrationHelper.codexMCPServerEntries() },
-            contextWindowSelection: CodexContextWindowPreferences.Selection = .codexDefault
+            contextWindowSelection: CodexContextWindowPreferences.Selection = .codexDefault,
+            permissionReader: CodexAgentToolPreferences.SecurePermissionReader = .init(),
+            readsUserConfiguredRequestPermissions: Bool = false
         ) -> Options {
             Options(
                 requestTimeout: 120,
@@ -812,6 +815,8 @@ final class CodexNativeSessionController {
                             computerUseEnabled: computerUseEnabledProvider()
                         )
                     }
+                    let entries = mcpServerEntriesProvider()
+                    let permissions = await permissionReader.snapshot(for: entries)
                     return CodexNativeSessionController.defaultAppServerConfigOverrides(
                         shellToolEnabled: shellToolEnabled,
                         suppressThirdPartyMCPServers: suppressThirdPartyMCPServers,
@@ -821,13 +826,15 @@ final class CodexNativeSessionController {
                         memoriesEnabled: featurePolicy.memoriesEnabled,
                         computerUseEnabled: featurePolicy.computerUseEnabled,
                         computerUseClientPath: computerUseClientPathProvider(),
-                        serverEntries: mcpServerEntriesProvider(),
-                        contextWindowSelection: contextWindowSelection
+                        serverEntries: entries,
+                        contextWindowSelection: contextWindowSelection,
+                        permissionSnapshot: permissions
                     )
                 },
                 approvalPolicyProvider: approvalPolicyProvider,
                 sandboxModeProvider: sandboxModeProvider,
                 approvalReviewerProvider: approvalReviewerProvider,
+                userConfiguredPermissionReader: readsUserConfiguredRequestPermissions ? permissionReader : nil,
                 authTokensRefreshHandler: nil,
                 processModelReasoningSummary: nil,
                 capabilitiesProvider: capabilitiesProvider,
@@ -1174,9 +1181,11 @@ final class CodexNativeSessionController {
     ) async throws -> [String: Any] {
         let attemptedStyle = appServerRequestValueStyle
         do {
+            let params = await paramsBuilder(attemptedStyle)
+            try Task.checkCancellation()
             return try await performRequest(
                 method: method,
-                params: paramsBuilder(attemptedStyle),
+                params: params,
                 timeout: timeout,
                 useDefaultTimeout: useDefaultTimeout
             )
@@ -1188,9 +1197,11 @@ final class CodexNativeSessionController {
             Self.logCodexDebug(
                 "[CodexNativeController] retrying \(method) with alternate request value style=\(String(describing: fallbackStyle)) after error=\(error.localizedDescription)"
             )
+            let params = await paramsBuilder(fallbackStyle)
+            try Task.checkCancellation()
             let result = try await performRequest(
                 method: method,
-                params: paramsBuilder(fallbackStyle),
+                params: params,
                 timeout: timeout,
                 useDefaultTimeout: useDefaultTimeout
             )
@@ -1975,9 +1986,10 @@ final class CodexNativeSessionController {
                 timeout: timeout
             ) { requestValueStyle in
                 var requestParams = params
-                requestParams["approvalPolicy"] = effectiveApprovalPolicy.appServerRequestValue(style: requestValueStyle)
-                requestParams["sandbox"] = options.sandboxModeProvider().appServerRequestValue(style: requestValueStyle)
-                requestParams["approvalsReviewer"] = effectiveApprovalReviewer.appServerRequestValue
+                let permissions = await requestPermissions()
+                requestParams["approvalPolicy"] = permissions.approvalPolicy.appServerRequestValue(style: requestValueStyle)
+                requestParams["sandbox"] = permissions.sandboxMode.appServerRequestValue(style: requestValueStyle)
+                requestParams["approvalsReviewer"] = permissions.approvalReviewer.appServerRequestValue
                 return requestParams
             }
             try Task.checkCancellation()
@@ -2026,9 +2038,10 @@ final class CodexNativeSessionController {
             timeout: timeout
         ) { requestValueStyle in
             var requestParams = params
-            requestParams["approvalPolicy"] = effectiveApprovalPolicy.appServerRequestValue(style: requestValueStyle)
-            requestParams["sandbox"] = options.sandboxModeProvider().appServerRequestValue(style: requestValueStyle)
-            requestParams["approvalsReviewer"] = effectiveApprovalReviewer.appServerRequestValue
+            let permissions = await requestPermissions()
+            requestParams["approvalPolicy"] = permissions.approvalPolicy.appServerRequestValue(style: requestValueStyle)
+            requestParams["sandbox"] = permissions.sandboxMode.appServerRequestValue(style: requestValueStyle)
+            requestParams["approvalsReviewer"] = permissions.approvalReviewer.appServerRequestValue
             return requestParams
         }
     }
@@ -2531,7 +2544,6 @@ final class CodexNativeSessionController {
         #if DEBUG
             print("[CodexNativeSessionController] turn/start request model=\(String(describing: params["model"] ?? "default")) effort=\(String(describing: params["effort"] ?? "default")) serviceTier=\(String(describing: params["serviceTier"] ?? "missing")) threadID=\(threadID)")
         #endif
-        let sandboxMode = options.sandboxModeProvider()
         #if DEBUG
             let turnAcceptanceStartMS = perfRecorder.timestampMSIfEnabled()
         #endif
@@ -2543,10 +2555,11 @@ final class CodexNativeSessionController {
                 useDefaultTimeout: false
             ) { requestValueStyle in
                 var requestParams = params
-                requestParams["approvalPolicy"] = effectiveApprovalPolicy.appServerRequestValue(style: requestValueStyle)
-                requestParams["approvalsReviewer"] = effectiveApprovalReviewer.appServerRequestValue
+                let permissions = await requestPermissions()
+                requestParams["approvalPolicy"] = permissions.approvalPolicy.appServerRequestValue(style: requestValueStyle)
+                requestParams["approvalsReviewer"] = permissions.approvalReviewer.appServerRequestValue
                 requestParams["sandboxPolicy"] = Self.appServerTurnSandboxPolicyPayload(
-                    mode: sandboxMode,
+                    mode: permissions.sandboxMode,
                     executionDirectory: workspacePaths.executionDirectory
                 )
                 // app-server v2 turn/start does not accept a config override bag.
@@ -3421,12 +3434,25 @@ final class CodexNativeSessionController {
 
     private func runtimeConfigOverrides() async throws -> [String: Any] {
         let overrides = await options.configOverridesProvider()
+        try Task.checkCancellation()
         return try Self.computerUseRuntimeConfigOverrides(
             overrides,
             computerUseEnabled: computerUseRequiresUserReview,
             acceptedClientPath: computerUseAcceptedClientPath,
             effectiveServerNames: effectiveComputerUseServerNames
         )
+    }
+
+    private func requestPermissions() async -> CodexAgentToolPreferences.RequestPermissions {
+        if let reader = options.userConfiguredPermissionReader {
+            let permissions = await reader.requestPermissions()
+            return (
+                computerUseRequiresUserReview ? .onRequest : permissions.approvalPolicy,
+                permissions.sandboxMode,
+                computerUseRequiresUserReview ? .user : permissions.approvalReviewer
+            )
+        }
+        return (effectiveApprovalPolicy, options.sandboxModeProvider(), effectiveApprovalReviewer)
     }
 
     private var effectiveApprovalPolicy: CodexAgentToolPreferences.ApprovalPolicy {
@@ -9846,16 +9872,17 @@ final class CodexNativeSessionController {
         computerUseEnabled: Bool = false,
         computerUseClientPath: String? = computerUseClientPath(),
         serverEntries: [MCPIntegrationHelper.CodexServerEntry] = MCPIntegrationHelper.codexMCPServerEntries(),
-        contextWindowSelection: CodexContextWindowPreferences.Selection = .codexDefault
+        contextWindowSelection: CodexContextWindowPreferences.Selection = .codexDefault,
+        permissionSnapshot: CodexAgentToolPreferences.Snapshot? = nil
     ) -> [String: Any] {
         let readyComputerUse = computerUseEnabled && computerUseClientPath != nil && !hasReservedComputerUseEntry(serverEntries)
-        let preferences = CodexAgentToolPreferences.snapshot(for: serverEntries)
+        let permissions = permissionSnapshot ?? CodexAgentToolPreferences.snapshot(for: serverEntries)
         let modelReasoningSummary = reasoningSummariesEnabled.map {
             $0 ? CodexOverrides.ReasoningSummary.auto : .none
         }
         let toolPolicy = defaultAppServerToolPolicy(
-            shellToolEnabled: shellToolEnabled ?? preferences.bashToolEnabled,
-            webSearchRequestEnabled: preferences.searchToolEnabled,
+            shellToolEnabled: shellToolEnabled ?? permissions.bashToolEnabled,
+            webSearchRequestEnabled: permissions.searchToolEnabled,
             modelReasoningSummary: modelReasoningSummary
         )
         var overrides = CodexOverrides.appServerConfigMap(
@@ -9872,7 +9899,7 @@ final class CodexNativeSessionController {
         }
         let mcpOverrides = appServerMCPServerOverrides(
             serverEntries: serverEntries,
-            enabledMCPServerNames: preferences.enabledMCPServerNames,
+            enabledMCPServerNames: permissions.enabledMCPServerNames,
             suppressThirdPartyMCPServers: suppressThirdPartyMCPServers,
             computerUseEnabled: readyComputerUse,
             computerUseClientPath: computerUseClientPath

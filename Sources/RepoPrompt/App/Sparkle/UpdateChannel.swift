@@ -74,6 +74,30 @@ final class SparkleUpdateFeedDelegate: NSObject, SPUUpdaterDelegate {
         UpdateChannel.load().feedURLString
     }
 
+    /// Once this install runs the successor identity, the identity-transition
+    /// package is never selected again; Sparkle keeps its default choice for
+    /// feeds without a privileged installer item.
+    func bestValidUpdate(in appcast: SUAppcast, for updater: SPUUpdater) -> SUAppcastItem? {
+        let host = updater.hostBundle
+        guard IdentityTransitionUpdatePolicy.hasCompletedIdentityTransition(
+            bundleIdentifier: host.bundleIdentifier
+        ) else { return nil }
+        switch IdentityTransitionUpdatePolicy.successorSelection(
+            from: appcast.items,
+            currentBuild: host.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
+            installationType: \.installationType,
+            buildVersion: \.versionString,
+            meetsMinimumUpdateVersion: \.minimumUpdateVersionIsOK
+        ) {
+        case .sparkleDefault:
+            return nil
+        case .noUpdate:
+            return SUAppcastItem.empty()
+        case let .item(item):
+            return item
+        }
+    }
+
     func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) {
         record(stage: "update-found", outcome: .succeeded, item: item)
     }

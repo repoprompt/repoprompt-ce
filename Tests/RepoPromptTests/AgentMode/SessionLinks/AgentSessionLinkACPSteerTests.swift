@@ -300,7 +300,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         let message = request("Keep the parser fix & skip the rest.")
         let outcome = await steer(fixture, request: message)
         guard case let .delivered(delivery) = outcome else { return XCTFail("Expected delivery: \(outcome)") }
-        XCTAssertEqual(delivery.deliveryState, .steered)
+        XCTAssertEqual(delivery.deliveryState, .providerPromptWritten)
         let envelope = AgentSessionLinkMessageEnvelope.render(
             sourceSessionID: message.observerSessionID, sourceName: message.observerDisplayName,
             linkID: message.linkID, linkGeneration: message.linkGeneration,
@@ -313,11 +313,12 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         XCTAssertEqual(row.crossSessionAttribution, message.attribution)
     }
 
-    func testWrittenACPPromptErrorIsUnconfirmedRatherThanRetried() async throws {
+    func testWrittenACPPromptReceiptSurvivesProviderErrorWithoutReplay() async throws {
         let fixture = try await makeFixture(failPromptsContaining: "REFUSE_THIS_STEER")
         let message = request("REFUSE_THIS_STEER")
         let outcome = await steer(fixture, request: message)
-        XCTAssertEqual(outcome, .blocked(.steerUnconfirmed))
+        guard case let .delivered(receipt) = outcome else { return XCTFail("Expected the physical write receipt") }
+        XCTAssertEqual(receipt.deliveryState, .providerPromptWritten)
         XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
         XCTAssertTrue(fixture.session.items.contains { $0.text == message.message })
     }
@@ -334,7 +335,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         fixture.session.pendingACPSteeringInstructions.append(local)
         let outcome = await steer(fixture, request: request("managed direction"))
         guard case let .delivered(delivery) = outcome else { return XCTFail("Expected delivery: \(outcome)") }
-        XCTAssertEqual(delivery.deliveryState, .steered)
+        XCTAssertEqual(delivery.deliveryState, .providerPromptWritten)
         let sent = try XCTUnwrap(fixture.provider.promptedMessages.last?.userMessage)
         XCTAssertTrue(sent.contains("local direction"))
         XCTAssertTrue(sent.contains("managed direction"))
@@ -1102,13 +1103,20 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         fixture.session.pendingACPSteeringInstructions = [local]
         fixture.session.pendingNonCodexUserInputTokenQueue = [11]
         let message = request("in-flight managed direction")
-        let steering = Task { await self.steer(fixture, request: message) }
+        let receiptReady = expectation(description: "transport receipt before provider completion")
+        let steering = Task {
+            let outcome = await self.steer(fixture, request: message)
+            receiptReady.fulfill()
+            return outcome
+        }
         try await XCTUnwrap(fixture.promptGate).waitUntilEntered()
+        await fulfillment(of: [receiptReady], timeout: 3)
         XCTAssertTrue(fixture.session.pendingACPSteeringInstructions.isEmpty)
         let managedRow = try XCTUnwrap(fixture.session.items.first { $0.text == message.message })
         await fixture.viewModel.cancelAgentRun(tabID: fixture.session.tabID, completion: .terminalTeardownCompleted)
         let outcome = await steering.value
-        XCTAssertEqual(outcome, .blocked(.steerUnconfirmed))
+        guard case let .delivered(receipt) = outcome else { return XCTFail("Expected the physical write receipt") }
+        XCTAssertEqual(receipt.deliveryState, .providerPromptWritten)
         XCTAssertEqual(fixture.viewModel.draftRuntime.text(for: fixture.session.tabID), "still typing")
         XCTAssertTrue(fixture.session.items.contains { $0.id == local.optimisticUserItemID })
         XCTAssertTrue(fixture.session.items.contains { $0.id == managedRow.id })
@@ -1226,7 +1234,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         guard case let .delivered(firstDelivery) = firstOutcome else {
             return XCTFail("Expected first managed steer delivery: \(firstOutcome)")
         }
-        XCTAssertEqual(firstDelivery.deliveryState, .steered)
+        XCTAssertEqual(firstDelivery.deliveryState, .providerPromptWritten)
         let firstEnvelope = AgentSessionLinkMessageEnvelope.render(
             sourceSessionID: first.observerSessionID, sourceName: first.observerDisplayName,
             linkID: first.linkID, linkGeneration: first.linkGeneration,
@@ -1246,7 +1254,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         guard case let .delivered(secondDelivery) = secondOutcome else {
             return XCTFail("Expected second managed steer delivery: \(secondOutcome)")
         }
-        XCTAssertEqual(secondDelivery.deliveryState, .steered)
+        XCTAssertEqual(secondDelivery.deliveryState, .providerPromptWritten)
         let secondEnvelope = AgentSessionLinkMessageEnvelope.render(
             sourceSessionID: second.observerSessionID, sourceName: second.observerDisplayName,
             linkID: second.linkID, linkGeneration: second.linkGeneration,

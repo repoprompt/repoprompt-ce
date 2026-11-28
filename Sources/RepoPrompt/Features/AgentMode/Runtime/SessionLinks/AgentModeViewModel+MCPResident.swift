@@ -109,6 +109,7 @@ extension AgentModeViewModel {
         guard mcpActivationTargetIsCurrent(target, ownership: ownership) else {
             throw MCPError.invalidParams(Self.mcpResidentTargetError)
         }
+        try Self.requireSubscriptionAccountAdmission(target.session)
         try linkExecutionRuntime.mcpRequireResidentLinkFence(target.endpoint, authoritativeHasLinks: authoritativeHasLinks)
     }
 
@@ -123,6 +124,14 @@ extension AgentModeViewModel {
         } else if Self.isMCPResidentAppOwned(session) {
             // A previously non-app-owned admission cannot silently capture its new owner.
             throw MCPError.invalidParams(Self.mcpResidentTargetError)
+        }
+    }
+
+    /// Resolving the session does not grant use of its subscription account.
+    /// Status and transcript reads retain their existing authorization.
+    private static func requireSubscriptionAccountAdmission(_ session: TabSession) throws {
+        guard !session.subscriptionAccountBinding.blocksProviderOperations else {
+            throw MCPError.invalidParams(AgentSessionSubscriptionBinding.notRunnableMessage)
         }
     }
 
@@ -269,6 +278,7 @@ extension AgentModeViewModel {
         guard targetIsCurrent() else {
             throw MCPError.invalidParams(Self.mcpResidentTargetError)
         }
+        try Self.requireSubscriptionAccountAdmission(session)
         let protectedPrompt = session.pendingApplyEditsReview != nil || session.pendingWorktreeMergeReview != nil
             || mcpRuntime.mcpPendingInteraction(for: session).map { $0.kind != .instruction } == true
         guard !protectedPrompt else { throw MCPError.invalidParams(Self.mcpResidentProtectedError) }
