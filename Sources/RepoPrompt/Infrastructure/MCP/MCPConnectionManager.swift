@@ -15757,14 +15757,10 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         var authorizedCanonicalRoots: Set<String> = []
         if let registration {
             do {
-                let handle = try await runtime.routingCoordinator.resolveReadContext(connection: registration)
-                guard let workspace = await runtime.contextStore.workspaceSnapshot(handle.context.workspaceID) else {
-                    hasAuthoritativeRoutingContext = false
-                    throw DomainReadContextResolutionError.contextUnavailable
-                }
-                workspaceID = handle.context.workspaceID
-                workspaceRevision = handle.workspaceRevision
-                authorizedCanonicalRoots = Set(workspace.document.metadata.repoPaths.compactMap {
+                let resolved = try await runtime.routingCoordinator.resolveReadContextWithWorkspace(connection: registration)
+                workspaceID = resolved.handle.context.workspaceID
+                workspaceRevision = resolved.handle.workspaceRevision
+                authorizedCanonicalRoots = Set(resolved.workspace.document.metadata.canonicalLoadableRepoPaths.compactMap {
                     DomainMutationPathFence.canonicalPath($0)
                 })
             } catch {

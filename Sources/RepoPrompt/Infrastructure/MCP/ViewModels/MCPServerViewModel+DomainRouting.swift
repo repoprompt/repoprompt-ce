@@ -63,11 +63,12 @@ extension MCPServerViewModel {
     ) -> Bool {
         switch (requestedRunID, resolvedBindingKind) {
         case let (.some(requestedRunID), .runScoped(actualRunID)),
+             let (.some(requestedRunID), .canonicalRunScoped(actualRunID)),
              let (.some(requestedRunID), .savedRunScoped(actualRunID, _)):
             requestedRunID == actualRunID
         case (.some, _):
             false
-        case (nil, .runScoped), (nil, .savedRunScoped):
+        case (nil, .runScoped), (nil, .canonicalRunScoped), (nil, .savedRunScoped):
             false
         case (nil, _):
             true

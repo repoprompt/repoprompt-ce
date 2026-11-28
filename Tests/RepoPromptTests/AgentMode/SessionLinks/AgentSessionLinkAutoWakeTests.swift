@@ -2731,7 +2731,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         let registration = try XCTUnwrap(routing.connections.first { $0.registration.connectionID == connection }?.registration)
         let routed = try await coordinator.resolveReadContext(connection: registration)
         XCTAssertEqual(routed.context, DomainContextIdentity(workspaceID: f.endpoint.workspaceID, contextID: session.tabID))
-        XCTAssertEqual(routed.bindingKind, .runScoped(runID: runID))
+        XCTAssertEqual(routed.bindingKind, .canonicalRunScoped(runID: runID))
 
         let staleRollback = route.rollbackPendingPolicy(original, token: installed.token, clientName: clientName)
         XCTAssertEqual(staleRollback, .supersededBySameConnection)
@@ -2741,7 +2741,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         let otherRegistration = try XCTUnwrap(routing.connections.first { $0.registration.connectionID == secondConnection }?.registration)
         let otherContext = try await coordinator.resolveReadContext(connection: otherRegistration)
         XCTAssertEqual(otherContext.context, DomainContextIdentity(workspaceID: f.endpoint.workspaceID, contextID: secondTabID))
-        XCTAssertEqual(otherContext.bindingKind, .runScoped(runID: secondRunID))
+        XCTAssertEqual(otherContext.bindingKind, .canonicalRunScoped(runID: secondRunID))
 
         let current = await authority.canonicalWorkspaceSnapshot(f.endpoint.workspaceID)
         let snapshot = try XCTUnwrap(current)

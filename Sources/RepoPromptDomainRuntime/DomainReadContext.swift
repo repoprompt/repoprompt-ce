@@ -4,6 +4,7 @@ package enum DomainReadBindingKind: Hashable, Sendable {
     case explicit
     case appPresentation
     case runScoped(runID: UUID)
+    case canonicalRunScoped(runID: UUID)
     case savedRunScoped(runID: UUID, sessionID: UUID)
 }
 

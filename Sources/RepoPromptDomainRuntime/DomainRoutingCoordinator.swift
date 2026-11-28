@@ -273,6 +273,12 @@ package actor DomainRoutingCoordinator {
     package func resolveReadContext(
         connection registration: DomainConnectionRegistration
     ) async throws -> DomainReadContextHandle {
+        try await resolveReadContextWithWorkspace(connection: registration).handle
+    }
+
+    package func resolveReadContextWithWorkspace(
+        connection registration: DomainConnectionRegistration
+    ) async throws -> (handle: DomainReadContextHandle, workspace: DomainWorkspaceSnapshot) {
         guard registration.runtimeID == identity.runtimeID else {
             throw DomainReadContextResolutionError.runtimeGenerationMismatch
         }
@@ -304,7 +310,7 @@ package actor DomainRoutingCoordinator {
             guard !isStopped, connections[registration.connectionID] == current else {
                 throw DomainReadContextResolutionError.staleConnectionGeneration
             }
-            return DomainReadContextHandle(
+            let handle = DomainReadContextHandle(
                 runtimeID: identity.runtimeID,
                 runtimeGeneration: identity.lifecycleGeneration,
                 connectionID: registration.connectionID,
@@ -313,8 +319,9 @@ package actor DomainRoutingCoordinator {
                 workspaceRevision: resolved.workspace.revisions.workingRevision,
                 contextRevision: resolved.context.revisions.workingRevision,
                 routingRevision: revision,
-                bindingKind: .runScoped(runID: runID)
+                bindingKind: .canonicalRunScoped(runID: runID)
             )
+            return (handle, resolved.workspace)
         case let .savedRunScoped(runID, context, sessionID):
             guard let workspace = await savedCarrierWorkspace(context, sessionID: sessionID) else {
                 throw DomainReadContextResolutionError.contextUnavailable
@@ -322,13 +329,14 @@ package actor DomainRoutingCoordinator {
             guard !isStopped, connections[registration.connectionID] == current else {
                 throw DomainReadContextResolutionError.staleConnectionGeneration
             }
-            return DomainReadContextHandle(
+            let handle = DomainReadContextHandle(
                 runtimeID: identity.runtimeID, runtimeGeneration: identity.lifecycleGeneration,
                 connectionID: registration.connectionID, connectionGeneration: registration.generation,
                 context: context, workspaceRevision: workspace.revisions.workingRevision,
                 contextRevision: workspace.revisions.workingRevision, routingRevision: revision,
                 bindingKind: .savedRunScoped(runID: runID, sessionID: sessionID)
             )
+            return (handle, workspace)
         case let .appPresentationWindow(windowID):
             guard let window = windows[windowID], !window.isClosing else {
                 throw DomainReadContextResolutionError.presentationWindowUnavailable
@@ -353,7 +361,7 @@ package actor DomainRoutingCoordinator {
         if case .removed = context.health {
             throw DomainReadContextResolutionError.contextRemoved
         }
-        return DomainReadContextHandle(
+        let handle = DomainReadContextHandle(
             runtimeID: identity.runtimeID,
             runtimeGeneration: identity.lifecycleGeneration,
             connectionID: registration.connectionID,
@@ -364,6 +372,7 @@ package actor DomainRoutingCoordinator {
             routingRevision: revision,
             bindingKind: bindingKind
         )
+        return (handle, workspace)
     }
 
     private func canonicalContextSnapshot(

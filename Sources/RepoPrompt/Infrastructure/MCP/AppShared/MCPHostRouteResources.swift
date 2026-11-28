@@ -495,9 +495,13 @@ final class MCPHostRouteResources {
               connections[connectionID]?.registration == registration.registration,
               handle.context == DomainContextIdentity(workspaceID: workspaceID, contextID: context.tabID)
         else { return false }
-        let expectedBinding = context.savedCarrierSessionID.map {
-            DomainReadBindingKind.savedRunScoped(runID: receipt.runID, sessionID: $0)
-        } ?? .runScoped(runID: receipt.runID)
+        let expectedBinding: DomainReadBindingKind = if let sessionID = context.savedCarrierSessionID {
+            .savedRunScoped(runID: receipt.runID, sessionID: sessionID)
+        } else if identity.kind == .independent, isLeaseManaged {
+            .canonicalRunScoped(runID: receipt.runID)
+        } else {
+            .runScoped(runID: receipt.runID)
+        }
         return handle.bindingKind == expectedBinding
     }
 
