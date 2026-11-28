@@ -1210,7 +1210,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     nonisolated static let transcriptVisibleItemLimit = 50
     private nonisolated static let detachedTranscriptVisibleItemBuffer = 5
     private nonisolated static let detachedTranscriptEvictionChunkSize = 5
-    nonisolated static let staleComposerSubmitTargetMessage = "This composer changed before the message could be sent. Please try again."
+    nonisolated static let staleComposerSubmitTargetMessage = AgentSessionComposerSubmitRuntime.staleTargetMessage
 
     #if DEBUG
         var test_afterRebindOwnershipChecks: (@MainActor () async -> Void)?
@@ -16333,13 +16333,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // provider-facing list is consumed: prepared bytes must not be read a second time.
         let providerTaggedFiles = preparedTaggedInput == nil ? taggedFilesToSend : []
         let providerSkipsSlashExpansion = preparedTaggedInput != nil || repromptedText != nil
-        if let providerSwitchPreparation {
+        if !canonicalLocalDispatch, let providerSwitchPreparation {
             guard linkExecutionRuntime.providerSwitchPreparationIsCurrent(providerSwitchPreparation, session: session)
             else {
                 return .blocked(message: AgentSessionLinkSendFailure.providerHandoverNeedsReview.message)
             }
         }
-        if providerSwitchPreparation != nil || preparedTaggedInput != nil {
+        if !canonicalLocalDispatch, providerSwitchPreparation != nil || preparedTaggedInput != nil {
             if isLocalComposerInput {
                 if session.userWorkflowSelectionMutationGeneration == restorationSelectedWorkflowMutationGeneration {
                     session.selectedWorkflow = nil
@@ -16366,15 +16366,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         }
 
-        if session.runState.isActive,
-           session.runState != .waitingForUser
-        {
-            streamRuntime.flushPendingAssistantDelta(session)
-        }
-
-        // An accepted local or managed steer owns the boundary before its user row is published.
-        agentSelfCompactCancelForAcceptedLocalInput(session)
-        session.noteAcceptedTaskInput()
         var userItem = AgentChatItem.user(
             bubbleText,
             attachments: attachmentsToSend,
@@ -16385,49 +16376,33 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             dispatchedProviderText: managedTurn != nil || repromptedText != nil ? unexpandedWrappedText : nil
         )
         userItem.delegationDecisionBatch = delegationDecisionBatch
-        let canonicalPublication: AgentSessionComposerSubmitRuntime.CanonicalPublication?
-        let turnRuntimeAnchorRollback: AgentTurnUserAnchorRollbackState
-        let localComposerCandidate: UUID?
-        let acceptedSwitchPreparation = providerSwitchPreparation?.accepting(userItem.id, session: session)
         let registersLocalComposerOrigin = composerOrigin == .localComposer && isLocalComposerInput
             && managedTurn == nil && codexAttemptID == nil && !trimmedText.isEmpty
-        if canonicalLocalDispatch {
-            guard let originalHost = canonicalHost, let claim = providerSwitchClaim,
-                  let accepted = originalHost.scope.submissions.publishCanonicalInput(
-                      userItem, claim: claim, host: originalHost, registersLocalComposerOrigin: registersLocalComposerOrigin
-                  ) else { return .blocked(message: Self.staleComposerSubmitTargetMessage) }
-            canonicalPublication = accepted.publication
-            turnRuntimeAnchorRollback = accepted.anchorRollback
-            localComposerCandidate = accepted.localComposerCandidate
-        } else {
-            canonicalPublication = nil
-            turnRuntimeAnchorRollback = recordAgentTurnUserAnchor(for: session, userItem: userItem)
-            session.appendItem(userItem)
-            if isLocalComposerInput, managedTurn == nil, codexAttemptID == nil {
-                session.composerStartCancellation?.recordOptimisticInput(userItem.id, on: session)
-            }
-            localComposerCandidate = if registersLocalComposerOrigin, let index = session.items.indices.last {
-                session.registerLocalComposerCandidate(itemID: userItem.id, at: index)
-            } else { nil }
-        }
-        func dispatchCanonicalPreparedTurn() -> UserTurnSubmissionResult {
-            guard let claim = providerSwitchClaim, let originalHost = canonicalHost,
-                  let publication = canonicalPublication else { return .blocked(message: Self.staleComposerSubmitTargetMessage) }
-            let options = AgentDirectRunStartOptions(
-                skipsSlashExpansion: providerSkipsSlashExpansion, stopFence: stopFence,
-                localComposerCandidate: localComposerCandidate, initialUserItemID: userItem.id,
-                restorationDraftText: restorationDraftText
-            )
-            let turn = AgentSessionComposerSubmitRuntime.PreparedTurn(
-                publication: publication, message: wrappedText, attachments: attachmentsToSend,
-                taggedFiles: taggedFilesToSend, providerTaggedFiles: providerTaggedFiles,
-                userItemID: userItem.id, draftText: restorationDraftText, workflow: restorationSelectedWorkflow,
-                workflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
-                anchorRollback: turnRuntimeAnchorRollback, autoEffortSelection: autoEffortSelection,
-                options: options, providerSwitchPreparation: acceptedSwitchPreparation
-            )
-            let producer = originalHost.scope.submissions.submitCanonicalTurn(
-                turn, claim: claim, host: originalHost,
+        let steeringMessage = trimmedText.isEmpty ? nil : (repromptedText == nil ? trimmedText : unexpandedWrappedText)
+        if canonicalLocalDispatch, let originalHost = canonicalHost, let claim = providerSwitchClaim {
+            let afterRestartStop: (@MainActor () async -> Void)?
+            let attachmentRestartFinished: (@MainActor () -> Void)?
+            #if DEBUG
+                afterRestartStop = test_afterClaudeAttachmentSelfCancel
+                attachmentRestartFinished = test_claudeAttachmentRestartFinished
+            #else
+                afterRestartStop = nil
+                attachmentRestartFinished = nil
+            #endif
+            let result = originalHost.scope.submissions.acceptCanonicalInput(
+                .init(
+                    row: userItem, message: wrappedText, providerTaggedFiles: providerTaggedFiles,
+                    restorationDraftText: restorationDraftText,
+                    followUpDraftText: preparedTaggedInput == nil && repromptedText == nil ? wrappedText : restorationDraftText,
+                    steeringDraftText: repromptedText == nil ? trimmedText : restorationDraftText,
+                    workflow: restorationSelectedWorkflow, workflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
+                    autoEffortSelection: autoEffortSelection, routerAudit: routerAudit, autoEffortAudit: autoEffortAudit,
+                    repromptAudit: repromptAudit, steeringMessage: steeringMessage, skipsSlashExpansion: providerSkipsSlashExpansion,
+                    registersLocalComposerOrigin: registersLocalComposerOrigin,
+                    consumesPreparedAttachments: providerSwitchPreparation != nil || preparedTaggedInput != nil,
+                    stopFence: stopFence, providerSwitchPreparation: providerSwitchPreparation
+                ),
+                claim: claim, host: originalHost,
                 rejectedPresentation: { [weak self] message in
                     guard let self, runtimeHost === originalHost, sessions[tabID] === session else { return }
                     if currentTabID == tabID { selectedWorkflow = session.selectedWorkflow }
@@ -16437,27 +16412,30 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                             draftAtInvalidation: originalHost.scope.drafts.text(for: tabID)
                         )
                     }
-                }
+                },
+                afterAttachmentRestartStop: afterRestartStop, attachmentRestartFinished: attachmentRestartFinished
             )
-            switch producer {
-            case .queued:
-                return .submitted
-            case let .refused(recovered):
-                session.settleLocalComposerOrigin(localComposerCandidate, disposition: recovered ? .rolledBack : .retained)
-                return .blocked(
-                    message: recovered ? Self.staleComposerSubmitTargetMessage
-                        : "The input was not dispatched. Its changed transcript or composer state was retained without rollback."
-                )
+            switch result {
+            case .queued: return .submitted
+            case let .refused(message): return .blocked(message: message)
             }
         }
-        if let publication = canonicalPublication, let originalHost = canonicalHost, let claim = providerSwitchClaim,
-           publication.acceptedInputIndex == nil || !originalHost.scope.submissions.isCurrent(claim)
-           || originalHost.workspaceActivation?.isCurrent != true || !publication.command.isCurrent
-        {
-            // Synchronous publication may revoke admission. Handle its original receipt before
-            // any subsequent acceptance notifications; no provider is dispatched on this path.
-            return dispatchCanonicalPreparedTurn()
+
+        if session.runState.isActive, session.runState != .waitingForUser {
+            streamRuntime.flushPendingAssistantDelta(session)
         }
+        agentSelfCompactCancelForAcceptedLocalInput(session)
+        session.noteAcceptedTaskInput()
+        userItem.sequenceIndex = session.nextSequenceIndex
+        let acceptedSwitchPreparation = providerSwitchPreparation?.accepting(userItem.id, session: session)
+        let turnRuntimeAnchorRollback = recordAgentTurnUserAnchor(for: session, userItem: userItem)
+        session.appendItem(userItem)
+        if isLocalComposerInput, managedTurn == nil, codexAttemptID == nil {
+            session.composerStartCancellation?.recordOptimisticInput(userItem.id, on: session)
+        }
+        let localComposerCandidate: UUID? = if registersLocalComposerOrigin, let index = session.items.indices.last {
+            session.registerLocalComposerCandidate(itemID: userItem.id, at: index)
+        } else { nil }
         if managedTurn == nil, isLocalComposerInput,
            let endpoint = linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: tabID)
         {
@@ -16506,7 +16484,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         updateBindingsFromSession(session)
         persistenceRuntime.scheduleSave(for: session)
 
-        let steeringMessage = trimmedText.isEmpty ? nil : (repromptedText == nil ? trimmedText : unexpandedWrappedText)
         if session.runState == .running,
            !session.isMCPInstructionDispatchInProgress
         {
@@ -16575,7 +16552,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return .submitted
         }
 
-        if route == .codex, canonicalLocalDispatch { return dispatchCanonicalPreparedTurn() }
         if route == .codex {
             let dispatchTicket = session.codexDispatchSerialGate.issueTicket()
             let producerStopFence = stopFence ?? session.composerStartCancellation?.pendingStartFence(for: session)
@@ -16821,7 +16797,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
 
         if route == .start {
-            if canonicalLocalDispatch { return dispatchCanonicalPreparedTurn() }
             let producerStopFence = stopFence ?? session.composerStartCancellation?.pendingStartFence(for: session)
                 ?? AgentRunStartStopFence(session: session)
             let composerStart = isLocalComposerInput && managedTurn == nil && codexAttemptID == nil
@@ -16841,7 +16816,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 )
             }
         } else if case let .steer(steering) = route {
-            let accepted = submitActiveProviderSteering(
+            if runtimeHost.workspaceActivation == nil { _ = runService }
+            let accepted = linkExecutionRuntime.submitActiveProviderSteering(
                 steering,
                 session: session,
                 wrappedText: wrappedText,
@@ -16849,7 +16825,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 taggedFilesToSend: taggedFilesToSend,
                 trimmedText: repromptedText == nil ? trimmedText : restorationDraftText,
                 userItem: userItem,
-                userInputTokenEstimate: userInputTokenEstimate,
                 managedTurn: managedTurn,
                 localComposerCandidate: localComposerCandidate,
                 skipsSlashExpansion: providerSkipsSlashExpansion,
@@ -16883,71 +16858,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         attachments: [AgentFileAttachment] = []
     ) -> ActiveProviderSteeringRoute? {
         linkExecutionRuntime.inputRouting(for: session, hasImages: !attachments.isEmpty).activeSteering
-    }
-
-    private func submitActiveProviderSteering(
-        _ route: ActiveProviderSteeringRoute,
-        session: TabSession,
-        wrappedText: String,
-        attachmentsToSend: [AgentFileAttachment],
-        taggedFilesToSend: [AgentTaggedFileAttachment],
-        trimmedText: String,
-        userItem: AgentChatItem,
-        userInputTokenEstimate: Int,
-        managedTurn: AgentNoncomposerTurn? = nil,
-        localComposerCandidate: UUID? = nil,
-        skipsSlashExpansion: Bool = false,
-        providerTaggedFiles: [AgentTaggedFileAttachment]? = nil
-    ) -> Bool {
-        // Steering recovery restores a queued instruction's draft into the composer. A managed
-        // steer carries none, so a withdrawn one can never reappear as the target user's draft.
-        let restorableDraftText = managedTurn == nil ? trimmedText : ""
-        switch route {
-        case .acpPrompt:
-            // ACP live steering uses the same serialized queued-flush shape as
-            // Claude native steering. The run service waits for MCP tools to go idle,
-            // sends session/cancel, waits for the active ACP prompt to settle, then
-            // submits the steering session/prompt. Do not prompt directly here.
-            let interruptedPromptProviderText = AgentSessionLinkExecutionRuntime.interruptedACPProviderText(for: session, before: userItem)
-            let steering = TabSession.ACPSteeringInstruction(
-                id: UUID(),
-                targetRunID: session.runID,
-                targetRunAttemptID: session.activeRunAttemptID,
-                providerText: wrappedText,
-                interruptedPromptProviderText: interruptedPromptProviderText,
-                attachments: attachmentsToSend,
-                taggedFileAttachments: taggedFilesToSend,
-                draftText: restorableDraftText,
-                optimisticUserItemID: userItem.id,
-                createdAt: Date(),
-                managed: managedTurn.map {
-                    TabSession.ACPSteeringManagedContext(
-                        sink: $0.sink,
-                        attributedItemID: userItem.id,
-                        endpoint: $0.endpoint,
-                        attribution: $0.attribution
-                    )
-                },
-                skipsSlashExpansion: skipsSlashExpansion,
-                providerTaggedFileAttachments: providerTaggedFiles
-            )
-            let owner = runtimeSessionStore
-            let service = runService
-            let command = linkExecutionRuntime.instructionCommand(for: session)
-            return linkExecutionRuntime.enqueueACPSteering(
-                steering, session: session, owner: owner, service: service, localComposerCandidate: localComposerCandidate,
-                admitted: { command?.isCurrent ?? (owner.executableHost?.workspaceActivation == nil) }
-            )
-        case .claudeNativeInterrupt:
-            return runtimeSessionStore.startup.queueClaudeSteering(
-                session: session, service: runService, wrappedText: wrappedText,
-                attachments: attachmentsToSend, taggedFiles: taggedFilesToSend,
-                draftText: restorableDraftText, userItem: userItem,
-                localComposerCandidate: localComposerCandidate, skipsSlashExpansion: skipsSlashExpansion,
-                providerTaggedFiles: providerTaggedFiles,
-                accepted: { managedTurn?.sink.resolve(.delivered(.queuedInterrupt)) }
-            )
-        }
     }
 
     private struct NativeControlProgressRestoreState {
@@ -18308,7 +18218,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         func test_settleRejectedACPSteeringSubmission(
             id: UUID, session: TabSession, stopFence: AgentRunStartStopFence
         ) {
-            settleRejectedACPSteeringSubmission(id: id, session: session, stopFence: stopFence)
+            runService.settleRejectedACPSteeringSubmission(id: id, session: session, stopFence: stopFence)
         }
 
         func test_submitWaitingClaudeAttachment(

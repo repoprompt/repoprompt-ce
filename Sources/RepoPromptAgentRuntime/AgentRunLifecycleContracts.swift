@@ -104,6 +104,18 @@ package struct AgentRunProgressSignal: Equatable {
     package let kind: AgentRunLivenessSignalKind
     package let stage: AgentRunLifecycleStage
     package let retryIntent: AgentRunRetryIntent
+
+    package init(
+        ownership: AgentRunOwnership, sequence: UInt64, timestampUptimeNanoseconds: UInt64,
+        kind: AgentRunLivenessSignalKind, stage: AgentRunLifecycleStage, retryIntent: AgentRunRetryIntent
+    ) {
+        self.ownership = ownership
+        self.sequence = sequence
+        self.timestampUptimeNanoseconds = timestampUptimeNanoseconds
+        self.kind = kind
+        self.stage = stage
+        self.retryIntent = retryIntent
+    }
 }
 
 package struct AgentRunLivenessSnapshot: Equatable {

@@ -21,6 +21,70 @@ extension AgentSessionLinkExecutionRuntime {
         inputRouting(for: session, hasImages: false).managedSteering
     }
 
+    func submitActiveProviderSteering(
+        _ route: AgentSessionInputRouting.ActiveSteeringRoute,
+        session: TabSession,
+        wrappedText: String,
+        attachmentsToSend: [AgentFileAttachment],
+        taggedFilesToSend: [AgentTaggedFileAttachment],
+        trimmedText: String,
+        userItem: AgentChatItem,
+        managedTurn: AgentNoncomposerTurn? = nil,
+        localComposerCandidate: UUID? = nil,
+        skipsSlashExpansion: Bool = false,
+        providerTaggedFiles: [AgentTaggedFileAttachment]? = nil
+    ) -> Bool {
+        guard let owner = scope, owner.sessions[session.tabID] === session,
+              let service = owner.execution else { return false }
+        // Steering recovery restores a queued instruction's draft into the composer. A managed
+        // steer carries none, so a withdrawn one can never reappear as the target user's draft.
+        let restorableDraftText = managedTurn == nil ? trimmedText : ""
+        switch route {
+        case .acpPrompt:
+            // ACP live steering uses the same serialized queued-flush shape as
+            // Claude native steering. The run service waits for MCP tools to go idle,
+            // sends session/cancel, waits for the active ACP prompt to settle, then
+            // submits the steering session/prompt. Do not prompt directly here.
+            let interruptedPromptProviderText = Self.interruptedACPProviderText(for: session, before: userItem)
+            let steering = TabSession.ACPSteeringInstruction(
+                id: UUID(),
+                targetRunID: session.runID,
+                targetRunAttemptID: session.activeRunAttemptID,
+                providerText: wrappedText,
+                interruptedPromptProviderText: interruptedPromptProviderText,
+                attachments: attachmentsToSend,
+                taggedFileAttachments: taggedFilesToSend,
+                draftText: restorableDraftText,
+                optimisticUserItemID: userItem.id,
+                createdAt: Date(),
+                managed: managedTurn.map {
+                    TabSession.ACPSteeringManagedContext(
+                        sink: $0.sink,
+                        attributedItemID: userItem.id,
+                        endpoint: $0.endpoint,
+                        attribution: $0.attribution
+                    )
+                },
+                skipsSlashExpansion: skipsSlashExpansion,
+                providerTaggedFileAttachments: providerTaggedFiles
+            )
+            let command = instructionCommand(for: session)
+            return enqueueACPSteering(
+                steering, session: session, owner: owner, service: service, localComposerCandidate: localComposerCandidate,
+                admitted: { command?.isCurrent ?? (owner.executableHost?.workspaceActivation == nil) }
+            )
+        case .claudeNativeInterrupt:
+            return owner.startup.queueClaudeSteering(
+                session: session, service: service, wrappedText: wrappedText,
+                attachments: attachmentsToSend, taggedFiles: taggedFilesToSend,
+                draftText: restorableDraftText, userItem: userItem,
+                localComposerCandidate: localComposerCandidate, skipsSlashExpansion: skipsSlashExpansion,
+                providerTaggedFiles: providerTaggedFiles,
+                accepted: { managedTurn?.sink.resolve(.delivered(.queuedInterrupt)) }
+            )
+        }
+    }
+
     @discardableResult
     func submitNoncomposerSteer(
         tabID: UUID, session: TabSession, displayText: String, turn: AgentNoncomposerTurn,
@@ -76,7 +140,7 @@ extension AgentSessionLinkExecutionRuntime {
         cancelAgentSessionLinkAutoWake(for: turn.endpoint, reason: .localUserWon)
         owner.presentation.bindingChanged(session)
         owner.persistence.scheduleSave(for: session)
-        wakeManagedInputWaiters(session: session, message: displayText, environment: environment)
+        wakeInputWaiters(session: session, message: displayText, environment: environment, isManaged: true)
 
         if session.selectedAgent != .codexExec {
             let preview = AgentSessionProviderInputRuntime.renderProviderMessage(text: wrapped, attachments: [], agent: session.selectedAgent)
@@ -491,7 +555,9 @@ extension AgentSessionLinkExecutionRuntime {
         }
     }
 
-    private func wakeManagedInputWaiters(session: TabSession, message: String, environment: ManagedInputEnvironment) {
+    func wakeInputWaiters(
+        session: TabSession, message: String?, environment: ManagedInputEnvironment, isManaged: Bool
+    ) {
         guard session.runState == .running, !session.isMCPInstructionDispatchInProgress, let owner = scope else { return }
         let runID = session.runID
         let attemptID = session.activeRunAttemptID
@@ -505,18 +571,13 @@ extension AgentSessionLinkExecutionRuntime {
         {
             retainInputEffect(session: session, owner: owner) {
                 await environment.tools.wakeAgentRunWaitersOwnedByActiveRun(
-                    runID: runID, source: "managed-active-submit-parent-run", steeringMessage: message,
+                    runID: runID, source: isManaged ? "managed-active-submit-parent-run" : "manual-active-submit-parent-run", steeringMessage: message,
                     steeringOriginRunID: currentOrigin,
-                    publicationForSessionID: { id in
-                        guard let cursor = owner.mcp.waitCursor(sessionID: id),
-                              let target = owner.mcp.controlRead(sessionID: id).session,
-                              let snapshot = owner.mcp.mcpReadSnapshot(for: target) else { return nil }
-                        return (snapshot, cursor)
-                    }
+                    publicationForSessionID: { id in owner.mcp.waitPublication(sessionID: id) }
                 )
             }
         }
-        if let (snapshot, context) = owner.mcp.currentSteeringSnapshot(for: session, operation: "managed steer") {
+        if let (snapshot, context) = owner.mcp.currentSteeringSnapshot(for: session, operation: isManaged ? "managed steer" : "active composer input") {
             retainInputEffect(session: session, owner: owner) {
                 guard owner.mcp.mcpControlContextMatches(
                     tabID: session.tabID,

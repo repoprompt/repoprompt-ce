@@ -705,7 +705,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             }
             let stop = try XCTUnwrap(claim.cancellation.pendingStartFence(for: f.session))
             let item = AgentChatItem.user("Original row", sequenceIndex: f.session.nextSequenceIndex)
-            let receipt = try XCTUnwrap(submissions.captureCanonicalPublication(claim: claim, host: host, session: f.session, item: item))
+            let receipt = try XCTUnwrap(submissions.test_captureCanonicalPublication(claim: claim, host: host, session: f.session, item: item))
             let rollback = host.scope.turnTiming.recordAgentTurnUserAnchor(for: f.session, userItem: item)
             let previousObserver = f.session.onSourceItemsChanged
             f.session.onSourceItemsChanged = { session, mutation in
@@ -735,7 +735,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                 anchorRollback: rollback, autoEffortSelection: nil, options: .init(stopFence: stop),
                 providerSwitchPreparation: nil
             )
-            let submission = submissions.submitCanonicalTurn(turn, claim: claim, host: host)
+            let submission = submissions.test_submitCanonicalTurn(turn, claim: claim, host: host)
             guard case let .refused(recovered) = submission else {
                 if case let .queued(task) = submission { task.cancel()
                     _ = await task.value
@@ -752,7 +752,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             if change == "draft" { XCTAssertEqual(f.session.draftText, "Newer draft") }
             if change == "workflow" { XCTAssertEqual(f.session.selectedWorkflow, .init(builtIn: .review)) }
             let retainedDraft = f.session.draftText
-            XCTAssertFalse(submissions.rollbackCanonicalPublication(turn, claim: claim, message: "Repeated cleanup"), change)
+            XCTAssertFalse(submissions.test_rollbackCanonicalPublication(turn, claim: claim, message: "Repeated cleanup"), change)
             XCTAssertEqual(f.session.draftText, retainedDraft, change)
             submissions.release(claim)
             XCTAssertTrue(claim.cancellation.isFinalized, change)
@@ -792,22 +792,20 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             return XCTFail("Expected the local input claim")
         }
         let row = AgentChatItem.user(message, sequenceIndex: session.nextSequenceIndex)
-        let accepted = try XCTUnwrap(submissions.publishCanonicalInput(
-            row, claim: claim, host: host, registersLocalComposerOrigin: true
-        ))
-        let submission = submissions.submitCanonicalTurn(.init(
-            publication: accepted.publication, message: message, attachments: [], taggedFiles: [], providerTaggedFiles: [],
-            userItemID: row.id, draftText: message, workflow: nil, workflowMutationGeneration: nil,
-            anchorRollback: accepted.anchorRollback, autoEffortSelection: nil,
-            options: .init(localComposerCandidate: accepted.localComposerCandidate), providerSwitchPreparation: nil
+        let admission = submissions.acceptCanonicalInput(.init(
+            row: row, message: message, providerTaggedFiles: [],
+            restorationDraftText: message, followUpDraftText: message, steeringDraftText: message,
+            workflow: nil, workflowMutationGeneration: nil, autoEffortSelection: nil,
+            routerAudit: nil, autoEffortAudit: nil, repromptAudit: nil, steeringMessage: message,
+            skipsSlashExpansion: false, registersLocalComposerOrigin: true, consumesPreparedAttachments: false,
+            stopFence: nil, providerSwitchPreparation: nil
         ), claim: claim, host: host)
         submissions.release(claim)
         XCTAssertNil(session.composerStartCancellation, "Another input must be admissible while the provider queue is held")
         session.codexDispatchSerialGate.finish(ticket)
-        guard case let .queued(producer) = submission else { return XCTFail("Expected the admitted input producer") }
+        guard case .queued = admission else { return XCTFail("Expected the admitted input producer") }
+        await fixture.runtime.drainPendingInputEffects(for: session)
 
-        let outcome = await producer.value
-        XCTAssertEqual(outcome, .sent)
         XCTAssertEqual(controller.startedTurns.count, 1)
         XCTAssertEqual(controller.steeredTurns.count, 1)
         XCTAssertTrue(controller.steeredTurns.first?.contains(message) == true)
@@ -832,7 +830,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                 return XCTFail("Expected the original composer claim: \(change)")
             }
             let item = AgentChatItem.user("Canonical local input", sequenceIndex: f.session.nextSequenceIndex)
-            let publication = try XCTUnwrap(submissions.captureCanonicalPublication(claim: claim, host: host, session: f.session, item: item))
+            let publication = try XCTUnwrap(submissions.test_captureCanonicalPublication(claim: claim, host: host, session: f.session, item: item))
             let rollback = host.scope.turnTiming.recordAgentTurnUserAnchor(for: f.session, userItem: item)
             f.session.appendItem(item)
             claim.cancellation.recordOptimisticInput(item.id, on: f.session)
@@ -842,7 +840,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                 let admitted = await f.session.codexDispatchSerialGate.awaitTurn(predecessor)
                 XCTAssertTrue(admitted)
             }
-            let submission = submissions.submitCanonicalTurn(
+            let submission = submissions.test_submitCanonicalTurn(
                 .init(
                     publication: publication, message: "Canonical local input",
                     attachments: [],

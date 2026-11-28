@@ -34,7 +34,7 @@ The terminal settlement implementation imported by `RepoPromptApp` runs independ
 | Responsibility | Owning path |
 | --- | --- |
 | Session incarnations, input route selection, run-attempt identity, liveness, terminal commit and teardown | `RepoPromptAgentRuntime` |
-| Admitted input producers, including waiting replies and ACP steering | The originating session host and its input-effect drain |
+| Canonical desktop input publication and queue ownership, waiting replies, and ACP steering | The originating session host and its input-effect drain |
 | File and worktree discovery | The originating host's retained workspace root lease |
 | Handover delivery acknowledgment and its durable clear | The exact link executor and the existing session persistence owner |
 | Provider-switch Summary, commit, rollback and save admission | The originating host's handoff runtime |

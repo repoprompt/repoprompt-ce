@@ -151,7 +151,7 @@ extension AgentSessionHandoffRuntime {
         let computerUseActivation: CodexComputerUseActivation?
         // In-flight arming IDs belong to the async arming call, not rollback.
         let context: AgentTabSession.ProviderSwitchContextSnapshot
-        let handoff: PendingHandoffState
+        let handoff: AgentPendingHandoffState
 
         init(_ session: AgentTabSession) {
             agent = session.selectedAgent

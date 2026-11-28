@@ -45,7 +45,7 @@ package struct AgentRunTerminalCommitRevision: Equatable {
 @MainActor
 package final class AgentRunTerminalCommitBarrier {
     package struct ProviderSuccessor {
-        let id: UUID
+        package let id: UUID
         let transitionKind: AgentRunEpochTransitionKind
         let consumeAfterPublication: (
             AgentRunTerminalCommitRevision,
