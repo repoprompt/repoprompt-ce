@@ -6,6 +6,15 @@ import SwiftUI
 // MARK: - Oracle Pill
 
 enum AgentOraclePillLogic {
+    static func singleOracleModelName(messages: [AIChatMessage], activeQueryID: UUID?, isStreaming: Bool) -> String? {
+        let message: AIChatMessage? = if let activeQueryID {
+            messages.first { $0.id == activeQueryID && !$0.isUser }
+        } else {
+            isStreaming ? nil : messages.last.flatMap { $0.isUser ? nil : $0 }
+        }
+        return message?.modelName.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
+    }
+
     struct ExplicitOpenRequest: Equatable {
         let generation: UInt64
         let workspaceID: UUID
@@ -203,8 +212,8 @@ struct AgentOraclePill: View {
     let activeAgentSessionID: UUID?
     let activeRunID: UUID?
 
-    private struct PopoverPresentation: Identifiable {
-        /// Identifies the open request; bump the generation whenever the session or policy changes
+    private struct PopoverPresentation {
+        /// Identifies the open request across member switches.
         let id: UInt64
         let sessionID: UUID
         let isExplicit: Bool
@@ -310,6 +319,7 @@ struct AgentOraclePill: View {
         #if DEBUG
             let _ = perfRecorder.increment("ui.body.statusPills.oracle")
         #endif
+        let presentation = presentedPopover
         Group {
             if hasAnySessions {
                 let cornerRadius = AgentPillMetrics.cornerRadius()
@@ -372,8 +382,11 @@ struct AgentOraclePill: View {
             else { return }
             openLatestStreamingPopover()
         }
-        .popover(item: $presentedPopover, arrowEdge: .bottom) { presentation in
-            oraclePopoverContent(presentation)
+        .popover(isPresented: isPopoverPresented, arrowEdge: .bottom) {
+            if let presentation {
+                oraclePopoverContent(presentation)
+                    .id(presentation.id)
+            }
         }
         .onChange(of: currentTabID) { _, _ in
             openRequestGeneration &+= 1
@@ -395,11 +408,31 @@ struct AgentOraclePill: View {
         }
     }
 
+    private var isPopoverPresented: Binding<Bool> {
+        Binding(
+            get: { presentedPopover != nil },
+            set: { if !$0 { presentedPopover = nil } }
+        )
+    }
+
     private func groupMemberSessions(for session: ChatSession) -> [ChatSession] {
         guard let groupID = session.oracleGroupID else { return [] }
         return currentTabSessions
             .filter { $0.oracleGroupID == groupID }
             .sorted { ($0.oracleLaneIndex ?? .max) < ($1.oracleLaneIndex ?? .max) }
+    }
+
+    func popoverModelName(for session: ChatSession) -> String? {
+        if session.oracleGroupID != nil {
+            guard groupMemberSessions(for: session).count > 1 else { return nil }
+            return oracleViewModel.oracleMemberPresentation(for: session).capturedModelName
+                .flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 } ?? "Model unavailable"
+        }
+        return AgentOraclePillLogic.singleOracleModelName(
+            messages: oracleViewModel.messagesSnapshot(for: session.id),
+            activeQueryID: oracleViewModel.activeQueryId(for: session.id),
+            isStreaming: oracleViewModel.isSessionStreaming(session.id)
+        )
     }
 
     @ViewBuilder
@@ -450,12 +483,14 @@ struct AgentOraclePill: View {
                                 let provider = status.providerID.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 } ?? "Provider unavailable"
                                 let isSelected = member.id == presented.id
                                 Button {
+                                    guard !isSelected else { return }
                                     openRequestGeneration &+= 1
+                                    autoScrollEnabled = autoScrollEnabled && oracleViewModel.isSessionStreaming(member.id)
                                     present(
                                         sessionID: member.id,
                                         isExplicit: presentation.isExplicit,
                                         actionPolicy: presentation.actionPolicy,
-                                        generation: openRequestGeneration
+                                        generation: presentation.id
                                     )
                                 } label: {
                                     HStack(spacing: 4) {
@@ -486,10 +521,6 @@ struct AgentOraclePill: View {
                     }
                     .fixedSize(horizontal: false, vertical: true)
                     let selected = oracleViewModel.oracleMemberPresentation(for: presented)
-                    Text(selected.capturedModelName.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 } ?? "Model unavailable")
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
-                        .fixedSize(horizontal: false, vertical: true)
-                        .textSelection(.enabled)
                     if let errorMessage = selected.errorMessage {
                         Text(errorMessage)
                             .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
@@ -497,6 +528,15 @@ struct AgentOraclePill: View {
                             .textSelection(.enabled)
                     }
                 }
+            }
+
+            if let presented = presentedSession(for: presentation),
+               let modelName = popoverModelName(for: presented)
+            {
+                Text(modelName)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
             }
 
             ChatMessagesView(
@@ -511,6 +551,7 @@ struct AgentOraclePill: View {
                     AgentOraclePillLogic.canCopyAll(session) ? oracleViewModel.oracleMemberPresentation(for: session) : nil
                 }
             )
+            .id(presentation.sessionID)
             .frame(minHeight: transcriptMinHeight, idealHeight: transcriptIdealHeight, maxHeight: transcriptMaxHeight)
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         }

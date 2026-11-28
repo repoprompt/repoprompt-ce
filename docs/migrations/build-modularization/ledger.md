@@ -9047,3 +9047,26 @@ host-owned tool capabilities and endpoint discovery. After activation, the close
 paths can release presentation leases, and a deferred visit can rehydrate after the final save and
 drain acknowledge settlement. Those lifecycle acceptance gates remain open in #1406. M10 still
 owns the app-free target move.
+
+## M9 integrated cutover candidate (#1828)
+
+[#1828](https://github.com/repoprompt/repoprompt-ce/pull/1828) contains both deliveries in
+[#1827](https://github.com/repoprompt/repoprompt-ce/issues/1827). The integrated runtime at
+`0d22d7de2` includes the saved-host implementation from #1831 (`81fedcd76`) and main
+`8c04edf15`. The following production entry points supersede the November 18 audit.
+
+| Responsibility | Production owner and acceptance evidence |
+| --- | --- |
+| Construct and select the saved execution owner | `prepareSavedOversightTarget` returns the canonical writer. `AppSavedAgentSessionExecution` hydrates or creates it. The prepared-window constructor and collections are gone. A conflicting writer refuses admission. |
+| Advertise and invoke tools without a window | The saved-host registered-tool journey dispatches history, tree, CodeMap, read/search, selection, file edits, Git, worktree operations, interaction, and parent/child Agent controls against the originating workspace. The [capability matrix](https://github.com/repoprompt/repoprompt-ce/pull/1831) records presenter-only operations and the provider/catalog boundaries. |
+| Adopt visible execution and detach a presenter | `WindowStateComposition` installs the workspace activation. The ordinary close, last-window close and A → B → A tests assert one provider dispatch, the same writer identity, run and attempt IDs, ACP controller, activation and root lease. They read the saved transcript back through the session route. An unpublished first save can still withdraw. |
+| Keep pending interactions and decide when to exit | The originating host retains the approval or file edit while detached. The tests answer the original question and verify the edited bytes and Git diff against the original root. The last-window policy keeps the process alive through a pending terminal save. Explicit Stop, deletion, revocation and Quit have separate cancellation witnesses. |
+| Release, recover and revisit | A failed atomic write keeps the exact drain. Two visits cause zero retries. The explicit recovery action performs one further write. Cancelling a waiter leaves ownership intact. The drain returns `.released`, the writer claims release, the route closes, and only the second visit resumes. Late callbacks leave the successor intact. |
+
+The assembled XCTest witnesses live in `AgentSavedSessionRuntimeLoadingTests` and
+`AgentSessionLinkExecutionRuntimeTests`. At the integrated runtime SHA, Conductor ticket
+`f07e7f0e-b247-4722-8ed0-db1f8d528529` recorded 566 passes and five opt-in skips in the
+close/switch/recovery, starter and Remote suites. Ticket `788a953d-b7fb-4e8a-8c2a-f74a82eae06f`
+recorded 121 ACP/Codex passes. These tests invoke assembled app entry points with controlled
+providers. The [integration PR](https://github.com/repoprompt/repoprompt-ce/pull/1828) carries
+the final candidate's hosted run and merge status. M10 owns the app-free module move.

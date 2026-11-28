@@ -244,6 +244,56 @@ struct AgentTranscriptRow: View, @MainActor Equatable {
     let promptManager: PromptViewModel
     let contextBuilderAgentVM: ContextBuilderAgentViewModel
     let codexManagedLoginAction: CodexManagedLoginAction?
+    @State private var showingRetainedContent = false
+
+    struct RetainedContent {
+        let input: String?
+        let output: String?
+        let fallbackText: String?
+        let isToolResult: Bool
+        let outputUnavailable: Bool
+
+        init(item: AgentChatItem, hydratedResult: String?) {
+            let summaryOnly = toolResultIsSummaryOnly(item)
+            input = item.toolArgsJSON.flatMap { $0.isEmpty ? nil : $0 }
+            if let hydratedResult, !hydratedResult.isEmpty {
+                output = hydratedResult
+            } else if !summaryOnly, let stored = item.toolResultJSON, !stored.isEmpty {
+                output = stored
+            } else {
+                output = nil
+            }
+            fallbackText = output == nil && !summaryOnly && !item.text.isEmpty ? item.text : nil
+            isToolResult = item.kind == .toolResult
+            outputUnavailable = summaryOnly && output == nil
+        }
+
+        var hasSections: Bool {
+            input != nil || output != nil || fallbackText != nil
+        }
+
+        var source: String? {
+            isToolResult ? output : input
+        }
+
+        var readableText: String {
+            var sections: [String] = []
+            if let input {
+                sections.append("Input\n\(ToolResultMarkdownRenderer.readableStructuredPayload(input))")
+            }
+            if let output {
+                sections.append("Output\n\(ToolResultMarkdownRenderer.readableResult(output))")
+            } else if let fallbackText {
+                let text = isToolResult ? ToolResultMarkdownRenderer.readableResult(fallbackText)
+                    : ToolResultMarkdownRenderer.readableStructuredPayload(fallbackText)
+                sections.append("\(isToolResult ? "Output" : "Text")\n\(text)")
+            }
+            if outputUnavailable {
+                sections.append("Full output was not retained or is unavailable.")
+            }
+            return sections.joined(separator: "\n\n")
+        }
+    }
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.inputs == rhs.inputs
@@ -254,10 +304,32 @@ struct AgentTranscriptRow: View, @MainActor Equatable {
     }
 
     var body: some View {
+        Group {
+            if let batch = Self.delegationBatch(for: inputs.item) {
+                AgentDelegationDecisionDisclosure(batch: batch, copy: copyContent)
+                    .contextMenu {
+                        Button("Copy Batch") { copyContent(batch.text) }
+                    }
+            } else {
+                messageBubble
+            }
+        }
+        .environment(\.agentTranscriptDisclosureScope, .init(
+            store: agentModeVM.ui.transcript, workspaceID: inputs.workspaceID,
+            tabID: inputs.tabID, itemID: inputs.item.id
+        ))
+    }
+
+    static func delegationBatch(for item: AgentChatItem) -> AgentDelegationDecisionBatch? {
+        guard item.kind == .user, let batch = item.delegationDecisionBatch, !batch.decisions.isEmpty else { return nil }
+        return batch
+    }
+
+    private var messageBubble: some View {
         let cancelAction: (() -> Void)? = inputs.cancelRunID.map { runID in
             { [weak agentModeVM] in agentModeVM?.cancelActiveToolsForRun(runID: runID, reason: "tool_card_header_cancel") }
         }
-        AgentMessageBubble(
+        return AgentMessageBubble(
             item: inputs.item,
             isMostRecentEditBubble: inputs.isMostRecentEditBubble,
             windowID: inputs.windowID,
@@ -287,13 +359,55 @@ struct AgentTranscriptRow: View, @MainActor Equatable {
         .environment(\.markdownFileLinkOpener, MarkdownFileLinkOpener { target in
             await promptManager.fileManager.openFileForMarkdownLink(target)
         })
-        .environment(\.agentTranscriptDisclosureScope, .init(
-            store: agentModeVM.ui.transcript, workspaceID: inputs.workspaceID,
-            tabID: inputs.tabID, itemID: inputs.item.id
-        ))
         .environment(\.agentToolCardAutoExpandEnabled, inputs.autoExpandEnabled)
         .environment(\.agentLiveBashExecutionByItemID, inputs.liveBashExecution.map { [inputs.item.id: $0] } ?? [:])
         .environment(\.agentApprovalVisible, inputs.approvalVisible)
+        .contextMenu {
+            if isToolRow {
+                let content = retainedContent
+                if content.hasSections {
+                    Button("View Retained Content…") { showingRetainedContent = true }
+                    Button("Copy Content") { copyContent(content.readableText) }
+                    if let source = content.source {
+                        Button("Copy Source") { copyContent(source) }
+                    }
+                }
+            } else if !inputs.item.text.isEmpty {
+                Button("Copy Text") { copyContent(inputs.item.text) }
+            }
+        }
+        .sheet(isPresented: $showingRetainedContent) {
+            let content = retainedContent
+            let readableText = content.readableText
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Text("Retained Tool Content").font(.headline)
+                    Spacer()
+                    Button("Copy Content") { copyContent(readableText) }
+                    if let source = content.source {
+                        Button("Copy Source") { copyContent(source) }
+                    }
+                    Button("Done") { showingRetainedContent = false }
+                        .keyboardShortcut(.defaultAction)
+                }
+                ToolScrollableMarkdownTextView(text: readableText, maxHeight: 400)
+            }
+            .padding()
+            .frame(minWidth: 620)
+        }
+    }
+
+    private var isToolRow: Bool {
+        inputs.item.kind == .toolCall || inputs.item.kind == .toolResult
+    }
+
+    private var retainedContent: RetainedContent {
+        RetainedContent(item: inputs.item, hydratedResult: inputs.rawToolResultPayload)
+    }
+
+    private func copyContent(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
     }
 
     var handoffConfig: AgentHandoffConfig {
@@ -317,6 +431,53 @@ struct AgentTranscriptRow: View, @MainActor Equatable {
                 )
             }
         )
+    }
+}
+
+@MainActor
+private struct AgentDelegationDecisionDisclosure: View {
+    let batch: AgentDelegationDecisionBatch
+    let copy: (String) -> Void
+    @AgentTranscriptDisclosure("AgentDelegationDecisionDisclosure") private var isExpanded = false
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $isExpanded) {
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(batch.decisions.indices, id: \.self) { index in
+                    let decision = batch.decisions[index]
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text(outcomeLabel(decision.outcome)).fontWeight(.medium)
+                            Spacer()
+                            Button("Copy Decision") { copy(decision.text) }
+                        }
+                        if let target = decision.targetSessionID {
+                            Text("Target: \(target.uuidString)").font(.caption.monospaced()).textSelection(.enabled)
+                        }
+                        Text(decision.text).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                    }
+                }
+                Button("Copy Batch") { copy(batch.text) }
+            }
+            .padding(.top, 6)
+        } label: {
+            HStack(spacing: 6) {
+                Label("Delegation decisions", systemImage: "checkmark.shield")
+                Text(summary).foregroundStyle(.secondary).lineLimit(1)
+            }
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var summary: String {
+        guard let first = batch.decisions.first else { return "0" }
+        let mixed = batch.decisions.contains { $0.outcome != first.outcome }
+        return "\(batch.decisions.count) · \(mixed ? "Mixed outcomes" : outcomeLabel(first.outcome))"
+    }
+
+    private func outcomeLabel(_ outcome: String) -> String {
+        outcome.replacingOccurrences(of: "_", with: " ").capitalized
     }
 }
 
@@ -528,7 +689,10 @@ struct AgentMessageBubble: View {
     // MARK: - User Bubble
 
     private var userBubble: some View {
-        HStack {
+        let displayText = AgentModeViewModel.mcpResidentTaskDisplayText(
+            item.text, origin: item.userInputOrigin, attribution: item.crossSessionAttribution
+        )
+        return HStack {
             Spacer(minLength: 60)
 
             VStack(alignment: .trailing, spacing: 6) {
@@ -564,7 +728,7 @@ struct AgentMessageBubble: View {
                         TaggedFilesBadge(attachments: item.taggedFileAttachments)
                     }
                     MarkdownTextView(
-                        text: item.text,
+                        text: displayText,
                         isMarkdown: true,
                         allowInteraction: true,
                         bareURLLinkificationPolicy: .httpHTTPSOnly
@@ -575,7 +739,7 @@ struct AgentMessageBubble: View {
                 .background(BubbleColors.lightBlue)
                 .cornerRadius(20)
 
-                MessageFooterStrip(text: item.text, timestamp: item.timestamp, isTrailing: true, handoffConfig: handoffConfig, hasHandoffButton: handoffConfig != nil)
+                MessageFooterStrip(text: displayText, timestamp: item.timestamp, isTrailing: true, handoffConfig: handoffConfig, hasHandoffButton: handoffConfig != nil)
             }
         }
     }
@@ -1597,8 +1761,14 @@ struct AskUserQuestionSummary {
     let skipped: Bool
     let timedOut: Bool
     let isHistoricalScalar: Bool
+    /// True for transcripts saved before ask_user exchanges were persisted: only a status summary
+    /// survived, so there are no questions or answers to show.
+    var detailsUnavailable = false
 
     var displayTitle: String {
+        if detailsUnavailable {
+            return "Question"
+        }
         if let title, !title.isEmpty {
             return questions.count > 1 ? "\(title) (\(questions.count) questions)" : title
         }
@@ -1664,8 +1834,8 @@ private struct AskUserQuestionResult: Decodable {
 
 /// Render structured ask_user replies and retained scalar transcripts.
 func parseAskUserQuestionSummaryRobust(args: String?, result: String?) -> AskUserQuestionSummary {
-    let argsDTO = ToolJSON.decodeResult(AskUserQuestionArgs.self, from: args)
     let resultString = result?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let argsDTO = askUserQuestionArgs(args: args, result: resultString)
     let resultDTO = decodeAskUserQuestionResult(resultString)
     let structuredQuestions = argsDTO?.questions ?? []
     let isStructured = !structuredQuestions.isEmpty
@@ -1696,6 +1866,18 @@ func parseAskUserQuestionSummaryRobust(args: String?, result: String?) -> AskUse
         )
     }
 
+    if argsDTO?.question == nil, isSummaryOnlyAskUserResult(resultString) {
+        return AskUserQuestionSummary(
+            title: nil,
+            context: nil,
+            questions: [],
+            skipped: skipped,
+            timedOut: timedOut,
+            isHistoricalScalar: false,
+            detailsUnavailable: true
+        )
+    }
+
     let question = normalizedNonEmpty(argsDTO?.question) ?? "Question"
     let response: String? = {
         if let resultDTO {
@@ -1718,6 +1900,25 @@ func parseAskUserQuestionSummaryRobust(args: String?, result: String?) -> AskUse
         timedOut: timedOut,
         isHistoricalScalar: true
     )
+}
+
+/// Saved transcripts drop tool args; their persisted result carries the title and questions instead.
+private func askUserQuestionArgs(args: String?, result: String?) -> AskUserQuestionArgs? {
+    let fromArgs = ToolJSON.decodeResult(AskUserQuestionArgs.self, from: args)
+    if fromArgs?.question != nil || fromArgs?.questions?.isEmpty == false {
+        return fromArgs
+    }
+    let fromResult = ToolJSON.decodeResult(AskUserQuestionArgs.self, from: result)
+    return fromResult?.questions?.isEmpty == false ? fromResult : fromArgs
+}
+
+/// A bare persisted status summary (`summary_only` with no reply fields) has nothing to render as Q&A.
+private func isSummaryOnlyAskUserResult(_ result: String?) -> Bool {
+    guard let object = parseJSONObject(result) else { return false }
+    return object["summary_only"] as? Bool == true
+        && object["answers"] == nil
+        && object["response"] == nil
+        && object["questions"] == nil
 }
 
 private func decodeAskUserQuestionResult(_ result: String?) -> AskUserQuestionResult? {
@@ -1935,6 +2136,12 @@ private struct AskUserQuestionResultView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            if summary.detailsUnavailable {
+                Text("The questions and answers were not saved with this transcript.")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                    .foregroundColor(.secondary)
+                    .textSelection(.enabled)
+            }
             ForEach(Array(summary.questions.enumerated()), id: \.element.id) { index, question in
                 VStack(alignment: .leading, spacing: 5) {
                     HStack(alignment: .top, spacing: 6) {

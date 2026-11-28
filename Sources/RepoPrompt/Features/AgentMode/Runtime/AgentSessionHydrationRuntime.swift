@@ -218,6 +218,7 @@ enum AgentSessionHydrationRuntime {
         }
         session.codexConversationID = persisted.codexConversationID
         session.codexRolloutPath = persisted.codexRolloutPath
+        session.codexInstructionMode = persisted.codexInstructionMode
         session.subscriptionAccountBinding = persisted.subscriptionAccountBinding
         session.providerCleanupHandle = persisted.resolvedProviderCleanupHandle
         session.codexModel = persisted.codexModel
@@ -261,6 +262,9 @@ enum AgentSessionHydrationRuntime {
         session.organizationalParentID = indexedPlacement?.organizationalParentID ?? persisted.organizationalParentID
         session.delegationScopeID = indexedPlacement?.delegationScopeID ?? persisted.delegationScopeID
         session.isMCPOriginated = persisted.isMCPOriginated
+        session.originWorkflowID = persisted.originWorkflowID
+        session.originWorkflowDisplayName = persisted.originWorkflowDisplayName
+        session.lastRunStartedAt = persisted.lastRunStartedAt
         session.worktreeBindings = persisted.worktreeBindings
         session.worktreeMergeOperations = persisted.worktreeMergeOperations
         session.nextSequenceIndex = payload.transcript.nextSequenceIndex
@@ -307,14 +311,16 @@ enum AgentSessionHydrationRuntime {
             sourceItemID: persisted.pendingHandoffSourceItemID,
             defersProviderLockUntilSend: persisted.pendingHandoffDefersProviderLockUntilSend,
             isStagedForSend: false,
+            awaitsLocalClaudeOverflowInput: persisted.pendingHandoffAwaitsLocalClaudeOverflowInput == true && persisted.pendingHandoffPayload?.isEmpty == false,
             executionLocationFailure: persisted.pendingHandoffExecutionLocationFailure,
             providerSwitchDelivery: persisted.pendingHandoffProviderSwitchDelivery
         )
+        restoreCodexMetadata(from: persisted, to: session)
         session.selfCompactState = persisted.selfCompactState ?? .init()
         session.selfCompactPersistenceWarning = persisted.selfCompactPersistenceWarning
         session.contextWindowCapacity = persisted.contextWindowCapacity
+        session.claudeWakeCompactionSpentConversation = persisted.claudeWakeCompactionSpentConversation
         session.claudeAutoCompactWindowTokens = nil
-        restoreCodexMetadata(from: persisted, to: session)
         switch session.selectedAgent {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             session.contextCompactedAt = session.providerTokenUsageByTurn.last(where: { $0.contextCompacted })?.timestamp

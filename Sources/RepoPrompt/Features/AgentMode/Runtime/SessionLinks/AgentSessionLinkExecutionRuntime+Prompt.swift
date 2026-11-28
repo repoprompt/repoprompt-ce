@@ -112,6 +112,55 @@ extension AgentSessionLinkExecutionRuntime {
         )
     }
 
+    /// Keep the shared negative outbound-link fence across projections. In-progress
+    /// membership writers withhold the same endpoint's inventory before their authority hop.
+    func mcpRequireResidentLinkFence(
+        _ endpoint: DomainAgentSessionLinkEndpointIdentity, authoritativeHasLinks: Bool = false
+    ) throws {
+        guard agentSessionLinkPromptInventoryHoldsByEndpoint[endpoint] == nil else {
+            throw MCPError.invalidParams(AgentModeViewModel.mcpResidentTargetError)
+        }
+        let published = agentSessionLinkPromptInventoryBySessionID[endpoint.sessionID]
+        let publishedLinks = published?.endpoint == endpoint && published?.inventory.isEmpty == false
+        if authoritativeHasLinks || publishedLinks {
+            throw MCPError.invalidParams(
+                "Session \(endpoint.sessionID.uuidString) is app-owned and oversees other sessions. MCP activation would revoke its oversight links. Use agent_run.steer with wait=false, agent_run.poll, and agent_manage.get_log."
+            )
+        }
+    }
+
+    /// Counts only published rows whose link IDs and generations agree with the endpoint's
+    /// current inventory. The caller separately re-proves its exact authorization.
+    func mcpResidentLaneStateCounts(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity, hasOutboundLinks: Bool, props: AgentMonitorPillProps?
+    ) throws -> (idle: Int, running: Int, awaitingUser: Int, unavailable: Int) {
+        let notReady = MCPError.invalidParams("Live status is not ready for this session binding. Retry agent_run.poll.")
+        guard agentSessionLinkPromptInventoryHoldsByEndpoint[endpoint] == nil else { throw notReady }
+        let published = agentSessionLinkPromptInventoryBySessionID[endpoint.sessionID]
+        guard hasOutboundLinks else {
+            // A grant can finish between the authority hop and the publication read.
+            guard published?.endpoint != endpoint || published?.inventory.isEmpty == true else { throw notReady }
+            return (0, 0, 0, 0)
+        }
+        guard let props, props.endpoint == endpoint, let published, published.endpoint == endpoint else { throw notReady }
+        let references = published.inventory.items.compactMap(\.reference)
+        let rows = props.outbound
+        guard references.count == published.inventory.items.count,
+              !rows.isEmpty, rows.count == references.count,
+              Set(references) == Set(rows.map { DomainAgentSessionLinkReference(linkID: $0.linkID, generation: $0.generation) })
+        else { throw notReady }
+        var counts = (idle: 0, running: 0, awaitingUser: 0, unavailable: 0)
+        for row in rows {
+            switch row.status {
+            case .idle: counts.idle += 1
+            case .running: counts.running += 1
+            case .awaitingUser: counts.awaitingUser += 1
+            case .unavailable: counts.unavailable += 1
+            }
+        }
+        return counts
+    }
+
     private func agentSessionLinkAuthoritativeRunCatalogRouteToken(
         runID: UUID,
         windowID: Int,

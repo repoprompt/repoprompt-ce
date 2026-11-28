@@ -128,13 +128,19 @@ enum AgentModelCatalog {
         case general
         case headless
 
-        func allows(_ agentKind: AgentProviderKind) -> Bool {
+        var operation: AgentOperationEligibility.AgentOperation {
             switch self {
-            case .general:
-                true
-            case .headless:
-                agentKind != .antigravity
+            case .general: .subAgent
+            case .headless: .contextBuilder
             }
+        }
+
+        func allows(_ agentKind: AgentProviderKind) -> Bool {
+            operation.supports(agentKind)
+        }
+
+        func eligibility(for agentKind: AgentProviderKind, availability: AvailabilityContext) -> AgentOperationEligibility {
+            operation.eligibility(for: agentKind, available: AgentModelCatalog.isAgentAvailable(agentKind, availability: availability))
         }
     }
 
@@ -232,7 +238,7 @@ enum AgentModelCatalog {
         surface: AgentSelectionSurface = .general
     ) -> [AgentProviderKind] {
         [.codexExec, .claudeCode, .openCode, .cursor, .grokBuild, .antigravity, .devin, .claudeCodeGLM, .kimiCode, .customClaudeCompatible]
-            .filter { surface.allows($0) && isAgentAvailable($0, availability: availability) }
+            .filter { surface.eligibility(for: $0, availability: availability).isEligible }
     }
 
     static func hasUnconfiguredSupportedCLIProviders(
@@ -323,7 +329,7 @@ enum AgentModelCatalog {
             candidateModelRaw = ClaudeCompatibleModelCatalogAdapter.canonicalCompatibleBackendModelRaw(candidateModelRaw, for: agent)
         }
 
-        if !surface.allows(agent) || !isAgentAvailable(agent, availability: availability) {
+        if !surface.eligibility(for: agent, availability: availability).isEligible {
             if preserveUnavailableAgent, parsedAgent != nil, surface.allows(agent) {
                 effectiveAvailability = availability.assumingAvailable(agent)
             } else {
@@ -1856,13 +1862,15 @@ enum AgentModelCatalog {
 
     // MARK: - Discovery Internals
 
-    private static func discoveryAgent(
+    static func discoveryAgent(
         _ agent: AgentProviderKind,
-        availability: AvailabilityContext
+        availability: AvailabilityContext,
+        modelOptions: [AgentModelOption]? = nil,
+        preferredModelRaw: String? = nil
     ) -> DiscoveryAgent {
         let available = isAgentAvailable(agent, availability: availability)
-        let agentOptions = options(for: agent, availability: availability)
-        let defaultRaw = available ? defaultModelRaw(for: agent, availability: availability) : nil
+        let agentOptions = modelOptions ?? options(for: agent, availability: availability)
+        let defaultRaw = available ? preferredModelRaw ?? defaultModelRaw(for: agent, availability: availability) : nil
 
         let models: [DiscoveryModel] = if agent == .codexExec {
             codexDiscoveryModels(
@@ -1940,7 +1948,10 @@ enum AgentModelCatalog {
             }
             // Use the first option's metadata for family-level fields
             let representative = group.options.first
-            let allEfforts = group.options.compactMap { CodexModelSpecifier(raw: $0.rawValue).reasoningEffort }
+            let allEfforts = Set(group.options.flatMap { option in
+                option.supportedReasoningEfforts
+                    + [CodexModelSpecifier(raw: option.rawValue).reasoningEffort].compactMap(\.self)
+            })
             let defaultEffort = representative?.defaultReasoningEffort
                 ?? group.options.first(where: \.isProviderDefault)
                 .flatMap { CodexModelSpecifier(raw: $0.rawValue).reasoningEffort }
@@ -1962,7 +1973,7 @@ enum AgentModelCatalog {
                 available: true,
                 tags: allTags,
                 contextWindowTokens: nil,
-                supportedReasoningEfforts: allEfforts.isEmpty ? [] : CodexReasoningEffort.displayOrder.filter(allEfforts.contains),
+                supportedReasoningEfforts: CodexReasoningEffort.displayOrder.filter(allEfforts.contains),
                 defaultReasoningEffort: defaultEffort,
                 startTargets: targets
             ))

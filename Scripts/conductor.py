@@ -95,7 +95,10 @@ LOG_TAIL_MAX_BYTES = 64 * 1024
 LOG_TAIL_FRAGMENT_MAX_BYTES = 4 * 1024
 BUILD_CACHE_DIAGNOSTIC_MAX_ROWS = 12
 BUILD_CACHE_SCHEMA_VERSION = 1
-BUILD_CACHE_DEFAULT_LIMIT_BYTES = 40 * 1024 * 1024 * 1024
+BUILD_CACHE_DEFAULT_LIMIT_BYTES = 4 * 1024 * 1024 * 1024
+BUILD_CACHE_MAX_BEHIND_COMMITS = 100
+BUILD_CACHE_HISTORY_SCAN_SECONDS = 3
+BUILD_CACHE_RETENTION_SECONDS = 14 * 24 * 60 * 60
 BUILD_CACHE_PUBLISH_THROTTLE_SECONDS = 60 * 60.0
 BUILD_CACHE_CLONE_MIN_SECONDS = 60.0
 BUILD_CACHE_CLONE_MAX_SECONDS = 10 * 60.0
@@ -166,6 +169,9 @@ BUILD_CACHE_ENV_KEYS = (
     "ONLY_ACTIVE_ARCH",
     "OTHER_SWIFT_FLAGS",
     "REPOPROMPT_ENABLE_SENTRY",
+    "REPOPROMPT_REMOTE_NETWORKING_PATH",
+    "REPOPROMPT_IROH_LOCAL_ARTIFACT",
+    "REPOPROMPT_IROH_USE_LOCAL_ARTIFACT",
     "SDKROOT",
     "SWIFT_EXEC",
     "SWIFTFLAGS",
@@ -187,6 +193,11 @@ PROGRESS_HEARTBEAT_SECONDS = 30.0
 PROGRESS_MAX_LINES_PER_POLL = 6
 MAX_TERMINAL_JOBS = 200
 TERMINAL_RETENTION_SECONDS = 24 * 60 * 60
+STORAGE_SWEEP_INTERVAL = 60 * 60
+JOB_LOG_HEAD_BYTES = 4 * 1024 * 1024
+JOB_LOG_TAIL_BYTES = 4 * 1024 * 1024
+JOB_LOG_LIMIT_BYTES = 16 * 1024 * 1024
+JOB_LOG_ROTATION_MARKER = b"\n[conductor: middle of oversized job log omitted]\n"
 STARTUP_TIMEOUT_SECONDS = 10.0
 WAIT_POLL_SECONDS = 1.0
 TERMINATE_GRACE_SECONDS = 3.0
@@ -330,6 +341,7 @@ Operation commands:
     (without --launch/--packaged-app, requires the CE debug app to already be running and CLI installed)
   ./conductor diagnostics agent-mode-on [--log-file <path>]
   ./conductor diagnostics build-cache [--limit <n>]
+  ./conductor storage report  # JSON dry-run; never starts a daemon or removes files
   ./conductor cache status [--limit <n>] [--json]  # read-only; performs no repair or cleanup
   ./conductor cache drop <compatibility-key> [--json]
   ./conductor diagnostics focused-build [--product <name>] [--test] [--filter <filter>]
@@ -845,6 +857,10 @@ def resolve_repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def default_conductor_root() -> Path:
+    return Path.home() / "Library" / "Application Support" / "RepoPrompt CE" / "Conductor"
+
+
 def compute_paths(repo_root: Path) -> Paths:
     real_root = repo_root.resolve()
     repo_hash = hashlib.sha256(str(real_root).encode("utf-8")).hexdigest()
@@ -854,14 +870,7 @@ def compute_paths(repo_root: Path) -> Paths:
     if state_override:
         state_dir = Path(state_override).expanduser().resolve()
     else:
-        state_dir = (
-            Path.home()
-            / "Library"
-            / "Application Support"
-            / "RepoPrompt CE"
-            / "Conductor"
-            / repo_hash
-        )
+        state_dir = default_conductor_root() / repo_hash
     uid = os.getuid() if hasattr(os, "getuid") else 0
     socket_path = (
         Path(socket_override).expanduser().resolve()
@@ -913,7 +922,50 @@ def ensure_private_dir(path: Path) -> None:
             raise ConductorError(f"private directory {path} is not credential-safe (mode {mode:o})")
 
 
+HASHED_STORAGE_NAME = re.compile(r"[0-9a-f]{64}")
+JOB_STORAGE_NAME = re.compile(
+    r"([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})"
+    r"\.(log|timing\.json|cache-(?:attempt|outcome)\.json|xctest-stall\.(?:json|sample\.txt)|log-rotation\.tmp)"
+)
+
+
+def private_retention_directory(path: Path) -> bool:
+    try:
+        info = path.lstat()
+        return stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and not info.st_mode & 0o077
+    except OSError:
+        return False
+
+
+def owned_storage_file(path: Path) -> Optional[os.stat_result]:
+    try:
+        info = path.lstat()
+        if stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and info.st_nlink == 1 and not info.st_mode & 0o022:
+            return info
+    except OSError:
+        pass
+    return None
+
+
+@contextlib.contextmanager
+def existing_storage_lock(path: Path):
+    # Never unlink or create lock inodes from a sweep. Older clients can already
+    # have this inode open even if nobody currently holds its flock.
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = owned_storage_file(path)
+        opened = os.fstat(descriptor)
+        if info is None or (info.st_dev, info.st_ino) != (opened.st_dev, opened.st_ino):
+            raise OSError(errno.EINVAL, "unsafe Conductor storage lock", str(path))
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+    finally:
+        os.close(descriptor)
+
+
 def ensure_state_dirs(paths: Paths) -> None:
+    if paths.state_dir == default_conductor_root() / paths.repo_hash:
+        ensure_private_dir(paths.state_dir.parent)
     ensure_private_dir(paths.state_dir)
     ensure_private_dir(paths.jobs_dir)
     ensure_private_dir(paths.socket_path.parent)
@@ -1011,8 +1063,12 @@ class BuildCacheManager:
         self.repo_root = repo_root.resolve()
         self.env = dict(os.environ if env is None else env)
         override = self.env.get("REPOPROMPT_DEV_BUILD_CACHE_DIR")
-        self.store_root = (store_root or (Path(override).expanduser() if override else Path.home() / "Library" / "Application Support" / "RepoPrompt CE" / "Conductor" / "BuildCache")).resolve()
+        requested_root = store_root or (Path(override).expanduser() if override else default_conductor_root() / "BuildCache")
+        self.cache_root = requested_root.resolve()
+        self.store_root = self.cache_root / "checkout-v2"
+        self._retention_scope_valid = store_root is not None or bool(override) or self.cache_root == requested_root
         self.locks_dir = self.store_root / "locks"
+        self.repo_locks_dir = self.cache_root / "locks"
         self._probe_provider = probe_provider or self._probe_toolchain
         self._clone_runner = clone_runner or self._clone_cow
         self._clock = clock
@@ -1030,6 +1086,7 @@ class BuildCacheManager:
         ensure_private_dir(self.store_root.parent)
         ensure_private_dir(self.store_root)
         ensure_private_dir(self.locks_dir)
+        ensure_private_dir(self.repo_locks_dir)
 
     @staticmethod
     def _remove_owned_temporary(path: Path) -> None:
@@ -1053,7 +1110,8 @@ class BuildCacheManager:
     @contextlib.contextmanager
     def _repo_prepare_lock(self, *, nonblocking: bool = False):
         digest = hashlib.sha256(str(self.repo_root).encode("utf-8")).hexdigest()
-        lock_path = self.locks_dir / f"repo-{digest}.lock"
+        # Legacy restores stage their copies in the same checkout directory.
+        lock_path = self.repo_locks_dir / f"repo-{digest}.lock"
         lock_file = lock_path.open("a+", encoding="utf-8")
         os.chmod(lock_path, 0o600)
         flags = fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0)
@@ -1193,6 +1251,8 @@ class BuildCacheManager:
             "configuration": configuration,
             "environment": {key: job_env.get(key) for key in BUILD_CACHE_ENV_KEYS},
             "manifests": self._manifest_hashes(),
+            # SwiftPM's database and derived products embed absolute checkout paths.
+            "checkoutPath": str(self.repo_root),
         }
         encoded = json_dumps(payload).encode("utf-8")
         toolchain_signature = hashlib.sha256(json_dumps(toolchain).encode("utf-8")).hexdigest()
@@ -1203,13 +1263,16 @@ class BuildCacheManager:
             raise ConductorError("invalid build-cache key")
         return self.store_root / key
 
-    @contextlib.contextmanager
     def key_lock(self, key: str, *, exclusive: bool, nonblocking: bool = False):
-        self._key_dir(key)
+        return self._key_lock_at(self._key_dir(key), exclusive=exclusive, nonblocking=nonblocking)
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _key_lock_at(key_dir: Path, *, exclusive: bool, nonblocking: bool = False):
         # The persistent per-key inode is the cross-process flock authority.
         # Unlinking a seemingly idle lock can split exclusion when a waiter has
         # already opened the old inode, so zero-byte lock files are retained.
-        lock_path = self.locks_dir / f"{key}.lock"
+        lock_path = key_dir.parent / "locks" / f"{key_dir.name}.lock"
         lock_file = lock_path.open("a+", encoding="utf-8")
         os.chmod(lock_path, 0o600)
         flags = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
@@ -1303,23 +1366,32 @@ class BuildCacheManager:
             return False
 
     @staticmethod
-    def _source_head(repo_root: Path) -> Optional[str]:
+    def _checkout_git(checkout: Path, deadline: float, *args: str, stdin: bytes = b"") -> bytes:
+        timeout = deadline - time.monotonic()
+        if timeout <= 0:
+            raise subprocess.TimeoutExpired(args, 0)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        # Older Git may ignore NO_LAZY_FETCH; allow no fetch transports even
+        # when repository config or a partial clone would try to fetch an object.
+        env.update(GIT_NO_LAZY_FETCH="1", GIT_ALLOW_PROTOCOL="", GIT_OPTIONAL_LOCKS="0")
+        return subprocess.run(["git", *args], cwd=checkout, input=stdin, env=env,
+                              capture_output=True, timeout=timeout, check=True).stdout
+
+    @classmethod
+    def _source_head(cls, repo_root: Path) -> Optional[str]:
+        deadline = time.monotonic() + 5
         try:
-            completed = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=str(repo_root),
-                stdin=subprocess.DEVNULL,
-                text=True,
-                capture_output=True,
-                timeout=5.0,
-            )
-            value = completed.stdout.strip()
-            return value if completed.returncode == 0 and re.fullmatch(r"[0-9a-f]{40,64}", value) else None
-        except (OSError, subprocess.TimeoutExpired):
+            if cls._checkout_git(repo_root, deadline, "rev-parse", "--show-toplevel").removesuffix(b"\n") != os.fsencode(repo_root):
+                return None
+            value = cls._checkout_git(repo_root, deadline, "rev-parse", "HEAD").strip()
+            return value.decode("ascii") if re.fullmatch(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})", value) else None
+        except (OSError, subprocess.SubprocessError, ValueError):
             return None
 
     def _validate_seed_at(self, key: str, meta: Dict[str, Any], seed: Path) -> bool:
-        marker = self._read_json_file(seed / ".generation.json")
+        if not private_retention_directory(seed):
+            return False
+        marker = read_storage_record(seed / ".generation.json")
         build = seed / ".build"
         return bool(
             marker
@@ -1332,11 +1404,13 @@ class BuildCacheManager:
     def _validate_seed(self, key: str, meta: Dict[str, Any]) -> bool:
         return self._validate_seed_at(key, meta, self._key_dir(key) / "seed")
 
-    def _quarantine_seed(self, key: str, reason: str) -> None:
+    def _quarantine_seed(self, key: str, reason: str, expected_meta: Dict[str, Any]) -> None:
         with self.key_lock(key, exclusive=True):
             key_dir = self._key_dir(key)
-            meta = self._meta(key) or {"key": key, "generation": 0}
+            meta = self._meta(key)
             seed = key_dir / "seed"
+            if meta != expected_meta or _path_identity(seed) is None or self._validate_seed(key, expected_meta):
+                return
             if seed.exists() and not seed.is_symlink():
                 quarantine = key_dir / f"suspect-{int(self._clock())}-{uuid.uuid4().hex[:8]}"
                 os.replace(seed, quarantine)
@@ -1374,6 +1448,7 @@ class BuildCacheManager:
         if (
             not self.eligible(operation, args)
             or self.env.get("REPOPROMPT_DEV_BUILD_CACHE_DISABLE") == "1"
+            or any(job_env.get(key) for key in OperationRegistry.REMOTE_NETWORKING_ENV_KEYS)
             or not (self.repo_root / "Package.swift").is_file()
         ):
             return None
@@ -1419,8 +1494,11 @@ class BuildCacheManager:
                     )
                     return context
                 if meta and not valid_seed:
-                    self._quarantine_seed(snapshot.key, "seed generation or shape did not match metadata")
-                    context.status["state"] = "corruptSeedCold"
+                    seed = self._key_dir(snapshot.key) / "seed"
+                    # Retention removes only the seed and preserves the generation floor.
+                    if _path_identity(seed) is not None:
+                        self._quarantine_seed(snapshot.key, "seed generation or shape did not match metadata", meta)
+                        context.status["state"] = "corruptSeedCold"
                     return context
                 if not valid_seed:
                     return context
@@ -1574,6 +1652,8 @@ class BuildCacheManager:
                 self._sanitize_seed(temporary / ".build")
                 _atomic_write_json(temporary / ".generation.json", {"key": key, "generation": next_generation})
                 size = self._disk_usage_bytes(temporary / ".build")
+                if size > self._retention_limit_bytes():
+                    return {"state": "publicationSkipped", "reason": "seed exceeds cache budget", "sizeBytes": size}
                 source_head = self._source_head(self.repo_root)
                 meta = {
                     "schemaVersion": BUILD_CACHE_SCHEMA_VERSION,
@@ -1617,56 +1697,204 @@ class BuildCacheManager:
                 if publication_committed and previous.exists():
                     with contextlib.suppress(OSError):
                         self._remove_owned_temporary(previous)
-        retention = self.enforce_retention(context.snapshot.toolchain_signature)
+        try:
+            retention = self.enforce_retention()
+        except (ConductorError, OSError) as exc:
+            retention = {"error": str(exc)[:500]}
         return {"state": "published", "key": key, "generation": next_generation, "sizeBytes": size, "retention": retention}
 
-    def confirm_seeded_failure(self, key: str) -> Dict[str, Any]:
-        with self.key_lock(key, exclusive=True):
-            key_dir = self._key_dir(key)
-            meta = self._meta(key) or {"key": key, "generation": 0}
+    def confirm_seeded_failure(self, key: str, provenance: Dict[str, Any]) -> Dict[str, Any]:
+        key_dir = self._key_dir(key)
+        seed_path = provenance.get("seedPath")
+        # A running legacy daemon can invoke this updated wrapper with a legacy seed.
+        legacy_key_dir = self.cache_root / key
+        if seed_path == str(legacy_key_dir / "seed"):
+            key_dir = legacy_key_dir
+        seed = key_dir / "seed"
+        if seed_path != str(seed) or not all(
+            private_retention_directory(path)
+            for path in (self.cache_root, key_dir.parent, key_dir.parent / "locks", key_dir)
+        ):
+            return {"suspectBookkeepingSkipped": "unrecognized seed namespace"}
+        generation = provenance.get("generation")
+        with self._key_lock_at(key_dir, exclusive=True):
+            meta = read_storage_record(key_dir / "meta.json")
+            if (
+                provenance.get("schemaVersion") != BUILD_CACHE_SCHEMA_VERSION
+                or type(generation) is not int
+                or meta.get("key") != key
+                or meta.get("generation") != generation
+                or not self._validate_seed_at(key, meta, seed)
+            ):
+                return {"suspectBookkeepingSkipped": "seed generation changed or was removed"}
             count = int(meta.get("suspectCount") or 0) + 1
             meta["suspectCount"] = count
             meta["lastSuspectAt"] = self._clock()
             quarantined = False
-            seed = key_dir / "seed"
-            if count >= 2 and seed.exists() and not seed.is_symlink():
+            if count >= 2:
                 quarantine = key_dir / f"suspect-{int(self._clock())}-{uuid.uuid4().hex[:8]}"
                 os.replace(seed, quarantine)
                 shutil.rmtree(quarantine, ignore_errors=True)
                 meta["quarantinedAt"] = self._clock()
                 quarantined = True
-            ensure_private_dir(key_dir)
             _atomic_write_json(key_dir / "meta.json", meta)
             return {"suspectCount": count, "quarantined": quarantined}
 
-    def enforce_retention(self, current_toolchain_signature: str) -> Dict[str, Any]:
-        self._ensure_store_dirs()
-        hygiene = self._sweep_stranded_store_temporaries()
+    def enforce_retention(self, *, dry_run: bool = False) -> Dict[str, Any]:
+        roots = self._retention_roots()
+        if dry_run or not roots:
+            return self._scan_retention(roots, dry_run=dry_run)
+        # Serialize budget calculations among updated daemons without waiting.
+        # Older daemons still coordinate mutations through the persistent key locks.
+        guard = self.cache_root / "retention.lock"
         try:
-            limit = int(self.env.get("REPOPROMPT_DEV_BUILD_CACHE_LIMIT_BYTES") or BUILD_CACHE_DEFAULT_LIMIT_BYTES)
+            descriptor = os.open(guard, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            os.close(descriptor)
+        try:
+            with existing_storage_lock(guard):
+                return self._scan_retention(roots, dry_run=False)
+        except BlockingIOError:
+            return {"storePath": str(self.store_root), "deferred": "retention lock busy", "reclaimedBytes": 0}
+
+    def _retention_roots(self) -> List[Path]:
+        if not self._retention_scope_valid or not private_retention_directory(self.cache_root):
+            return []
+        return [root for root in (self.cache_root, self.store_root)
+                if private_retention_directory(root) and private_retention_directory(root / "locks")]
+
+    def _retention_limit_bytes(self) -> int:
+        try:
+            return max(0, int(self.env.get("REPOPROMPT_DEV_BUILD_CACHE_LIMIT_BYTES") or BUILD_CACHE_DEFAULT_LIMIT_BYTES))
         except ValueError:
-            limit = BUILD_CACHE_DEFAULT_LIMIT_BYTES
-        rows: List[Tuple[bool, float, int, str]] = []
-        for child in self.store_root.iterdir():
-            if not child.is_dir() or not re.fullmatch(r"[0-9a-f]{64}", child.name):
+            return BUILD_CACHE_DEFAULT_LIMIT_BYTES
+
+    @classmethod
+    def _obsolete_source(cls, checkout: Path, source: Any, deadline: float) -> bool:
+        if not isinstance(source, str) or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", source):
+            return False
+        # These are read-only local probes. An unavailable or ambiguous history
+        # is not evidence that a checkout's seed has become obsolete.
+        def git(*args: str, stdin: bytes = b"") -> bytes:
+            return cls._checkout_git(checkout, deadline, *args, stdin=stdin)
+
+        try:
+            if git("rev-parse", "--show-toplevel").removesuffix(b"\n") != os.fsencode(checkout):
+                return False
+            kind = git("cat-file", "--batch-check=%(objecttype)", stdin=source.encode() + b"\n").strip()
+            if kind == source.encode() + b" missing":
+                return True
+            if kind != b"commit":
+                return False
+            ahead = git("rev-list", "--count", f"--max-count={BUILD_CACHE_MAX_BEHIND_COMMITS + 1}",
+                        "HEAD", "--not", source)
+            return int(ahead) > BUILD_CACHE_MAX_BEHIND_COMMITS
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return False
+
+    def _scan_retention(self, roots: List[Path], *, dry_run: bool) -> Dict[str, Any]:
+        limit = self._retention_limit_bytes()
+        result: Dict[str, Any] = {
+            "storePath": str(self.cache_root), "limitBytes": limit, "remainingBytes": 0,
+            "reclaimableBytes": 0, "reclaimedBytes": 0, "evictedKeys": [], "skippedKeys": 0,
+            "strandedTemporariesRemoved": 0,
+        }
+        rows = []
+        newest: Dict[str, Tuple[float, Path]] = {}
+        history: Dict[Tuple[str, str], bool] = {}
+        history_deadline = time.monotonic() + BUILD_CACHE_HISTORY_SCAN_SECONDS
+        for child in (item for root in roots for item in root.iterdir()):
+            if not HASHED_STORAGE_NAME.fullmatch(child.name) or not private_retention_directory(child):
                 continue
-            meta = self._meta(child.name) or {}
-            rows.append((meta.get("toolchainSignature") == current_toolchain_signature, float(meta.get("lastUsedAt") or 0.0), int(meta.get("sizeBytes") or 0), child.name))
-        total = sum(row[2] for row in rows)
-        evicted: List[str] = []
-        for _same_toolchain, _used, size, key in sorted(rows):
-            if total <= max(0, limit):
-                break
+            seed = child / "seed"
+            meta = read_storage_record(child / "meta.json")
+            if meta.get("key") == child.name and meta.get("schemaVersion") == BUILD_CACHE_SCHEMA_VERSION:
+                if not dry_run:
+                    result["strandedTemporariesRemoved"] += self._expire_cache_temporaries(child)
+            if _path_identity(seed) is None:
+                continue  # A generation floor can outlive its seed.
+            used = meta.get("lastUsedAt")
+            size = meta.get("sizeBytes")
+            if not (
+                meta.get("key") == child.name and meta.get("schemaVersion") == BUILD_CACHE_SCHEMA_VERSION
+                and type(size) is int and size >= 0 and type(used) in (int, float)
+                and 0 < used < float("inf") and private_retention_directory(child / "seed")
+                and self._validate_seed_at(child.name, meta, seed)
+            ):
+                result["skippedKeys"] += 1
+                continue
+            compatibility = meta.get("compatibility")
+            checkout = compatibility.get("checkoutPath") if isinstance(compatibility, dict) else None
+            known_checkout = isinstance(checkout, str) and bool(checkout) and Path(checkout).is_absolute()
+            obsolete = child.parent == self.cache_root or not known_checkout
+            if not obsolete:
+                try:
+                    Path(checkout).lstat()
+                except FileNotFoundError:
+                    obsolete = True
+                except (OSError, ValueError):
+                    pass
+                source = meta.get("sourceHead")
+                if not obsolete and isinstance(source, str):
+                    identity = (checkout, source)
+                    if identity not in history:
+                        history[identity] = self._obsolete_source(Path(checkout), source, history_deadline)
+                    obsolete = history[identity]
+                if not obsolete:
+                    newest[checkout] = max(newest.get(checkout, (0, child)), (used, child))
+            rows.append((not obsolete, used, child, size, meta))
+        preferred = {child for _, child in newest.values()}
+        total = sum(row[3] for row in rows)
+        cutoff = self._clock() - BUILD_CACHE_RETENTION_SECONDS
+        # Remove obsolete seeds regardless of size; under pressure, keep the
+        # newest seed for each extant checkout ahead of redundant generations.
+        ordered = sorted(rows, key=lambda row: (row[0], row[1] >= cutoff, row[2] in preferred, row[1], row[2]))
+        for compatible, used, key_dir, size, snapshot in ordered:
+            key = key_dir.name
+            if compatible and used >= cutoff and total <= limit:
+                continue
             try:
-                with self.key_lock(key, exclusive=True, nonblocking=True):
-                    key_dir = self._key_dir(key)
-                    if key_dir.exists() and not key_dir.is_symlink():
-                        shutil.rmtree(key_dir)
+                with existing_storage_lock(key_dir.parent / "locks" / f"{key}.lock"):
+                    seed = key_dir / "seed"
+                    if not (
+                        private_retention_directory(key_dir) and private_retention_directory(seed)
+                        and read_storage_record(key_dir / "meta.json") == snapshot and self._validate_seed_at(key, snapshot, seed)
+                    ):
+                        result["skippedKeys"] += 1
+                        continue
+                    result["reclaimableBytes"] += size
+                    if not dry_run:
+                        # Keep the metadata (generation floor) and the flock inode.
+                        # Never recursively remove the key directory or its unknown siblings.
+                        retired = key_dir / f"seed.tmp-{uuid.uuid4().hex}"
+                        os.replace(seed, retired)
                         total -= size
-                        evicted.append(key)
-            except BlockingIOError:
-                continue
-        return {"limitBytes": limit, "remainingBytes": total, "evictedKeys": evicted, "hygiene": hygiene}
+                        shutil.rmtree(retired)
+                        result["reclaimedBytes"] += size
+                        result["evictedKeys"].append(key)
+                    else:
+                        total -= size
+            except OSError:
+                result["skippedKeys"] += 1
+        result["remainingBytes"] = total
+        return result
+
+    def _expire_cache_temporaries(self, key_dir: Path) -> int:
+        cutoff = self._clock() - STORAGE_SWEEP_INTERVAL
+        removed = 0
+        try:
+            with existing_storage_lock(key_dir.parent / "locks" / f"{key_dir.name}.lock"):
+                for child in key_dir.glob("seed.tmp-*"):
+                    if not self._is_store_temporary_name(child.name) or not private_retention_directory(child):
+                        continue
+                    if child.lstat().st_mtime < cutoff:
+                        shutil.rmtree(child)
+                        removed += 1
+        except OSError:
+            pass
+        return removed
 
     def status(self, limit: int = BUILD_CACHE_DIAGNOSTIC_MAX_ROWS) -> Dict[str, Any]:
         entries: List[Dict[str, Any]] = []
@@ -2734,6 +2962,143 @@ def now() -> float:
     return time.time()
 
 
+def read_storage_record(path: Path) -> Dict[str, Any]:
+    info = owned_storage_file(path)
+    if info is None or info.st_size > 64 * 1024:
+        return {}
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if (info.st_dev, info.st_ino) != (opened.st_dev, opened.st_ino):
+                return {}
+            value = json.loads(stream.read(64 * 1024 + 1))
+            return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def registered_checkout_hashes(repo_root: Path) -> Optional[set[str]]:
+    try:
+        listing = subprocess.run(
+            ["git", "worktree", "list", "--porcelain", "-z"], cwd=repo_root,
+            capture_output=True, check=True, timeout=5,
+        )
+        return {
+            hashlib.sha256(os.fsencode(Path(os.fsdecode(field[9:])).resolve())).hexdigest()
+            for field in listing.stdout.split(b"\0") if field.startswith(b"worktree ")
+            and Path(os.fsdecode(field[9:])).is_dir()
+        }
+    except (OSError, subprocess.SubprocessError, RuntimeError):
+        return None
+
+
+def sweep_ticket_artifacts(
+    jobs_dir: Path, cutoff: float, *, dry_run: bool,
+    protected: frozenset[str] = frozenset(), require_receipt: bool = False,
+) -> Tuple[int, int]:
+    if not private_retention_directory(jobs_dir):
+        return 0, 0
+    groups: Dict[str, Dict[str, Tuple[Path, os.stat_result]]] = {}
+    blocked = set(protected)
+    for child in jobs_dir.iterdir():
+        match = JOB_STORAGE_NAME.fullmatch(child.name)
+        if not match:
+            continue
+        ticket, kind = match.groups()
+        info = owned_storage_file(child)
+        if info is None or info.st_mtime >= cutoff:
+            blocked.add(ticket)
+        else:
+            groups.setdefault(ticket, {})[kind] = (child, info)
+    files = size = 0
+    for ticket, group in groups.items():
+        if ticket in blocked:
+            continue
+        if require_receipt:
+            receipt = read_storage_record(jobs_dir / f"{ticket}.timing.json")
+            state = receipt.get("state")
+            if (
+                receipt.get("schemaVersion") != 1 or receipt.get("ticket") != ticket
+                or not isinstance(state, str) or state not in TERMINAL_STATES
+            ):
+                continue
+        # Leave the receipt until last, so an interrupted legacy cleanup is retryable.
+        for kind in sorted(group, key=lambda name: name == "timing.json"):
+            child, info = group[kind]
+            current = owned_storage_file(child)
+            if current is None or (current.st_ino, current.st_dev, current.st_mtime_ns, current.st_size) != (
+                info.st_ino, info.st_dev, info.st_mtime_ns, info.st_size,
+            ):
+                break
+            try:
+                if not dry_run:
+                    child.unlink()
+            except OSError:
+                break
+            files += 1
+            size += info.st_blocks * 512
+    return files, size
+
+
+def sweep_sibling_storage(paths: Paths, *, dry_run: bool) -> Dict[str, Any]:
+    result: Dict[str, Any] = {"files": 0, "bytes": 0, "buckets": 0, "skippedBuckets": 0}
+    root = default_conductor_root()
+    if paths.state_dir != root / paths.repo_hash or not private_retention_directory(root) or root.resolve() != root:
+        return result
+    registered = registered_checkout_hashes(paths.repo_root)
+    if registered is None:
+        result["deferred"] = "checkout registration unavailable"
+        return result
+    cutoff = now() - TERMINAL_RETENTION_SECONDS
+    for bucket in root.iterdir():
+        if not HASHED_STORAGE_NAME.fullmatch(bucket.name) or not private_retention_directory(bucket):
+            continue
+        if bucket == paths.state_dir and not dry_run:
+            continue
+        socket = Path("/tmp") / f"conductor-{os.getuid()}" / f"{bucket.name[:16]}.sock"
+        try:
+            with existing_storage_lock(bucket / "daemon.start.lock"):
+                # A startup holds this lock until the daemon has published its PID,
+                # metadata and registry, including when the socket is overridden.
+                if any(_path_identity(path) is not None for path in (
+                    bucket / "daemon.pid", bucket / "daemon.json", bucket / "running-processes.json", socket,
+                )):
+                    result["skippedBuckets"] += 1
+                    continue
+                identity_path = bucket / "checkout.json"
+                legacy = _path_identity(identity_path) is None
+                require_receipt = legacy or bucket.name in registered
+                if not legacy:
+                    identity = read_storage_record(identity_path)
+                    checkout = identity.get("checkoutPath")
+                    if not (
+                        identity.get("schemaVersion") == 1 and isinstance(checkout, str)
+                        and Path(checkout).is_absolute()
+                        and hashlib.sha256(checkout.encode("utf-8")).hexdigest() == bucket.name
+                    ):
+                        result["skippedBuckets"] += 1
+                        continue
+                    try:
+                        Path(checkout).lstat()
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        # An extant checkout may be used again. Expire only
+                        # demonstrably terminal output, never incomplete jobs.
+                        require_receipt = True
+                files, size = sweep_ticket_artifacts(
+                    bucket / "jobs", cutoff, dry_run=dry_run, require_receipt=require_receipt,
+                )
+                if files:
+                    result["files"] += files
+                    result["bytes"] += size
+                    result["buckets"] += 1
+        except (OSError, ValueError):
+            result["skippedBuckets"] += 1
+    return result
+
+
 def iso_timestamp(ts: Optional[float]) -> Optional[str]:
     if ts is None:
         return None
@@ -3346,6 +3711,7 @@ class Job:
     output_summary: Optional[Dict[str, Any]] = None
     summary_generation: int = 0
     summary_in_flight: bool = False
+    waiter_count: int = 0
     infrastructure_warnings: List[Dict[str, Any]] = dataclasses.field(default_factory=list)
     log_sequence: int = 0
     log_flushed_sequence: int = 0
@@ -3609,7 +3975,6 @@ class OperationRegistry:
         "REPOPROMPT_DEV_HEAVY_SLOTS",
         "REPOPROMPT_DEV_BUILD_CACHE_DIR",
         "REPOPROMPT_DEV_BUILD_CACHE_DISABLE",
-        "REPOPROMPT_DEV_BUILD_CACHE_LIMIT_BYTES",
     ]
     TELEMETRY_ENV_KEYS = [
         "REPOPROMPT_ENABLE_SENTRY",
@@ -3621,6 +3986,11 @@ class OperationRegistry:
         "REPOPROMPT_SENTRY_UPLOAD_WAIT",
         "SENTRY_URL",
     ]
+    REMOTE_NETWORKING_ENV_KEYS = [
+        "REPOPROMPT_REMOTE_NETWORKING_PATH",
+        "REPOPROMPT_IROH_LOCAL_ARTIFACT",
+        "REPOPROMPT_IROH_USE_LOCAL_ARTIFACT",
+    ]
     PASSTHROUGH_ENV_KEYS = sorted(
         set(
             SIGNING_ENV_KEYS
@@ -3630,6 +4000,7 @@ class OperationRegistry:
             + TEST_ENV_KEYS
             + CONDUCTOR_ENV_KEYS
             + TELEMETRY_ENV_KEYS
+            + REMOTE_NETWORKING_ENV_KEYS
         )
     )
 
@@ -3936,10 +4307,14 @@ class DaemonState:
         self._daemon_start_token = read_daemon_metadata(paths).get("processStart")
         self._running_registry_generation = 0
         self._retention_generation = 0
+        self._storage_sweep_pending = False
+        self._next_storage_sweep = 0.0
+        self._storage_retention: Dict[str, Any] = {}
         self._registry_publish_lock = threading.Lock()
         self._cache_write_lock = threading.Lock()
         self._cache_write_active_ticket: Optional[str] = None
         self.build_cache: Optional[BuildCacheManager] = None
+        self._observed_cache_roots: Deque[Path] = deque(maxlen=8)
         self._daemon_infrastructure_warnings: Deque[Dict[str, Any]] = deque(maxlen=MAX_INFRASTRUCTURE_WARNINGS)
         self._io_worker = ExternalIOWorker(self._record_io_worker_error)
         self._output_pump = ProcessOutputPump(
@@ -3948,14 +4323,25 @@ class DaemonState:
         )
 
     def _build_cache_manager(self, env: Optional[Dict[str, str]] = None) -> BuildCacheManager:
-        desired_env = dict(os.environ if env is None else env)
+        source = os.environ if env is None else env
+        desired_env = {key: source[key] for key in (
+            "REPOPROMPT_DEV_BUILD_CACHE_DIR", "REPOPROMPT_DEV_BUILD_CACHE_DISABLE",
+        ) if key in source}
         override = desired_env.get("REPOPROMPT_DEV_BUILD_CACHE_DIR")
         desired_root = (
             Path(override).expanduser().resolve()
             if override
             else (Path.home() / "Library" / "Application Support" / "RepoPrompt CE" / "Conductor" / "BuildCache").resolve()
         )
-        if self.build_cache is None or self.build_cache.store_root != desired_root:
+        # Retention is daemon policy, not a per-job input. A build may select a
+        # store, but cannot silently switch the budget applied to that store.
+        if override:
+            with self.condition:
+                if desired_root not in self._observed_cache_roots:
+                    self._observed_cache_roots.append(desired_root)
+        if "REPOPROMPT_DEV_BUILD_CACHE_LIMIT_BYTES" in os.environ:
+            desired_env["REPOPROMPT_DEV_BUILD_CACHE_LIMIT_BYTES"] = os.environ["REPOPROMPT_DEV_BUILD_CACHE_LIMIT_BYTES"]
+        if self.build_cache is None or self.build_cache.cache_root != desired_root or self.build_cache.env != desired_env:
             self.build_cache = BuildCacheManager(self.paths.repo_root, env=desired_env)
         return self.build_cache
 
@@ -4074,6 +4460,7 @@ class DaemonState:
                 "queuedJobs": queued_jobs,
                 "queueDepth": len(self.queue),
                 "retainedTerminalCount": terminal_count,
+                "storageRetention": dict(self._storage_retention),
                 "shutdownRequested": self.shutdown_requested,
                 "health": {
                     "state": "stopping" if self.shutdown_requested else ("degraded" if active_warnings else "healthy"),
@@ -4296,22 +4683,24 @@ class DaemonState:
         deadline = now() + timeout if timeout is not None else None
         with self.condition:
             job = self.resolve_job_locked(ticket, request_key)
-            while job.state not in TERMINAL_STATES:
-                remaining = None if deadline is None else deadline - now()
-                if remaining is not None and remaining <= 0:
-                    payload = self._job_payload_locked(job, include_tail=True)
-                    payload["waitTimedOut"] = True
-                    return payload
-                self.condition.wait(timeout=remaining if remaining is not None else 30.0)
-            if job.output_summary is not None:
+            job.waiter_count += 1
+        try:
+            with self.condition:
+                while job.state not in TERMINAL_STATES:
+                    remaining = None if deadline is None else deadline - now()
+                    if remaining is not None and remaining <= 0:
+                        payload = self._job_payload_locked(job, include_tail=True)
+                        payload["waitTimedOut"] = True
+                        return payload
+                    self.condition.wait(timeout=remaining if remaining is not None else 30.0)
+            self._refresh_output_summary(job)
+            with self.condition:
                 payload = self._job_payload_locked(job, include_tail=True)
                 payload["waitTimedOut"] = False
                 return payload
-        self._refresh_output_summary(job)
-        with self.condition:
-            payload = self._job_payload_locked(self.resolve_job_locked(ticket, request_key), include_tail=True)
-            payload["waitTimedOut"] = False
-            return payload
+        finally:
+            with self.condition:
+                job.waiter_count -= 1
 
     def job_cancel(self, ticket: Optional[str], request_key: Optional[str]) -> Dict[str, Any]:
         with self.condition:
@@ -5600,6 +5989,22 @@ class DaemonState:
             job.log_settled_sequences.remove(job.log_flushed_sequence)
         self.condition.notify_all()
 
+    @staticmethod
+    def _rotate_job_log(descriptor: int, log_path: Path, payload: bytes, size: int) -> None:
+        head = os.pread(descriptor, JOB_LOG_HEAD_BYTES, 0)
+        tail = os.pread(descriptor, JOB_LOG_TAIL_BYTES, max(JOB_LOG_HEAD_BYTES, size - JOB_LOG_TAIL_BYTES))
+        temporary = log_path.with_suffix(".log-rotation.tmp")
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(head)
+                stream.write(JOB_LOG_ROTATION_MARKER)
+                stream.write((tail + payload)[-JOB_LOG_TAIL_BYTES:])
+            os.replace(temporary, log_path)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                temporary.unlink()
+
     def _write_job_log_record(
         self,
         lease: JobLease,
@@ -5614,12 +6019,22 @@ class DaemonState:
         try:
             descriptor = os.open(
                 log_path,
-                os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK,
                 0o600,
             )
             try:
-                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                    raise ConductorError(f"refusing non-regular job log {log_path}")
+                info = os.fstat(descriptor)
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.getuid():
+                    raise ConductorError(f"refusing unsafe job log {log_path}")
+                if info.st_size + len(payload) > JOB_LOG_LIMIT_BYTES:
+                    self._rotate_job_log(descriptor, log_path, payload, info.st_size)
+                    with self.condition:
+                        current = self._job_matches_lease_locked(lease)
+                        if current is not None:
+                            current.log_truncated = True
+                            if current.log_truncation_reason is None:
+                                current.log_truncation_reason = "storageLimit"
+                    return
                 remaining = memoryview(payload)
                 while remaining:
                     written = os.write(descriptor, remaining)
@@ -5986,7 +6401,12 @@ class DaemonState:
 
     def _retention_pass_locked(self) -> None:
         cutoff = now() - TERMINAL_RETENTION_SECONDS
-        terminal = [job for job in self.jobs.values() if job.state in TERMINAL_STATES]
+        terminal = [
+            job for job in self.jobs.values()
+            if job.state in TERMINAL_STATES and not job.waiter_count and not job.summary_in_flight
+            and not job.cleanup_in_flight and job.ticket not in self.active_unlaned
+            and job.ticket not in self.active_lanes.values()
+        ]
         prune: set[str] = set()
         for job in terminal:
             if job.finished_at is not None and job.finished_at < cutoff:
@@ -5994,34 +6414,27 @@ class DaemonState:
         terminal_sorted = sorted(terminal, key=lambda job: job.finished_at or job.created_at)
         excess = max(0, len(terminal_sorted) - MAX_TERMINAL_JOBS)
         for job in terminal_sorted[:excess]:
-            prune.add(job.ticket)
+            if job.finished_at is not None and job.finished_at < now() - STORAGE_SWEEP_INTERVAL:
+                prune.add(job.ticket)
 
         detached_paths: List[Path] = []
         for ticket in prune:
             job = self.jobs.pop(ticket, None)
             if not job:
                 continue
-            detached_paths.append(job.log_path)
-            detached_paths.extend(job.diagnostic_paths)
+            if JOB_STORAGE_NAME.fullmatch(f"{ticket}.log"):
+                detached_paths.extend(
+                    self.paths.jobs_dir / f"{ticket}.{suffix}"
+                    for suffix in ("log", "cache-attempt.json", "cache-outcome.json", "xctest-stall.json",
+                                   "xctest-stall.sample.txt", "log-rotation.tmp", "timing.json")
+                )
             for key, mapped_ticket in list(self.request_keys.items()):
                 if mapped_ticket == ticket:
                     del self.request_keys[key]
 
         self._retention_generation += 1
         generation = self._retention_generation
-        retained_logs = {job.log_path.name for job in self.jobs.values()}
-        retained_diagnostics = {
-            diagnostic_path.name
-            for job in self.jobs.values()
-            for diagnostic_path in job.diagnostic_paths
-        }
-        submitted = self._io_worker.submit(
-            self._retention_external,
-            generation,
-            tuple(detached_paths),
-            frozenset(retained_logs),
-            frozenset(retained_diagnostics),
-        )
+        submitted = self._io_worker.submit(self._retention_external, generation, tuple(detached_paths))
         if not submitted:
             self._daemon_infrastructure_warnings.append(
                 {
@@ -6035,49 +6448,62 @@ class DaemonState:
         self,
         generation: int,
         detached_paths: Sequence[Path],
-        retained_logs: frozenset[str],
-        retained_diagnostics: frozenset[str],
     ) -> None:
+        if not private_retention_directory(self.paths.jobs_dir):
+            return
+        files = size = 0
         for path in detached_paths:
-            with contextlib.suppress(FileNotFoundError):
-                path.unlink()
-
-        cutoff = now() - TERMINAL_RETENTION_SECONDS
-        candidates: List[Path] = []
-        with contextlib.suppress(FileNotFoundError):
-            candidates.extend(
-                path for path in self.paths.jobs_dir.glob("*.log") if path.name not in retained_logs
-            )
-            candidates.extend(
-                path
-                for path in self.paths.jobs_dir.glob("*.xctest-stall.*")
-                if path.name not in retained_diagnostics
-            )
-            candidates.extend(
-                path
-                for path in self.paths.jobs_dir.glob(f"*{JOB_TIMING_RECORD_SUFFIX}")
-                if job_timing_record_log_name(path.name) not in retained_logs
-            )
-        for path in candidates:
-            try:
-                stale = path.stat().st_mtime < cutoff
-            except OSError:
-                continue
-            if not stale:
-                continue
-            with self.condition:
-                if generation != self._retention_generation:
-                    return
-                current_names = {job.log_path.name for job in self.jobs.values()}
-                current_names.update(
-                    diagnostic_path.name
-                    for job in self.jobs.values()
-                    for diagnostic_path in job.diagnostic_paths
-                )
-                if path.name in current_names or job_timing_record_log_name(path.name) in current_names:
+            info = owned_storage_file(path)
+            if info is not None:
+                try:
+                    path.unlink()
+                except OSError:
                     continue
-            with contextlib.suppress(FileNotFoundError):
-                path.unlink()
+                files += 1
+                size += info.st_blocks * 512
+        with self.condition:
+            # Current tickets can only be added with a fresh UUID; those admitted
+            # after this snapshot cannot have any files older than the cutoff.
+            protected = frozenset(self.jobs)
+        if generation == self._retention_generation:
+            count, allocated = sweep_ticket_artifacts(
+                self.paths.jobs_dir, now() - TERMINAL_RETENTION_SECONDS, dry_run=False, protected=protected,
+            )
+            files += count
+            size += allocated
+        if files:
+            with self.condition:
+                self._storage_retention["checkoutFilesReclaimed"] = self._storage_retention.get("checkoutFilesReclaimed", 0) + files
+                self._storage_retention["checkoutBytesReclaimed"] = self._storage_retention.get("checkoutBytesReclaimed", 0) + size
+
+    def schedule_storage_maintenance(self) -> None:
+        with self.condition:
+            if self.shutdown_requested or self._storage_sweep_pending or time.monotonic() < self._next_storage_sweep:
+                return
+            self._next_storage_sweep = time.monotonic() + STORAGE_SWEEP_INTERVAL
+            self._retention_pass_locked()
+            # Recursive cache removal must not stall the single log/registry I/O worker.
+            self._storage_sweep_pending = True
+            threading.Thread(target=self._maintain_shared_storage, name="conductor-storage", daemon=True).start()
+
+    def _maintain_shared_storage(self) -> None:
+        try:
+            siblings = sweep_sibling_storage(self.paths, dry_run=False)
+            manager = BuildCacheManager(self.paths.repo_root, startup_hygiene=False)
+            caches = [manager.enforce_retention()]
+            with self.condition:
+                overrides = tuple(self._observed_cache_roots)
+            for root in overrides:
+                if root != manager.cache_root:
+                    caches.append(BuildCacheManager(self.paths.repo_root, store_root=root, startup_hygiene=False).enforce_retention())
+            with self.condition:
+                self._storage_retention.update(lastSweepAt=now(), siblingBuckets=siblings, buildCache=caches[0],
+                                               cacheOverrides=caches[1:])
+        except (OSError, ValueError, ConductorError) as exc:
+            self._record_io_worker_error(f"storage retention: {exc}")
+        finally:
+            with self.condition:
+                self._storage_sweep_pending = False
 
 
 def validate_json_shape(value: Any, depth: int = 0) -> None:
@@ -6113,6 +6539,9 @@ class ThreadedUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamSer
         self.handler_permits = threading.BoundedSemaphore(MAX_ACTIVE_REQUEST_HANDLERS)
         self.wait_permits = threading.BoundedSemaphore(MAX_ACTIVE_WAIT_HANDLERS)
         super().__init__(server_address, handler_cls)
+
+    def service_actions(self) -> None:
+        self.state.schedule_storage_maintenance()
 
     def process_request(self, request: Any, client_address: Any) -> None:
         if not self.handler_permits.acquire(blocking=False):
@@ -6220,6 +6649,13 @@ def run_daemon(paths: Paths) -> int:
     with contextlib.suppress(OSError):
         os.chmod(paths.pid_path, 0o600)
     write_daemon_metadata(paths)
+    if paths.state_dir == default_conductor_root() / paths.repo_hash:
+        identity_path = paths.state_dir / "checkout.json"
+        try:
+            if _path_identity(identity_path) is None:
+                _atomic_write_json(identity_path, {"schemaVersion": 1, "checkoutPath": str(paths.repo_root)})
+        except OSError:
+            pass  # A provenance write failure must not block daemon startup.
     paths.running_processes_path.write_text(json.dumps({"updatedAt": now(), "processes": []}, indent=2), encoding="utf-8")
     with contextlib.suppress(OSError):
         os.chmod(paths.running_processes_path, 0o600)
@@ -6856,6 +7292,13 @@ def render_daemon_status(payload: Dict[str, Any], shorthand: bool = False) -> No
     print(f"conductor daemon running (pid {payload.get('pid')})")
     print(f"protocol: {payload.get('protocolVersion')}")
     print(f"socket:   {payload.get('socketPath')}")
+    storage = payload.get("storageRetention") or {}
+    if storage:
+        siblings = storage.get("siblingBuckets") or {}
+        cache = storage.get("buildCache") or {}
+        print(f"storage reclaimed: checkout={format_bytes(storage.get('checkoutBytesReclaimed', 0))}, "
+              f"last background sweep: siblings={format_bytes(siblings.get('bytes', 0))}, "
+              f"cache={format_bytes(cache.get('reclaimedBytes', 0))}")
     print(f"state:    {payload.get('stateDir')}")
     active = payload.get("activeJobsByLane") or {}
     if active:
@@ -8737,8 +9180,8 @@ def operation_cache_retry(repo_root: Path, args: Dict[str, Any]) -> int:
     outcome["coldSucceeded"] = cold_code == 0
     if cold_code == 0:
         try:
-            manager = BuildCacheManager(repo_root)
-            outcome.update(manager.confirm_seeded_failure(key))
+            manager = BuildCacheManager(repo_root, startup_hygiene=False)
+            outcome.update(manager.confirm_seeded_failure(key, provenance))
         except Exception as exc:
             # A successful cold build is authoritative. Suspect bookkeeping is
             # advisory, but its failure remains visible in the retained outcome.
@@ -9074,6 +9517,17 @@ def main(argv: List[str]) -> int:
         return run_daemon(daemon_paths)
 
     paths = compute_paths(repo_root)
+    if argv and argv[0] == "storage":
+        parser = argparse.ArgumentParser(prog="conductor storage")
+        parser.add_argument("action", choices=("report",))
+        parser.parse_args(argv[1:])
+        siblings = sweep_sibling_storage(paths, dry_run=True)
+        cache = BuildCacheManager(repo_root, startup_hygiene=False).enforce_retention(dry_run=True)
+        print_json({
+            "readOnly": True, "siblingBuckets": siblings, "buildCache": cache,
+            "reclaimableBytes": siblings["bytes"] + cache["reclaimableBytes"],
+        })
+        return 0
     ensure_state_dirs(paths)
 
     if not argv or argv[0] in {"-h", "--help"}:

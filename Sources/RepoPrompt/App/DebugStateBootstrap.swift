@@ -421,7 +421,7 @@ enum DebugStateBootstrap {
                             if session.keys.contains("subscriptionAccountBinding") {
                                 session["subscriptionAccountBinding"] = AgentSessionSubscriptionBinding.detachedSnapshotValue
                             }
-                            for key in ["providerSessionID", "providerCleanupHandle", "codexConversationID", "codexRolloutPath", "codexMcpSessionKey", "delegationScopeID", "lastRunState", "selfCompactState"] {
+                            for key in ["providerSessionID", "providerCleanupHandle", "codexConversationID", "codexRolloutPath", "codexInstructionMode", "codexMcpSessionKey", "delegationScopeID", "lastRunState", "selfCompactState"] {
                                 session.removeValue(forKey: key)
                             }
                             for key in ["autoWakeOnOversightUpdates", "routineWakeIntervalEnabled", "periodicIdleWakeEnabled"] {

@@ -13,6 +13,7 @@ final class AgentSelfCompactNativeCompletionTests: XCTestCase {
         var shouldAcceptNote = true
         var noteTransportFailureGate: TestReleaseFence?
         var ownerIsCurrent = true
+        var overflowVerificationCount = 0
         var pendingSleeps: [CheckedContinuation<Void, Never>] = []
         var slept: [Duration] = []
         var instant = ContinuousClock.now
@@ -62,7 +63,11 @@ final class AgentSelfCompactNativeCompletionTests: XCTestCase {
                         self.pendingSleeps.append(continuation)
                     }
                 },
-                now: { self.instant }
+                now: { self.instant },
+                verifyOverflow: { attempt in
+                    self.overflowVerificationCount += 1
+                    return attempt.claudePostCompactTokens == 12329
+                }
             )
         }
 
@@ -150,6 +155,54 @@ final class AgentSelfCompactNativeCompletionTests: XCTestCase {
         )
         await drain()
         XCTAssertEqual(fake.dispatchCount, 1)
+    }
+
+    func testOverflowWaitsForExactSuccessfulDrainedTerminalAndNeverSendsNote() async {
+        let fake = Fake()
+        let id = fake.arm()
+        fake.state.active?.claudeOverflowHoldID = UUID()
+        fake.state.active?.claudePostCompactTokens = 12329
+        let coordinator = fake.coordinator()
+        XCTAssertTrue(coordinator.bindCompact(.init(requestID: id, stage: .compact), runID: fake.compactRunID, runAttemptID: fake.compactAttemptID))
+        coordinator.compactTurnSettled(
+            revision: fake.completeRevision(status: .completed, runAttemptID: UUID()),
+            publication: .accepted(successorEpoch: nil), teardownSettled: { true }
+        )
+        XCTAssertEqual(fake.overflowVerificationCount, 0)
+        var drained = false
+        let revision = fake.completeRevision(status: .completed)
+        coordinator.compactTurnSettled(revision: revision, publication: .accepted(successorEpoch: nil), teardownSettled: { drained })
+        await drain()
+        XCTAssertEqual(fake.overflowVerificationCount, 0)
+        drained = true
+        let sleepers = fake.pendingSleeps
+        fake.pendingSleeps.removeAll()
+        sleepers.forEach { $0.resume() }
+        await drain()
+        coordinator.compactTurnSettled(revision: revision, publication: .accepted(successorEpoch: nil), teardownSettled: { true })
+        XCTAssertEqual(fake.overflowVerificationCount, 1)
+        XCTAssertEqual(fake.dispatchCount, 0)
+        XCTAssertEqual(fake.state.latest?.outcome, .compacted)
+        XCTAssertNil(fake.state.latest?.recoveryNote)
+    }
+
+    func testOverflowAdmissionAndReleaseRequireMeasuredContextAndHeadroom() {
+        XCTAssertFalse(ClaudeOverflowRecoveryPolicy.historyIsNearLimit(used: nil, window: 1_000_000))
+        XCTAssertFalse(ClaudeOverflowRecoveryPolicy.historyIsNearLimit(used: 899_999, window: 1_000_000))
+        XCTAssertTrue(ClaudeOverflowRecoveryPolicy.historyIsNearLimit(used: 977_902, window: 1_000_000))
+        XCTAssertFalse(ClaudeOverflowRecoveryPolicy.hasHeadroom(postTokens: 12329, window: nil))
+        XCTAssertFalse(ClaudeOverflowRecoveryPolicy.hasHeadroom(postTokens: 800_001, window: 1_000_000))
+        XCTAssertTrue(ClaudeOverflowRecoveryPolicy.hasHeadroom(postTokens: 12329, window: 1_000_000))
+    }
+
+    func testOverflowTeardownDoesNotParkAnyProviderInput() {
+        let fake = Fake()
+        _ = fake.arm()
+        fake.state.active?.claudeOverflowHoldID = UUID()
+        XCTAssertTrue(fake.state.releaseForRuntimeTeardown())
+        XCTAssertNil(fake.state.active)
+        XCTAssertNil(fake.state.parkedNote)
+        XCTAssertNil(fake.state.latest?.recoveryNote)
     }
 
     func testCodexRequiresCompactKindSuccessEvidence() async {

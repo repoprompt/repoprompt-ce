@@ -4,18 +4,22 @@ import RepoPromptDomainRuntime
 import RepoPromptMCPServer
 
 extension MCPHostRouteResources {
-    /// The existing complete catalog consumes this binder for both route kinds. Unmigrated
-    /// physical capabilities retain their original preparation and presenter requirements.
+    /// The existing catalog consumes this binder for both route kinds. Only explicitly migrated
+    /// capabilities may execute independently; unmigrated tools remain physical-window only.
     func makeToolBinder(
         service: MCPService,
         validateInvocation: @escaping MCPToolInvocationValidator,
         independentFileReads: Set<String> = [],
+        independentHostTools: Set<String> = [],
+        captureIndependentOrigin: (@MainActor (ToolInvocationContext) -> AgentSelfMCPCallOrigin?)? = nil,
         windowExecution: @escaping MCPAppToolBinder.ExecuteTool
     ) -> MCPAppToolBinder {
         MCPAppToolBinder(windowID: identity.routeID) { [self] name, freshness, arguments, implementation in
             try await invokeBoundTool(
                 service: service, name: name, freshness: freshness, arguments: arguments,
-                validateInvocation: validateInvocation, independentFileReads: independentFileReads, windowExecution: windowExecution, implementation: implementation
+                validateInvocation: validateInvocation, independentFileReads: independentFileReads,
+                independentHostTools: independentHostTools, captureIndependentOrigin: captureIndependentOrigin,
+                windowExecution: windowExecution, implementation: implementation
             )
         }
     }
@@ -23,24 +27,32 @@ extension MCPHostRouteResources {
     private func invokeBoundTool(
         service: MCPService, name: String, freshness: MCPToolFreshnessPolicy,
         arguments: [String: Value], validateInvocation: @escaping MCPToolInvocationValidator,
-        independentFileReads: Set<String>,
+        independentFileReads: Set<String>, independentHostTools: Set<String>,
+        captureIndependentOrigin: (@MainActor (ToolInvocationContext) -> AgentSelfMCPCallOrigin?)?,
         windowExecution: @escaping MCPAppToolBinder.ExecuteTool,
         implementation: @escaping MCPAppToolBinder.ProviderImplementation
     ) async throws -> Value {
         // Capture exactly once, before preparation or provider work can suspend.
         let context = try service.captureInvocationContext(toolName: name, expectedWindowID: identity.routeID)
-        if identity.kind == .independent,
-           name == MCPWindowToolName.history || independentFileReads.contains(name)
-        {
+        if identity.kind == .independent {
+            guard name == MCPWindowToolName.history || independentFileReads.contains(name) || independentHostTools.contains(name) else {
+                throw MCPError.invalidRequest("Tool \(name) is not supported by the independent Agent session route")
+            }
             // Only explicitly migrated read capabilities may use route-owned preparation.
             // A future freshness requirement must not be silently bypassed here.
             guard case .providerManaged = freshness else {
                 throw MCPError.internalError("Independent reads require their provider-managed freshness contract")
             }
+            let origin = captureIndependentOrigin?(context)
+            if captureIndependentOrigin != nil, independentHostTools.contains(name) || independentFileReads.contains(name), origin == nil {
+                throw ServerNetworkManager.ToolDispatchAdmissionError.windowTerminal
+            }
             return try await executeIndependentReadInvocation(
                 context, requiresBoundFileContext: independentFileReads.contains(name), validateInvocation: validateInvocation
             ) {
-                try await implementation(.init(toolName: name, windowID: self.identity.routeID, context: context), arguments)
+                try await AgentSelfMCPCallOrigin.currentTaskLocal.withValue(origin) {
+                    try await implementation(.init(toolName: name, windowID: self.identity.routeID, context: context), arguments)
+                }
             }
         }
         return try await MCPInvocationContextBridge.withInvocation(context) {

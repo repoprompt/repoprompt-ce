@@ -206,7 +206,7 @@ enum MCPAppPhysicalCapabilityAdapters {
     typealias FreezePromptGitReviewContext = @MainActor @Sendable (
         _ context: MCPTabContextSnapshot
     ) async -> FrozenPromptGitReviewContext
-    typealias ParseManageSelectionInputs = @Sendable (_ rawPaths: [String], _ slicesValue: Value?) -> MCPServerViewModel.ManageSelectionInputs
+    typealias ParseManageSelectionInputs = @Sendable (_ rawPaths: [String], _ slicesValue: Value?) -> MCPSelectionArguments.Inputs
     typealias ResolveFileToolLookupContext = @MainActor @Sendable (_ metadata: MCPRequestMetadata) async -> WorkspaceLookupContext
     typealias RequiredFileToolLookupContext = @MainActor @Sendable (_ metadata: MCPRequestMetadata) async throws -> MCPFrozenFileToolAuthority
     typealias ResolveMutationFileToolContext = @MainActor @Sendable (
@@ -248,7 +248,7 @@ enum MCPAppPhysicalCapabilityAdapters {
         _ reviewGitContext: FrozenPromptGitReviewContext?
     ) async throws -> ToolResultDTOs.SelectionReply
     typealias BuildManageSelectionSetSelection = @MainActor @Sendable (
-        _ inputs: MCPServerViewModel.ManageSelectionInputs,
+        _ inputs: MCPSelectionArguments.Inputs,
         _ mode: String,
         _ existing: StoredSelection,
         _ hasFullFileArtifactInputs: Bool,

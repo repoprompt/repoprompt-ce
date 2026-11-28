@@ -115,6 +115,172 @@ final class ACPAgentSessionControllerHostTests: XCTestCase {
         }
     }
 
+    func testAntigravityBootstrapKeepsRawFramesOutOfTimeoutDiagnostics() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("AntigravityStderr-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let script = directory.appendingPathComponent("agy-acp-fixture")
+        let warning = "W0906 123 local_connection.py:42] Retrying connection"
+        let marker = "raw-websocket-fixture-payload"
+        try #"""
+        #!/bin/sh
+        printf '%s\n' '\#(warning)' 'I0906 123 local_connection.py:42] RAW WS MSG: {"content":"\#(marker)"}' >&2
+        while IFS= read -r line; do :; done
+        """#.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
+
+        let provider = AntigravityACPAgentProvider(
+            executablePath: script.path,
+            harnessPath: nil,
+            installedRuntime: { nil },
+            prepareSessionHome: { directory },
+            toolNames: ACPToolNameResolution(
+                isRepoPromptServerIdentifier: { _ in false },
+                canonicalRepoPromptToolName: { _ in nil },
+                isRepoPromptToolNameWithServerPrefix: { _ in false }
+            ),
+            includeRepoPromptMCPServer: false
+        )
+        let request = ACPRunRequest(agentKind: .antigravity, modelString: nil, workspacePath: directory.path, resumeSessionID: nil, attachments: [], taskLabelKind: nil)
+        let controller = try ACPAgentSessionController(
+            provider: provider,
+            runRequest: request,
+            host: RecordingHost(),
+            diagnosticSink: { event in
+                if case let .stderrLine(line) = event {
+                    XCTAssertFalse(line.contains(marker))
+                }
+            },
+            requestTimeouts: .init(bootstrapSeconds: 2),
+            allowsProviderProcessLaunchForTesting: true
+        )
+        do {
+            _ = try await controller.bootstrap()
+            XCTFail("The fixture never responds to initialize.")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains(warning), error.localizedDescription)
+            XCTAssertFalse(error.localizedDescription.contains(marker))
+        }
+        await controller.shutdown()
+    }
+
+    func testAntigravityUnexpectedExitSurfacesLastStderrDiagnosticWithoutTranscriptSystemEvents() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("AntigravityExitStderr-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let startupInfo = "I1121 13:38:11.713540 8556827392 main.py:80] Starting AGY ACP Server..."
+        let fatalError = "E1121 13:38:11.900000 8556827392 main.py:99] OAuth token refresh failed: invalid_grant"
+        let rawMarker = "raw-websocket-exit-payload"
+        let unterminatedError = "fatal: missing credentials without trailing newline"
+
+        let cases: [(name: String, scriptBody: String, exitCode: Int32, expectedStderr: String)] = [
+            (
+                name: "discarded-frame-after-error",
+                scriptBody: #"""
+                #!/bin/sh
+                printf '%s\n' '\#(startupInfo)' '\#(fatalError)' 'I1121 13:38:11.901000 8556827392 local_connection.py:42] RAW WS MSG: {"content":"\#(rawMarker)"}' >&2
+                exit 7
+                """#,
+                exitCode: 7,
+                expectedStderr: fatalError
+            ),
+            (
+                name: "unterminated-stderr-flushed-on-exit",
+                scriptBody: #"""
+                #!/bin/sh
+                printf '%s\n' '\#(startupInfo)' >&2
+                printf '%s' '\#(unterminatedError)' >&2
+                exit 9
+                """#,
+                exitCode: 9,
+                expectedStderr: unterminatedError
+            )
+        ]
+
+        for testCase in cases {
+            let script = directory.appendingPathComponent("agy-exit-\(testCase.name)")
+            try testCase.scriptBody.write(to: script, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
+
+            let provider = AntigravityACPAgentProvider(
+                executablePath: script.path,
+                harnessPath: nil,
+                installedRuntime: { nil },
+                prepareSessionHome: { directory },
+                toolNames: ACPToolNameResolution(
+                    isRepoPromptServerIdentifier: { _ in false },
+                    canonicalRepoPromptToolName: { _ in nil },
+                    isRepoPromptToolNameWithServerPrefix: { _ in false }
+                ),
+                includeRepoPromptMCPServer: false
+            )
+            let request = ACPRunRequest(agentKind: .antigravity, modelString: nil, workspacePath: directory.path, resumeSessionID: nil, attachments: [], taskLabelKind: nil)
+            final class StderrRecorder: @unchecked Sendable {
+                private let lock = NSLock()
+                private var storage: [String] = []
+                var lines: [String] {
+                    lock.withLock { storage }
+                }
+
+                func append(_ line: String) {
+                    lock.withLock { storage.append(line) }
+                }
+            }
+            let recordedDiagnostics = StderrRecorder()
+            let controller = try ACPAgentSessionController(
+                provider: provider,
+                runRequest: request,
+                host: RecordingHost(),
+                diagnosticSink: { event in
+                    if case let .stderrLine(line) = event {
+                        XCTAssertFalse(line.contains(rawMarker))
+                        recordedDiagnostics.append(line)
+                    }
+                },
+                requestTimeouts: .init(bootstrapSeconds: 5),
+                allowsProviderProcessLaunchForTesting: true
+            )
+
+            let events = await controller.events
+            let collected = Task { () -> [AIStreamResult] in
+                var results: [AIStreamResult] = []
+                for await event in events {
+                    if case let .stream(result) = event {
+                        results.append(result)
+                    }
+                }
+                return results
+            }
+
+            do {
+                _ = try await controller.bootstrap()
+                XCTFail("Expected unexpected exit for \(testCase.name)")
+            } catch {
+                let description = error.localizedDescription
+                XCTAssertTrue(description.contains("code \(testCase.exitCode)"), description)
+                XCTAssertTrue(description.contains(testCase.expectedStderr), description)
+                XCTAssertFalse(description.contains(rawMarker), description)
+            }
+
+            await controller.shutdown()
+            let results = await collected.value
+            XCTAssertFalse(results.contains { $0.type == "system" }, "Unexpected system events for \(testCase.name): \(results)")
+            XCTAssertTrue(
+                results.contains {
+                    $0.type == "error"
+                        && ($0.text?.contains("code \(testCase.exitCode)") == true)
+                        && ($0.text?.contains(testCase.expectedStderr) == true)
+                        && ($0.text?.contains(rawMarker) == false)
+                },
+                "Expected error event with stderr preview for \(testCase.name), got: \(results)"
+            )
+            XCTAssertTrue(recordedDiagnostics.lines.contains(startupInfo))
+            XCTAssertTrue(recordedDiagnostics.lines.contains(testCase.expectedStderr))
+        }
+    }
+
     func testRequiredHostRoutesLaunchAndReadsRegistryAtSelectionTime() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ACPHost-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -189,6 +355,158 @@ final class ACPAgentSessionControllerHostTests: XCTestCase {
             throw error
         }
     }
+
+    /// #1699: Devin's retryable `EmptyResponse` fails only the turn. The live process and session
+    /// stay open, nothing is cancelled or resent, and the next explicit prompt runs in that session.
+    /// A steer already waiting on the turn when the error lands is refused, as after any failed turn.
+    func testDevinEmptyResponseFailsTheTurnButKeepsTheSessionForTheNextPrompt() async throws {
+        for (retryable, steers) in [(true, false), (false, false), (true, true)] {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ACPEmptyResponse-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let script = directory.appendingPathComponent("server.py")
+            let observations = directory.appendingPathComponent("requests.jsonl")
+            try #"""
+            import json, os, sys
+            prompts = 0
+            held = None
+            for line in sys.stdin:
+                request = json.loads(line)
+                with open(os.environ['OBS_FILE'], 'a') as output:
+                    output.write(json.dumps(request) + '\n')
+                if request.get('method') == 'session/cancel' and held is not None:
+                    error = json.loads(os.environ['FIXTURE_PROMPT_ERROR'])
+                    print(json.dumps({'jsonrpc': '2.0', 'id': held, 'error': error}), flush=True)
+                    held = None
+                    continue
+                if 'id' not in request: continue
+                method = request.get('method')
+                reply = {'jsonrpc': '2.0', 'id': request['id'], 'result': {}}
+                if method == 'initialize':
+                    reply['result'] = {'agentCapabilities': {}}
+                elif method == 'session/new':
+                    reply['result'] = {'sessionId': 'devin-session'}
+                elif method == 'session/prompt':
+                    prompts += 1
+                    if prompts == 1 and \#(steers ? "True" : "False"):
+                        held = request['id']
+                        continue
+                    if prompts == 1:
+                        del reply['result']
+                        reply['error'] = json.loads(os.environ['FIXTURE_PROMPT_ERROR'])
+                    else:
+                        reply['result'] = {'stopReason': 'end_turn'}
+                print(json.dumps(reply), flush=True)
+            """#.write(to: script, atomically: true, encoding: .utf8)
+            let promptError: [String: Any] = [
+                "code": -32021,
+                "message": "The model ended its turn without a response. Send a message to continue.",
+                "data": ["cognition.ai/errorKind": "empty_response", "cognition.ai/retryable": retryable]
+            ]
+            var provider = FixtureProvider(providerID: .grokBuild, script: script.path, observations: observations.path)
+            provider.promptError = try String(decoding: JSONSerialization.data(withJSONObject: promptError), as: UTF8.self)
+            provider.promptErrorClassifier = makeDevinProvider()
+            let host = RecordingHost(allowsDiagnostics: true)
+            let request = ACPRunRequest(agentKind: .grokBuild, modelString: nil, workspacePath: directory.path, resumeSessionID: nil, attachments: [], taskLabelKind: nil)
+            let controller = try ACPAgentSessionController(provider: provider, runRequest: request, host: host, allowsProviderProcessLaunchForTesting: true)
+            addTeardownBlock { await controller.shutdown() }
+            _ = try await controller.bootstrap()
+            let message = AgentMessage(systemPrompt: "", userMessage: "Run the tools", resumeSessionID: nil)
+
+            let firstEvents = await controller.events
+            let firstPrompt = Task { try await controller.prompt(message) }
+            if steers {
+                var sent = false
+                for _ in 0 ..< 100 where !sent {
+                    sent = try recordedMethods(at: observations).contains("session/prompt")
+                    if !sent { try await Task.sleep(nanoseconds: 20_000_000) }
+                }
+                do {
+                    try await controller.interruptActivePromptForSteering()
+                    XCTFail("A steer waiting on the turn when the provider ends it must be refused")
+                } catch {}
+            }
+            do {
+                try await firstPrompt.value
+                XCTFail("The provider error must fail the turn")
+            } catch {
+                XCTAssertEqual(error is ACPSessionPreservingPromptFailure, retryable, "\(error)")
+            }
+            let firstTerminal = await terminalEvent(in: firstEvents)
+            XCTAssertEqual(firstTerminal?.state, .failed)
+            let reusable = await controller.hasReusableSession
+            let retained = await controller.retainsSessionAfterLastPromptFailure
+            XCTAssertEqual(reusable, retryable)
+            XCTAssertEqual(retained, retryable)
+            let methods = try recordedMethods(at: observations)
+            XCTAssertEqual(methods.count(where: { $0 == "session/prompt" }), 1, "The failed turn must never be resent")
+
+            guard retryable else {
+                XCTAssertTrue(try XCTUnwrap(firstTerminal?.errorText).contains("cognition.ai"), "Unclassified errors keep today's detail")
+                let retired = await controller.isRetired
+                XCTAssertTrue(retired)
+                var cancelled = false
+                for _ in 0 ..< 100 where !cancelled {
+                    cancelled = try recordedMethods(at: observations).contains("session/cancel")
+                    if !cancelled { try await Task.sleep(nanoseconds: 50_000_000) }
+                }
+                XCTAssertTrue(cancelled, "An ordinary prompt failure still cancels the provider turn")
+                continue
+            }
+            XCTAssertEqual(firstTerminal?.errorText, DevinACPAgentProvider.emptyResponseUserMessage)
+            do {
+                try await controller.interruptActivePromptForSteering()
+                XCTFail("Steering into the failed turn's run must be refused, as after any failed turn")
+            } catch {}
+            let prepared = await controller.prepareForNextTurn()
+            XCTAssertTrue(prepared)
+            let secondEvents = await controller.events
+            try await controller.prompt(message)
+            let secondTerminal = await terminalEvent(in: secondEvents)
+            XCTAssertEqual(secondTerminal?.state, .completed)
+            let retainedAfterSuccess = await controller.retainsSessionAfterLastPromptFailure
+            XCTAssertFalse(retainedAfterSuccess)
+            let allMethods = try recordedMethods(at: observations)
+            XCTAssertEqual(allMethods.count(where: { $0 == "initialize" }), 1, "The next prompt must reuse the live process")
+            XCTAssertEqual(allMethods.count(where: { $0 == "session/new" }), 1)
+            XCTAssertEqual(allMethods.count(where: { $0 == "session/prompt" }), 2)
+            XCTAssertFalse(allMethods.contains("session/load"))
+            XCTAssertEqual(allMethods.count(where: { $0 == "session/cancel" }), steers ? 1 : 0, "Only the steer cancels")
+            XCTAssertEqual(host.events().count(where: { $0 == "register" }), 1)
+        }
+    }
+
+    private func terminalEvent(in events: AsyncStream<NormalizedAgentRuntimeEvent>) async -> (state: AgentSessionRunState, errorText: String?)? {
+        for await event in events {
+            if case let .terminal(state, errorText) = event { return (state, errorText) }
+        }
+        return nil
+    }
+
+    private func makeDevinProvider() -> DevinACPAgentProvider {
+        DevinACPAgentProvider(
+            config: DevinAgentConfig(additionalPathHints: []),
+            repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration(name: "fixture-host", command: "/usr/bin/true"),
+            launchResolver: DevinACPLaunchResolver(
+                launchEnvironmentProvider: { _ in ACPLaunchEnvironment(environment: [:]) },
+                supplementalPathProvider: { $0 },
+                environmentFilter: { value, _ in value },
+                failureRecorder: { _, _ in }
+            ),
+            isolateForeignMCPImports: false,
+            toolNames: ACPToolNameResolution(isRepoPromptServerIdentifier: { _ in false }, canonicalRepoPromptToolName: { _ in nil }, isRepoPromptToolNameWithServerPrefix: { _ in false }),
+            permissionArguments: { _ in [] },
+            prepareIntegration: { _, _, _, _ in throw CancellationError() },
+            cleanupIntegration: { _ in }
+        )
+    }
+}
+
+private func recordedMethods(at url: URL) throws -> [String] {
+    try String(contentsOf: url, encoding: .utf8).split(separator: "\n").compactMap { line in
+        let request = try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+        return request?["method"] as? String
+    }
 }
 
 private struct FixtureProvider: ACPAgentProvider, ACPDirectSessionModelProvider {
@@ -197,6 +515,9 @@ private struct FixtureProvider: ACPAgentProvider, ACPDirectSessionModelProvider 
     let observations: String
     var emitsFixtureText = false
     var responseText: String?
+    var promptError: String?
+    /// Classifies prompt errors with Devin's shipped rules.
+    var promptErrorClassifier: DevinACPAgentProvider?
 
     func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
         .supported
@@ -206,6 +527,9 @@ private struct FixtureProvider: ACPAgentProvider, ACPDirectSessionModelProvider 
         var environment = ["OBS_FILE": observations]
         if let responseText {
             environment["FIXTURE_RESPONSE"] = responseText
+        }
+        if let promptError {
+            environment["FIXTURE_PROMPT_ERROR"] = promptError
         }
         return ACPLaunchConfiguration(providerID: providerID, command: "/usr/bin/python3", arguments: ["-u", script], environment: environment, workingDirectory: nil, additionalPathHints: [], enableDebugLogging: false)
     }
@@ -232,6 +556,10 @@ private struct FixtureProvider: ACPAgentProvider, ACPDirectSessionModelProvider 
 
     func normalizeError(_ error: Error) -> Error {
         error
+    }
+
+    func sessionPreservingPromptFailure(forResponseError error: [String: Any]) -> ACPSessionPreservingPromptFailure? {
+        promptErrorClassifier?.sessionPreservingPromptFailure(forResponseError: error)
     }
 
     func parseDirectSessionModelSnapshot(from _: [String: Any]) -> ACPProviderModelSnapshotResult {
@@ -600,12 +928,5 @@ final class ACPCLIProviderExecutionTests: XCTestCase {
             print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
         """#.write(to: script, atomically: true, encoding: .utf8)
         return (directory, observations, FixtureProvider(providerID: consumer.providerID, script: script.path, observations: observations.path, emitsFixtureText: true))
-    }
-
-    private func recordedMethods(at url: URL) throws -> [String] {
-        try String(contentsOf: url, encoding: .utf8).split(separator: "\n").compactMap { line in
-            let request = try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
-            return request?["method"] as? String
-        }
     }
 }

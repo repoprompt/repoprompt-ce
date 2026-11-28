@@ -52,11 +52,43 @@ package struct ProviderAccountKey: Hashable, CustomStringConvertible, CustomDebu
     /// Credential profile identity, not a token or an inferred account identifier.
     package let credentialProfileID: String?
 
+    private struct ManagedScope: Hashable {
+        // Swift String equality treats canonically equivalent Unicode spellings as equal.
+        // Provider-issued opaque IDs have no such normalization contract.
+        let exactPrincipal: Data
+        let identityEpoch: UUID
+        let credentialGeneration: UUID
+    }
+
+    private let managedScope: ManagedScope?
+
     package init(lineage: ProviderQuotaLineage, opaqueAccountID: String?, credentialProfileID: String? = nil) {
         self.credentialProfileID = credentialProfileID
+        managedScope = nil
         self.lineage = lineage
         let trimmed = opaqueAccountID?.trimmingCharacters(in: .whitespacesAndNewlines)
         self.opaqueAccountID = (trimmed?.isEmpty == false) ? trimmed : nil
+    }
+
+    /// Construct only from a caller's verified subscription admission. This key does not
+    /// verify credentials itself. A new credential generation cannot merge earlier observations.
+    package init?(
+        managedSubscriptionLineage lineage: ProviderQuotaLineage,
+        verifiedPrincipal: String,
+        profileID: UUID,
+        identityEpoch: UUID,
+        credentialGeneration: UUID
+    ) {
+        guard lineage == .codexFirstParty || lineage == .anthropicFirstParty,
+              !verifiedPrincipal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        self.lineage = lineage
+        opaqueAccountID = verifiedPrincipal
+        credentialProfileID = profileID.uuidString
+        managedScope = ManagedScope(
+            exactPrincipal: Data(verifiedPrincipal.utf8),
+            identityEpoch: identityEpoch,
+            credentialGeneration: credentialGeneration
+        )
     }
 
     package static func codex(accountID: String?) -> Self {
@@ -68,10 +100,10 @@ package struct ProviderAccountKey: Hashable, CustomStringConvertible, CustomDebu
         opaqueAccountID != nil
     }
 
-    /// Two keys refer to the same account only when lineage matches and neither side is
-    /// contradicted by a known identifier. An unidentified key never claims equality with an
-    /// identified one from a different account.
+    /// Managed subscriptions require exact equality, even across a reconnect to the same
+    /// principal. Legacy providers retain sparse attribution for notifications with no ID.
     package func refersToSameAccount(as other: ProviderAccountKey) -> Bool {
+        if managedScope != nil || other.managedScope != nil { return self == other }
         guard lineage == other.lineage, credentialProfileID == other.credentialProfileID else { return false }
         switch (opaqueAccountID, other.opaqueAccountID) {
         case let (lhs?, rhs?): return lhs == rhs

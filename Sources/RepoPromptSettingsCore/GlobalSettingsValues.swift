@@ -259,7 +259,8 @@ package struct GlobalDefaults: Codable, Equatable {
 
 // MARK: - Scalar Settings Snapshots
 
-package struct FileSystemSettingsSnapshot: Equatable {
+// swiftformat:disable:next redundantSendable
+package struct FileSystemSettingsSnapshot: Equatable, Sendable {
     package var respectRepoIgnore: Bool
     package var respectCursorignore: Bool
     package var globalIgnoreDefaults: String

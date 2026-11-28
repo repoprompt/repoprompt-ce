@@ -263,9 +263,11 @@ struct DomainWorkspaceAuthorityClient {
         _ document: DomainWorkspaceDocument,
         expectedWorkspaceRevision: UInt64,
         expectedContentDigest: String,
-        operationIDs: DomainWorkspaceSaveOperationIDs = .init()
+        operationIDs: DomainWorkspaceSaveOperationIDs = .init(),
+        origin: DomainCommandOrigin? = nil
     ) async throws -> DomainWorkspaceFailClosedSaveOutcome {
         try Task.checkCancellation()
+        let writeOrigin = origin ?? .appPresentation(windowID: windowID)
         var saveRevision = expectedWorkspaceRevision
         var workingOutcome: DomainCommandOutcome?
         if document.contentDigest != expectedContentDigest {
@@ -273,7 +275,7 @@ struct DomainWorkspaceAuthorityClient {
                 operationID: operationIDs.working,
                 expectedWorkspaceRevision: expectedWorkspaceRevision,
                 conflictRecoveryPolicy: .failClosed,
-                origin: .appPresentation(windowID: windowID),
+                origin: writeOrigin,
                 command: .replaceWorkingDocument(document)
             ))
             workingOutcome = working
@@ -291,7 +293,7 @@ struct DomainWorkspaceAuthorityClient {
             operationID: operationIDs.saved,
             expectedWorkspaceRevision: saveRevision,
             conflictRecoveryPolicy: .failClosed,
-            origin: .appPresentation(windowID: windowID),
+            origin: writeOrigin,
             command: .saveWorkspaceDocument(workspaceID: document.workspaceID)
         ))
         return DomainWorkspaceFailClosedSaveOutcome(

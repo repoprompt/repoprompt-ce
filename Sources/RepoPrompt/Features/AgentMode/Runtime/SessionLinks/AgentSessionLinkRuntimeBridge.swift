@@ -169,13 +169,32 @@ protocol PreparedAgentSessionRuntimeRegistry: AnyObject {
     func finishPreparedRuntimeVisit(_ sessionID: UUID)
     func releasePreparedOversightOwnerForVisit(sessionID: UUID, preparingReplacement: Bool) async -> Bool
     func queuePreparedRuntimeVisit(_ sessionID: UUID, resume: @escaping @MainActor () async -> Void)
+    func beginRuntimeVisitIntent(_ sessionID: UUID) -> UUID?
+    func isRuntimeVisitIntentCurrent(_ sessionID: UUID, intent: UUID?) -> Bool
+    func queuePreparedRuntimeVisit(_ sessionID: UUID, intent: UUID?, resume: @escaping @MainActor () async -> Void)
     func beginPreparedOversightPreparation(_ id: UUID)
     func endPreparedOversightPreparation(_ id: UUID)
     func prepareScopedSavedTarget(_ sessionID: UUID, isStillAuthorized: @escaping @MainActor () -> Bool) async -> Bool
 }
 
+extension PreparedAgentSessionRuntimeRegistry {
+    func beginRuntimeVisitIntent(_ sessionID: UUID) -> UUID? {
+        nil
+    }
+
+    func isRuntimeVisitIntentCurrent(_ sessionID: UUID, intent: UUID?) -> Bool {
+        true
+    }
+
+    func queuePreparedRuntimeVisit(_ sessionID: UUID, intent: UUID?, resume: @escaping @MainActor () async -> Void) {
+        queuePreparedRuntimeVisit(sessionID, resume: resume)
+    }
+}
+
 @MainActor
 protocol AgentSessionLinkEndpointHost: AnyObject {
+    func retryRetainedAgentHostDrain(warningID: String) async
+
     /// Exact bounded retained-input lookup. Metadata-only lifecycle calls never copy text.
     func agentSessionLinkLocalInputSnapshot(for endpoint: DomainAgentSessionLinkEndpointIdentity, includeRecords: Bool) -> AgentSessionLinkRetainedLocalInputIndex.Snapshot?
 
@@ -598,6 +617,8 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
 /// topology at all. The defaults are the conservative ones: no descriptors, no discovery level, and a
 /// pending topology, which together mean automatic restoration never runs against such a host.
 extension AgentSessionLinkEndpointHost {
+    func retryRetainedAgentHostDrain(warningID _: String) async {}
+
     func agentSessionLinkWillActivate(_: DomainAgentSessionLinkEndpointIdentity) async {}
 
     /// Full choice discovery remains rich by default; cheap topology discovery is explicit.
@@ -2009,8 +2030,8 @@ final class AgentSessionLinkRuntimeBridge {
     }
 
     /// Records a bounded, identifier-free warning and repaints every window.
-    func reportPersistenceWarning(id: String, message: String) {
-        guard persistencePresentation.appendWarning(id: id, message: message) else {
+    func reportPersistenceWarning(id: String, message: String, canRetrySessionSettlement: Bool = false) {
+        guard persistencePresentation.appendWarning(id: id, message: message, canRetrySessionSettlement: canRetrySessionSettlement) else {
             publishPersistencePresentation()
             return
         }
@@ -2024,6 +2045,12 @@ final class AgentSessionLinkRuntimeBridge {
     func dismissPersistenceWarnings(ids: Set<String>) {
         guard persistencePresentation.dismissWarnings(ids: ids) else { return }
         publishPersistencePresentation()
+    }
+
+    func retrySessionSettlement(warningID: String) async {
+        guard !isFrozenForTermination,
+              persistencePresentation.warnings.contains(where: { $0.id == warningID && $0.canRetrySessionSettlement }) else { return }
+        await host?.retryRetainedAgentHostDrain(warningID: warningID)
     }
 
     /// One of the few permitted cleanup retry triggers.
@@ -4578,6 +4605,7 @@ final class AgentSessionLinkRuntimeBridge {
             // Seen state is generation-qualified: a fresh re-add of the same pair baselines against
             // current activity instead of inheriting an acknowledgement made under removed authority.
             monitorSeenByReference.removeValue(forKey: reference)
+            AgentSessionLinkExecutionRuntime.cancelRunStartedByRevokedLink(notice)
             // The exact grant already ended. A saved relationship's history ends only when
             // its token-qualified retirement succeeds.
             let hasDurableIntent = capturedBookkeeping[reference]?.token != nil
@@ -6558,11 +6586,16 @@ final class AgentSessionLinkRuntimeBridge {
         }
     }
 
+    struct AttentionObserverCandidate: Equatable {
+        let sessionID: UUID
+        let displayName: String?
+    }
+
     enum AttentionRequestDisposition: Equatable {
         case accepted(hasWaitingOn: Bool)
         case atCapacity
         /// Candidate UUIDs are present only when the caller omitted `observer_session_id`.
-        case ambiguous(candidateObserverSessionIDs: [UUID]?, omittedCandidateCount: Int)
+        case ambiguous(candidates: [AttentionObserverCandidate]?, omittedCandidateCount: Int)
         case denied
         case shuttingDown
     }
@@ -6594,7 +6627,11 @@ final class AgentSessionLinkRuntimeBridge {
         case let .success(value):
             authorization = value
         case let .failure(error):
-            return Self.attentionDisposition(for: error, selectorWasOmitted: observerSessionID == nil)
+            return attentionDisposition(
+                for: error,
+                selectorWasOmitted: observerSessionID == nil,
+                liveEndpoints: initialLiveEndpoints
+            )
         }
 
         // An active inverse grant can precede this bridge's observer-local baseline publication.
@@ -6650,7 +6687,11 @@ final class AgentSessionLinkRuntimeBridge {
             authorization,
             liveEndpoints: currentLiveEndpoints
         ) {
-            return Self.attentionDisposition(for: error, selectorWasOmitted: observerSessionID == nil)
+            return attentionDisposition(
+                for: error,
+                selectorWasOmitted: observerSessionID == nil,
+                liveEndpoints: currentLiveEndpoints
+            )
         }
         guard !isFrozenForTermination else { return .shuttingDown }
 
@@ -6752,20 +6793,35 @@ final class AgentSessionLinkRuntimeBridge {
         return candidates
     }
 
-    private static func attentionDisposition(
+    private func attentionDisposition(
         for error: DomainAgentSessionLinkAuthority.RequestAttentionAuthorizationError,
-        selectorWasOmitted: Bool
+        selectorWasOmitted: Bool,
+        liveEndpoints: Set<DomainAgentSessionLinkEndpointIdentity>
     ) -> AttentionRequestDisposition {
         switch error {
         case .denied:
-            .denied
+            return .denied
         case let .ambiguousObserver(candidateObserverSessionIDs, omittedCandidateCount):
-            .ambiguous(
-                candidateObserverSessionIDs: selectorWasOmitted ? candidateObserverSessionIDs : nil,
-                omittedCandidateCount: selectorWasOmitted ? omittedCandidateCount : 0
-            )
+            guard selectorWasOmitted else {
+                return .ambiguous(candidates: nil, omittedCandidateCount: 0)
+            }
+            let endpointsBySessionID = Dictionary(grouping: liveEndpoints, by: \.sessionID)
+            let candidates = candidateObserverSessionIDs.map { sessionID in
+                // A UUID shared by multiple live endpoints cannot identify the authorized name source.
+                guard let endpoints = endpointsBySessionID[sessionID], endpoints.count == 1,
+                      let endpoint = endpoints.first,
+                      let candidate = host?.agentSessionLinkCandidate(for: endpoint, includeLocation: false),
+                      candidate.domainEndpoint == endpoint,
+                      let name = DomainAgentSessionLinkTextBudget.normalized(
+                          candidate.displayName,
+                          maxBytes: DomainAgentSessionLinkTextBudget.displayNameMaxBytes
+                      ), !name.isEmpty
+                else { return AttentionObserverCandidate(sessionID: sessionID, displayName: nil) }
+                return AttentionObserverCandidate(sessionID: sessionID, displayName: name)
+            }
+            return .ambiguous(candidates: candidates, omittedCandidateCount: omittedCandidateCount)
         case .runtimeShuttingDown:
-            .shuttingDown
+            return .shuttingDown
         }
     }
 
@@ -7018,6 +7074,16 @@ final class AgentSessionLinkRuntimeBridge {
             }
         }
         await reconcile(after: notices, capturedBookkeeping: capturedBookkeeping)
+    }
+
+    /// Synchronous endpoint fence for preparation and commits that already own consent.
+    func exactOverseeRequesterIsCurrent(_ endpoint: DomainAgentSessionLinkEndpointIdentity) -> Bool {
+        guard !isFrozenForTermination, !Task.isCancelled,
+              let candidate = host?.agentSessionLinkCandidate(for: endpoint, includeLocation: false),
+              candidate.domainEndpoint == endpoint else { return false }
+        return AgentSessionLinkEndpointEligibility.addDisabledReason(
+            candidate.eligibilityInput, roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring
+        ) == nil
     }
 
     /// Resolves and re-checks the caller for a targetless operation.
@@ -8755,7 +8821,8 @@ final class AgentSessionLinkRuntimeBridge {
         // No suspension from the stable inventory/authorization fence through count and reserve.
         let ticket = UUID()
         let admittedCount = admittedLaneCount(creatorSessionID: creatorID, linkedIDs: linkedIDs)
-        guard delegationScopes.authorization.admitsAdditionalLane(admittedLaneCount: admittedCount)
+        let laneAdmission = delegationScopes.authorization.laneAdmissionDecision(admittedLaneCount: admittedCount)
+        guard laneAdmission.admitted
         else { return .refused(.laneLimitReached, laneCount: admittedCount) }
         laneCreationCapReservations[creatorID, default: [:]][ticket] = .pending
         laneCreationCapGeneration[creatorID, default: 0] &+= 1
@@ -8769,7 +8836,8 @@ final class AgentSessionLinkRuntimeBridge {
         return await performLaneCreation(
             observerEndpoint: observerEndpoint, callerBasis: callerBasis, request: request, selection: selection,
             destinationWindowID: destination.windowID, workspaceID: destination.workspaceID,
-            workspaceName: destination.workspaceName, reservationTicket: ticket
+            workspaceName: destination.workspaceName, reservationTicket: ticket,
+            laneQuotaWaived: laneAdmission.quotaWaived
         )
     }
 
@@ -8781,7 +8849,8 @@ final class AgentSessionLinkRuntimeBridge {
         destinationWindowID: Int,
         workspaceID: UUID,
         workspaceName: String,
-        reservationTicket: UUID
+        reservationTicket: UUID,
+        laneQuotaWaived: Bool
     ) async -> AgentSessionLaneCreateReceipt {
         guard !isFrozenForTermination, !Task.isCancelled, let host else {
             return .refused(.shuttingDown)
@@ -8827,6 +8896,7 @@ final class AgentSessionLinkRuntimeBridge {
                     sessionName: request.sessionName, linked: false, reason: reason, firstTask: .none,
                     laneCount: linkedCreatedLaneIDs(creatorSessionID: observerEndpoint.sessionID).ids.count
                 )
+                receipt.laneQuotaWaived = laneQuotaWaived
                 receipt.workspaceName = workspaceName
             } else {
                 receipt = .refused(reason)
@@ -8879,6 +8949,7 @@ final class AgentSessionLinkRuntimeBridge {
                 reason: reason, firstTask: firstTask, laneCount: count
             )
             value.firstTaskReason = firstTaskReason
+            value.laneQuotaWaived = laneQuotaWaived
             value.workspaceName = workspaceName
             return value
         }

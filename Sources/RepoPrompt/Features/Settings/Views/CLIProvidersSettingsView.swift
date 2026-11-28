@@ -171,6 +171,7 @@ struct CLIProvidersSettingsView: View {
                 // CLI providers.
                 codexCard
                 claudeCodeCard
+                SubscriptionAccountsReadOnlySection()
                 claudeCompatibleBackendsSection
                 openCodeCard
                 cursorCard
@@ -2344,6 +2345,8 @@ struct CLIProvidersSettingsView: View {
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
+
+                ProviderUsageQuotaSection(provider: .antigravity)
             }
         }
     }

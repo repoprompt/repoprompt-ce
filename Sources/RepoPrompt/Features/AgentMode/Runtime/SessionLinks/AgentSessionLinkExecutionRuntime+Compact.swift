@@ -354,7 +354,8 @@ extension AgentSessionLinkExecutionRuntime {
             let providerCommand = AgentProviderControlCommand.compact(
                 expectedBinding: binding,
                 expectedProviderConversation: conversation,
-                selfCompactDispatchID: selfCompactDispatchID
+                selfCompactDispatchID: selfCompactDispatchID,
+                isClaudeOverflowRecovery: selfCompactDispatchID != nil && session.selfCompactState.active?.claudeOverflowHoldID != nil
             )
             let recorder = AgentRunStartOutcomeRecorder()
             _ = await startAgentRun(

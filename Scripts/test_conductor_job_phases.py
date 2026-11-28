@@ -172,7 +172,7 @@ class DaemonStateTests(unittest.TestCase):
         root = Path(self._tmp.name)
         state_dir = root / "state"
         jobs_dir = state_dir / "jobs"
-        jobs_dir.mkdir(parents=True)
+        jobs_dir.mkdir(mode=0o700, parents=True)
         self.paths = conductor.Paths(
             repo_root=root,
             repo_hash="0" * 64,
@@ -214,17 +214,17 @@ class DaemonStateTests(unittest.TestCase):
 
     def test_retention_expires_timing_records_with_their_logs(self) -> None:
         stale = time.time() - conductor.TERMINAL_RETENTION_SECONDS - 60
-        names = ("old.log", "old.timing.json", "kept.log", "kept.timing.json")
+        old = "11111111-1111-4111-8111-111111111111"
+        kept = "22222222-2222-4222-8222-222222222222"
+        names = (f"{old}.log", f"{old}.timing.json", f"{kept}.log", f"{kept}.timing.json")
         for name in names:
             path = self.paths.jobs_dir / name
             path.write_text("{}")
             os.utime(path, (stale, stale))
-        self.state.jobs["kept"] = make_job(log_path=self.paths.jobs_dir / "kept.log", ticket="kept")
-        self.state._retention_external(
-            self.state._retention_generation, (), frozenset({"kept.log"}), frozenset()
-        )
+        self.state.jobs[kept] = make_job(log_path=self.paths.jobs_dir / f"{kept}.log", ticket=kept)
+        self.state._retention_external(self.state._retention_generation, ())
         remaining = sorted(path.name for path in self.paths.jobs_dir.iterdir())
-        self.assertEqual(remaining, ["kept.log", "kept.timing.json"])
+        self.assertEqual(remaining, [f"{kept}.log", f"{kept}.timing.json"])
 
 
 class PeakRssTests(unittest.TestCase):

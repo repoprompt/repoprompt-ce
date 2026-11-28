@@ -1074,6 +1074,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
     }
 
     package struct FileSystemSettings: Codable, Equatable {
+        package var respectGitignore: Bool?
         package var respectRepoIgnore: Bool?
         package var respectCursorignore: Bool?
         package var globalIgnoreDefaults: String?
@@ -1082,6 +1083,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
         package var showEmptyFolders: Bool?
 
         package init(
+            respectGitignore: Bool? = nil,
             respectRepoIgnore: Bool? = nil,
             respectCursorignore: Bool? = nil,
             globalIgnoreDefaults: String? = nil,
@@ -1089,6 +1091,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             skipSymlinks: Bool? = nil,
             showEmptyFolders: Bool? = nil
         ) {
+            self.respectGitignore = respectGitignore
             self.respectRepoIgnore = respectRepoIgnore
             self.respectCursorignore = respectCursorignore
             self.globalIgnoreDefaults = globalIgnoreDefaults
@@ -1161,6 +1164,8 @@ package struct GlobalScalarPreferences: Codable, Equatable {
         /// Default-off opt-in flags only; quota readings themselves are never persisted.
         /// `codexUsageQuotaEnabled` authorizes the Codex app-server quota source.
         package var codexUsageQuotaEnabled: Bool?
+        /// Allows explicit Antigravity CLI usage reads, never background collection.
+        package var antigravityUsageQuotaEnabled: Bool?
         /// Legacy name. Gates passive Claude run rate-limit telemetry only; it never authorizes
         /// an account usage read and is never migrated into `claudeAccountUsageGrant`.
         package var claudeUsageQuotaEnabled: Bool?
@@ -1175,6 +1180,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
         package var providerConversationCleanupAction: String?
         package var restrictMCPAgentDiscoveryToRoleLabels: Bool?
         package var agentSessionHandoffInstructions: String?
+        package var claudeWakeCompactionThresholdPercent: Int?
         package var subagentDefaultWaitSeconds: Int?
         /// App-global UI preference; skips only the confirmation dialog, never authority.
         package var suppressOversightLinkConfirmation: Bool?
@@ -1204,6 +1210,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             codexHookApprovalStrictModeEnabled: Bool? = nil,
             codexHookApprovalStrictModeWorkspaceOverrides: [String: Bool]? = nil,
             codexUsageQuotaEnabled: Bool? = nil,
+            antigravityUsageQuotaEnabled: Bool? = nil,
             claudeUsageQuotaEnabled: Bool? = nil,
             usageLimitsDisplayEnabled: Bool? = nil,
             claudeAccountUsageGrant: ClaudeAccountUsageGrant? = nil,
@@ -1211,6 +1218,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             providerConversationCleanupAction: String? = nil,
             restrictMCPAgentDiscoveryToRoleLabels: Bool? = nil,
             agentSessionHandoffInstructions: String? = nil,
+            claudeWakeCompactionThresholdPercent: Int? = nil,
             subagentDefaultWaitSeconds: Int? = nil,
             suppressOversightLinkConfirmation: Bool? = nil,
             providerEnvironmentWithheldNames: [String]? = nil,
@@ -1237,6 +1245,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             self.codexHookApprovalStrictModeEnabled = codexHookApprovalStrictModeEnabled
             self.codexHookApprovalStrictModeWorkspaceOverrides = codexHookApprovalStrictModeWorkspaceOverrides
             self.codexUsageQuotaEnabled = codexUsageQuotaEnabled
+            self.antigravityUsageQuotaEnabled = antigravityUsageQuotaEnabled
             self.claudeUsageQuotaEnabled = claudeUsageQuotaEnabled
             self.usageLimitsDisplayEnabled = usageLimitsDisplayEnabled
             self.claudeAccountUsageGrant = claudeAccountUsageGrant
@@ -1244,6 +1253,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             self.providerConversationCleanupAction = providerConversationCleanupAction
             self.restrictMCPAgentDiscoveryToRoleLabels = restrictMCPAgentDiscoveryToRoleLabels
             self.agentSessionHandoffInstructions = agentSessionHandoffInstructions
+            self.claudeWakeCompactionThresholdPercent = claudeWakeCompactionThresholdPercent
             self.subagentDefaultWaitSeconds = subagentDefaultWaitSeconds
             self.suppressOversightLinkConfirmation = suppressOversightLinkConfirmation
             self.providerEnvironmentWithheldNames = providerEnvironmentWithheldNames

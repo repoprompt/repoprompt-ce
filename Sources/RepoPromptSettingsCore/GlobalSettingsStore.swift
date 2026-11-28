@@ -996,6 +996,16 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         }
     }
 
+    package func respectGitignore() -> Bool {
+        scalarPreferences.fileSystem?.respectGitignore ?? true
+    }
+
+    package func setRespectGitignore(_ enabled: Bool, commit: Bool = true) {
+        updateFileSystemScalar(commit: commit) { settings in
+            settings.respectGitignore = enabled
+        }
+    }
+
     package func respectRepoIgnore() -> Bool {
         scalarPreferences.fileSystem?.respectRepoIgnore ?? true
     }
@@ -1186,6 +1196,14 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         updateAgentModeScalar(commit: commit) { $0.codexUsageQuotaEnabled = enabled }
     }
 
+    package func antigravityUsageQuotaEnabled() -> Bool {
+        scalarPreferences.agentMode?.antigravityUsageQuotaEnabled ?? false
+    }
+
+    package func setAntigravityUsageQuotaEnabled(_ enabled: Bool) {
+        updateAgentModeScalar(commit: true) { $0.antigravityUsageQuotaEnabled = enabled }
+    }
+
     package func claudeUsageQuotaEnabled() -> Bool {
         scalarPreferences.agentMode?.claudeUsageQuotaEnabled ?? false
     }
@@ -1371,6 +1389,17 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
             settings.subagentDefaultWaitSeconds = proposedValue
         }
         return true
+    }
+
+    /// Zero disables proactive compaction. Invalid persisted values fall back to the default.
+    package func claudeWakeCompactionThresholdPercent() -> Int {
+        let percent = scalarPreferences.agentMode?.claudeWakeCompactionThresholdPercent ?? 80
+        return percent == 0 || (70 ... 90).contains(percent) ? percent : 80
+    }
+
+    package func setClaudeWakeCompactionThresholdPercent(_ percent: Int) {
+        guard percent == 0 || (70 ... 90).contains(percent) else { return }
+        updateAgentModeScalar(commit: true) { $0.claudeWakeCompactionThresholdPercent = percent }
     }
 
     package func agentSessionHandoffInstructions() -> String {

@@ -459,7 +459,7 @@ class OracleViewModel: ObservableObject {
     let restorePerfRecorder: any WorkspaceRestorePerfRecording
     @Published var messages: [AIChatMessage] = []
     @Published private(set) var streamingSessions: Set<UUID> = []
-    @Published private(set) var messageStoreRevision: Int = 0
+    private let transcriptChanges = PassthroughSubject<UUID, Never>()
     @Published var oracleGroupPresentations: [OracleGroupPresentation.Key: OracleGroupPresentation] = [:]
     @Published private(set) var currentQueryId: UUID?
 
@@ -489,6 +489,8 @@ class OracleViewModel: ObservableObject {
 
     /// An ephemeral dictionary to remember typed drafts across tab changes / onDisappear
     private var ephemeralDrafts: [UUID: String] = [:]
+    /// The original Chat record created by a presentation callback, never a restored record.
+    private var implicitDefaultChat: ChatSession?
 
     /// Add a flag to signal focusing the input field
     @Published var focusInputField: Bool = false
@@ -558,9 +560,6 @@ class OracleViewModel: ObservableObject {
     @Published private(set) var tokenDisplayText: String = ""
     // NEW: live estimate for the *next* user prompt
     @Published private(set) var upcomingInputTokenText: String = ""
-
-    /// Tick counter to force UI refresh when reasoning content updates during streaming
-    @Published var reasoningUpdateTick: Int = 0
 
     @MainActor
     private func syncMCPGlobalsForCurrentSession() {
@@ -834,6 +833,10 @@ class OracleViewModel: ObservableObject {
         return []
     }
 
+    func transcriptChanges(for sessionID: UUID?) -> AnyPublisher<UUID, Never> {
+        transcriptChanges.filter { $0 == sessionID }.eraseToAnyPublisher()
+    }
+
     @MainActor
     @discardableResult
     func ensureSessionMessagesLoaded(_ sessionID: UUID) async -> Bool {
@@ -896,13 +899,18 @@ class OracleViewModel: ObservableObject {
     private func withSessionMessages(_ sessionID: UUID, _ mutate: (inout [AIChatMessage]) -> Void) {
         ensureSessionStorage(sessionID)
         var arr = messageStore[sessionID] ?? []
+        let oldCount = arr.count
         mutate(&arr)
+        // Pill eligibility depends on whether a lane has messages. In-place reply
+        // updates only need to wake the transcript subscribed to this session.
+        if currentSessionID != sessionID, arr.count != oldCount {
+            objectWillChange.send()
+        }
         messageStore[sessionID] = arr
-        messageStoreRevision &+= 1
-
         if currentSessionID == sessionID {
             messages = arr
         }
+        transcriptChanges.send(sessionID)
     }
 
     @MainActor
@@ -1002,7 +1010,8 @@ class OracleViewModel: ObservableObject {
     func purgeSessionStorage(_ sessionID: UUID) {
         let messageIDs: [UUID]
         if let stored = messageStore.removeValue(forKey: sessionID) {
-            messageStoreRevision &+= 1
+            objectWillChange.send()
+            transcriptChanges.send(sessionID)
             messageIDs = stored.map(\.id)
         } else {
             messageIDs = sessionIDByMessageId.filter { $0.value == sessionID }.map(\.key)
@@ -1029,8 +1038,11 @@ class OracleViewModel: ObservableObject {
     @MainActor
     private func clearAllSessionStorage() {
         sessionSwitchGeneration += 1
+        let storedSessionIDs = Array(messageStore.keys)
         messageStore.removeAll(keepingCapacity: false)
-        messageStoreRevision &+= 1
+        for sessionID in storedSessionIDs {
+            transcriptChanges.send(sessionID)
+        }
         sessionIDByMessageId.removeAll(keepingCapacity: false)
         runStateBySession.removeAll(keepingCapacity: false)
         nextSequenceIndexBySession.removeAll(keepingCapacity: false)
@@ -1929,12 +1941,12 @@ class OracleViewModel: ObservableObject {
         refreshSessionLists()
         guard !isSwitchingTabsForSession else { return }
         guard tabID != nil else { return }
-        _ = await ensureActiveSessionForCurrentTab(createIfMissing: true)
+        _ = await ensureActiveSessionForCurrentTab(createIfMissing: true, fromPresentation: true)
     }
 
     @MainActor
     @discardableResult
-    func ensureActiveSessionForCurrentTab(createIfMissing: Bool = true) async -> UUID? {
+    func ensureActiveSessionForCurrentTab(createIfMissing: Bool = true, fromPresentation: Bool = false) async -> UUID? {
         guard let tabID = promptViewModel.activeComposeTabID else { return nil }
 
         if let activeID = workspaceManager.activeChatSessionID(forTabID: tabID),
@@ -1954,8 +1966,23 @@ class OracleViewModel: ObservableObject {
         }
 
         guard createIfMissing else { return nil }
-        await startNewChatSession(tabID: tabID)
+        await startNewChatSession(tabID: tabID, fromPresentation: fromPresentation)
         return currentSessionID
+    }
+
+    @MainActor
+    func isUnusedImplicitDefaultChat(_ id: UUID) -> Bool {
+        guard let original = implicitDefaultChat, original.id == id,
+              let workspaceID = original.workspaceID, workspaceManager.activeWorkspaceID == workspaceID,
+              currentSessionID == id, sessions.count == 1, let current = sessions.first,
+              current.id == id, current.fileURL == nil, current.effectiveMessageCount == 0,
+              messages.isEmpty, messageStore[id]?.isEmpty != false, inputText.isEmpty, retrieveDraftText(for: id).isEmpty,
+              !isSessionStreaming(id), autosaveTasksByWorkspaceID[workspaceID]?.isEmpty != false
+        else { return false }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        guard let originalBytes = try? encoder.encode(original) else { return false }
+        return (try? encoder.encode(current)) == originalBytes
     }
 
     @MainActor
@@ -2290,7 +2317,7 @@ class OracleViewModel: ObservableObject {
         #if DEBUG
             let ensureActiveSessionStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
-        await ensureActiveSessionForCurrentTab(createIfMissing: true)
+        await ensureActiveSessionForCurrentTab(createIfMissing: true, fromPresentation: true)
         #if DEBUG
             restorePerfRecorder.event(
                 "chat.workspaceSwitch.ensureActiveSession",
@@ -2331,8 +2358,10 @@ class OracleViewModel: ObservableObject {
         oracleModelRaw: String? = nil,
         activateInUI: Bool = true,
         setActiveForTab: Bool = true,
-        reuseBlankSession: Bool = true
+        reuseBlankSession: Bool = true,
+        fromPresentation: Bool = false
     ) async -> UUID? {
+        implicitDefaultChat = nil
         if let activeWorkspace = workspaceManager.activeWorkspace,
            workspaceID == nil || workspaceID == activeWorkspace.id
         {
@@ -2406,6 +2435,12 @@ class OracleViewModel: ObservableObject {
             preferredAIModel: preferredModelName,
             selectedChatPresetID: selectedChatPresetId
         )
+        if fromPresentation, let active = workspaceManager.activeWorkspace,
+           WorkspaceManagerViewModel.isSyntheticFallbackWorkspace(active),
+           newSession.workspaceID == active.id, resolvedTabID == promptViewModel.activeComposeTabID
+        {
+            implicitDefaultChat = newSession
+        }
         sessions.append(newSession)
         if setActiveForTab, let resolvedTabID {
             workspaceManager.setActiveChatSessionID(newSession.id, forTabID: resolvedTabID)
@@ -2609,6 +2644,7 @@ class OracleViewModel: ObservableObject {
 
     @MainActor
     func switchToSession(_ id: UUID, setActiveForTab: Bool = true) async {
+        if setActiveForTab { implicitDefaultChat = nil }
         guard currentSessionID != id else {
             return
         }
@@ -2860,14 +2896,19 @@ class OracleViewModel: ObservableObject {
         }
 
         guard contextBuilderScope?.isLive != false else { return }
-        let newSortedMessages = newMessages.sorted { $0.sequenceIndex < $1.sequenceIndex }
+        var newSortedMessages = newMessages.sorted { $0.sequenceIndex < $1.sequenceIndex }
+        for index in newSortedMessages.indices where !newSortedMessages[index].isUser {
+            newSortedMessages[index].setIsFinalized(true)
+        }
         if let existing = messageStore[session.id] {
             for message in existing {
                 sessionIDByMessageId.removeValue(forKey: message.id)
             }
         }
+        // A reload can change the model label even when the message count is unchanged.
+        objectWillChange.send()
+        ensureSessionStorage(session.id)
         messageStore[session.id] = newSortedMessages
-        messageStoreRevision &+= 1
         for msg in newSortedMessages {
             registerMessage(msg.id, sessionID: session.id)
         }
@@ -2875,14 +2916,11 @@ class OracleViewModel: ObservableObject {
         if shouldAffectDisplayed {
             currentQueryId = nil
             setDisplayedSession(session.id)
+        } else if currentSessionID == session.id {
+            messages = newSortedMessages
         }
 
-        // Historical messages now display directly from raw stored text.
-        withSessionMessages(session.id) { msgs in
-            for index in msgs.indices where !msgs[index].isUser {
-                msgs[index].setIsFinalized(true)
-            }
-        }
+        transcriptChanges.send(session.id)
         // Batch finished – re-enable token updates and do a single refresh
         if shouldAffectDisplayed {
             isBatchLoadingMessages = false
@@ -3579,7 +3617,6 @@ class OracleViewModel: ObservableObject {
                     await MainActor.run {
                         guard self.canCommitContextBuilderLane(contextBuilderScope, backgroundQuery: backgroundQuery) else { return }
                         let sawText = !delta.isEmpty
-                        let sawReasoning = !(reasoningDelta?.isEmpty ?? true)
                         let now = self.streamWatchdogNow
                         if activityKind != nil {
                             guard self.recordObservedStreamActivity(for: aiResponseId, at: now) else { return }
@@ -3588,13 +3625,8 @@ class OracleViewModel: ObservableObject {
                             self.hasSeenNonReasoningText.insert(aiResponseId)
                             self.lastTextStreamActivityAt[aiResponseId] = now
                         }
-                        // Store reasoning content in ephemeral state instead of message
+                        // MCP reads the live reasoning from ephemeral state.
                         self.ephemeralState.setReasoningContent(reasoningBuffer, for: aiResponseId)
-
-                        // Increment tick to force popover UI refresh when reasoning updates
-                        if sawReasoning {
-                            self.reasoningUpdateTick += 1
-                        }
 
                         self.withSessionMessages(targetSessionID) { msgs in
                             if let idx = msgs.firstIndex(where: { $0.id == aiResponseId }) {
@@ -4496,32 +4528,6 @@ class OracleViewModel: ObservableObject {
         history += "</conversation_history>"
         print(history)
         return history
-    }
-
-    func bindingForReasoningContent(of messageId: UUID) -> Binding<String> {
-        Binding<String>(
-            get: {
-                // Only access ephemeral state if message still exists
-                if self.messages.contains(where: { $0.id == messageId }) {
-                    return self.ephemeralState.reasoningContent(for: messageId)
-                } else {
-                    #if DEBUG
-                        print("Warning: Binding accessed reasoning for non-existent message: \(messageId)")
-                    #endif
-                    return ""
-                }
-            },
-            set: { newValue in
-                // Only update if message still exists
-                if self.messages.contains(where: { $0.id == messageId }) {
-                    self.ephemeralState.setReasoningContent(newValue, for: messageId)
-                } else {
-                    #if DEBUG
-                        print("Warning: Binding attempted to update reasoning for non-existent message: \(messageId)")
-                    #endif
-                }
-            }
-        )
     }
 
     @MainActor

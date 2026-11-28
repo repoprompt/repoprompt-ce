@@ -262,8 +262,30 @@ final class CodexAppServerTransportOwnerTests: XCTestCase {
         await client.debugIngestStdoutChunk(incoming, generation: firstGeneration)
         let duplicate = await requests.next()
         XCTAssertEqual(duplicate?.receipt, first.receipt, "Replay in one generation retains identity")
-        try await client.respondToServerRequest(receipt: first.receipt, result: ["accepted": true])
+        try await client.respondToServerRequest(receipt: first.receipt, result: ["accepted": true], respectingCancellation: true)
         XCTAssertEqual(frames.withLock { $0.count }, 1)
+
+        let ready = AsyncStream<Void>.makeStream()
+        let release = AsyncStream<Void>.makeStream()
+        defer { ready.continuation.finish() }
+        let response = Task {
+            ready.continuation.yield(())
+            var resumed = release.stream.makeAsyncIterator()
+            _ = await resumed.next()
+            try await client.respondToServerRequest(receipt: first.receipt, result: ["accepted": true], respectingCancellation: true)
+        }
+        var waiting = ready.stream.makeAsyncIterator()
+        _ = await waiting.next()
+        response.cancel()
+        release.continuation.finish()
+        do {
+            try await response.value
+            XCTFail("A cancelled response must be refused before writing")
+            await client.stop()
+            return
+        } catch is CancellationError {
+            XCTAssertEqual(frames.withLock { $0.count }, 1)
+        }
         await client.stop()
         await assertResponseRefused(client, receipt: first.receipt, reason: .transportUnavailable)
 

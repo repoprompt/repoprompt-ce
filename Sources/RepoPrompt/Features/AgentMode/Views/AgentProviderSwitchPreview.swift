@@ -40,6 +40,8 @@ private struct AgentProviderSwitchChrome: View {
         VStack(spacing: 0) {
             if let tabID, let session = viewModel.sessions[tabID] {
                 AgentProviderSwitchBanner(viewModel: viewModel, session: session)
+                ClaudeOverflowRecoveryBanner(viewModel: viewModel, session: session)
+                    .id(session.currentRestorationBindingToken)
             }
         }
         .sheet(isPresented: Binding(
@@ -63,6 +65,42 @@ private extension View {
             .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
             .padding(.horizontal, 24)
             .padding(.bottom, 8)
+    }
+}
+
+private struct ClaudeOverflowRecoveryBanner: View {
+    let viewModel: AgentModeViewModel
+    @ObservedObject var session: AgentTabSession
+    @State private var preparing = false
+    @State private var refused = false
+
+    var body: some View {
+        if session.pendingHandoff.awaitsLocalClaudeOverflowInput {
+            Text("Fresh Claude conversation prepared. Send a new message to continue; Auto-wake is paused until then.")
+                .providerSwitchBannerStyle()
+        } else if let hold = session.activeClaudeContextAutoWakeHold, session.providerSessionID != nil {
+            VStack(alignment: .leading, spacing: 6) {
+                if session.selfCompactState.active?.claudeOverflowHoldID == hold.id {
+                    Text("Recovering Claude context… Auto-wake is paused.")
+                } else {
+                    Text("Claude rejected the request because of a size limit. Auto-wake is paused.")
+                    Text("Your next message can start a fresh Claude conversation without replaying prior work.")
+                    Button("Continue fresh in this session") {
+                        preparing = true
+                        refused = false
+                        Task { @MainActor in
+                            refused = await !viewModel.continueFreshAfterClaudeOverflow(session, expectedHoldID: hold.id)
+                            preparing = false
+                        }
+                    }
+                    .disabled(preparing || session.runState.isActive || session.selfCompactState.active != nil)
+                    if refused {
+                        Text("Couldn't prepare a fresh conversation. Check that the session is idle and try again.")
+                    }
+                }
+            }
+            .providerSwitchBannerStyle()
+        }
     }
 }
 

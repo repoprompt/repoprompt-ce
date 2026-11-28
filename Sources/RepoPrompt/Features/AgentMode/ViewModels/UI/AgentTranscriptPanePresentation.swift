@@ -7,6 +7,7 @@ enum AgentTranscriptPanePresentation: Equatable {
     case restoring
     case welcome
     case unavailable(UnavailableReason, retry: AgentTranscriptRetryTarget?)
+    case workspaceActivationFailed(AgentWorkspaceSessionIndexStore.SessionIndexOwner)
 
     enum UnavailableReason: Equatable {
         case missing
@@ -52,6 +53,9 @@ enum AgentTranscriptPanePresentation: Equatable {
 
     /// Pure classifier: no I/O, tasks, clocks or mutable authority.
     static func resolve(_ input: Input) -> AgentTranscriptPanePresentation? {
+        if case let .activationFailed(owner) = input.target.owner {
+            return .workspaceActivationFailed(owner)
+        }
         let scope = input.target.scope
         if let scope, scope.tabID != input.target.tabID {
             return nil
@@ -116,6 +120,8 @@ struct AgentTranscriptPaneTarget: Equatable {
         case owner(AgentWorkspaceSessionIndexStore.SessionIndexOwner)
         /// Active ID published for an actual switch/queued adoption; owner not yet installed.
         case awaitingOwner(workspaceID: UUID)
+        /// The current activation settled without an executable presenter.
+        case activationFailed(AgentWorkspaceSessionIndexStore.SessionIndexOwner)
         /// Settled with no active workspace.
         case noWorkspace
         /// Active workspace settled without any owning runtime/adoption (authority-only projection).

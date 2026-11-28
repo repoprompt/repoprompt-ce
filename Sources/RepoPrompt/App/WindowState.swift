@@ -217,7 +217,7 @@ class WindowState: ObservableObject {
     // MARK: - Shared Services
 
     /// Single shared MCP service instance across all windows
-    static let sharedMCPService = MCPService()
+    static let sharedMCPService = AppGlobalMCPServiceComposition.transport
 
     // MARK: - Window identification
 
@@ -559,15 +559,25 @@ class WindowState: ObservableObject {
         isClosing || WindowStatesManager.shared.isTerminating
     }
 
+    private var detachedAgentExecutionAtClose: (
+        host: AgentSessionRuntimeHost, switchProvider: AgentModeWorkspaceSwitchSessionProvider?
+    )?
+    private var isRequestingWorkspaceDeletionClose = false
+
     func beginClose(preservingOversightIntent: Bool = true) {
         guard !isClosing else { return }
         let manager = windowStatesManager ?? WindowStatesManager.shared
         if !manager.isTerminating, preservingOversightIntent {
             AgentSessionLinkRuntimeBridge.shared.noteOversightWindowClosing(windowID: windowID)
         }
-        if !isPreparedSessionOwner { manager.detachPreparedRuntimeCarriers(from: self) }
         isClosing = true
-        agentModeViewModel.closeOracleBackgroundWindowAdmission()
+        if !manager.isTerminating, !isPreparedSessionOwner, preservingOversightIntent, !isRequestingWorkspaceDeletionClose,
+           let host = agentModeViewModel.detachExecutionForWindowClose()
+        {
+            detachedAgentExecutionAtClose = (host, workspaceManager.agentSwitchSessionProvider)
+        } else {
+            agentModeViewModel.closeOracleBackgroundWindowAdmission()
+        }
         failUnstartedCommandsForWindowClose()
 
         if !manager.isTerminating, !isPreparedSessionOwner {
@@ -675,6 +685,14 @@ class WindowState: ObservableObject {
             await domainWorkspacePresentationBridge?.stopAndJoinForTesting()
         }
 
+        convenience init(domainRuntime: MCPDomainRuntime, visibleAgentProviderResources: AgentRunProviderComposition, mcpTransport: MCPService) {
+            self.init(
+                contextBuilderProviderFactory: nil, loadStoredAPISettingsDataOnInit: false,
+                codexModelPollingService: .shared, automaticProviderModelDiscoveryEnabled: false,
+                domainRuntimeOverride: domainRuntime, visibleAgentProviderResources: visibleAgentProviderResources, mcpTransport: mcpTransport
+            )
+        }
+
         func restartDomainWorkspaceProjectionForTesting() {
             domainWorkspacePresentationBridge?.start()
         }
@@ -734,68 +752,9 @@ class WindowState: ObservableObject {
 
     #endif
 
-    /// Runtime composition only: no NSWindow, restore claim, UI registration or automatic provider
-    /// reconnect. The borrowed workspace is an immutable placement projection, not a document owner.
-    static func makePreparedSessionOwner(
-        workspace: WorkspaceModel,
-        borrowing source: WindowState,
-        agentModeViewModelFactory: WindowStateCompositionFactory.AgentModeViewModelFactory? = nil
-    ) -> WindowState {
-        guard let settingsLease = APISettingsRuntimeLease.acquire(from: source.apiSettingsViewModel) else {
-            preconditionFailure("Prepared owner requires live settings")
-        }
-        return WindowState(
-            contextBuilderProviderFactory: nil, loadStoredAPISettingsDataOnInit: false,
-            codexModelPollingService: .shared, domainRuntimeOverride: source.compositionDomainRuntime,
-            keyManager: source.keyManager,
-            agentModeViewModelFactory: agentModeViewModelFactory, sessionRuntimeWorkspace: workspace,
-            borrowedAPISettingsViewModel: source.apiSettingsViewModel,
-            managedSettingsLease: settingsLease
-        )
-    }
-
-    let isPreparedSessionOwner: Bool
-    private let compositionDomainRuntime: MCPDomainRuntime?
-    private var didReleaseManagedSettings = false
-    private let managedSettingsLease: APISettingsRuntimeLease?
-    private var preparedSessionTeardownTask: Task<Bool, Never>?
-    var isPreparedSessionTeardownInFlight: Bool {
-        preparedSessionTeardownTask != nil
-    }
-
-    /// Retire the private route and its provider/session work, not the app-wide MCP listener or
-    /// borrowed API settings. This owner has no window settings or placement document to persist.
-    @discardableResult
-    func tearDownPreparedSessionOwner() async -> Bool {
-        guard isPreparedSessionOwner else { return false }
-        if let preparedSessionTeardownTask { return await preparedSessionTeardownTask.value }
-        if didReleaseManagedSettings { return true }
-        agentModeViewModel.beginPreparedOversightRetirement()
-        beginClose()
-        let task = Task { @MainActor in
-            // beginClose cancels reconciliation; join it before releasing this private owner so a
-            // late root load cannot outlive failed-command cleanup and observe a removed repository.
-            await self.workspaceManager.awaitRootReconciliationShutdown()
-            guard await self.agentModeViewModel.finishPreparedOversightRuntime() else { return false }
-            await self.mcpServer.unregisterDomainRoutingWindow()
-            self.mcpServer.stopServiceObservation()
-            await self.promptManager.gitViewModel.shutdownForWindowClose()
-            self.aiQueriesService.cancelQuery()
-            guard self.agentModeViewModel.releasePreparedOversightWriterAfterDrain() else { return false }
-            // This adapter has no visible window. Retire its private roots/observers as well as
-            // the writer; do not leave metadata reconciliation running until eventual deallocation.
-            await self.workspaceFilesViewModel.unloadAllRootFolders()
-            if !self.didReleaseManagedSettings {
-                self.didReleaseManagedSettings = true
-                self.managedSettingsLease?.release()
-            }
-            return true
-        }
-        preparedSessionTeardownTask = task
-        let saved = await task.value
-        preparedSessionTeardownTask = nil
-        return saved
-    }
+    /// Compatibility for visible-presentation lifetime callers pending their census cleanup.
+    /// All WindowStates are now presenters; saved execution never constructs one.
+    let isPreparedSessionOwner = false
 
     private init(
         contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory?,
@@ -807,19 +766,15 @@ class WindowState: ObservableObject {
         domainRuntimeOverride: MCPDomainRuntime?,
         keyManager injectedKeyManager: KeyManager? = nil,
         agentModeViewModelFactory: WindowStateCompositionFactory.AgentModeViewModelFactory? = nil,
-        sessionRuntimeWorkspace: WorkspaceModel? = nil,
-        borrowedAPISettingsViewModel: APISettingsViewModel? = nil,
-        managedSettingsLease: APISettingsRuntimeLease? = nil
+        visibleAgentProviderResources: AgentRunProviderComposition? = nil,
+        mcpTransport: MCPService? = nil
     ) {
-        self.managedSettingsLease = managedSettingsLease
-        isPreparedSessionOwner = sessionRuntimeWorkspace != nil
-        compositionDomainRuntime = domainRuntimeOverride
         // Assign a unique window ID
         windowID = WindowState.allocateWindowID()
         let manager = WindowStatesManager.shared
 
-        let claimedInitialRefreshDeferral = sessionRuntimeWorkspace == nil ? manager.claimInitialRefreshDeferralForNewWindow() : nil
-        let deferredInitialAgentSystemWorkspaceRefresh = sessionRuntimeWorkspace != nil || claimedInitialRefreshDeferral != nil
+        let claimedInitialRefreshDeferral = manager.claimInitialRefreshDeferralForNewWindow()
+        let deferredInitialAgentSystemWorkspaceRefresh = claimedInitialRefreshDeferral != nil
         claimedInitialRefreshDeferralID = claimedInitialRefreshDeferral?.id
         claimedInitialRefreshDeferralWaiterID = claimedInitialRefreshDeferral?.waiterID
 
@@ -830,7 +785,7 @@ class WindowState: ObservableObject {
         let composition = WindowStateCompositionFactory.make(
             windowID: windowID,
             deferredInitialAgentSystemWorkspaceRefresh: deferredInitialAgentSystemWorkspaceRefresh,
-            sharedMCPService: Self.sharedMCPService,
+            sharedMCPService: mcpTransport ?? Self.sharedMCPService,
             domainRuntime: domainRuntimeOverride,
             contextBuilderProviderFactory: contextBuilderProviderFactory,
             keyManager: injectedKeyManager,
@@ -840,8 +795,7 @@ class WindowState: ObservableObject {
             automaticProviderModelDiscoveryEnabled: automaticProviderModelDiscoveryEnabled,
             codexModelPollingService: codexModelPollingService,
             agentModeViewModelFactory: agentModeViewModelFactory,
-            sessionRuntimeWorkspace: sessionRuntimeWorkspace,
-            borrowedAPISettingsViewModel: borrowedAPISettingsViewModel
+            visibleAgentProviderResources: visibleAgentProviderResources
         )
         compositionSpan.end()
 
@@ -868,9 +822,9 @@ class WindowState: ObservableObject {
         workspaceManager = composition.workspaceManager
         domainWorkspacePresentationBridge = composition.domainWorkspacePresentationBridge
 
-        // A prepared session is deliberately absent from the UI window/restore registry. The
-        // ordinary run, save, endpoint and MCP owners above are retained without UI startup work.
-        if isPreparedSessionOwner { return }
+        workspaceManager.isUnusedAutomaticChat = { [weak oracleViewModel] id in
+            oracleViewModel?.isUnusedImplicitDefaultChat(id) == true
+        }
 
         // Set up additional actions
         oracleViewModel.setupSendPromptAction()
@@ -1412,6 +1366,10 @@ class WindowState: ObservableObject {
     }
 
     func requestClose(authorization: WindowCloseAuthorization? = nil) {
+        // A vetoed deletion close must not turn a subsequent ordinary close into retirement.
+        let wasRequestingDeletionClose = isRequestingWorkspaceDeletionClose
+        isRequestingWorkspaceDeletionClose = wasRequestingDeletionClose || authorization?.source == .workspaceDelete
+        defer { isRequestingWorkspaceDeletionClose = wasRequestingDeletionClose }
         if let authorization {
             closeCoordinator.enqueueAuthorization(authorization)
         }
@@ -2303,29 +2261,45 @@ class WindowState: ObservableObject {
     }
 
     @MainActor
-    func routeToAgentSession(_ route: AgentSessionDeepLinkRoute) async -> AgentSessionRouteResult {
-        await waitForWorkspaceInitializationForRouting()
-
-        guard let targetWorkspace = workspaceManager.workspace(withID: route.workspaceID) else {
-            return .workspaceUnavailable
+    func routeToAgentSession(_ route: AgentSessionDeepLinkRoute, validatedWorkspace: WorkspaceModel) async -> AgentSessionRouteResult {
+        let departure = workspaceManager.activeWorkspaceID
+        func canNavigate() -> Bool {
+            !Task.isCancelled && !isClosing && !hasUnfinishedRestoreExecution && workspaceManager.isInitialized
+                && !workspaceManager.isSwitchingWorkspace && workspaceManager.activeWorkspaceSwitch == nil
         }
+        guard canNavigate(), validatedWorkspace.id == route.workspaceID else { return .workspaceUnavailable }
+        let workspace = departure == route.workspaceID ? workspaceManager.activeWorkspace : validatedWorkspace
+        guard let workspace, workspace.id == route.workspaceID,
+              !workspace.composeTabsDecodeWasLossy else { return .workspaceUnavailable }
+        guard AppDeepLinkRouter.containsAgentDeepLinkTab(route.tabID, in: workspace) else { return .tabUnavailable }
 
-        NSApplication.shared.activate(ignoringOtherApps: true)
-        if let window = nsWindow {
-            window.makeKeyAndOrderFront(nil)
-        } else {
-            focusWindowIfPossible()
-        }
-
-        if workspaceManager.activeWorkspaceID != route.workspaceID {
-            let switchResult = await workspaceManager.requestWorkspaceSwitch(to: targetWorkspace, saveState: true)
+        focusWindowIfPossible()
+        guard canNavigate(), workspaceManager.activeWorkspaceID == departure else { return .workspaceUnavailable }
+        if departure != route.workspaceID {
+            let switchResult = await requestAgentDeepLinkWorkspaceSwitch(to: workspace)
             if !switchResult.didSwitch {
                 return .workspaceSwitchBlocked(switchResult.message)
             }
         }
 
-        let result = await navigateAgentDeepLinkTab(route.tabID, sessionID: route.sessionID, workspaceID: route.workspaceID)
+        guard canNavigate(), workspaceManager.activeWorkspaceID == route.workspaceID else { return .workspaceUnavailable }
+        let result = await navigateAgentDeepLinkTab(route.tabID, sessionID: route.sessionID, workspaceID: route.workspaceID) { [weak self] in
+            self?.finishAgentRoutePresentation(route)
+        }
         guard result == .routed else { return result }
+        guard canNavigate(), let activeWorkspace = workspaceManager.activeWorkspace,
+              activeWorkspace.id == route.workspaceID else { return .workspaceUnavailable }
+        guard AppDeepLinkRouter.containsAgentDeepLinkTab(route.tabID, in: activeWorkspace) else { return .tabUnavailable }
+        finishAgentRoutePresentation(route)
+        return .routed
+    }
+
+    private func finishAgentRoutePresentation(_ route: AgentSessionDeepLinkRoute) {
+        guard !Task.isCancelled, !isClosing, !hasUnfinishedRestoreExecution, workspaceManager.isInitialized,
+              !workspaceManager.isSwitchingWorkspace, workspaceManager.activeWorkspaceSwitch == nil,
+              let activeWorkspace = workspaceManager.activeWorkspace, activeWorkspace.id == route.workspaceID,
+              AppDeepLinkRouter.containsAgentDeepLinkTab(route.tabID, in: activeWorkspace),
+              promptManager.activeComposeTabID == route.tabID else { return }
         if let window = nsWindow {
             window.makeKeyAndOrderFront(nil)
         } else {
@@ -2334,11 +2308,14 @@ class WindowState: ObservableObject {
         if route.interactionID != nil {
             agentModeViewModel.notificationAttention.revealRequests.send(route.tabID)
         }
-        return .routed
     }
 
-    func navigateAgentDeepLinkTab(_ tabID: UUID, sessionID: UUID?, workspaceID: UUID, workspaceLink: Bool = false) async -> AgentSessionRouteResult {
-        guard let activeWorkspace = workspaceManager.activeWorkspace,
+    func navigateAgentDeepLinkTab(
+        _ tabID: UUID, sessionID: UUID?, workspaceID: UUID, workspaceLink: Bool = false,
+        existingVisitIntent: UUID? = nil, onDeferredSuccess: (@MainActor () -> Void)? = nil
+    ) async -> AgentSessionRouteResult {
+        guard !isClosing, !Task.isCancelled, !workspaceManager.isSwitchingWorkspace,
+              let activeWorkspace = workspaceManager.activeWorkspace,
               activeWorkspace.id == workspaceID
         else {
             return .workspaceUnavailable
@@ -2350,12 +2327,32 @@ class WindowState: ObservableObject {
             return .tabUnavailable
         }
 
-        if let sessionID {
+        let visitRegistry = workspaceLink || workspaceManager.isSessionRuntimeProjection ? nil : agentModeViewModel.preparedSessionRuntimes
+        let visitSessionID = sessionID ?? workspaceManager.activeAgentSessionID(forTabID: tabID, inWorkspaceID: workspaceID)
+        let visitIntent = existingVisitIntent ?? visitSessionID.flatMap { visitRegistry?.beginRuntimeVisitIntent($0) }
+        func visitIsCurrent() -> Bool {
+            guard let visitSessionID, let visitRegistry else { return true }
+            return visitRegistry.isRuntimeVisitIntentCurrent(visitSessionID, intent: visitIntent)
+        }
+        let resume: @MainActor (UUID) async -> Void = { [weak self] intent in
+            guard let self else { return }
+            let result = await navigateAgentDeepLinkTab(
+                tabID, sessionID: sessionID, workspaceID: workspaceID, existingVisitIntent: intent, onDeferredSuccess: onDeferredSuccess
+            )
+            if result == .routed { onDeferredSuccess?() }
+        }
+
+        guard visitIsCurrent() else { return .blockedByActiveDifferentSession }
+        let preparedTarget = visitSessionID.flatMap { visitRegistry?.hasPreparedRuntime($0) == true ? $0 : nil }
+        if let target = sessionID ?? preparedTarget {
             let activationResult = await agentModeViewModel.activateRoutedAgentSession(
                 tabID: tabID,
-                sessionID: sessionID,
+                sessionID: target,
                 workspace: activeWorkspace,
-                workspaceLink: workspaceLink
+                workspaceLink: workspaceLink,
+                restoringStashedCarrier: tabIsStashed && !tabIsActive,
+                visitIntent: visitIntent,
+                resumePreparedVisit: resume
             )
             guard activationResult == .ready else {
                 return agentSessionRouteResult(for: activationResult)
@@ -2365,6 +2362,7 @@ class WindowState: ObservableObject {
         if workspaceLink, isClosing || Task.isCancelled || workspaceManager.activeWorkspaceID != workspaceID || workspaceManager.isSwitchingWorkspace {
             return .workspaceUnavailable
         }
+        guard visitIsCurrent() else { return .blockedByActiveDifferentSession }
         if tabIsStashed {
             guard await promptManager.restoreStashedComposeTab(containingTabID: tabID) != nil else {
                 return .tabUnavailable
@@ -2382,10 +2380,13 @@ class WindowState: ObservableObject {
             return .workspaceUnavailable
         }
         if workspaceLink { return .routed }
+        guard visitIsCurrent() else { return .blockedByActiveDifferentSession }
         let finalActivationResult = await agentModeViewModel.activateRoutedAgentSession(
             tabID: tabID,
             sessionID: sessionID,
-            workspace: finalWorkspace
+            workspace: finalWorkspace,
+            visitIntent: visitIntent,
+            resumePreparedVisit: resume
         )
         guard finalActivationResult == .ready else {
             return agentSessionRouteResult(for: finalActivationResult)
@@ -2393,18 +2394,16 @@ class WindowState: ObservableObject {
         return .routed
     }
 
+    func requestAgentDeepLinkWorkspaceSwitch(to workspace: WorkspaceModel) async -> WorkspaceSwitchResult {
+        await workspaceManager.requestWorkspaceSwitch(
+            to: workspace, saveState: true, reason: WorkspaceManagerViewModel.agentDeepLinkSwitchReason
+        )
+    }
+
     /// Whether the given agent session is the transcript the user is looking at in this window.
     func isAgentSessionVisible(tabID: UUID, sessionID: UUID?) -> Bool {
         guard !isClosing, isCurrentlyFocused else { return false }
         return agentModeViewModel.isAgentSessionDisplayed(tabID: tabID, sessionID: sessionID)
-    }
-
-    @MainActor
-    private func waitForWorkspaceInitializationForRouting() async {
-        guard !workspaceManager.isInitialized else {
-            return
-        }
-        await workspaceManager.awaitInitialized()
     }
 
     private func agentSessionRouteResult(for activationResult: AgentRouteSessionActivationResult) -> AgentSessionRouteResult {
@@ -3161,7 +3160,14 @@ class WindowState: ObservableObject {
 
     func tearDown() async {
         beginClose()
-        if !WindowStatesManager.shared.isTerminating { await agentModeViewModel.joinOracleBackgroundWindowDrain() }
+        // The retained host drain joins its own Oracle producers. Waiting here would delay
+        // starting that drain and skip its bounded observation when the window closes.
+        let detachedAgentHost = detachedAgentExecutionAtClose?.host
+        if detachedAgentHost == nil, !WindowStatesManager.shared.isTerminating,
+           agentModeViewModel.runtimeHost.workspaceActivation == nil
+        {
+            await agentModeViewModel.joinOracleBackgroundWindowDrain()
+        }
         // Join cancelled startup before saves/root drains so it cannot publish or hydrate late.
         await workspaceManager.awaitInitialWorkspaceActivationCompletion()
         await workspaceManager.awaitPostSwitchGitDataLoadShutdown()
@@ -3188,7 +3194,11 @@ class WindowState: ObservableObject {
         // a long-lived subscription, so explicit cancellation is required to bound closed-window
         // memory and prevent stale windows from multiplying catalog snapshot work.
         domainWorkspacePresentationBridge?.stop()
-        await mcpServer.unregisterDomainRoutingWindow()
+        // A shared route belongs to the lease owner, not this teardown. In particular a
+        // timed-out retirement waiter must not revoke routing needed by the retained host.
+        let mayDisposePresentationRoute = !mcpServer.routeResources.isLeaseManaged
+            && detachedAgentHost?.route !== mcpServer.routeResources
+        if mayDisposePresentationRoute { await mcpServer.unregisterDomainRoutingWindow() }
         mcpServer.stopServiceObservation()
 
         // App-level termination already coordinates agent/session and MCP shutdown.
@@ -3199,12 +3209,17 @@ class WindowState: ObservableObject {
         }
 
         await contextBuilderAgentViewModel.cancelAllActiveRuns()
-        await workspaceManager.cancelActiveSessions()
-        await agentModeViewModel.prepareForWindowClose()
-        WorkspaceApprovalManager.shared.cancelPending(forWindowID: windowID)
+        await workspaceManager.cancelActiveSessions(excluding: detachedAgentExecutionAtClose?.switchProvider)
+        if detachedAgentHost == nil {
+            await agentModeViewModel.retireRuntimeForClosingOrQuit()
+        }
+        // Independent host approvals are keyed to their own route. If the route is shared,
+        // the host's exact interaction owner, not this closing window, settles those requests.
+        if detachedAgentHost?.routeID != windowID {
+            WorkspaceApprovalManager.shared.cancelPending(forWindowID: windowID)
+        }
 
-        // Stop the local MCP server
-        await mcpServer.stopServer()
+        if mayDisposePresentationRoute { await mcpServer.stopServer() }
 
         // Cancel any ongoing AI query
         aiQueriesService.cancelQuery()

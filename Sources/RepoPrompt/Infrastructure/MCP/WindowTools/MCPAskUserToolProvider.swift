@@ -178,10 +178,14 @@ final class MCPAskUserToolProvider: MCPAppToolProviding {
         // Get target window.
         let targetWindow = try dependencies.requireTargetWindow()
 
-        let defaultTimeout = try await resolveDefaultTimeoutSeconds(
-            invocationContext: invocationContext,
-            dependencies: dependencies
-        )
+        let defaultTimeout: TimeInterval = if let resolvedTimeout = DomainInteractionPresentationContext.deadline?.originalTimeoutSeconds {
+            resolvedTimeout
+        } else {
+            try await resolveDefaultTimeoutSeconds(
+                invocationContext: invocationContext,
+                dependencies: dependencies
+            )
+        }
         let parsed = try parseAskUserInteraction(args: args, defaultTimeout: defaultTimeout)
 
         // Route based on run purpose.
@@ -504,7 +508,7 @@ final class MCPAskUserToolProvider: MCPAppToolProviding {
         return bool
     }
 
-    private static func askUserResponseValue(_ response: AgentAskUserResponse, includeLegacyResponse: Bool) -> Value {
+    static func askUserResponseValue(_ response: AgentAskUserResponse, includeLegacyResponse: Bool) -> Value {
         var object: [String: Value] = [
             "answers": .object(response.answersByQuestionID.reduce(into: [String: Value]()) { partialResult, entry in
                 partialResult[entry.key] = askUserAnswerValue(entry.value)

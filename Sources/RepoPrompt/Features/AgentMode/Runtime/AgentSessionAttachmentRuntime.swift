@@ -147,7 +147,8 @@ final class AgentSessionAttachmentRuntime {
     }
 
     func repairRetainedAttachmentPathsAfterHydration(_ session: AgentTabSession, sessionID: UUID) {
-        guard clearsConsumedFiles, let scope,
+        guard !session.subscriptionAccountBinding.blocksProviderOperations,
+              clearsConsumedFiles, let scope,
               let membership = scope.membership(of: session),
               session.activeAgentSessionID == sessionID,
               let configuration, let location = configuration.location(session), let root = location.retainedRoot
@@ -208,7 +209,8 @@ final class AgentSessionAttachmentRuntime {
 
     /// Repairs canonical requests and their working copies without replacing row-owned metadata.
     func applyRetainedAttachments(_ retained: [UUID: AgentFileAttachment], to session: AgentTabSession, sessionID: UUID) {
-        guard !retained.isEmpty, session.activeAgentSessionID == sessionID,
+        guard !session.subscriptionAccountBinding.blocksProviderOperations,
+              !retained.isEmpty, session.activeAgentSessionID == sessionID,
               scope?.sessions[session.tabID] === session
         else { return }
         func repaired(_ attachments: [AgentFileAttachment]) -> [AgentFileAttachment] {

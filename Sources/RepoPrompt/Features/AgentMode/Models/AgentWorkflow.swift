@@ -47,17 +47,22 @@ extension AgentWorkflow {
         }
     }
 
-    var accentColor: Color {
+    /// Stable six-digit sRGB accent shared by desktop and remote clients.
+    var accentColorHex: String {
         switch self {
-        case .build: .blue
-        case .review: .purple
-        case .refactor: .orange
-        case .investigate: .teal
-        case .oracleExport: .indigo
-        case .orchestrate: .green
-        case .optimize: .red
-        case .deepPlan: .cyan
+        case .build: "#007AFF"
+        case .review: "#AF52DE"
+        case .refactor: "#FF9500"
+        case .investigate: "#5AC8FA"
+        case .oracleExport: "#5856D6"
+        case .orchestrate: "#34C759"
+        case .optimize: "#FF3B30"
+        case .deepPlan: "#32ADE6"
         }
+    }
+
+    var accentColor: Color {
+        Color(hex: accentColorHex) ?? .secondary
     }
 
     /// Workflow metadata for suggested task-label affinity.
@@ -191,7 +196,7 @@ public struct AgentWorkflowDefinition: Sendable, Identifiable, Equatable, Hashab
         iconName = workflow.iconName
         tooltipText = workflow.tooltipText
         descriptionText = workflow.descriptionText
-        accentColorHex = nil
+        accentColorHex = workflow.accentColorHex
         template = workflow.template
     }
 

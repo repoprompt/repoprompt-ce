@@ -15,12 +15,14 @@ final class AgentRuntimeMetricsUIStore: ObservableObject {
         liveSelectedFileCount: Int?,
         liveSelectionSummary: AgentContextSelectionSummary? = nil,
         selectedAgent: AgentProviderKind,
-        selectedModelRaw: String
+        selectedModelRaw: String,
+        claudeWakePressure: ClaudeWakeContextPressure.Presentation? = nil
     ) {
         let previousSnapshot = runtimeVM.snapshot
         runtimeVM.update(
             snapshot: transcriptSnapshot,
             codexUsage: codexUsage,
+            claudeWakePressure: claudeWakePressure,
             liveSelectedFileCount: liveSelectedFileCount,
             liveSelectionSummary: liveSelectionSummary,
             selectedAgent: selectedAgent,

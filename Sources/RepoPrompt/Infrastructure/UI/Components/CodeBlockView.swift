@@ -8,7 +8,7 @@ struct CodeBlock: View {
     let content: String
     var allowTextInteraction: Bool = true
     @State private var isCopyHovering = false
-    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.layoutDirection) private var layoutDirection
     @ObservedObject private var fontScale = FontScaleManager.shared
 
     private var scaledCodeFontSize: CGFloat {
@@ -26,6 +26,9 @@ struct CodeBlock: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .lineLimit(nil)
                 .fixedSize(horizontal: false, vertical: true)
+                .semanticTextDirection(.dedicatedLeftToRight)
+                // In RTL the copy button sits over the same edge as the code.
+                .padding(.top, layoutDirection == .rightToLeft ? 28 : 0)
 
             Button(action: {
                 NSPasteboard.general.clearContents()
@@ -134,6 +137,7 @@ struct CollapsibleCodeBlock: View {
     let previewLineCount: Int
     let allowInteraction: Bool
 
+    @Environment(\.layoutDirection) private var layoutDirection
     @State private var localExpansion = false
     private let expansion: Binding<Bool>?
     private var isExpanded: Bool {
@@ -204,6 +208,9 @@ struct CollapsibleCodeBlock: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .lineLimit(nil)
                     .fixedSize(horizontal: false, vertical: true)
+                    .semanticTextDirection(.dedicatedLeftToRight)
+                    // In RTL the copy button sits over the same edge as the code.
+                    .padding(.top, layoutDirection == .rightToLeft ? 28 : 0)
 
                 copyButton
             }

@@ -32,6 +32,7 @@ struct SessionAdminMCPToolService {
     let resolveObserverEndpoint: ObserverEndpointResolver
     let scopes: () -> DelegationScopeRuntime
     let administration: () -> any AgentSessionAdministrationService
+    var resolveCanonicalObserverEndpoint: ((MCPRequestMetadata) async -> Endpoint?)?
     var now: () -> Date = Date.init
     var isToolEnabled: () -> Bool = { ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.sessionAdmin) }
 
@@ -95,6 +96,12 @@ struct SessionAdminMCPToolService {
 
     private func resolveCaller() async throws -> Endpoint {
         let metadata = await captureRequestMetadata()
+        if let resolveCanonicalObserverEndpoint {
+            guard let endpoint = await resolveCanonicalObserverEndpoint(metadata), endpoint.hasResolvedPersistentBinding else {
+                throw Self.unavailableError
+            }
+            return endpoint
+        }
         let window = try requireTargetWindow()
         guard !window.isClosing,
               let endpoint = await AgentSessionTargetOperationGuard.resolveObserverEndpoint(

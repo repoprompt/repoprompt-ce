@@ -13,6 +13,90 @@ import XCTest
 
 @MainActor
 final class AgentOraclePillRoutingTests: XCTestCase {
+    func testSingleOracleModelNameTracksRequestNotPreviousAnswer() {
+        let previous = AIChatMessage(content: "old", isUser: false, modelName: "Previous")
+        var reply = AIChatMessage(content: "", isUser: false, modelName: "Recorded Model")
+        XCTAssertEqual(AgentOraclePillLogic.singleOracleModelName(messages: [previous, reply], activeQueryID: reply.id, isStreaming: true), "Recorded Model")
+        reply.setIsFinalized(true)
+        XCTAssertEqual(AgentOraclePillLogic.singleOracleModelName(messages: [previous, reply], activeQueryID: nil, isStreaming: false), "Recorded Model")
+        let missing = AIChatMessage(content: "error", isUser: false)
+        XCTAssertNil(AgentOraclePillLogic.singleOracleModelName(messages: [previous, missing], activeQueryID: missing.id, isStreaming: true))
+        XCTAssertNil(AgentOraclePillLogic.singleOracleModelName(messages: [previous, missing], activeQueryID: nil, isStreaming: false))
+        XCTAssertNil(AgentOraclePillLogic.singleOracleModelName(messages: [previous], activeQueryID: UUID(), isStreaming: true))
+        XCTAssertNil(AgentOraclePillLogic.singleOracleModelName(messages: [previous, AIChatMessage(content: "next", isUser: true)], activeQueryID: nil, isStreaming: false))
+    }
+
+    func testSingleOracleModelLabelSurvivesReloadAndSelectionChange() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanup() }
+        var session = ChatSession(workspaceID: fixture.workspace.id, composeTabID: fixture.tabID, name: "Recorded Oracle", messages: [StoredMessage(isUser: false, rawText: "answer", modelName: "Recorded Model")])
+        session.fileURL = try await fixture.oracleViewModel.chatData.saveChatSession(session, for: fixture.workspace)
+        fixture.oracleViewModel.sessions = [session.listStub()]
+        let loaded = await fixture.oracleViewModel.ensureSessionMessagesLoaded(session.id)
+        XCTAssertTrue(loaded)
+        let pill = AgentOraclePill(oracleViewModel: fixture.oracleViewModel, windowID: -1, currentTabID: fixture.tabID, activeAgentSessionID: nil, activeRunID: nil)
+        XCTAssertEqual(pill.popoverModelName(for: session), "Recorded Model")
+        let previousSelection = fixture.composition.promptManager.preferredModel
+        defer { fixture.composition.promptManager.preferredModel = previousSelection }
+        session.preferredAIModel = "Different Model"
+        fixture.composition.promptManager.preferredModel = "Different Model"
+        XCTAssertEqual(pill.popoverModelName(for: session), "Recorded Model")
+    }
+
+    func testOracleTranscriptPublishesBackgroundChangesOnlyToTheirLane() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanup() }
+        let vm = fixture.oracleViewModel
+        var selected = ChatSession(workspaceID: fixture.workspace.id, composeTabID: fixture.tabID, name: "Selected", messages: [StoredMessage(isUser: false, rawText: "Retained answer")])
+        var sibling = ChatSession(workspaceID: fixture.workspace.id, composeTabID: fixture.tabID, name: "Sibling", messages: [StoredMessage(isUser: false, rawText: "Another answer")])
+        selected.fileURL = try await vm.chatData.saveChatSession(selected, for: fixture.workspace)
+        sibling.fileURL = try await vm.chatData.saveChatSession(sibling, for: fixture.workspace)
+        vm.sessions = [selected.listStub(), sibling.listStub()]
+        XCTAssertNotEqual(vm.currentSessionID, selected.id)
+        XCTAssertNotEqual(vm.currentSessionID, sibling.id)
+
+        var selectedPublications = 0
+        var siblingPublications = 0
+        var wholeModelPublications = 0
+        let observers = [
+            vm.transcriptChanges(for: selected.id).sink { _ in selectedPublications += 1 },
+            vm.transcriptChanges(for: sibling.id).sink { _ in siblingPublications += 1 },
+            vm.objectWillChange.sink { _ in wholeModelPublications += 1 }
+        ]
+        defer { observers.forEach { $0.cancel() } }
+
+        let loadedSelected = await vm.ensureSessionMessagesLoaded(selected.id)
+        XCTAssertTrue(loadedSelected)
+        let retainedAnswer = try XCTUnwrap(vm.messagesSnapshot(for: selected.id).last)
+        XCTAssertTrue(retainedAnswer.isFinalized)
+        XCTAssertEqual(selectedPublications, 1)
+        XCTAssertEqual(siblingPublications, 0)
+        let loadedSibling = await vm.ensureSessionMessagesLoaded(sibling.id)
+        XCTAssertTrue(loadedSibling)
+        let siblingAnswer = try XCTUnwrap(vm.messagesSnapshot(for: sibling.id).last)
+        XCTAssertEqual(selectedPublications, 1)
+        XCTAssertEqual(siblingPublications, 1)
+
+        wholeModelPublications = 0
+        vm.updateMessage(withId: siblingAnswer.id) { $0.updateContent("Sibling delta") }
+        XCTAssertEqual(wholeModelPublications, 0)
+        XCTAssertEqual(siblingPublications, 2)
+        XCTAssertEqual(selectedPublications, 1)
+        XCTAssertEqual(vm.messagesSnapshot(for: selected.id).last?.content, "Retained answer")
+
+        vm.updateMessage(withId: retainedAnswer.id) { $0.updateReasoningContent("Selected reasoning delta") }
+        XCTAssertEqual(wholeModelPublications, 0)
+        XCTAssertEqual(siblingPublications, 2)
+        XCTAssertEqual(selectedPublications, 2)
+        XCTAssertEqual(vm.messagesSnapshot(for: selected.id).last?.reasoningRevisionCount, 1)
+        XCTAssertEqual(vm.messagesSnapshot(for: selected.id).last?.reasoningContent, "Selected reasoning delta")
+
+        vm.purgeSessionStorage(selected.id)
+        XCTAssertEqual(selectedPublications, 3)
+        XCTAssertEqual(siblingPublications, 2)
+        XCTAssertTrue(vm.messagesSnapshot(for: selected.id).isEmpty)
+    }
+
     func testExplicitRequestStateRejectsBlankStaleTabAndMismatchedSession() throws {
         let tabID = UUID()
         let otherTabID = UUID()

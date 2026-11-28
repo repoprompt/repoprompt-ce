@@ -20,7 +20,14 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         selection: MCPAppPhysicalCapabilityAdapters.Selection
     )
 
-    let dependencies: Dependencies
+    private let physical: Dependencies?
+    let canonicalCommand: (@MainActor (ToolInvocationContext) -> AgentSessionRuntimeStore.Command?)?
+
+    func physicalDependencies() throws -> Dependencies {
+        guard let physical else { throw MCPError.invalidRequest("This worktree request requires a physical presenter") }
+        return physical
+    }
+
     private let vcsService: VCSService
     private let resolver: GitRepoTargetResolver
     private let resolveSpawnParentSessionID: AgentSessionTargetOperationGuard.SpawnParentSessionResolver
@@ -44,12 +51,24 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         resolver: GitRepoTargetResolver = GitRepoTargetResolver()
     ) {
         self.runtime = runtime
-        dependencies = (execution: execution, context: context, selection: selection)
+        physical = (execution: execution, context: context, selection: selection)
+        canonicalCommand = nil
         self.resolveSpawnParentSessionID = resolveSpawnParentSessionID
         self.resolveObserverEndpoint = resolveObserverEndpoint
         self.hasManageGrant = hasManageGrant
         self.vcsService = vcsService
         self.resolver = resolver
+    }
+
+    init(runtime: MCPAppToolBinder, canonicalCommand: @escaping @MainActor (ToolInvocationContext) -> AgentSessionRuntimeStore.Command?) {
+        self.runtime = runtime
+        self.canonicalCommand = canonicalCommand
+        physical = nil
+        resolveSpawnParentSessionID = { _, _ in nil }
+        resolveObserverEndpoint = { _, _ in nil }
+        hasManageGrant = { await Self.sessionLinkManageGrant(observerEndpoint: $0, targetSessionID: $1) }
+        vcsService = .shared
+        resolver = GitRepoTargetResolver()
     }
 
     /// Live Manage-grant proof from the session-link authority, revalidated against both endpoints.
@@ -185,7 +204,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         case preview, apply, status, `continue`, abort
     }
 
-    private func executeManageWorktree(args: [String: Value], invocationContext: ToolInvocationContext) async throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
+    func executeManageWorktree(args: [String: Value], invocationContext: ToolInvocationContext) async throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
         guard let opRaw = trimmedString(args["op"])?.lowercased() else {
             throw MCPError.invalidParams("op is required. Valid ops: list, show, create, bind, select, unbind, preview, apply, status, continue, abort")
         }
@@ -208,7 +227,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         case .unbind:
             return try await executeUnbind(args: args, invocationContext: invocationContext)
         case .preview, .apply, .status, .continue, .abort:
-            return try await executeMerge(op: op, args: args)
+            return try await executeMerge(op: op, args: args, invocationContext: invocationContext)
         }
     }
 
@@ -234,6 +253,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         )
         let pagedWorktrees = Array(worktrees[page.range])
         if persistVisuals {
+            try await discovery.validate?()
             if !pagedWorktrees.isEmpty {
                 let logicalRoot = try await logicalRoot(for: context)
                 try await admitLogicalMutationRoots([logicalRoot.standardizedFullPath])
@@ -256,6 +276,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             warnings.append("Showing worktrees \(page.range.lowerBound + 1)-\(page.range.upperBound) of \(page.totalCount); continue with offset=\(nextOffset).")
         }
         let warning: String? = warnings.isEmpty ? nil : warnings.joined(separator: "\n")
+        if !persistVisuals { try await discovery.validate?() }
         return await ToolResultDTOs.ManageWorktreeReplyDTO(
             op: "list",
             repository: repositoryDTO(
@@ -282,6 +303,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             requireExplicit: false
         )
         if parseBool(args["persist_visuals"]) == true {
+            try await discovery.validate?()
             let logicalRoot = try await logicalRoot(for: worktree, context: context)
             try await admitLogicalMutationRoots([logicalRoot.standardizedFullPath])
             try await MCPDomainMutationCommitContext.willCommit()
@@ -291,6 +313,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             includeStatus: parseBool(args["include_status"]) ?? false,
             persistVisuals: parseBool(args["persist_visuals"]) ?? false
         )
+        if parseBool(args["persist_visuals"]) != true { try await discovery.validate?() }
         return await ToolResultDTOs.ManageWorktreeReplyDTO(
             op: "show",
             repository: repositoryDTO(from: worktree.repository, fallback: context.repo),
@@ -328,8 +351,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
 
         let logicalRoot = try await logicalRoot(for: context)
         let logicalRootPath = logicalRoot.standardizedFullPath
-        var mutationRootMappings = try await context.lookupContext.domainMutationPhysicalRootMappings(
-            store: (dependencies.context.requirePromptVM()).workspaceFileContextStore
+        var mutationRootMappings = await context.lookupContext.domainMutationPhysicalRootMappings(
+            store: discovery.store
         )
         mutationRootMappings.append(
             .init(
@@ -373,6 +396,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
                 request: plan.createRequest,
                 at: context.repo.rootURL,
                 beforeCommit: { [self] in
+                    try await discovery.validate?()
                     if let bindingRequest {
                         try await commitBindingMutation(bindingRequest)
                     } else {
@@ -454,7 +478,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
                     owner.appendItem(.system(warning, sequenceIndex: owner.nextSequenceIndex))
                     owner.isDirty = true
                     bindingRequest.admission.command.writer.scope.persistence.scheduleSave(for: owner)
-                    bindingRequest.agentModeVM.syncTranscriptUIState()
+                    bindingRequest.agentModeVM?.syncTranscriptUIState()
                 }
                 if currentBindings != nil, applied == nil {
                     AgentSessionLinkRuntimeBridge.shared.worktreeOwnership.markReleased([
@@ -593,6 +617,50 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
 
     // MARK: - Binding
 
+    /// Freeze the writer and binding baseline before caller authorization can suspend. Legacy
+    /// windows also freeze their resource admission here; canonical writers never borrow it.
+    @MainActor
+    struct ExecutionAdmission {
+        private enum Source {
+            case legacy(Result<AgentSessionWorktreeRuntime.Admission, Error>)
+            case canonical(AgentSessionRuntimeHost)
+        }
+
+        private let command: AgentSessionRuntimeStore.Command
+        private let bindings: [AgentSessionWorktreeBinding]
+        private let source: Source
+
+        init(_ command: AgentSessionRuntimeStore.Command) {
+            self.command = command
+            bindings = command.writer.session.worktreeBindings
+            let scope = command.writer.scope
+            if let host = scope.executableHost, host.workspaceActivation != nil {
+                source = .canonical(host)
+            } else {
+                source = .legacy(Result { try scope.worktrees.admit(command) })
+            }
+        }
+
+        func resolve() async throws -> AgentSessionWorktreeRuntime.Admission {
+            guard command.isCurrent, command.writer.session.worktreeBindings == bindings else {
+                throw AgentSessionWorktreeRuntime.TransitionError.stale
+            }
+            let admission: AgentSessionWorktreeRuntime.Admission
+            switch source {
+            case let .legacy(legacy):
+                admission = try legacy.get()
+            case let .canonical(canonicalHost):
+                guard command.writer.scope.executableHost === canonicalHost else {
+                    throw AgentSessionWorktreeRuntime.TransitionError.stale
+                }
+                admission = try await canonicalHost.scope.worktrees.admitForExecution(command)
+            }
+            try admission.requireCurrent()
+            guard admission.bindings == bindings else { throw AgentSessionWorktreeRuntime.TransitionError.stale }
+            return admission
+        }
+    }
+
     private func applyBinding(
         request: BindingRequest,
         worktree: GitWorktreeDescriptor,
@@ -706,12 +774,26 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
 
     /// The mutation journal may suspend too; never carry an entry-only permission across it.
     private func commitBindingMutation(_ request: BindingRequest) async throws {
+        try await request.admission.resources.validatePlacement?()
         try await request.authority.revalidate()
         try request.admission.requireCurrent()
         try await MCPDomainMutationCommitContext.willCommit()
+        try await Self.commitAfterBindingAuthorization(
+            validatePlacement: request.admission.resources.validatePlacement,
+            revalidateAuthority: { try await request.authority.revalidate() },
+            commit: { try request.authority.commit { try request.admission.requireCurrent() } }
+        )
+    }
+
+    static func commitAfterBindingAuthorization(
+        validatePlacement: (@MainActor () async throws -> Void)?,
+        revalidateAuthority: @MainActor () async throws -> Void,
+        commit: @MainActor () throws -> Void
+    ) async throws {
         do {
-            try await request.authority.revalidate()
-            try request.authority.commit { try request.admission.requireCurrent() }
+            try await revalidateAuthority()
+            try await validatePlacement?()
+            try commit()
         } catch {
             throw DomainMutationRefusedBeforeEffects(error)
         }
@@ -736,9 +818,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
     ) async throws -> AgentSelfWorktreeRelocation? {
         try request.admission.requireCurrent()
         if let origin = selfRunOrigin(for: request.sessionID),
-           let scheduled = try await request.agentModeVM.scheduleSelfWorktreeRelocation(
-               desiredBindings,
-               forSessionID: request.sessionID, admission: request.admission,
+           let scheduled = try await AgentModeViewModel.scheduleSelfWorktreeRelocation(
+               desiredBindings, admission: request.admission,
                originRunID: origin.runID,
                originRunAttemptID: origin.runAttemptID,
                beforeRecord: beforeCommit
@@ -773,7 +854,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
     private func requireNoPendingSelfRelocation(_ request: BindingRequest) throws {
         try request.admission.requireCurrent()
         guard let origin = selfRunOrigin(for: request.sessionID) else { return }
-        try request.agentModeVM.requireNoPendingSelfWorktreeRelocation(
+        try AgentModeViewModel.requireNoPendingSelfWorktreeRelocationForSession(
             in: request.admission.session, originRunAttemptID: origin.runAttemptID
         )
     }
@@ -860,7 +941,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         let authority: AgentSessionTargetOperationGuard.WorktreeBindingAuthority
         let admission: AgentSessionWorktreeRuntime.Admission
         /// Call-scoped presentation/continuation adapter, never the writer-selection authority.
-        let agentModeVM: AgentModeViewModel
+        let agentModeVM: AgentModeViewModel?
     }
 
     private func resolveBindingRequest(args: [String: Value], invocationContext: ToolInvocationContext) async throws -> BindingRequest {
@@ -875,6 +956,12 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             explicitSessionID = nil
         }
 
+        if let canonicalCommand {
+            return try await resolveHostBindingRequest(
+                explicitSessionID: explicitSessionID, invocationContext: invocationContext, canonicalCommand: canonicalCommand
+            )
+        }
+        let dependencies = try physicalDependencies()
         let resolved: MCPResolvedTabContextSnapshot? = if explicitSessionID == nil {
             try dependencies.context.resolveTabContextSnapshot(
                 metadata,
@@ -892,7 +979,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         let targetWindow = try dependencies.execution.requireTargetWindow()
         let agentModeVM = targetWindow.agentModeViewModel
         // Capture before authorization suspends, but do not disclose liveness until it succeeds.
-        let capturedAdmission = agentModeVM.admitWorktreeTransition(forSessionID: sessionID)
+        let capturedCommand = try? agentModeVM.runtimeCommand(sessionID: sessionID)
+        let capturedAdmission = capturedCommand.map(ExecutionAdmission.init)
         let authority: AgentSessionTargetOperationGuard.WorktreeBindingAuthority = if let explicitSessionID {
             // A caller-supplied session UUID is a target reference, not authority over that session.
             try await AgentSessionTargetOperationGuard.requireWorktreeBindingAuthority(
@@ -932,11 +1020,86 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         } else {
             nil
         }
-        guard let admission = capturedAdmission else {
+        guard let capturedAdmission else {
             throw MCPError.invalidParams("The requested agent session is not currently available.")
         }
+        let admission: AgentSessionWorktreeRuntime.Admission
+        do {
+            admission = try await capturedAdmission.resolve()
+        } catch {
+            try await authority.revalidate()
+            if case AgentSessionWorktreeRuntime.TransitionError.unavailable = error {
+                throw MCPError.invalidParams("The requested agent session is not currently available.")
+            }
+            throw error
+        }
+        try await authority.revalidate()
         try admission.requireCurrent()
         return BindingRequest(sessionID: sessionID, invocation: invocation, authority: authority, admission: admission, agentModeVM: agentModeVM)
+    }
+
+    private func resolveHostBindingRequest(
+        explicitSessionID: UUID?, invocationContext: ToolInvocationContext,
+        canonicalCommand: @escaping @MainActor (ToolInvocationContext) -> AgentSessionRuntimeStore.Command?
+    ) async throws -> BindingRequest {
+        guard let origin = canonicalCommand(invocationContext) else { throw MCPFileToolAuthorityFailure.unavailable }
+        let originID = origin.identity.sessionID
+        let targetID = explicitSessionID ?? originID
+        // As for a physical route, direct bind/select operates within the originating scope.
+        // Cross-scope operations use session_admin and its separate scoped admission.
+        let target: AgentSessionRuntimeStore.Command? = if targetID == originID {
+            origin
+        } else if case let .unique(writer) = origin.writer.scope.resolveWriter(sessionID: targetID, expectedWorkspaceID: origin.identity.workspaceID),
+                  writer.scope === origin.writer.scope
+        {
+            try? writer.admitCommand().get()
+        } else { nil }
+        let endpoint = origin.writer.scope.linkExecution?.agentSessionLinkObserverEndpoint(tabID: origin.writer.session.tabID)
+        let authority = try await AgentSessionTargetOperationGuard.requireWorktreeBindingAuthority(
+            targetSessionID: targetID, caller: .agentSession(originID), resolveObserverEndpoint: { endpoint },
+            resolveTargetProvenance: { id in
+                guard let target else { return .unknown(targetSessionID: id) }
+                return AgentSessionTargetOperationGuard.provenance(for: id, loadedParentSessionID: target.writer.session.parentSessionID)
+            }, hasManageGrant: hasManageGrant
+        )
+        func requireOrigin() throws {
+            guard !Task.isCancelled, canonicalCommand(invocationContext)?.identity == origin.identity else {
+                throw MCPFileToolAuthorityFailure.superseded
+            }
+        }
+        try requireOrigin()
+        try await authority.revalidate()
+        try requireOrigin()
+        guard let target else { throw MCPError.invalidParams("The requested agent session is not currently available.") }
+        let admission: AgentSessionWorktreeRuntime.Admission
+        do {
+            admission = try await ExecutionAdmission(target).resolve()
+        } catch {
+            try await authority.revalidate()
+            try requireOrigin()
+            throw error
+        }
+        let current: @MainActor () throws -> Void = {
+            try requireOrigin()
+            try admission.requireCurrent()
+        }
+        try await authority.revalidate()
+        try current()
+        let metadata = invocationContext.metadata
+        let invocation: AgentModeViewModel.WorktreeBindingMutationInvocationIdentity? = if let connectionID = metadata.connectionID,
+                                                                                           let runID = origin.writer.session.runID, MCPClientIdentity.matches(metadata.clientName, AgentProviderKind.codexMCPClientID)
+        {
+            .init(connectionID: connectionID, sessionID: originID, runID: runID, provider: .codexExec)
+        } else { nil }
+        return BindingRequest(sessionID: targetID, invocation: invocation, authority: .init(
+            revalidate: {
+                try await authority.revalidate()
+                try current()
+            }, commit: { body in
+                try current()
+                try authority.commit(body)
+            }
+        ), admission: admission, agentModeVM: nil)
     }
 
     // MARK: - Repository and worktree resolution
@@ -948,6 +1111,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         let allRepos: [GitRepoDescriptor]
         let visibleRoots: [WorkspaceRootRef]
         let lookupContext: WorkspaceLookupContext
+        let store: WorkspaceFileContextStore
+        var validate: (@MainActor () async throws -> Void)?
     }
 
     /// A real selected repository and the logical root its binding mutations are attributed to.
@@ -968,6 +1133,30 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
     }
 
     private func captureDiscovery(invocationContext: ToolInvocationContext) async throws -> DiscoveryContext {
+        if let canonicalCommand {
+            guard let command = canonicalCommand(invocationContext) else { throw MCPFileToolAuthorityFailure.unavailable }
+            let admission = try await ExecutionAdmission(command).resolve()
+            guard let store = admission.resources.store else { throw MCPFileToolAuthorityFailure.unavailable }
+            try await admission.resources.awaitRootReadiness()
+            let source = AgentWorkspaceLookupContextSource(activeAgentSessionID: command.identity.sessionID, worktreeBindings: admission.bindings)
+            let roots = await store.rootRefs(scope: .visibleWorkspace)
+            let lookup = try await AgentWorkspaceLookupContextResolver.requiredLookupContext(source: source, visibleRoots: roots, store: store)
+            let lookupRoots = await store.rootRefs(scope: lookup.rootScope)
+            let repos = await discoverGitRepos(in: lookupRoots)
+            let validate: @MainActor () async throws -> Void = {
+                try await admission.resources.validatePlacement?()
+                guard canonicalCommand(invocationContext)?.identity == command.identity, !Task.isCancelled else {
+                    throw MCPFileToolAuthorityFailure.superseded
+                }
+                try admission.requireCurrent()
+            }
+            try await validate()
+            return DiscoveryContext(metadata: invocationContext.metadata, election: .init(
+                workspaceID: command.identity.workspaceID, declaredRepoPaths: admission.resources.declaredRepoPaths,
+                bindingSource: source, lookupContext: lookup, lookupRoots: lookupRoots
+            ), allRepos: repos, visibleRoots: lookupRoots, lookupContext: lookup, store: store, validate: validate)
+        }
+        let dependencies = try physicalDependencies()
         guard let workspaceManager = dependencies.context.workspaceManager,
               let activeWorkspace = workspaceManager.activeWorkspace
         else {
@@ -985,7 +1174,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         } else {
             activeWorkspace
         }
-        let visibleRoots = try await (dependencies.context.requirePromptVM()).workspaceFileContextStore.rootRefs(scope: lookupContext.rootScope)
+        let store = try dependencies.context.requirePromptVM().workspaceFileContextStore
+        let visibleRoots = await store.rootRefs(scope: lookupContext.rootScope)
         let allRepos = await discoverGitRepos(in: visibleRoots)
         return DiscoveryContext(
             metadata: metadata,
@@ -1001,7 +1191,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             ),
             allRepos: allRepos,
             visibleRoots: visibleRoots,
-            lookupContext: lookupContext
+            lookupContext: lookupContext, store: store
         )
     }
 
@@ -1139,6 +1329,11 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         do {
             let selection = try await WorkspaceDefaultGitRepositoryElection(vcsService: vcsService).elect(in: discovery.election)
             // Fail a superseded attempt rather than retarget it.
+            if let validate = discovery.validate {
+                try await validate()
+                return selection
+            }
+            let dependencies = try physicalDependencies()
             let currentWorkspace = discovery.election.workspaceID.flatMap { id in
                 dependencies.context.workspaceManager?.workspaces.first { $0.id == id }
             }

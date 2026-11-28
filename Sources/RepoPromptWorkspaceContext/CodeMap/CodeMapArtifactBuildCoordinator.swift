@@ -10,6 +10,14 @@ enum CodeMapArtifactBuildPriority: Equatable {
     case explicit
     case background
 
+    fileprivate var schedulingRank: Int {
+        switch self {
+        case .demand: 0
+        case .explicit: 1
+        case .background: 2
+        }
+    }
+
     fileprivate var taskPriority: TaskPriority {
         switch self {
         case .demand: .userInitiated
@@ -1168,17 +1176,17 @@ actor CodeMapArtifactBuildCoordinator {
     }
 
     private func scheduleBuilds() {
-        resetBackgroundAgingCountIfNeeded()
+        if activeBuildCount >= policy.maximumConcurrentBuildCount {
+            resetBackgroundAgingCountIfNeeded()
+        }
         while activeBuildCount < policy.maximumConcurrentBuildCount,
-              let key = selectNextBuildKey(),
-              let flight = flights[key],
-              let input = flight.input,
-              !flight.waiters.isEmpty
+              let selection = selectNextBuild(),
+              let input = selection.candidate.flight.input
         {
-            let now = clock.nowNanoseconds()
-            let backgroundAged = hasAgedBackground(now: now)
-            queuedBuildKeys.removeAll { $0 == key }
-            let descriptor = schedulingDescriptor(for: flight, now: now)
+            let candidate = selection.candidate
+            let flight = candidate.flight
+            let key = queuedBuildKeys.remove(at: candidate.index)
+            let descriptor = candidate.descriptor
             ownerLastAdmission[descriptor.ownerID] = takeOrdinal()
             if descriptor.isDemand {
                 if consecutiveDemandAdmissions < policy.maximumConsecutiveDemandAdmissions {
@@ -1187,7 +1195,7 @@ actor CodeMapArtifactBuildCoordinator {
             } else {
                 consecutiveDemandAdmissions = 0
             }
-            recordAdmission(descriptor, backgroundAged: backgroundAged)
+            recordAdmission(descriptor, backgroundAged: selection.backgroundAged)
             let queueDuration = duration(
                 from: flight.enqueueNanoseconds ?? clock.nowNanoseconds(),
                 to: clock.nowNanoseconds()
@@ -1596,7 +1604,6 @@ actor CodeMapArtifactBuildCoordinator {
             increment(&counters.sharedTaskCancellations)
             removeFlight(flight, hook: .flightCancelled)
         case .awaitingBuildAdmission:
-            queuedBuildKeys.removeAll { $0 == key }
             flight.task?.cancel()
             removeFlight(flight, hook: .flightCancelled)
             scheduleBuilds()
@@ -1694,44 +1701,55 @@ actor CodeMapArtifactBuildCoordinator {
         }
     }
 
-    private func selectNextBuildKey() -> CodeMapArtifactKey? {
+    private func selectNextBuild() -> (candidate: SchedulingCandidate, backgroundAged: Bool)? {
+        // Use the same age snapshot for selection and the corresponding admission counters.
         let now = clock.nowNanoseconds()
-        let candidates = queuedBuildKeys.compactMap { key -> (CodeMapArtifactKey, Flight, SchedulingDescriptor)? in
-            guard let flight = flights[key], !flight.waiters.isEmpty else { return nil }
-            return (key, flight, schedulingDescriptor(for: flight, now: now))
+        var best = [SchedulingCandidate?](repeating: nil, count: SchedulingTier.allCases.count)
+        for (index, key) in queuedBuildKeys.enumerated() {
+            guard let flight = flights[key], !flight.waiters.isEmpty else { continue }
+            let descriptor = schedulingDescriptor(for: flight, now: now)
+            let candidate = SchedulingCandidate(
+                index: index,
+                flight: flight,
+                descriptor: descriptor,
+                ownerGrant: ownerLastAdmission[descriptor.ownerID] ?? 0
+            )
+            let tier = descriptor.tier.rawValue
+            if let incumbent = best[tier], !candidate.precedes(incumbent) { continue }
+            best[tier] = candidate
         }
-        let demand = candidates.filter { $0.2.tier == .demand }
-        let agedExplicit = candidates.filter { $0.2.tier == .agedExplicit }
-        let explicit = candidates.filter { $0.2.tier == .explicit }
-        let agedBackground = candidates.filter { $0.2.tier == .agedBackground }
-        let background = candidates.filter { $0.2.tier == .background }
-        if agedBackground.isEmpty {
+        let agedBackground = best[SchedulingTier.agedBackground.rawValue]
+        if agedBackground == nil {
             consecutiveNonBackgroundAdmissionsWhileBackgroundAged = 0
         }
-        let backgroundDue = !agedBackground.isEmpty
-            && consecutiveNonBackgroundAdmissionsWhileBackgroundAged
-            >= policy.maximumConsecutiveNonBackgroundAdmissionsWhileBackgroundAged
-        let pool: [(CodeMapArtifactKey, Flight, SchedulingDescriptor)] = if backgroundDue {
+        let explicit = best[SchedulingTier.explicit.rawValue]
+        let winner: SchedulingCandidate? = if let agedBackground,
+                                              consecutiveNonBackgroundAdmissionsWhileBackgroundAged
+                                              >= policy.maximumConsecutiveNonBackgroundAdmissionsWhileBackgroundAged
+        {
             agedBackground
-        } else if !agedExplicit.isEmpty {
+        } else if let agedExplicit = best[SchedulingTier.agedExplicit.rawValue] {
             agedExplicit
-        } else if !demand.isEmpty,
-                  explicit.isEmpty || consecutiveDemandAdmissions < policy.maximumConsecutiveDemandAdmissions
+        } else if let demand = best[SchedulingTier.demand.rawValue],
+                  explicit == nil || consecutiveDemandAdmissions < policy.maximumConsecutiveDemandAdmissions
         {
             demand
-        } else if !explicit.isEmpty {
-            explicit
-        } else if !agedBackground.isEmpty {
-            agedBackground
         } else {
-            background
+            explicit ?? agedBackground ?? best[SchedulingTier.background.rawValue]
         }
-        return pool.min { lhs, rhs in
-            let lhsGrant = ownerLastAdmission[lhs.2.ownerID] ?? 0
-            let rhsGrant = ownerLastAdmission[rhs.2.ownerID] ?? 0
-            if lhsGrant != rhsGrant { return lhsGrant < rhsGrant }
-            return lhs.1.enqueueOrdinal < rhs.1.enqueueOrdinal
-        }?.0
+        return winner.map { ($0, agedBackground != nil) }
+    }
+
+    private struct SchedulingCandidate {
+        let index: Int
+        let flight: Flight
+        let descriptor: SchedulingDescriptor
+        let ownerGrant: UInt64
+
+        func precedes(_ other: Self) -> Bool {
+            if ownerGrant != other.ownerGrant { return ownerGrant < other.ownerGrant }
+            return flight.enqueueOrdinal < other.flight.enqueueOrdinal
+        }
     }
 
     private struct SchedulingDescriptor {
@@ -1744,7 +1762,7 @@ actor CodeMapArtifactBuildCoordinator {
         }
     }
 
-    private enum SchedulingTier {
+    private enum SchedulingTier: Int, CaseIterable {
         case demand
         case agedExplicit
         case explicit
@@ -1754,32 +1772,20 @@ actor CodeMapArtifactBuildCoordinator {
 
     private func schedulingDescriptor(
         for flight: Flight,
-        now: UInt64? = nil
+        now: UInt64
     ) -> SchedulingDescriptor {
-        let demandWaiters = flight.waiters.values.filter { $0.priority == .demand }
-        let explicitWaiters = flight.waiters.values.filter { $0.priority == .explicit }
-        let selected = (
-            !demandWaiters.isEmpty
-                ? demandWaiters
-                : (!explicitWaiters.isEmpty ? explicitWaiters : Array(flight.waiters.values))
-        )
-        .min { $0.ordinal < $1.ordinal }!
-        let current = now ?? clock.nowNanoseconds()
-        let aged = selected.priority == .explicit && duration(
-            from: flight.enqueueNanoseconds ?? current,
-            to: current
-        ) >= policy.agePromotionNanoseconds
-        let backgroundAged = selected.priority == .background && duration(
-            from: flight.enqueueNanoseconds ?? current,
-            to: current
-        ) >= policy.backgroundAgePromotionNanoseconds
+        let selected = flight.waiters.values.min { lhs, rhs in
+            let lhsRank = lhs.priority.schedulingRank
+            let rhsRank = rhs.priority.schedulingRank
+            if lhsRank != rhsRank { return lhsRank < rhsRank }
+            return lhs.ordinal < rhs.ordinal
+        }!
+        let age = duration(from: flight.enqueueNanoseconds ?? now, to: now)
         let tier: SchedulingTier = if selected.priority == .demand {
             .demand
-        } else if aged {
-            .agedExplicit
         } else if selected.priority == .explicit {
-            .explicit
-        } else if backgroundAged {
+            age >= policy.agePromotionNanoseconds ? .agedExplicit : .explicit
+        } else if age >= policy.backgroundAgePromotionNanoseconds {
             .agedBackground
         } else {
             .background
@@ -1794,7 +1800,9 @@ actor CodeMapArtifactBuildCoordinator {
     private func hasAgedBackground(now: UInt64) -> Bool {
         queuedBuildKeys.contains { key in
             guard let flight = flights[key], !flight.waiters.isEmpty else { return false }
-            return schedulingDescriptor(for: flight, now: now).tier == .agedBackground
+            let age = duration(from: flight.enqueueNanoseconds ?? now, to: now)
+            return age >= policy.backgroundAgePromotionNanoseconds
+                && flight.waiters.values.allSatisfy { $0.priority == .background }
         }
     }
 

@@ -2772,13 +2772,36 @@ package enum MCPDomainCanonicalToolDefinitions {
         }
     }
 
+    private static var agentSessionLinkSnooze24HourSchema: Value {
+        var schema = AgentSessionLinkWaitCursorMigration.inputSchema.objectValue!
+        if case var .object(properties)? = schema["properties"],
+           case var .object(duration)? = properties["duration_seconds"],
+           case let .string(description)? = duration["description"]
+        {
+            duration["description"] = .string(description.replacingOccurrences(of: "60...3600", with: "60...86400"))
+            duration["maximum"] = .int(86400)
+            properties["duration_seconds"] = .object(duration)
+            schema["properties"] = .object(properties)
+        }
+        return .object(schema)
+    }
+
     private static func canonicalizeAgentSessionLink(
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
-        if AgentSessionLinkDirectionGuidanceMigration.isCurrent(definition) {
+        let schema = agentSessionLinkSnooze24HourSchema
+        if definition.description == AgentSessionLinkDirectionGuidanceMigration.description,
+           definition.inputSchema == schema
+        {
             return definition
         }
-        return AgentSessionLinkDirectionGuidanceMigration.apply(canonicalizeAgentSessionLinkBeforeDirectionGuidance(definition))
+        let previous = AgentSessionLinkDirectionGuidanceMigration.isCurrent(definition)
+            ? definition
+            : AgentSessionLinkDirectionGuidanceMigration.apply(canonicalizeAgentSessionLinkBeforeDirectionGuidance(definition))
+        return MCPDomainToolDefinition(
+            name: previous.name, description: previous.description, inputSchema: schema,
+            annotations: previous.annotations, isEnabledByDefault: previous.isEnabledByDefault
+        )
     }
 
     private static func canonicalizeAgentSessionLinkBeforeDirectionGuidance(
@@ -2806,7 +2829,8 @@ package enum MCPDomainCanonicalToolDefinitions {
     }
 
     private static func agentSessionLinkModelSelectionIsPartial(_ definition: MCPDomainToolDefinition) -> Bool {
-        !AgentSessionLinkDirectionGuidanceMigration.isCurrent(definition)
+        !(definition.description == AgentSessionLinkDirectionGuidanceMigration.description && definition.inputSchema == agentSessionLinkSnooze24HourSchema)
+            && !AgentSessionLinkDirectionGuidanceMigration.isCurrent(definition)
             && !AgentSessionLinkWaitCursorMigration.isCurrent(definition)
             && !AgentSessionLinkOverseerActivationGuidance.isCurrent(definition)
             && !AgentSessionLinkOverseerActivationGuidance.isPrevious(definition)

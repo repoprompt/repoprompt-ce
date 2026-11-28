@@ -31,6 +31,9 @@ struct AgentSessionIndexEntry: Identifiable, Equatable {
     var isMCPOriginated: Bool
     var worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary]
     var activeWorktreeMergeSummaries: [AgentSessionWorktreeMergeSummary]
+    var originWorkflowID: String?
+    var originWorkflowDisplayName: String?
+    var lastRunStartedAt: Date?
 }
 
 struct AgentSessionSidebarBuildRequest {

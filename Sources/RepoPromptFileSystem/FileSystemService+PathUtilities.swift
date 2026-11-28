@@ -167,7 +167,15 @@ package extension FileSystemService {
 
     func isIgnoreFile(_ relPath: String) -> Bool {
         let filename = (relPath as NSString).lastPathComponent.lowercased()
-        return filename == ".gitignore" || filename == ".repo_ignore" || filename == ".cursorignore"
+        return filename == ".gitignore" || Self.isAppIgnoreFilename(filename)
+    }
+
+    func isAppIgnoreFile(_ relPath: String) -> Bool {
+        Self.isAppIgnoreFilename((relPath as NSString).lastPathComponent.lowercased())
+    }
+
+    private static func isAppIgnoreFilename(_ filename: String) -> Bool {
+        filename == ".repo_ignore" || filename == ".cursorignore"
     }
 
     @inline(__always)

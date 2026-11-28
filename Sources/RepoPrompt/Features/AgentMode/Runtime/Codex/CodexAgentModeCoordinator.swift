@@ -291,6 +291,13 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
     private var toolTrackingByTabID: [UUID: AgentToolTrackingController] = [:]
     private let windowID: Int
     private let routingOwner: MCPHostRouteResources?
+    private var originatingContextSource: MCPHostRouteResources.ProviderContextSource?
+
+    func installOriginatingContextSource(_ source: @escaping MCPHostRouteResources.ProviderContextSource) {
+        precondition(originatingContextSource == nil)
+        originatingContextSource = source
+    }
+
     private let runtimeWorkspacePathsProvider: (AgentTabSession) throws -> CodexRuntimeWorkspacePaths
     private let codexControllerFactory: CodexControllerFactory
     private let codexCapabilitiesForLaunch: (_ isMCPRelated: Bool) -> CodexCapabilitySettings
@@ -3965,6 +3972,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         controller: (any CodexSessionControlling)?,
         existingRef: CodexNativeSessionController.SessionRef?,
         baseInstructions: String,
+        developerInstructions: CodexDeveloperInstructionPlan,
         model: String?,
         reasoningEffort: String?,
         serviceTier: String?,
@@ -3983,6 +3991,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             let ref = try await controller.startOrResume(
                 existing: existingRef,
                 baseInstructions: baseInstructions,
+                developerInstructions: existingRef == nil ? developerInstructions.newThread : developerInstructions.resume,
                 model: model,
                 reasoningEffort: reasoningEffort,
                 serviceTier: serviceTier
@@ -4004,6 +4013,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 let ref = try await controller.startOrResume(
                     existing: nil,
                     baseInstructions: baseInstructions,
+                    developerInstructions: developerInstructions.newThread,
                     model: model,
                     reasoningEffort: reasoningEffort,
                     serviceTier: serviceTier
@@ -4111,7 +4121,19 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             conversationID: session.codexConversationID ?? "",
             rolloutPath: session.codexRolloutPath,
             model: session.codexModel,
-            reasoningEffort: session.codexReasoningEffort
+            reasoningEffort: session.codexReasoningEffort,
+            instructionMode: session.codexInstructionMode
+        )
+    }
+
+    /// RepoPrompt developer instructions for this session's next bind. Eligibility decides whether a
+    /// new thread may use Codex's own base instructions; a resume follows the conversation's
+    /// recorded mode, so later role or parent changes cannot strip a native thread's guidance.
+    static func codexDeveloperInstructionPlan(for session: AgentTabSession) -> CodexDeveloperInstructionPlan {
+        CodexDeveloperInstructionPlan.resolve(
+            note: AgentModePrompts.codexNativeDeveloperNote(),
+            eligibleForNativeStart: session.mcpControlContext?.taskLabelKind == nil && session.parentSessionID == nil,
+            conversationMode: session.codexInstructionMode
         )
     }
 
@@ -4218,6 +4240,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             policyInstaller: MCPBootstrapLease.agentModePolicyInstaller(connectionPolicyInstaller),
             routingStateOwner: routingStateOwner,
             routingOwner: routingOwner,
+            originatingContextSource: originatingContextSource,
             processRegistrationProvider: { await (reusingController as? CodexNativeSessionController)?.routingProcessRegistration() }
         )
     }
@@ -4620,6 +4643,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             cancelCodexTransportClosedFallback(for: session.tabID)
             session.codexConversationID = ref.conversationID
             session.codexRolloutPath = ref.rolloutPath
+            session.codexInstructionMode = ref.instructionMode
             session.providerCleanupHandle = ProviderConversationCleanupHandle(
                 provider: AgentProviderKind.codexExec.rawValue,
                 conversationID: ref.conversationID,
@@ -6928,6 +6952,20 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
 
             let expectedControllerID = pendingStart.controllerID
             if shouldWaitForRouting {
+                // The committed connection belongs to this startup lease, not the window census.
+                // Keep the compatibility validator only for originless legacy leases.
+                let registration = await lease.originatingRoutingCleanupReceipts()?.last
+                func validateRoutingProcess() async -> Bool {
+                    guard let routingOwner else {
+                        return await routeOwnerValidator(expectedController, runID, windowID, session.tabID)
+                    }
+                    guard let registration, registration.routeOwner === routingOwner,
+                          let pid = await expectedController.routingProcessID() else { return false }
+                    return await ServerNetworkManager.shared.isRunRouteAuthoritativelyCommitted(
+                        runID: runID, windowID: windowID, tabID: session.tabID,
+                        expectedAgentPID: pid, registration: registration
+                    )
+                }
                 do {
                     try await lease.requireRouting(
                         timeoutMs: codexLeaseRoutingTimeoutMs,
@@ -6946,12 +6984,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                             guard readiness.allowsDispatch else { return false }
                             // Validate inside the lease boundary: a stale .routed outcome
                             // cannot retain an unconsumed policy for another process.
-                            let routeBelongsToController = await routeOwnerValidator(
-                                expectedController,
-                                runID,
-                                windowID,
-                                session.tabID
-                            )
+                            let routeBelongsToController = await validateRoutingProcess()
                             return !Task.isCancelled
                                 && routeBelongsToController
                                 && linkExecutionRuntime.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: readiness)
@@ -6972,7 +7005,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                     // that exact process/run route before publishing a companion-enabled thread.
                     if computerUseActivationID != nil {
                         let readiness = await linkExecutionRuntime?.qualifyProviderInputRoute(for: session) ?? .unavailable
-                        let routeIsOwned = await routeOwnerValidator(expectedController, runID, windowID, session.tabID)
+                        let routeIsOwned = await validateRoutingProcess()
                         guard !Task.isCancelled, computerUseStartupStopFence.permitsStart(of: session), routeIsOwned,
                               session.runID == runID, session.activeRunAttemptID == runAttemptIDAtEntry,
                               session.codexController.map(ObjectIdentifier.init) == expectedControllerID,
@@ -7088,6 +7121,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             taskLabelKind: session.mcpControlContext?.taskLabelKind,
             codeMapsDisabled: GlobalSettingsStore.shared.globalCodeMapsDisabled()
         )
+        let developerInstructions = Self.codexDeveloperInstructionPlan(for: session)
         let resumeCandidate = Self.codexResumeCandidate(
             for: session,
             skipResumeWhenNoPriorCodexHistory: skipResumeWhenNoPriorCodexHistory
@@ -7101,6 +7135,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 controller: startController,
                 existingRef: existingRef,
                 baseInstructions: basePrompt,
+                developerInstructions: developerInstructions,
                 model: selection.model,
                 reasoningEffort: selection.reasoningEffort,
                 serviceTier: selection.serviceTier,
@@ -7182,6 +7217,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                             controller: recoveredController,
                             existingRef: existingRef,
                             baseInstructions: basePrompt,
+                            developerInstructions: developerInstructions,
                             model: selection.model,
                             reasoningEffort: selection.reasoningEffort,
                             serviceTier: selection.serviceTier,
@@ -11671,6 +11707,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         session: AgentTabSession,
         force: Bool = false
     ) {
+        guard !session.subscriptionAccountBinding.blocksProviderOperations else { return }
         if !force {
             guard !session.hasReconciledPersistedCodexCommandStatus else { return }
         }

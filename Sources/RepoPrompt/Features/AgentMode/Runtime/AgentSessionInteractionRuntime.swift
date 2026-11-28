@@ -159,7 +159,8 @@ final class AgentSessionInteractionRuntime {
     }
 
     func ensureApprovalSync(for session: AgentTabSession, adoptPayload: Bool = false) {
-        guard let scope, let membership = scope.membership(of: session),
+        guard !session.subscriptionAccountBinding.blocksProviderOperations,
+              let scope, let membership = scope.membership(of: session),
               membership.permitsBindingPreparation else { return }
         let identity = ObjectIdentifier(session)
         let candidate = approvalSyncs[identity]
@@ -262,7 +263,8 @@ final class AgentSessionInteractionRuntime {
     /// membership admission. The no-tab global preference remains a presentation concern.
     @discardableResult
     func setAutoEditEnabled(_ enabled: Bool, for session: AgentTabSession) -> Task<Void, Never>? {
-        guard let scope, let membership = scope.membership(of: session), membership.permitsBindingPreparation else { return nil }
+        guard !session.subscriptionAccountBinding.blocksProviderOperations,
+              let scope, let membership = scope.membership(of: session), membership.permitsBindingPreparation else { return nil }
         let command: AgentSessionRuntimeStore.Command?
         if session.activeAgentSessionID != nil {
             guard let admitted = try? scope.admit(session: session) else { return nil }
@@ -277,13 +279,15 @@ final class AgentSessionInteractionRuntime {
                 await self?.test_beforeAutoEditWrite?()
             #endif
             guard let scope, let session, scope.holds(record.identity, for: session),
+                  !session.subscriptionAccountBinding.blocksProviderOperations,
                   command?.isCurrent != false, let lease = record.lease else { return }
             _ = await store.setAutoEditEnabled(enabled, for: address, lease: lease, updateGlobalDefault: true)
         }
     }
 
     func applyApprovalSnapshot(_ snapshot: ApplyEditsApprovalSnapshot, to session: AgentTabSession) {
-        guard let scope, scope.sessions[session.tabID] === session,
+        guard !session.subscriptionAccountBinding.blocksProviderOperations,
+              let scope, scope.sessions[session.tabID] === session,
               snapshot.scope == approvalScope(for: session) else { return }
         let changed = session.autoEditEnabled != snapshot.autoEditEnabled
         session.autoEditEnabled = snapshot.autoEditEnabled
@@ -424,6 +428,7 @@ final class AgentSessionInteractionRuntime {
     }
 
     static func invalidatePendingAskUserTimeout(for session: AgentTabSession) {
+        session.askUserDeadline = nil
         session.pendingAskUserTimeoutGeneration &+= 1
         session.askUserTimeoutTask?.cancel()
         session.askUserTimeoutTask = nil

@@ -19,6 +19,7 @@ final class AgentSelfCompactNativeCompletionCoordinator {
     private let store: @MainActor (State) -> Void
     private let isCurrentOwner: @MainActor (AgentSelfCompactOwner) -> Bool
     private let dispatchNote: NoteDispatch
+    private let verifyOverflow: @MainActor (AgentSelfCompactAttempt) -> Bool
     private let sleep: @MainActor (Duration) async -> Void
     typealias ProducerStarted = @MainActor (UUID, Task<Void, Never>) -> Void
 
@@ -40,12 +41,14 @@ final class AgentSelfCompactNativeCompletionCoordinator {
             try? await Task.sleep(for: duration)
         },
         now: @escaping @MainActor () -> ContinuousClock.Instant = { ContinuousClock.now },
+        verifyOverflow: @escaping @MainActor (AgentSelfCompactAttempt) -> Bool = { _ in false },
         producerStarted: @escaping ProducerStarted = { _, _ in }
     ) {
         self.load = load
         self.store = store
         self.isCurrentOwner = isCurrentOwner
         self.dispatchNote = dispatchNote
+        self.verifyOverflow = verifyOverflow
         self.sleep = sleep
         self.now = now
         self.producerStarted = producerStarted
@@ -75,6 +78,8 @@ final class AgentSelfCompactNativeCompletionCoordinator {
             else { return }
             if let owner = current.active?.owner, !isCurrentOwner(owner) {
                 current.settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
+            } else if current.active?.claudeOverflowHoldID != nil {
+                current.settle(.completionUnverified, noteDelivery: .notSent, completionVerified: false)
             } else {
                 // Release the hold without revoking this live request's correlated completion.
                 // A late confirmation can still send its undelivered note; ordinary input may
@@ -144,8 +149,28 @@ final class AgentSelfCompactNativeCompletionCoordinator {
         }
         guard revision.successorKind == nil else {
             revokeLateConfirmation(requestID: attempt.id)
-            state.active?.phase = .parked
+            if attempt.claudeOverflowHoldID != nil {
+                state.settle(.completionUnverified, noteDelivery: .notSent, completionVerified: false)
+            } else {
+                state.active?.phase = .parked
+            }
             store(state)
+            return
+        }
+        if attempt.claudeOverflowHoldID != nil {
+            if revision.terminalState != .completed || attempt.claudePostCompactTokens == nil {
+                state.settle(.completionUnverified, noteDelivery: .notSent, completionVerified: false)
+                store(state)
+                return
+            }
+            state.active?.phase = .awaitingNoteBoundary
+            store(state)
+            noteTask = Task { @MainActor [self] in
+                await settleOverflow(attempt, owner: owner, teardownSettled: teardownSettled)
+            }
+            if let noteTask {
+                producerStarted(attempt.id, noteTask)
+            }
             return
         }
         if attempt.admittedSupport == .acpAdvertisedCommand {
@@ -177,7 +202,29 @@ final class AgentSelfCompactNativeCompletionCoordinator {
         noteTask = Task { @MainActor [self] in
             await beginNote(requestID: attempt.id, owner: owner, teardownSettled: teardownSettled)
         }
-        if let noteTask { producerStarted(attempt.id, noteTask) }
+        if let noteTask {
+            producerStarted(attempt.id, noteTask)
+        }
+    }
+
+    private func settleOverflow(
+        _ attempt: AgentSelfCompactAttempt, owner: AgentSelfCompactOwner,
+        teardownSettled: @escaping @MainActor () -> Bool
+    ) async {
+        let deadline = now().advanced(by: .seconds(60))
+        while !Task.isCancelled {
+            var state = load()
+            guard state.active?.id == attempt.id, state.active?.phase == .awaitingNoteBoundary else { return }
+            if isCurrentOwner(owner), now() < deadline, !teardownSettled() {
+                await sleep(.milliseconds(100))
+                await Task.yield()
+                continue
+            }
+            let verified = isCurrentOwner(owner) && now() < deadline && verifyOverflow(attempt)
+            state.settle(verified ? .compacted : .completionUnverified, noteDelivery: .notSent, completionVerified: verified)
+            store(state)
+            return
+        }
     }
 
     /// A writer can bind after the note pipeline starts but before its physical send. Release the
@@ -246,6 +293,8 @@ final class AgentSelfCompactNativeCompletionCoordinator {
         deadlineTask?.cancel()
         if let owner = attempt.owner, !isCurrentOwner(owner) {
             state.settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
+        } else if attempt.claudeOverflowHoldID != nil {
+            state.settle(.completionUnverified, noteDelivery: .notSent, completionVerified: false)
         } else {
             state.active?.phase = .parked
         }

@@ -85,7 +85,11 @@ final class WindowCloseCoordinator {
 
         let authorization = consumeAuthorization()
         let snapshot = windowState.makeCloseImpactSnapshot()
-        let decision = Self.decide(snapshot: snapshot, authorization: authorization)
+        let decision = Self.decide(
+            snapshot: snapshot, authorization: authorization,
+            preservesAgentExecution: windowState.agentModeViewModel.preservableExecutionHost() != nil,
+            keepsProcessAliveForAgentExecution: snapshot.isLastAppWindow && AppDelegate.hasUnsettledAgentExecution()
+        )
 
         switch decision {
         case let .confirm(confirmation):
@@ -113,7 +117,9 @@ final class WindowCloseCoordinator {
 
     static func decide(
         snapshot: WindowCloseImpactSnapshot,
-        authorization: WindowCloseAuthorization?
+        authorization: WindowCloseAuthorization?,
+        preservesAgentExecution: Bool = false,
+        keepsProcessAliveForAgentExecution: Bool = false
     ) -> WindowCloseDecision {
         if snapshot.isTerminating {
             return .allow
@@ -123,13 +129,15 @@ final class WindowCloseCoordinator {
             return .allow
         }
 
-        let activeItems = activeItems(for: snapshot)
+        let activeItems = activeItems(for: snapshot).filter {
+            !preservesAgentExecution || $0.id != AgentModeWorkspaceSwitchSessionProvider.activityID
+        }
         if !activeItems.isEmpty {
             return .confirm(activeWorkConfirmation(activeItems: activeItems))
         }
 
         if snapshot.isLastMCPEnabledWindow {
-            if snapshot.isLastAppWindow, snapshot.mcp.toolsEnabled {
+            if snapshot.isLastAppWindow, snapshot.mcp.toolsEnabled, !keepsProcessAliveForAgentExecution {
                 return .confirm(lastWindowMCPContinuityConfirmation(connectionCount: snapshot.mcp.liveConnectionCount))
             }
             if snapshot.mcp.hasIdleLiveConnections {

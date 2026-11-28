@@ -2384,6 +2384,8 @@ struct AgentModeChatDetailView: View {
             restoringPaneView
         case let .unavailable(reason, retry):
             unavailablePaneView(reason: reason, retry: retry)
+        case let .workspaceActivationFailed(owner):
+            workspaceActivationFailureView(owner: owner)
         case .runningOrWaiting:
             // The existing run indicator and interaction cards below present current run facts; show
             // fallback copy only when neither is visible.
@@ -2664,7 +2666,9 @@ struct AgentModeChatDetailView: View {
             expandableTranscriptBlock(block) { isExpanded in
                 clusterSummaryLabel(for: block, isExpanded: isExpanded)
             } expandedContent: {
-                expandedTranscriptSurface(useScroll: block.rows.count > 5, maxHeight: 220) {
+                // Ordinary activity groups flow with the transcript. Bound unusually large
+                // groups so expanding one cannot dominate the outer list's layout.
+                expandedTranscriptSurface(scrollHeight: block.rows.count > 20 ? 360 : nil) {
                     expandedClusterContent(block: block, renderContext: renderContext)
                 }
             }
@@ -2679,7 +2683,7 @@ struct AgentModeChatDetailView: View {
                 groupedHistorySummaryLabel(for: block, isExpanded: isExpanded)
             } expandedContent: {
                 if block.groupedHistory != nil {
-                    expandedTranscriptSurface(useScroll: entry.groupedRowCount > 5, maxHeight: 260) {
+                    expandedTranscriptSurface(scrollHeight: entry.groupedRowCount > 5 ? 260 : nil) {
                         expandedGroupedContent(entries: entry.groupedChildren, renderContext: renderContext)
                     }
                 }
@@ -2816,21 +2820,15 @@ struct AgentModeChatDetailView: View {
         }
     }
 
-    private func expandedTranscriptSurface(
-        useScroll: Bool,
-        maxHeight: CGFloat,
-        @ViewBuilder content: () -> some View
-    ) -> some View {
+    private func expandedTranscriptSurface(scrollHeight: CGFloat?, @ViewBuilder content: () -> some View) -> some View {
         Group {
-            if useScroll {
+            if let scrollHeight {
                 ScrollView {
-                    content()
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                    content().frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .frame(maxHeight: maxHeight)
+                .frame(maxHeight: scrollHeight)
             } else {
-                content()
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                content().frame(maxWidth: .infinity, alignment: .leading)
             }
         }
         .padding(8)
@@ -5666,6 +5664,18 @@ struct AgentModeChatDetailView: View {
                 Button("Retry") {
                     _ = agentModeVM.retryTranscriptRestoration(retry)
                 }
+            }
+        }
+    }
+
+    private func workspaceActivationFailureView(owner: AgentWorkspaceSessionIndexStore.SessionIndexOwner) -> some View {
+        VStack(spacing: 10) {
+            Text(AgentModeViewModel.workspaceActivationFailureMessage)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 14, weight: .medium))
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+            Button("Retry") {
+                Task { await agentModeVM.retryWorkspaceActivation(owner) }
             }
         }
     }

@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptMCPServer
 import RepoPromptVCS
 import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
@@ -25,8 +26,8 @@ extension MCPWorktreeToolProvider {
         }
     }
 
-    func executeMerge(op: Operation, args: [String: Value]) async throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
-        let session = try await resolveMergeSession(args: args, needsResources: op != .status)
+    func executeMerge(op: Operation, args: [String: Value], invocationContext: ToolInvocationContext) async throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
+        let session = try await resolveMergeSession(args: args, needsResources: op != .status, invocationContext: invocationContext)
         do {
             switch op {
             case .preview:
@@ -297,7 +298,20 @@ extension MCPWorktreeToolProvider {
         try admission.requireCurrent()
     }
 
-    private func resolveMergeSession(args: [String: Value], needsResources: Bool) async throws -> SessionResolution {
+    private func resolveMergeSession(args: [String: Value], needsResources: Bool, invocationContext: ToolInvocationContext) async throws -> SessionResolution {
+        if let canonicalCommand {
+            guard let captured = canonicalCommand(invocationContext) else { throw MCPFileToolAuthorityFailure.unavailable }
+            if let raw = trimmedString(args["session_id"]) {
+                guard let id = UUID(uuidString: raw) else { throw MCPError.invalidParams("session_id must be a UUID. Received: \(raw)") }
+                guard id == captured.identity.sessionID else { throw MCPError.invalidParams("session_id must match the routed Agent Mode session.") }
+            }
+            let admission = needsResources ? try await ExecutionAdmission(captured).resolve() : nil
+            guard !Task.isCancelled, canonicalCommand(invocationContext)?.identity == captured.identity else {
+                throw MCPFileToolAuthorityFailure.superseded
+            }
+            return .init(sessionID: captured.identity.sessionID, isRoutedAgentMode: true, command: captured, admission: admission)
+        }
+        let dependencies = try physicalDependencies()
         let metadata = await dependencies.context.captureRequestMetadata()
         let resolved = try dependencies.context.resolveTabContextSnapshot(metadata, MCPWindowToolName.manageWorktree)
         let raw = trimmedString(args["session_id"])
@@ -305,13 +319,13 @@ extension MCPWorktreeToolProvider {
         let sessionID = explicitID ?? resolved.snapshot.activeAgentSessionID
         // Capture before authorization suspends, but reveal liveness/admission failures only after
         // the existing routed/plain-caller authorization and argument checks.
-        let captured = Result { () throws -> (AgentSessionRuntimeStore.Command, AgentSessionWorktreeRuntime.Admission?) in
+        let captured = Result { () throws -> (AgentSessionRuntimeStore.Command, ExecutionAdmission?) in
             guard let sessionID,
                   let command = try dependencies.execution.requireTargetWindow().agentModeViewModel.runtimeCommand(sessionID: sessionID)
             else {
                 throw MCPError.invalidParams("The requested agent session is not currently available.")
             }
-            return try (command, needsResources ? command.writer.scope.worktrees.admit(command) : nil)
+            return (command, needsResources ? ExecutionAdmission(command) : nil)
         }
         let isRoutedAgentMode = await (try? dependencies.execution.requireAgentModeConnection(MCPWindowToolName.manageWorktree)) != nil
         if let raw {
@@ -323,9 +337,9 @@ extension MCPWorktreeToolProvider {
             throw MCPError.invalidParams("session_id is required for plain MCP callers.")
         }
         guard let sessionID else { throw MCPError.invalidParams("Current MCP routing does not resolve an active Agent session.") }
-        let (command, admission) = try captured.get()
+        let (command, capturedAdmission) = try captured.get()
         guard command.isCurrent else { throw AgentSessionWorktreeRuntime.TransitionError.stale }
-        try admission?.requireCurrent()
+        let admission = try await capturedAdmission?.resolve()
         return SessionResolution(sessionID: sessionID, isRoutedAgentMode: isRoutedAgentMode, command: command, admission: admission)
     }
 

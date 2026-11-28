@@ -62,6 +62,11 @@ extension AgentComposerActions {
             },
             storeDraft: { tabID, text, sequence in
                 guard isCurrent() else { return }
+                // A departing current-tab editor can deliver a delayed draft write after selection
+                // changes. It no longer has edit authority over a running rewrite's draft.
+                if active, tabID != agentModeVM.currentTabID, agentModeVM.repromptOperations[tabID]?.phase.isBusy == true {
+                    return
+                }
                 agentModeVM.storeDraftText(for: tabID, text, acknowledgingThrough: sequence)
             },
             loadDraft: { tabID in guard isCurrent() else { return .init(text: "", restorationSequence: 0) }
@@ -164,7 +169,7 @@ extension AgentComposerActions {
                 isCurrent() && agentModeVM.canMutateCursorComposerModel(expectedSession: cursorSession, expectedTabID: tabID)
             },
             setAutoEditEnabled: { enabled in guard isCurrent() else { return }
-                if active { agentModeVM.setAutoEditEnabled(enabled) } else if let session = exactSession { _ = agentModeVM.runtimeSessionStore.interactions(routeID: windowID, approvalStore: agentModeVM.applyEditsApprovalStore).setAutoEditEnabled(enabled, for: session) }
+                if active { agentModeVM.setAutoEditEnabled(enabled) } else if let session = exactSession { _ = agentModeVM.interactionRuntime.setAutoEditEnabled(enabled, for: session) }
             },
             setProviderPermissionLevel: { id in guard isCurrent() else { return }
                 agentModeVM.setProviderPermissionLevel(id)
