@@ -557,6 +557,9 @@ struct ManageWorkspacesView: View {
                             },
                             onDelete: {
                                 deleteWorkspaceWithFeedback(ws)
+                            },
+                            onSetColor: { color in
+                                workspaceManager.setWorkspaceColor(ws, color: color)
                             }
                         )
                     }
@@ -593,7 +596,9 @@ struct ManageWorkspacesView: View {
                             },
                             onDelete: {
                                 deleteWorkspaceWithFeedback(workspace)
-                            }
+                            },
+                            // Recovery copies are not opened as workspaces, so they are not coloured.
+                            onSetColor: nil
                         )
                     }
                 }

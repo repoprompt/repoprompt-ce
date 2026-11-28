@@ -41,6 +41,76 @@ struct AgentModeTitlebarNewSessionButton: View {
     }
 }
 
+/// The workspace's colour sticker. A click opens the swatch picker; the System workspace (no
+/// colourable workspace) shows nothing.
+struct AgentModeTitlebarWorkspaceStickerButton: View {
+    @ObservedObject var model: WorkspaceStickerModel
+    let host: WorkspaceStickerHost
+    @State private var isHovering = false
+    /// The last opening this host showed, kept so the popover keeps its swatches while it closes.
+    @State private var lastPresentation: WorkspaceStickerModel.PickerPresentation?
+
+    var body: some View {
+        if model.state.workspaceID != nil {
+            // Captured now: whether the popover shows, its swatches and its dismissal all describe
+            // this one opening, so they cannot disagree before the next render.
+            let actions = model.actions(in: host)
+            Button {
+                model.togglePicker(from: host)
+            } label: {
+                WorkspaceSticker(color: model.state.color)
+            }
+            .buttonStyle(TitlebarAccessoryButtonStyle(isHovering: isHovering))
+            .onHover { hovering in
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    isHovering = hovering
+                }
+            }
+            .hoverTooltip("Workspace Color", .bottom)
+            .accessibilityLabel("Workspace Color")
+            .accessibilityValue(model.state.color?.accessibilityLabel ?? "None")
+            .accessibilityIdentifier("WorkspaceStickerButton")
+            .popover(isPresented: pickerBinding(actions), arrowEdge: .bottom) {
+                // While closing, the retired opening's swatches stay visible; they no longer apply.
+                if let shown = actions ?? lastPresentation.map(model.actions(for:)) {
+                    WorkspaceStickerPickerPopover(model: model, actions: shown)
+                }
+            }
+            .onChange(of: actions?.presentation, initial: true) { _, presentation in
+                if let presentation {
+                    lastPresentation = presentation
+                }
+            }
+        }
+    }
+
+    /// Presented from the model so toolbar re-evaluation cannot drop it. A dismissal only closes
+    /// the opening this render showed, never one the other host, or a later opening, has since made.
+    private func pickerBinding(_ actions: WorkspaceStickerModel.PickerActions?) -> Binding<Bool> {
+        Binding(
+            get: { actions != nil },
+            set: { isPresented in
+                if !isPresented {
+                    actions?.dismiss()
+                }
+            }
+        )
+    }
+}
+
+/// Observes the model so the selection ring follows the stored colour while the popover is open.
+/// Swatches apply only through the opening that rendered them.
+private struct WorkspaceStickerPickerPopover: View {
+    @ObservedObject var model: WorkspaceStickerModel
+    let actions: WorkspaceStickerModel.PickerActions
+
+    var body: some View {
+        WorkspaceColorSwatchPicker(selection: model.state.color) { color in
+            actions.select(color)
+        }
+    }
+}
+
 private struct AgentModeTitlebarSidebarToggleButton: View {
     let isSidebarCollapsed: Bool
     let action: () -> Void
@@ -67,22 +137,51 @@ private struct AgentModeTitlebarSidebarToggleButton: View {
     }
 }
 
-/// Everything beside the traffic lights. The toggle comes first so it never moves when the sidebar
-/// collapses. Compose normally sits at the sidebar's trailing edge; that cluster goes away with the
-/// sidebar, so compose appears here while it is hidden.
+/// What sits beside the traffic lights. The toggle comes first so it never moves when the sidebar
+/// collapses. Compose and the workspace sticker normally sit at the sidebar's trailing edge; that
+/// cluster goes away with the sidebar, so they appear here while it is hidden.
+enum AgentModeTitlebarLeadingItem: Hashable {
+    case sidebarToggle
+    case newSession
+    case workspaceSticker
+
+    static func items(isSidebarCollapsed: Bool, showsWorkspaceSticker: Bool) -> [Self] {
+        guard isSidebarCollapsed else { return [.sidebarToggle] }
+        return showsWorkspaceSticker
+            ? [.sidebarToggle, .newSession, .workspaceSticker]
+            : [.sidebarToggle, .newSession]
+    }
+}
+
+/// Everything beside the traffic lights, in `AgentModeTitlebarLeadingItem` order.
 private struct AgentModeTitlebarLeadingView: View {
     let isSidebarCollapsed: Bool
+    /// Passed by value so a change reaches the accessory's measured width through `update`.
+    let showsWorkspaceSticker: Bool
+    let workspaceSticker: WorkspaceStickerModel
     let onToggleSidebar: () -> Void
     let onNewSession: () -> Void
 
     var body: some View {
         HStack(spacing: 2) {
-            AgentModeTitlebarSidebarToggleButton(
-                isSidebarCollapsed: isSidebarCollapsed,
-                action: onToggleSidebar
-            )
-            if isSidebarCollapsed {
-                AgentModeTitlebarNewSessionButton(action: onNewSession)
+            ForEach(
+                AgentModeTitlebarLeadingItem.items(
+                    isSidebarCollapsed: isSidebarCollapsed,
+                    showsWorkspaceSticker: showsWorkspaceSticker
+                ),
+                id: \.self
+            ) { item in
+                switch item {
+                case .sidebarToggle:
+                    AgentModeTitlebarSidebarToggleButton(
+                        isSidebarCollapsed: isSidebarCollapsed,
+                        action: onToggleSidebar
+                    )
+                case .newSession:
+                    AgentModeTitlebarNewSessionButton(action: onNewSession)
+                case .workspaceSticker:
+                    AgentModeTitlebarWorkspaceStickerButton(model: workspaceSticker, host: .titlebarAccessory)
+                }
             }
         }
     }
@@ -128,11 +227,13 @@ final class AgentModeTitlebarAccessoryViewController: NSTitlebarAccessoryViewCon
 
     init(
         isSidebarCollapsed: Bool,
+        workspaceSticker: WorkspaceStickerModel,
         onToggleSidebar: @escaping () -> Void,
         onNewSession: @escaping () -> Void
     ) {
-        rootView = AgentModeTitlebarLeadingView(
+        rootView = Self.makeRootView(
             isSidebarCollapsed: isSidebarCollapsed,
+            workspaceSticker: workspaceSticker,
             onToggleSidebar: onToggleSidebar,
             onNewSession: onNewSession
         )
@@ -155,17 +256,35 @@ final class AgentModeTitlebarAccessoryViewController: NSTitlebarAccessoryViewCon
     /// Updates the content without recreating the controller
     func update(
         isSidebarCollapsed: Bool,
+        workspaceSticker: WorkspaceStickerModel,
         onToggleSidebar: @escaping () -> Void,
         onNewSession: @escaping () -> Void
     ) {
-        rootView = AgentModeTitlebarLeadingView(
+        rootView = Self.makeRootView(
             isSidebarCollapsed: isSidebarCollapsed,
+            workspaceSticker: workspaceSticker,
             onToggleSidebar: onToggleSidebar,
             onNewSession: onNewSession
         )
         guard let hostingView else { return }
         hostingView.rootView = rootView
-        // The accessory's width follows its content: compose comes and goes with the sidebar.
+        // The accessory's width follows its content: compose and the sticker come and go with the
+        // sidebar, and the sticker also with the workspace.
         hostingView.frame.size = hostingView.fittingSize
+    }
+
+    private static func makeRootView(
+        isSidebarCollapsed: Bool,
+        workspaceSticker: WorkspaceStickerModel,
+        onToggleSidebar: @escaping () -> Void,
+        onNewSession: @escaping () -> Void
+    ) -> AgentModeTitlebarLeadingView {
+        AgentModeTitlebarLeadingView(
+            isSidebarCollapsed: isSidebarCollapsed,
+            showsWorkspaceSticker: workspaceSticker.state.workspaceID != nil,
+            workspaceSticker: workspaceSticker,
+            onToggleSidebar: onToggleSidebar,
+            onNewSession: onNewSession
+        )
     }
 }

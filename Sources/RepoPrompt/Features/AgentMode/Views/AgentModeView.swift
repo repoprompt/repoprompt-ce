@@ -119,7 +119,8 @@ struct AgentModeView: View {
                     },
                     onNewSession: {
                         navigationController.requestNewSession(agentModeVM: agentModeVM)
-                    }
+                    },
+                    workspaceSticker: windowState.workspaceSticker
                 )
                 .navigationSplitViewColumnWidth(
                     min: sidebarMinWidth,

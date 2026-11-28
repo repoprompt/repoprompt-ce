@@ -140,6 +140,7 @@ struct WorkspacePickerMenu<Label: View>: View {
                         let isSelected = ws.id == workspaceManager.activeWorkspaceID
                         menuRow(
                             title: ws.name,
+                            color: ws.workspaceColor,
                             isSelected: isSelected,
                             isDisabled: isSelected
                         ) {
@@ -158,6 +159,7 @@ struct WorkspacePickerMenu<Label: View>: View {
 
     private func menuRow(
         title: String,
+        color: WorkspaceColor? = nil,
         isSelected: Bool,
         isDisabled: Bool,
         action: @escaping () -> Void
@@ -172,6 +174,10 @@ struct WorkspacePickerMenu<Label: View>: View {
                     }
                 }
                 .frame(width: checkmarkColumnWidth)
+
+                if let color {
+                    WorkspaceColorDot(color: color)
+                }
 
                 Text(title)
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: isSelected ? .semibold : .regular))

@@ -7,8 +7,12 @@ struct OptimizedWorkspaceRow: View {
     let onRename: () -> Void
     let onToggleHidden: () -> Void
     let onDelete: () -> Void
+    /// Sets the workspace colour from the row's sticker and context menu; nil shows only the dot
+    /// and offers no menu.
+    let onSetColor: ((WorkspaceColor?) -> Void)?
 
     @State private var showingDeleteConfirmation = false
+    @State private var showingColorPicker = false
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
@@ -17,8 +21,15 @@ struct OptimizedWorkspaceRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text(workspace.name)
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 16, weight: .medium))
+                HStack(spacing: 6) {
+                    if let onSetColor {
+                        colorSticker(onSetColor: onSetColor)
+                    } else if let color = workspace.workspaceColor {
+                        WorkspaceColorDot(color: color)
+                    }
+                    Text(workspace.name)
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 16, weight: .medium))
+                }
 
                 Spacer()
 
@@ -95,5 +106,24 @@ struct OptimizedWorkspaceRow: View {
             RoundedRectangle(cornerRadius: 8)
                 .fill(Color(NSColor.windowBackgroundColor).opacity(0.85))
         )
+        .contentShape(RoundedRectangle(cornerRadius: 8))
+        .workspaceColorContextMenu(selection: workspace.workspaceColor, onSelect: onSetColor)
+    }
+
+    /// The workspace sticker at row size; a click opens the same swatch picker as the titlebar.
+    private func colorSticker(onSetColor: @escaping (WorkspaceColor?) -> Void) -> some View {
+        Button {
+            showingColorPicker.toggle()
+        } label: {
+            WorkspaceSticker(color: workspace.workspaceColor, size: 16)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .hoverTooltip("Workspace Color")
+        .accessibilityLabel("Workspace Color")
+        .accessibilityValue(workspace.workspaceColor?.accessibilityLabel ?? "None")
+        .popover(isPresented: $showingColorPicker, arrowEdge: .bottom) {
+            WorkspaceColorSwatchPicker(selection: workspace.workspaceColor, onSelect: onSetColor)
+        }
     }
 }

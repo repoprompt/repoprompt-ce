@@ -52,6 +52,9 @@ struct AgentModeSessionsSidebarView: View {
     let currentTabID: UUID?
     let onManageWorkspaces: () -> Void
     let onNewSession: () -> Void
+    /// Not observed here: the sticker button observes it, so colour changes and picker toggles
+    /// do not invalidate the sessions sidebar.
+    let workspaceSticker: WorkspaceStickerModel
 
     /// Remembered per window; mirrored into the sidebar store, which owns filtering.
     @SceneStorage("agentModeSidebarTab") private var storedSidebarTab = AgentSidebarTab.all.rawValue
@@ -151,19 +154,31 @@ struct AgentModeSessionsSidebarView: View {
         }
     }
 
-    /// The sidebar column's trailing titlebar cluster: list actions, then compose.
+    /// The sidebar column's titlebar strip: list actions and compose, then the workspace sticker. On
+    /// macOS 26 a flexible spacer pushes the sticker to the column's trailing edge; earlier releases
+    /// keep it as the last button of the group.
     @ToolbarContentBuilder
     private var titlebarActions: some ToolbarContent {
         if #available(macOS 26.0, *) {
-            titlebarActionsGroup
+            titlebarActionsGroup(includesSticker: false)
+                .sharedBackgroundVisibility(.hidden)
+            ToolbarSpacer(.flexible, placement: .primaryAction)
+            titlebarStickerItem
                 .sharedBackgroundVisibility(.hidden)
         } else {
-            titlebarActionsGroup
+            titlebarActionsGroup(includesSticker: true)
         }
     }
 
     @ToolbarContentBuilder
-    private var titlebarActionsGroup: some ToolbarContent {
+    private var titlebarStickerItem: some ToolbarContent {
+        ToolbarItem(placement: .primaryAction) {
+            AgentModeTitlebarWorkspaceStickerButton(model: workspaceSticker, host: .sidebarToolbar)
+        }
+    }
+
+    @ToolbarContentBuilder
+    private func titlebarActionsGroup(includesSticker: Bool) -> some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
             let searchText = sidebarUI.snapshot.searchText
             AgentSidebarCollapseAllButton(
@@ -178,6 +193,9 @@ struct AgentModeSessionsSidebarView: View {
                 action: toggleAllThreads
             )
             AgentModeTitlebarNewSessionButton(action: onNewSession)
+            if includesSticker {
+                AgentModeTitlebarWorkspaceStickerButton(model: workspaceSticker, host: .sidebarToolbar)
+            }
         }
     }
 
