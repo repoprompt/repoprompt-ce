@@ -248,6 +248,7 @@ actor DomainWorkspaceContextAuthority {
         var document: DomainWorkspaceDocument
         var savedDigest: String
         var revisions: DomainRevisionState
+        var executionRevision: UInt64 = 0
         var contextRevisions: [UUID: DomainRevisionState]
         var contextTombstones: [UUID: UInt64]
         var operations: [DomainRecordedOperation]
@@ -263,6 +264,7 @@ actor DomainWorkspaceContextAuthority {
     private let persistence: DomainPersistenceCoordinator
     private let metrics: DomainRuntimeMetricsSink
     private var records: [UUID: WorkspaceRecord] = [:]
+    private var workspaceExecutionRevisionFloor: [UUID: UInt64] = [:]
     private var workspaceIDsByReadName: [String: Set<UUID>] = [:]
     private var workspaceLocationGenerations: [UUID: UInt64] = [:]
     private var unreadableLocationIDs: Set<UUID> = []
@@ -331,10 +333,17 @@ actor DomainWorkspaceContextAuthority {
             ($0.workspaceID, $0)
         })
         records = Dictionary(uniqueKeysWithValues: loaded.workspaces.map { workspace in
+            let workspaceID = workspace.document.workspaceID
+            let executionRevision = max(
+                workspaceExecutionRevisionFloor[workspaceID, default: 0] &+ 1,
+                workspace.revisions.workingRevision
+            )
+            workspaceExecutionRevisionFloor[workspaceID] = executionRevision
             let record = WorkspaceRecord(
                 document: workspace.document,
                 savedDigest: workspace.savedDigest,
                 revisions: workspace.revisions,
+                executionRevision: executionRevision,
                 contextRevisions: workspace.contextRevisions,
                 contextTombstones: workspace.contextTombstones,
                 operations: workspace.operations,
@@ -346,7 +355,7 @@ actor DomainWorkspaceContextAuthority {
                 externalDocument: nil,
                 fileMetadata: workspace.fileMetadata
             )
-            return (workspace.document.workspaceID, record)
+            return (workspaceID, record)
         })
         for record in records.values {
             updateWorkspaceLocationIndex(previous: nil, next: record)
@@ -450,10 +459,51 @@ actor DomainWorkspaceContextAuthority {
     @discardableResult
     private func removeCanonicalRecord(_ id: UUID) -> WorkspaceRecord? {
         guard let previous = records.removeValue(forKey: id) else { return nil }
+        workspaceExecutionRevisionFloor[id] = max(
+            workspaceExecutionRevisionFloor[id, default: 0],
+            previous.executionRevision
+        ) &+ 1
         removeReadName(Self.readNameKey(previous.document.metadata.name), workspaceID: id)
         workspaceLocationGenerations.removeValue(forKey: id)
         unreadableLocationIDs.remove(id)
         return previous
+    }
+
+    /// Monotonic execution-lineage revision per workspace ID. Preserved only when the authority
+    /// directly observes a contiguous (0- or 1-step) transition whose execution-relevant digest,
+    /// file URL, and health are unchanged. Any execution-relevant mutation, health change, gap in
+    /// observed revisions, or delete/recreate advances the revision permanently (preventing ABA).
+    private func resolvedExecutionRevision(
+        workspaceID: UUID,
+        previousDocument: DomainWorkspaceDocument?,
+        previousHealth: DomainAuthorityHealth?,
+        previousWorkingRevision: UInt64?,
+        previousExecutionRevision: UInt64?,
+        nextDocument: DomainWorkspaceDocument,
+        nextHealth: DomainAuthorityHealth,
+        nextWorkingRevision: UInt64
+    ) -> UInt64 {
+        let floor = workspaceExecutionRevisionFloor[workspaceID, default: 0]
+        if let previousDocument,
+           let previousHealth,
+           let previousWorkingRevision,
+           let previousExecutionRevision,
+           previousDocument.executionContentDigest == nextDocument.executionContentDigest,
+           previousDocument.fileURL == nextDocument.fileURL,
+           previousHealth == nextHealth,
+           nextWorkingRevision >= previousWorkingRevision,
+           nextWorkingRevision - previousWorkingRevision <= 1
+        {
+            let kept = max(previousExecutionRevision, floor)
+            workspaceExecutionRevisionFloor[workspaceID] = kept
+            return kept
+        }
+        let advanced = max(
+            max(previousExecutionRevision ?? 0, floor) &+ 1,
+            nextWorkingRevision
+        )
+        workspaceExecutionRevisionFloor[workspaceID] = advanced
+        return advanced
     }
 
     func workspaceSnapshot(_ workspaceID: UUID) -> DomainWorkspaceSnapshot? {
@@ -496,6 +546,16 @@ actor DomainWorkspaceContextAuthority {
         let workspaceID = record.document.workspaceID
         let current = records[workspaceID]
         var replacement = record
+        replacement.executionRevision = resolvedExecutionRevision(
+            workspaceID: workspaceID,
+            previousDocument: current?.document,
+            previousHealth: current?.health,
+            previousWorkingRevision: current?.revisions.workingRevision,
+            previousExecutionRevision: current?.executionRevision,
+            nextDocument: replacement.document,
+            nextHealth: replacement.health,
+            nextWorkingRevision: replacement.revisions.workingRevision
+        )
         // A new saved baseline ends the old dirty lineage. Keep its origin only for a
         // clean transition's dirtyCleared event, or while the same dirty lineage advances.
         let continuesDirtyLineage = current?.revisions.dirtyRevision != nil
@@ -618,9 +678,20 @@ actor DomainWorkspaceContextAuthority {
                 ($0.identity.contextID, revisions)
             })
         }
+        let executionRevision = resolvedExecutionRevision(
+            workspaceID: document.workspaceID,
+            previousDocument: previous?.document,
+            previousHealth: previous?.health,
+            previousWorkingRevision: previous?.revisions.workingRevision,
+            previousExecutionRevision: previous?.executionRevision,
+            nextDocument: document,
+            nextHealth: .writable,
+            nextWorkingRevision: nextWorking
+        )
         let registration = DomainWorkspaceSnapshot(
             document: document,
             revisions: revisions,
+            executionRevision: executionRevision,
             health: .writable,
             contexts: document.metadata.contexts.map { metadata in
                 DomainContextSnapshot(
@@ -2736,9 +2807,11 @@ actor DomainWorkspaceContextAuthority {
     }
 
     private func makeSnapshot(_ record: WorkspaceRecord) -> DomainWorkspaceSnapshot {
-        DomainWorkspaceSnapshot(
+        let executionRevision = records[record.document.workspaceID]?.executionRevision ?? record.executionRevision
+        return DomainWorkspaceSnapshot(
             document: record.document,
             revisions: record.revisions,
+            executionRevision: executionRevision,
             health: record.health,
             contexts: record.document.metadata.contexts.map { metadata in
                 DomainContextSnapshot(

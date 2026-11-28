@@ -84,7 +84,8 @@ struct AgentHostWorkspaceResources {
             #endif
             try Task.checkCancellation()
             guard let after = await workspaceSnapshot(for: workspaceID, authority: authority),
-                  after.health != .removed, admits(after)
+                  after.health != .removed,
+                  after.isInSameExecutionLineage(as: snapshot), admits(after)
             else { throw Failure.contextChanged }
             guard after.document.metadata.canonicalLoadableRepoPathSet == retainedRootPathSet,
                   await files.isRootRetentionCurrent(retention)
@@ -109,6 +110,7 @@ struct AgentHostWorkspaceResources {
         private let retention: WorkspaceFileContextStore.RootRetention
         private let rootOwner: Lease?
         private(set) var isReleased = false
+        private var isInvalidated = false
 
         fileprivate init(
             resources: AgentHostWorkspaceResources,
@@ -139,13 +141,22 @@ struct AgentHostWorkspaceResources {
             return rootsAreCurrent
         }
 
-        func isCurrent() async -> Bool {
-            guard rootsAreCurrent,
-                  await resources.workspaceSnapshot(
+        func isCurrent(requiresExactSnapshot: Bool = false) async -> Bool {
+            guard !isInvalidated, rootsAreCurrent,
+                  let current = await resources.workspaceSnapshot(
                       for: snapshot.document.workspaceID, authority: snapshotAuthority
-                  ) == snapshot
-            else { return false }
-            return await retainedRootsAreCurrent()
+                  ),
+                  current.isInSameExecutionLineage(as: snapshot),
+                  !requiresExactSnapshot || current == snapshot
+            else {
+                isInvalidated = true
+                return false
+            }
+            let rootsValid = await retainedRootsAreCurrent()
+            if !rootsValid {
+                isInvalidated = true
+            }
+            return rootsValid && !isInvalidated
         }
 
         /// A request captures fresh canonical bytes while borrowing this activation's existing
@@ -172,7 +183,8 @@ struct AgentHostWorkspaceResources {
                   await resources.files.isRootRetentionCurrent(retention), rootsAreCurrent
             else { throw Failure.rootsChanged }
             guard let after = await resources.workspaceSnapshot(for: workspaceID, authority: effectiveAuthority),
-                  after.health != .removed, admits(after)
+                  after.health != .removed,
+                  after.isInSameExecutionLineage(as: current), admits(after)
             else { throw Failure.contextChanged }
             guard after.document.metadata.canonicalLoadableRepoPathSet == retainedRootPathSet else {
                 throw Failure.rootsChanged
@@ -190,5 +202,32 @@ struct AgentHostWorkspaceResources {
             isReleased = true
             if rootOwner == nil { await resources.files.releaseRootRetention(retention) }
         }
+    }
+}
+
+extension DomainWorkspaceSnapshot {
+    /// Returns true when `self` belongs to the same unbroken presentation-only lineage as `baseline`:
+    /// same workspace identity/file/roots/health/contexts, monotonic working revision, and identical
+    /// store-maintained `executionRevision` and `executionContentDigest`. Any intermediate
+    /// execution-relevant edit—even one later reverted to matching bytes—advances `executionRevision`
+    /// permanently and fails closed here.
+    func isInSameExecutionLineage(as baseline: DomainWorkspaceSnapshot) -> Bool {
+        if self == baseline { return true }
+        guard health != .removed, baseline.health != .removed, health == baseline.health,
+              document.workspaceID == baseline.document.workspaceID,
+              document.fileURL == baseline.document.fileURL,
+              document.metadata.repoPaths == baseline.document.metadata.repoPaths,
+              revisions.workingRevision >= baseline.revisions.workingRevision,
+              executionRevision == baseline.executionRevision,
+              document.executionContentDigest == baseline.document.executionContentDigest,
+              contexts.count == baseline.contexts.count
+        else { return false }
+        for (lhs, rhs) in zip(contexts, baseline.contexts) {
+            guard lhs.metadata.identity == rhs.metadata.identity,
+                  lhs.health != .removed, rhs.health != .removed,
+                  lhs.health == rhs.health
+            else { return false }
+        }
+        return true
     }
 }

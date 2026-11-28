@@ -203,6 +203,7 @@ final class AgentSessionHostWorkspaceActivation {
         let retainedPaths = Set(lease.roots.compactMap { StandardizedPath.canonicalWorkspaceRootPath($0.fullPath) })
         guard let current = await authority.canonicalWorkspaceSnapshot(workspaceID),
               current.health != .removed,
+              current.isInSameExecutionLineage(as: lease.snapshot),
               admits(current),
               current.document.metadata.canonicalLoadableRepoPathSet == retainedPaths,
               isCurrent, lease.rootsAreCurrent, !Task.isCancelled, catalogFileLease == nil
@@ -406,6 +407,7 @@ final class AgentSessionHostWorkspaceActivation {
                 let retainedPaths = Set(lease.roots.compactMap { StandardizedPath.canonicalWorkspaceRootPath($0.fullPath) })
                 guard let current = await authority.canonicalWorkspaceSnapshot(workspaceID),
                       current.health != .removed,
+                      current.isInSameExecutionLineage(as: lease.snapshot),
                       admits(current),
                       current.document.metadata.canonicalLoadableRepoPathSet == retainedPaths
                 else {

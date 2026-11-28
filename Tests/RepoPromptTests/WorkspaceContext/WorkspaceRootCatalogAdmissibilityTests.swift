@@ -123,6 +123,25 @@ final class WorkspaceRootRetentionTests: XCTestCase {
         XCTAssertEqual(presentationJoin.id, loaded.id)
     }
 
+    func testSessionWorktreeOwnershipPreservesTrailingWhitespaceInPhysicalPath() async throws {
+        let parent = try directory()
+        let path = parent.appendingPathComponent("worktree ", isDirectory: true)
+        try FileManager.default.createDirectory(at: path, withIntermediateDirectories: false)
+        let physicalPath = StandardizedPath.absolute(path.path)
+        let store = WorkspaceFileContextStore(codemapGraphIndexBuildLaunchPolicyForTesting: .disabled)
+        let ownerID = UUID()
+        addTeardownBlock { await store.releaseSessionWorktreeOwnership(ownerID: ownerID) }
+
+        let preparation = try await store.prepareSessionWorktreeOwnership(
+            ownerID: ownerID,
+            bindingFingerprint: "whitespace-worktree",
+            physicalRootPaths: [physicalPath]
+        )
+
+        XCTAssertTrue(physicalPath.hasSuffix(" "))
+        XCTAssertEqual(preparation.roots.map(\.standardizedPhysicalPath), [physicalPath])
+    }
+
     func testLoadOrJoinPrimaryRootFailsClosedOnSessionWorktreeAndGitDataKinds() async throws {
         let worktreePath = try directory()
         let gitDataPath = try directory()
@@ -348,9 +367,9 @@ final class WorkspaceRootRetentionTests: XCTestCase {
             skipSymlinks: true,
             showEmptyFolders: false
         )
-        let loaded = try await store.loadRoot(path: "  \(dir.path)/  ", kind: .primaryWorkspace, fileSystemSettings: settings)
+        let loaded = try await store.loadRoot(path: canonicalDir, kind: .primaryWorkspace, fileSystemSettings: settings)
         addTeardownBlock { await store.unloadRoot(id: loaded.id) }
-        let joined = try await store.loadOrJoinPrimaryRoot(path: dir.path, fileSystemSettings: settings)
+        let joined = try await store.loadOrJoinPrimaryRoot(path: "  \(dir.path)/  ", fileSystemSettings: settings)
         XCTAssertEqual(joined.id, loaded.id)
 
         let probeFailure = try await WorkspaceRootDirectoryProbe().run(

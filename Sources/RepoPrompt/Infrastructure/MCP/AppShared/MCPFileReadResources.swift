@@ -174,7 +174,7 @@ struct MCPFileReadResources {
                     let snapshotMatches = await lease.resources.workspaceSnapshot(for: context.workspaceID, authority: authority) == expectedWorkspace
                     retained = snapshotMatches ? await lease.retainedRootsAreCurrent() : false
                 } else {
-                    retained = await lease.isCurrent()
+                    retained = await lease.isCurrent(requiresExactSnapshot: true)
                 }
                 let rootSetIsCurrent = if usesRetainedRoots { true } else { await Set(store.rootRefs(scope: .visibleWorkspace)) == Set(roots) }
                 guard refreshed.runtimeID == handle.runtimeID, refreshed.runtimeGeneration == handle.runtimeGeneration,

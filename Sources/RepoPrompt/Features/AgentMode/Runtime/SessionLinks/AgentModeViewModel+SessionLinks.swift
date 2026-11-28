@@ -999,7 +999,7 @@ extension AgentModeViewModel {
                 roles[tab.id] = agentSessionLinkOversightRole(
                     tabID: tab.id,
                     expectedSessionID: expectedSessionID,
-                    endpoint: identity.monitorEndpoint(windowID: windowID)
+                    endpoint: identity.monitorEndpoint(windowID: linkExecutionRuntime.routeID)
                 )
             }
         }

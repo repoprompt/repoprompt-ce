@@ -12043,13 +12043,6 @@ package actor WorkspaceFileContextStore {
         }
     }
 
-    private func normalizedRootLoadPath(_ path: String) -> String {
-        StandardizedPath.canonicalWorkspaceRootPath(path)
-            ?? StandardizedPath.absolute(
-                URL(fileURLWithPath: (path as NSString).standardizingPath).standardizedFileURL.path
-            )
-    }
-
     /// Non-presentation primary-root join/load for independent Agent host retention.
     /// Enforces `.primaryWorkspace` kind isolation fail-closed, joins already-loaded or in-flight
     /// primary roots without reattaching detached presentations (`deferredRootUnloads` stays intact),
@@ -12060,7 +12053,10 @@ package actor WorkspaceFileContextStore {
         fileSystemSettings: FileSystemSettingsSnapshot,
         cancelUnderlyingLoadOnCallerCancellation: Bool = false
     ) async throws -> WorkspaceRootRecord {
-        let standardizedPath = normalizedRootLoadPath(path)
+        guard let canonicalPath = StandardizedPath.canonicalWorkspaceRootPath(path) else {
+            throw WorkspaceFileContextStoreError.catalogMaterializationFailed("Invalid configured workspace root path.")
+        }
+        let standardizedPath = (canonicalPath as NSString).standardizingPath
         try Task.checkCancellation()
         try await waitForRootUnloadIfNeeded(standardizedPath: standardizedPath)
         try Task.checkCancellation()
@@ -12137,7 +12133,7 @@ package actor WorkspaceFileContextStore {
         cancelUnderlyingLoadOnCallerCancellation: Bool = false,
         sessionWorktreeReservationToken: WorkspaceSessionWorktreeOwnershipToken? = nil
     ) async throws -> WorkspaceRootRecord {
-        let standardizedPath = normalizedRootLoadPath(path)
+        let standardizedPath = (path as NSString).standardizingPath
         #if DEBUG
             let rootLoadRouteStartMS = restorePerfRecorder.timestampMSIfEnabled()
             let rootLoadName = URL(fileURLWithPath: standardizedPath).lastPathComponent
@@ -12309,7 +12305,7 @@ package actor WorkspaceFileContextStore {
     }
 
     package func cancelRootLoad(path: String) {
-        let standardizedPath = normalizedRootLoadPath(path)
+        let standardizedPath = (path as NSString).standardizingPath
         guard let flight = rootLoadFlightsByPath[standardizedPath] else { return }
         flight.task.cancel()
         removeRootLoadFlight(
