@@ -6,7 +6,74 @@ extension AgentSessionRuntimeHost {
     /// original cancellation producers. The shared shutdown deadline bounds observation, not
     /// producer lifetime. This must never be used for a workspace/presenter switch.
     func beginFinalShutdown() -> AgentSessionHostDrainRuntime {
-        let participants = scope.sessions.values.map { session in
+        beginCancellationRetirement()
+    }
+
+    /// An explicitly authorized retirement starts the original cancellation and final-save
+    /// producer independently of its waiter. Ordinary presentation close must not call this.
+    func beginAuthorizedRetirement() -> AgentSessionHostDrainRuntime {
+        let drain = beginCancellationRetirement()
+        drain.startIfNeeded()
+        return drain
+    }
+
+    /// Confirmed deletion must join exact detached owners too. A timeout does not transfer
+    /// authority to remove storage while an originating provider or writer is still draining.
+    static func drainRetainedHostsForWorkspaceDeletion(
+        workspaceID: UUID, until deadline: ContinuousClock.Instant, isAdmitted: @MainActor () -> Bool
+    ) async -> Bool {
+        func canContinue() -> Bool {
+            !Task.isCancelled && ContinuousClock.now < deadline && isAdmitted()
+        }
+        guard canContinue() else { return false }
+        let store = AgentSessionRuntimeStore.shared
+        func retainedHosts() -> [AgentSessionRuntimeHost] {
+            (store.retainedExecutionHosts + store.retainedDrains.compactMap(\.scope.executableHost)).filter {
+                $0.route.identity.kind == .independent && $0.workspaceActivation?.key.owner.workspaceID == workspaceID
+            }
+        }
+        var seen = Set<ObjectIdentifier>()
+        let drains = retainedHosts().compactMap { host -> AgentSessionHostDrainRuntime? in
+            guard seen.insert(ObjectIdentifier(host)).inserted else { return nil }
+            if host.scope.hasReleasedWriterClaims { return host.scope.retainedDrain }
+            return host.beginAuthorizedRetirement()
+        }
+        for drain in drains {
+            guard canContinue(), await drain.wait(until: deadline) == .released, canContinue() else { return false }
+        }
+        return canContinue() && retainedHosts().isEmpty
+    }
+
+    /// Invoked only after the process-lifetime deletion fence commits. The caller can time out
+    /// waiting; the workspace retains the exact producer until its effects acknowledge release.
+    static func beginCommittedDetachedSessionDeletion(_ id: UUID) -> AgentSessionHostDrainRuntime? {
+        guard AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: id),
+              case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: id),
+              let host = writer.scope.executableHost,
+              host.route.identity.kind == .independent, let activation = host.workspaceActivation,
+              activation.savedCarrierSessionID == nil, !host.scope.presentation.hasPresenter(for: writer.session)
+        else { return nil }
+        if let retiring = host.scope.retainedDrain {
+            retiring.settleAfterDurableDeletion(sessionID: id)
+            return retiring
+        }
+        let drain = AgentSessionHostDrainRuntime.beginDeletion(scope: host.scope, session: writer.session, owner: host, adapters: host.drainAdapters())
+        host.scope.persistence.observeRetainedVisibleDrain?(drain)
+        host.prepareCancellation(drain: drain, sessions: [writer.session])
+        drain.startIfNeeded()
+        return drain
+    }
+
+    private func beginCancellationRetirement() -> AgentSessionHostDrainRuntime {
+        let drain = beginRetirement()
+        prepareCancellation(drain: drain, sessions: scope.sessions.values.filter {
+            scope.sessionDeletionDrains[ObjectIdentifier($0)] == nil
+        })
+        return drain
+    }
+
+    private func prepareCancellation(drain: AgentSessionHostDrainRuntime, sessions: [AgentTabSession]) {
+        let participants = sessions.map { session in
             (
                 session: session,
                 membership: scope.membership(of: session),
@@ -16,7 +83,6 @@ extension AgentSessionRuntimeHost {
                 context: session.mcpControlContext
             )
         }
-        let drain = beginRetirement()
         drain.prepareForFinalShutdown(withdrawScheduledStarts: { [self] in
             for participant in participants {
                 guard let membership = participant.membership,
@@ -67,17 +133,21 @@ extension AgentSessionRuntimeHost {
                 }
             }
         }
-        return drain
     }
 
     /// Executable composition for an explicitly authorized retirement. Stop and presentation
     /// detachment do not call this. The retained drain alone releases route/root/settings leases.
     func beginRetirement() -> AgentSessionHostDrainRuntime {
+        beginRetirement(adapters: drainAdapters())
+    }
+
+    private func drainAdapters() -> AgentSessionHostDrainRuntime.Adapters {
         let links = scope.linkExecution
         let execution = scope.execution
         let coordinator = codexCoordinator
+        let claudeCoordinator = claudeCoordinator
         let tools = route.toolExecutionRuntime
-        return beginRetirement(adapters: .init(
+        return .init(
             managedInput: links.map { .managedInput($0) },
             selfCompact: links.map { .selfCompact($0) },
             captureProvider: { session in
@@ -107,7 +177,7 @@ extension AgentSessionRuntimeHost {
                     await terminal.waitForCompletion()
                     await agentTask?.value
                     await provider?.dispose()
-                    await claude?.shutdown()
+                    if let claude { await claudeCoordinator.finishControllerForHostDrain(claude, session: session) }
                     await acp?.shutdown()
                     await codexRetirement?.waitForCompletion()
                     if let runID { try await tools.awaitNoActiveToolExecutions(runID: runID) }
@@ -123,6 +193,6 @@ extension AgentSessionRuntimeHost {
                     return current()
                 })
             }
-        ))
+        )
     }
 }

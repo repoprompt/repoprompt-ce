@@ -212,7 +212,18 @@ struct AgentManageMCPToolService {
         let workspaceID = targetWindow.workspaceManager.activeWorkspace?.id
         let openCodeWorkspacePath = targetWindow.workspaceManager.activeWorkspace?.repoPaths.first
         let rolesOnly = try parseBool(args["roles_only"], name: "roles_only", defaultValue: false)
-        let restrictedDiscovery = restrictDiscoveryToRoleLabels(workspaceID)
+        return try await Self.listAgents(
+            availability: availability, workspaceID: workspaceID, openCodeWorkspacePath: openCodeWorkspacePath,
+            rolesOnly: rolesOnly, restrictedDiscovery: restrictDiscoveryToRoleLabels(workspaceID),
+            openCodeOneShotObservationProvider: openCodeOneShotObservationProvider
+        )
+    }
+
+    static func listAgents(
+        availability: AgentModelCatalog.AvailabilityContext, workspaceID: UUID?, openCodeWorkspacePath: String?,
+        rolesOnly: Bool, restrictedDiscovery: Bool,
+        openCodeOneShotObservationProvider: @escaping AgentMCPModelParameterSupport.OneShotObservationProvider = AgentMCPModelParameterSupport.liveOneShotObservationProvider
+    ) async throws -> Value {
         let omitAgentCatalog = rolesOnly || restrictedDiscovery
         // Demand-scoped OpenCode enrichment is expensive: each uncached entry can drive a
         // serialized disposable-controller probe. Restrict OpenCode enrichment to the

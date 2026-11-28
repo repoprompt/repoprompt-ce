@@ -148,6 +148,23 @@ commands, self-compaction settlement and composer claims remain required composi
 legacy app adapter still supplies those inputs; this relocation alone does not make the saved-session
 execution host independent of windows.
 
+Claude Code proactive compaction runs inside the existing wake producer, before it reserves any
+prompt claim. This applies to automatic idle lane updates (including attention) and periodic wakes,
+not `Wake now`, waiting continuations, or local sends. The threshold defaults to 80% of the
+provider-vouched effective window, with an earlier trigger if the bounded wake and output reserve
+would not fit. The context pill shows measured pressure. Billing totals, restored counts, and
+unverified windows never qualify. The session's existing save keeps one spent reservation per
+provider conversation, shared with provider-initiated compaction boundaries. Only verified low load
+(at most 60%, with room for the reserve) rearms that episode; a fresh conversation with its own
+live measurement has its own budget. A process restart or new lane fingerprint cannot rearm it.
+
+This path sends only native `/compact` against the same live Claude controller. It cannot start a
+replacement process, interrupt a turn, acknowledge a lane batch, or consume a staged handoff. A
+successful drained command with a compact boundary re-enters wake admission; an absent
+post-compact measurement is not reported as headroom. An unverified compact, or a result that still
+shows high pressure, withholds that wake attempt without consuming the notices. This is not a
+context-exhaustion hold: future eligible wakes still use their ordinary policy.
+
 The lane board is derived data in the existing passive observation pipeline, not a fifth owner. The target view model combines its own run outcome, stamped failure reason, send-readiness blockers, and a current child-session census into the observation snapshot; the runtime bridge publishes that snapshot through link authority, and `poll`/`wait` render it. A board change can advance the existing `wait(until: "change")` cursor, but it creates no new status or attention edge for the passive reducer, changes no Auto-wake admission rule, and persists no board state.
 
 Existing managed-link status and attention rows also carry cached `context_used_percent`,
@@ -1324,6 +1341,33 @@ as `Additional changes pending` rather than empty. The `Next wake in …` countd
 the interval is the one thing delaying a wake that would otherwise be accepted right now, and it is
 omitted rather than shown as zero once elapsed. `agent_session_link` is unchanged: the interval and
 `Wake now` have no agent-facing surface.
+
+## Claude conversation size hold
+
+A correlated Claude size rejection installs a process-local hold before the run publishes idle.
+The hold names the provider and conversation, not its process, model, or last wake fingerprint.
+An unknown conversation identity does not prove a replacement. An output cap alone does not hold
+wakes. Status, exact attention, Wake now, and periodic wakes all obey the hold, including at the
+first physical acquisition. The hold does not change preferences, link authority, pending notices,
+or receipts. Explicit local input and maintenance remain available. Holds are not restored on app restart.
+
+A typed input-context refusal with a vouched context already at or above 90% can schedule one
+host-owned native `/compact` per live Claude conversation. The terminal scheduler requires the
+original failed attempt's accepted publication without a successor, exclusive binding ownership,
+and drained teardown/tools. The physical command also requires the exact idle provider
+conversation. The controller accepts an unkeyed `local_command: compact` result only in the
+uncontested command interval on that conversation; ordinary results still require their existing
+correlation. Release requires a correlated manual boundary with a positive `post_tokens` drop,
+a successful compact terminal and drained teardown/tools, and at least 20% of the vouched model
+window free. Only that request's hold can be released. The host sends no continuation prompt,
+replays no failed work, and does not touch consumed wake receipts. Newly eligible wake work can
+use the usual admission path.
+
+If recovery is unavailable or unverified, **Continue fresh in this session** stages a bounded
+handoff and retires only the Claude provider conversation. The next local composer message can
+start it with the existing session UUID, worktree, links, and grants. The saved handoff excludes
+prior prompts and tool activity. Pending fresh handoff inhibits Auto-wake, even after restore or
+failed dispatch, until the new local input is accepted. Fresh rollover is never automatic.
 
 ## Periodic idle wake
 

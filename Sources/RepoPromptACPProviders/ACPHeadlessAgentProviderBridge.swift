@@ -30,6 +30,7 @@ package final class ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {
     private let makeController: ControllerFactory
     private let beforePrompt: BeforePrompt
     private let approvalPolicy: ApprovalPolicy
+    private let openCodeLimitGrace: Duration?
     private let lifecycle = ACPHeadlessProviderLifecycle()
 
     package init(
@@ -38,7 +39,8 @@ package final class ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {
         makeRequest: @escaping RequestFactory,
         makeController: @escaping ControllerFactory,
         beforePrompt: @escaping BeforePrompt = { _, _ in },
-        approvalPolicy: ApprovalPolicy
+        approvalPolicy: ApprovalPolicy,
+        openCodeLimitGrace: Duration? = nil
     ) {
         self.providerName = providerName
         self.makeProvider = makeProvider
@@ -46,6 +48,7 @@ package final class ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {
         self.makeController = makeController
         self.beforePrompt = beforePrompt
         self.approvalPolicy = approvalPolicy
+        self.openCodeLimitGrace = openCodeLimitGrace
     }
 
     package func streamAgentMessage(
@@ -123,6 +126,9 @@ package final class ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {
             }
             defer { lifecycle.clearActiveController(id: handleID, generation: generation) }
 
+            if let openCodeLimitGrace {
+                await controller.enableOpenCodeHeadlessPromptLimitHandling(grace: openCodeLimitGrace)
+            }
             await controller.setExpectedMCPRunID(runID)
             let events = await controller.currentEventsStream()
             let forwardTask = Task {
@@ -138,12 +144,20 @@ package final class ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {
             do {
                 _ = try await controller.bootstrap()
                 try await beforePrompt(controller, request)
+                try Task.checkCancellation()
                 try await controller.prompt(message, request: request)
                 await controller.shutdown()
-                await forwardTask.value
+                let terminalError = await forwardTask.value
+                try Task.checkCancellation()
+                if let terminalError {
+                    continuation.finish(throwing: AIProviderError.invalidConfiguration(detail: terminalError))
+                } else {
+                    continuation.finish()
+                }
             } catch {
                 forwardTask.cancel()
                 await controller.shutdown()
+                try Task.checkCancellation()
                 throw await controller.normalizeError(error)
             }
         } catch is CancellationError {
@@ -159,7 +173,7 @@ package final class ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {
         providerName: String,
         approvalPolicy: ApprovalPolicy,
         to continuation: AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error>.Continuation
-    ) async {
+    ) async -> String? {
         var terminalError: String?
         for await event in events {
             switch event {
@@ -184,20 +198,13 @@ package final class ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {
                     await controller.respondToPermissionRequest(id: request.requestID.displayValue, decision: .decline)
                     await controller.cancelPrompt()
                     continuation.finish(throwing: AIProviderError.invalidConfiguration(detail: message))
-                    return
+                    return nil
                 }
             case .approvalCancelled:
                 break
             }
         }
 
-        if Task.isCancelled {
-            return
-        }
-        if let terminalError {
-            continuation.finish(throwing: AIProviderError.invalidConfiguration(detail: terminalError))
-        } else {
-            continuation.finish()
-        }
+        return terminalError
     }
 }

@@ -336,7 +336,10 @@ enum AgentSessionRestoreSupport {
             hasUnknownConversationContent: hasUnknownConversationContent,
             isMCPOriginated: session.isMCPOriginated,
             worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,
-            activeWorktreeMergeSummaries: session.worktreeMergeOperations.activeWorktreeMergeSummaries
+            activeWorktreeMergeSummaries: session.worktreeMergeOperations.activeWorktreeMergeSummaries,
+            originWorkflowID: session.originWorkflowID,
+            originWorkflowDisplayName: session.originWorkflowDisplayName,
+            lastRunStartedAt: session.lastRunStartedAt
         )
     }
 

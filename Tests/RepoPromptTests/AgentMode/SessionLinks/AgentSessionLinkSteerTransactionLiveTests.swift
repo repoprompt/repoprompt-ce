@@ -972,7 +972,7 @@ final class AgentSessionManagedInputRuntimeTests: XCTestCase {
                 return try await initialThreadInput(session)
             },
             modelDisplayName: { $0.selectedModelRaw },
-            start: { _, _, _, _, _ in XCTFail("Active managed input must not call the legacy start adapter")
+            start: { _, _, _, _, _, _ in XCTFail("Active managed input must not call the legacy start adapter")
                 return nil
             },
             settleSelfCompact: { _ in }, selfCompactBlocksWake: { _ in false }, selfCompactHoldsWakeAcquisition: { _ in false },

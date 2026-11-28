@@ -863,11 +863,10 @@ private struct MessageBubbleContent: View {
     private var reasoningButtonIfNeeded: some View {
         // Always render container to prevent layout shifts.
         if shouldShowReasoningButton {
-            let binding = viewModel.bindingForReasoningContent(of: message.id)
             ReasoningButton(
-                reasoningContent: binding,
+                reasoningContent: .constant(message.reasoningContent),
                 isStreaming: isStreamingWithEmptyContent,
-                externalUpdateTick: viewModel.reasoningUpdateTick
+                externalUpdateTick: message.reasoningRevisionCount
             )
         } else {
             Color.clear
@@ -876,11 +875,7 @@ private struct MessageBubbleContent: View {
     }
 
     private var shouldShowReasoningButton: Bool {
-        !message.isUser &&
-            (
-                !message.reasoningContent.isEmpty ||
-                    !viewModel.ephemeralState.reasoningContent(for: message.id).isEmpty
-            )
+        !message.isUser && !message.reasoningContent.isEmpty
     }
 
     private var isStreamingWithEmptyContent: Bool {

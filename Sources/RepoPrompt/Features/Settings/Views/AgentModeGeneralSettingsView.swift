@@ -106,6 +106,19 @@ struct AgentModeGeneralSettingsView: View {
 
                 Divider()
 
+                Picker("Claude context compaction before Auto-wake", selection: Binding(
+                    get: { globalSettings.claudeWakeCompactionThresholdPercent() },
+                    set: { globalSettings.setClaudeWakeCompactionThresholdPercent($0) }
+                )) {
+                    Text("Off").tag(0)
+                    ForEach(Array(70 ... 90), id: \.self) { percent in
+                        Text("\(percent)%").tag(percent)
+                    }
+                }
+                Text("Claude Code only. A measured high context load can trigger one native compaction before an automatic wake. RepoPrompt may start sooner to leave space for the wake and its reply.")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                    .foregroundStyle(.secondary)
+
                 SettingToggle(
                     title: "Command Center (experimental)",
                     description: "Enable the cross-workspace session browser for tip experimentation. Off by default; disabling it stops its observations without closing windows or stopping agents.",

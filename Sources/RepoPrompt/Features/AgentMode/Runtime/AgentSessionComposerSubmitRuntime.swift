@@ -85,7 +85,9 @@ final class AgentSessionComposerSubmitRuntime {
         if let pending = session.composerStartCancellation { return .rejected(.activeAttemptExists(activeAttemptID: pending.attemptID)) }
         if let active = session.activeComposerSubmitAttempt { return .rejected(.activeAttemptExists(activeAttemptID: active.id)) }
         guard !scope.isRetiring, !scope.hasReleasedWriterClaims else { return .rejected(.targetRejected(reason: "writer_retiring")) }
-        if session.restorationAdmissionFailureMessage != nil { return .rejected(.targetRejected(reason: "restoration_unavailable")) }
+        if scope.isAwaitingWorkspaceAdoption || session.isAwaitingWorkspaceAdoption || session.restorationAdmissionFailureMessage != nil {
+            return .rejected(.targetRejected(reason: "restoration_unavailable"))
+        }
         guard session.composerSubmissionToken == target.expectedSubmissionToken else { return .rejected(.targetRejected(reason: "submission_token_mismatch")) }
         if let presentationRejection { return .rejected(.targetRejected(reason: presentationRejection)) }
 
@@ -104,7 +106,8 @@ final class AgentSessionComposerSubmitRuntime {
             else { return .rejected(.targetRejected(reason: "writer_unavailable")) }
             command = admitted
         case .createAgentSessionFromSourceTab:
-            guard suppliedCommand == nil, session.activeAgentSessionID == nil,
+            guard suppliedCommand == nil, !scope.isAwaitingWorkspaceAdoption, !session.isAwaitingWorkspaceAdoption,
+                  session.activeAgentSessionID == nil,
                   target.expectedSourceAgentSessionID == nil, session.persistentSessionBindingIdentity == nil,
                   !session.bindingTransitionInProgress,
                   session.bindingTransitionGeneration == target.expectedBindingTransitionGeneration,
@@ -281,6 +284,7 @@ final class AgentComposerStartCancellation {
     private(set) var destinationWriterIdentity: AgentSessionRuntimeStore.WriterIdentity?
     private weak var runtime: AgentSessionComposerSubmitRuntime?
     private let allowsPendingStartWithdrawal: Bool
+    private let originatingSteerAttempt: (runID: UUID, attemptID: UUID)?
     private var preparationOwners: Set<ObjectIdentifier> = []
     private var owedDraft: String?
     private var stopFence: AgentRunStartStopFence
@@ -304,6 +308,13 @@ final class AgentComposerStartCancellation {
         self.source = source
         self.runtime = runtime
         self.allowsPendingStartWithdrawal = allowsPendingStartWithdrawal
+        if attempt.target.expectedRunState.isActive, let runID = attempt.target.expectedRunID,
+           let attemptID = attempt.target.expectedRunAttemptID
+        {
+            originatingSteerAttempt = (runID, attemptID)
+        } else {
+            originatingSteerAttempt = nil
+        }
         executorEntered = !awaitsExecutor
         stopFence = AgentRunStartStopFence(session: source)
         didLaunch = source.runState.isActive || source.activeRunOwnership != nil
@@ -343,6 +354,16 @@ final class AgentComposerStartCancellation {
         if !executorEntered { releaseRequested = true }
         finalizeIfReleased()
         return true
+    }
+
+    /// Departure may withdraw a local steer before its optimistic input is published, but not
+    /// a fresh submission that has since handed ownership to its own admitted attempt.
+    func withdrawForPresentationDeparture(on session: AgentTabSession) -> Bool {
+        if withdraw(on: session) { return true }
+        guard allowsPendingStartWithdrawal, let originatingSteerAttempt,
+              session.runState.isActive, session.runID == originatingSteerAttempt.runID,
+              session.activeRunAttemptID == originatingSteerAttempt.attemptID else { return false }
+        return cancelPresentedInput(on: session)
     }
 
     func beginExecution() -> Bool {

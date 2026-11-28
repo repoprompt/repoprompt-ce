@@ -1196,6 +1196,7 @@ import XCTest
         private struct QueuedSessionAdminAgent {
             let context: PersistentMCPTestContext
             let endpoint: PersistentMCPTestEndpoint
+            let host: AgentSessionRuntimeHost
             let runID: UUID
             let sessionID: UUID
             let originalName: String
@@ -1233,10 +1234,10 @@ import XCTest
                         }
                         scopes.revokeAll(involving: agent.sessionID)
                         await manager.clearClientConnectionPolicy(
-                            for: agent.endpoint.clientName, windowID: agent.context.window.windowID, runID: agent.runID
+                            for: agent.endpoint.clientName, windowID: agent.host.routeID, runID: agent.runID
                         )
                         await Self.cleanupEndpoint(agent.endpoint, manager: manager)
-                        await manager.cleanupRunRoutingState(for: agent.runID, windowID: agent.context.window.windowID)
+                        await manager.cleanupRunRoutingState(for: agent.runID, windowID: agent.host.routeID)
                     }
                     await fixture.cleanup()
                     for agent in agents {
@@ -1361,7 +1362,7 @@ import XCTest
                         XCTAssertFalse(scopes.hasLiveScope(grantedTo: a.sessionID))
                     }
                     if change != .removed {
-                        XCTAssertEqual(a.context.window.mcpServer.runRouteBindings.connectionIDByRunID[a.runID], a.endpoint.connectionID)
+                        XCTAssertEqual(a.host.route.runRouteBindings.connectionIDByRunID[a.runID], a.endpoint.connectionID)
                         let current = await manager.debugRunPolicyState(for: a.runID)
                         XCTAssertEqual(try XCTUnwrap(current).purpose, .agentModeRun)
                     }
@@ -1412,12 +1413,22 @@ import XCTest
                     }
                     await manager.debugSetAfterConnectionCallPermitAcquiredForTesting(nil)
                     await manager.debugSetBeforeToolResultFormattingForTesting(nil)
+                    if rename, change == .unchanged || change == .policyChangedAfterProvider {
+                        // This next read tests the unchanged route after the rename, not a
+                        // read racing the rename's working-document and durable publications.
+                        let workspaceManager = a.context.window.workspaceManager
+                        await workspaceManager.debugDrainScheduledSaves()
+                        await workspaceManager.debugAwaitWorkingDocumentCommitToDomainAuthority(workspaceID: a.context.workspaceID)
+                    }
                     if change != .removed {
                         let read = try await a.endpoint.callTool(
                             name: MCPWindowToolName.readFile, arguments: ["path": a.context.fileURL.path]
                         )
-                        XCTAssertTrue(try Self.toolResultText(read).contains(a.context.sentinel), "Policy denial must preserve this connection's allowed reads")
-                        XCTAssertEqual(a.context.window.mcpServer.runRouteBindings.connectionIDByRunID[a.runID], a.endpoint.connectionID)
+                        XCTAssertTrue(
+                            try Self.toolResultText(read).contains(a.context.sentinel),
+                            "\(change.rawValue): policy changes must preserve this connection's allowed reads: \(read.rawJSON)"
+                        )
+                        XCTAssertEqual(a.host.route.runRouteBindings.connectionIDByRunID[a.runID], a.endpoint.connectionID)
                     }
                 } catch {
                     failure = error
@@ -1439,66 +1450,58 @@ import XCTest
         private static func renewQueuedSessionAdminPolicy(
             _ agent: QueuedSessionAdminAgent, restricted: Bool = false, explore: Bool = false
         ) async {
-            await ServerNetworkManager.shared.installClientConnectionPolicy(
-                for: agent.endpoint.clientName, windowID: agent.context.window.windowID,
-                restrictedTools: restricted ? [MCPWindowToolName.sessionAdmin] : [],
-                reason: "Queued session administration regression", ttl: 60,
-                tabID: agent.context.tabID, runID: agent.runID, additionalTools: [], purpose: .agentModeRun,
-                taskLabelKind: explore ? .explore : nil, allowsAgentExternalControlTools: true
+            // Change the production policy revision without replacing the admitted provider
+            // connection. Connection replacement is tested separately by the removal case.
+            await ServerNetworkManager.shared.debugSeedRunPolicyState(
+                runID: agent.runID, windowID: agent.host.routeID, workspaceID: agent.context.workspaceID,
+                tabID: agent.context.tabID, restrictedTools: restricted ? [MCPWindowToolName.sessionAdmin] : [],
+                additionalTools: [], purpose: .agentModeRun, taskLabelKind: explore ? .explore : nil,
+                allowsAgentExternalControlTools: true
             )
         }
 
         private static func prepareQueuedSessionAdminAgent(
             _ fixture: PersistentMCPTestFixture, context: PersistentMCPTestContext
         ) async throws -> QueuedSessionAdminAgent {
-            try await fixture.registerDomainWorkspace(context)
             let window = context.window
-            let configuredWorkspace = try XCTUnwrap(window.workspaceManager.workspaces.first { $0.id == context.workspaceID })
-            let configuredTab = try XCTUnwrap(configuredWorkspace.composeTabs.first { $0.id == context.tabID })
+            var configuredWorkspace = try XCTUnwrap(window.workspaceManager.workspace(withID: context.workspaceID))
+            let tabIndex = try XCTUnwrap(configuredWorkspace.composeTabs.firstIndex { $0.id == context.tabID })
             let sessionID = UUID()
-            // This is restored history, not a transient index injection. Workspace activation may
-            // finish its real index refresh after socket setup; it must find the same durable row.
+            configuredWorkspace.composeTabs[tabIndex].activeAgentSessionID = sessionID
+            let name = configuredWorkspace.composeTabs[tabIndex].name
+            let workspace = try await fixture.commitCanonicalAgentWorkspace(configuredWorkspace, in: context)
             let fileURL = try await AgentSessionDataService.shared.saveAgentSession(AgentSession(
-                id: sessionID, workspaceID: configuredWorkspace.id, composeTabID: context.tabID,
-                name: configuredTab.name, agentKind: AgentProviderKind.claudeCode.rawValue, autoEditEnabled: false
-            ), for: configuredWorkspace)
+                id: sessionID, workspaceID: workspace.id, composeTabID: context.tabID,
+                name: name, agentKind: AgentProviderKind.claudeCode.rawValue, autoEditEnabled: false,
+                autoWakeOnOversightUpdates: false
+            ), for: workspace)
             try await activateWorkspace(for: context)
             let vm = window.agentModeViewModel
-            let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
-            let tab = try XCTUnwrap(workspace.composeTabs.first { $0.id == context.tabID })
-            let session = vm.session(for: context.tabID)
-            // Install runtime and carrier together. Prewriting the carrier would conflict
-            // with a runtime already materialized by workspace activation.
-            _ = try XCTUnwrap(vm.test_installPersistentSessionBinding(
-                sessionID: sessionID, on: session, compareAndSetInWorkspaceID: workspace.id
-            ))
-            let boundWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
-            XCTAssertEqual(boundWorkspace.composeTabs.first { $0.id == context.tabID }?.activeAgentSessionID, sessionID)
-            window.promptManager.loadComposeTabsFromWorkspace(boundWorkspace, syncPromptText: true)
-            let name = tab.name
-            session.selectedAgent = .claudeCode
-            session.hasLoadedPersistedState = true
-            session.oversight.autoWakeOnUpdates = false
-            // This fixture starts at an explicitly restored session; it does not model
-            // fresh creation or use a missing payload as evidence of a new session.
-            session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            let session = await vm.ensureSessionReady(tabID: context.tabID, expectedWorkspaceID: workspace.id)
+            let host = vm.runtimeHost
+            _ = try XCTUnwrap(host.workspaceActivation)
+            XCTAssertEqual(session.activeAgentSessionID, sessionID)
             XCTAssertTrue(session.permitsBoundOperationAndSave)
             XCTAssertEqual(vm.mcpSpawnParentSessionID(sourceTabID: context.tabID), sessionID)
             let runID = UUID()
             session.installRunID(runID)
+            _ = session.beginRunAttempt(source: "queued policy fixture")
+            session.runState = .running
             WindowStatesManager.shared.attachAgentSessionLinkBridge()
             let clientName = "queued-policy-\(UUID())"
-            await fixture.networkManager.installClientConnectionPolicy(
-                for: clientName, windowID: window.windowID, restrictedTools: [],
+            let receipt = await fixture.networkManager.installClientConnectionPolicy(
+                for: clientName, windowID: host.routeID, restrictedTools: [],
                 reason: "Queued session administration fixture", ttl: 60,
                 tabID: context.tabID, runID: runID, additionalTools: [], purpose: .agentModeRun,
-                allowsAgentExternalControlTools: true
+                allowsAgentExternalControlTools: true,
+                routingOwner: host.route, originatingContextSource: host.originatingContextSource
             )
+            _ = try XCTUnwrap(receipt)
             let endpoint = try await PersistentMCPTestEndpoint.make(
                 label: "queued-policy", networkManager: fixture.networkManager, clientName: clientName,
                 requiredToolNames: [MCPWindowToolName.sessionAdmin, MCPWindowToolName.readFile]
             )
-            XCTAssertEqual(window.mcpServer.runRouteBindings.connectionIDByRunID[runID], endpoint.connectionID)
+            XCTAssertEqual(host.route.runRouteBindings.connectionIDByRunID[runID], endpoint.connectionID)
             let resolved = try AgentSessionLinkEndpointTestSupport.endpoint(vm, tabID: context.tabID)
             XCTAssertEqual(resolved.sessionID, sessionID)
             // Scope admission needs owner-valid placement, not the sidebar's UI restore join.
@@ -1506,7 +1509,7 @@ import XCTest
                 OpenWindowsDelegationProvenanceSource().placement(for: sessionID)?.workspaceID == context.workspaceID
             }
             XCTAssertTrue(placementReady, "Restored fixture placement must be published by the real workspace index")
-            return QueuedSessionAdminAgent(context: context, endpoint: endpoint, runID: runID, sessionID: sessionID, originalName: name, fileURL: fileURL)
+            return QueuedSessionAdminAgent(context: context, endpoint: endpoint, host: host, runID: runID, sessionID: sessionID, originalName: name, fileURL: fileURL)
         }
 
         func testExpiredClientEnvelopeRejectsBeforeProviderAndJournalForBothPublicTools() async throws {
@@ -5303,6 +5306,7 @@ import XCTest
         let contextB: PersistentMCPTestContext
         private let storage: WorkspaceFixtureStorage
         private var primaryPersistentMCPTestEndpoint: PersistentMCPTestEndpoint?
+        private var canonicalAgentWorkspaces: [UUID: (authority: DomainWorkspaceAuthorityClient, directory: URL)] = [:]
         private var cleanedUp = false
 
         private init(
@@ -5433,8 +5437,20 @@ import XCTest
                     runID: nil
                 )
             }
+            for context in [contextB, contextA] where canonicalAgentWorkspaces[context.workspaceID] != nil {
+                await context.window.agentModeViewModel.test_retireAndCancelFixture()
+            }
             await contextB.window.tearDown()
             await contextA.window.tearDown()
+            for (id, fixture) in canonicalAgentWorkspaces {
+                let outcome = await fixture.authority.delete(workspaceID: id, expectedCatalogRevision: nil, expectedWorkspaceRevision: nil)
+                XCTAssertEqual(outcome.disposition, .applied)
+                if FileManager.default.fileExists(atPath: fixture.directory.path) {
+                    do { try FileManager.default.removeItem(at: fixture.directory) }
+                    catch { XCTFail("Remove canonical Agent fixture storage: \(error)") }
+                }
+            }
+            canonicalAgentWorkspaces.removeAll()
             await contextA.window.mcpServer.shutdownListener()
             await AppDomainRuntimeComposition.shared.unregister(contextB.catalogService)
             await AppDomainRuntimeComposition.shared.unregister(contextA.catalogService)
@@ -5543,6 +5559,34 @@ import XCTest
             // and restores the inherited transport state; this fixture never owns global
             // registration handles.
             await ServerNetworkManager.shared.setEnabled(true)
+        }
+
+        /// The Agent transport tests create real workspace carriers, not routing-only overlays.
+        func commitCanonicalAgentWorkspace(
+            _ candidate: WorkspaceModel, in context: PersistentMCPTestContext
+        ) async throws -> WorkspaceModel {
+            precondition(candidate.id == context.workspaceID && canonicalAgentWorkspaces[candidate.id] == nil)
+            var workspace = candidate
+            workspace.isEphemeral = false
+            workspace = storage.track(workspace)
+            let window = context.window
+            let authority = DomainWorkspaceAuthorityClient(
+                store: AppDomainRuntimeComposition.shared.runtime.workspaceStore, windowID: window.windowID
+            )
+            // Keep the document in the configured authority root and the sidecars in fixture storage.
+            var documentLocation = workspace
+            documentLocation.customStoragePath = nil
+            let fileURL = window.workspaceManager.workspaceFileURL(for: documentLocation)
+            let committed = try await authority.create(workspace, fileURL: fileURL)
+            guard committed.disposition == .applied else {
+                throw MCPError.internalError("Agent fixture workspace commit refused: \(committed.diagnostic ?? committed.disposition.rawValue)")
+            }
+            canonicalAgentWorkspaces[workspace.id] = (authority, fileURL.deletingLastPathComponent())
+            window.workspaceManager.workspaces.removeAll { $0.id == workspace.id && $0.isEphemeral }
+            let projection = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
+            let refreshed = await projection.refreshForAgentAdmission()
+            XCTAssertTrue(refreshed)
+            return try XCTUnwrap(window.workspaceManager.workspace(withID: workspace.id))
         }
 
         func registerDomainWorkspace(_ context: PersistentMCPTestContext) async throws {

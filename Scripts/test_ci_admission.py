@@ -139,6 +139,96 @@ class CheckoutTests(unittest.TestCase):
         self.assertEqual(lines['range'], f'{self.base}..{self.head}')
         return json.loads(lines['context'])
 
+    def test_native_stack_preview_admits_exact_parents_and_full_trunk_range(self):
+        lower_layer = self.head
+        (self.root / 'upper').write_text('upper layer')
+        admission.git(self.root, 'add', 'upper')
+        admission.git(self.root, 'commit', '-qm', 'upper layer')
+        topic = admission.git(self.root, 'rev-parse', 'HEAD')
+        tree = admission.git(self.root, 'rev-parse', 'HEAD^{tree}')
+        synthetic = admission.git(self.root, 'commit-tree', tree, '-p', lower_layer, '-p', topic,
+                                  '-m', 'GitHub stack preview')
+        admission.git(self.root, 'checkout', '--detach', synthetic)
+        event = {'pull_request': {'number': 9, 'base': {'ref': 'lower-layer', 'sha': lower_layer},
+                                  'head': {'sha': topic}, 'stack': {'base': {'ref': 'main', 'sha': self.base}}}}
+        output = self.root / 'stack-outputs'
+
+        def prepare(payload, ref='refs/pull/9/merge'):
+            output.unlink(missing_ok=True)
+            self.event_path.write_text(json.dumps(payload))
+            return self.command('prepare', event_path=self.event_path, event_name='pull_request',
+                                sha=synthetic, ref=ref, output=output)
+
+        result = prepare(event)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        outputs = dict(line.split('=', 1) for line in output.read_text().splitlines())
+        self.assertEqual(outputs['range'], f'{self.base}..{synthetic}')
+        context = json.loads(outputs['context'])
+        self.assertEqual((context['base'], context['head'], context['tree']), (self.base, synthetic, tree))
+        self.assertIn(lower_layer, admission.git(self.root, 'rev-list', outputs['range']).splitlines())
+
+        for key, value, expected_error in (
+            ('stack', None, 'synthetic merge into main'),
+            ('stack', {'base': {'ref': 'release', 'sha': self.base}}, 'rooted on main'),
+            ('stack', {'base': {'ref': 'main'}}, 'requires a real base commit'),
+            ('stack', {'base': {'ref': 'main', 'sha': topic}}, 'does not contain the pinned main trunk'),
+            ('head', {'sha': lower_layer}, 'parents do not match'),
+            ('base', {'ref': 'lower-layer', 'sha': self.base}, 'parents do not match'),
+            ('number', 8, 'does not match the synthetic merge ref'),
+        ):
+            with self.subTest(key=key, value=value):
+                invalid = {'pull_request': {**event['pull_request'], key: value}}
+                result = prepare(invalid)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected_error, result.stderr)
+                self.assertFalse(output.exists())
+
+    def test_native_stack_preview_can_chain_synthetic_merge_parents(self):
+        first_topic = self.head
+        for name in ('middle', 'upper'):
+            (self.root / name).write_text(name)
+            admission.git(self.root, 'add', name)
+            admission.git(self.root, 'commit', '-qm', name)
+        topic = admission.git(self.root, 'rev-parse', 'HEAD')
+        middle_topic = admission.git(self.root, 'rev-parse', 'HEAD^')
+
+        def preview(base, head):
+            tree = admission.git(self.root, 'rev-parse', f'{head}^{{tree}}')
+            return admission.git(self.root, 'commit-tree', tree, '-p', base, '-p', head, '-m', 'GitHub stack preview')
+
+        event = {'pull_request': {'number': 9, 'base': {'ref': 'middle', 'sha': middle_topic},
+                                  'head': {'sha': topic}, 'stack': {'base': {'ref': 'main', 'sha': self.base}}}}
+        output = self.root / 'stack-outputs'
+
+        def prepare(start, payload=event):
+            output.unlink(missing_ok=True)
+            first = preview(start, first_topic)
+            middle = preview(first, middle_topic)
+            synthetic = preview(middle, topic)
+            admission.git(self.root, 'checkout', '--detach', synthetic)
+            self.event_path.write_text(json.dumps(payload))
+            return synthetic, self.command('prepare', event_path=self.event_path, event_name='pull_request',
+                                           sha=synthetic, ref='refs/pull/9/merge', output=output)
+
+        synthetic, result = prepare(self.base)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        outputs = dict(line.split('=', 1) for line in output.read_text().splitlines())
+        self.assertEqual(outputs['range'], f'{self.base}..{synthetic}')
+        commits = admission.git(self.root, 'rev-list', outputs['range']).splitlines()
+        self.assertTrue({first_topic, middle_topic, topic}.issubset(commits))
+
+        wrong_root = admission.git(self.root, 'commit-tree', f'{self.base}^{{tree}}', '-m', 'Unrelated root')
+        _, result = prepare(wrong_root)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('synthetic merge chain is not rooted at the pinned main trunk', result.stderr)
+        self.assertFalse(output.exists())
+
+        wrong_base = {'pull_request': {**event['pull_request'], 'base': {'ref': 'middle', 'sha': first_topic}}}
+        _, result = prepare(self.base, wrong_base)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('synthetic merge parents do not match its PR event', result.stderr)
+        self.assertFalse(output.exists())
+
     def producer(self, context, attempt='1'):
         return admission.producer_context(context, attempt, {'swift': 'Swift fixture', 'xcode': 'Xcode fixture', 'architecture': 'arm64'})
 

@@ -86,6 +86,11 @@ final class AgentSessionPersistenceRuntime {
         let admitBinding: (AgentTabSession) -> Admission?
         var isRestoringConfiguration: () -> Bool = { false }
         var canonicalStorage: CanonicalStorage?
+        var canonicalDisplayName: ((WorkspaceModel, UUID) -> String?)?
+
+        func displayName(for tabID: UUID, in workspace: WorkspaceModel) -> String {
+            canonicalDisplayName?(workspace, tabID) ?? displayName(tabID)
+        }
 
         var workspaceID: UUID? {
             canonicalStorage?.workspaceID ?? workspace()?.id
@@ -118,6 +123,14 @@ final class AgentSessionPersistenceRuntime {
     let queue = AgentSessionSaveQueue()
     var composition: Composition?
     var presentation: Presentation?
+    var observeRetainedVisibleDrain: ((AgentSessionHostDrainRuntime) -> Void)?
+    private struct DetachedFinalSaveFailure {
+        let writer: AgentSessionRuntimeStore.WriterIdentity
+        let terminal: AgentRunTerminalCommitRevision
+        let message: String
+    }
+
+    private var detachedFinalSaveFailures: [UUID: DetachedFinalSaveFailure] = [:]
     var perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     var saver: Saver = { payload, workspace, count in
         try await AgentSessionDataService.shared.saveAgentSession(
@@ -209,9 +222,34 @@ final class AgentSessionPersistenceRuntime {
         }
     }
 
+    private func detachedFinalSaveFailure(for session: AgentTabSession) -> DetachedFinalSaveFailure? {
+        guard let failure = detachedFinalSaveFailures[session.tabID], session.isDirty, !session.runState.isActive,
+              session.lastTerminalCommitRevision == failure.terminal,
+              scope?.originatingWriter(identity: failure.writer, session: session) != nil
+        else { return nil }
+        return failure
+    }
+
+    /// A passive settlement signal may transfer a known failure, but never starts a save.
+    func retainDetachedFinalSaveFailureIfReady() {
+        guard !detachedFinalSaveFailures.isEmpty, let observeRetainedVisibleDrain, let scope,
+              let host = scope.executableHost, !scope.isRetiring, scope.saveQueue.inFlightSessionIDs.isEmpty,
+              scope.sessions.values.allSatisfy({ !scope.presentation.hasPresenter(for: $0) && scope.settlement(for: $0).canJoinHostDrain })
+        else { return }
+        for session in scope.sessions.values {
+            guard let failure = detachedFinalSaveFailure(for: session),
+                  let writer = scope.originatingWriter(identity: failure.writer, session: session), writer.isCurrent else { continue }
+            let drain = host.beginRetirement()
+            drain.retainObservedFinalSaveFailure(failure.message, for: writer)
+            observeRetainedVisibleDrain(drain)
+            return
+        }
+    }
+
     func scheduleSave(for tabID: UUID) {
         guard composition?.isSuppressed() == false else { return }
-        guard let session = sessions[tabID], session.creationState == nil else { return }
+        guard let session = sessions[tabID], session.creationState == nil,
+              detachedFinalSaveFailure(for: session) == nil else { return }
         session.saveRequestGeneration &+= 1
         guard !session.isInstallingHandoffWorktreeBindings else {
             // Handoff saves the destination explicitly once its inherited bindings are installed.
@@ -252,6 +290,7 @@ final class AgentSessionPersistenceRuntime {
                 if session.isDirty { scheduleSave(for: session) }
                 return
             }
+            guard detachedFinalSaveFailure(for: session) == nil else { return }
             _ = await saveSession(for: tabID)
         }
     }
@@ -439,7 +478,11 @@ final class AgentSessionPersistenceRuntime {
 
         // Build the persisted session only for the binding generation captured below.
         let canonicalItemCount = persistableSnapshot.canonicalVisibleRowCount
-        let sessionName = composition?.displayName(tabID) ?? AgentSessionRestoreSupport.normalizedSessionTitle(nil)
+        func displayName(in workspace: WorkspaceModel) -> String {
+            composition?.displayName(for: tabID, in: workspace) ?? AgentSessionRestoreSupport.normalizedSessionTitle(nil)
+        }
+        let sessionName = displayName(in: workspace)
+        var lastValidatedWorkspace = workspace
         let agentSession = AgentSessionPayloadBuilder.makePayload(
             session: session, sessionID: sessionID, workspaceID: workspace.id,
             name: sessionName, snapshot: persistableSnapshot
@@ -468,6 +511,7 @@ final class AgentSessionPersistenceRuntime {
                 return .deferred("The originating writer changed before persistence could commit.")
             }
         }
+        let terminalAtSave = session.runState.isActive ? nil : session.lastTerminalCommitRevision
         let preparedWrite: AgentSessionSaveRuntime.PreparedWrite
         do {
             preparedWrite = try AgentSessionSaveRuntime.prepare(
@@ -488,11 +532,15 @@ final class AgentSessionPersistenceRuntime {
                           current.id == workspace.id, admissionFailure() == nil,
                           isSaveCommitTokenCurrent(saveToken, requireWorkspaceMatch: composition?.canonicalStorage == nil, creationHandle: effectiveCreationSave?.handle)
                     else { return false }
-                    return WorkspaceSessionSidecarMigration.workspaceDirectory(
+                    guard WorkspaceSessionSidecarMigration.workspaceDirectory(
                         for: current, root: AgentSessionDataService.defaultWorkspaceRootURL()
-                    ).standardizedFileURL.path == saveToken.workspaceDirectoryPath
+                    ).standardizedFileURL.path == saveToken.workspaceDirectoryPath,
+                        composition?.canonicalDisplayName == nil || displayName(in: current) == sessionName
+                    else { return false }
+                    lastValidatedWorkspace = current
+                    return true
                 },
-                currentName: { composition?.displayName(tabID) ?? AgentSessionRestoreSupport.normalizedSessionTitle(nil) },
+                currentName: { displayName(in: lastValidatedWorkspace) },
                 observingPhase: observingPhase,
                 saver: saver
             )
@@ -511,7 +559,11 @@ final class AgentSessionPersistenceRuntime {
             guard permits(expectation, tabID: tabID) else {
                 return .deferred("The originating writer changed after persistence committed.")
             }
-            presentation?.didCommit(session, receipt, canonicalItemCount)
+            if let presentation {
+                presentation.didCommit(session, receipt, canonicalItemCount)
+            } else {
+                scope?.presentation.sessionSaveCommitted(session, receipt: receipt, canonicalItemCount: canonicalItemCount)
+            }
             #if DEBUG
                 if let diagnosticsStartMS {
                     perfRecorder.event(
@@ -531,6 +583,7 @@ final class AgentSessionPersistenceRuntime {
                 }
                 return .deferred("The session binding changed after persistence committed.")
             }
+            detachedFinalSaveFailures.removeValue(forKey: tabID)
             observingPhase?(.durablySaved(durableBindingToken))
             return .durablySaved(durableBindingToken)
         } catch {
@@ -543,6 +596,13 @@ final class AgentSessionPersistenceRuntime {
                 message: String(describing: error)
             )
             print("[AgentSessionPersistenceRuntime] Failed to save session: \(failure.message)")
+            if observeRetainedVisibleDrain != nil, !Task.isCancelled, writer.isCurrent, let scope,
+               !scope.isRetiring, !scope.presentation.hasPresenter(for: session),
+               let terminal = terminalAtSave, session.lastTerminalCommitRevision == terminal, !session.runState.isActive,
+               isSaveCommitTokenCurrent(saveToken, requireWorkspaceMatch: false, creationHandle: effectiveCreationSave?.handle)
+            {
+                detachedFinalSaveFailures[tabID] = .init(writer: writer.identity, terminal: terminal, message: failure.message)
+            }
             return .failed(failure)
         }
     }

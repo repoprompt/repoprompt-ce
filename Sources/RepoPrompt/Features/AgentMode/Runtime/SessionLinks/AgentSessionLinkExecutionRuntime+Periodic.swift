@@ -20,7 +20,8 @@ extension AgentSessionLinkExecutionRuntime {
     func agentSessionLinkPeriodicWakeIsEligible(
         _ session: TabSession, endpoint: DomainAgentSessionLinkEndpointIdentity, requiresReadyCatalog: Bool = true
     ) -> Bool {
-        guard sessions[endpoint.tabID] === session,
+        guard !session.claudeContextBlocksAutoWake,
+              sessions[endpoint.tabID] === session,
               agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
               session.oversight.periodicIdleWakeEnabled,
               session.permitsBoundOperationAndSave,

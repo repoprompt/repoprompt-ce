@@ -2,10 +2,42 @@ import Foundation
 import RepoPromptDomainRuntime
 import RepoPromptProviderQuota
 
-package enum NativeAgentRuntimeTurnStatus {
+package enum NativeAgentRuntimeTurnStatus: Equatable {
     case completed
     case cancelled
     case failed
+    case claudeSizeFailure(ClaudeTurnSizeFailure)
+}
+
+/// Settled evidence for the exact Claude input(s) named by the terminal event.
+package struct ClaudeTurnSizeFailure: Equatable {
+    package enum Kind: String {
+        case inputContextRejected
+        case generationContextLimit
+        case outputLimit
+        case requestTooLarge
+        case unknownSizeLimit
+    }
+
+    package enum Source: String {
+        case localCLIRejection
+        case apiError
+        case resultStopReason
+    }
+
+    package let kind: Kind
+    package let source: Source
+    package let inputTokens: Int?
+    package let limitTokens: Int?
+    package let conversationID: String?
+
+    package init(kind: Kind, source: Source, inputTokens: Int? = nil, limitTokens: Int? = nil, conversationID: String?) {
+        self.kind = kind
+        self.source = source
+        self.inputTokens = inputTokens
+        self.limitTokens = limitTokens
+        self.conversationID = conversationID
+    }
 }
 
 package struct NativeAgentRuntimeRuntimeInitStatus: Equatable {

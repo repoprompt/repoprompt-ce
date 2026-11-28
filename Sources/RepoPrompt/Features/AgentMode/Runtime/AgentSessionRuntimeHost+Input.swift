@@ -62,13 +62,13 @@ extension AgentSessionRuntimeHost {
                     availability: availability, includeEffortSuffix: false
                 )
             },
-            start: { [weak self] command, text, options, outcome, preparation in
+            start: { [weak self] command, text, attachments, options, outcome, preparation in
                 guard let self else {
                     outcome?.recordStartFailure(message: "The originating execution host is unavailable.")
                     return nil
                 }
                 return await startCanonicalRequest(
-                    command: command, message: text, options: options, outcome: outcome,
+                    command: command, message: text, attachments: attachments, options: options, outcome: outcome,
                     providerSwitchPreparation: preparation
                 )
             },
@@ -78,14 +78,6 @@ extension AgentSessionRuntimeHost {
             managedInputEnvironment: { [weak self] session in self?.canonicalInputEnvironment(for: session) },
             workspaceCaptureOrder: .beforeSkillExpansion
         ), diagnostics: diagnostics)
-        if route.identity.kind == .independent {
-            route.installModelEndpointResolver { [weak activation, weak runtime] tabID in
-                guard activation?.isCurrent == true,
-                      let runtime, let endpoint = runtime.agentSessionLinkObserverEndpoint(tabID: tabID),
-                      let command = runtime.admit(endpoint: endpoint) else { return nil }
-                return .init(endpoint: endpoint, writer: command.identity)
-            }
-        }
         runtime.codexCoordinator = codexCoordinator
         runtime.perfRecorder = perfRecorder
         runtime.activeMCPToolProbe = { [tools = route.toolExecutionRuntime] in tools.hasActiveToolExecutions(runID: $0) }

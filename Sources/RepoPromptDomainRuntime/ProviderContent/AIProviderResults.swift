@@ -103,6 +103,19 @@ package enum AIProviderCompletionOutcome: Equatable {
     case incomplete(reason: String)
 }
 
+/// Native transport proof for a completed Claude `/compact` input, never ordinary usage.
+package struct ClaudeCompactEvidence {
+    package let conversationID: String
+    package let turnID: UUID
+    package let postTokens: Int
+
+    package init(conversationID: String, turnID: UUID, postTokens: Int) {
+        self.conversationID = conversationID
+        self.turnID = turnID
+        self.postTokens = postTokens
+    }
+}
+
 /// Updated `AIStreamResult` to include optional `reasoning`, token counts, and tool metadata.
 package struct AIStreamResult {
     /// Standard type strings for stream results
@@ -140,6 +153,9 @@ package struct AIStreamResult {
     /// Stable provider message identifier for content chunks when available.
     /// Used by lightweight aggregators to separate whole-message chunks without affecting token deltas.
     package let contentMessageID: String?
+    /// Native transport proof attached only to an attributed Claude compact boundary.
+    package var nativeCompactInputID: UUID?
+    package let claudeCompactEvidence: ClaudeCompactEvidence?
     /// Optional provider conversation cleanup handle, used for best-effort Oracle cleanup.
     package let cleanupHandle: ProviderConversationCleanupHandle?
 
@@ -163,6 +179,7 @@ package struct AIStreamResult {
         modelContextWindow: Int? = nil,
         contextUsedTokens: Int? = nil,
         contentMessageID: String? = nil,
+        claudeCompactEvidence: ClaudeCompactEvidence? = nil,
         cleanupHandle: ProviderConversationCleanupHandle? = nil
     ) {
         self.type = type
@@ -184,6 +201,7 @@ package struct AIStreamResult {
         self.modelContextWindow = modelContextWindow
         self.contextUsedTokens = contextUsedTokens
         self.contentMessageID = contentMessageID
+        self.claudeCompactEvidence = claudeCompactEvidence
         self.cleanupHandle = cleanupHandle
     }
 }

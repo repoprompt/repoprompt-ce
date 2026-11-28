@@ -457,6 +457,14 @@
         "RepoPromptShared",
         "RepoPromptInstrumentation"
       ]
+    },
+    "RepoPromptRemoteProtocolTests": {
+      "source_root": "Tests/RepoPromptRemoteProtocolTests",
+      "allowed_dependencies": []
+    },
+    "RepoPromptIrohSpikeMac": {
+      "source_root": "Spikes/IrohTransportSpikeMac",
+      "allowed_dependencies": []
     }
   },
   "moved_families": {

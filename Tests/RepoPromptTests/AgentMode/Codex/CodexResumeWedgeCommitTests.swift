@@ -1456,9 +1456,12 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
         let activationID = try XCTUnwrap(session.pendingCodexComputerUseActivation?.id)
         var flags: [Bool] = []
+        var replacement: WedgeFakeCodexController?
         let coordinator = makeComputerUseCoordinator(fixture: fixture) { runID, enabled in
             flags.append(enabled)
-            return WedgeFakeCodexController(runID: runID, responses: [.success("armed-cu-thread")])
+            let controller = WedgeFakeCodexController(runID: runID, responses: [.success("armed-cu-thread")])
+            replacement = controller
+            return controller
         }
 
         let ensure = Task { await coordinator.ensureCodexNativeSession(session: session) }
@@ -1476,6 +1479,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertTrue(session.isCodexComputerUseArmed, "Arming must survive the transient retirement fence")
         XCTAssertEqual(session.pendingCodexComputerUseActivation?.id, activationID)
         XCTAssertEqual(flags, [true], "The replacement controller must activate Computer Use")
+        XCTAssertEqual(replacement?.developerInstructionAttempts, [AgentModePrompts.codexNativeDeveloperNote()])
         XCTAssertEqual(session.codexControllerFeatureState?.computerUseEnabled, true)
         XCTAssertEqual(controller.shutdownCount, 1)
         XCTAssertFalse(session.items.contains { $0.kind == .error && $0.text == CodexComputerUseWorkflow.ineligibleMessage })
@@ -2542,6 +2546,53 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertEqual(fixture.session.items.count(where: { $0.text.contains("Started a fresh thread") }), 1)
     }
 
+    /// A resume follows the conversation's recorded instruction mode, not the session's current
+    /// eligibility: a native thread keeps its note after gaining a parent, and a legacy thread does
+    /// not get guidance its RepoPrompt base already carries.
+    func testResumeDeveloperNoteFollowsRecordedInstructionMode() async throws {
+        let note = AgentModePrompts.codexNativeDeveloperNote()
+        let cases: [(mode: CodexThreadInstructionMode?, hasParent: Bool, expected: String?)] = [
+            (.native, true, note),
+            (.legacy, false, nil),
+            (nil, false, note),
+            (nil, true, nil)
+        ]
+        for testCase in cases {
+            let fixture = makeFixture([[.success(Self.oldThreadID)]], shouldManageCodexTooling: false)
+            fixture.session.codexInstructionMode = testCase.mode
+            fixture.session.parentSessionID = testCase.hasParent ? UUID() : nil
+            await fixture.coordinator.ensureCodexNativeSession(session: fixture.session)
+            let controller = try XCTUnwrap(fixture.factory.controllers.first)
+            XCTAssertEqual(controller.receivedExistingIDs, [Self.oldThreadID], "\(testCase)")
+            XCTAssertEqual(controller.developerInstructionAttempts, [testCase.expected], "\(testCase)")
+            XCTAssertEqual(fixture.session.codexInstructionMode, testCase.mode, "a resume must keep the recorded mode")
+            await fixture.coordinator.shutdownCodexSession(fixture.session)
+        }
+    }
+
+    /// A missing-rollout fallback starts a new conversation, so it is offered the new-thread note
+    /// even when the lost conversation was legacy, and records the new conversation's mode.
+    func testMissingRolloutFallbackRecordsNewConversationInstructionMode() async throws {
+        let fixture = makeFixture([[.missingRollout, .success("ready-fresh-thread")]])
+        fixture.session.codexInstructionMode = .legacy
+        let startup = Task { await fixture.coordinator.ensureCodexNativeSession(session: fixture.session) }
+        defer { startup.cancel() }
+        try await waitForPendingStart(fixture)
+        XCTAssertEqual(fixture.session.codexInstructionMode, .legacy, "staged startup must not publish the new mode early")
+        try await MCPRoutingWaiter.shared.notifyRouted(runID: XCTUnwrap(fixture.session.runID))
+        await startup.value
+
+        XCTAssertEqual(fixture.session.codexConversationID, "ready-fresh-thread")
+        XCTAssertEqual(fixture.session.codexInstructionMode, .native)
+        XCTAssertEqual(
+            fixture.factory.controllers.first?.developerInstructionAttempts,
+            [nil, AgentModePrompts.codexNativeDeveloperNote()]
+        )
+        var persisted = AgentSession(id: UUID(), name: "Instruction mode", savedAt: Date(), autoEditEnabled: false)
+        AgentSessionPayloadBuilder.applyCodexPersistence(from: fixture.session, to: &persisted)
+        XCTAssertEqual(persisted.codexInstructionMode, .native)
+    }
+
     func testSecondCallerCannotBypassUnpublishedStartup() async throws {
         let gate = TestReleaseFence(name: "first Codex start response")
         let fixture = makeFixture(restored: true, [[.suspendedSuccess("claimed-thread", gate)]])
@@ -2857,6 +2908,12 @@ final class WedgeFakeCodexController: CodexSessionControllerPassiveStubDefaults,
     private let lock = NSLock()
     private var responses: [Response]
     private var existingIDs: [String?] = []
+    private var developerNotes: [String?] = []
+
+    var developerInstructionAttempts: [String?] {
+        lock.withLock { developerNotes }
+    }
+
     private var active = false
     private var turnCount = 0
     private var compactions = 0
@@ -2988,13 +3045,32 @@ final class WedgeFakeCodexController: CodexSessionControllerPassiveStubDefaults,
 
     func startOrResume(
         existing: CodexNativeSessionController.SessionRef?,
+        baseInstructions: String,
+        model: String?,
+        reasoningEffort: String?,
+        serviceTier: String?
+    ) async throws -> CodexNativeSessionController.SessionRef {
+        try await startOrResume(
+            existing: existing,
+            baseInstructions: baseInstructions,
+            developerInstructions: nil,
+            model: model,
+            reasoningEffort: reasoningEffort,
+            serviceTier: serviceTier
+        )
+    }
+
+    func startOrResume(
+        existing: CodexNativeSessionController.SessionRef?,
         baseInstructions _: String,
+        developerInstructions: String?,
         model: String?,
         reasoningEffort: String?,
         serviceTier _: String?
     ) async throws -> CodexNativeSessionController.SessionRef {
         let response = lock.withLock { () -> Response? in
             existingIDs.append(existing?.conversationID)
+            developerNotes.append(developerInstructions)
             startupRoutingPolicies.append(routingCleanup?.policyID)
             return responses.isEmpty ? nil : responses.removeFirst()
         }
@@ -3082,11 +3158,16 @@ final class WedgeFakeCodexController: CodexSessionControllerPassiveStubDefaults,
             )
         case let .success(threadID):
             lock.withLock { active = true }
+            // Mirrors the real controller on a supported runtime: a start records its mode, a
+            // resume keeps the existing one.
             return CodexNativeSessionController.SessionRef(
                 conversationID: threadID,
                 rolloutPath: nil,
                 model: model,
-                reasoningEffort: reasoningEffort
+                reasoningEffort: reasoningEffort,
+                instructionMode: existing == nil
+                    ? (developerInstructions == nil ? .legacy : .native)
+                    : existing?.instructionMode
             )
         case nil:
             throw CodexAppServerClient.ClientError.invalidResponse

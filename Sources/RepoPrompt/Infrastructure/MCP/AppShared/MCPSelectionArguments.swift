@@ -3,15 +3,18 @@ import MCP
 import RepoPromptFoundation
 import RepoPromptWorkspaceContext
 
-extension MCPServerViewModel {
-    struct ManageSelectionInputs {
+/// Shared wire arguments for selection on both app route kinds.
+enum MCPSelectionArguments {
+    static let codeMapsGloballyDisabledMCPMessage = "Code Maps are globally disabled in Advanced Settings; codemap-only selection modes and get_code_structure are unavailable."
+
+    struct Inputs {
         let paths: [String]
         let sliceInputs: [WorkspaceSelectionSliceInput]
         let sliceErrors: [String]
         let hadExplicitSliceSpec: Bool
     }
 
-    nonisolated static func isLineRangeSuffix(_ suffix: Substring) -> Bool {
+    private static func isLineRangeSuffix(_ suffix: Substring) -> Bool {
         guard let first = suffix.first, first == "L" || first == "l" else { return false }
         let remainder = suffix.dropFirst()
         guard !remainder.isEmpty else { return false }
@@ -24,7 +27,7 @@ extension MCPServerViewModel {
         return true
     }
 
-    nonisolated func parseManageSelectionInputs(rawPaths: [String], slicesValue: Value?) -> ManageSelectionInputs {
+    static func parse(rawPaths: [String], slicesValue: Value?) -> Inputs {
         var sanitizedPaths: [String] = []
         var seenPaths = Set<String>()
         var sliceInputs: [WorkspaceSelectionSliceInput] = []
@@ -126,7 +129,7 @@ extension MCPServerViewModel {
             }
         }
 
-        return ManageSelectionInputs(
+        return Inputs(
             paths: sanitizedPaths,
             sliceInputs: sliceInputs,
             sliceErrors: sliceErrors,
@@ -134,7 +137,7 @@ extension MCPServerViewModel {
         )
     }
 
-    nonisolated static func parseLineRangeTokens(from text: String) -> ([LineRange], [String]) {
+    private static func parseLineRangeTokens(from text: String) -> ([LineRange], [String]) {
         let compact = text
             .replacingOccurrences(of: "\n", with: "")
             .replacingOccurrences(of: "\r", with: "")

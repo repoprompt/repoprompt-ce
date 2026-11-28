@@ -255,6 +255,7 @@ enum AgentMonitorWakeNowRefusal: Equatable {
     case sessionBusy
     /// The provider context cannot carry a lane supplement right now.
     case notReady
+    case claudeSizeFailure
 
     /// Shown in the dashboard's existing observer-control message area, and as the button tooltip.
     var message: String {
@@ -269,6 +270,8 @@ enum AgentMonitorWakeNowRefusal: Equatable {
             "This session is busy. Try again when its current turn finishes."
         case .notReady:
             "This session can’t carry an update right now."
+        case .claudeSizeFailure:
+            "Auto-wake is paused after Claude hit a size limit. See the last turn’s error for next steps."
         }
     }
 }
@@ -1725,6 +1728,7 @@ enum AgentSessionOversightPersistenceCopy {
 struct AgentSessionOversightWarning: Equatable, Identifiable {
     let id: String
     let message: String
+    var canRetrySessionSettlement = false
 }
 
 /// Process-wide durable-oversight state, overlaid onto every window's Oversee props.
@@ -1799,12 +1803,13 @@ struct AgentSessionOversightPersistencePresentation: Equatable {
     /// Returns `false` when nothing changed, so a caller can skip a broadcast that would repaint
     /// every window for an identical value.
     @discardableResult
-    mutating func appendWarning(id: String, message: String) -> Bool {
-        if let existing = warnings.first(where: { $0.id == id }), existing.message == message {
+    mutating func appendWarning(id: String, message: String, canRetrySessionSettlement: Bool = false) -> Bool {
+        let warning = AgentSessionOversightWarning(id: id, message: message, canRetrySessionSettlement: canRetrySessionSettlement)
+        if warnings.contains(warning) {
             return false
         }
         warnings.removeAll { $0.id == id }
-        warnings.append(AgentSessionOversightWarning(id: id, message: message))
+        warnings.append(warning)
         if warnings.count > Self.maxWarnings {
             // Oldest first: the newest failure is the one the user is currently reacting to.
             warnings.removeFirst(warnings.count - Self.maxWarnings)

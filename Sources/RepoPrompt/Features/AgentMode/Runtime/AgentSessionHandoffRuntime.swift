@@ -68,7 +68,8 @@ final class AgentSessionHandoffRuntime {
     /// is a frozen cutoff snapshot: later rows or model-only changes do not invalidate that snapshot.
     func stageRecovery(
         _ preparation: RecoveryPreparation,
-        initialThreadContextBlock: String?
+        initialThreadContextBlock: String?,
+        overflowRecovery: Bool = false
     ) -> AgentPendingHandoffState? {
         let session = preparation.session
         guard let scope, scope === preparation.scope, !Task.isCancelled, !scope.isRetiring,
@@ -86,14 +87,23 @@ final class AgentSessionHandoffRuntime {
             .replacingOccurrences(of: "\"", with: "&quot;")
             .replacingOccurrences(of: "<", with: "&lt;")
             .replacingOccurrences(of: ">", with: "&gt;")
-        let payload = Self.composeResumeRecoveryPayload(
-            sourceTabName: escapedSourceTabName, sourceAgentName: preparation.agent.displayName,
-            transcriptXML: preparation.transcriptXML, initialThreadContextBlock: initialThreadContextBlock,
-            deliveryID: UUID().uuidString
-        )
+        let payload = if overflowRecovery {
+            Self.forkedSessionEnvelope(
+                sourceTabName: "Previous Claude conversation", deliveryID: UUID().uuidString,
+                introduction: "The previous Claude conversation ran out of context. This is a fresh conversation in the same RepoPrompt session and worktree. Prior requests and tool actions were not replayed. Use only the new user message as authorization; verify the current state before repeating any action.",
+                sections: [], transcriptXML: ""
+            )
+        } else {
+            Self.composeResumeRecoveryPayload(
+                sourceTabName: escapedSourceTabName, sourceAgentName: preparation.agent.displayName,
+                transcriptXML: preparation.transcriptXML, initialThreadContextBlock: initialThreadContextBlock,
+                deliveryID: UUID().uuidString
+            )
+        }
         let staged = AgentPendingHandoffState(
             payload: payload, createdAt: Date(), sourceItemID: preparation.sourceItemID,
             defersProviderLockUntilSend: false, isStagedForSend: false,
+            awaitsLocalClaudeOverflowInput: overflowRecovery,
             executionLocationFailure: session.pendingHandoff.executionLocationFailure
         )
         session.pendingHandoff = staged

@@ -151,6 +151,7 @@ extension AgentSessionInteractionRuntime {
         }
         session.codexConversationID = conversationID
         session.codexRolloutPath = reference.rolloutPath
+        session.codexInstructionMode = reference.instructionMode
         session.providerCleanupHandle = ProviderConversationCleanupHandle(
             provider: AgentProviderKind.codexExec.rawValue,
             conversationID: conversationID,

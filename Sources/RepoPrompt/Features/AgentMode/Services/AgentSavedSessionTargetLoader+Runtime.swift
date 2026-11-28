@@ -8,6 +8,9 @@ extension AgentSavedSessionTargetLoader {
         let currentWorkspace: (UUID) -> WorkspaceModel?
         let currentMetadata: (UUID, UUID) -> LiveMetadata?
         let isCurrent: (Target) -> Bool
+        /// Durable workspace authority may suspend. Local writer, deletion and authorization
+        /// fences are sampled again after this check, never carried across it.
+        var validateCanonicalTarget: ((Target) async -> Bool)?
     }
 
     struct RuntimeLoad {
@@ -42,6 +45,15 @@ extension AgentSavedSessionTargetLoader {
         let effects: Effects
     }
 
+    static func canHydrateOriginalColdWriter(_ writer: AgentSessionRuntimeStore.Writer) -> Bool {
+        guard case .failure(.restorationUnavailable) = writer.admitCommand(),
+              !writer.scope.isRetiring, !writer.scope.hasReleasedWriterClaims else { return false }
+        let session = writer.session
+        return session.creationState == nil && !session.hasLoadedPersistedState && !session.isDirty
+            && !session.runState.isActive && session.activeRunOwnership == nil
+            && session.activeComposerSubmitAttempt == nil && !session.terminalCommitInProgress
+    }
+
     /// Loads exactly one saved payload into the existing runtime authority. No provider starts,
     /// workspace CAS, new lifecycle manager, window construction or presentation publication.
     /// The caller retains the returned writer's scope. An existing writer may belong to a different
@@ -55,6 +67,7 @@ extension AgentSavedSessionTargetLoader {
         selection: (AgentSessionHydrationPayload) -> AgentSessionHydrationRuntime.Selection,
         codexPolicy: (AgentSessionHydrationRuntime.Selection) -> AgentCodexSelectionPolicy,
         isStillAuthorized: () -> Bool,
+        originalColdWriter: AgentSessionRuntimeStore.Writer? = nil,
         readRecord: (UUID, WorkspaceModel) async throws -> AgentSessionMetadataRecord? = {
             try await AgentSessionDataService.shared.metadataRecordForSessionID($0, for: $1)
         },
@@ -70,14 +83,21 @@ extension AgentSavedSessionTargetLoader {
         }
         func existing() -> Result<RuntimeLoad, RuntimeLoadFailure>? {
             switch scope.resolveWriter(sessionID: sessionID, expectedWorkspaceID: storage.workspaceID) {
-            case .unavailable(.absent): nil
-            case let .unavailable(reason): failed(.writerUnavailable(reason))
-            case .conflicting: failed(.lookup(.ambiguous))
+            case .unavailable(.absent):
+                return originalColdWriter == nil ? nil : failed(.lookup(.changed))
+            case let .unavailable(reason): return failed(.writerUnavailable(reason))
+            case .conflicting: return failed(.lookup(.ambiguous))
             case let .unique(writer):
+                if let originalColdWriter {
+                    guard writer.identity == originalColdWriter.identity, writer.scope === scope, writer.session === originalColdWriter.session else {
+                        return failed(.lookup(.changed))
+                    }
+                    if canHydrateOriginalColdWriter(writer) { return nil }
+                }
                 switch writer.admitCommand() {
-                case let .failure(reason): failed(.commandRejected(reason))
+                case let .failure(reason): return failed(.commandRejected(reason))
                 case .success:
-                    .success(.init(writer: writer, source: .existingWriter, requiresSave: writer.session.isDirty))
+                    return .success(.init(writer: writer, source: .existingWriter, requiresSave: writer.session.isDirty))
                 }
             }
         }
@@ -98,25 +118,37 @@ extension AgentSavedSessionTargetLoader {
         case let .failure(reason): return failed(.lookup(reason))
         case let .success(value): target = value
         }
-        guard target.workspace.id == storage.workspaceID, catalog.isCurrent(target),
+        if let validate = catalog.validateCanonicalTarget, await !validate(target) {
+            return failed(.lookup(.changed))
+        }
+        guard !Task.isCancelled, isStillAuthorized(), target.workspace.id == storage.workspaceID, catalog.isCurrent(target),
               let workspace = storage.workspace, sameStorage(workspace, target.workspace), available()
         else { return failed(.lookup(.changed)) }
         if let existing = existing() { return existing }
         guard !scope.isRetiring, !scope.hasReleasedWriterClaims else { return failed(.commandRejected(.retiring)) }
-        guard scope.sessions[target.tab.id] == nil else { return failed(.occupiedTab) }
         guard let composedWorkspace = scope.persistence.composition?.workspace(),
               sameStorage(composedWorkspace, workspace), scope.attachments.configuration != nil
         else {
             return failed(.compositionUnavailable)
         }
-        let session = scope.makeSession(tabID: target.tab.id)
-        guard scope.permitsBinding(sessionID, on: session) else { return failed(.lookup(.ambiguous)) }
-        session.installPersistentSessionBinding(.init(tabID: target.tab.id, sessionID: sessionID, workspaceID: workspace.id))
-        var sessions = scope.sessions
-        sessions[session.tabID] = session
-        scope.replaceSessions(sessions)
+        let session: AgentTabSession
+        if let originalColdWriter {
+            guard originalColdWriter.session.tabID == target.tab.id,
+                  scope.sessions[target.tab.id] === originalColdWriter.session,
+                  canHydrateOriginalColdWriter(originalColdWriter) else { return failed(.lookup(.changed)) }
+            session = originalColdWriter.session
+        } else {
+            guard scope.sessions[target.tab.id] == nil else { return failed(.occupiedTab) }
+            session = scope.makeSession(tabID: target.tab.id)
+            guard scope.permitsBinding(sessionID, on: session) else { return failed(.lookup(.ambiguous)) }
+            session.installPersistentSessionBinding(.init(tabID: target.tab.id, sessionID: sessionID, workspaceID: workspace.id))
+            var sessions = scope.sessions
+            sessions[session.tabID] = session
+            scope.replaceSessions(sessions)
+        }
         let transition = session.persistentBindingTransitionToken()
         guard let hydration = AgentSessionHydrationRuntime.Attempt.capture(session, in: scope, transition: transition) else {
+            guard originalColdWriter == nil else { return failed(.lookup(.changed)) }
             // No suspension or external callback separates installation from this refusal.
             var remaining = scope.sessions
             remaining.removeValue(forKey: session.tabID)
@@ -133,7 +165,7 @@ extension AgentSavedSessionTargetLoader {
             guard scope.sessions[session.tabID] === session else {
                 return .failure(.init(reason: reason, effects: .loadingClaimDisplaced))
             }
-            guard writer.ownsPersistentClaim, transition.matches(session),
+            guard originalColdWriter == nil, writer.ownsPersistentClaim, transition.matches(session),
                   !session.isDirty, session.activeRunOwnership == nil, !session.runState.isActive,
                   session.activeComposerSubmitAttempt == nil, !session.terminalCommitInProgress
             else { return .failure(.init(reason: reason, effects: .loadingClaimRetained)) }
@@ -153,9 +185,13 @@ extension AgentSavedSessionTargetLoader {
         } catch {
             return failLoading(.lookup(error is CancellationError || Task.isCancelled ? .changed : .unreadable))
         }
+        if let validate = catalog.validateCanonicalTarget, await !validate(target) {
+            return failLoading(.lookup(.changed))
+        }
         guard !Task.isCancelled, isStillAuthorized(), available(), !storage.isSuppressed(),
               catalog.isCurrent(target), let current = storage.workspace, sameStorage(current, workspace),
-              scope.sessions[session.tabID] === session, transition.matches(session)
+              scope.sessions[session.tabID] === session, transition.matches(session),
+              originalColdWriter.map(canHydrateOriginalColdWriter) ?? true
         else { return failLoading(.lookup(.changed)) }
         guard hydration.isCurrent else {
             // Diagnose only. Never adopt a freshly resolved writer after the read.
@@ -184,7 +220,7 @@ extension AgentSavedSessionTargetLoader {
         switch writer.admitCommand() {
         case let .failure(reason): return .failure(.init(reason: .commandRejected(reason), effects: .loadingClaimRetained))
         case .success:
-            return .success(.init(writer: writer, source: .savedPayload, requiresSave: session.isDirty))
+            return .success(.init(writer: writer, source: originalColdWriter == nil ? .savedPayload : .existingWriter, requiresSave: session.isDirty))
         }
     }
 

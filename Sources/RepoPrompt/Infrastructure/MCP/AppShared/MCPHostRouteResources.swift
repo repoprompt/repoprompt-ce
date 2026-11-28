@@ -26,7 +26,7 @@ final class MCPHostRouteResources {
     }
 
     typealias ProviderContextResolver = @MainActor @Sendable () async -> ProviderContext?
-    typealias ProviderContextSource = @MainActor (_ runID: UUID, _ tabID: UUID?) -> ProviderContextResolver?
+    typealias ProviderContextSource = @MainActor @Sendable (_ runID: UUID, _ tabID: UUID?) -> ProviderContextResolver?
 
     enum ProviderContextAdmission {
         case compatibility
@@ -82,6 +82,10 @@ final class MCPHostRouteResources {
     private var catalogTransitionTail: Task<Void, Never>?
     private(set) var catalogHandle: MCPDomainToolRegistrationHandle?
     private var catalog: MCPAppToolCatalogRegistration?
+    var usesHostCapabilities: Bool {
+        catalog?.ownsHostInteractions == true
+    }
+
     private var runRouting: RunRouting?
     private(set) var providerContextSource: ProviderContextSource?
     /// Only an entered context/mapping producer retains its original physical cleanup adapter.
@@ -96,6 +100,8 @@ final class MCPHostRouteResources {
         guard !isClosing, let current = runRouteBindings.tabContextByConnectionID[connectionID] else { return false }
         return current.windowID == original.windowID && current.workspaceID == original.workspaceID
             && current.tabID == original.tabID && current.runID == original.runID
+            && current.savedCarrierSessionID == original.savedCarrierSessionID
+            && current.runAttemptIDAtBinding == original.runAttemptIDAtBinding
             && current.readFileAutoSelectionGeneration == original.readFileAutoSelectionGeneration
             && current.routeOwnerIdentity == original.routeOwnerIdentity
             && current.fileToolAuthoritySourceIdentity == original.fileToolAuthoritySourceIdentity
@@ -108,6 +114,27 @@ final class MCPHostRouteResources {
         fileprivate let policyID: UUID?
         fileprivate let tab: MCPTabContextSnapshot
 
+        var savedCarrierSessionID: UUID? {
+            tab.savedCarrierSessionID
+        }
+
+        var runID: UUID? {
+            tab.runID
+        }
+
+        var runAttemptIDAtBinding: UUID? {
+            tab.runAttemptIDAtBinding
+        }
+
+        var connectionID: UUID {
+            registration.connectionID
+        }
+
+        var writerAtBinding: AgentSessionRuntimeStore.WriterIdentity? {
+            if case let .captured(identity) = tab.modelWriterAtBinding { return identity }
+            return nil
+        }
+
         var lookupSource: AgentWorkspaceLookupContextSource {
             .init(activeAgentSessionID: tab.activeAgentSessionID, worktreeBindingState: tab.worktreeBindingState)
         }
@@ -115,13 +142,13 @@ final class MCPHostRouteResources {
 
     /// Capture the current connection before selection or domain reads can suspend, and use its
     /// bound tab for the entire invocation. The route's active presentation is irrelevant here.
-    func fileReadConnection(metadata: MCPRequestMetadata, workspaceID: UUID) throws -> FileReadConnection {
+    func fileReadConnection(metadata: MCPRequestMetadata, workspaceID expectedWorkspaceID: UUID? = nil) throws -> FileReadConnection {
         guard !isClosing, let connectionID = metadata.connectionID,
               let retained = connections[connectionID],
               let routed = runRouteBindings.tabContextByConnectionID[connectionID],
               metadata.windowID == identity.routeID,
               routed.windowID == identity.routeID, routed.routeOwnerIdentity == ObjectIdentifier(self),
-              routed.workspaceID == workspaceID,
+              let workspaceID = routed.workspaceID, expectedWorkspaceID.map({ $0 == workspaceID }) ?? true,
               runRouteBindings.connectionIDToRunID[connectionID].map({ $0 == routed.runID }) ?? true,
               metadata.tabContextHint.map({ $0.tabID == routed.tabID && ($0.workspaceID == nil || $0.workspaceID == workspaceID) }) ?? true
         else { throw MCPFileToolAuthorityFailure.unavailable }
@@ -146,6 +173,11 @@ final class MCPHostRouteResources {
         guard fileReadConnectionIsCurrent(connection), handle.context == connection.context,
               MCPServerViewModel.domainReadBindingSatisfiesRequestedRun(requestedRunID: connection.tab.runID, resolvedBindingKind: handle.bindingKind)
         else { throw MCPFileToolAuthorityFailure.superseded }
+        if let sessionID = connection.savedCarrierSessionID, let runID = connection.runID {
+            guard handle.bindingKind == .savedRunScoped(runID: runID, sessionID: sessionID) else {
+                throw MCPFileToolAuthorityFailure.superseded
+            }
+        }
         return handle
     }
 
@@ -191,11 +223,21 @@ final class MCPHostRouteResources {
     private var presentationRevision: UInt64 = 0
     private var routingPublicationTail: Task<Void, Never>?
 
-    init(
+    let isLeaseManaged: Bool
+
+    convenience init(
         identity: MCPHostRouteIdentity,
         coordinator: DomainRoutingCoordinator?,
         runtime: MCPDomainRuntime = AppDomainRuntimeComposition.shared.runtime
     ) {
+        self.init(identity: identity, coordinator: coordinator, runtime: runtime, isLeaseManaged: false)
+    }
+
+    private init(
+        identity: MCPHostRouteIdentity, coordinator: DomainRoutingCoordinator?,
+        runtime: MCPDomainRuntime, isLeaseManaged: Bool
+    ) {
+        self.isLeaseManaged = isLeaseManaged
         self.identity = identity
         self.coordinator = coordinator
         precondition(coordinator == nil || coordinator === runtime.routingCoordinator, "A route must use one domain runtime")
@@ -245,8 +287,12 @@ final class MCPHostRouteResources {
         if presentationRevision < .max { presentationRevision += 1 }
         let revision = presentationRevision
         let binding: DomainBinding = if let workspaceID = context.workspaceID {
-            if let runID = context.runID {
-                .runScoped(runID: runID, context: DomainContextIdentity(workspaceID: workspaceID, contextID: context.tabID))
+            if let runID = context.runID, let sessionID = context.savedCarrierSessionID {
+                .savedRunScoped(runID: runID, context: .init(workspaceID: workspaceID, contextID: context.tabID), sessionID: sessionID)
+            } else if let runID = context.runID {
+                identity.kind == .independent && isLeaseManaged
+                    ? .canonicalRunScoped(runID: runID, context: .init(workspaceID: workspaceID, contextID: context.tabID))
+                    : .runScoped(runID: runID, context: .init(workspaceID: workspaceID, contextID: context.tabID))
             } else {
                 .context(DomainContextIdentity(workspaceID: workspaceID, contextID: context.tabID), explicit: context.explicitlyBound)
             }
@@ -315,16 +361,44 @@ final class MCPHostRouteResources {
     #if DEBUG
         /// Suspend the actual transfer after tentative publication to exercise actor reentrancy.
         var test_afterProcessConnectionTransfer: (@MainActor @Sendable (MCPRunRoutingCleanupReceipt) async -> Void)?
+        /// An in-process provider fixture can supply its real socket after the exact policy is armed.
+        /// The fixture may stop its own startup, but a successful hook never substitutes for route proof.
+        // Process identity is supplied only by socket fixtures whose peer PID was admitted via
+        // the real network manager. The bootstrap still verifies the original policy and route.
+        var test_existingProcessForBootstrap: (@MainActor @Sendable (MCPBootstrapLeaseSpec) async -> MCPRunRoutingProcessRegistration?)?
+        var test_afterExpectedPIDPolicyArmed: (@MainActor @Sendable (MCPBootstrapLeaseSpec, MCPRunRoutingCleanupReceipt) async -> Bool)?
     #endif
 
     /// Join original publications before transferring the existing domain receipt and context.
     /// No new connection generation or catalog lookup is manufactured for a process refresh.
     func transferProcessConnection(_ connectionID: UUID, from origin: MCPRunRoutingCleanupReceipt, to successor: MCPRunRoutingCleanupReceipt) async -> Bool {
         await settleRoutingPublications()
+        let renewal: ProviderContext?
+        if origin.usesExplicitProviderContext || successor.usesExplicitProviderContext {
+            guard origin.usesExplicitProviderContext, successor.usesExplicitProviderContext,
+                  let resolver = successor.providerContextResolver, let context = await resolver(),
+                  await context.validateCarrier() else { return false }
+            renewal = context
+        } else {
+            renewal = nil
+        }
         guard !isClosing, origin.routeOwner === self, successor.routeOwner === self,
-              coordinator == nil || connections[connectionID]?.policyID == origin.policyID,
-              runRouteBindings.transferProcessConnection(connectionID, from: origin, to: successor)
-        else { return false }
+              coordinator == nil || connections[connectionID]?.policyID == origin.policyID else { return false }
+        if let renewal {
+            let next = renewal.snapshot
+            guard renewal.isCurrent(), let previous = runRouteBindings.tabContextByConnectionID[connectionID],
+                  previous.routeOwnerIdentity == ObjectIdentifier(self), next.windowID == identity.routeID,
+                  previous.windowID == next.windowID, previous.runID == origin.runID, next.runID == origin.runID,
+                  previous.tabID == next.tabID, previous.workspaceID == next.workspaceID,
+                  previous.activeAgentSessionID == next.activeAgentSessionID,
+                  previous.savedCarrierSessionID == next.savedCarrierSessionID,
+                  previous.worktreeBindingState.bindings == next.worktreeBindingState.bindings,
+                  case let .captured(previousWriter) = previous.modelWriterAtBinding,
+                  case let .captured(nextWriter) = next.modelWriterAtBinding, previousWriter == nextWriter
+            else { return false }
+        }
+        guard runRouteBindings.transferProcessConnection(connectionID, from: origin, to: successor) else { return false }
+        if let renewal { renewProviderAttempt(connectionID: connectionID, attemptID: renewal.snapshot.runAttemptIDAtBinding) }
         if let retained = connections[connectionID] {
             connections[connectionID] = RetainedConnection(registration: retained.registration, policyID: successor.policyID)
         }
@@ -334,6 +408,42 @@ final class MCPHostRouteResources {
         return true
     }
 
+    /// A provider-initiated turn uses an existing process registration, not a policy minted
+    /// by a presenter. Only its admitted writer may renew the attempt on that connection.
+    func renewAdoptedProviderAttempt(
+        runID: UUID, tabID: UUID, writer: AgentSessionRuntimeStore.WriterIdentity,
+        attemptID: UUID, receipts: [MCPRunRoutingCleanupReceipt]
+    ) -> Bool {
+        guard identity.kind == .independent, !isClosing,
+              let connectionID = runRouteBindings.connectionID(forRunID: runID),
+              let ownership = runRouteBindings.cleanupOwnership(for: connectionID),
+              receipts.contains(where: {
+                  !$0.isConsumed && $0.routeOwner === self && $0.routeID == identity.routeID
+                      && $0.runID == runID && $0.policyID == ownership.policyID
+              }),
+              let previous = runRouteBindings.tabContextByConnectionID[connectionID],
+              previous.routeOwnerIdentity == ObjectIdentifier(self), previous.windowID == identity.routeID,
+              previous.runID == runID, previous.tabID == tabID, previous.workspaceID == writer.workspaceID,
+              previous.activeAgentSessionID == writer.sessionID,
+              case let .captured(boundWriter) = previous.modelWriterAtBinding, boundWriter == writer
+        else { return false }
+        renewProviderAttempt(connectionID: connectionID, attemptID: attemptID)
+        return true
+    }
+
+    private func renewProviderAttempt(connectionID: UUID, attemptID: UUID?) {
+        guard var context = runRouteBindings.tabContextByConnectionID[connectionID],
+              context.runAttemptIDAtBinding != attemptID else { return }
+        readFileAutoSelectionCoordinator?.invalidate(
+            context: runRouteBindings.readFileAutoSelectionContextKey(connectionID: connectionID, context: context)
+        )
+        runRouteBindings.nextReadFileAutoSelectionBindingGeneration &+= 1
+        context.readFileAutoSelectionGeneration = runRouteBindings.nextReadFileAutoSelectionBindingGeneration
+        context.runAttemptIDAtBinding = attemptID
+        runRouteBindings.tabContextByConnectionID[connectionID] = context
+        runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
+    }
+
     func installProviderContextSource(_ source: @escaping ProviderContextSource) {
         precondition(identity.kind == .independent && providerContextSource == nil)
         precondition(!isClosing && !runRouteBindings.hasRetainedCleanupOwnership)
@@ -341,20 +451,24 @@ final class MCPHostRouteResources {
         runRouting = nil
     }
 
-    func admitProviderContext(runID: UUID, tabID: UUID?) -> ProviderContextAdmission {
+    func admitProviderContext(
+        runID: UUID, tabID: UUID?, originatingContextSource: ProviderContextSource? = nil
+    ) -> ProviderContextAdmission {
         guard !isClosing else { return .refused }
-        guard let providerContextSource else { return .compatibility }
+        guard let providerContextSource = originatingContextSource ?? providerContextSource else { return .compatibility }
         guard let resolve = providerContextSource(runID, tabID) else { return .refused }
         return .canonical(resolve)
     }
 
     func installPendingPolicy(_ receipt: MCPRunRoutingCleanupReceipt, connectionID: UUID, clientName: String?, tabID: UUID?) async -> PolicyContextInstallation? {
         guard !isClosing, !receipt.isConsumed, receipt.routeOwner === self else { return nil }
-        guard providerContextSource != nil else {
-            return runRouting?.install(self, receipt, connectionID, clientName, tabID)
+        // The receipt selects the originating adapter, even on a shared physical route.
+        if let resolve = receipt.providerContextResolver {
+            guard let context = await resolve() else { return nil }
+            return installProviderContext(context, receipt: receipt, connectionID: connectionID, tabID: tabID)
         }
-        guard let resolve = receipt.providerContextResolver, let context = await resolve() else { return nil }
-        return installProviderContext(context, receipt: receipt, connectionID: connectionID, tabID: tabID)
+        guard providerContextSource == nil else { return nil }
+        return runRouting?.install(self, receipt, connectionID, clientName, tabID)
     }
 
     func canCommitPendingPolicy(_ receipt: MCPRunRoutingCleanupReceipt, token: MCPRunRouteBindings.PendingPolicyToken) async -> Bool {
@@ -379,15 +493,17 @@ final class MCPHostRouteResources {
               let context = runRouteBindings.tabContextByConnectionID[connectionID], let workspaceID = context.workspaceID,
               let handle = try? await coordinator.resolveReadContext(connection: registration.registration),
               connections[connectionID]?.registration == registration.registration,
-              handle.context == DomainContextIdentity(workspaceID: workspaceID, contextID: context.tabID),
-              handle.bindingKind == .runScoped(runID: receipt.runID)
+              handle.context == DomainContextIdentity(workspaceID: workspaceID, contextID: context.tabID)
         else { return false }
-        return true
+        let expectedBinding = context.savedCarrierSessionID.map {
+            DomainReadBindingKind.savedRunScoped(runID: receipt.runID, sessionID: $0)
+        } ?? .runScoped(runID: receipt.runID)
+        return handle.bindingKind == expectedBinding
     }
 
     func rollbackPendingPolicy(_ receipt: MCPRunRoutingCleanupReceipt, token: MCPRunRouteBindings.PendingPolicyToken, clientName: String?) -> MCPRunRouteBindings.PendingPolicyRollbackResult? {
         guard receipt.routeOwner === self else { return nil }
-        if providerContextSource != nil {
+        if receipt.providerContextResolver != nil {
             return rollbackProviderContext(receipt, token: token)
         }
         return runRouting?.rollback(self, token, clientName, receipt.routingWaitGeneration)
@@ -396,7 +512,7 @@ final class MCPHostRouteResources {
     func consumeCleanup(_ receipt: MCPRunRoutingCleanupReceipt) async {
         guard receipt.routeOwner === self else { return }
         runRouteBindings.consumeCleanup(receipt) { connectionID in
-            if providerContextSource != nil {
+            if receipt.providerContextResolver != nil {
                 removeProviderContext(connectionID: connectionID, runID: receipt.runID)
                 runRouteBindings.presentationWindowByConnection.removeValue(forKey: connectionID)
             } else {
@@ -447,6 +563,64 @@ final class MCPHostRouteResources {
         return await domainRuntime.toolRegistry.isActive(handle)
     }
 
+    func hasHostTransport(_ candidate: MCPService) -> Bool {
+        catalog?.hostTransport === candidate
+    }
+
+    /// Resolve only through the installed catalog's canonical execution adapter. The caller
+    /// still checks the returned writer against the connection's immutable binding receipt.
+    func resolveHostModelEndpoint(_ metadata: MCPRequestMetadata) -> ModelEndpoint? {
+        guard catalogHandle != nil, !isClosing else { return nil }
+        return catalog?.hostModelEndpoint?(metadata)
+    }
+
+    func canonicalWorkspaceSnapshots(_ workspaceIDs: Set<UUID>) async -> [UUID: DomainWorkspaceSnapshot] {
+        await domainRuntime.workspaceStore.canonicalWorkspaceSnapshots(workspaceIDs)
+    }
+
+    var workspaceStorageDirectory: URL {
+        domainRuntime.configuration.workspaceStorageDirectory
+    }
+
+    var domainRuntimeIdentity: DomainRuntimeIdentity {
+        domainRuntime.identity
+    }
+
+    var agentRunSessionStore: DomainAgentRunSessionStore {
+        domainRuntime.agentSessionStore
+    }
+
+    var hostProviderTransport: MCPService? {
+        guard !isClosing, catalogHandle != nil else { return nil }
+        return catalog?.hostTransport
+    }
+
+    /// A child uses the same process authority and listener, but an independent execution
+    /// lease and route. This does not issue a child writer or rebind the caller's connection.
+    func makeChildExecutionRoute() -> (owner: LeaseOwner, transport: MCPService)? {
+        guard identity.kind == .independent, !isClosing, catalogHandle != nil,
+              let transport = catalog?.hostTransport else { return nil }
+        return (LeaseOwner(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: coordinator, runtime: domainRuntime), transport)
+    }
+
+    /// A provider start, not a window joining or a catalog being registered, requests the
+    /// process listener. Transport startup cannot transfer admission to a replacement catalog.
+    func ensureHostProviderTransport() async -> Bool {
+        guard identity.kind == .independent, !isClosing, !Task.isCancelled,
+              let catalog, let handle = catalogHandle, let transport = catalog.hostTransport else { return false }
+        let demand: @MainActor @Sendable () async -> Bool = { [weak self] in
+            guard let self, !isClosing, !Task.isCancelled, catalogHandle == handle, self.catalog === catalog else { return false }
+            return await domainRuntime.toolRegistry.isActive(handle) && catalogHandle == handle
+                && self.catalog === catalog && !isClosing && !Task.isCancelled
+        }
+        do {
+            try await transport.start(requiring: demand)
+        } catch {
+            return false
+        }
+        return await demand()
+    }
+
     func unregisterCatalog(_ handle: MCPDomainToolRegistrationHandle) async {
         let predecessor = catalogTransitionTail
         let task = Task { @MainActor in
@@ -464,11 +638,18 @@ final class MCPHostRouteResources {
     /// Full route-resource release; no tool cancellation or session retirement is implied.
     /// Callers must separately join their run/tool users before releasing their resources.
     func close() async {
-        closeDomainAdmission()
+        precondition(!isLeaseManaged, "Dispose a leased route through its lease owner")
+        await closePhysicalResources()
+    }
+
+    private func closePhysicalResources() async {
+        isClosing = true
         ownerLifetime = nil
         await catalogTransitionTail?.value
-        if let handle = catalogHandle { await unregisterCatalog(handle) }
-        await closeDomainRoute()
+        if let handle = catalogHandle {
+            await unregisterCatalog(handle)
+        }
+        await closePhysicalDomainRoute()
         // A prematurely closed route must retain its original context cleanup operations until
         // their mappings have been consumed; never resolve a reopened catalog for that obligation.
         releaseContextOwnerIfUnregisteredAndDrained()
@@ -496,7 +677,9 @@ final class MCPHostRouteResources {
         guard let coordinator else { return }
         let snapshot = await coordinator.snapshot()
         guard let registration = snapshot.connections.first(where: { $0.registration.connectionID == connectionID })?.registration else { return }
-        if connections[connectionID]?.registration == registration { connections.removeValue(forKey: connectionID) }
+        if connections[connectionID]?.registration == registration {
+            connections.removeValue(forKey: connectionID)
+        }
         await releaseConnection(registration)
     }
 
@@ -515,13 +698,19 @@ final class MCPHostRouteResources {
     /// Legacy window teardown closes domain admission before draining runs. Keep the mapping owner
     /// alive through that drain, just as the server-owned lifetime was before resource extraction.
     func closeDomainAdmission() {
+        precondition(!isLeaseManaged, "Dispose a leased route through its lease owner")
         isClosing = true
     }
 
     /// The caller first closes and joins its publication producers. Already-installed connection
     /// generations are withdrawn through the canonical coordinator, never by a guessed successor.
     func closeDomainRoute() async {
-        closeDomainAdmission()
+        precondition(!isLeaseManaged, "Dispose a leased route through its lease owner")
+        await closePhysicalDomainRoute()
+    }
+
+    private func closePhysicalDomainRoute() async {
+        isClosing = true
         if let closeTask { await closeTask.value
             return
         }
@@ -548,5 +737,77 @@ final class MCPHostRouteResources {
         closeTask = task
         await task.value
         closeTask = nil
+    }
+
+    /// Physical route lifetime, separate from workspace epochs and from run admission.
+    @MainActor
+    final class LeaseOwner {
+        enum Role { case presentation, execution }
+
+        @MainActor
+        final class Lease {
+            private let owner: LeaseOwner
+            private let id: UUID
+            let role: Role
+            private var claimedByExecutionHost = false
+
+            func transferToExecutionHost(on route: MCPHostRouteResources) -> (@MainActor () async -> Void)? {
+                guard role == .execution, owner.route === route, !owner.disposalRequested,
+                      owner.leases.contains(id), !claimedByExecutionHost else { return nil }
+                claimedByExecutionHost = true
+                return { [owner, id] in await owner.release(id) }
+            }
+
+            fileprivate init(owner: LeaseOwner, id: UUID, role: Role) {
+                self.owner = owner
+                self.id = id
+                self.role = role
+            }
+
+            /// Release only after this user has drained. Dropping a reference is not a drain receipt.
+            func release() async {
+                guard !claimedByExecutionHost else { return }
+                await owner.release(id)
+            }
+        }
+
+        let route: MCPHostRouteResources
+        private var leases: Set<UUID> = []
+        private var disposalRequested = false
+        private var disposalTask: Task<Void, Never>?
+
+        init(identity: MCPHostRouteIdentity, coordinator: DomainRoutingCoordinator?, runtime: MCPDomainRuntime) {
+            route = MCPHostRouteResources(identity: identity, coordinator: coordinator, runtime: runtime, isLeaseManaged: true)
+        }
+
+        func acquire(_ role: Role) -> Lease? {
+            guard !disposalRequested else { return nil }
+            let id = UUID()
+            leases.insert(id)
+            return Lease(owner: self, id: id, role: role)
+        }
+
+        /// Stops issuing leases. Does not wait for outstanding owners (the caller may hold one).
+        func requestTerminalDisposal() async {
+            disposalRequested = true
+            await finishDisposalIfUnleased()
+        }
+
+        private func release(_ id: UUID) async {
+            leases.remove(id)
+            await finishDisposalIfUnleased()
+        }
+
+        private func finishDisposalIfUnleased() async {
+            guard disposalRequested, leases.isEmpty else { return }
+            if let disposalTask {
+                await disposalTask.value
+                return
+            }
+            route.isClosing = true
+            let task = Task { [route] in await route.closePhysicalResources() }
+            disposalTask = task
+            await task.value
+        }
     }
 }

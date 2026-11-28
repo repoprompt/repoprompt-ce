@@ -170,6 +170,7 @@ actor MCPBootstrapLease {
     private let mcpServerEnabler: (() async -> Bool)?
     private let policyInstaller: (MCPBootstrapLeaseSpec) async -> Void
     private let routingOwner: MCPHostRouteResources?
+    private let originatingContextSource: MCPHostRouteResources.ProviderContextSource?
     private let processRegistrationProvider: (@MainActor @Sendable () async -> MCPRunRoutingProcessRegistration?)?
     private var routingWaitGeneration: UUID?
     private var cleanupReceipts: [MCPRunRoutingCleanupReceipt] = []
@@ -228,6 +229,7 @@ actor MCPBootstrapLease {
         routingStateOwner: (@MainActor @Sendable () -> Bool)? = nil,
         routeAuthorityResolver: ((MCPBootstrapLeaseSpec) async -> MCPRunRouteAuthorityDecision)? = nil,
         routingOwner: MCPHostRouteResources? = nil,
+        originatingContextSource: MCPHostRouteResources.ProviderContextSource? = nil,
         processRegistrationProvider: (@MainActor @Sendable () async -> MCPRunRoutingProcessRegistration?)? = nil
     ) {
         self.spec = spec
@@ -236,6 +238,7 @@ actor MCPBootstrapLease {
         self.mcpServerEnabler = mcpServerEnabler
         self.policyInstaller = policyInstaller ?? Self.defaultPolicyInstaller
         self.routingOwner = routingOwner
+        self.originatingContextSource = originatingContextSource
         self.processRegistrationProvider = processRegistrationProvider
         self.expectedPIDPolicyArmer = expectedPIDPolicyArmer ?? Self.defaultExpectedPIDPolicyArmer
         self.policyClearer = policyClearer ?? Self.defaultPolicyClearer
@@ -247,23 +250,41 @@ actor MCPBootstrapLease {
     /// existing lease. A stale command can lose admission without losing its cleanup obligations.
     private func installPolicy(reusingProcess: Bool = true) async -> Bool {
         guard let routingOwner else {
+            guard originatingContextSource == nil else { return false }
             await policyInstaller(spec)
             return true
         }
-        let process = reusingProcess ? await processRegistrationProvider?() : nil
+        let process = reusingProcess ? await existingProcessRegistration(on: routingOwner) : nil
         guard let generation = routingWaitGeneration,
-              let receipt = await Self.installPolicy(spec, routingOwner: routingOwner, routingWaitGeneration: generation, reusingProcess: process)
+              let receipt = await Self.installPolicy(
+                  spec, routingOwner: routingOwner, originatingContextSource: originatingContextSource,
+                  routingWaitGeneration: generation, reusingProcess: process
+              )
         else { return false }
         cleanupReceipts.append(receipt)
         return true
     }
 
+    private func existingProcessRegistration(on routingOwner: MCPHostRouteResources) async -> MCPRunRoutingProcessRegistration? {
+        if let explicit = await processRegistrationProvider?() { return explicit }
+        #if DEBUG
+            if let fixture = await routingOwner.test_existingProcessForBootstrap { return await fixture(spec) }
+        #endif
+        return nil
+    }
+
     private func armExpectedPIDPolicy() async -> Bool {
-        guard routingOwner != nil else { return await expectedPIDPolicyArmer(spec) }
+        guard let routingOwner else { return await expectedPIDPolicyArmer(spec) }
         guard let receipt = cleanupReceipts.last, let client = spec.clientName else { return false }
-        return await ServerNetworkManager.shared.requireExpectedAgentPIDForPendingPolicy(
+        let armed = await ServerNetworkManager.shared.requireExpectedAgentPIDForPendingPolicy(
             for: client, runID: spec.runID, windowID: spec.windowID, registration: receipt
         )
+        #if DEBUG
+            if armed, let onArmed = await routingOwner.test_afterExpectedPIDPolicyArmed {
+                return await onArmed(spec, receipt)
+            }
+        #endif
+        return armed
     }
 
     private func resolveRouteAuthority() async -> MCPRunRouteAuthorityDecision {
@@ -309,6 +330,11 @@ actor MCPBootstrapLease {
     /// PID-owned policies release the gate after their unique pending policy is confirmed armed.
     /// Returns `false` if cancelled, the gate could not be acquired, or PID ownership could not be armed.
     func acquire() async -> Bool {
+        if originatingContextSource != nil, routingOwner?.identity.routeID != spec.windowID {
+            hasReleased = true
+            routingTerminalOutcome = .failed(.notRegistered)
+            return false
+        }
         guard routingOwner != nil else { return await performAcquire() }
         guard !hasReleased else { return false }
         let operation: Task<Bool, Never>
@@ -1145,7 +1171,8 @@ actor MCPBootstrapLease {
     }
 
     private static func installPolicy(
-        _ spec: MCPBootstrapLeaseSpec, routingOwner: MCPHostRouteResources?, routingWaitGeneration: UUID?,
+        _ spec: MCPBootstrapLeaseSpec, routingOwner: MCPHostRouteResources?,
+        originatingContextSource: MCPHostRouteResources.ProviderContextSource? = nil, routingWaitGeneration: UUID?,
         reusingProcess: MCPRunRoutingProcessRegistration? = nil
     ) async -> MCPRunRoutingCleanupReceipt? {
         guard let clientName = spec.clientName else { return nil }
@@ -1164,7 +1191,8 @@ actor MCPBootstrapLease {
             allowsAgentExternalControlTools: spec.allowsAgentExternalControlTools,
             requiresExpectedAgentPID: spec.requiresExpectedAgentPID,
             prunesOnlyAfterSettlement: spec.purpose == .discoverRun,
-            routingOwner: routingOwner, routingWaitGeneration: routingWaitGeneration, reusingProcess: reusingProcess
+            routingOwner: routingOwner, originatingContextSource: originatingContextSource,
+            routingWaitGeneration: routingWaitGeneration, reusingProcess: reusingProcess
         )
     }
 
