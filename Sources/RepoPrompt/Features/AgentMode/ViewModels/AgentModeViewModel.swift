@@ -11582,6 +11582,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         workflow: AgentWorkflowDefinition? = nil,
         nativePreparedTurn: NativeSlashPreparedUserTurn? = nil,
         preserveRoutedInitialEffort: Bool = false,
+        preserveRequestedReasoningEffort: Bool = false,
         remoteAttachments: [AgentFileAttachment]? = nil,
         remoteInterviewFirst: Bool? = nil,
         validateInitialStart: (@MainActor () throws -> Void)? = nil
@@ -11624,7 +11625,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // Preserve Model Router's effort on a router-owned first start. Auto effort may
         // judge other first starts and settled follow-ups; active steering keeps its effort.
         let judgesUserTurn = AutoEffortModelPolicy.shouldJudgeMCPUserTurn(
-            isEnabled: modelRouterSettingsStore.autoEffortEnabled(),
+            isEnabled: !preserveRequestedReasoningEffort && modelRouterSettingsStore.autoEffortEnabled(),
             startsNewRun: allowStartingRun && !session.runState.isActive
                 && !(session.runState == .waitingForUser && session.instructionContinuation != nil),
             hasPriorUserTurn: session.hasSentFirstMessage,

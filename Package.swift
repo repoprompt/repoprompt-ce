@@ -15,7 +15,7 @@ let remoteNetworking: Package.Dependency = if let remoteNetworkingLocalPath {
 } else {
     .package(
         url: "https://github.com/repoprompt/repoprompt-remote.git",
-        revision: "fcd581ad13b63329bb3cd600ff0b448e6feed750"
+        revision: "d34e2f500890ede9e5447675aac176f402f50f8d"
     )
 }
 

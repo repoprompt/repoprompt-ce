@@ -24,6 +24,7 @@ struct RemoteSettingsView: View {
                 gatewaySection
                 pairingSection
                 authorizationSection
+                workspaceVoiceSection
                 availabilitySection
             }
             .frame(maxWidth: 720, alignment: .leading)
@@ -228,6 +229,21 @@ struct RemoteSettingsView: View {
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(8)
+        }
+    }
+
+    private var workspaceVoiceSection: some View {
+        GroupBox("Workspace Voice") {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Workspace Voice sends microphone audio from your paired phone to OpenAI through Codex. It can also send workspace tool results to OpenAI, including file contents, chat transcripts, and settings.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Toggle("Allow OpenAI data sharing for Workspace Voice", isOn: $gateway.allowsWorkspaceVoiceDataSharing)
+                    .disabled(!gateway.isPaired)
             }
             .padding(8)
         }
