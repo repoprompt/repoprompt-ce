@@ -186,10 +186,251 @@ final class AppDomainRuntimeCompositionTests: XCTestCase {
 
         let registration = try await fixture.runtime.routingCoordinator.currentRegistration(connectionID: connectionID)
         let handle = try await fixture.runtime.routingCoordinator.resolveReadContext(connection: registration)
-        XCTAssertEqual(handle.bindingKind, .runScoped(runID: runID))
+        XCTAssertEqual(handle.bindingKind, .canonicalRunScoped(runID: runID))
         XCTAssertEqual(handle.workspaceRevision, canonicalBefore.revisions.workingRevision)
         XCTAssertNotEqual(handle.workspaceRevision, overlay.revisions.workingRevision)
 
+        await retireVisibleHost(host)
+    }
+
+    @MainActor
+    func testDomainInvocationSecurityContextUsesCanonicalRootsForCanonicalAndSavedRunsAcrossDivergentOverlay() async throws {
+        let fixture = try await makeVisibleHostPreparationFixture()
+        let overlayRoot = fixture.directory.appendingPathComponent("overlay-root", isDirectory: true)
+        try FileManager.default.createDirectory(at: overlayRoot, withIntermediateDirectories: true)
+
+        let savedSessionID = UUID()
+        var canonicalWorkspace = fixture.workspace
+        var canonicalTab = try XCTUnwrap(canonicalWorkspace.composeTabs.first)
+        canonicalTab.activeAgentSessionID = savedSessionID
+        canonicalWorkspace.composeTabs = [canonicalTab]
+        canonicalWorkspace.activeComposeTabID = canonicalTab.id
+
+        let beforeSaveValue = await fixture.authority.canonicalWorkspaceSnapshot(fixture.workspace.id)
+        let beforeSave = try XCTUnwrap(beforeSaveValue)
+        let saved = try await fixture.authority.save(
+            canonicalWorkspace,
+            fileURL: fixture.workspaceURL,
+            expectedWorkspaceRevision: beforeSave.revisions.workingRevision,
+            expectedContentDigest: beforeSave.document.contentDigest
+        )
+        XCTAssertEqual(saved.disposition, .applied)
+        let canonicalSnapshotValue = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspace.id)
+        let canonicalSnapshot = try XCTUnwrap(canonicalSnapshotValue)
+
+        var overlayWorkspace = canonicalWorkspace
+        overlayWorkspace.name = "Transient Read Overlay With Divergent Root"
+        overlayWorkspace.repoPaths = [overlayRoot.path]
+        let overlayDocument = try DomainWorkspaceDocument.decode(
+            documentBytes: JSONEncoder().encode(overlayWorkspace),
+            fileURL: fixture.workspaceURL
+        )
+        let overlaySnapshot = await fixture.runtime.workspaceStore.registerReadDocument(overlayDocument)
+        XCTAssertNotEqual(overlaySnapshot.revisions.workingRevision, canonicalSnapshot.revisions.workingRevision)
+
+        let host = try await WindowStateCompositionFactory.prepareVisibleAgentHost(
+            workspace: canonicalWorkspace,
+            owner: fixture.owner,
+            activations: fixture.activations,
+            resources: fixture.resources,
+            apiSettings: fixture.apiSettings,
+            settingsStore: fixture.settingsStore,
+            runtime: fixture.runtime
+        ) { host, roots in
+            try await self.installTestVisibleExecution(
+                host, roots: roots, settings: fixture.settingsStore, service: fixture.mcpService
+            )
+        }
+        addTeardownBlock { @MainActor in await self.retireVisibleHost(host) }
+
+        let presentationRoute = MCPHostRouteResources(
+            identity: MCPRouteIdentityAllocator.allocateHost(),
+            coordinator: fixture.runtime.routingCoordinator,
+            runtime: fixture.runtime
+        )
+        XCTAssertFalse(presentationRoute.isLeaseManaged)
+        addTeardownBlock { @MainActor in await presentationRoute.close() }
+
+        let canonicalRootPath = try XCTUnwrap(DomainMutationPathFence.canonicalPath(fixture.root.path))
+        let overlayRootPath = try XCTUnwrap(DomainMutationPathFence.canonicalPath(overlayRoot.path))
+        XCTAssertNotEqual(canonicalRootPath, overlayRootPath)
+
+        try await AppDomainRuntimeComposition.shared.withRuntimeForTesting(fixture.runtime) {
+            let network = ServerNetworkManager.shared
+            let pid = Int(ProcessInfo.processInfo.processIdentifier)
+
+            // 1. .canonicalRunScoped resolves canonical snapshot and canonical authorized roots.
+            let canonicalRunID = UUID()
+            let canonicalConnID = UUID()
+            var canonicalTabContext = MCPTabContextSnapshot(
+                tabID: canonicalTab.id,
+                windowID: host.routeID,
+                workspaceID: canonicalWorkspace.id,
+                promptText: "",
+                selection: .init(),
+                selectedMetaPromptIDs: [],
+                tabName: canonicalTab.name,
+                runID: canonicalRunID,
+                activeAgentSessionID: savedSessionID,
+                explicitlyBound: false
+            )
+            canonicalTabContext.routeOwnerIdentity = ObjectIdentifier(host.route)
+            host.route.publishBinding(connectionID: canonicalConnID, context: canonicalTabContext)
+            await host.route.settleRoutingPublications()
+            await network.debugSeedConnectionRunRouting(
+                connectionID: canonicalConnID, runID: canonicalRunID, purpose: .agentModeRun, windowID: host.routeID
+            )
+            await network.debugSetDomainPeerIdentityForTesting(
+                connectionID: canonicalConnID, identity: .verified(processID: pid, fingerprint: "canonical-security-test")
+            )
+            addTeardownBlock {
+                await network.debugSetDomainPeerIdentityForTesting(connectionID: canonicalConnID, identity: nil)
+                await network.cleanupRunRoutingState(for: canonicalRunID, windowID: host.routeID)
+            }
+
+            let canonicalReg = try await fixture.runtime.routingCoordinator.currentRegistration(connectionID: canonicalConnID)
+            let canonicalResolved = try await fixture.runtime.routingCoordinator.resolveReadContextWithWorkspace(
+                connection: canonicalReg
+            )
+            XCTAssertEqual(canonicalResolved.handle.bindingKind, .canonicalRunScoped(runID: canonicalRunID))
+            XCTAssertEqual(canonicalResolved.workspace.revisions.workingRevision, canonicalSnapshot.revisions.workingRevision)
+
+            let canonicalSecurity = await network.debugDomainInvocationSecurityContextForTesting(
+                connectionID: canonicalConnID, toolName: "apply_edits"
+            )
+            XCTAssertTrue(canonicalSecurity.hasAuthoritativeRoutingContext)
+            XCTAssertEqual(canonicalSecurity.workspaceRevision, canonicalSnapshot.revisions.workingRevision)
+            XCTAssertEqual(canonicalSecurity.authorizedCanonicalRoots, [canonicalRootPath])
+            _ = try await fixture.runtime.mutationPolicyStore.authorize(
+                context: canonicalSecurity, toolName: "apply_edits", action: "replace",
+                workspaceID: canonicalWorkspace.id, canonicalRoots: [canonicalRootPath]
+            )
+            do {
+                _ = try await fixture.runtime.mutationPolicyStore.authorize(
+                    context: canonicalSecurity, toolName: "apply_edits", action: "replace",
+                    workspaceID: canonicalWorkspace.id, canonicalRoots: [overlayRootPath]
+                )
+                XCTFail("Canonical run security context must not authorize divergent overlay root")
+            } catch DomainMutationPolicyError.grantMissing {}
+
+            // 2. .savedRunScoped resolves canonical snapshot and canonical authorized roots across overlay.
+            let savedRunID = UUID()
+            let savedConnID = UUID()
+            var savedTabContext = MCPTabContextSnapshot(
+                tabID: canonicalTab.id,
+                windowID: host.routeID,
+                workspaceID: canonicalWorkspace.id,
+                promptText: "",
+                selection: .init(),
+                selectedMetaPromptIDs: [],
+                tabName: canonicalTab.name,
+                runID: savedRunID,
+                activeAgentSessionID: savedSessionID,
+                explicitlyBound: false
+            )
+            savedTabContext.routeOwnerIdentity = ObjectIdentifier(host.route)
+            savedTabContext.savedCarrierSessionID = savedSessionID
+            host.route.publishBinding(connectionID: savedConnID, context: savedTabContext)
+            await host.route.settleRoutingPublications()
+            await network.debugSeedConnectionRunRouting(
+                connectionID: savedConnID, runID: savedRunID, purpose: .agentModeRun, windowID: host.routeID
+            )
+            await network.debugSetDomainPeerIdentityForTesting(
+                connectionID: savedConnID, identity: .verified(processID: pid, fingerprint: "saved-security-test")
+            )
+            addTeardownBlock {
+                await network.debugSetDomainPeerIdentityForTesting(connectionID: savedConnID, identity: nil)
+                await network.cleanupRunRoutingState(for: savedRunID, windowID: host.routeID)
+            }
+
+            let savedReg = try await fixture.runtime.routingCoordinator.currentRegistration(connectionID: savedConnID)
+            let savedResolved = try await fixture.runtime.routingCoordinator.resolveReadContextWithWorkspace(
+                connection: savedReg
+            )
+            XCTAssertEqual(
+                savedResolved.handle.bindingKind,
+                .savedRunScoped(runID: savedRunID, sessionID: savedSessionID)
+            )
+            XCTAssertEqual(savedResolved.workspace.revisions.workingRevision, canonicalSnapshot.revisions.workingRevision)
+
+            let savedSecurity = await network.debugDomainInvocationSecurityContextForTesting(
+                connectionID: savedConnID, toolName: "apply_edits"
+            )
+            XCTAssertTrue(savedSecurity.hasAuthoritativeRoutingContext)
+            XCTAssertEqual(savedSecurity.workspaceRevision, canonicalSnapshot.revisions.workingRevision)
+            XCTAssertEqual(savedSecurity.authorizedCanonicalRoots, [canonicalRootPath])
+            _ = try await fixture.runtime.mutationPolicyStore.authorize(
+                context: savedSecurity, toolName: "apply_edits", action: "replace",
+                workspaceID: canonicalWorkspace.id, canonicalRoots: [canonicalRootPath]
+            )
+            do {
+                _ = try await fixture.runtime.mutationPolicyStore.authorize(
+                    context: savedSecurity, toolName: "apply_edits", action: "replace",
+                    workspaceID: canonicalWorkspace.id, canonicalRoots: [overlayRootPath]
+                )
+                XCTFail("Saved run security context must not authorize divergent overlay root")
+            } catch DomainMutationPolicyError.grantMissing {}
+
+            // 3. Non-lease-managed .runScoped continues reading the transient overlay snapshot.
+            let overlayRunID = UUID()
+            let overlayConnID = UUID()
+            var overlayTabContext = MCPTabContextSnapshot(
+                tabID: canonicalTab.id,
+                windowID: presentationRoute.identity.routeID,
+                workspaceID: canonicalWorkspace.id,
+                promptText: "",
+                selection: .init(),
+                selectedMetaPromptIDs: [],
+                tabName: canonicalTab.name,
+                runID: overlayRunID,
+                activeAgentSessionID: savedSessionID,
+                explicitlyBound: false
+            )
+            overlayTabContext.routeOwnerIdentity = ObjectIdentifier(presentationRoute)
+            presentationRoute.publishBinding(connectionID: overlayConnID, context: overlayTabContext)
+            await presentationRoute.settleRoutingPublications()
+            await network.debugSeedConnectionRunRouting(
+                connectionID: overlayConnID, runID: overlayRunID, purpose: .agentModeRun,
+                windowID: presentationRoute.identity.routeID
+            )
+            await network.debugSetDomainPeerIdentityForTesting(
+                connectionID: overlayConnID, identity: .verified(processID: pid, fingerprint: "overlay-security-test")
+            )
+            addTeardownBlock {
+                await network.debugSetDomainPeerIdentityForTesting(connectionID: overlayConnID, identity: nil)
+                await network.cleanupRunRoutingState(for: overlayRunID, windowID: presentationRoute.identity.routeID)
+            }
+
+            let overlayReg = try await fixture.runtime.routingCoordinator.currentRegistration(connectionID: overlayConnID)
+            let overlayResolved = try await fixture.runtime.routingCoordinator.resolveReadContextWithWorkspace(
+                connection: overlayReg
+            )
+            XCTAssertEqual(overlayResolved.handle.bindingKind, .runScoped(runID: overlayRunID))
+            XCTAssertEqual(overlayResolved.workspace.revisions.workingRevision, overlaySnapshot.revisions.workingRevision)
+
+            let overlaySecurity = await network.debugDomainInvocationSecurityContextForTesting(
+                connectionID: overlayConnID, toolName: "apply_edits"
+            )
+            XCTAssertTrue(overlaySecurity.hasAuthoritativeRoutingContext)
+            XCTAssertEqual(overlaySecurity.workspaceRevision, overlaySnapshot.revisions.workingRevision)
+            XCTAssertEqual(overlaySecurity.authorizedCanonicalRoots, [overlayRootPath])
+
+            // 4. domainReadBindingSatisfiesRequestedRun matches exact .canonicalRunScoped run ID only.
+            XCTAssertTrue(MCPServerViewModel.domainReadBindingSatisfiesRequestedRun(
+                requestedRunID: canonicalRunID,
+                resolvedBindingKind: .canonicalRunScoped(runID: canonicalRunID)
+            ))
+            XCTAssertFalse(MCPServerViewModel.domainReadBindingSatisfiesRequestedRun(
+                requestedRunID: UUID(),
+                resolvedBindingKind: .canonicalRunScoped(runID: canonicalRunID)
+            ))
+            XCTAssertFalse(MCPServerViewModel.domainReadBindingSatisfiesRequestedRun(
+                requestedRunID: nil,
+                resolvedBindingKind: .canonicalRunScoped(runID: canonicalRunID)
+            ))
+        }
+
+        await presentationRoute.close()
         await retireVisibleHost(host)
     }
 
