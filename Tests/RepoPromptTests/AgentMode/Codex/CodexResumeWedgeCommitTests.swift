@@ -5249,6 +5249,29 @@ extension CodexResumeWedgeCommitTests {
         })
     }
 
+    func testOverlappingIdenticalRepoPromptCallsKeepSeparateWatchdogLiveness() async throws {
+        let (f, old) = try await makeGraceFixture()
+        let firstID = UUID()
+        let secondID = UUID()
+        await startRepoPromptCall(f, controller: old, invocationID: firstID)
+        await startRepoPromptCall(f, controller: old, invocationID: secondID)
+
+        await f.coordinator.test_handleCodexNativeEvent(
+            .toolResult(
+                name: Self.repoPromptApplyEditsEventName, invocationID: firstID,
+                argsJSON: #"{"path":"a.swift"}"#, resultJSON: #"{"status":"completed"}"#, isError: false
+            ),
+            session: f.session, sourceController: old
+        )
+        XCTAssertEqual(Set(f.session.codexNativeToolLiveness.inFlight.keys.compactMap(\.invocationID)), [secondID])
+
+        old.setRecoverySnapshot(Self.repoPromptCallSnapshot(itemID: secondID, itemStatus: "inProgress"))
+        silence(f, for: 150)
+        _ = await probe(f)
+        _ = await probe(f)
+        XCTAssertNil(f.session.codexWatchdogState.activeTurnGrace, "the remaining call counts as progress")
+    }
+
     func testRepoPromptMCPResultClosesSpanWithoutNativeTranscriptRow() async throws {
         let (f, old) = try await makeGraceFixture()
         for isError in [false, true] {

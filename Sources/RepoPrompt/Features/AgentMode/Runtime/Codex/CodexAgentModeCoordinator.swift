@@ -995,10 +995,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         invocationID: UUID?,
         argsJSON: String?
     ) -> NativeToolLivenessState.Key? {
-        if let invocationID,
-           let exact = state.inFlight.first(where: { $0.key.invocationID == invocationID })?.key
-        {
-            return exact
+        if let invocationID {
+            return state.inFlight.first(where: { $0.key.invocationID == invocationID })?.key
         }
         let fallbackSignature = canonicalNativeToolFallbackSignature(toolName: toolName, argsJSON: argsJSON)
         let candidate = state.inFlight
