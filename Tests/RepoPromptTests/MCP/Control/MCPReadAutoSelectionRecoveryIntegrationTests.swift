@@ -62,20 +62,18 @@ import XCTest
                         throw CocoaError(.fileReadUnknown)
                     }
 
-                    // A catalogued file can resolve and reach the edit engine while cleanup is held.
-                    let temporarySentinel = "let catalogueControl = true"
+                    // A deliberate miss proves the catalogued file reaches the edit engine without writing.
                     let control = try await survivor.callTool(
                         name: MCPWindowToolName.applyEdits,
                         arguments: [
                             "path": context.fileURL.path,
-                            "edits": [
-                                ["search": context.sentinel, "replace": temporarySentinel],
-                                ["search": temporarySentinel, "replace": context.sentinel]
-                            ]
+                            "search": "catalogueControlMarkerAbsentFromFixture",
+                            "replace": "let catalogueControl = true",
+                            "all": true
                         ]
                     )
-                    XCTAssertFalse(control.rawJSON.contains("\"isError\":true"), control.rawJSON)
-                    XCTAssertTrue(try Self.toolResultText(control).contains("no net change"))
+                    XCTAssertTrue(control.rawJSON.contains("\"isError\":true"), control.rawJSON)
+                    XCTAssertTrue(try Self.toolResultText(control).contains("search text not found in file"), control.rawJSON)
                     XCTAssertEqual(try String(contentsOf: context.fileURL, encoding: .utf8), "\(context.sentinel)\n")
 
                     let pending = Task {
