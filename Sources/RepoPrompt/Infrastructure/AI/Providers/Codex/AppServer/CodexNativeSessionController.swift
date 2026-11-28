@@ -552,19 +552,27 @@ final class CodexNativeSessionController {
         let threadID: String?
         let turnID: String?
         let itemID: String?
+        /// Codex's underlying error text, e.g. the provider's capacity message on a retry notice.
+        let additionalDetails: String?
+        /// Codex's structured error classification, rendered as text (JSON for object payloads).
+        let codexErrorInfo: String?
 
         init(
             message: String,
             willRetry: Bool?,
             threadID: String?,
             turnID: String?,
-            itemID: String? = nil
+            itemID: String? = nil,
+            additionalDetails: String? = nil,
+            codexErrorInfo: String? = nil
         ) {
             self.message = message
             self.willRetry = willRetry
             self.threadID = threadID
             self.turnID = turnID
             self.itemID = itemID
+            self.additionalDetails = additionalDetails
+            self.codexErrorInfo = codexErrorInfo
         }
     }
 
@@ -4786,12 +4794,21 @@ final class CodexNativeSessionController {
         let itemID = notificationItemID(from: params)
             ?? firstString(in: errorObject, keys: ["itemId", "item_id", "itemID", "callId", "call_id"])
             ?? detailsObject.flatMap { firstString(in: $0, keys: ["itemId", "item_id", "itemID", "callId", "call_id"]) }
+        func diagnostic(_ camelKey: String, _ snakeKey: String) -> String? {
+            diagnosticText(from: errorObject[camelKey])
+                ?? diagnosticText(from: errorObject[snakeKey])
+                ?? detailsObject.flatMap { diagnosticText(from: $0[camelKey]) ?? diagnosticText(from: $0[snakeKey]) }
+                ?? diagnosticText(from: params[camelKey])
+                ?? diagnosticText(from: params[snakeKey])
+        }
         return ErrorNotification(
             message: message,
             willRetry: willRetry,
             threadID: threadID,
             turnID: turnID,
-            itemID: itemID
+            itemID: itemID,
+            additionalDetails: diagnostic("additionalDetails", "additional_details"),
+            codexErrorInfo: diagnostic("codexErrorInfo", "codex_error_info")
         )
     }
 

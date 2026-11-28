@@ -37,7 +37,9 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         companionReady: @escaping () -> Bool = { true },
         freshSession: Bool = false,
         shouldManageCodexTooling: Bool = true,
-        authRecovery: (any CodexManagedAuthRecovering)? = nil
+        authRecovery: (any CodexManagedAuthRecovering)? = nil,
+        watchdogProbeThreshold: TimeInterval? = nil,
+        watchdogRecoveryThreshold: TimeInterval? = nil
     ) -> Fixture {
         let factory = WedgeControllerFactory(plans: plans)
         let tabID = UUID()
@@ -56,7 +58,12 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             testCodexComputerUseCompanionReady: companionReady,
             testCodexComputerUseReservedEntryExists: { false },
             testCodexLeaseRoutingTimeoutMs: 5000,
-            testCodexRouteOwnerValidator: routeOwnerValidator
+            testCodexRouteOwnerValidator: routeOwnerValidator,
+            // Positive thresholds would start the background watchdog loop; park it so only the
+            // explicit recovery probes in a test drive decisions.
+            testCodexStallWatchdogPollIntervalNanos: watchdogProbeThreshold == nil ? nil : 3_600_000_000_000,
+            testCodexStallWatchdogProbeThreshold: watchdogProbeThreshold,
+            testCodexStallWatchdogRecoveryThreshold: watchdogRecoveryThreshold
         )
         let workspaceManager = AgentSessionLinkEndpointTestSupport.installWorkspace(
             on: viewModel,
@@ -2945,6 +2952,14 @@ final class WedgeFakeCodexController: CodexSessionControllerPassiveStubDefaults,
     private var qaResponses = 0
     private var recoverySnapshot: CodexNativeSessionController.ThreadSnapshot?
     private var recoverySnapshotGate: TestReleaseFence?
+    private var recoverySnapshotFails = false
+
+    func setRecoverySnapshotFailure() {
+        lock.withLock {
+            recoverySnapshotFails = true
+            active = true
+        }
+    }
 
     func setRecoverySnapshot(_ snapshot: CodexNativeSessionController.ThreadSnapshot, gate: TestReleaseFence? = nil) {
         lock.withLock {
@@ -2955,8 +2970,9 @@ final class WedgeFakeCodexController: CodexSessionControllerPassiveStubDefaults,
     }
 
     func readThreadSnapshot(includeTurns _: Bool, timeout _: TimeInterval?) async throws -> CodexNativeSessionController.ThreadSnapshot {
-        let (snapshot, gate) = lock.withLock { (recoverySnapshot, recoverySnapshotGate) }
+        let (snapshot, gate, fails) = lock.withLock { (recoverySnapshot, recoverySnapshotGate, recoverySnapshotFails) }
         if let gate { await gate.enterAndWait() }
+        if fails { throw CodexAppServerClient.ClientError.invalidResponse }
         return snapshot ?? .init(
             conversationID: "fake", rolloutPath: nil, model: nil, reasoningEffort: nil,
             runtimeStatus: .idle, currentTurnID: nil, activeTurnIDs: [], latestTurnStatus: nil
@@ -4808,6 +4824,540 @@ extension CodexResumeWedgeCommitTests {
             XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: 1), "The dropped frame adds no evidence, but the undeclared ack is ordinary: \(badLine)")
             XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty)
             await client.stop()
+        }
+    }
+}
+
+// MARK: - Active-turn grace (silent extension and provider capacity retries)
+
+extension CodexResumeWedgeCommitTests {
+    private static let graceTurnID = "grace-turn"
+    private static let capacityDetails = "Selected model is at capacity. Please try a different model."
+
+    private static func graceSnapshot(active: Bool = true) -> CodexNativeSessionController.ThreadSnapshot {
+        .init(
+            conversationID: oldThreadID, rolloutPath: oldRolloutPath, model: nil, reasoningEffort: nil,
+            runtimeStatus: active ? .active(activeFlags: []) : .idle,
+            currentTurnID: active ? graceTurnID : nil,
+            activeTurnIDs: active ? [graceTurnID] : [],
+            latestTurnStatus: nil
+        )
+    }
+
+    private static func retryNotice(
+        _ message: String,
+        details: String? = capacityDetails,
+        info: String? = nil
+    ) -> CodexNativeSessionController.Event {
+        .errorNotification(.init(
+            message: message, willRetry: true, threadID: oldThreadID, turnID: graceTurnID,
+            additionalDetails: details, codexErrorInfo: info
+        ))
+    }
+
+    /// Probe 10 s, recovery 100 s, so the grace interval is 200 s.
+    private func makeGraceFixture(
+        _ plans: [[WedgeFakeCodexController.Response]] = []
+    ) async throws -> (Fixture, WedgeFakeCodexController) {
+        let f = makeFixture(
+            plans, freshSession: true, shouldManageCodexTooling: false,
+            watchdogProbeThreshold: 10, watchdogRecoveryThreshold: 100
+        )
+        _ = try installRestoredBinding(f)
+        f.viewModel.test_initializeRunService()
+        let runID = UUID()
+        f.session.installRunID(runID)
+        f.session.codexConversationID = Self.oldThreadID
+        f.session.codexRolloutPath = Self.oldRolloutPath
+        let old = WedgeFakeCodexController(runID: runID, responses: [])
+        old.setRecoverySnapshot(Self.graceSnapshot())
+        f.session.codexController = old
+        f.session.runState = .running
+        f.session.beginRunAttempt(source: "active-turn-grace")
+        await f.coordinator.test_handleCodexNativeEvent(
+            .turnStarted(turnID: Self.graceTurnID), session: f.session, sourceController: old
+        )
+        addTeardownBlock { @MainActor in
+            await f.coordinator.shutdownCodexSession(f.session)
+            f.session.saveDebounceTask?.cancel()
+        }
+        return (f, old)
+    }
+
+    /// Moves the watchdog reference back so the turn has been silent for `seconds`.
+    private func silence(_ f: Fixture, for seconds: TimeInterval) {
+        f.session.codexWatchdogState.lastProgressAt = Date().addingTimeInterval(-seconds)
+    }
+
+    private func probe(_ f: Fixture) async -> Bool {
+        await f.coordinator.test_attemptCodexStallRecovery(session: f.session)
+    }
+
+    private func capacityNoticeCount(_ f: Fixture) -> Int {
+        f.session.items.count {
+            $0.kind == .system && $0.text == CodexAgentModeCoordinator.codexCapacityRetryNoticeText
+        }
+    }
+
+    func testSilentActiveTurnSurvivesRecoveryThresholdAndReattachesWhenGraceExpires() async throws {
+        let startup = TestReleaseFence(name: "silent grace reattach startup")
+        let (f, old) = try await makeGraceFixture([[.suspendedSuccess(Self.oldThreadID, startup)]])
+        silence(f, for: 150)
+
+        var failed = await probe(f)
+        XCTAssertFalse(failed)
+        XCTAssertNil(f.session.codexWatchdogState.activeTurnGrace, "a late first sample only records the comparison")
+
+        let generation = f.session.codexWatchdogState.progressGeneration
+        let beforeGrant = Date()
+        failed = await probe(f)
+        let afterGrant = Date()
+        XCTAssertFalse(failed)
+        let grace = try XCTUnwrap(f.session.codexWatchdogState.activeTurnGrace)
+        let reference = try XCTUnwrap(f.session.codexWatchdogState.lastProgressAt)
+        XCTAssertEqual(grace.reason, .stillInProgress)
+        XCTAssertEqual(grace.until.timeIntervalSince(reference), 200, accuracy: 0.001)
+        XCTAssertEqual(f.session.codexWatchdogState.progressGeneration, generation, "granting is not progress")
+        XCTAssertEqual(f.session.codexWatchdogState.stillInProgressGraceGeneration, generation)
+        XCTAssertEqual(f.session.runningStatusText, "Still working — no updates from Codex for 5 min.")
+        XCTAssertEqual(f.session.runningStatusSource, .transport)
+        let nextProbe = try XCTUnwrap(f.session.codexWatchdogState.suppressUntil)
+        XCTAssertGreaterThanOrEqual(nextProbe, beforeGrant.addingTimeInterval(10), "the next probe is one probe window away")
+        XCTAssertLessThanOrEqual(nextProbe, afterGrant.addingTimeInterval(10))
+        XCTAssertTrue(f.factory.controllers.isEmpty)
+        XCTAssertEqual(old.shutdownCount, 0)
+
+        failed = await probe(f)
+        XCTAssertFalse(failed)
+        XCTAssertEqual(f.session.codexWatchdogState.activeTurnGrace, grace, "probes inside the grace keep its deadline")
+        XCTAssertTrue(f.factory.controllers.isEmpty)
+        XCTAssertEqual(old.shutdownCount, 0)
+
+        let nearDeadline = Date().addingTimeInterval(5)
+        f.session.codexWatchdogState.activeTurnGrace?.until = nearDeadline
+        failed = await probe(f)
+        XCTAssertFalse(failed)
+        XCTAssertEqual(f.session.codexWatchdogState.suppressUntil, nearDeadline, "the last in-grace probe is clamped to the deadline")
+        XCTAssertEqual(old.shutdownCount, 0)
+
+        f.session.codexWatchdogState.activeTurnGrace?.until = Date().addingTimeInterval(-1)
+        let recovery = Task { await probe(f) }
+        addTeardownBlock { @MainActor in
+            startup.release()
+            recovery.cancel()
+            _ = await recovery.value
+        }
+        let entered = await startup.waitUntilEntered(timeout: 4)
+        XCTAssertTrue(entered, "an expired grace admits the existing reattach")
+        XCTAssertEqual(f.factory.controllers.count, 1)
+        XCTAssertEqual(old.shutdownCount, 1)
+        XCTAssertNotEqual(f.session.runningStatusText, CodexAgentModeCoordinator.codexStillInProgressStatusText)
+        startup.release()
+        _ = await recovery.value
+    }
+
+    func testSilentGraceIsGrantedOncePerSilenceAndClearsWithProgress() async throws {
+        let (f, old) = try await makeGraceFixture()
+        silence(f, for: 150)
+        _ = await probe(f)
+        _ = await probe(f)
+        XCTAssertEqual(f.session.codexWatchdogState.activeTurnGrace?.reason, .stillInProgress)
+        XCTAssertEqual(f.session.runningStatusText, CodexAgentModeCoordinator.codexStillInProgressStatusText)
+
+        await f.coordinator.test_handleCodexNativeEvent(.assistantDelta("progress"), session: f.session, sourceController: old)
+        XCTAssertNil(f.session.codexWatchdogState.activeTurnGrace)
+        XCTAssertNil(f.session.codexWatchdogState.ownedStatusText)
+        XCTAssertNotEqual(f.session.runningStatusText, CodexAgentModeCoordinator.codexStillInProgressStatusText)
+
+        let nextGeneration = f.session.codexWatchdogState.progressGeneration
+        silence(f, for: 150)
+        _ = await probe(f)
+        _ = await probe(f)
+        XCTAssertEqual(f.session.codexWatchdogState.activeTurnGrace?.reason, .stillInProgress, "a new silent stretch earns its own extension")
+        XCTAssertEqual(f.session.codexWatchdogState.stillInProgressGraceGeneration, nextGeneration)
+        XCTAssertTrue(f.factory.controllers.isEmpty)
+        XCTAssertEqual(old.shutdownCount, 0)
+    }
+
+    func testCapacityRetryGrantsAndRenewsGraceWithOnePillAndOneNotice() async throws {
+        let startup = TestReleaseFence(name: "capacity grace reattach startup")
+        let (f, old) = try await makeGraceFixture([[.suspendedSuccess(Self.oldThreadID, startup)]])
+
+        let before = Date()
+        await f.coordinator.test_handleCodexNativeEvent(Self.retryNotice("Reconnecting... 2/5"), session: f.session, sourceController: old)
+        let after = Date()
+        let grace = try XCTUnwrap(f.session.codexWatchdogState.activeTurnGrace)
+        XCTAssertEqual(grace.reason, .capacityRetry)
+        XCTAssertGreaterThanOrEqual(grace.until, before.addingTimeInterval(200))
+        XCTAssertLessThanOrEqual(grace.until, after.addingTimeInterval(200))
+        XCTAssertEqual(f.session.runningStatusText, "Model at capacity. Codex retries automatically (2/5).")
+        XCTAssertEqual(f.session.runningStatusSource, .reconnect)
+        XCTAssertEqual(capacityNoticeCount(f), 1)
+        XCTAssertEqual(
+            f.session.items.last { $0.kind == .system }?.text,
+            "Model at capacity. Codex is retrying automatically; this can take several minutes."
+        )
+
+        silence(f, for: 150)
+        _ = await probe(f)
+        _ = await probe(f)
+        XCTAssertTrue(f.factory.controllers.isEmpty, "a live capacity grace defers reattach past the recovery threshold")
+        XCTAssertEqual(old.shutdownCount, 0)
+        XCTAssertEqual(f.session.codexWatchdogState.activeTurnGrace?.reason, .capacityRetry)
+        XCTAssertEqual(f.session.runningStatusText, "Model at capacity. Codex retries automatically (2/5).")
+
+        let renewedAt = Date()
+        await f.coordinator.test_handleCodexNativeEvent(Self.retryNotice("Reconnecting... 3/5"), session: f.session, sourceController: old)
+        let renewed = try XCTUnwrap(f.session.codexWatchdogState.activeTurnGrace)
+        XCTAssertEqual(renewed.reason, .capacityRetry)
+        XCTAssertGreaterThanOrEqual(renewed.until, renewedAt.addingTimeInterval(200))
+        XCTAssertEqual(f.session.runningStatusText, "Model at capacity. Codex retries automatically (3/5).")
+        XCTAssertEqual(capacityNoticeCount(f), 1, "one notice per turn")
+
+        silence(f, for: 150)
+        _ = await probe(f)
+        f.session.codexWatchdogState.activeTurnGrace?.until = Date().addingTimeInterval(-1)
+        let recovery = Task { await probe(f) }
+        addTeardownBlock { @MainActor in
+            startup.release()
+            recovery.cancel()
+            _ = await recovery.value
+        }
+        let entered = await startup.waitUntilEntered(timeout: 4)
+        XCTAssertTrue(entered, "an expired capacity grace reattaches without a further silent extension")
+        XCTAssertEqual(old.shutdownCount, 1)
+        let replacement = try XCTUnwrap(f.factory.controllers.last)
+        replacement.setRecoverySnapshot(Self.graceSnapshot())
+        startup.release()
+        _ = await recovery.value
+        XCTAssertTrue(f.session.runState.isActive, "the replacement still reports the same active turn")
+
+        await f.coordinator.test_handleCodexNativeEvent(Self.retryNotice("Reconnecting... 4/5"), session: f.session, sourceController: replacement)
+        XCTAssertEqual(f.session.codexWatchdogState.activeTurnGrace?.reason, .capacityRetry)
+        XCTAssertEqual(f.session.runningStatusText, "Model at capacity. Codex retries automatically (4/5).")
+        XCTAssertEqual(capacityNoticeCount(f), 1, "controller replacement keeps the same turn's single notice")
+    }
+
+    func testNoActiveTurnAndFailedProbeStillRecoverAtRecoveryThresholdDespiteGrace() async throws {
+        for variant in ["no-active-turn", "probe-failed"] {
+            let startup = TestReleaseFence(name: "ambiguous recovery startup \(variant)")
+            let (f, old) = try await makeGraceFixture([[.suspendedSuccess(Self.oldThreadID, startup)]])
+            await f.coordinator.test_handleCodexNativeEvent(Self.retryNotice("Reconnecting... 2/5"), session: f.session, sourceController: old)
+            XCTAssertEqual(f.session.codexWatchdogState.activeTurnGrace?.reason, .capacityRetry, variant)
+            if variant == "no-active-turn" {
+                old.setRecoverySnapshot(Self.graceSnapshot(active: false))
+            } else {
+                old.setRecoverySnapshotFailure()
+            }
+            silence(f, for: 150)
+
+            let firstFailed = await probe(f)
+            XCTAssertFalse(firstFailed, variant)
+            XCTAssertTrue(f.factory.controllers.isEmpty, "\(variant): first sample is only a comparison")
+            XCTAssertNotNil(f.session.codexWatchdogState.activeTurnGrace, variant)
+
+            let recovery = Task { await probe(f) }
+            addTeardownBlock { @MainActor in
+                startup.release()
+                recovery.cancel()
+                _ = await recovery.value
+            }
+            let entered = await startup.waitUntilEntered(timeout: 4)
+            XCTAssertTrue(entered, "\(variant): the grace never delays this path")
+            XCTAssertEqual(old.shutdownCount, 1, variant)
+            startup.release()
+            _ = await recovery.value
+        }
+    }
+
+    func testCapacityPillClearsOnProgressAndNoticeStaysOncePerTurn() async throws {
+        let (f, old) = try await makeGraceFixture()
+        await f.coordinator.test_handleCodexNativeEvent(Self.retryNotice("Reconnecting... 2/5"), session: f.session, sourceController: old)
+        XCTAssertEqual(f.session.runningStatusText, "Model at capacity. Codex retries automatically (2/5).")
+
+        await f.coordinator.test_handleCodexNativeEvent(.assistantDelta("resumed"), session: f.session, sourceController: old)
+        XCTAssertNil(f.session.codexWatchdogState.activeTurnGrace)
+        XCTAssertNil(f.session.codexWatchdogState.ownedStatusText)
+        XCTAssertNotEqual(f.session.runningStatusText, "Model at capacity. Codex retries automatically (2/5).")
+
+        await f.coordinator.test_handleCodexNativeEvent(Self.retryNotice("Reconnecting... 3/5"), session: f.session, sourceController: old)
+        XCTAssertEqual(f.session.runningStatusText, "Model at capacity. Codex retries automatically (3/5).")
+        XCTAssertEqual(capacityNoticeCount(f), 1, "progress inside the same turn does not repeat the notice")
+
+        await f.coordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: Self.graceTurnID, status: .completed), session: f.session, sourceController: old
+        )
+        XCTAssertEqual(f.session.runState, .completed)
+        XCTAssertNotEqual(f.session.runningStatusText, "Model at capacity. Codex retries automatically (3/5).")
+        XCTAssertEqual(capacityNoticeCount(f), 1)
+    }
+
+    func testNonCapacityAndUncountedRetryNoticesKeepExistingPresentation() async throws {
+        let (f, old) = try await makeGraceFixture()
+        await f.coordinator.test_handleCodexNativeEvent(
+            Self.retryNotice("Reconnecting... 2/5", details: "stream disconnected before completion"),
+            session: f.session, sourceController: old
+        )
+        XCTAssertEqual(f.session.runningStatusText, "Reconnecting... 2/5")
+        XCTAssertNil(f.session.codexWatchdogState.activeTurnGrace)
+        XCTAssertEqual(capacityNoticeCount(f), 0)
+
+        await f.coordinator.test_handleCodexNativeEvent(
+            Self.retryNotice("Reconnecting...", details: nil, info: "serverOverloaded"),
+            session: f.session, sourceController: old
+        )
+        XCTAssertEqual(f.session.runningStatusText, "Reconnecting...", "without a retry count the raw notice stays")
+        XCTAssertEqual(f.session.codexWatchdogState.activeTurnGrace?.reason, .capacityRetry)
+        XCTAssertEqual(capacityNoticeCount(f), 1)
+    }
+
+    func testCapacityClassificationAndRetryCountParsing() {
+        func notice(details: String? = nil, info: String? = nil) -> CodexNativeSessionController.ErrorNotification {
+            .init(message: "Reconnecting... 2/5", willRetry: true, threadID: nil, turnID: nil, additionalDetails: details, codexErrorInfo: info)
+        }
+        typealias Coordinator = CodexAgentModeCoordinator
+        XCTAssertTrue(Coordinator.isCodexCapacityRetryNotification(notice(details: Self.capacityDetails)))
+        XCTAssertTrue(Coordinator.isCodexCapacityRetryNotification(notice(info: "serverOverloaded")))
+        XCTAssertTrue(Coordinator.isCodexCapacityRetryNotification(notice(info: #"{"serverOverloaded":null}"#)))
+        XCTAssertTrue(Coordinator.isCodexCapacityRetryNotification(notice(info: "server_overloaded")))
+        XCTAssertFalse(Coordinator.isCodexCapacityRetryNotification(notice(
+            details: "stream disconnected", info: #"{"responseStreamDisconnected":{"httpStatusCode":null}}"#
+        )))
+        XCTAssertFalse(Coordinator.isCodexCapacityRetryNotification(notice()))
+
+        XCTAssertEqual(Coordinator.codexRetryAttempt(fromReconnectMessage: "Reconnecting... 2/5")?.attempt, 2)
+        XCTAssertEqual(Coordinator.codexRetryAttempt(fromReconnectMessage: "Reconnecting... 5/5")?.maxAttempts, 5)
+        XCTAssertNil(Coordinator.codexRetryAttempt(fromReconnectMessage: "Reconnecting... 6/5"))
+        XCTAssertNil(Coordinator.codexRetryAttempt(fromReconnectMessage: "Reconnecting... 0/5"))
+        XCTAssertNil(Coordinator.codexRetryAttempt(fromReconnectMessage: "Reconnecting..."))
+        XCTAssertNil(Coordinator.codexRetryAttempt(fromReconnectMessage: "Stream failed 2/5"))
+        XCTAssertEqual(
+            Coordinator.codexCapacityRetryStatusText(attempt: 4, maxAttempts: 5),
+            "Model at capacity. Codex retries automatically (4/5)."
+        )
+    }
+
+    func testParseErrorNotificationKeepsAdditionalDetailsAndCodexErrorInfo() throws {
+        let nested = try XCTUnwrap(CodexNativeSessionController.test_parseErrorNotification(from: [
+            "error": [
+                "message": "Reconnecting... 2/5",
+                "codexErrorInfo": ["responseStreamDisconnected": ["httpStatusCode": NSNull()]],
+                "additionalDetails": Self.capacityDetails
+            ],
+            "willRetry": true,
+            "threadId": "thread-1",
+            "turnId": "turn-1"
+        ]))
+        XCTAssertEqual(nested.message, "Reconnecting... 2/5")
+        XCTAssertEqual(nested.willRetry, true)
+        XCTAssertEqual(nested.turnID, "turn-1")
+        XCTAssertEqual(nested.additionalDetails, Self.capacityDetails)
+        XCTAssertEqual(nested.codexErrorInfo, #"{"responseStreamDisconnected":{"httpStatusCode":null}}"#)
+
+        let snake = try XCTUnwrap(CodexNativeSessionController.test_parseErrorNotification(from: [
+            "error": ["message": "m", "additional_details": "details", "codex_error_info": "serverOverloaded"]
+        ]))
+        XCTAssertEqual(snake.additionalDetails, "details")
+        XCTAssertEqual(snake.codexErrorInfo, "serverOverloaded")
+
+        let nullFallsBack = try XCTUnwrap(CodexNativeSessionController.test_parseErrorNotification(from: [
+            "error": ["message": "m", "additionalDetails": NSNull(), "additional_details": "fallback"]
+        ]))
+        XCTAssertEqual(nullFallsBack.additionalDetails, "fallback")
+
+        let absent = try XCTUnwrap(CodexNativeSessionController.test_parseErrorNotification(from: [
+            "error": ["message": "m"]
+        ]))
+        XCTAssertNil(absent.additionalDetails)
+        XCTAssertNil(absent.codexErrorInfo)
+    }
+}
+
+// MARK: - In-flight RepoPrompt MCP calls (Codex-started, not yet tracked by the app)
+
+extension CodexResumeWedgeCommitTests {
+    private static let repoPromptApplyEditsEventName = "mcp__\(MCPIntegrationHelper.repoPromptMCPServerName)__apply_edits"
+
+    /// A `thread/read` snapshot parsed by the real parser: MCP items keep the bare `tool` name.
+    private static func repoPromptCallSnapshot(
+        itemID: UUID,
+        itemStatus: String
+    ) -> CodexNativeSessionController.ThreadSnapshot {
+        CodexNativeSessionController.test_parseThreadSnapshot([
+            "thread": [
+                "id": oldThreadID,
+                "status": ["type": "active"],
+                "turns": [[
+                    "id": graceTurnID,
+                    "status": "inProgress",
+                    "itemsView": "full",
+                    "items": [[
+                        "type": "mcpToolCall",
+                        "id": itemID.uuidString,
+                        "server": MCPIntegrationHelper.repoPromptMCPServerName,
+                        "tool": "apply_edits",
+                        "status": itemStatus
+                    ]]
+                ]]
+            ]
+        ], fallbackEffort: nil)
+    }
+
+    private func startRepoPromptCall(
+        _ f: Fixture,
+        controller: WedgeFakeCodexController,
+        invocationID: UUID
+    ) async {
+        await f.coordinator.test_handleCodexNativeEvent(
+            .toolCall(name: Self.repoPromptApplyEditsEventName, invocationID: invocationID, argsJSON: #"{"path":"a.swift"}"#),
+            session: f.session, sourceController: controller
+        )
+    }
+
+    func testInFlightRepoPromptMCPCallIsNotRecoveredDuringLongSilence() async throws {
+        let (f, old) = try await makeGraceFixture()
+        let invocationID = UUID()
+        await startRepoPromptCall(f, controller: old, invocationID: invocationID)
+        XCTAssertEqual(f.session.codexNativeToolLiveness.inFlight.count, 1, "a Codex-started RepoPrompt call opens a liveness span")
+        XCTAssertFalse(f.session.items.contains { $0.toolInvocationID == invocationID }, "the native transcript still skips it")
+
+        let snapshot = Self.repoPromptCallSnapshot(itemID: invocationID, itemStatus: "inProgress")
+        XCTAssertTrue(snapshot.hasAuthoritativeActiveTurnItems)
+        XCTAssertEqual(snapshot.activeToolItems.map(\.toolName), ["apply_edits"], "snapshots carry the bare MCP tool name")
+        XCTAssertEqual(snapshot.activeToolItems.map(\.invocationID), [invocationID])
+        old.setRecoverySnapshot(snapshot)
+
+        // Recovery is 100 s and grace 200 s in this fixture; stay silent far past both.
+        for seconds: TimeInterval in [150, 1000, 5000] {
+            silence(f, for: seconds)
+            _ = await probe(f)
+            _ = await probe(f)
+            XCTAssertTrue(f.factory.controllers.isEmpty, "silence \(seconds)s: an in-flight call is not a stall")
+            XCTAssertEqual(old.shutdownCount, 0, "silence \(seconds)s")
+            XCTAssertTrue(f.session.runState.isActive, "silence \(seconds)s")
+            XCTAssertEqual(f.session.codexNativeToolLiveness.inFlight.count, 1, "silence \(seconds)s")
+            XCTAssertNil(f.session.codexWatchdogState.activeTurnGrace, "silence \(seconds)s: corroboration is progress")
+        }
+
+        f.session.codexWatchdogState.activeTurnGrace = .init(until: Date().addingTimeInterval(-1), reason: .stillInProgress)
+        silence(f, for: 5000)
+        _ = await probe(f)
+        XCTAssertTrue(f.factory.controllers.isEmpty, "an expired grace does not override a corroborated call")
+        XCTAssertEqual(old.shutdownCount, 0)
+        XCTAssertFalse(f.session.items.contains {
+            $0.kind == .system && $0.text == "Codex became idle before the run resolved. Send a message to continue."
+        })
+    }
+
+    func testOverlappingIdenticalRepoPromptCallsKeepSeparateWatchdogLiveness() async throws {
+        let (f, old) = try await makeGraceFixture()
+        let firstID = UUID()
+        let secondID = UUID()
+        await startRepoPromptCall(f, controller: old, invocationID: firstID)
+        await startRepoPromptCall(f, controller: old, invocationID: secondID)
+
+        await f.coordinator.test_handleCodexNativeEvent(
+            .toolResult(
+                name: Self.repoPromptApplyEditsEventName, invocationID: firstID,
+                argsJSON: #"{"path":"a.swift"}"#, resultJSON: #"{"status":"completed"}"#, isError: false
+            ),
+            session: f.session, sourceController: old
+        )
+        XCTAssertEqual(Set(f.session.codexNativeToolLiveness.inFlight.keys.compactMap(\.invocationID)), [secondID])
+
+        old.setRecoverySnapshot(Self.repoPromptCallSnapshot(itemID: secondID, itemStatus: "inProgress"))
+        silence(f, for: 150)
+        _ = await probe(f)
+        _ = await probe(f)
+        XCTAssertNil(f.session.codexWatchdogState.activeTurnGrace, "the remaining call counts as progress")
+    }
+
+    func testRepoPromptMCPResultClosesSpanWithoutNativeTranscriptRow() async throws {
+        let (f, old) = try await makeGraceFixture()
+        for isError in [false, true] {
+            let invocationID = UUID()
+            await startRepoPromptCall(f, controller: old, invocationID: invocationID)
+            XCTAssertEqual(f.session.codexNativeToolLiveness.inFlight.count, 1)
+            for _ in 0 ..< 2 {
+                await f.coordinator.test_handleCodexNativeEvent(
+                    .toolResult(
+                        name: Self.repoPromptApplyEditsEventName, invocationID: invocationID,
+                        argsJSON: #"{"path":"a.swift"}"#, resultJSON: #"{"status":"completed"}"#, isError: isError
+                    ),
+                    session: f.session, sourceController: old
+                )
+                XCTAssertTrue(f.session.codexNativeToolLiveness.inFlight.isEmpty, "isError=\(isError): the result closes the span")
+            }
+            XCTAssertFalse(f.session.items.contains { $0.toolInvocationID == invocationID }, "isError=\(isError)")
+        }
+    }
+
+    func testRepoPromptSpanWithLostCompletionDoesNotProtectSilentTurn() async throws {
+        let startup = TestReleaseFence(name: "terminal repoprompt span reattach startup")
+        let (f, old) = try await makeGraceFixture([[.suspendedSuccess(Self.oldThreadID, startup)]])
+        let invocationID = UUID()
+        await startRepoPromptCall(f, controller: old, invocationID: invocationID)
+        old.setRecoverySnapshot(Self.repoPromptCallSnapshot(itemID: invocationID, itemStatus: "completed"))
+        silence(f, for: 150)
+
+        _ = await probe(f)
+        XCTAssertTrue(f.session.codexNativeToolLiveness.inFlight.isEmpty, "a terminal item reconciles the lost completion")
+        XCTAssertTrue(f.factory.controllers.isEmpty, "a late first sample only records the comparison")
+        _ = await probe(f)
+        XCTAssertEqual(f.session.codexWatchdogState.activeTurnGrace?.reason, .stillInProgress, "the silent turn earns the usual grace")
+        XCTAssertTrue(f.factory.controllers.isEmpty)
+
+        f.session.codexWatchdogState.activeTurnGrace?.until = Date().addingTimeInterval(-1)
+        let recovery = Task { await probe(f) }
+        addTeardownBlock { @MainActor in
+            startup.release()
+            recovery.cancel()
+            _ = await recovery.value
+        }
+        let entered = await startup.waitUntilEntered(timeout: 4)
+        XCTAssertTrue(entered, "a genuinely silent turn still reattaches when the grace expires")
+        XCTAssertEqual(old.shutdownCount, 1)
+        startup.release()
+        _ = await recovery.value
+    }
+
+    func testOpenRepoPromptSpanDoesNotDelayNoActiveTurnOrFailedProbeRecovery() async throws {
+        for variant in ["no-active-turn", "probe-failed", "active-without-item", "active-other-item"] {
+            let startup = TestReleaseFence(name: "open repoprompt span recovery startup \(variant)")
+            let (f, old) = try await makeGraceFixture([[.suspendedSuccess(Self.oldThreadID, startup)]])
+            await startRepoPromptCall(f, controller: old, invocationID: UUID())
+            switch variant {
+            case "no-active-turn":
+                old.setRecoverySnapshot(Self.graceSnapshot(active: false))
+            case "probe-failed":
+                old.setRecoverySnapshotFailure()
+            case "active-other-item":
+                // Same bare tool name, different item: identity, not the name, corroborates.
+                old.setRecoverySnapshot(Self.repoPromptCallSnapshot(itemID: UUID(), itemStatus: "inProgress"))
+            default:
+                // E.g. an app-server restarted mid-call: Codex reports the turn without the item.
+                old.setRecoverySnapshot(Self.graceSnapshot())
+            }
+            silence(f, for: 150)
+            _ = await probe(f)
+            XCTAssertTrue(f.factory.controllers.isEmpty, "\(variant): first sample is only a comparison")
+            if variant.hasPrefix("active-") {
+                _ = await probe(f)
+                XCTAssertEqual(f.session.codexWatchdogState.activeTurnGrace?.reason, .stillInProgress, variant)
+                f.session.codexWatchdogState.activeTurnGrace?.until = Date().addingTimeInterval(-1)
+            }
+
+            let recovery = Task { await probe(f) }
+            addTeardownBlock { @MainActor in
+                startup.release()
+                recovery.cancel()
+                _ = await recovery.value
+            }
+            let entered = await startup.waitUntilEntered(timeout: 4)
+            XCTAssertTrue(entered, "\(variant): an uncorroborated local span never vetoes recovery")
+            XCTAssertEqual(old.shutdownCount, 1, variant)
+            startup.release()
+            _ = await recovery.value
         }
     }
 }
