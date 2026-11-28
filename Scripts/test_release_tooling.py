@@ -287,6 +287,70 @@ class PackagedSparkleLayoutTests(unittest.TestCase):
             self.assertIn("Autoupdate", bad_alias.stderr)
 
 
+class ReleaseSentrySparkleSymbolsTests(unittest.TestCase):
+    def test_sparkle_symbols_are_required_staged_uuid_checked_and_uploaded(self) -> None:
+        uuid = "ABCD1234-5678-1234-ABCD-0123456789AB"
+        other_uuid = "01234567-89AB-CDEF-0123-456789ABCDEF"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            symbols = root / "symbols"
+            staged = root / "staged"
+            app = root / "RepoPrompt.app"
+            tools = root / "bin"
+            tools.mkdir()
+            for name, script in {
+                "ditto": 'cp -R "$1" "$2"',
+                "dwarfdump": 'while read -r uuid arch; do printf "UUID: %s (%s) %s\\n" "$uuid" "$arch" "$2"; done < "$2"',
+                "upload": 'test -f "$1/Sparkle.framework.dSYM/Contents/Resources/DWARF/Sparkle" && echo uploaded',
+            }.items():
+                tool = tools / name
+                tool.write_text(f"#!/bin/bash\n{script}\n")
+                tool.chmod(0o755)
+
+            for executable in ("RepoPrompt", "repoprompt-mcp"):
+                payload = symbols / f"{executable}.dSYM" / "Contents/Resources/DWARF" / executable
+                payload.parent.mkdir(parents=True)
+                payload.write_text(f"{uuid} arm64\n")
+                binary = app / "Contents/MacOS" / executable
+                binary.parent.mkdir(parents=True, exist_ok=True)
+                binary.write_text(f"{uuid} arm64\n")
+            framework_binary = app / "Contents/Frameworks/Sparkle.framework/Versions/B/Sparkle"
+            framework_binary.parent.mkdir(parents=True)
+            framework_binary.write_text(f"{uuid} arm64\n{other_uuid} x86_64\n")
+
+            def run(body: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    ["bash", "-c", f'source "$1"; configure_release_sentry_symbol_mappings RepoPrompt; {body}',
+                     "fixture", str(SCRIPT_DIR / "release_sentry_symbols.sh"),
+                     str(symbols), str(staged), str(app), str(tools / "upload")],
+                    env={"PATH": f"{tools}:{os.defpath}", "REPOPROMPT_ENABLE_SENTRY": "1",
+                         "REPOPROMPT_DWARFDUMP_BIN": str(tools / "dwarfdump")},
+                    text=True, capture_output=True, timeout=10,
+                )
+
+            stage = 'stage_release_sentry_symbols "$2" "$3" "${RELEASE_SENTRY_SYMBOL_MAPPINGS[@]}"'
+            verify = 'verify_release_sentry_symbol_uuids_before_signing "$3" "$4" "${RELEASE_SENTRY_SYMBOL_MAPPINGS[@]}"'
+            upload = 'upload_release_sentry_symbols "$3" "$5" "${RELEASE_SENTRY_SYMBOL_MAPPINGS[@]}"'
+            missing = run(stage)
+            self.assertEqual(missing.returncode, 1)
+            self.assertIn("missing required debug symbols", missing.stderr)
+            self.assertIn("Sparkle.framework.dSYM", missing.stderr)
+
+            relative_payload = Path("Sparkle.framework.dSYM/Contents/Resources/DWARF/Sparkle")
+            payload = symbols / relative_payload
+            payload.parent.mkdir(parents=True)
+            payload.write_text(f"{other_uuid} x86_64\n{uuid.lower()} arm64\n")
+            success = run(f"{stage} && {verify} && {upload}")
+            self.assertEqual(success.returncode, 0, success.stderr)
+            self.assertEqual(success.stdout.strip(), "uploaded")
+
+            (staged / relative_payload).write_text(f"{uuid} arm64\n")
+            mismatch = run(f"{verify} && {upload}")
+            self.assertEqual(mismatch.returncode, 1)
+            self.assertIn("Sentry dSYM UUIDs do not match staged executable: Sparkle.framework.dSYM", mismatch.stderr)
+            self.assertEqual(mismatch.stdout, "")
+
+
 class ReleaseStagePhaseTests(unittest.TestCase):
     """#166: the workflow runs stage-publish's phases as separate, observable steps."""
 

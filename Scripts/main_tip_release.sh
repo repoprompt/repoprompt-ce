@@ -340,6 +340,7 @@ APPCAST="$DIST_DIR/appcast.xml"
 CHECKSUMS="$DIST_DIR/SHA256SUMS"
 BUILD_ARTIFACT_MANIFEST="$ROOT_DIR/.build/release/$APP_NAME-artifact-manifest.json"
 SENTRY_SYMBOLS_DIR="$ROOT_DIR/.build/sentry-symbols/release"
+configure_release_sentry_symbol_mappings "$APP_NAME"
 FINAL_ARTIFACT_MANIFEST="$DIST_DIR/$ARCHIVE_BASENAME-artifact-manifest.json"
 FINAL_METADATA="$DIST_DIR/$ARCHIVE_BASENAME-metadata.json"
 ROLLOUT_MANIFEST="$DIST_DIR/identity-rollout.json"
@@ -537,10 +538,7 @@ stage_tip() {
     validate_public_app "$APP_BUNDLE" "$BUILD_ARTIFACT_MANIFEST" "Tip staging"
     REPOPROMPT_ENABLE_SENTRY=1 require_release_sentry_symbols_when_enabled \
         "$SENTRY_SYMBOLS_DIR" \
-        "$APP_NAME.dSYM" \
-        "$APP_NAME" \
-        "repoprompt-mcp.dSYM" \
-        "repoprompt-mcp"
+        "${RELEASE_SENTRY_SYMBOL_MAPPINGS[@]}"
 
     TMP_DIR="$(mktemp -d)"
     local stage_root="$TMP_DIR/tip-stage"
@@ -550,10 +548,7 @@ stage_tip() {
     REPOPROMPT_ENABLE_SENTRY=1 stage_release_sentry_symbols \
         "$SENTRY_SYMBOLS_DIR" \
         "$stage_root/.build/sentry-symbols/release" \
-        "$APP_NAME.dSYM" \
-        "$APP_NAME" \
-        "repoprompt-mcp.dSYM" \
-        "repoprompt-mcp"
+        "${RELEASE_SENTRY_SYMBOL_MAPPINGS[@]}"
     cp "$ROLLOUT_DECLARATION" "$stage_root/tip-rollout.json"
     write_tip_version_env "$stage_root/version.env"
     cp "$ROOT_DIR/LICENSE" "$ROOT_DIR/THIRD_PARTY_NOTICES.md" "$stage_root/"
@@ -841,10 +836,7 @@ sign_tip_application_phase() {
     verify_release_sentry_symbol_uuids_before_signing \
         "$SENTRY_SYMBOLS_DIR" \
         "$APP_BUNDLE" \
-        "$APP_NAME.dSYM" \
-        "$APP_NAME" \
-        "repoprompt-mcp.dSYM" \
-        "repoprompt-mcp"
+        "${RELEASE_SENTRY_SYMBOL_MAPPINGS[@]}"
     REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE="$TIP_BUILD_NUMBER" \
         REPOPROMPT_TIP_ARCHIVE_CONTRACT=tip-rollout-v1 \
@@ -865,10 +857,7 @@ sign_tip_application_phase() {
     upload_release_sentry_symbols \
         "$SENTRY_SYMBOLS_DIR" \
         "$CONTROL_PLANE_SCRIPTS_DIR/upload_sentry_debug_symbols.sh" \
-        "$APP_NAME.dSYM" \
-        "$APP_NAME" \
-        "repoprompt-mcp.dSYM" \
-        "repoprompt-mcp"
+        "${RELEASE_SENTRY_SYMBOL_MAPPINGS[@]}"
 
     if [[ "$ROLLOUT_INSTALLATION_TYPE" == "package" ]]; then
         printf 'OK: signed and validated Tip application for package rollout %s.\n' "$TIP_TAG"
