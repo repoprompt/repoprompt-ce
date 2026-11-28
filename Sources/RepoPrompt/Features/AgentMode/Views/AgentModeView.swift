@@ -2384,6 +2384,8 @@ struct AgentModeChatDetailView: View {
             restoringPaneView
         case let .unavailable(reason, retry):
             unavailablePaneView(reason: reason, retry: retry)
+        case let .workspaceActivationFailed(owner):
+            workspaceActivationFailureView(owner: owner)
         case .runningOrWaiting:
             // The existing run indicator and interaction cards below present current run facts; show
             // fallback copy only when neither is visible.
@@ -5662,6 +5664,18 @@ struct AgentModeChatDetailView: View {
                 Button("Retry") {
                     _ = agentModeVM.retryTranscriptRestoration(retry)
                 }
+            }
+        }
+    }
+
+    private func workspaceActivationFailureView(owner: AgentWorkspaceSessionIndexStore.SessionIndexOwner) -> some View {
+        VStack(spacing: 10) {
+            Text(AgentModeViewModel.workspaceActivationFailureMessage)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 14, weight: .medium))
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+            Button("Retry") {
+                Task { await agentModeVM.retryWorkspaceActivation(owner) }
             }
         }
     }

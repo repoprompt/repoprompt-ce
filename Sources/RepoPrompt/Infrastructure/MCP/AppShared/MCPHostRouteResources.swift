@@ -290,7 +290,9 @@ final class MCPHostRouteResources {
             if let runID = context.runID, let sessionID = context.savedCarrierSessionID {
                 .savedRunScoped(runID: runID, context: .init(workspaceID: workspaceID, contextID: context.tabID), sessionID: sessionID)
             } else if let runID = context.runID {
-                .runScoped(runID: runID, context: .init(workspaceID: workspaceID, contextID: context.tabID))
+                identity.kind == .independent && isLeaseManaged
+                    ? .canonicalRunScoped(runID: runID, context: .init(workspaceID: workspaceID, contextID: context.tabID))
+                    : .runScoped(runID: runID, context: .init(workspaceID: workspaceID, contextID: context.tabID))
             } else {
                 .context(DomainContextIdentity(workspaceID: workspaceID, contextID: context.tabID), explicit: context.explicitlyBound)
             }

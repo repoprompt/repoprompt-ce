@@ -2234,6 +2234,7 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
         func cleanup() async {
             await ingress?.cleanup()
             ingress = nil
+            await window.agentModeViewModel.test_retireAndCancelFixture()
             WindowStatesManager.shared.unregisterWindowState(window)
             if runtime != nil {
                 window.beginClose()

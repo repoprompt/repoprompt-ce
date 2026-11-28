@@ -8823,6 +8823,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
 
         func cleanup() async {
             if !ownsRuntime, let carriers { _ = await window.workspaceManager.deleteWorkspaceAsync(carriers) }
+            await window.agentModeViewModel.test_retireAndCancelFixture()
             WindowStatesManager.shared.unregisterWindowState(window)
             await window.workspaceManager.debugDrainScheduledSaves()
             await window.tearDown()

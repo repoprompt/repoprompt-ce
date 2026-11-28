@@ -20,7 +20,7 @@ The app target (`RepoPromptApp`) is the composition and product-flow owner, not 
 | `RepoPromptPersistence` | CodeMap artifacts/catalog/manifests/leases and durable artifact storage | FileSystem, VCS values, CodeMapCore, Shared; no workspace capability or app source-provenance dependency |
 | `RepoPromptSettingsCore` | Persisted settings values/document/file store, settings store and global-ignore facet | App-only deployment, with typed events; app policy and notifications remain composition-owned |
 | `RepoPromptC`, `CSwiftPCRE2`, `TreeSitterScannerSupport`, `Sparkle` | C/binary support | Leaf support targets |
-| `RepoPromptRemoteProtocol` | Standalone Remote wire values, replay, coalescing, and notification crypto; mirrored by the mobile peer | App-free leaf; App, Shared, and their tests declare direct imports |
+| `RepoPromptRemoteProtocol` | Standalone Remote wire values, replay, coalescing, and notification crypto; from the pinned RepoPrompt Remote package | App-free leaf; App, Shared, and their tests declare direct imports |
 | `RepoPromptIrohSpikeMac` | Isolated Iroh transport diagnostic executable | External transport package only |
 | `<Module>Tests` | Tests of their corresponding module | Production target plus explicitly cataloged test support |
 

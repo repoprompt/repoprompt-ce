@@ -1108,8 +1108,327 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         try await runVisibleLifetimeWitness(switchWorkspace: false, submission: .composerWithHiddenRow)
     }
 
+    func testWorkspaceActivationFailureSettlesAndRetriesWithoutLosingDraftOrSavedSession() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("AgentActivationRetry-\(UUID())")
+        let runtime = MCPDomainRuntime(configuration: .init(
+            mode: .app, profileIdentifier: "activation-retry-\(UUID())", storageDirectory: directory,
+            workspaceStorageDirectory: directory.appendingPathComponent("workspaces"),
+            eventDirectory: directory.appendingPathComponent("events"),
+            temporaryDirectory: directory.appendingPathComponent("tmp"), externalReloadInterval: nil
+        ))
+        try await runtime.start()
+        addTeardownBlock {
+            _ = await runtime.shutdown()
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        defer { GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false) }
+        let transport = MCPService(controller: ServerController(), hostBootstrapOperation: {}, controllerStartOperation: {}, controllerFullShutdownOperation: {})
+        addTeardownBlock { await transport.fullShutdown() }
+        let providerResources = AgentRunProviderComposition(
+            headless: { _, _ in preconditionFailure("Retry must not start a provider") },
+            acp: { _, _ in
+                XCTFail("Retry must not start a provider")
+                return nil
+            },
+            controller: { try ACPAgentSessionController(provider: $0, runRequest: $1, allowsProviderProcessLaunchForTesting: true) }
+        )
+        let sessionID = UUID()
+        let tab = ComposeTabState(activeAgentSessionID: sessionID)
+        var workspace = WorkspaceModel(name: "Activation retry", repoPaths: [], customStoragePath: directory.appendingPathComponent("sessions"))
+        workspace.composeTabs = [tab]
+        workspace.activeComposeTabID = tab.id
+        let authority = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: 0)
+        _ = try await authority.create(
+            workspace, fileURL: runtime.configuration.workspaceStorageDirectory.appendingPathComponent("\(workspace.id.uuidString).json")
+        )
+        let savedFile = try await AgentSessionDataService.shared.saveAgentSession(.init(
+            id: sessionID, workspaceID: workspace.id, composeTabID: tab.id, name: "Saved conversation", itemCount: 0
+        ), for: workspace)
+        let savedBytes = try Data(contentsOf: savedFile)
+        let window = makeVisibleLifetimeWindow(runtime: runtime, providerResources: providerResources, transport: transport)
+        let agent = window.agentModeViewModel
+        let prepare = try XCTUnwrap(agent.canonicalWorkspaceHostPreparation)
+        var preparationAttempts = 0
+        agent.canonicalWorkspaceHostPreparation = { candidate, owner, activations in
+            if candidate.id == workspace.id {
+                preparationAttempts += 1
+                if preparationAttempts == 1 { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
+            }
+            return try await prepare(candidate, owner, activations)
+        }
+        try await activateVisibleLifetimeWorkspace(workspace, in: window, expectsHost: false)
+        let navigation = AgentModeNavigationController(isSystemWorkspaceMode: workspace.isSystemWorkspace)
+        navigation.onAppear(isSystem: workspace.isSystemWorkspace, windowState: window, agentModeVM: agent)
+        let outgoing = agent.runtimeHost
+        guard case let .workspaceActivationFailed(initialOwner) = agent.ui.transcript.snapshot.panePresentation else {
+            return XCTFail("A refused workspace activation must finish restoring and offer Retry")
+        }
+        XCTAssertNil(agent.activeSessionLoadInProgressTabID)
+        XCTAssertNil(agent.makeComposerSubmitTarget(tabID: tab.id, session: nil))
+        agent.storeDraftText(for: tab.id, "Keep this draft")
+        let outgoingTabIDs = Set(outgoing.scope.sessions.keys)
+
+        var service = AgentRunMCPToolService(
+            toolName: MCPWindowToolName.agentRun,
+            captureRequestMetadata: { .init(connectionID: nil, clientName: nil, windowID: window.windowID) },
+            requireTargetWindow: { window },
+            resolveRequestedTabID: { _ in nil },
+            resolveSpawnParentSourceTabID: { _ in nil },
+            resolveSpawnParentSessionID: { _, _ in nil },
+            withHeartbeat: { _, _, _, _, operation in try await operation() },
+            startRun: { _, _, _, _, _, _, _, _, _, _, _, _, _ in throw MCPError.internalError("Unexpected run dispatch") }
+        )
+        service.resolveOracleReviewLaunchSource = { _, window in
+            .init(
+                snapshot: .init(
+                    route: .explicitWindowActiveCompose, windowID: window.windowID, workspaceID: workspace.id,
+                    tabID: tab.id, selectionRevision: 0, promptText: "", selection: tab.selection,
+                    sourceAgentSessionID: sessionID, routedRunID: nil
+                ),
+                source: .unavailable(.init(
+                    delegationID: UUID(), sourceTabID: tab.id, workspaceID: workspace.id,
+                    sourceAgentSessionID: sessionID, sourceAgentRunID: nil,
+                    reason: .sourceCaptureFailed("Workspace activation test")
+                ))
+            )
+        }
+        let model = AgentModelCatalog.defaultModelRaw(for: .openCode, availability: agent.agentAvailabilityContext)
+        for request: [String: Value] in [
+            ["op": .string("start"), "model_id": .string("\(AgentProviderKind.openCode.rawValue):\(model)"), "message": .string("Start"), "detach": .bool(true)],
+            ["op": .string("steer"), "session_id": .string(sessionID.uuidString), "message": .string("Continue"), "wait": .bool(false)]
+        ] {
+            do {
+                _ = try await service.execute(args: request)
+                XCTFail("Agent Run must refuse until the workspace host is ready")
+            } catch {
+                guard case let MCPError.invalidParams(message) = error else { return XCTFail("Unexpected error: \(error)") }
+                XCTAssertEqual(message, "Agent Mode could not start for this workspace. Use Retry in Agent Mode, then run this command again.")
+            }
+        }
+        XCTAssertTrue(agent.runtimeHost === outgoing)
+        XCTAssertEqual(Set(outgoing.scope.sessions.keys), outgoingTabIDs)
+        XCTAssertNil(outgoing.scope.sessions[tab.id])
+
+        let activity = window.workspaceManager.workspaceActivityCoordinator
+        let retirement = try XCTUnwrap(activity.claimLaneRetirement(workspaceID: workspace.id))
+        await agent.retryWorkspaceActivation(initialOwner)
+        activity.releaseLaneRetirement(workspaceID: workspace.id, claimID: retirement)
+        guard case let .workspaceActivationFailed(retryOwner) = agent.ui.transcript.snapshot.panePresentation else {
+            return XCTFail("A refused retry must settle and offer another Retry")
+        }
+        XCTAssertNotEqual(retryOwner, initialOwner)
+        XCTAssertEqual(agent.draftRuntime.text(for: tab.id), "Keep this draft")
+        await agent.retryWorkspaceActivation(initialOwner)
+        XCTAssertEqual(preparationAttempts, 1, "An old Retry action cannot start another activation")
+
+        var didFinishTabActivation = false
+        agent.test_afterTabActivationContinuation = { tabID, _ in
+            if tabID == tab.id { didFinishTabActivation = true }
+        }
+        defer { agent.test_afterTabActivationContinuation = nil }
+        await agent.retryWorkspaceActivation(retryOwner)
+        XCTAssertFalse(agent.isAwaitingWorkspaceAdoption)
+        XCTAssertFalse(agent.runtimeHost === outgoing)
+        try await AsyncTestWait.waitUntil("finish the recovered tab's activation") { didFinishTabActivation }
+        let session = try XCTUnwrap(agent.sessions[tab.id])
+        XCTAssertEqual(session.activeAgentSessionID, sessionID)
+        XCTAssertTrue(session.hasLoadedPersistedState)
+        XCTAssertEqual(agent.ui.composer.props.submitTarget?.tabID, tab.id)
+        XCTAssertEqual(agent.draftRuntime.text(for: tab.id), "Keep this draft")
+        XCTAssertEqual(window.workspaceManager.activeAgentSessionID(forTabID: tab.id), sessionID)
+        XCTAssertEqual(try Data(contentsOf: savedFile), savedBytes)
+    }
+
+    func testWorkspaceActivationRetryPreservesInactiveAndMidPreparationDraftsAndDispatchesOnceForFreshAndRestoredTabs() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("AgentActivationRetryDispatch-\(UUID())")
+        let root = directory.appendingPathComponent("root", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("synthetic".utf8).write(to: root.appendingPathComponent("note.txt"))
+        let runtime = MCPDomainRuntime(configuration: .init(
+            mode: .app, profileIdentifier: "activation-retry-dispatch-\(UUID())", storageDirectory: directory,
+            workspaceStorageDirectory: directory.appendingPathComponent("workspaces"),
+            eventDirectory: directory.appendingPathComponent("events"),
+            temporaryDirectory: directory.appendingPathComponent("tmp"), externalReloadInterval: nil
+        ))
+        try await runtime.start()
+        addTeardownBlock {
+            _ = await runtime.shutdown()
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        defer { GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false) }
+        let transport = MCPService(
+            controller: ServerController(), hostBootstrapOperation: {},
+            controllerStartOperation: {}, controllerFullShutdownOperation: {}
+        )
+        addTeardownBlock { await transport.fullShutdown() }
+
+        let script = try AgentSessionLinkACPServerScript.write(to: directory)
+        let provider = AgentSessionLinkCapturingACPProvider(providerID: .openCode, commandPath: script.path, environment: [:])
+        let providerResources = AgentRunProviderComposition(
+            headless: { _, _ in preconditionFailure("The retry dispatch witness only launches ACP") },
+            acp: { _, _ in provider },
+            controller: { try ACPAgentSessionController(provider: $0, runRequest: $1, allowsProviderProcessLaunchForTesting: true) }
+        )
+
+        let savedSessionID = UUID()
+        let savedTab = ComposeTabState(name: "Saved tab", activeAgentSessionID: savedSessionID)
+        let freshTab = ComposeTabState(name: "Fresh tab", activeAgentSessionID: nil)
+        var workspace = WorkspaceModel(
+            name: "Activation retry dispatch",
+            repoPaths: [root.path],
+            customStoragePath: directory.appendingPathComponent("sessions")
+        )
+        workspace.composeTabs = [savedTab, freshTab]
+        workspace.activeComposeTabID = savedTab.id
+        let authority = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: 0)
+        let created = try await authority.create(
+            workspace,
+            fileURL: runtime.configuration.workspaceStorageDirectory.appendingPathComponent("\(workspace.id.uuidString).json")
+        )
+        XCTAssertEqual(created.disposition, .applied)
+        let savedFile = try await AgentSessionDataService.shared.saveAgentSession(.init(
+            id: savedSessionID, workspaceID: workspace.id, composeTabID: savedTab.id, name: "Saved conversation",
+            itemCount: 0, agentKind: AgentProviderKind.openCode.rawValue, agentModel: "model-a"
+        ), for: workspace)
+        let savedBytes = try Data(contentsOf: savedFile)
+
+        let window = makeVisibleLifetimeWindow(runtime: runtime, providerResources: providerResources, transport: transport)
+        let agent = window.agentModeViewModel
+        let prepare = try XCTUnwrap(agent.canonicalWorkspaceHostPreparation)
+        let retryPrepGate = AutoWakeCatalogAuthorityGate()
+        defer { Task { await retryPrepGate.open() } }
+        var preparationAttempts = 0
+        agent.canonicalWorkspaceHostPreparation = { candidate, owner, activations in
+            if candidate.id == workspace.id {
+                preparationAttempts += 1
+                if preparationAttempts == 1 { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
+                if preparationAttempts == 2 { _ = await retryPrepGate.requirement() }
+            }
+            return try await prepare(candidate, owner, activations)
+        }
+
+        try await activateVisibleLifetimeWorkspace(workspace, in: window, expectsHost: false)
+        let navigation = AgentModeNavigationController(isSystemWorkspaceMode: workspace.isSystemWorkspace)
+        navigation.onAppear(isSystem: workspace.isSystemWorkspace, windowState: window, agentModeVM: agent)
+        let outgoing = agent.runtimeHost
+        guard case let .workspaceActivationFailed(initialOwner) = agent.ui.transcript.snapshot.panePresentation else {
+            return XCTFail("A refused workspace activation must settle and offer Retry")
+        }
+        XCTAssertNil(agent.makeComposerSubmitTarget(tabID: savedTab.id, session: nil))
+        XCTAssertNil(agent.makeComposerSubmitTarget(tabID: freshTab.id, session: nil))
+
+        agent.storeDraftText(for: savedTab.id, "Active draft before retry")
+        agent.storeDraftText(for: freshTab.id, "Inactive draft before retry")
+
+        let retryTask = Task { @MainActor in
+            await agent.retryWorkspaceActivation(initialOwner)
+        }
+        await retryPrepGate.waitUntilEntered()
+        XCTAssertTrue(agent.isAwaitingWorkspaceAdoption)
+        agent.storeDraftText(for: savedTab.id, "Active draft edited mid-preparation")
+        agent.storeDraftText(for: freshTab.id, "Inactive draft edited mid-preparation")
+        await retryPrepGate.open()
+        await retryTask.value
+
+        XCTAssertFalse(agent.isAwaitingWorkspaceAdoption)
+        let recoveredHost = agent.runtimeHost
+        XCTAssertFalse(recoveredHost === outgoing)
+        addVisibleLifetimeHostCleanup(recoveredHost)
+
+        try await AsyncTestWait.waitUntil("restore active saved tab and publish usable composer") {
+            guard agent.currentTabID == savedTab.id,
+                  let session = agent.sessions[savedTab.id],
+                  session.hasLoadedPersistedState,
+                  session.activeAgentSessionID == savedSessionID
+            else { return false }
+            return AgentComposerProjection.props(vm: agent, subject: .currentTab).submitTarget?.tabID == savedTab.id
+        }
+        XCTAssertEqual(agent.draftRuntime.text(for: savedTab.id), "Active draft edited mid-preparation")
+        XCTAssertEqual(agent.draftRuntime.text(for: freshTab.id), "Inactive draft edited mid-preparation")
+        XCTAssertEqual(window.workspaceManager.activeAgentSessionID(forTabID: savedTab.id), savedSessionID)
+        XCTAssertEqual(try Data(contentsOf: savedFile), savedBytes)
+        XCTAssertTrue(provider.promptedMessages.isEmpty)
+
+        let savedSession = try XCTUnwrap(agent.sessions[savedTab.id])
+        savedSession.selectedAgent = .openCode
+        savedSession.selectedModelRaw = "model-a"
+        savedSession.selectedReasoningEffortRaw = nil
+        savedSession.acpModelParameterSelections = []
+        savedSession.oversight.autoWakeOnUpdates = false
+        let restoredSendTarget = try XCTUnwrap(AgentComposerProjection.props(vm: agent, subject: .currentTab).submitTarget)
+        let restoredPrompt = "Restored post-recovery send"
+        let restoredSubmit = await agent.submitUserTurnCreatingSessionIfNeeded(
+            text: restoredPrompt, target: restoredSendTarget
+        )
+        XCTAssertEqual(restoredSubmit, .submitted)
+        try await AsyncTestWait.waitUntil("launch restored post-recovery ACP attempt") {
+            savedSession.agentTask != nil && savedSession.runID != nil && savedSession.acpController != nil
+        }
+        _ = try await routeScriptedHostProvider(savedSession)
+        await savedSession.agentTask?.value
+        XCTAssertEqual(provider.promptedMessages.count, 1, "Restored runState=\(savedSession.runState)")
+        let firstPrompt = try XCTUnwrap(provider.promptedMessages.first)
+        XCTAssertTrue(firstPrompt.userMessage.contains(restoredPrompt))
+        XCTAssertEqual(savedSession.activeAgentSessionID, savedSessionID)
+        await window.workspaceManager.debugDrainScheduledSaves()
+
+        await window.promptManager.switchComposeTab(freshTab.id, focusIntent: .userInitiated)
+        try await AsyncTestWait.waitUntil("activate fresh tab and publish usable composer") {
+            guard agent.currentTabID == freshTab.id, agent.sessions[freshTab.id] != nil else { return false }
+            return AgentComposerProjection.props(vm: agent, subject: .currentTab).submitTarget?.tabID == freshTab.id
+        }
+        XCTAssertEqual(agent.draftRuntime.text(for: freshTab.id), "Inactive draft edited mid-preparation")
+
+        agent.test_afterFreshForegroundSessionCreation = { _ in
+            await window.workspaceManager.debugDrainScheduledSaves()
+        }
+        defer { agent.test_afterFreshForegroundSessionCreation = nil }
+        let createdTabIDValue = await agent.createAndActivateSessionTab()
+        let createdTabID = try XCTUnwrap(createdTabIDValue)
+        XCTAssertNotEqual(createdTabID, savedTab.id)
+        XCTAssertNotEqual(createdTabID, freshTab.id)
+        try await AsyncTestWait.waitUntil("publish usable composer for newly created fresh session") {
+            guard agent.currentTabID == createdTabID, agent.sessions[createdTabID] != nil else { return false }
+            return AgentComposerProjection.props(vm: agent, subject: .currentTab).submitTarget?.tabID == createdTabID
+        }
+        let createdSession = try XCTUnwrap(agent.sessions[createdTabID])
+        XCTAssertFalse(createdSession.hasSentFirstMessage)
+        XCTAssertTrue(createdSession.items.isEmpty)
+        createdSession.selectedAgent = .openCode
+        createdSession.selectedModelRaw = "model-a"
+        createdSession.selectedReasoningEffortRaw = nil
+        createdSession.acpModelParameterSelections = []
+        createdSession.oversight.autoWakeOnUpdates = false
+        let freshSendTarget = try XCTUnwrap(AgentComposerProjection.props(vm: agent, subject: .currentTab).submitTarget)
+        XCTAssertEqual(freshSendTarget.tabID, createdTabID)
+        XCTAssertEqual(freshSendTarget.route, .existingAgentSession)
+        let freshPrompt = "Fresh post-recovery send"
+        let freshSubmit = await agent.submitUserTurnCreatingSessionIfNeeded(
+            text: freshPrompt, target: freshSendTarget
+        )
+        XCTAssertEqual(freshSubmit, .submitted)
+        try await AsyncTestWait.waitUntil("launch fresh post-recovery ACP attempt") {
+            createdSession.agentTask != nil && createdSession.runID != nil && createdSession.acpController != nil
+        }
+        _ = try await routeScriptedHostProvider(createdSession)
+        await createdSession.agentTask?.value
+        XCTAssertEqual(provider.promptedMessages.count, 2, "Fresh runState=\(createdSession.runState)")
+        let secondPrompt = try XCTUnwrap(provider.promptedMessages.dropFirst().first)
+        XCTAssertTrue(secondPrompt.userMessage.contains(freshPrompt))
+        XCTAssertNotNil(createdSession.activeAgentSessionID)
+        XCTAssertNotEqual(createdSession.activeAgentSessionID, savedSessionID)
+    }
+
     func testRemoteFollowUpReachesVisibleSessionOnIndependentHost() async throws {
         try await runVisibleLifetimeWitness(switchWorkspace: false, submission: .remoteFollowUp)
+    }
+
+    func testRemoteFollowUpPreservesOverseerBindingAndLink() async throws {
+        try await runVisibleLifetimeWitness(switchWorkspace: false, submission: .remoteFollowUp, withOutboundLink: true)
     }
 
     func testVisibleWorkspaceRoundTripPreservesDispatchedAttempt() async throws {
@@ -1195,7 +1514,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         switchWorkspace: Bool, failFinalSave: Bool = false, leaveOtherWindowOpen: Bool = false,
         holdFirstSave: Bool = false, explicitStop: Bool = false, detachedShutdown: DetachedShutdown? = nil,
         revokeLinkStartedRun: Bool = false, revokeDuringLinkSave: Bool = false, heldTool: VisibleHeldTool? = nil,
-        submission: VisibleSubmission = .composer
+        submission: VisibleSubmission = .composer, withOutboundLink: Bool = false
     ) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("VisibleAgentLifetime-\(UUID())")
         let gitFixture = heldTool == .fileEdit ? try ReviewGitRepositoryFixture(name: "VisibleHost", parentDirectory: directory) : nil
@@ -1247,8 +1566,9 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         tab.activeAgentSessionID = holdFirstSave ? nil : sessionID
         var workspace = WorkspaceModel(name: "Original", repoPaths: [root.path], customStoragePath: directory.appendingPathComponent("first"))
         var siblingTab = ComposeTabState()
-        if revokeLinkStartedRun { siblingTab.activeAgentSessionID = UUID() }
-        workspace.composeTabs = detachedShutdown == .sessionDeletion || revokeLinkStartedRun ? [tab, siblingTab] : [tab]
+        if revokeLinkStartedRun || withOutboundLink { siblingTab.activeAgentSessionID = UUID() }
+        workspace.composeTabs = detachedShutdown == .sessionDeletion || revokeLinkStartedRun || withOutboundLink
+            ? [tab, siblingTab] : [tab]
         workspace.activeComposeTabID = tab.id
         let second = WorkspaceModel(name: "Other", repoPaths: otherRoot.map { [$0.path] } ?? [], customStoragePath: directory.appendingPathComponent("second"))
         let authority = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: 0)
@@ -1287,6 +1607,48 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         session.oversight.autoWakeOnUpdates = false
         agent.test_installLiveSession(session)
         let command = try host.scope.admit(session: session)
+        let outboundLink: (AgentSessionLinkRuntimeBridge, DomainAgentSessionLinkEndpointIdentity)?
+        if withOutboundLink {
+            let siblingID = try XCTUnwrap(siblingTab.activeAgentSessionID)
+            let sibling = host.scope.makeSession(tabID: siblingTab.id)
+            sibling.installPersistentSessionBinding(.init(tabID: siblingTab.id, sessionID: siblingID, workspaceID: workspace.id))
+            sibling.recordRestorationAuthoritative(.persistedPayloadApplied)
+            sibling.hasLoadedPersistedState = true
+            agent.test_installLiveSession(sibling)
+            let executor = try XCTUnwrap(host.scope.linkExecution)
+            let endpoint = try XCTUnwrap(executor.agentSessionLinkObserverEndpoint(tabID: tab.id))
+            let authority = DomainAgentSessionLinkAuthority(identity: .init(
+                runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date()
+            ))
+            let bridge = AgentSessionLinkRuntimeBridge(authority: authority, host: WindowStatesManager.shared, toolAdvertisementInvalidator: { _ in })
+            var notifiedTargetIDs: [UUID] = []
+            let notification = NotificationCenter.default.publisher(
+                for: .agentSessionLinkOverseerProjectionDidChange, object: agent
+            ).sink { _ in
+                notifiedTargetIDs = agent.monitorPillPropsByEndpoint[endpoint]?.outbound.map(\.targetSessionID) ?? []
+            }
+            let result = await bridge.addMonitorLink(observerSessionID: sessionID, rawTargetSessionID: siblingID.uuidString)
+            guard case .added = result else { return XCTFail("Expected an outbound link, got \(result)") }
+            await bridge.test_settleProjections()
+            withExtendedLifetime(notification) {
+                XCTAssertEqual(notifiedTargetIDs, [siblingID], "The presenter notification must observe the updated cache")
+            }
+            XCTAssertEqual(agent.monitorPillPropsByEndpoint[endpoint]?.outbound.map(\.targetSessionID), [siblingID])
+            let hud = AgentNavigationHUDSnapshotBuilder.currentWindowSnapshot(windowState: window)
+            let hudItem = try XCTUnwrap(hud.items.first { $0.tabID == tab.id })
+            XCTAssertEqual(hudItem.windowID, window.windowID)
+            XCTAssertEqual(hudItem.overseenSessionCount, 1, "Role lookup must use the independent host route")
+            executor.test_agentSessionLinkHasActiveOutboundLink = { await bridge.hasActiveOutboundLink(observerEndpoint: $0) }
+            outboundLink = (bridge, endpoint)
+            do {
+                _ = try await agent.mcpPreflightResidentActivation(sessionID: sessionID)
+                XCTFail("An actual MCP activation must still refuse to adopt the overseer")
+            } catch {
+                XCTAssertTrue(String(describing: error).contains("MCP activation would revoke its oversight links"))
+            }
+        } else {
+            outboundLink = nil
+        }
         let rootIDs = try await activation.loadedRootIDs(for: command, route: host.route)
         XCTAssertEqual(rootIDs.count, 1)
         let resources = try await host.captureStartupResources(for: command, rootIDs: rootIDs)
@@ -1387,6 +1749,13 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                 let response = try await remoteSubmission.value
                 XCTAssertTrue(response.accepted)
                 XCTAssertEqual(response.sessionID, sessionID)
+                XCTAssertNil(session.mcpControlContext)
+                XCTAssertFalse(session.isMCPOriginated)
+                XCTAssertEqual(try host.scope.admit(session: session).identity, command.identity)
+                if let (bridge, endpoint) = outboundLink {
+                    let linkIsActive = await bridge.hasActiveOutboundLink(observerEndpoint: endpoint)
+                    XCTAssertTrue(linkIsActive, "A Remote follow-up must preserve the outbound oversight link")
+                }
             }
             XCTAssertEqual(provider.promptedMessages.count, 1)
             XCTAssertTrue(provider.promptedMessages[0].userMessage.contains(prompt))
@@ -2837,11 +3206,19 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             await host.scope.persistence.flushSave(for: f.session.tabID)
             await route.close()
         }
+        let canonicalAuthority = authority
         return (host, f, resources, provider, activations, {
             var replacement = workspace
             replacement.composeTabs[1].promptText = "Changed after resource capture"
             let document = try DomainWorkspaceDocument.decode(documentBytes: JSONEncoder().encode(replacement), fileURL: directory.appendingPathComponent("workspace.json"))
-            _ = await domain.workspaceStore.registerReadDocument(document)
+            if canonicalWorkspace {
+                let updated = try await canonicalAuthority.replaceWorking(
+                    replacement, fileURL: document.fileURL, expectedWorkspaceRevision: nil
+                )
+                XCTAssertEqual(updated.disposition, .applied)
+            } else {
+                _ = await domain.workspaceStore.registerReadDocument(document)
+            }
         }, authority)
     }
 

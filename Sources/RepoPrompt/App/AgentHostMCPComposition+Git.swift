@@ -42,6 +42,7 @@ extension AgentSessionRuntimeHost {
         let directory = WorkspaceSessionSidecarMigration.workspaceDirectory(for: workspace, root: route.workspaceStorageDirectory)
         let files = origin.lease.resources.files
         let requireCurrent = origin.requireCurrent
+        let settingsStore = modelRouterSettingsStore
         let identity = WorkspaceSelectionIdentity(workspaceID: workspace.id, tabID: origin.tab.id)
         let config = MCPGitToolProvider.HostExecution(
             workspaceID: workspace.id, workspaceDirectory: directory, repoPaths: workspace.repoPaths,
@@ -52,7 +53,13 @@ extension AgentSessionRuntimeHost {
                 guard !workspace.isSystemWorkspace else { throw MCPFileToolAuthorityFailure.unavailable }
                 let path = directory.appendingPathComponent("_git_data", isDirectory: true).path
                 if let root = await files.exactRootRef(path: path, kind: .workspaceGitData) { return root }
-                _ = try await files.loadRoot(path: path, kind: .workspaceGitData, cancelUnderlyingLoadOnCallerCancellation: true)
+                let fileSystemSettings = settingsStore.fileSystemSettingsSnapshot()
+                _ = try await files.loadRoot(
+                    path: path,
+                    kind: .workspaceGitData,
+                    fileSystemSettings: fileSystemSettings,
+                    cancelUnderlyingLoadOnCallerCancellation: true
+                )
                 guard let root = await files.exactRootRef(path: path, kind: .workspaceGitData) else {
                     throw MCPFileToolAuthorityFailure.unavailable
                 }

@@ -1,6 +1,8 @@
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptSettingsCore
 import RepoPromptWorkspaceContext
+import RepoPromptWorkspaceCore
 
 /// Exact resource ownership for one visible activation. This retains existing authorities and
 /// their leases; it does not mirror the workspace catalog or elect a session writer.
@@ -152,24 +154,32 @@ final class AgentSessionHostWorkspaceActivation {
 
     /// A visible activation pins the originating workspace roots before registering its route.
     /// No compose tab or saved carrier is required until a request captures its writer receipt.
-    func retainVisibleFileResources() async throws -> AgentHostWorkspaceResources.Lease {
+    func retainVisibleFileResources(
+        fileSystemSettings: FileSystemSettingsSnapshot
+    ) async throws -> AgentHostWorkspaceResources.Lease {
         guard savedTarget == nil, isPresenterCurrent, retainedRoots.isEmpty,
               let workspaceID = key.owner.workspaceID,
               let original = await authority.canonicalWorkspaceSnapshot(workspaceID), original.health != .removed,
               isPresenterCurrent
         else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
+        let loadablePaths = original.document.metadata.canonicalLoadableRepoPaths
         var rootIDs: [UUID] = []
-        for path in original.document.metadata.repoPaths {
+        rootIDs.reserveCapacity(loadablePaths.count)
+        for path in loadablePaths {
             try Task.checkCancellation()
             guard isPresenterCurrent else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
-            // Join the file store's existing load. Abandoning this candidate must not cancel
-            // a root producer which also belongs to the workspace's visible file projection.
-            let root = try await resources.files.loadRoot(path: path, cancelUnderlyingLoadOnCallerCancellation: false)
+            // Join the file store's existing primary root without mutating presentation detach
+            // state. Abandoning this candidate must not cancel a shared visible root load.
+            let root = try await resources.files.loadOrJoinPrimaryRoot(
+                path: path,
+                fileSystemSettings: fileSystemSettings,
+                cancelUnderlyingLoadOnCallerCancellation: false
+            )
             rootIDs.append(root.id)
         }
         guard isPresenterCurrent else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
         let lease = try await retainHostFileResources(rootIDs: rootIDs)
-        guard lease.snapshot.document.metadata.repoPaths == original.document.metadata.repoPaths,
+        guard lease.snapshot.document.metadata.canonicalLoadableRepoPaths == loadablePaths,
               isPresenterCurrent, lease.rootsAreCurrent, !Task.isCancelled
         else { throw AgentHostWorkspaceResources.Failure.contextChanged }
         return lease
@@ -182,13 +192,21 @@ final class AgentSessionHostWorkspaceActivation {
         guard let workspaceID = key.owner.workspaceID, isCurrent, catalogFileLease == nil else {
             throw AgentHostWorkspaceResources.Failure.authorityUnavailable
         }
-        let lease = try await resources.acquire(workspaceID: workspaceID, rootIDs: rootIDs) { snapshot in
-            guard let savedTarget else { return true }
+        let admits: (DomainWorkspaceSnapshot) -> Bool = { snapshot in
+            guard let savedTarget = self.savedTarget else { return true }
             guard let workspace = try? JSONDecoder().decode(WorkspaceModel.self, from: snapshot.document.documentBytes) else { return false }
             return savedTarget.carrier(in: workspace) != nil
         }
-        guard await authority.canonicalWorkspaceSnapshot(workspaceID) == lease.snapshot, isCurrent,
-              !Task.isCancelled, catalogFileLease == nil
+        let lease = try await resources.acquire(
+            workspaceID: workspaceID, rootIDs: rootIDs, authority: .canonical, admits: admits
+        )
+        let retainedPaths = Set(lease.roots.compactMap { StandardizedPath.canonicalWorkspaceRootPath($0.fullPath) })
+        guard let current = await authority.canonicalWorkspaceSnapshot(workspaceID),
+              current.health != .removed,
+              current.isInSameExecutionLineage(as: lease.snapshot),
+              admits(current),
+              current.document.metadata.canonicalLoadableRepoPathSet == retainedPaths,
+              isCurrent, lease.rootsAreCurrent, !Task.isCancelled, catalogFileLease == nil
         else {
             await lease.release()
             throw AgentHostWorkspaceResources.Failure.contextChanged
@@ -316,9 +334,11 @@ final class AgentSessionHostWorkspaceActivation {
         try Task.checkCancellation()
         try command.requireCurrent()
         guard isCurrent, !route.isClosing else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
-        let paths = Set(snapshot.document.metadata.repoPaths.map { ($0 as NSString).standardizingPath })
-        let selected = roots.filter { paths.contains(($0.fullPath as NSString).standardizingPath) }
-        guard Set(selected.map { ($0.fullPath as NSString).standardizingPath }) == paths else {
+        let paths = snapshot.document.metadata.canonicalLoadableRepoPathSet
+        let selected = roots.filter {
+            StandardizedPath.canonicalWorkspaceRootPath($0.fullPath).map(paths.contains) == true
+        }
+        guard Set(selected.compactMap { StandardizedPath.canonicalWorkspaceRootPath($0.fullPath) }) == paths else {
             throw AgentHostWorkspaceResources.Failure.rootsChanged
         }
         return selected.map(\.id)
@@ -378,19 +398,27 @@ final class AgentSessionHostWorkspaceActivation {
         let roots = Set(rootIDs)
         let existing = rootLeases[roots].flatMap { $0.rootsAreCurrent ? $0 : nil }
         let lease: AgentHostWorkspaceResources.Lease = if let existing {
-            try await existing.capture(workspaceID: workspaceID, admits: admits)
+            try await existing.capture(workspaceID: workspaceID, authority: .canonical, admits: admits)
         } else {
-            try await resources.acquire(workspaceID: workspaceID, rootIDs: rootIDs, admits: admits)
+            try await resources.acquire(workspaceID: workspaceID, rootIDs: rootIDs, authority: .canonical, admits: admits)
         }
         do {
             if savedTarget != nil {
-                guard await authority.canonicalWorkspaceSnapshot(workspaceID) == lease.snapshot else {
+                let retainedPaths = Set(lease.roots.compactMap { StandardizedPath.canonicalWorkspaceRootPath($0.fullPath) })
+                guard let current = await authority.canonicalWorkspaceSnapshot(workspaceID),
+                      current.health != .removed,
+                      current.isInSameExecutionLineage(as: lease.snapshot),
+                      admits(current),
+                      current.document.metadata.canonicalLoadableRepoPathSet == retainedPaths
+                else {
                     throw AgentHostWorkspaceResources.Failure.contextChanged
                 }
             }
             try Task.checkCancellation()
             try command.requireCurrent()
-            guard isCurrent, !route.isClosing else { throw AgentHostWorkspaceResources.Failure.authorityUnavailable }
+            guard isCurrent, lease.rootsAreCurrent, !route.isClosing else {
+                throw AgentHostWorkspaceResources.Failure.authorityUnavailable
+            }
             if existing == nil {
                 rootLeases[roots] = lease
                 retainedRoots.append(lease)
