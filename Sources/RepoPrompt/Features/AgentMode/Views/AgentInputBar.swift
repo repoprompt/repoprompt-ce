@@ -480,6 +480,15 @@ struct AgentComposerView: View, Equatable {
             && !isSubmissionPending
     }
 
+    private var disabledSendTooltip: String? {
+        guard !canSubmitToRenderedTarget else { return nil }
+        if !props.canSendWithCurrentProvider {
+            return props.unavailableSelectedAgentMessage
+                ?? "Connect an agent provider in Settings before sending."
+        }
+        return props.submitDisabledReason
+    }
+
     private var localInputTextBinding: Binding<String> {
         Binding(
             get: { localInputText },
@@ -964,6 +973,8 @@ struct AgentComposerView: View, Equatable {
                         resendAction: {}
                     )
                     .disabled(!canSubmitToRenderedTarget)
+                    .contentShape(Rectangle())
+                    .hoverTooltip(disabledSendTooltip)
                     .transaction { transaction in
                         transaction.animation = nil
                     }
@@ -1912,7 +1923,7 @@ struct AgentComposerView: View, Equatable {
         }
         guard let submitTarget = renderedSubmitTarget else {
             logViewSubmitRejection(reason: "view_nil_target", target: props.submitTarget)
-            showSteeringUnsupportedNotice(Self.staleSubmitTargetMessage)
+            showSteeringUnsupportedNotice(props.submitDisabledReason ?? Self.staleSubmitTargetMessage)
             return
         }
         setLocalInputText(rawDraftSnapshot)

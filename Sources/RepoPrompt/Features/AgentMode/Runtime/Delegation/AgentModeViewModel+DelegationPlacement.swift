@@ -210,16 +210,9 @@ extension AgentModeViewModel {
         guard session.activeAgentSessionID == sessionID else {
             throw DelegationPlacementPersistenceError.ownerChanged
         }
-        let placement = DelegationSpawnTargetPlacement(
-            organizationalParentID: session.organizationalParentID,
-            parentSessionID: session.parentSessionID,
-            createdByOverseerSessionID: session.createdByOverseerSessionID,
-            delegationScopeID: session.delegationScopeID
-        )
-        guard placement.admitsStamp(by: creatorSessionID) else { return false }
-        session.organizationalParentID = creatorSessionID
-        session.delegationScopeID = delegationScopeID
-        session.isDirty = true
+        guard DelegationSpawnAdmission.applyCreationStamp(
+            to: session, creatorSessionID: creatorSessionID, delegationScopeID: delegationScopeID
+        ) else { return false }
         if var entry = ownerValidatedSessionIndex[sessionID] {
             entry.organizationalParentID = creatorSessionID
             entry.delegationScopeID = delegationScopeID

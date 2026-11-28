@@ -9,6 +9,12 @@ extension AgentSessionLinkExecutionRuntime {
     func agentSessionLinkModelCandidate(
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> AgentSessionLinkEndpointCandidate? {
+        agentSessionLinkRuntimeCandidate(for: endpoint, displayName: nil)
+    }
+
+    func agentSessionLinkRuntimeCandidate(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity, displayName: String?
+    ) -> AgentSessionLinkEndpointCandidate? {
         guard agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
               let session = sessions[endpoint.tabID] else { return nil }
         return AgentSessionLinkEndpointCandidate(
@@ -23,7 +29,9 @@ extension AgentSessionLinkExecutionRuntime {
             roleAllowsOutboundMonitoring: AgentSessionLinkToolPolicy.allowsOutboundMonitoring(
                 taskLabelKind: session.mcpControlContext?.taskLabelKind
             ),
-            displayName: "", providerDisplayName: session.selectedAgent.rawValue, locationLabel: nil,
+            displayName: displayName ?? "",
+            providerDisplayName: displayName == nil ? session.selectedAgent.rawValue : session.selectedAgent.displayName,
+            locationLabel: nil,
             restorationReadiness: session.qualifiedRestorationReadiness,
             isDeletionInProgress: AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: endpoint.sessionID),
             parentSessionID: session.parentSessionID, createdByOverseerSessionID: session.createdByOverseerSessionID

@@ -114,6 +114,33 @@ final class WindowCloseCoordinatorPolicyTests: XCTestCase {
         }
     }
 
+    func testRetainedAgentRunDoesNotMaskWorkThatCloseEnds() {
+        let agent = activity(
+            id: AgentModeWorkspaceSwitchSessionProvider.activityID, count: 1,
+            singular: "active agent session", plural: "active agent sessions"
+        )
+        let agentOnly = makeSnapshot(
+            isLastAppWindow: true, isLastMCPEnabledWindow: true,
+            activeItems: [agent], mcp: mcp(toolsEnabled: true)
+        )
+        XCTAssertEqual(
+            WindowCloseCoordinator.decide(
+                snapshot: agentOnly, authorization: nil,
+                preservesAgentExecution: true, keepsProcessAliveForAgentExecution: true
+            ),
+            .allow
+        )
+        XCTAssertEqual(
+            WindowCloseCoordinator.decide(snapshot: agentOnly, authorization: nil),
+            .confirm(activeWorkConfirmation("1 active agent session"))
+        )
+        let mixed = makeSnapshot(activeItems: [agent], mcp: mcp(activeExecutionCount: 1))
+        XCTAssertEqual(
+            WindowCloseCoordinator.decide(snapshot: mixed, authorization: nil, preservesAgentExecution: true),
+            .confirm(activeWorkConfirmation("1 active MCP tool execution"))
+        )
+    }
+
     private func authorization(source: WindowCloseAuthorization.Source) -> WindowCloseAuthorization {
         WindowCloseAuthorization(
             source: source,

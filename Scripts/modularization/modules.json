@@ -43,7 +43,6 @@
         "RepoPromptShared",
         "RepoPromptWorkspaceCore",
         "Sparkle",
-        "RepoPromptRemoteProtocol",
         "RepoPromptWorkspaceContext",
         "RepoPromptMCPServer"
       ],
@@ -323,9 +322,7 @@
     },
     "RepoPromptShared": {
       "source_root": "Sources/RepoPromptShared",
-      "allowed_dependencies": [
-        "RepoPromptRemoteProtocol"
-      ]
+      "allowed_dependencies": []
     },
     "RepoPromptTestSupport": {
       "source_root": "Tests/RepoPromptTestSupport",
@@ -356,7 +353,6 @@
         "RepoPromptShared",
         "RepoPromptTestSupport",
         "RepoPromptWorkspaceCore",
-        "RepoPromptRemoteProtocol",
         "RepoPromptWorkspaceContext",
         "RepoPromptWorkspaceContextTestSupport",
         "RepoPromptMCPServer"
@@ -462,17 +458,9 @@
         "RepoPromptInstrumentation"
       ]
     },
-    "RepoPromptRemoteProtocol": {
-      "source_root": "Sources/RepoPromptRemoteProtocol",
-      "allowed_dependencies": [],
-      "test_target": "RepoPromptRemoteProtocolTests",
-      "app_free_tests": true
-    },
     "RepoPromptRemoteProtocolTests": {
       "source_root": "Tests/RepoPromptRemoteProtocolTests",
-      "allowed_dependencies": [
-        "RepoPromptRemoteProtocol"
-      ]
+      "allowed_dependencies": []
     },
     "RepoPromptIrohSpikeMac": {
       "source_root": "Spikes/IrohTransportSpikeMac",

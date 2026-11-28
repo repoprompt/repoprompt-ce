@@ -1728,6 +1728,7 @@ enum AgentSessionOversightPersistenceCopy {
 struct AgentSessionOversightWarning: Equatable, Identifiable {
     let id: String
     let message: String
+    var canRetrySessionSettlement = false
 }
 
 /// Process-wide durable-oversight state, overlaid onto every window's Oversee props.
@@ -1802,12 +1803,13 @@ struct AgentSessionOversightPersistencePresentation: Equatable {
     /// Returns `false` when nothing changed, so a caller can skip a broadcast that would repaint
     /// every window for an identical value.
     @discardableResult
-    mutating func appendWarning(id: String, message: String) -> Bool {
-        if let existing = warnings.first(where: { $0.id == id }), existing.message == message {
+    mutating func appendWarning(id: String, message: String, canRetrySessionSettlement: Bool = false) -> Bool {
+        let warning = AgentSessionOversightWarning(id: id, message: message, canRetrySessionSettlement: canRetrySessionSettlement)
+        if warnings.contains(warning) {
             return false
         }
         warnings.removeAll { $0.id == id }
-        warnings.append(AgentSessionOversightWarning(id: id, message: message))
+        warnings.append(warning)
         if warnings.count > Self.maxWarnings {
             // Oldest first: the newest failure is the one the user is currently reacting to.
             warnings.removeFirst(warnings.count - Self.maxWarnings)

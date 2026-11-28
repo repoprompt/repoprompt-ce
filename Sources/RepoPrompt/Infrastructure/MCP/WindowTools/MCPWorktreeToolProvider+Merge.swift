@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptMCPServer
 import RepoPromptVCS
 import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
@@ -25,8 +26,8 @@ extension MCPWorktreeToolProvider {
         }
     }
 
-    func executeMerge(op: Operation, args: [String: Value]) async throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
-        let session = try await resolveMergeSession(args: args, needsResources: op != .status)
+    func executeMerge(op: Operation, args: [String: Value], invocationContext: ToolInvocationContext) async throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
+        let session = try await resolveMergeSession(args: args, needsResources: op != .status, invocationContext: invocationContext)
         do {
             switch op {
             case .preview:
@@ -297,7 +298,20 @@ extension MCPWorktreeToolProvider {
         try admission.requireCurrent()
     }
 
-    private func resolveMergeSession(args: [String: Value], needsResources: Bool) async throws -> SessionResolution {
+    private func resolveMergeSession(args: [String: Value], needsResources: Bool, invocationContext: ToolInvocationContext) async throws -> SessionResolution {
+        if let canonicalCommand {
+            guard let captured = canonicalCommand(invocationContext) else { throw MCPFileToolAuthorityFailure.unavailable }
+            if let raw = trimmedString(args["session_id"]) {
+                guard let id = UUID(uuidString: raw) else { throw MCPError.invalidParams("session_id must be a UUID. Received: \(raw)") }
+                guard id == captured.identity.sessionID else { throw MCPError.invalidParams("session_id must match the routed Agent Mode session.") }
+            }
+            let admission = needsResources ? try await ExecutionAdmission(captured).resolve() : nil
+            guard !Task.isCancelled, canonicalCommand(invocationContext)?.identity == captured.identity else {
+                throw MCPFileToolAuthorityFailure.superseded
+            }
+            return .init(sessionID: captured.identity.sessionID, isRoutedAgentMode: true, command: captured, admission: admission)
+        }
+        let dependencies = try physicalDependencies()
         let metadata = await dependencies.context.captureRequestMetadata()
         let resolved = try dependencies.context.resolveTabContextSnapshot(metadata, MCPWindowToolName.manageWorktree)
         let raw = trimmedString(args["session_id"])

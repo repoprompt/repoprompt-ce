@@ -6,10 +6,105 @@ import RepoPromptDomainRuntime
 import RepoPromptRemoteProtocol
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
+import RepoPromptVCS
 import XCTest
 
 @MainActor
 final class RemoteGatewayRouterTests: XCTestCase {
+    func testVoiceStartRequiresConfirmedSyncWhileStatusEndAndUnpairRemainAvailable() throws {
+        let workspaceID = UUID()
+        let callID = UUID()
+        let start = RemoteGatewayRequest.workspaceVoice(.init(action: .start, callID: callID, workspaceID: workspaceID, offerSDP: "v=0"))
+        let status = RemoteGatewayRequest.workspaceVoice(.init(action: .status, callID: callID, workspaceID: workspaceID))
+        let end = RemoteGatewayRequest.workspaceVoice(.init(action: .end, callID: callID, workspaceID: workspaceID))
+        var sync = RemoteIrohGatewayAdapter.SyncState(sessionID: UUID())
+        XCTAssertFalse(sync.permits(start))
+        XCTAssertFalse(RemoteIrohGatewayAdapter.SyncState(sessionID: nil).permits(start))
+        XCTAssertTrue(sync.permits(status))
+        XCTAssertTrue(sync.permits(end))
+        XCTAssertTrue(sync.permits(.unpair))
+        let ticket = try XCTUnwrap(sync.issueTicket())
+        XCTAssertFalse(sync.permits(start))
+        XCTAssertTrue(sync.confirm(ticket))
+        XCTAssertTrue(sync.permits(start))
+    }
+
+    func testWorkspaceVoiceStartRequiresConsentWhileStatusAndEndStillRoute() async throws {
+        let workspaceID = UUID()
+        let callID = UUID()
+        var hasConsent = false
+        var routed: [RemoteWorkspaceVoiceRequest.Action] = []
+        let router = makeRouter(
+            workspaceVoiceConsent: { hasConsent },
+            workspaceVoice: { request, _ in
+                routed.append(request.action)
+                return .init(callID: callID, workspaceID: workspaceID, phase: .ended)
+            }
+        )
+        let peer = RemoteGatewayRequestContext.testPeer(authorizationHeader: "Bearer valid")
+        let start = RemoteGatewayRequest.workspaceVoice(.init(action: .start, callID: callID, workspaceID: workspaceID, offerSDP: "v=0"))
+        let denied = await router.route(start, context: peer)
+        XCTAssertEqual(denied.status, 403)
+        XCTAssertEqual(try error(from: denied).code, "workspace_voice_consent_required")
+        XCTAssertTrue(routed.isEmpty)
+
+        for action: RemoteWorkspaceVoiceRequest.Action in [.status, .end] {
+            let response = await router.route(.workspaceVoice(.init(action: action, callID: callID, workspaceID: workspaceID)), context: peer)
+            XCTAssertEqual(response.status, 200)
+        }
+        hasConsent = true
+        let accepted = await router.route(start, context: peer)
+        XCTAssertEqual(accepted.status, 200)
+        XCTAssertEqual(routed, [.status, .end, .start])
+    }
+
+    func testWorkspacePresentationRequiresPairedControlAndReturnsRequestedState() async throws {
+        var authority: RemoteAuthorityLevel = .observe
+        var changes: [RemoteWorkspacePresentation] = []
+        let router = makeRouter(
+            authorize: { $0.authorizationHeader == "Bearer valid" },
+            authorizationState: { .init(defaultLevel: authority) },
+            workspacePresentation: { request, authorize in
+                try authorize()
+                changes.append(request)
+            }
+        )
+        let paired = RemoteGatewayRequestContext.testPeer(authorizationHeader: "Bearer valid")
+        let open = RemoteWorkspacePresentation(workspaceID: UUID(), isOpen: true)
+        let unpairedReply = await router.route(.workspacePresentation(open), context: .testPeer(authorizationHeader: nil))
+        XCTAssertEqual(unpairedReply.status, 401)
+        let observeReply = await router.route(.workspacePresentation(open), context: paired)
+        XCTAssertEqual(observeReply.status, 403)
+        XCTAssertTrue(changes.isEmpty)
+
+        authority = .control
+        let close = RemoteWorkspacePresentation(workspaceID: open.workspaceID, isOpen: false)
+        for request in [open, close] {
+            let reply = await router.route(.workspacePresentation(request), context: paired)
+            XCTAssertEqual(reply.status, 200)
+            XCTAssertEqual(try JSONDecoder().decode(RemoteWorkspacePresentation.self, from: json(from: reply)), request)
+        }
+        XCTAssertEqual(changes, [open, close])
+    }
+
+    func testWorkspacePresentationRevalidatesAuthorityBeforeChangingWindows() async throws {
+        var generation: UInt64 = 1
+        let router = makeRouter(
+            commandGeneration: { generation },
+            workspacePresentation: { _, authorize in
+                generation += 1
+                try authorize()
+                XCTFail("A stale workspace change must be rejected")
+            }
+        )
+        let reply = await router.route(
+            .workspacePresentation(.init(workspaceID: UUID(), isOpen: true)),
+            context: .testPeer(authorizationHeader: "Bearer valid")
+        )
+        XCTAssertEqual(reply.status, 409)
+        XCTAssertEqual(try error(from: reply).code, "workspace_presentation")
+    }
+
     func testFirstSyncDoesNotSendSavedSessionIndexForTwoWorkspaces() async throws {
         let workspaceIDs = [UUID(), UUID()]
         let liveID = UUID()
@@ -550,7 +645,14 @@ final class RemoteGatewayRouterTests: XCTestCase {
         pairIroh: @escaping (RemoteIrohPairingRequest, String) -> Result<RemoteIrohPairingResponse, Error> = { _, _ in
             .failure(TestFailure.unexpectedResponse)
         },
-        bootstrapSnapshot: (() async -> RemoteSnapshot?)? = nil
+        bootstrapSnapshot: (() async -> RemoteSnapshot?)? = nil,
+        workspaceVoiceConsent: @escaping () -> Bool = { false },
+        workspaceVoice: @escaping (RemoteWorkspaceVoiceRequest, RemoteGatewayRequestContext) throws -> RemoteWorkspaceVoiceStatus = { _, _ in
+            throw TestFailure.unexpectedResponse
+        },
+        workspacePresentation: @escaping (RemoteWorkspacePresentation, @escaping RemoteDispatchAuthorization) async throws -> Void = { _, _ in
+            throw TestFailure.unexpectedResponse
+        }
     ) -> RemoteGatewayRequestRouter {
         RemoteGatewayRequestRouter(services: RemoteGatewayRoutingServices(
             authorize: authorize,
@@ -566,7 +668,10 @@ final class RemoteGatewayRouterTests: XCTestCase {
             eventCursor: eventCursor,
             imageAttachment: imageAttachment,
             pairIroh: pairIroh,
-            bootstrapSnapshot: bootstrapSnapshot
+            bootstrapSnapshot: bootstrapSnapshot,
+            workspaceVoiceConsent: workspaceVoiceConsent,
+            workspaceVoice: workspaceVoice,
+            workspacePresentation: workspacePresentation
         ))
     }
 
@@ -597,6 +702,8 @@ final class RemoteGatewayRouterTests: XCTestCase {
         case .history: "history"
         case .transcript: "transcript"
         case .imageAttachment: "image_attachment"
+        case .workspaceVoice: "workspace_voice"
+        case .workspacePresentation: "workspace_presentation"
         case .events: "events"
         case .command: "command"
         }
@@ -752,19 +859,36 @@ final class RemoteIrohSecurityTests: XCTestCase {
         XCTAssertTrue(manager.isPaired)
     }
 
-    func testExpiredQRAndLegacyPrepareCannotActivateNewDevice() throws {
+    func testLegacyHelloPairsOnceAndPreservesTheCredentialAcrossRestart() throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 4600))
+        var disk = RemoteStoredPairingState()
+        let manager = makeManager(clock: clock, persist: { disk = $0 })
+        let issued = try manager.issueAdvertisement(server: .init(endpointID: endpointID("a")))
+        let legacy = pairingRequest(secret: issued.oneTimeSecret, attemptID: nil)
+        XCTAssertThrowsError(try prepare(legacy, on: manager, peer: endpointID("c")))
+        let receipt = try prepare(legacy, on: manager)
+        XCTAssertNil(receipt.attemptID)
+        XCTAssertNil(disk.pending)
+        XCTAssertNil(disk.advertisement)
+        XCTAssertTrue(isAuthorized(receipt, on: manager))
+        XCTAssertThrowsError(try prepare(legacy, on: manager))
+        let restored = makeManager(clock: clock, storedState: disk)
+        XCTAssertTrue(isAuthorized(receipt, on: restored))
+    }
+
+    func testLegacyHelloCannotReplacePendingConfirmationOrUseExpiredCode() throws {
         let clock = TestClock(Date(timeIntervalSince1970: 4600))
         let manager = makeManager(clock: clock)
         let issued = try manager.issueAdvertisement(server: .init(endpointID: endpointID("a")))
-        let legacy = pairingRequest(secret: issued.oneTimeSecret, attemptID: nil)
-        XCTAssertThrowsError(try prepare(legacy, on: manager)) { error in
-            guard case RemoteGatewaySecurityError.confirmationRequired = error else {
-                return XCTFail("Expected legacy pairing to require an app update")
-            }
-        }
-        clock.date = issued.expiresAt
+        let receipt = try prepare(pairingRequest(secret: issued.oneTimeSecret), on: manager)
+        XCTAssertThrowsError(try prepare(pairingRequest(secret: issued.oneTimeSecret, attemptID: nil), on: manager))
+        XCTAssertFalse(isAuthorized(receipt, on: manager))
+        XCTAssertTrue(try confirm(confirmation(for: receipt), on: manager))
+        try manager.revokeDevice()
+        let next = try manager.issueAdvertisement(server: .init(endpointID: endpointID("a")))
+        clock.date = next.expiresAt
         XCTAssertEqual(manager.status, .codeExpired)
-        XCTAssertThrowsError(try prepare(pairingRequest(secret: issued.oneTimeSecret), on: manager))
+        XCTAssertThrowsError(try prepare(pairingRequest(secret: next.oneTimeSecret, attemptID: nil), on: manager))
         XCTAssertFalse(manager.isPaired)
     }
 
@@ -1215,6 +1339,22 @@ final class RemoteMutationBehaviorTests: XCTestCase {
         XCTAssertEqual(session.selectedModelRaw, originalModel)
     }
 
+    func testRemoteInterviewRejectsCodexControlCommandBeforeSubmission() async throws {
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let agentMode = window.agentModeViewModel
+        let tabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.composeTabs.first?.id)
+        let session = await agentMode.ensureSessionReady(tabID: tabID)
+        session.selectedAgent = .codexExec
+
+        let result = agentMode.submitUserTurn(
+            text: "/goal", tabID: tabID, isLocalComposerInput: false, remoteInterviewFirst: true
+        )
+
+        XCTAssertEqual(result, .blocked(message: "Interview first requires a message that starts an agent turn."))
+        XCTAssertTrue(session.items.isEmpty)
+    }
+
     func testStartCommandSavesConfiguredSessionAndDeliversUploadedFile() async throws {
         let window = try await makeWindow()
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
@@ -1258,6 +1398,7 @@ final class RemoteMutationBehaviorTests: XCTestCase {
             workspaceID: workspace.id.uuidString,
             message: "Exercise the Remote launch path.",
             agentID: "claudeCode",
+            interviewFirst: true,
             attachmentIDs: [attachmentID]
         ), authorizeDispatch: {})
 
@@ -1273,7 +1414,9 @@ final class RemoteMutationBehaviorTests: XCTestCase {
             return XCTFail("Expected the uploaded file in managed attachment storage.")
         }
         let escapedPath = AgentSessionProviderInputRuntime.escapePathForAtCommand(path)
-        XCTAssertTrue(try XCTUnwrap(inputAtDispatch).contains("@\(escapedPath)"))
+        let input = try XCTUnwrap(inputAtDispatch)
+        XCTAssertTrue(input.contains("@\(escapedPath)"))
+        XCTAssertTrue(input.contains("<interview_first>"))
         XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), bytes)
     }
 
@@ -1319,6 +1462,254 @@ final class RemoteMutationBehaviorTests: XCTestCase {
 
 @MainActor
 final class RemoteProducerParityTests: XCTestCase {
+    func testRecordedQuestionsProjectLiveAndSavedExchangesWithoutRawToolPayloads() throws {
+        struct LegacyTranscriptRow: Decodable {
+            struct Detail: Decodable {
+                let argumentsJSON: String?
+                let resultJSON: String?
+                let keyPaths: [String]
+            }
+
+            let text: String?
+            let detail: Detail?
+        }
+
+        let arguments = """
+        {"title":"Badge setup","provider_context":"internal test metadata","questions":[
+            {"id":"shape","header":"Shape","question":"What shape should the badge be?"},
+            {"id":"placement","header":"Placement","question":"Where should the badge appear?"},
+            {"id":"notes","header":"Notes","question":"Any other notes? Bearer fixture-only-value"}
+        ]}
+        """
+        let result = """
+        {"answers":{
+            "shape":{"answers":["Square"]},
+            "placement":{"answers":["Sidebar","Header"]},
+            "notes":{"skipped":true}
+        },"timed_out":false,"skipped":false}
+        """
+        let stored = try XCTUnwrap(
+            AgentAskUserTranscriptExchange.decode(argsJSON: arguments, resultJSON: result)?
+                .persistedResultJSON(statusWord: "success", summaryText: "ask_user • success", byteBudget: 4096)
+        )
+        let executions = [
+            toolExecution(name: "mcp__RepoPrompt__ask_user", status: .success, argsJSON: arguments, resultJSON: result),
+            toolExecution(name: "ask_user", status: .success, resultJSON: stored),
+            toolExecution(
+                name: "ask_user",
+                status: .success,
+                argsJSON: arguments,
+                resultJSON: #"{"answers":{},"timed_out":true}"#
+            ),
+            toolExecution(
+                name: "ask_user",
+                status: .success,
+                argsJSON: arguments,
+                resultJSON: #"{"status":"success"}"#
+            )
+        ]
+        let timestamp = Date(timeIntervalSinceReferenceDate: 100)
+        let activities = executions.enumerated().map { index, execution in
+            AgentTranscriptActivity(
+                id: fixedUUID(960 + index), timestamp: timestamp, sequenceIndex: index,
+                role: index == 1 ? .assistant : .toolExecution, itemKind: .toolResult,
+                text: index == 1 ? "Previously recorded answer" : "", toolExecution: execution,
+                isSubstantiveAssistant: index == 1, sealsAssistantBoundary: index == 0
+            )
+        }
+        let transcript = AgentTranscript(
+            turns: [.init(
+                id: fixedUUID(965), request: nil, responseSpans: [.init(startedAt: timestamp, activities: activities)],
+                startedAt: timestamp
+            )],
+            nextSequenceIndex: activities.count
+        )
+
+        let collapsed = WindowRemoteReadService.project(transcript: transcript, includeDetails: false)
+        let expanded = WindowRemoteReadService.project(transcript: transcript, includeDetails: true)
+        XCTAssertEqual(collapsed.map(\.semanticKind), [.question, .question, .question, .question])
+        XCTAssertTrue(collapsed.allSatisfy { $0.kind == .activity })
+        XCTAssertEqual(collapsed.map(\.text), [
+            "Shape: Square · Placement: Sidebar, Header · Notes: Skipped",
+            "Shape: Square · Placement: Sidebar, Header · Notes: Skipped",
+            "Timed out",
+            nil
+        ])
+        XCTAssertTrue(collapsed.allSatisfy { $0.detail == nil })
+        let exchange = try XCTUnwrap(expanded.first?.detail?.questionExchange)
+        XCTAssertEqual(exchange.title, "Badge setup")
+        XCTAssertEqual(exchange.questions[1].prompt, "Where should the badge appear?")
+        XCTAssertEqual(exchange.questions[1].answer, "Sidebar, Header")
+        XCTAssertTrue(exchange.questions[2].skipped)
+        XCTAssertEqual(expanded[1].detail?.questionExchange, exchange)
+        XCTAssertEqual(expanded[2].detail?.questionExchange?.outcome, .timedOut)
+        XCTAssertNil(expanded[3].detail?.questionExchange)
+        XCTAssertNil(expanded[0].detail?.argumentsJSON)
+        XCTAssertNil(expanded[0].detailText)
+
+        // Older iOS builds ignore questionExchange and display detail.resultJSON
+        // even when the collapsed row already has text.
+        let legacyRows = try JSONDecoder().decode([LegacyTranscriptRow].self, from: JSONEncoder().encode(expanded))
+        XCTAssertNotNil(legacyRows[0].text)
+        XCTAssertNil(legacyRows[0].detail?.argumentsJSON)
+        XCTAssertEqual(legacyRows[0].detail?.keyPaths, [])
+        let legacyResult = try XCTUnwrap(legacyRows[0].detail?.resultJSON)
+        XCTAssertTrue(legacyResult.contains("What shape should the badge be?\nAnswer\nSquare"))
+        XCTAssertTrue(legacyResult.contains("Where should the badge appear?\nAnswer\nSidebar, Header"))
+        XCTAssertTrue(legacyResult.contains("Bearer [REDACTED]\nAnswer\nSkipped"))
+        XCTAssertFalse(legacyResult.contains("fixture-only-value"))
+        XCTAssertFalse(legacyResult.contains("internal test metadata"))
+        XCTAssertEqual(legacyRows[1].detail?.resultJSON, legacyResult)
+        XCTAssertTrue(try XCTUnwrap(legacyRows[2].detail?.resultJSON).contains("Answer\nTimed out"))
+    }
+
+    func testLiveTranscriptRecoversGitPreviewAfterToolResultCompaction() async throws {
+        let diff = try await MCPGitToolProjection.makeDiffDTO(
+            compare: "uncommitted",
+            detail: "patches",
+            changedFiles: [VCSUncommittedFile(path: "README.md", status: "M", additions: 2, deletions: 1)],
+            perFilePatches: ["README.md": "--- a/README.md\n+++ b/README.md\n@@ -1 +1,2 @@\n-old\n+new\n+extra\n"],
+            maxLinesForPatches: 100
+        )
+        let resultJSON = try String(decoding: JSONEncoder().encode(
+            ToolResultDTOs.GitToolReplyDTO(op: "diff", diff: diff)
+        ), as: UTF8.self)
+        let result = AgentChatItem.toolResult(
+            name: "git", invocationID: UUID(),
+            argsJSON: #"{"op":"diff","detail":"patches","path":"README.md"}"#,
+            resultJSON: resultJSON, isError: false, sequenceIndex: 1
+        )
+        let agentMode = AgentModeViewModel(
+            testWindowID: -993, testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in preconditionFailure("No provider is needed") },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            mcpServerEnabler: { true }
+        )
+        let tabID = UUID()
+        let workspaceManager = AgentSessionLinkEndpointTestSupport.installWorkspace(
+            on: agentMode, tabID: tabID, name: "Remote live diff"
+        )
+        let session = AgentModeViewModel.TabSession(tabID: tabID)
+        let sessionID = UUID()
+        agentMode.test_installLiveSession(session)
+        _ = try XCTUnwrap(agentMode.test_installPersistentSessionBinding(sessionID: sessionID, on: session))
+        session.setItemsSilently([.user("Show the README diff", sequenceIndex: 0), result], reason: .testOverride)
+        session.compactSummaryOnlyToolResultsAndAlignEphemeralPayloadMap()
+        session.transcript = AgentTranscriptIO.buildTranscript(from: session.items, compact: false)
+        let compacted = try XCTUnwrap(session.transcript.allActivities.first { $0.id == result.id }?.toolExecution?.resultJSON)
+        XCTAssertTrue(AgentTranscriptToolNormalizer.isSummaryOnly(raw: compacted))
+        XCTAssertEqual(agentMode.rawToolResultPayloadForRendering(tabID: tabID, itemID: result.id), resultJSON)
+
+        let service = WindowRemoteReadService(contexts: [(agentMode, workspaceManager)])
+        let page = try await service.transcript(
+            sessionID: sessionID, paging: .recentBackward(before: nil), limit: 20, includeDetails: false
+        )
+        let collapsed = try XCTUnwrap(page.items.first { $0.id == result.id })
+        XCTAssertEqual(collapsed.diffSummary, .init(fileCount: 1, singleFilePath: "README.md", additions: 2, deletions: 1))
+        XCTAssertNil(collapsed.detail)
+
+        let expanded = try await service.transcript(
+            sessionID: sessionID, paging: .exactItem(result.id), limit: 1, includeDetails: true
+        )
+        let detail = try XCTUnwrap(expanded.items.first?.detail)
+        let preview = try XCTUnwrap(detail.diffPreview)
+        let patch = try XCTUnwrap(preview.files.first?.patch)
+        XCTAssertTrue(patch.contains("@@ -1 +1,2 @@\n-old\n+new\n+extra"))
+        XCTAssertFalse(preview.isTruncated)
+        XCTAssertEqual(detail.resultJSON, compacted)
+
+        let oversizedResult = resultJSON.replacingOccurrences(of: "+new", with: "+" + String(repeating: "界", count: 23000))
+        XCTAssertLessThan(oversizedResult.count, 65536)
+        XCTAssertGreaterThan(oversizedResult.utf8.count, 65536)
+        session.replaceEphemeralToolResultPayloadMap([result.id: oversizedResult], liveItemIDs: [result.id])
+
+        let boundedPage = try await service.transcript(
+            sessionID: sessionID, paging: .recentBackward(before: nil), limit: 20, includeDetails: false
+        )
+        let boundedRow = try XCTUnwrap(boundedPage.items.first { $0.id == result.id })
+        XCTAssertNil(boundedRow.diffSummary)
+        XCTAssertTrue(try XCTUnwrap(boundedRow.text).contains("1 files (+2 -1)"))
+        let boundedDetails = try await service.transcript(
+            sessionID: sessionID, paging: .exactItem(result.id), limit: 1, includeDetails: true
+        )
+        XCTAssertNil(boundedDetails.items.first?.detail?.diffPreview)
+        XCTAssertEqual(boundedDetails.items.first?.detail?.resultJSON, compacted)
+    }
+
+    func testRecordedDiffUsesDesktopCardPatchAndKeepsLargeGitSummaries() throws {
+        let edit = #"""
+        {"structuredContent":{"status":"success","edits_requested":1,"edits_applied":1,
+        "added_lines":1,"deleted_lines":1,"card_unified_diff":"--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-old\n+new"}}
+        """#
+        let gitPatch = "-old\n+first change\n+" + String(repeating: "x", count: 13000)
+        let gitPatchJSON = try String(decoding: JSONEncoder().encode(gitPatch), as: UTF8.self)
+        let git = #"""
+        {"op":"diff","diff":{"compare":"uncommitted","oneliner":"1 file","totals":{"files":1,"insertions":2,"deletions":1},
+        "files":[{"path":"Sources/A.swift","status":"modified","insertions":2,"deletions":1,
+        "hunks":[{"header":"@@ -1 +1,2 @@","old_start":1,"new_start":1,"patch":\#(gitPatchJSON)}]}]}}
+        """#
+        let executions = [
+            toolExecution(name: "apply_edits", status: .success, argsJSON: #"{"path":"/project/README.md"}"#, resultJSON: edit),
+            toolExecution(name: "git", status: .success, resultJSON: git),
+            toolExecution(name: "git", status: .success, resultJSON: #"{"op":"status"}"#)
+        ]
+        let timestamp = Date(timeIntervalSinceReferenceDate: 100)
+        let activities = executions.enumerated().map { index, execution in
+            AgentTranscriptActivity(
+                id: fixedUUID(980 + index), timestamp: timestamp, sequenceIndex: index,
+                role: .toolExecution, itemKind: .toolResult, text: "", toolExecution: execution,
+                sealsAssistantBoundary: index == 0
+            )
+        }
+        let transcript = AgentTranscript(
+            turns: [.init(
+                id: fixedUUID(985), request: nil, responseSpans: [.init(startedAt: timestamp, activities: activities)],
+                startedAt: timestamp
+            )],
+            nextSequenceIndex: activities.count
+        )
+
+        let collapsed = WindowRemoteReadService.project(transcript: transcript, includeDetails: false)
+        let expanded = WindowRemoteReadService.project(transcript: transcript, includeDetails: true)
+        XCTAssertEqual(collapsed[0].kind, .activity)
+        XCTAssertEqual(collapsed[0].semanticKind, .compactActivity)
+        XCTAssertEqual(collapsed[0].diffSummary, .init(fileCount: 1, singleFilePath: "README.md", additions: 1, deletions: 1))
+        XCTAssertEqual(collapsed[1].diffSummary, .init(fileCount: 1, singleFilePath: "Sources/A.swift", additions: 2, deletions: 1))
+        XCTAssertNil(collapsed[2].diffSummary)
+        XCTAssertTrue(collapsed.allSatisfy { $0.detail == nil })
+        XCTAssertEqual(expanded.map(\.diffSummary), collapsed.map(\.diffSummary))
+        XCTAssertEqual(expanded[0].detail?.diffPreview?.files.first?.patch, "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-old\n+new")
+        let preview = try XCTUnwrap(expanded[1].detail?.diffPreview)
+        XCTAssertTrue(preview.isTruncated)
+        XCTAssertEqual(preview.files.first?.patch, "@@ -1 +1,2 @@\n-old\n+first change")
+        XCTAssertNil(expanded[2].detail?.diffPreview)
+        XCTAssertEqual(try JSONDecoder().decode([RemoteTranscriptItem].self, from: JSONEncoder().encode(expanded)), expanded)
+    }
+
+    func testCompactToolSummariesIncludeResultMetadataWithoutFullOutput() {
+        let read = toolExecution(
+            name: "read_file", status: .success, argsJSON: #"{"path":"Sources/A.swift"}"#,
+            resultJSON: #"{"content":"omitted body","total_lines":100,"first_line":3,"last_line":6,"display_path":"Sources/A.swift"}"#
+        )
+        XCTAssertEqual(WindowRemoteReadService.compactToolSummary(read), "Sources/A.swift • Lines 3–6")
+        let search = toolExecution(
+            name: "file_search", status: .success, argsJSON: #"{"pattern":"needle"}"#,
+            resultJSON: #"{"total_matches":12,"content_match_groups":[]}"#
+        )
+        XCTAssertEqual(WindowRemoteReadService.compactToolSummary(search), "\"needle\" • 12 matches")
+        let command = toolExecution(
+            name: "functions.exec_command", status: .failed,
+            resultJSON: #"{"type":"commandExecution","command":"swift build","exitCode":1,"aggregatedOutput":"omitted output","status":"failed"}"#
+        )
+        XCTAssertEqual(WindowRemoteReadService.compactToolSummary(command), "Shell command • Exit 1")
+        let patch = toolExecution(
+            name: "apply_patch", status: .success,
+            resultJSON: #"{"status":"success","change_count":1,"changes":[{"path":"Sources/A.swift","kind":"update","diff":"@@ -1 +1 @@\n-old\n+new"}]}"#
+        )
+        XCTAssertEqual(WindowRemoteReadService.compactToolSummary(patch), "Sources/A.swift • +1 −1 lines")
+        XCTAssertNil(WindowRemoteReadService.compactToolSummary(toolExecution(name: "unrecognized", status: .success)))
+    }
+
     func testWorkflowDescriptorsUseAuthoritativeVisualsAndFeaturedRanks() throws {
         let customID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000901"))
         let custom = AgentWorkflowDefinition(
@@ -1777,7 +2168,7 @@ final class RemoteProducerParityTests: XCTestCase {
                 argsJSON: #"{"api_key":"raw-argument"}"#,
                 resultJSON: #"{"password":"raw-result"}"#,
                 isError: true,
-                summaryText: "Command failed"
+                summaryText: "TOKEN=shell-secret do-work"
             ),
             reasoning: "Bearer raw-reasoning"
         )
@@ -1863,7 +2254,7 @@ final class RemoteProducerParityTests: XCTestCase {
         XCTAssertEqual(sanitized.first { $0.id == answer.id }?.kind, .conclusion)
         XCTAssertEqual(sanitized.first { $0.id == substantiveAnswer.id }?.semanticKind, .assistantAnswer)
         XCTAssertEqual(sanitized.first { $0.id == failedTool.id }?.semanticKind, .error)
-        XCTAssertEqual(sanitized.first { $0.id == failedTool.id }?.text, "Command failed")
+        XCTAssertEqual(sanitized.first { $0.id == failedTool.id }?.text, "Shell command")
         XCTAssertNil(sanitized.first { $0.id == failedTool.id }?.detail)
         XCTAssertEqual(sanitized.first { $0.id == question.id }?.semanticKind, .question)
         XCTAssertNil(sanitized.first { $0.id == question.id }?.text)
@@ -1878,6 +2269,7 @@ final class RemoteProducerParityTests: XCTestCase {
         XCTAssertFalse(encodedDefault.contains("raw-result"))
         XCTAssertFalse(encodedDefault.contains("raw-reasoning"))
         XCTAssertFalse(encodedDefault.contains("request-secret"))
+        XCTAssertFalse(encodedDefault.contains("shell-secret"))
 
         let detailed = WindowRemoteReadService.project(transcript: transcript, includeDetails: true)
         let toolDetail = try XCTUnwrap(detailed.first { $0.id == failedTool.id }?.detail)
@@ -2253,23 +2645,100 @@ final class RemoteSnapshotProjectionTests: XCTestCase {
         }
     }
 
-    func testSecretAndMultipartInputRetainSecureEntryWithoutPretendingToSupportMultipart() throws {
+    func testMultipartInputProjectsChoicesAndMarksOnlySecretFields() throws {
         let secret = AgentRunMCPSnapshot.Interaction.Field(
-            id: "token", prompt: "Enter token", isSecret: true, allowsOther: true, options: []
+            id: "token", prompt: "Enter token", isSecret: true, allowsOther: false, options: []
         )
-        for fields in [[secret], [secret, secret]] {
-            let interaction = AgentRunMCPSnapshot.Interaction(
-                id: UUID(), kind: .userInput, responseType: .structured,
-                title: "Input", prompt: nil, context: nil, allowsMultiple: nil,
-                options: [], fields: fields, details: []
-            )
-            let result = try XCTUnwrap(AgentModeRemoteSessionQueryService.projectInteraction(
-                interaction, createdAt: .distantPast
-            ))
-            XCTAssertEqual(result.kind, .secretInput)
-            XCTAssertTrue(result.requiresSecureEntry)
-            XCTAssertEqual(result.responseUnavailableReason == nil, fields.count == 1)
+        let choice = AgentRunMCPSnapshot.Interaction.Field(
+            id: "mode", prompt: "Choose a mode", isSecret: false, allowsOther: true,
+            options: [.init(label: "Read", description: "Only read files")]
+        )
+        let interaction = AgentRunMCPSnapshot.Interaction(
+            id: UUID(), kind: .userInput, responseType: .structured,
+            title: "Input", prompt: nil, context: nil, allowsMultiple: nil,
+            options: [], fields: [choice, secret], details: []
+        )
+        let result = try XCTUnwrap(AgentModeRemoteSessionQueryService.projectInteraction(
+            interaction, createdAt: .distantPast
+        ))
+        XCTAssertEqual(result.kind, .secretInput)
+        XCTAssertTrue(result.requiresSecureEntry)
+        XCTAssertNil(result.responseUnavailableReason)
+        let questions = try XCTUnwrap(result.questionnaire?.questions)
+        XCTAssertEqual(questions.map(\.id), ["mode", "token"])
+        XCTAssertEqual(questions.map(\.isSecret), [false, true])
+        XCTAssertEqual(questions[0].options.map(\.label), ["Read", AgentRequestUserInputQuestion.otherOptionLabel])
+        XCTAssertEqual(questions[0].options.first?.description, "Only read files")
+        XCTAssertTrue(questions[0].allowsNote)
+        XCTAssertFalse(questions[1].allowsSkip)
+
+        struct LegacyInteraction: Decodable {
+            let responseUnavailableReason: String?
         }
+        let encoded = try JSONEncoder().encode(result)
+        XCTAssertNotNil(try JSONDecoder().decode(LegacyInteraction.self, from: encoded).responseUnavailableReason)
+        XCTAssertEqual(try JSONDecoder().decode(RemoteInteractionSummary.self, from: encoded), result)
+
+        let unavailable = AgentModeRemoteSessionQueryService.projectInteraction(
+            interaction, createdAt: .distantPast, requiresLocalUserInput: true
+        )
+        XCTAssertNil(unavailable?.questionnaire)
+        XCTAssertNotNil(unavailable?.responseUnavailableReason)
+    }
+
+    func testRemoteAskUserConvertsChoicesAndPerQuestionSkipAndRejectsIncompleteAnswers() throws {
+        let questionnaire = RemoteQuestionnaire(questions: [
+            .init(
+                id: "modes", prompt: "Choose modes", options: [.init(label: "Read"), .init(label: "Write")],
+                allowsMultiple: true, allowsCustom: true, allowsSkip: true
+            ),
+            .init(id: "notes", prompt: "Anything else?", allowsCustom: true, allowsSkip: true)
+        ])
+        let answers: [String: RemoteQuestionAnswer] = [
+            "modes": .init(selectedOptionIndices: [1, 0], text: "Read both"),
+            "notes": .init(skipped: true)
+        ]
+        let payload = try WindowRemoteAgentControlService.questionResponsePayload(
+            answers, questionnaire: questionnaire, userInput: nil
+        )
+        XCTAssertEqual(payload.askUserAnswersByQuestionID["modes"]?.selectedOptions, ["Write", "Read"])
+        XCTAssertEqual(payload.askUserAnswersByQuestionID["modes"]?.customResponse, "Read both")
+        XCTAssertEqual(payload.askUserAnswersByQuestionID["notes"]?.skipped, true)
+        XCTAssertFalse(payload.skip)
+        XCTAssertThrowsError(try WindowRemoteAgentControlService.questionResponsePayload(
+            ["modes": .init(selectedOptionIndices: [1])], questionnaire: questionnaire, userInput: nil
+        ))
+    }
+
+    func testRemoteUserInputUsesProviderDraftEncodingForOtherAndSecureNotes() throws {
+        let request = AgentRequestUserInputRequest(
+            receipt: .fixture(.int(9)), method: "item/tool/requestUserInput", threadID: "t", turnID: "t", itemID: "i",
+            questions: [
+                .init(
+                    id: "mode",
+                    header: "Mode",
+                    question: "Which mode?",
+                    isOther: true,
+                    isSecret: false,
+                    options: [.init(label: "Read", description: "Read files")]
+                ),
+                .init(id: "code", header: "Code", question: "Enter a code", isOther: false, isSecret: true, options: [])
+            ]
+        )
+        let questionnaire = RemoteQuestionnaire(questions: [
+            .init(
+                id: "mode", prompt: "Which mode?", options: [.init(label: "Read"), .init(label: "None of the above")],
+                allowsCustom: true, allowsNote: true
+            ),
+            .init(id: "code", prompt: "Enter a code", isSecret: true, allowsCustom: true)
+        ])
+        let payload = try WindowRemoteAgentControlService.questionResponsePayload(
+            ["mode": .init(selectedOptionIndices: [1], text: "Another mode"), "code": .init(text: " test-code ")],
+            questionnaire: questionnaire, userInput: request
+        )
+        XCTAssertEqual(payload.answersByQuestionID["mode"], ["None of the above", "user_note: Another mode"])
+        XCTAssertEqual(payload.answersByQuestionID["code"], ["user_note: test-code"])
+        XCTAssertNil(payload.text)
     }
 
     func testAvailabilityPolicyCoversActiveWaitingAndTerminalStates() {

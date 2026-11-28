@@ -124,13 +124,13 @@ extension MCPServerViewModel {
         WorkspaceSelectionMutationService(
             store: promptVM.workspaceFileContextStore,
             codemapsGloballyDisabled: codeMapsGloballyDisabledForMCP,
-            codemapsGloballyDisabledMessage: Self.codeMapsGloballyDisabledMCPMessage
+            codemapsGloballyDisabledMessage: MCPSelectionArguments.codeMapsGloballyDisabledMCPMessage
         )
     }
 
     @MainActor
     func buildStoredSelection(
-        from inputs: ManageSelectionInputs,
+        from inputs: MCPSelectionArguments.Inputs,
         mode: String,
         existing: StoredSelection,
         lookupRootScope: WorkspaceLookupRootScope = .visibleWorkspace
@@ -153,7 +153,7 @@ extension MCPServerViewModel {
 
     @MainActor
     func buildManageSelectionSetSelection(
-        from inputs: ManageSelectionInputs,
+        from inputs: MCPSelectionArguments.Inputs,
         mode: String,
         existing: StoredSelection,
         hasFullFileArtifactInputs: Bool = false,
@@ -227,11 +227,11 @@ extension MCPServerViewModel {
         let selection: StoredSelection
 
         if mode == "codemap_only", codeMapsGloballyDisabledForMCP {
-            invalidPaths.append(Self.codeMapsGloballyDisabledMCPMessage)
+            invalidPaths.append(MCPSelectionArguments.codeMapsGloballyDisabledMCPMessage)
             selection = StoredSelection()
         } else if mode == "codemap_only" {
             let buildResult = await buildStoredSelection(
-                from: ManageSelectionInputs(
+                from: MCPSelectionArguments.Inputs(
                     paths: paths,
                     sliceInputs: [],
                     sliceErrors: [],
@@ -246,7 +246,7 @@ extension MCPServerViewModel {
             invalidPaths.append(contentsOf: buildResult.codemapUnavailable)
             selection = buildResult.selection
         } else {
-            let inputs = ManageSelectionInputs(
+            let inputs = MCPSelectionArguments.Inputs(
                 paths: paths,
                 sliceInputs: sliceInputs,
                 sliceErrors: [],

@@ -291,6 +291,13 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
     private var toolTrackingByTabID: [UUID: AgentToolTrackingController] = [:]
     private let windowID: Int
     private let routingOwner: MCPHostRouteResources?
+    private var originatingContextSource: MCPHostRouteResources.ProviderContextSource?
+
+    func installOriginatingContextSource(_ source: @escaping MCPHostRouteResources.ProviderContextSource) {
+        precondition(originatingContextSource == nil)
+        originatingContextSource = source
+    }
+
     private let runtimeWorkspacePathsProvider: (AgentTabSession) throws -> CodexRuntimeWorkspacePaths
     private let codexControllerFactory: CodexControllerFactory
     private let codexCapabilitiesForLaunch: (_ isMCPRelated: Bool) -> CodexCapabilitySettings
@@ -4233,6 +4240,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             policyInstaller: MCPBootstrapLease.agentModePolicyInstaller(connectionPolicyInstaller),
             routingStateOwner: routingStateOwner,
             routingOwner: routingOwner,
+            originatingContextSource: originatingContextSource,
             processRegistrationProvider: { await (reusingController as? CodexNativeSessionController)?.routingProcessRegistration() }
         )
     }
@@ -6944,6 +6952,20 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
 
             let expectedControllerID = pendingStart.controllerID
             if shouldWaitForRouting {
+                // The committed connection belongs to this startup lease, not the window census.
+                // Keep the compatibility validator only for originless legacy leases.
+                let registration = await lease.originatingRoutingCleanupReceipts()?.last
+                func validateRoutingProcess() async -> Bool {
+                    guard let routingOwner else {
+                        return await routeOwnerValidator(expectedController, runID, windowID, session.tabID)
+                    }
+                    guard let registration, registration.routeOwner === routingOwner,
+                          let pid = await expectedController.routingProcessID() else { return false }
+                    return await ServerNetworkManager.shared.isRunRouteAuthoritativelyCommitted(
+                        runID: runID, windowID: windowID, tabID: session.tabID,
+                        expectedAgentPID: pid, registration: registration
+                    )
+                }
                 do {
                     try await lease.requireRouting(
                         timeoutMs: codexLeaseRoutingTimeoutMs,
@@ -6962,12 +6984,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                             guard readiness.allowsDispatch else { return false }
                             // Validate inside the lease boundary: a stale .routed outcome
                             // cannot retain an unconsumed policy for another process.
-                            let routeBelongsToController = await routeOwnerValidator(
-                                expectedController,
-                                runID,
-                                windowID,
-                                session.tabID
-                            )
+                            let routeBelongsToController = await validateRoutingProcess()
                             return !Task.isCancelled
                                 && routeBelongsToController
                                 && linkExecutionRuntime.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: readiness)
@@ -6988,7 +7005,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                     // that exact process/run route before publishing a companion-enabled thread.
                     if computerUseActivationID != nil {
                         let readiness = await linkExecutionRuntime?.qualifyProviderInputRoute(for: session) ?? .unavailable
-                        let routeIsOwned = await routeOwnerValidator(expectedController, runID, windowID, session.tabID)
+                        let routeIsOwned = await validateRoutingProcess()
                         guard !Task.isCancelled, computerUseStartupStopFence.permitsStart(of: session), routeIsOwned,
                               session.runID == runID, session.activeRunAttemptID == runAttemptIDAtEntry,
                               session.codexController.map(ObjectIdentifier.init) == expectedControllerID,

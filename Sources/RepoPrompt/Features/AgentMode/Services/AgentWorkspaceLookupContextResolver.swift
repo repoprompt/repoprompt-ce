@@ -141,10 +141,14 @@ enum AgentWorkspaceLookupContextResolver {
     static func requiredLookupContext(
         source: AgentWorkspaceLookupContextSource,
         visibleRoots: [WorkspaceRootRef],
-        store: WorkspaceFileContextStore
+        store: WorkspaceFileContextStore,
+        usesRetainedRoots: Bool = false
     ) async throws -> WorkspaceLookupContext {
         let capturedCanonicalRoots = Set(visibleRoots)
-        guard await Set(store.rootRefs(scope: .visibleWorkspace)) == capturedCanonicalRoots else {
+        let currentRoots = await Set(store.rootRefs(scope: usesRetainedRoots ? .allLoaded : .visibleWorkspace))
+        // The independent host supplies its exact lease, which can outlive the set of roots
+        // shown by a presenter. Ordinary callers must still agree with the visible root list.
+        guard usesRetainedRoots ? capturedCanonicalRoots.isSubset(of: currentRoots) : capturedCanonicalRoots == currentRoots else {
             throw AgentWorkspaceLookupContextResolutionError.unavailableProjection
         }
         guard let sessionID = source.activeAgentSessionID else {

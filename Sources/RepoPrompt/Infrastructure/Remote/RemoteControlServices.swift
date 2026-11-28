@@ -15,6 +15,7 @@ struct RemoteWorkspaceRecord: Equatable {
     let isOpen: Bool
     let activeSessionIDs: [UUID]
     let lastActivityAt: Date?
+    var supportsPresentationControl = false
 }
 
 struct RemoteSessionRecord: Equatable {
@@ -194,7 +195,8 @@ final class RemoteSnapshotBuilder {
                     repositoryRootSummary: $0.repositoryRootSummary,
                     isOpen: $0.isOpen,
                     activeSessionIDs: $0.activeSessionIDs,
-                    lastActivityAt: $0.lastActivityAt
+                    lastActivityAt: $0.lastActivityAt,
+                    supportsPresentationControl: $0.supportsPresentationControl
                 )
             }
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
@@ -282,28 +284,26 @@ final class RemoteSnapshotBuilder {
 
 @MainActor
 final class WorkspaceManagerRemoteCatalogService: WorkspaceCatalogService {
-    private let managers: [WorkspaceManagerViewModel]
+    private let windows: [WindowState]
 
-    init(manager: WorkspaceManagerViewModel) {
-        managers = [manager]
-    }
-
-    init(managers: [WorkspaceManagerViewModel]) {
-        self.managers = managers
+    init(windows: [WindowState]) {
+        self.windows = windows
     }
 
     func allSavedWorkspaces() async -> [RemoteWorkspaceRecord] {
+        let openWorkspaceIDs = Set(windows.filter { !$0.isClosing }.compactMap(\.workspaceManager.activeWorkspaceID))
         var records: [UUID: RemoteWorkspaceRecord] = [:]
-        for manager in managers {
+        for manager in windows.map(\.workspaceManager) {
             for workspace in manager.workspaces where !workspace.isEphemeral {
                 let current = RemoteWorkspaceRecord(
                     workspaceID: workspace.id,
                     name: workspace.name,
                     repositoryRootSummary: workspace.repoPaths.first
                         .map { URL(fileURLWithPath: $0).lastPathComponent },
-                    isOpen: WindowStatesManager.shared.countWindowsShowing(workspaceId: workspace.id) > 0,
+                    isOpen: openWorkspaceIDs.contains(workspace.id),
                     activeSessionIDs: workspace.composeTabs.compactMap(\.activeAgentSessionID),
-                    lastActivityAt: workspace.lastUsed
+                    lastActivityAt: workspace.lastUsed,
+                    supportsPresentationControl: RemoteWorkspacePresentationController.supportsControl(for: workspace)
                 )
                 if let existing = records[workspace.id] {
                     records[workspace.id] = RemoteWorkspaceRecord(
@@ -313,7 +313,8 @@ final class WorkspaceManagerRemoteCatalogService: WorkspaceCatalogService {
                         isOpen: existing.isOpen || current.isOpen,
                         activeSessionIDs: Array(Set(existing.activeSessionIDs + current.activeSessionIDs))
                             .sorted { $0.uuidString < $1.uuidString },
-                        lastActivityAt: max(existing.lastActivityAt ?? .distantPast, current.lastActivityAt ?? .distantPast)
+                        lastActivityAt: max(existing.lastActivityAt ?? .distantPast, current.lastActivityAt ?? .distantPast),
+                        supportsPresentationControl: existing.supportsPresentationControl && current.supportsPresentationControl
                     )
                 } else {
                     records[workspace.id] = current
@@ -561,7 +562,8 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
             agentMode.mcpRuntime.mcpPendingInteraction(for: session),
             createdAt: session.lastActivityAt,
             supportsPlainApproval: session.pendingApproval?.supportsPlainApprove ?? true,
-            macOnlyApprovalID: session.pendingWorktreeMergeReview?.id ?? session.pendingPermissionsRequest?.id
+            macOnlyApprovalID: session.pendingWorktreeMergeReview?.id ?? session.pendingPermissionsRequest?.id,
+            requiresLocalUserInput: session.pendingUserInputRequest?.questions.contains(where: \.isLegacyMCPToolApproval) == true
         )
     }
 
@@ -569,11 +571,14 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
         _ interaction: AgentRunMCPSnapshot.Interaction?,
         createdAt: Date,
         supportsPlainApproval: Bool = true,
-        macOnlyApprovalID: UUID? = nil
+        macOnlyApprovalID: UUID? = nil,
+        requiresLocalUserInput: Bool = false
     ) -> RemoteInteractionSummary? {
         guard let interaction, interaction.kind != .instruction else { return nil }
         let isApproval = interaction.kind == .approval || interaction.kind == .hookApproval
         let isSecret = interaction.fields.contains { $0.isSecret == true }
+        let isAskUser = interaction.kind == .question
+        let isUserInput = interaction.kind == .userInput
         let unavailableReason: String? = if interaction.id == macOnlyApprovalID {
             "Review this decision on your Mac."
         } else if interaction.kind == .hookApproval {
@@ -582,8 +587,8 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
             "Review the MCP request on your Mac."
         } else if isApproval, !supportsPlainApproval {
             "This request needs a specific approval option. Review it on your Mac."
-        } else if interaction.fields.count > 1 {
-            "Answer this multi-part request on your Mac."
+        } else if isUserInput, requiresLocalUserInput {
+            "Review this tool approval on your Mac."
         } else {
             nil
         }
@@ -591,6 +596,28 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
         let prompt = unavailableReason == nil
             ? ([interaction.prompt ?? interaction.fields.first?.prompt].compactMap(\.self) + details).joined(separator: "\n\n")
             : nil
+        let questionnaire: RemoteQuestionnaire? = if unavailableReason == nil,
+                                                     isAskUser || isUserInput,
+                                                     !interaction.fields.isEmpty
+        {
+            RemoteQuestionnaire(context: interaction.context, questions: interaction.fields.map { field in
+                var options = field.options.map {
+                    RemoteQuestionField.Option(label: $0.label, description: $0.description)
+                }
+                if isUserInput, field.allowsOther == true, !options.isEmpty {
+                    options.append(.init(label: AgentRequestUserInputQuestion.otherOptionLabel))
+                }
+                return RemoteQuestionField(
+                    id: field.id, header: field.header, prompt: field.prompt, context: field.context,
+                    options: options, isSecret: field.isSecret == true,
+                    allowsMultiple: field.allowsMultiple == true,
+                    allowsCustom: isUserInput || field.allowsCustom == true,
+                    allowsNote: isUserInput && !options.isEmpty, allowsSkip: isAskUser
+                )
+            })
+        } else {
+            nil
+        }
         return RemoteInteractionSummary(
             id: interaction.id.uuidString,
             kind: isApproval ? .approval : (isSecret ? .secretInput : .question),
@@ -598,7 +625,8 @@ final class AgentModeRemoteSessionQueryService: SessionQueryService {
             prompt: prompt?.isEmpty == false ? prompt : nil,
             requiresSecureEntry: isSecret,
             responseUnavailableReason: unavailableReason,
-            createdAt: createdAt
+            createdAt: createdAt,
+            questionnaire: questionnaire
         )
     }
 }
@@ -708,7 +736,8 @@ final class DesktopRemoteCatalogService: WorkflowCatalogService {
             toolCatalog: toolCatalog,
             supportsStartSelection: true,
             supportsSessionConfiguration: true,
-            supportsAttachments: true
+            supportsAttachments: true,
+            supportsWorkspaceVoice: true
         )
 
         return RemoteCatalogRecord(workflows: workflows, agents: agents, metadata: metadata)

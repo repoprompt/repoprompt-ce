@@ -13,6 +13,36 @@ package enum StandardizedPath {
         return standardized
     }
 
+    /// Canonical lexical path for a configured workspace root.
+    /// Trims surrounding whitespace, rejects empty/NUL/`file://` values, expands leading `~`,
+    /// standardizes separators, `.`, `..`, trailing `/`, and macOS `/private` aliases, and
+    /// resolves relative paths via `standardizedFileURL` so store keys and root records agree.
+    package static func canonicalWorkspaceRootPath(_ rawPath: String) -> String? {
+        let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              !containsNUL(trimmed),
+              !trimmed.lowercased().hasPrefix("file://")
+        else { return nil }
+        let expanded = (trimmed as NSString).expandingTildeInPath
+        let standardized = absolute(expanded)
+        let resolved = URL(fileURLWithPath: standardized, isDirectory: true).standardizedFileURL.path
+        return absolute(resolved)
+    }
+
+    /// Canonical, deduplicated workspace root paths in declaration order (invalid entries omitted).
+    package static func canonicalWorkspaceRootPaths(_ rawPaths: [String]) -> [String] {
+        var seen = Set<String>()
+        var ordered: [String] = []
+        ordered.reserveCapacity(rawPaths.count)
+        for rawPath in rawPaths {
+            guard let canonical = canonicalWorkspaceRootPath(rawPath),
+                  seen.insert(canonical).inserted
+            else { continue }
+            ordered.append(canonical)
+        }
+        return ordered
+    }
+
     @inline(__always)
     package static func relative(_ path: String) -> String {
         let trimmed = path.trimmingCharacters(in: standardizedPathSlashTrim)
