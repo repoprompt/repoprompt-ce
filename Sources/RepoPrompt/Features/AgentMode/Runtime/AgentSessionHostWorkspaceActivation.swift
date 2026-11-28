@@ -133,12 +133,11 @@ final class AgentSessionHostWorkspaceActivation {
     func validateExecutionInput(
         lease: AgentHostWorkspaceResources.Lease, command: AgentSessionRuntimeStore.Command
     ) async -> Bool {
-        // Recheck the lease's read source, including edits to this carrier before a workspace save.
-        guard isCurrent, command.isCurrent, await lease.retainedRootsAreCurrent(),
-              let current = await resources.workspaceSnapshot(for: command.identity.workspaceID, authority: lease.snapshotAuthority),
-              isCurrent, command.isCurrent, lease.rootsAreCurrent, !Task.isCancelled
+        // The lease's execution lineage survives pinning and focus changes but rejects an
+        // execution-relevant edit even when the old bytes were subsequently restored.
+        guard isCurrent, command.isCurrent, await lease.isCurrent(requiresExactSnapshot: savedTarget != nil)
         else { return false }
-        return executionInputMatches(lease.snapshot, current, command: command)
+        return isCurrent && command.isCurrent && lease.rootsAreCurrent && !Task.isCancelled
     }
 
     /// Only pre-installation and presenter attachment follow the window's latest epoch. Once
@@ -298,6 +297,10 @@ final class AgentSessionHostWorkspaceActivation {
         }
     #endif
 
+    private var executionInputAuthority: AgentHostWorkspaceResources.SnapshotAuthority {
+        savedTarget == nil ? .readOverlay : .canonical
+    }
+
     func capture(
         command: AgentSessionRuntimeStore.Command, rootIDs: [UUID], route: MCPHostRouteResources
     ) async throws -> AgentSessionHostStartupResources {
@@ -307,7 +310,9 @@ final class AgentSessionHostWorkspaceActivation {
         else {
             throw AgentHostWorkspaceResources.Failure.authorityUnavailable
         }
-        let lease = try await captureLease(command: command, rootIDs: rootIDs, route: route)
+        let lease = try await captureLease(
+            command: command, rootIDs: rootIDs, route: route, snapshotAuthority: executionInputAuthority
+        )
         do {
             let captured = try AgentSessionHostStartupResources(
                 origin: command, lease: lease, settings: settings, activations: activations,
@@ -329,7 +334,9 @@ final class AgentSessionHostWorkspaceActivation {
     func captureInput(
         command: AgentSessionRuntimeStore.Command, rootIDs: [UUID], route: MCPHostRouteResources
     ) async throws -> AgentSessionProviderInputRuntime.InitialThreadInput {
-        let lease = try await captureLease(command: command, rootIDs: rootIDs, route: route)
+        let lease = try await captureLease(
+            command: command, rootIDs: rootIDs, route: route, snapshotAuthority: executionInputAuthority
+        )
         let session = command.writer.session
         guard let tab = executionTab(in: lease.snapshot, command: command)
         else {
@@ -381,7 +388,9 @@ final class AgentSessionHostWorkspaceActivation {
         command: AgentSessionRuntimeStore.Command, rootIDs: [UUID], route: MCPHostRouteResources
     ) async throws -> AgentSessionWorktreeRuntime.Admission {
         let bindings = command.writer.session.worktreeBindings
-        let lease = try await captureLease(command: command, rootIDs: rootIDs, route: route)
+        let lease = try await captureLease(
+            command: command, rootIDs: rootIDs, route: route, snapshotAuthority: .canonical
+        )
         let workspace = try JSONDecoder().decode(WorkspaceModel.self, from: lease.snapshot.document.documentBytes)
         guard !workspace.isSystemWorkspace, executionTab(in: lease.snapshot, command: command) != nil
         else { throw AgentHostWorkspaceResources.Failure.contextUnavailable }
@@ -418,7 +427,8 @@ final class AgentSessionHostWorkspaceActivation {
     }
 
     private func captureLease(
-        command: AgentSessionRuntimeStore.Command, rootIDs: [UUID], route: MCPHostRouteResources
+        command: AgentSessionRuntimeStore.Command, rootIDs: [UUID], route: MCPHostRouteResources,
+        snapshotAuthority: AgentHostWorkspaceResources.SnapshotAuthority
     ) async throws -> AgentHostWorkspaceResources.Lease {
         try command.requireCurrent()
         guard owns(scope: command.writer.scope, route: route), command.identity.workspaceID == key.owner.workspaceID,
@@ -427,7 +437,6 @@ final class AgentSessionHostWorkspaceActivation {
             throw AgentHostWorkspaceResources.Failure.authorityUnavailable
         }
         let workspaceID = command.identity.workspaceID
-        let snapshotAuthority: AgentHostWorkspaceResources.SnapshotAuthority = savedTarget == nil ? .readOverlay : .canonical
         let admits: (DomainWorkspaceSnapshot) -> Bool = { self.executionTab(in: $0, command: command) != nil }
         let matchesSnapshot: (DomainWorkspaceSnapshot, DomainWorkspaceSnapshot) -> Bool = {
             self.executionInputMatches($0, $1, command: command)

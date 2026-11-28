@@ -3125,13 +3125,24 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         let current = await authority.canonicalWorkspaceSnapshot(command.identity.workspaceID)
         let snapshot = try XCTUnwrap(current)
         var changed = try JSONDecoder().decode(WorkspaceModel.self, from: snapshot.document.documentBytes)
+        var overlayWorkspace = changed
+        overlayWorkspace.customStoragePath = snapshot.document.fileURL.deletingLastPathComponent()
+            .appendingPathComponent("routing-only-storage")
+        let overlayDocument = try DomainWorkspaceDocument.decode(
+            documentBytes: JSONEncoder().encode(overlayWorkspace), fileURL: snapshot.document.fileURL
+        )
+        _ = await authority.store.registerReadDocument(overlayDocument)
+        let overlayAdmission = try await captured.resolve()
+        XCTAssertEqual(overlayAdmission.resources.storageDirectory, changed.customStoragePath)
+        let validatePlacement = try XCTUnwrap(admission.resources.validatePlacement)
+        try await validatePlacement()
+
         let index = try XCTUnwrap(changed.composeTabs.firstIndex(where: { $0.id == f.session.tabID }))
         changed.composeTabs[index].promptText = "Unrelated to execution placement"
         let result = try await authority.replaceWorkingFailClosed(
             changed, fileURL: snapshot.document.fileURL, expectedWorkspaceRevision: snapshot.revisions.workingRevision
         )
         XCTAssertEqual(result.disposition, .applied)
-        let validatePlacement = try XCTUnwrap(admission.resources.validatePlacement)
         try await validatePlacement()
         let afterPromptEdit = try await captured.resolve()
         XCTAssertEqual(afterPromptEdit.command.identity, command.identity)

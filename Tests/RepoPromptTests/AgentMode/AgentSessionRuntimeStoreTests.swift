@@ -1,3 +1,4 @@
+import Combine
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import XCTest
@@ -1004,6 +1005,78 @@ final class AgentSessionRuntimeStoreTests: XCTestCase {
         XCTAssertTrue(scope.settlement(for: session).isSettled)
         scope.replaceSessions([session.tabID: AgentTabSession(tabID: session.tabID)])
         XCTAssertEqual(scope.settlement(for: session).blockers, [.notInstalled])
+    }
+
+    /// M9.4 phase 0 pins today's cancelling policy; later detach phases must flip this deliberately.
+    func testLegacyWindowCloseCancelsOwnedRunBeforeDetachingPresentation() async {
+        let (vm, session, ownership) = makeLegacyRunningFixture()
+        await vm.prepareForWindowClose()
+        XCTAssertEqual(session.runState, .cancelled)
+        XCTAssertNil(session.activeRunOwnership)
+        XCTAssertEqual(session.lastTerminalCommitRevision?.ownership, ownership)
+        XCTAssertTrue(vm.tabsWithActiveAgentRun.isEmpty)
+        await vm.test_retireAndCancelFixture()
+    }
+
+    func testLegacyWorkspaceSwitchCancelsOwnedRunWithoutRetiringWriter() async throws {
+        let (vm, session, ownership) = makeLegacyRunningFixture()
+        let identity = try controlWriterIdentity(for: session)
+        let provider = AgentModeWorkspaceSwitchSessionProvider(agentModeViewModel: vm)
+        XCTAssertEqual(provider.switchSessionItems().first?.count, 1)
+        await provider.cancelSwitchSessions()
+        XCTAssertEqual(session.runState, .cancelled)
+        XCTAssertNil(session.activeRunOwnership)
+        XCTAssertEqual(session.lastTerminalCommitRevision?.ownership, ownership)
+        XCTAssertTrue(provider.switchSessionItems().isEmpty)
+        XCTAssertEqual(try controlWriterIdentity(for: session), identity, "A workspace switch cancels but does not elect a writer")
+        await vm.test_retireAndCancelFixture()
+    }
+
+    private func makeLegacyRunningFixture() -> (AgentModeViewModel, AgentTabSession, AgentRunOwnership) {
+        let vm = AgentModeViewModel(
+            testWindowID: -1406,
+            codexControllerFactory: { _, _, _, _, _, _ in preconditionFailure("Characterisation must not launch a provider") }
+        )
+        let session = AgentTabSession(tabID: UUID())
+        session.selectedAgent = .openCode
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: UUID(), workspaceID: UUID()))
+        vm.test_installLiveSession(session)
+        let ownership = session.beginRunAttempt(source: "m9.4.legacy-presentation-policy")
+        session.runState = .running
+        vm.runtimeSessionStore.presentation.makeRunHooks().setAgentRunActive(session, true)
+        return (vm, session, ownership)
+    }
+
+    func testViewModelPublishesBeforeStorageChangesAndUsesRuntimeIndex() {
+        let vm = AgentModeViewModel(
+            testWindowID: -1406,
+            codexControllerFactory: { _, _, _, _, _, _ in preconditionFailure("Store publication must not launch a provider") }
+        )
+        XCTAssertTrue(vm.runtimeSessionStore === vm.runtimeHost.scope)
+        XCTAssertTrue(vm.runtimeSessionStore.executableHost === vm.runtimeHost, "An existing writer scope must resolve its original executable composition")
+        XCTAssertTrue(vm.codexCoordinator === vm.runtimeHost.codexCoordinator)
+        XCTAssertTrue(vm.claudeCoordinator === vm.runtimeHost.claudeCoordinator)
+        XCTAssertNotNil(vm.runtimeHost.scope.execution, "Compose execution before creating a visible session")
+        XCTAssertNotNil(vm.runtimeHost.scope.linkExecution)
+        XCTAssertTrue(vm.runtimeHost.scope.sessions.isEmpty)
+        let session = vm.runtimeHost.scope.makeSession(tabID: UUID())
+        let sessionID = UUID()
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID))
+        var observedPresence: [Bool] = []
+        let subscription = vm.objectWillChange.sink {
+            observedPresence.append(vm.sessions[session.tabID] != nil)
+        }
+        defer { subscription.cancel() }
+        vm.test_installLiveSession(session)
+        XCTAssertEqual(observedPresence.first, false, "Preserve @Published will-change ordering.")
+        XCTAssertTrue(vm.sessions[session.tabID] === session)
+        XCTAssertEqual(vm.runtimeSessionStore.liveSessionTabIDs(for: sessionID), [session.tabID])
+        observedPresence.removeAll()
+        vm.test_removeSession(tabID: session.tabID)
+        XCTAssertEqual(observedPresence.first, true)
+        XCTAssertNil(vm.sessions[session.tabID])
+        XCTAssertTrue(vm.runtimeSessionStore.liveSessionTabIDs(for: sessionID).isEmpty)
+        XCTAssertNil(session.persistentSessionBindingDidChange)
     }
 }
 
