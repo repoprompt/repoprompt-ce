@@ -5,8 +5,28 @@ import RepoPromptRemoteProtocol
 /// Opens and closes saved workspaces through the existing Mac window lifecycle.
 @MainActor
 final class RemoteWorkspacePresentationController {
+    enum OpenSource {
+        case picker
+        case voice
+
+        enum Destination: Equatable {
+            case reuseWindow(Int)
+            case newWindow
+            case needsPicker
+        }
+
+        func destination(welcomeWindowID: Int?, voiceWindowID: Int?) -> Destination {
+            switch self {
+            case .picker:
+                welcomeWindowID.map(Destination.reuseWindow) ?? .newWindow
+            case .voice:
+                (voiceWindowID ?? welcomeWindowID).map(Destination.reuseWindow) ?? .needsPicker
+            }
+        }
+    }
+
     private var isChanging = false
-    private var lastReusedWindowID: Int?
+    private var voiceWindow: (windowID: Int, workspaceID: UUID)?
 
     static func supportsControl(for workspace: WorkspaceModel) -> Bool {
         !workspace.isSystemWorkspace && !workspace.isEphemeral && workspace.consolidatedIntoWorkspaceID == nil
@@ -18,6 +38,7 @@ final class RemoteWorkspacePresentationController {
 
     func set(
         _ request: RemoteWorkspacePresentation,
+        source: OpenSource = .picker,
         in manager: WindowStatesManager,
         isVoiceActive: (UUID) -> Bool,
         authorizeDispatch: RemoteDispatchAuthorization
@@ -53,17 +74,23 @@ final class RemoteWorkspacePresentationController {
 
         let showing = Self.windows(showing: workspaceID, in: manager)
         if request.isOpen {
-            guard showing.isEmpty else { return }
-            try await open(workspaceID, in: windows, isVoiceActive: isVoiceActive)
+            if !showing.isEmpty {
+                if source == .picker, voiceWindow?.workspaceID == workspaceID { voiceWindow = nil }
+                return
+            }
+            try await open(
+                workspaceID, source: source, windows: windows, manager: manager,
+                isVoiceActive: isVoiceActive, authorizeDispatch: requireAccess
+            )
         } else {
             guard !showing.isEmpty else { return }
             guard !isVoiceActive(workspaceID) else { throw RemoteWorkspaceVoiceError.busy }
-            guard showing.allSatisfy(isIdle) else { throw activeWorkError }
+            guard showing.allSatisfy({ $0.nsWindow != nil && isIdle($0) }) else { throw activeWorkError }
             for window in showing {
                 try requireAccess()
                 guard !window.isClosing, window.workspaceManager.activeWorkspaceID == workspaceID else { continue }
                 guard !isVoiceActive(workspaceID) else { throw RemoteWorkspaceVoiceError.busy }
-                guard isIdle(window) else { throw activeWorkError }
+                guard window.nsWindow != nil, isIdle(window) else { throw activeWorkError }
                 try await close(workspaceID, in: window, manager: manager)
             }
         }
@@ -75,32 +102,80 @@ final class RemoteWorkspacePresentationController {
         }
     }
 
-    private func open(_ workspaceID: UUID, in windows: [WindowState], isVoiceActive: (UUID) -> Bool) async throws {
+    private func open(
+        _ workspaceID: UUID,
+        source: OpenSource,
+        windows: [WindowState],
+        manager: WindowStatesManager,
+        isVoiceActive: (UUID) -> Bool,
+        authorizeDispatch: RemoteDispatchAuthorization
+    ) async throws {
         let candidates = windows.filter { window in
-            guard isIdle(window), let current = window.workspaceManager.activeWorkspace,
-                  !current.isEphemeral, !isVoiceActive(current.id),
-                  let target = window.workspaceManager.workspace(withID: workspaceID) else { return false }
+            guard isIdle(window),
+                  window.workspaceManager.activeWorkspaceID.map(isVoiceActive) != true,
+                  let target = window.workspaceManager.workspace(withID: workspaceID)
+            else { return false }
             return Self.supportsControl(for: target)
         }
-        let window = candidates.first {
-            $0.workspaceManager.activeWorkspace?.isSystemWorkspace == true
-                && $0.workspaceManager.activeWorkspace?.repoPaths.isEmpty == true
-        } ?? candidates.first { $0.windowID == lastReusedWindowID }
-            ?? candidates.first { !$0.isCurrentlyFocused }
-            ?? candidates.first
+        let welcomeWindowID = candidates.first(where: isWelcomeWindow)?.windowID
+        let voiceWindowID = candidates.first { window in
+            guard let voiceWindow else { return false }
+            return window.windowID == voiceWindow.windowID && window.workspaceManager.activeWorkspaceID == voiceWindow.workspaceID
+        }?.windowID
 
-        guard let window, let target = window.workspaceManager.workspace(withID: workspaceID) else {
-            throw RemoteAgentControlServiceError.commandRejected("No idle workspace window is available on the Mac. Try again when a window is idle.")
+        try authorizeDispatch()
+        switch source.destination(welcomeWindowID: welcomeWindowID, voiceWindowID: voiceWindowID) {
+        case let .reuseWindow(windowID):
+            guard let window = candidates.first(where: { $0.windowID == windowID }),
+                  let target = window.workspaceManager.workspace(withID: workspaceID)
+            else { throw RemoteAgentControlServiceError.workspaceNotFound }
+            try await switchWorkspace(in: window, to: target)
+            if source == .voice { voiceWindow = (windowID, workspaceID) }
+        case .newWindow:
+            try await openInNewWindow(workspaceID, manager: manager, authorizeDispatch: authorizeDispatch)
+        case .needsPicker:
+            throw RemoteAgentControlServiceError.commandRejected("Turn on this workspace in Remote’s workspace picker, then start Voice.")
+        }
+    }
+
+    private func openInNewWindow(
+        _ workspaceID: UUID, manager: WindowStatesManager, authorizeDispatch: RemoteDispatchAuthorization
+    ) async throws {
+        let window = try await manager.openNewMainWindow(
+            deferringInitialAgentSystemWorkspaceRefresh: true, matchingRestoreWorkspaceID: workspaceID
+        )
+        defer {
+            if !manager.isTerminating, window.nsWindow != nil, isIdle(window), isWelcomeWindow(window),
+               canCloseWindow(window, in: manager)
+            {
+                window.requestClose()
+            }
+            window.agentModeViewModel.finishInitialSystemWorkspaceSessionListRefreshDeferral(refreshIfStillSystem: !window.isClosing)
+        }
+        await window.workspaceManager.awaitInitialized()
+        await manager.waitForWindowRestoreBeforeWorkspaceLink(workspaceID: workspaceID, openedWindowID: window.windowID)
+        try authorizeDispatch()
+        if !Self.windows(showing: workspaceID, in: manager).isEmpty { return }
+        guard manager.window(withID: window.windowID) === window, isIdle(window), isWelcomeWindow(window) else {
+            throw RemoteAgentControlServiceError.commandRejected("The new Mac window is already in use. Try opening the workspace again.")
+        }
+        guard let target = window.workspaceManager.workspace(withID: workspaceID) else {
+            throw RemoteAgentControlServiceError.workspaceNotFound
+        }
+        guard Self.supportsControl(for: target) else {
+            throw RemoteAgentControlServiceError.commandRejected("This workspace can only be managed on the Mac.")
         }
         try await switchWorkspace(in: window, to: target)
-        lastReusedWindowID = window.windowID
+    }
+
+    private func canCloseWindow(_ window: WindowState, in manager: WindowStatesManager) -> Bool {
+        // Keep a window for the Remote gateway and honor the normal Mac close policy.
+        manager.allWindows.contains(where: { !$0.isClosing && $0 !== window })
+            && WindowCloseCoordinator.decide(snapshot: window.makeCloseImpactSnapshot(), authorization: nil) == .allow
     }
 
     private func close(_ workspaceID: UUID, in window: WindowState, manager: WindowStatesManager) async throws {
-        // Keep a window for the Remote gateway and honor the normal Mac close policy.
-        if manager.allWindows.contains(where: { !$0.isClosing && $0 !== window }),
-           WindowCloseCoordinator.decide(snapshot: window.makeCloseImpactSnapshot(), authorization: nil) == .allow
-        {
+        if canCloseWindow(window, in: manager) {
             window.requestClose()
             if window.isClosing { return }
             throw RemoteAgentControlServiceError.commandRejected("The Mac window could not be closed.")
@@ -122,10 +197,17 @@ final class RemoteWorkspacePresentationController {
         }
     }
 
+    private func isWelcomeWindow(_ window: WindowState) -> Bool {
+        let manager = window.workspaceManager
+        if manager.activeWorkspaceID == nil { return true }
+        guard let workspace = manager.activeWorkspace else { return false }
+        return workspace.isSystemWorkspace && workspace.repoPaths.isEmpty
+    }
+
     private func isIdle(_ window: WindowState) -> Bool {
         let workspace = window.workspaceManager
         return !window.isClosing && !window.hasUnfinishedRestoreExecution
-            && window.nsWindow != nil && window.nsWindow?.attachedSheet == nil
+            && window.nsWindow?.attachedSheet == nil
             && workspace.isInitialized && workspace.activeWorkspaceSwitch == nil
             && !workspace.isSwitchingWorkspace && !workspace.isRefreshing && !workspace.isChatBusy
             && !workspace.activeSessionSnapshot().hasActiveSessions

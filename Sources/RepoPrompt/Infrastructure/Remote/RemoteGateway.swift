@@ -444,7 +444,7 @@ final class RemoteGatewayController: NSObject, ObservableObject {
                 return try workspaceVoice.handle(request, peerEndpointID: context.endpointID, isAuthorized: isAuthorized) { [weak self] in
                     guard let self else { throw RemoteWorkspaceVoiceError.unavailable }
                     if voiceWindows(request.workspaceID).isEmpty {
-                        try await setWorkspacePresentation(.init(workspaceID: request.workspaceID, isOpen: true)) {
+                        try await setWorkspacePresentation(.init(workspaceID: request.workspaceID, isOpen: true), source: .voice) {
                             guard isAuthorized() else { throw RemoteWorkspaceVoiceError.unavailable }
                         }
                     }
@@ -466,11 +466,13 @@ final class RemoteGatewayController: NSObject, ObservableObject {
 
     private func setWorkspacePresentation(
         _ request: RemoteWorkspacePresentation,
+        source: RemoteWorkspacePresentationController.OpenSource = .picker,
         authorizeDispatch: RemoteDispatchAuthorization
     ) async throws {
         guard let manager = windowStatesManager else { throw RemoteWorkspaceVoiceError.unavailable }
         try await workspacePresentation.set(
             request,
+            source: source,
             in: manager,
             isVoiceActive: workspaceVoice.isUsingWorkspace,
             authorizeDispatch: authorizeDispatch

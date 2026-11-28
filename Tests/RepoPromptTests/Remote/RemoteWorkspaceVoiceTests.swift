@@ -6,6 +6,20 @@ import XCTest
 
 @MainActor
 final class RemoteWorkspaceVoiceTests: XCTestCase {
+    func testPickerKeepsOpenWorkspacesAndUsesANewWindowIfWelcomeIsOccupied() {
+        let picker = RemoteWorkspacePresentationController.OpenSource.picker
+        XCTAssertEqual(picker.destination(welcomeWindowID: nil, voiceWindowID: nil), .newWindow)
+        XCTAssertEqual(picker.destination(welcomeWindowID: nil, voiceWindowID: 2), .newWindow)
+        XCTAssertEqual(picker.destination(welcomeWindowID: 3, voiceWindowID: 2), .reuseWindow(3))
+    }
+
+    func testVoiceOnlyUsesItsOwnOrWelcomeWindow() {
+        let voice = RemoteWorkspacePresentationController.OpenSource.voice
+        XCTAssertEqual(voice.destination(welcomeWindowID: 3, voiceWindowID: 2), .reuseWindow(2))
+        XCTAssertEqual(voice.destination(welcomeWindowID: 3, voiceWindowID: nil), .reuseWindow(3))
+        XCTAssertEqual(voice.destination(welcomeWindowID: nil, voiceWindowID: nil), .needsPicker)
+    }
+
     func testVoiceReadsAndMessagesRunningAndSavedChatsInItsOwnWorkspace() async throws {
         let workspaceID = UUID()
         let otherWorkspace = UUID()
