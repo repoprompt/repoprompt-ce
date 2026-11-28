@@ -6506,6 +6506,44 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         )
     }
 
+    func testReadOnlySubscriptionSettlesQueuedSendWithoutSpendingTheKey() async {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        stageBusyTarget(fixture)
+        let queued = await queueSend(fixture)
+        XCTAssertEqual(queued, .queued(replaced: false, duplicate: false))
+
+        fixture.host.sendOutcome = .blocked(.targetSubscriptionReadOnly)
+        fixture.host.snapshotOverrides[fixture.target.sessionID] = .init(
+            sessionID: fixture.target.sessionID,
+            displayName: fixture.target.displayName,
+            providerDisplayName: "Codex CLI",
+            status: .idle,
+            board: .init(
+                runOutcome: .none, failureReason: nil,
+                sendBlockers: [AgentSessionLinkSendFailure.targetSubscriptionReadOnly.rawValue],
+                subagentRunning: 0, subagentFinished: 0
+            ),
+            idleForSend: false, pendingInteractionKind: nil, latestVisibleAssistantPreview: nil,
+            visibleRowCount: 1, lastActivityAt: Date(timeIntervalSince1970: 2000)
+        )
+        fixture.host.fireObservation(for: fixture.target.sessionID)
+        await settleDrains { await self.pendingSend(fixture)?.lastResult != nil }
+        let projection = await pendingSend(fixture)
+        XCTAssertNil(projection?.pending)
+        XCTAssertEqual(projection?.lastResult?.outcome, .failed(.targetSubscriptionReadOnly))
+        let ledger = await fixture.authority.snapshot()
+        XCTAssertEqual(ledger.inFlightSendCount, 0)
+        XCTAssertEqual(ledger.retainedSendOutcomeCount, 0)
+
+        stageReadyTarget(fixture)
+        await publishTargetActivity(fixture, status: .idle, activity: 2001)
+        guard case let .send(.receipt(receipt)) = await queueSend(fixture) else {
+            return XCTFail("A refused key may be used after the target becomes writable")
+        }
+        XCTAssertFalse(receipt.duplicate)
+    }
+
     func testMissingStartStopFenceRejectsQueuedSendBeforeAdmission() async {
         let fixture = makeFixture()
         _ = await addLink(fixture)

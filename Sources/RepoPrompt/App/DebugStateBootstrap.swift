@@ -415,9 +415,12 @@ enum DebugStateBootstrap {
                 if try DebugStateSnapshot.kind(url) == .directory { try addTree(url, relative: target) }
                 else if name.hasPrefix("AgentSession-"), url.pathExtension == "json" {
                     let baseline = retainedIdentities == nil
-                    let data = try derived(url, kind: baseline ? "agent-session-baseline" : "agent-session-retained") { builder, bytes in
+                    let data = try derived(url, kind: baseline ? "agent-session-baseline-account-binding-v1" : "agent-session-retained") { builder, bytes in
                         guard var session = try JSONSerialization.jsonObject(with: bytes) as? [String: Any] else { throw DebugStateSnapshot.Failure.unsafeFile }
                         if baseline {
+                            if session.keys.contains("subscriptionAccountBinding") {
+                                session["subscriptionAccountBinding"] = AgentSessionSubscriptionBinding.detachedSnapshotValue
+                            }
                             for key in ["providerSessionID", "providerCleanupHandle", "codexConversationID", "codexRolloutPath", "codexInstructionMode", "codexMcpSessionKey", "delegationScopeID", "lastRunState", "selfCompactState"] {
                                 session.removeValue(forKey: key)
                             }

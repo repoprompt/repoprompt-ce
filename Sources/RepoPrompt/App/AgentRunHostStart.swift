@@ -131,10 +131,6 @@ extension AgentRunHostAdmission {
         guard sessionID != creator, host.route.domainRuntimeIdentity == AppDomainRuntimeComposition.shared.runtime.identity else {
             throw MCPError.invalidParams("The explicit Agent tab is not a valid child destination.")
         }
-        let review = await captureOracleReviewSource()
-        let selection = try await resolveStartSelection(arguments: args, resolvedTabID: tabID, message: request.message)
-        try expiry.throwIfExpired()
-
         func matchesCarrier(_ snapshot: DomainWorkspaceSnapshot) -> Bool {
             guard let workspace = try? JSONDecoder().decode(WorkspaceModel.self, from: snapshot.document.documentBytes),
                   workspace.id == workspaceID else { return false }
@@ -197,11 +193,22 @@ extension AgentRunHostAdmission {
             target: DelegationSpawnTarget.classify(sessionID: sessionID, placement: placement, creatorSessionID: creator)
         )
         defer { DelegationSpawnAdmission.finish(admission) }
+        func requireAdmission() throws {
+            try requireOwner()
+            try AgentSessionMCPRuntime.requireSubscriptionAccountAdmission(session)
+        }
+        try requireAdmission()
+        let review = await captureOracleReviewSource()
+        try requireAdmission()
+        let selection = try await resolveStartSelection(arguments: args, resolvedTabID: tabID, message: request.message)
+        try expiry.throwIfExpired()
+        try requireAdmission()
+
         let parent = session.parentSessionID ?? creator
         /// Preparation may use the proposed lineage, but it may not publish child-control
         /// provenance before the exact existing session accepts a durable user row.
         func acceptInput() async throws {
-            try requireOwner()
+            try requireAdmission()
             let adoptedParent = expectedParent == nil
             if adoptedParent {
                 session.parentSessionID = parent
@@ -218,14 +225,14 @@ extension AgentRunHostAdmission {
             } else if adoptedParent, case let .failure(failure) = await writer.scope.persistence.flushSaveRequired(writer: writer) {
                 throw MCPError.internalError(failure.message)
             }
-            try requireOwner()
+            try requireAdmission()
             DelegationSpawnAdmission.finish(admission)
         }
 
         didAdmit(target, targetHost)
         let workspacePath = try await AgentRunHostStartTransaction.prepareWorktree(
             request.worktree, from: self, host: targetHost, command: target, stopFence: stopFence,
-            expiry: expiry, validatesCarrier: matchesCarrier, proposedParentID: parent, requireTarget: requireOwner
+            expiry: expiry, validatesCarrier: matchesCarrier, proposedParentID: parent, requireTarget: requireAdmission
         )
         let parameters = try await selection.resolveParameters(args["model_parameters"], workspacePath: workspacePath)
         try expiry.throwIfExpired()
@@ -233,9 +240,9 @@ extension AgentRunHostAdmission {
             host: targetHost, command: target, stopFence: stopFence, expectedParent: { expectedParent },
             from: self, message: request.message, selection: selection, parameters: parameters,
             workflow: request.workflow, reviewSource: review, expiry: expiry,
-            validateCarrier: matchesCarrier, requireTarget: requireOwner, didActivate: didActivate,
+            validateCarrier: matchesCarrier, requireTarget: requireAdmission, didActivate: didActivate,
             acceptDurableInput: acceptInput, commitConfiguration: {
-                try requireOwner()
+                try requireAdmission()
                 return target
             }
         )
