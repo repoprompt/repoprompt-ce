@@ -793,8 +793,15 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         _ props: AgentMonitorPillProps,
         to endpoint: DomainAgentSessionLinkEndpointIdentity
     ) {
-        if let runtime = independentLinkRuntime(for: endpoint), props.endpoint == endpoint {
+        if let runtime = independentLinkRuntime(for: endpoint), let scope = runtime.scope {
+            guard props.endpoint == endpoint else { return }
             runtime.residentMonitorPropsBySessionID[endpoint.sessionID] = props.outbound.isEmpty ? nil : props
+            // The independent route owns execution. Its attached window still owns presentation.
+            for window in sessionRuntimeWindows where !window.isClosing {
+                let presenter = window.agentModeViewModel
+                guard presenter.runtimeSessionStore === scope else { continue }
+                presenter.agentSessionLinkPublishProjection(props, to: endpoint)
+            }
         } else if let viewModel = agentSessionLinkOwningViewModel(for: endpoint) {
             viewModel.agentSessionLinkPublishProjection(props, to: endpoint)
         } else {
