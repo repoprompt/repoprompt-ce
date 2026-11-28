@@ -1626,6 +1626,10 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             mode: .enabled
         ))
         let workspace = await installLaneWorkspace(in: fixture.window)
+        final class Flag { var value = false }
+        let fullAccess = Flag()
+        fixture.bridge.delegationScopes.isGlobalAutoApproveEnabled = { fullAccess.value }
+        fullAccess.value = true
         let args: [String: Value] = [
             "op": .string("create_lane"),
             "idempotency_key": .string("service-replay-1"),
@@ -1645,6 +1649,11 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertEqual(replay["workspace"], first["workspace"])
         XCTAssertEqual(replay["session_id"], first["session_id"])
         XCTAssertEqual(replay["duplicate"], .bool(true))
+        XCTAssertEqual(first["lanes"], .string("1"))
+        XCTAssertEqual(replay["lanes"], .string("1"))
+        fullAccess.value = false
+        let replayAfterToggle = try await Self.executeObject(fixture.service, args: args)
+        XCTAssertEqual(replayAfterToggle["lanes"], .string("1"))
         XCTAssertEqual(fixture.host.laneCreationCount, 1)
 
         var conflictArgs = args

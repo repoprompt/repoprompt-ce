@@ -40,6 +40,35 @@ final class AgentSessionLaneMCPToolServiceTests: XCTestCase {
         }
     }
 
+    func testWaivedQuotaReceiptOmitsDenominator() {
+        var receipt = AgentSessionLaneCreateReceipt(
+            result: .created,
+            sessionID: UUID(),
+            sessionName: nil,
+            linked: true,
+            reason: nil,
+            firstTask: .none,
+            laneCount: 3
+        )
+        receipt.laneQuotaWaived = true
+        XCTAssertEqual(AgentSessionLaneMCPToolService.render(receipt).objectValue?["lanes"]?.stringValue, "3")
+
+        receipt.laneQuotaWaived = false
+        XCTAssertEqual(
+            AgentSessionLaneMCPToolService.render(receipt).objectValue?["lanes"]?.stringValue,
+            "3/\(AgentSessionLanePolicy.agentSessionLaneMaximumCount)"
+        )
+
+        let refused = AgentSessionLaneCreateReceipt.refused(
+            .laneLimitReached,
+            laneCount: AgentSessionLanePolicy.agentSessionLaneMaximumCount
+        )
+        XCTAssertEqual(
+            AgentSessionLaneMCPToolService.render(refused).objectValue?["lanes"]?.stringValue,
+            "\(AgentSessionLanePolicy.agentSessionLaneMaximumCount)/\(AgentSessionLanePolicy.agentSessionLaneMaximumCount)"
+        )
+    }
+
     func testRetirementReceiptsRemainNonDestructiveAndExplainPartialOutcome() {
         let sessionID = UUID()
         let partial = AgentSessionLaneMCPToolService.render(

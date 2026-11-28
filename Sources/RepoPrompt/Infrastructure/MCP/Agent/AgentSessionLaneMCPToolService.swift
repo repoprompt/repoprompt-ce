@@ -137,7 +137,11 @@ enum AgentSessionLaneMCPToolService {
             "result": .string(receipt.result == .created ? "created" : "creation_incomplete"),
             "linked": .bool(receipt.linked),
             "first_task": .string(firstTask(receipt.firstTask)),
-            "lanes": .string("\(receipt.laneCount)/\(AgentSessionLanePolicy.agentSessionLaneMaximumCount)"),
+            "lanes": .string(
+                receipt.laneQuotaWaived
+                    ? "\(receipt.laneCount)"
+                    : "\(receipt.laneCount)/\(AgentSessionLanePolicy.agentSessionLaneMaximumCount)"
+            ),
             "duplicate": .bool(receipt.duplicate)
         ]
         if receipt.firstTask == .failed, let reason = receipt.firstTaskReason {
