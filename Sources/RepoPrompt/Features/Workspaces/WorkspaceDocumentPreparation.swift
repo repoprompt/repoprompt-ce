@@ -1,10 +1,6 @@
 import Foundation
 import RepoPromptDomainRuntime
 
-enum WorkspaceMetadataField {
-    case name, hidden, color
-}
-
 private enum DomainWorkspaceModelEncoder {
     static func encode(_ workspace: WorkspaceModel) throws -> Data {
         let encoder = JSONEncoder()
@@ -68,31 +64,22 @@ actor WorkspaceDocumentPreparation {
         return Catalog(models: models, failedIDs: failedIDs, wasOnMainThread: Thread.isMainThread)
     }
 
-    func metadataModel(for canonical: DomainWorkspaceDocument) throws -> WorkspaceModel {
-        try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
-            documentBytes: canonical.documentBytes, fileURL: canonical.fileURL, preserveUnreadableDocument: false
-        )
-    }
-
-    /// Patch only the owned field and modification date; preserve unknown canonical JSON values.
-    func documentByApplyingMetadata(
-        _ field: WorkspaceMetadataField, model: WorkspaceModel, in canonical: DomainWorkspaceDocument
+    /// Closing metadata replay must preserve every field it did not edit, including fields
+    /// the app's typed decoder does not understand.
+    func documentBySettingColor(
+        _ colorID: String?, dateModified: Date, in canonical: DomainWorkspaceDocument
     ) throws -> DomainWorkspaceDocument {
-        guard var json = try JSONSerialization.jsonObject(with: canonical.documentBytes) as? [String: Any] else {
+        try Task.checkCancellation()
+        guard var fields = try JSONSerialization.jsonObject(with: canonical.documentBytes) as? [String: Any] else {
             throw CocoaError(.fileReadCorruptFile)
         }
-        switch field {
-        case .name: json["name"] = model.name
-        case .hidden: json["isHiddenInMenus"] = model.isHiddenInMenus
-        case .color:
-            if let color = model.color {
-                json["color"] = color
-            } else {
-                json.removeValue(forKey: "color")
-            }
+        if let colorID {
+            fields["color"] = colorID
+        } else {
+            fields.removeValue(forKey: "color")
         }
-        json["dateModified"] = model.dateModified.timeIntervalSinceReferenceDate
-        let bytes = try JSONSerialization.data(withJSONObject: json, options: [.sortedKeys])
+        fields["dateModified"] = dateModified.timeIntervalSinceReferenceDate
+        let bytes = try JSONSerialization.data(withJSONObject: fields, options: .sortedKeys)
         return try DomainWorkspaceDocument.decode(documentBytes: bytes, fileURL: canonical.fileURL)
     }
 

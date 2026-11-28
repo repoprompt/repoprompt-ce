@@ -1470,21 +1470,6 @@ class WindowStatesManager: ObservableObject {
 
     // MARK: - App Termination
 
-    func freezeWorkspaceSavesForTermination(deadline: ContinuousClock.Instant) {
-        for window in terminationWindowSnapshot {
-            window.workspaceManager.beginWorkspaceSaveShutdown(deadline: deadline)
-        }
-    }
-
-    func awaitWorkspaceSavesForTermination() async {
-        let managers = terminationWindowSnapshot.map(\.workspaceManager)
-        defer { managers.forEach { $0.fenceWorkspaceSaveShutdown() } }
-        for manager in managers {
-            guard !Task.isCancelled else { return }
-            await manager.awaitOwnSavesForWindowClose()
-        }
-    }
-
     /// Signals that the app is terminating. Call this at the START of applicationWillTerminate
     /// to prevent SwiftUI observation crashes during shutdown.
     nonisolated func signalTermination() {
