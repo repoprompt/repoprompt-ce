@@ -158,6 +158,8 @@ struct AgentSessionLaneCreateReceipt: Equatable {
     let firstTask: FirstTask
     let laneCount: Int
     var duplicate = false
+    /// Whether full access waived the creator-lane quota at admission.
+    var laneQuotaWaived = false
     var firstTaskReason: String?
     var refusalDetail: String?
     var admissionSubreason: String?
