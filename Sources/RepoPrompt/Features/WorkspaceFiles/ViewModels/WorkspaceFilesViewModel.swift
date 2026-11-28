@@ -1340,11 +1340,13 @@ class WorkspaceFilesViewModel: ObservableObject {
     private let automaticCodemapSelectionWaiter: WorkspaceCodemapAutomaticSelectionWaiter
     private let automaticCodemapReadinessRetryDelay: Duration
     private let defaultApplicationOpener: DefaultApplicationOpener
+    private let settingsStore: GlobalSettingsStore
     let restorePerfRecorder: any WorkspaceRestorePerfRecording
 
     init(
         alwaysReadableHomeDirectoryURL: URL? = nil,
         workspaceFileContextStore: WorkspaceFileContextStore,
+        settingsStore: GlobalSettingsStore = .shared,
         automaticCodemapSelectionRequestPolicy: WorkspaceCodemapAutomaticSelectionRequestPolicy = .default,
         automaticCodemapReadinessRetryPolicy: WorkspaceCodemapAutomaticSelectionRequestPolicy = .init(
             maximumReadinessRounds: 16,
@@ -1358,6 +1360,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder()
     ) {
         self.restorePerfRecorder = restorePerfRecorder
+        self.settingsStore = settingsStore
         self.alwaysReadableHomeDirectoryURL = (alwaysReadableHomeDirectoryURL ?? FileManager.default.homeDirectoryForCurrentUser).standardizedFileURL
         self.workspaceFileContextStore = workspaceFileContextStore
         self.automaticCodemapSelectionRequestPolicy = automaticCodemapSelectionRequestPolicy
@@ -10769,11 +10772,7 @@ extension WorkspaceFilesViewModel {
 
     /// Lexical load identity for configured workspace roots; not filesystem or symlink identity.
     func workspaceRootIdentity(for input: String) -> String? {
-        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, !trimmed.contains("\0"),
-              !trimmed.lowercased().hasPrefix("file://") else { return nil }
-        let normalized = normalizeUserInputPath(input)
-        return URL(fileURLWithPath: normalized, isDirectory: true).standardizedFileURL.path
+        StandardizedPath.canonicalWorkspaceRootPath(input)
     }
 
     func canonicalURL(for path: String, assumingDirectory: Bool = false) -> URL {
@@ -13470,7 +13469,7 @@ extension WorkspaceFilesViewModel {
 
     @MainActor
     private func syncFileSystemPreferencesFromGlobalSettings() {
-        let settings = GlobalSettingsStore.shared.fileSystemSettingsSnapshot()
+        let settings = settingsStore.fileSystemSettingsSnapshot()
         respectRepoIgnore = settings.respectRepoIgnore
         respectCursorignore = settings.respectCursorignore
         enableHierarchicalIgnores = settings.enableHierarchicalIgnores

@@ -64,6 +64,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
         WindowStatesManager.shared.registerWindowState(window)
         GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
         let cleanup: @MainActor () async -> Void = {
+            await window.agentModeViewModel.test_retireAndCancelFixture()
             window.beginClose()
             await window.domainWorkspacePresentationBridgeForTesting?.stopAndJoinForTesting()
             await window.tearDown()
@@ -154,11 +155,13 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             await window.workspaceManager.awaitInitialized()
             try await body(window)
         } catch {
+            await window.agentModeViewModel.test_retireAndCancelFixture()
             window.beginClose()
             await window.tearDown()
             WindowStatesManager.shared.unregisterWindowState(window)
             throw error
         }
+        await window.agentModeViewModel.test_retireAndCancelFixture()
         window.beginClose()
         await window.tearDown()
         WindowStatesManager.shared.unregisterWindowState(window)

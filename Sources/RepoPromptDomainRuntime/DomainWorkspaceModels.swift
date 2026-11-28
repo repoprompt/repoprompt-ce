@@ -1,6 +1,7 @@
 import CoreFoundation
 import CryptoKit
 import Foundation
+import RepoPromptWorkspaceCore
 
 package enum DomainWorkspaceStoragePath {
     package static func directoryName(name: String, id: UUID) -> String {
@@ -166,6 +167,21 @@ package struct DomainWorkspaceMetadata: Codable, Equatable {
         self.activeContextID = activeContextID
         self.contexts = contexts
         self.agentIdentityClaims = agentIdentityClaims
+    }
+
+    /// Raw configured root paths that are loadable for this workspace (`[]` for system workspaces).
+    package var loadableRepoPaths: [String] {
+        isSystemWorkspace ? [] : repoPaths
+    }
+
+    /// Canonical, deduplicated loadable root paths in declaration order.
+    package var canonicalLoadableRepoPaths: [String] {
+        StandardizedPath.canonicalWorkspaceRootPaths(loadableRepoPaths)
+    }
+
+    /// Canonical set of loadable root paths for equality checks across snapshots and retained roots.
+    package var canonicalLoadableRepoPathSet: Set<String> {
+        Set(canonicalLoadableRepoPaths)
     }
 }
 

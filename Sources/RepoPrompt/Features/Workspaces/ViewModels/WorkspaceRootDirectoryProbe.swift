@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptFoundation
 import RepoPromptWorkspaceContext
+import RepoPromptWorkspaceCore
 
 extension WorkspaceRootReadinessFailure.Availability: @unchecked Sendable {}
 
@@ -72,7 +73,9 @@ final class WorkspaceRootDirectoryProbe: @unchecked Sendable {
         for path in paths {
             try Task.checkCancellation()
             do {
-                let values = try URL(fileURLWithPath: path).resourceValues(forKeys: [.isDirectoryKey, .isReadableKey])
+                let resolvedPath = StandardizedPath.canonicalWorkspaceRootPath(path)
+                    ?? (path as NSString).expandingTildeInPath
+                let values = try URL(fileURLWithPath: resolvedPath).resourceValues(forKeys: [.isDirectoryKey, .isReadableKey])
                 if values.isDirectory != true { return .notDirectory }
                 if values.isReadable != true { return .accessDenied }
             } catch {

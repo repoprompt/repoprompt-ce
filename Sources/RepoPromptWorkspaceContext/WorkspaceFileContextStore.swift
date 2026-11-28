@@ -12043,6 +12043,81 @@ package actor WorkspaceFileContextStore {
         }
     }
 
+    /// Non-presentation primary-root join/load for independent Agent host retention.
+    /// Enforces `.primaryWorkspace` kind isolation fail-closed, joins already-loaded or in-flight
+    /// primary roots without reattaching detached presentations (`deferredRootUnloads` stays intact),
+    /// and loads absent roots using the caller's authoritative file-system settings.
+    @discardableResult
+    package func loadOrJoinPrimaryRoot(
+        path: String,
+        fileSystemSettings: FileSystemSettingsSnapshot,
+        cancelUnderlyingLoadOnCallerCancellation: Bool = false
+    ) async throws -> WorkspaceRootRecord {
+        guard let canonicalPath = StandardizedPath.canonicalWorkspaceRootPath(path) else {
+            throw WorkspaceFileContextStoreError.catalogMaterializationFailed("Invalid configured workspace root path.")
+        }
+        let standardizedPath = (canonicalPath as NSString).standardizingPath
+        try Task.checkCancellation()
+        try await waitForRootUnloadIfNeeded(standardizedPath: standardizedPath)
+        try Task.checkCancellation()
+        try await waitForPendingSeededRootVisibilityIfNeeded(
+            standardizedPath: standardizedPath,
+            bypassToken: nil
+        )
+        try Task.checkCancellation()
+        if let existingID = rootIDsByStandardizedPath[standardizedPath],
+           let existing = rootStatesByID[existingID]?.root
+        {
+            guard let existingConfiguration = rootLoadConfigurationsByPath[standardizedPath],
+                  existingConfiguration.kind == .primaryWorkspace
+            else {
+                throw WorkspaceFileContextStoreError.rootAlreadyLoadedWithDifferentConfiguration(standardizedPath)
+            }
+            return existing
+        }
+        if let inFlight = rootLoadFlightsByPath[standardizedPath] {
+            guard let inFlightConfiguration = rootLoadConfigurationsByPath[standardizedPath],
+                  inFlightConfiguration.kind == .primaryWorkspace
+            else {
+                throw WorkspaceFileContextStoreError.rootLoadInFlightWithDifferentConfiguration(standardizedPath)
+            }
+            return try await awaitRootLoadTask(
+                inFlight.task,
+                standardizedPath: standardizedPath,
+                cancelUnderlyingLoadOnCallerCancellation: cancelUnderlyingLoadOnCallerCancellation
+            )
+        }
+        return try await loadRoot(
+            path: standardizedPath,
+            isSystemRoot: false,
+            kind: .primaryWorkspace,
+            fileSystemSettings: fileSystemSettings,
+            cancelUnderlyingLoadOnCallerCancellation: cancelUnderlyingLoadOnCallerCancellation
+        )
+    }
+
+    @discardableResult
+    package func loadRoot(
+        path: String,
+        isSystemRoot: Bool = false,
+        kind: WorkspaceRootKind? = nil,
+        fileSystemSettings: FileSystemSettingsSnapshot,
+        cancelUnderlyingLoadOnCallerCancellation: Bool = false,
+        sessionWorktreeReservationToken: WorkspaceSessionWorktreeOwnershipToken? = nil
+    ) async throws -> WorkspaceRootRecord {
+        try await loadRoot(
+            path: path,
+            isSystemRoot: isSystemRoot,
+            kind: kind,
+            respectRepoIgnore: fileSystemSettings.respectRepoIgnore,
+            respectCursorignore: fileSystemSettings.respectCursorignore,
+            skipSymlinks: fileSystemSettings.skipSymlinks,
+            enableHierarchicalIgnores: fileSystemSettings.enableHierarchicalIgnores,
+            cancelUnderlyingLoadOnCallerCancellation: cancelUnderlyingLoadOnCallerCancellation,
+            sessionWorktreeReservationToken: sessionWorktreeReservationToken
+        )
+    }
+
     /// An owning caller cancels and joins its underlying load. If publication already won,
     /// return the root even on cancellation so the caller can clean up that exact receipt.
     /// Shared callers retain prompt cancellation without cancelling the shared load.
