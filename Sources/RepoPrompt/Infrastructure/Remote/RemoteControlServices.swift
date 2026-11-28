@@ -15,6 +15,7 @@ struct RemoteWorkspaceRecord: Equatable {
     let isOpen: Bool
     let activeSessionIDs: [UUID]
     let lastActivityAt: Date?
+    var supportsPresentationControl = false
 }
 
 struct RemoteSessionRecord: Equatable {
@@ -194,7 +195,8 @@ final class RemoteSnapshotBuilder {
                     repositoryRootSummary: $0.repositoryRootSummary,
                     isOpen: $0.isOpen,
                     activeSessionIDs: $0.activeSessionIDs,
-                    lastActivityAt: $0.lastActivityAt
+                    lastActivityAt: $0.lastActivityAt,
+                    supportsPresentationControl: $0.supportsPresentationControl
                 )
             }
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
@@ -282,28 +284,26 @@ final class RemoteSnapshotBuilder {
 
 @MainActor
 final class WorkspaceManagerRemoteCatalogService: WorkspaceCatalogService {
-    private let managers: [WorkspaceManagerViewModel]
+    private let windows: [WindowState]
 
-    init(manager: WorkspaceManagerViewModel) {
-        managers = [manager]
-    }
-
-    init(managers: [WorkspaceManagerViewModel]) {
-        self.managers = managers
+    init(windows: [WindowState]) {
+        self.windows = windows
     }
 
     func allSavedWorkspaces() async -> [RemoteWorkspaceRecord] {
+        let openWorkspaceIDs = Set(windows.filter { !$0.isClosing }.compactMap(\.workspaceManager.activeWorkspaceID))
         var records: [UUID: RemoteWorkspaceRecord] = [:]
-        for manager in managers {
+        for manager in windows.map(\.workspaceManager) {
             for workspace in manager.workspaces where !workspace.isEphemeral {
                 let current = RemoteWorkspaceRecord(
                     workspaceID: workspace.id,
                     name: workspace.name,
                     repositoryRootSummary: workspace.repoPaths.first
                         .map { URL(fileURLWithPath: $0).lastPathComponent },
-                    isOpen: WindowStatesManager.shared.countWindowsShowing(workspaceId: workspace.id) > 0,
+                    isOpen: openWorkspaceIDs.contains(workspace.id),
                     activeSessionIDs: workspace.composeTabs.compactMap(\.activeAgentSessionID),
-                    lastActivityAt: workspace.lastUsed
+                    lastActivityAt: workspace.lastUsed,
+                    supportsPresentationControl: RemoteWorkspacePresentationController.supportsControl(for: workspace)
                 )
                 if let existing = records[workspace.id] {
                     records[workspace.id] = RemoteWorkspaceRecord(
@@ -313,7 +313,8 @@ final class WorkspaceManagerRemoteCatalogService: WorkspaceCatalogService {
                         isOpen: existing.isOpen || current.isOpen,
                         activeSessionIDs: Array(Set(existing.activeSessionIDs + current.activeSessionIDs))
                             .sorted { $0.uuidString < $1.uuidString },
-                        lastActivityAt: max(existing.lastActivityAt ?? .distantPast, current.lastActivityAt ?? .distantPast)
+                        lastActivityAt: max(existing.lastActivityAt ?? .distantPast, current.lastActivityAt ?? .distantPast),
+                        supportsPresentationControl: existing.supportsPresentationControl && current.supportsPresentationControl
                     )
                 } else {
                     records[workspace.id] = current

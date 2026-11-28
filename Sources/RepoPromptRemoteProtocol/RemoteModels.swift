@@ -352,6 +352,7 @@ public struct RemoteWorkspaceSummary: Codable, Sendable, Equatable {
     public let isOpen: Bool
     public let activeSessionIDs: [UUID]
     public let lastActivityAt: Date?
+    public let supportsPresentationControl: Bool?
 
     public init(
         workspaceID: String,
@@ -359,7 +360,8 @@ public struct RemoteWorkspaceSummary: Codable, Sendable, Equatable {
         repositoryRootSummary: String? = nil,
         isOpen: Bool,
         activeSessionIDs: [UUID] = [],
-        lastActivityAt: Date? = nil
+        lastActivityAt: Date? = nil,
+        supportsPresentationControl: Bool? = nil
     ) {
         self.workspaceID = workspaceID
         self.name = name
@@ -367,6 +369,18 @@ public struct RemoteWorkspaceSummary: Codable, Sendable, Equatable {
         self.isOpen = isOpen
         self.activeSessionIDs = activeSessionIDs
         self.lastActivityAt = lastActivityAt
+        self.supportsPresentationControl = supportsPresentationControl
+    }
+}
+
+/// The requested workspace state, echoed by the Mac once it observes that state.
+public struct RemoteWorkspacePresentation: Codable, Sendable, Equatable {
+    public let workspaceID: UUID
+    public let isOpen: Bool
+
+    public init(workspaceID: UUID, isOpen: Bool) {
+        self.workspaceID = workspaceID
+        self.isOpen = isOpen
     }
 }
 

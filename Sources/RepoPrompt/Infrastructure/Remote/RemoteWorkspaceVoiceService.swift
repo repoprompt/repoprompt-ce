@@ -45,6 +45,10 @@ final class RemoteWorkspaceVoiceService {
     private var call: Call?
     private var endedCallIDs: [UUID] = []
 
+    func isUsingWorkspace(_ workspaceID: UUID) -> Bool {
+        call?.workspaceID == workspaceID && call?.isOpen == true
+    }
+
     func handle(
         _ request: RemoteWorkspaceVoiceRequest,
         peerEndpointID: String,
