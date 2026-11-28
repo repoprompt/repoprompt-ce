@@ -1,4 +1,5 @@
 import Foundation
+import os
 @testable import RepoPromptSettingsCore
 import XCTest
 
@@ -177,10 +178,16 @@ private final class ContractFileStore: GlobalSettingsFileStoring {
     let hasPendingStartupMigration = false
     var saveAttempts = 0
     var failWrites = false
-    var document = GlobalSettingsDocument(scalarPreferences: GlobalScalarPreferences(
-        contextBuilder: .init(),
-        fileSystem: .init(globalIgnoreDefaults: "")
+    private let documentLock = OSAllocatedUnfairLock(initialState: GlobalSettingsDocument(
+        scalarPreferences: GlobalScalarPreferences(
+            contextBuilder: .init(),
+            fileSystem: .init(globalIgnoreDefaults: "")
+        )
     ))
+    var document: GlobalSettingsDocument {
+        get { documentLock.withLock { $0 } }
+        set { documentLock.withLock { $0 = newValue } }
+    }
 
     func readSnapshot() throws -> GlobalSettingsDocument? {
         document
